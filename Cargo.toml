@@ -1,0 +1,21 @@
+[package]
+name = "coda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.101"
+async-openai = { version = "0.32.4", features = ["chat-completion"] }
+dotenvy = "0.15.7"
+futures = "0.3.31"
+opentelemetry = "0.31.0"
+opentelemetry-otlp = "0.31.0"
+opentelemetry_sdk = "0.31.0"
+schemars = "1.2.1"
+serde = "1.0.228"
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.32.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+uuid = { version = "1.21.0", features = ["v4"] }
