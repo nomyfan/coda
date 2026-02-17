@@ -9,7 +9,8 @@ use tracing::debug;
 
 use crate::agent::Agent;
 use crate::agent::tools::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ShellTool, WriteFileTool,
+    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteTodosTool,
+    WriteFileTool,
 };
 use crate::core::llm::{
     ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
@@ -50,30 +51,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    let mut agent = Agent::new(
-        "coda".to_string(),
-        OpenAI::new(LLMProviderConfig {
-            api_key,
-            base_url,
-            stream: true,
-        }),
-    );
+    let mut agent = Agent::new(OpenAI::new(LLMProviderConfig {
+        api_key,
+        base_url,
+        stream: true,
+    }));
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-    agent.session.add_message(Message::System(SystemMessage(
-        SYSTEM_PROMPT
-            .replace("{{OS}}", &format!("{}({})", os, arch))
-            .replace("{{CWD}}", &cwd),
-    )));
+    agent
+        .add_message(Message::System(SystemMessage(
+            SYSTEM_PROMPT
+                .replace("{{OS}}", &format!("{}({})", os, arch))
+                .replace("{{CWD}}", &cwd),
+        )))
+        .await;
 
+    let state = agent.state();
     agent.tools.register(ShellTool::new());
     agent.tools.register(ReadFileTool::new());
     agent.tools.register(WriteFileTool::new());
     agent.tools.register(ListDirectoryTool::new());
     agent.tools.register(GrepTool::new(cwd.clone()));
     agent.tools.register(GlobTool::new(cwd));
+    agent.tools.register(ReadTodosTool::new(state.clone()));
+    agent.tools.register(WriteTodosTool::new(state));
 
     print_logo();
     println!("Type 'quit', 'exit', or 'q' to stop");
@@ -100,11 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Add user message to session
+        // Add user message
         agent
-            .session
-            .add_message(Message::User(UserMessage(user_input.to_string())));
-        debug!("messages: {:?}", agent.session.messages());
+            .add_message(Message::User(UserMessage(user_input.to_string())))
+            .await;
+        debug!("messages: {:?}", agent.messages().await);
 
         print!("Assistant: ");
         io::stdout().flush()?;
@@ -113,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let request = ChatCompletionRequest {
                 model: model.clone(),
-                messages: agent.session.messages().to_vec(),
+                messages: agent.messages().await,
                 tools: agent.tools.descriptors(),
                 max_completion_tokens: Some(8000),
                 temperature: Some(0.7),
@@ -127,9 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let stop = assistant_message.tool_calls.is_empty();
             agent
-                .session
-                .add_message(Message::Assistant(assistant_message.clone()));
-            debug!("messages: {:?}", agent.session.messages());
+                .add_message(Message::Assistant(assistant_message.clone()))
+                .await;
+            debug!("messages: {:?}", agent.messages().await);
 
             if !assistant_message.tool_calls.is_empty() {
                 let futures: Vec<_> = assistant_message
@@ -163,10 +166,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let results = futures::future::join_all(futures).await;
                 for tool_message in results {
-                    agent.session.add_message(Message::Tool(tool_message));
+                    agent.add_message(Message::Tool(tool_message)).await;
                 }
             }
-            debug!("messages: {:?}", agent.session.messages());
+            debug!("messages: {:?}", agent.messages().await);
             if stop {
                 break;
             }
