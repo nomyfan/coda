@@ -10,7 +10,8 @@ use tracing::debug;
 use crate::agent::Agent;
 use crate::agent::tools::ShellTool;
 use crate::core::llm::{
-    ChatCompletionRequest, LLM, LLMProvider, Message, SystemMessage, ToolMessage, UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
+    UserMessage,
 };
 use crate::provider::openai::OpenAI;
 
@@ -46,7 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(io::stderr)
         .init();
 
-    let mut agent = Agent::new("coda".to_string());
+    let mut agent = Agent::new(
+        "coda".to_string(),
+        OpenAI::new(LLMProviderConfig {
+            api_key,
+            base_url,
+            stream: true,
+        }),
+    );
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -55,12 +63,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
 
     agent.tools.register(ShellTool::new());
-
-    let provider = OpenAI::new(LLM {
-        api_key,
-        base_url,
-        stream: true,
-    });
 
     print_logo();
     println!("Type 'quit', 'exit', or 'q' to stop");
@@ -91,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent
             .session
             .add_message(Message::User(UserMessage(user_input.to_string())));
-        debug!("messages: {:?}\n", agent.session.messages());
+        debug!("messages: {:?}", agent.session.messages());
 
         print!("Assistant: ");
         io::stdout().flush()?;
@@ -108,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let on_content = |content: String| async move {
                 print!("{}", content);
             };
-            let assistant_message = provider.stream(request, on_content).await?;
+            let assistant_message = agent.provider.stream(request, on_content).await?;
             if !assistant_message.content.is_empty() {
                 println!();
             }
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent
                 .session
                 .add_message(Message::Assistant(assistant_message.clone()));
+            debug!("messages: {:?}", agent.session.messages());
 
             if !assistant_message.tool_calls.is_empty() {
                 let futures: Vec<_> = assistant_message
@@ -152,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     agent.session.add_message(Message::Tool(tool_message));
                 }
             }
-            debug!("messages: {:?}\n", agent.session.messages());
+            debug!("messages: {:?}", agent.session.messages());
             if stop {
                 break;
             }

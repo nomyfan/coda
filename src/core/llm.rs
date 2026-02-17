@@ -57,7 +57,7 @@ pub(crate) enum Message {
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone)]
-pub(crate) struct LLM {
+pub(crate) struct LLMProviderConfig {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
     pub(crate) stream: bool,

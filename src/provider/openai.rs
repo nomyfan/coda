@@ -1,9 +1,10 @@
 use crate::core::llm::{
     AssistantMessage, CompletionUsage, LLMProvider, Message, StreamError, ToolCall, ToolDefinition,
 };
-use crate::core::llm::{ChatCompletionRequest, LLM};
+use crate::core::llm::{ChatCompletionRequest, LLMProviderConfig};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use async_openai::traits::RequestOptionsBuilder;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
@@ -95,6 +96,8 @@ impl From<ToolDefinition> for ChatCompletionTools {
 
 pub(crate) struct OpenAI {
     client: Client<OpenAIConfig>,
+    /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
+    stream: bool,
 }
 
 impl LLMProvider for OpenAI {
@@ -115,7 +118,13 @@ impl LLMProvider for OpenAI {
             req.max_completion_tokens(max_completion_tokens);
         }
         let req = req.build().unwrap();
-        let mut stream = self.client.chat().create_stream(req).await.unwrap();
+        let mut chat = self.client.chat();
+        if self.stream {
+            chat = chat
+                .header("stream_options", r#"{"include_usage": true}"#)
+                .unwrap();
+        }
+        let mut stream = chat.create_stream(req).await.unwrap();
         let mut chat_completion = ReducedChatCompletion::new();
         while let Some(response) = stream.next().await {
             match response {
@@ -149,17 +158,13 @@ impl LLMProvider for OpenAI {
 }
 
 impl OpenAI {
-    pub(crate) fn new(llm: LLM) -> Self {
-        let mut config = OpenAIConfig::new()
-            .with_api_base(llm.base_url)
-            .with_api_key(llm.api_key);
-        if llm.stream {
-            config = config
-                .with_header("stream_options", r#"{"include_usage": true}"#)
-                .unwrap();
-        }
+    pub(crate) fn new(config: LLMProviderConfig) -> Self {
+        let client_config = OpenAIConfig::new()
+            .with_api_base(config.base_url)
+            .with_api_key(config.api_key);
         Self {
-            client: Client::with_config(config),
+            client: Client::with_config(client_config),
+            stream: config.stream,
         }
     }
 }
