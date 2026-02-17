@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 
-use super::llm::ToolDescriptor;
+use super::llm::ToolDefinition;
 
 #[derive(Debug)]
 pub(crate) enum ToolError {
@@ -117,10 +117,10 @@ impl ToolManager {
         self.tools.get(name).cloned()
     }
 
-    pub(crate) fn descriptors(&self) -> Vec<ToolDescriptor> {
+    pub(crate) fn descriptors(&self) -> Vec<ToolDefinition> {
         self.tools
             .values()
-            .map(|tool| ToolDescriptor {
+            .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameter_schema: tool.parameter_schema().clone(),

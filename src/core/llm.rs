@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolDescriptor {
+pub(crate) struct ToolDefinition {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) parameter_schema: Value,
@@ -67,17 +67,34 @@ pub(crate) struct LLM {
 pub(crate) struct ChatCompletionRequest {
     pub(crate) model: String,
     pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<ToolDescriptor>,
+    pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) max_completion_tokens: Option<u32>,
     pub(crate) temperature: Option<f32>,
 }
 
-pub(crate) enum LLMError {
-    //
+#[derive(Debug, Clone)]
+pub(crate) enum StreamError {
+    /// Error occurred during streaming the response from the LLM.
+    StreamingError(String),
+    /// Error occurred while parsing the LLM's response.
+    InvalidResponse(String),
 }
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::StreamingError(err) => write!(f, "Streaming error: {}", err),
+            StreamError::InvalidResponse(err) => write!(f, "Invalid response: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
 pub(crate) trait LLMProvider: Send + Sync + 'static {
-    fn chat_completion(
+    async fn stream(
         &self,
         request: ChatCompletionRequest,
-    ) -> impl Future<Output = Result<AssistantMessage, LLMError>> + Send + 'static;
+        on_content: impl AsyncFnMut(String),
+    ) -> Result<AssistantMessage, StreamError>;
 }

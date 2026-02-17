@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::agent::Agent;
 use crate::agent::tools::ShellTool;
 use crate::core::llm::{
-    ChatCompletionRequest, LLM, Message, SystemMessage, ToolMessage, UserMessage,
+    ChatCompletionRequest, LLM, LLMProvider, Message, SystemMessage, ToolMessage, UserMessage,
 };
 use crate::provider::openai::OpenAI;
 

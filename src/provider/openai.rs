@@ -1,4 +1,6 @@
-use crate::core::llm::{AssistantMessage, CompletionUsage, Message, ToolCall, ToolDescriptor};
+use crate::core::llm::{
+    AssistantMessage, CompletionUsage, LLMProvider, Message, StreamError, ToolCall, ToolDefinition,
+};
 use crate::core::llm::{ChatCompletionRequest, LLM};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -78,8 +80,8 @@ impl From<Message> for ChatCompletionRequestMessage {
     }
 }
 
-impl From<ToolDescriptor> for ChatCompletionTools {
-    fn from(value: ToolDescriptor) -> Self {
+impl From<ToolDefinition> for ChatCompletionTools {
+    fn from(value: ToolDefinition) -> Self {
         ChatCompletionTools::Function(ChatCompletionTool {
             function: FunctionObject {
                 name: value.name,
@@ -95,26 +97,12 @@ pub(crate) struct OpenAI {
     client: Client<OpenAIConfig>,
 }
 
-impl OpenAI {
-    pub(crate) fn new(llm: LLM) -> Self {
-        let mut config = OpenAIConfig::new()
-            .with_api_base(llm.base_url)
-            .with_api_key(llm.api_key);
-        if llm.stream {
-            config = config
-                .with_header("stream_options", r#"{"include_usage": true}"#)
-                .unwrap();
-        }
-        Self {
-            client: Client::with_config(config),
-        }
-    }
-
-    pub(crate) async fn stream(
+impl LLMProvider for OpenAI {
+    async fn stream(
         &self,
         request: ChatCompletionRequest,
         mut on_content: impl AsyncFnMut(String),
-    ) -> Result<AssistantMessage, String> {
+    ) -> Result<AssistantMessage, StreamError> {
         let messages: Vec<ChatCompletionRequestMessage> =
             request.messages.into_iter().map(|x| x.into()).collect();
         let tools: Vec<ChatCompletionTools> = request.tools.into_iter().map(|x| x.into()).collect();
@@ -150,13 +138,29 @@ impl OpenAI {
                         }
                     }
                 }
-                Err(e) => {
-                    return Err(format!("Stream error: {}", e));
-                }
+                Err(e) => return Err(StreamError::StreamingError(format!("{}", e))),
             }
         }
 
-        chat_completion.try_into()
+        chat_completion
+            .try_into()
+            .map_err(StreamError::InvalidResponse)
+    }
+}
+
+impl OpenAI {
+    pub(crate) fn new(llm: LLM) -> Self {
+        let mut config = OpenAIConfig::new()
+            .with_api_base(llm.base_url)
+            .with_api_key(llm.api_key);
+        if llm.stream {
+            config = config
+                .with_header("stream_options", r#"{"include_usage": true}"#)
+                .unwrap();
+        }
+        Self {
+            client: Client::with_config(config),
+        }
     }
 }
 
