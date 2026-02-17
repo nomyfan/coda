@@ -8,7 +8,9 @@ use std::io::{self, Write};
 use tracing::debug;
 
 use crate::agent::Agent;
-use crate::agent::tools::ShellTool;
+use crate::agent::tools::{
+    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ShellTool, WriteFileTool,
+};
 use crate::core::llm::{
     ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
     UserMessage,
@@ -45,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(io::stderr)
+        .with_ansi(false)
         .init();
 
     let mut agent = Agent::new(
@@ -58,11 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
     agent.session.add_message(Message::System(SystemMessage(
-        SYSTEM_PROMPT.replace("{{OS}}", &format!("{}({})", os, arch)),
+        SYSTEM_PROMPT
+            .replace("{{OS}}", &format!("{}({})", os, arch))
+            .replace("{{CWD}}", &cwd),
     )));
 
     agent.tools.register(ShellTool::new());
+    agent.tools.register(ReadFileTool::new());
+    agent.tools.register(WriteFileTool::new());
+    agent.tools.register(ListDirectoryTool::new());
+    agent.tools.register(GrepTool::new(cwd.clone()));
+    agent.tools.register(GlobTool::new(cwd));
 
     print_logo();
     println!("Type 'quit', 'exit', or 'q' to stop");

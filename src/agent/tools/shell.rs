@@ -2,7 +2,7 @@ use crate::core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tracing::info;
+use tracing::debug;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct ShellToolParams {
@@ -16,10 +16,14 @@ pub(crate) struct ShellTool {
 
 impl ShellTool {
     pub(crate) fn new() -> Self {
-        let description = "Execute shell commands and return stdout and stderr. Your are in a Unix environment, cat, ls, echo, pwd, date, and other basic commands are available.".to_string();
+        let description =
+            "Execute shell commands and return stdout and stderr. Your are in a Unix environment."
+                .to_string();
+        let schema = schemars::schema_for!(ShellToolParams);
+        debug!("ShellTool schema: {:?}", schema);
 
         ShellTool {
-            schema: schemars::schema_for!(ShellToolParams),
+            schema,
             description,
         }
     }
@@ -47,7 +51,6 @@ impl Tool for ShellTool {
         params: Self::Parameters,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move {
-            info!("Executing shell command: {}", params.command);
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(&params.command)

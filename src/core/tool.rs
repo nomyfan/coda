@@ -1,10 +1,11 @@
 use std::boxed::Box;
 use std::collections::BTreeMap;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+use tracing::{Instrument, Span, info, info_span};
 
 use super::llm::ToolDefinition;
 
@@ -76,6 +77,13 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
         self: Arc<Self>,
         input: String,
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+        let span = info_span!(
+            "execute_tool",
+            tool = self.name(),
+            input = &input,
+            output = tracing::field::Empty,
+            error = tracing::field::Empty
+        );
         let params: T::Parameters = match serde_json::from_str(&input) {
             Ok(input) => input,
             Err(err) => {
@@ -84,10 +92,20 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
             }
         };
 
-        Box::pin(async move {
-            let output = self.0.execute(params).await?;
-            Ok(output.to_string())
-        })
+        Box::pin(
+            async move {
+                info!("executing tool");
+                let result = self.0.execute(params).await;
+                let span = Span::current();
+                match &result {
+                    Ok(output) => span.record("output", output.to_string()),
+                    Err(err) => span.record("error", err.to_string()),
+                };
+                info!("finished executing tool");
+                result.map(|output| output.to_string())
+            }
+            .instrument(span),
+        )
     }
 }
 
