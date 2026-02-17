@@ -114,7 +114,6 @@ impl OpenAI {
         &self,
         request: ChatCompletionRequest,
         mut on_content: impl AsyncFnMut(String),
-        // TODO: better error type
     ) -> Result<AssistantMessage, String> {
         let messages: Vec<ChatCompletionRequestMessage> =
             request.messages.into_iter().map(|x| x.into()).collect();
@@ -152,11 +151,12 @@ impl OpenAI {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {:?}", e);
+                    return Err(format!("Stream error: {}", e));
                 }
             }
         }
-        Ok(chat_completion.try_into().expect("TODO:"))
+
+        chat_completion.try_into()
     }
 }
 
@@ -229,26 +229,28 @@ impl ReducedChatCompletion {
 }
 
 impl TryFrom<ReducedChatCompletion> for AssistantMessage {
-    type Error = String; // TODO: define a proper error type
+    type Error = String;
 
     fn try_from(value: ReducedChatCompletion) -> Result<Self, Self::Error> {
+        let mut tool_calls = vec![];
+        for chunk in value.chunks {
+            let id = chunk.id.ok_or_else(|| "Missing tool call id".to_string())?;
+            let function = chunk
+                .function
+                .ok_or_else(|| "Missing function call".to_string())?;
+            let name = function
+                .name
+                .ok_or_else(|| "Missing function call name".to_string())?;
+            let arguments = function.arguments;
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
         Ok(AssistantMessage {
             content: value.content,
-            tool_calls: value
-                .chunks
-                .into_iter()
-                .map(|x| {
-                    let id = x.id.expect("TODO: expect an tool call id");
-                    let function = x.function.expect("TODO: expect a function call");
-                    let name = function.name.expect("TODO: expect a function call name");
-                    let arguments = function.arguments;
-                    ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    }
-                })
-                .collect(),
+            tool_calls,
             usage: value.usage,
         })
     }
