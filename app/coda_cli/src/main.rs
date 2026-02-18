@@ -11,7 +11,8 @@ use tracing::warn;
 
 use coda_agent::{Agent, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode};
 use coda_core::llm::{
-    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, UserMessage,
+    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolOutput,
+    UserMessage,
 };
 use coda_openai::OpenAI;
 use coda_skills::Skills;
@@ -236,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(id) => match session::load_session(&workspace_dir, &id) {
             Ok(data) => {
                 println!("Resuming: {}\n", data.title);
+                print_history(&data.messages);
                 agent.restore_history(data.messages, data.todos).await;
                 Some(id)
             }
@@ -318,8 +320,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AgentEvent::ToolCallEnd(m) => {
                         debug!(
-                            "tool result: id={} name={} result={}",
-                            m.id, m.name, m.result
+                            "tool result: id={} name={} output={:?}",
+                            m.id, m.name, m.output
                         );
                     }
                     AgentEvent::Suspended(checkpoint) => {
@@ -356,6 +358,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => warn!("Failed to save session: {}", e),
         }
     }
+}
+
+fn print_history(messages: &[Message]) {
+    for msg in messages {
+        match msg {
+            Message::System(_) => {}
+            Message::User(u) => {
+                println!("\nYou: {}", u.0);
+            }
+            Message::Assistant(a) => {
+                if !a.content.is_empty() {
+                    println!("Assistant: {}", a.content);
+                }
+                for call in &a.tool_calls {
+                    println!("\n[Tool: {}]: {:?}", call.name, call.arguments);
+                }
+            }
+            Message::Tool(t) => {
+                let status = match &t.outcome {
+                    ToolCallOutcome::Rejected { reason } => match reason {
+                        Some(r) => format!("rejected: {r}"),
+                        None => "rejected".to_string(),
+                    },
+                    _ => match &t.output {
+                        ToolOutput::Ok(_) => "ok".to_string(),
+                        ToolOutput::Err(e) => format!("err: {e}"),
+                    },
+                };
+                let approved_tag = match &t.outcome {
+                    ToolCallOutcome::Approved => " (approved)",
+                    _ => "",
+                };
+                println!("  -> {status}{approved_tag}");
+            }
+        }
+    }
+    println!();
 }
 
 async fn save_and_exit(agent: &Agent<OpenAI>, workspace_dir: &Path, session_id: Option<&str>) -> ! {

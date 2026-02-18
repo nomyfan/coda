@@ -37,12 +37,34 @@ pub struct CompletionUsage {
     pub completion_tokens: u32,
 }
 
+/// The output of a tool execution: success or error.
+///
+/// The LLM request layer is responsible for formatting this into the string
+/// content required by the API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolOutput {
+    Ok(String),
+    Err(String),
+}
+
+/// Records the approval/execution state of a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolCallOutcome {
+    /// Executed automatically without requiring user approval.
+    Auto,
+    /// Executed after explicit user approval.
+    Approved,
+    /// Rejected by the user; execution was skipped.
+    Rejected { reason: Option<String> },
+}
+
 /// A message representing the result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMessage {
     pub id: String,
     pub name: String,
-    pub result: String,
+    pub output: ToolOutput,
+    pub outcome: ToolCallOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

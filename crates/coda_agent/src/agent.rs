@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
-    ToolCall, ToolMessage, UserMessage,
+    ToolCall, ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
 };
 use coda_core::tool::ToolManager;
 use futures::{Stream, StreamExt};
@@ -197,17 +197,24 @@ impl<P: LLMProvider> Agent<P> {
                         .map(|call| {
                             let tool = self.tools.get(&call.name);
                             async move {
-                                let result = match tool {
-                                    Some(t) => t
+                                let output = match tool {
+                                    Some(t) => match t
                                         .execute(call.arguments.unwrap_or_default())
                                         .await
-                                        .unwrap_or_else(|e| format!("Error: {e}")),
-                                    None => format!("Error: Tool '{}' not found", call.name),
+                                    {
+                                        Ok(s) => ToolOutput::Ok(s),
+                                        Err(e) => ToolOutput::Err(e.to_string()),
+                                    },
+                                    None => ToolOutput::Err(format!(
+                                        "Tool '{}' not found",
+                                        call.name
+                                    )),
                                 };
                                 ToolMessage {
                                     id: call.id,
                                     name: call.name,
-                                    result,
+                                    output,
+                                    outcome: ToolCallOutcome::Auto,
                                 }
                             }
                         })
@@ -282,17 +289,24 @@ impl<P: LLMProvider> Agent<P> {
                 .map(|call| {
                     let tool = self.tools.get(&call.name);
                     async move {
-                        let result = match tool {
-                            Some(t) => t
+                        let output = match tool {
+                            Some(t) => match t
                                 .execute(call.arguments.unwrap_or_default())
                                 .await
-                                .unwrap_or_else(|e| format!("Error: {e}")),
-                            None => format!("Error: Tool '{}' not found", call.name),
+                            {
+                                Ok(s) => ToolOutput::Ok(s),
+                                Err(e) => ToolOutput::Err(e.to_string()),
+                            },
+                            None => ToolOutput::Err(format!(
+                                "Tool '{}' not found",
+                                call.name
+                            )),
                         };
                         ToolMessage {
                             id: call.id,
                             name: call.name,
-                            result,
+                            output,
+                            outcome: ToolCallOutcome::Approved,
                         }
                     }
                 })
@@ -309,15 +323,18 @@ impl<P: LLMProvider> Agent<P> {
                 .iter()
                 .filter(|c| rejected.contains_key(&c.id))
             {
-                let reason = rejected.get(&call.id).and_then(|r| r.as_deref());
-                let result = match reason {
-                    Some(r) => format!("ERROR: tool call rejected by user, reason: {r}"),
-                    None => "ERROR: tool call rejected by user.".to_string(),
+                let rejection_reason = rejected.get(&call.id).and_then(|r| r.clone());
+                let err_msg = match &rejection_reason {
+                    Some(r) => format!("tool call rejected by user, reason: {r}"),
+                    None => "tool call rejected by user".to_string(),
                 };
                 self.add_message(Message::Tool(ToolMessage {
                     id: call.id.clone(),
                     name: call.name.clone(),
-                    result,
+                    output: ToolOutput::Err(err_msg),
+                    outcome: ToolCallOutcome::Rejected {
+                        reason: rejection_reason,
+                    },
                 }))
                 .await;
             }

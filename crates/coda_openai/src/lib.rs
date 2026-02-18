@@ -13,7 +13,7 @@ use async_openai::types::chat::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMProviderConfig,
-    LLMStreamEvent, Message, StreamError, ToolCall, ToolDefinition,
+    LLMStreamEvent, Message, StreamError, ToolCall, ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -73,11 +73,13 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
             }
             Message::Tool(tool_message) => {
                 //
+                let content = match tool_message.output {
+                    ToolOutput::Ok(s) => s,
+                    ToolOutput::Err(s) => format!("Error: {s}"),
+                };
                 ChatCompletionRequestToolMessage {
                     tool_call_id: tool_message.id,
-                    content: ChatCompletionRequestToolMessageContent::Text(
-                        tool_message.result.to_string(),
-                    ),
+                    content: ChatCompletionRequestToolMessageContent::Text(content),
                 }
                 .into()
             }
