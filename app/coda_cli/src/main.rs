@@ -7,11 +7,13 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-use coda_agent::{Agent, AgentEvent, RunConfig};
-use coda_core::llm::{LLMProviderConfig, Message, StreamError, SystemMessage, UserMessage};
+use coda_agent::{Agent, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode};
+use coda_core::llm::{
+    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, UserMessage,
+};
 use coda_openai::OpenAI;
 use coda_skills::Skills;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -31,6 +33,59 @@ fn print_logo() {
     println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
     println!("\x1b[2;37m  An AI Agent\x1b[0m");
     println!();
+}
+
+fn prompt_approval(calls: &[ToolCall]) -> Result<ApprovalDecision, Box<dyn std::error::Error>> {
+    println!(
+        "\n[Approval Required] The agent wants to run {} tool call(s):",
+        calls.len()
+    );
+
+    let mut approved = vec![];
+    let mut rejected = vec![];
+
+    for (i, call) in calls.iter().enumerate() {
+        println!(
+            "\n  {}. {}: {}",
+            i + 1,
+            call.name,
+            call.arguments.as_deref().unwrap_or("{}")
+        );
+
+        loop {
+            print!("     Approve? [y/n]: ");
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            match input.trim().to_lowercase().as_str() {
+                "y" | "yes" => {
+                    approved.push(call.id.clone());
+                    break;
+                }
+                "n" | "no" => {
+                    print!("     Reason (optional, Enter to skip): ");
+                    io::stdout().flush()?;
+                    let mut reason = String::new();
+                    io::stdin().read_line(&mut reason)?;
+                    let reason = reason.trim().to_string();
+                    rejected.push(RejectedCall {
+                        id: call.id.clone(),
+                        reason: if reason.is_empty() {
+                            None
+                        } else {
+                            Some(reason)
+                        },
+                    });
+                    break;
+                }
+                _ => println!("     Please enter 'y' or 'n'."),
+            }
+        }
+    }
+
+    Ok(ApprovalDecision { approved, rejected })
 }
 
 #[tokio::main]
@@ -85,7 +140,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main conversation loop
     loop {
-        // Get user input
         print!("\nYou: ");
         io::stdout().flush()?;
 
@@ -93,7 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut user_input)?;
         let user_input = user_input.trim();
 
-        // Check for exit commands
         if user_input.is_empty() {
             continue;
         }
@@ -108,41 +161,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        let mut stream = std::pin::pin!(agent.run(
-            UserMessage(user_input.to_string()),
-            RunConfig {
-                model: model.clone(),
-                max_completion_tokens: Some(5000),
-                temperature: Some(0.5),
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        let make_config = |thread_id: String| RunConfig {
+            model: model.clone(),
+            max_completion_tokens: Some(5000),
+            temperature: Some(0.5),
+            thread_id,
+            tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+                call.name == "shell"
+            })),
+        };
+
+        // Explicit dyn Stream type so run() and resume() can be assigned to the same variable.
+        let mut stream: std::pin::Pin<
+            Box<dyn Stream<Item = Result<AgentEvent, StreamError>> + '_>,
+        > = Box::pin(agent.run(UserMessage(user_input.to_string()), make_config(thread_id)));
+
+        loop {
+            let mut suspended_checkpoint = None;
+
+            while let Some(event) = stream.next().await {
+                match event.map_err(|e: StreamError| Box::new(e) as Box<dyn std::error::Error>)? {
+                    AgentEvent::LLMContentChunk(s) => {
+                        print!("{s}");
+                        io::stdout().flush()?;
+                    }
+                    AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
+                        println!();
+                    }
+                    AgentEvent::ToolCallStart(c) => {
+                        debug!(
+                            "tool call: id={} name={} arguments={:?}",
+                            c.id, c.name, c.arguments
+                        );
+                        println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                    }
+                    AgentEvent::ToolCallEnd(m) => {
+                        debug!(
+                            "tool result: id={} name={} result={}",
+                            m.id, m.name, m.result
+                        );
+                    }
+                    AgentEvent::Suspended(checkpoint) => {
+                        suspended_checkpoint = Some(checkpoint);
+                        break;
+                    }
+                    _ => {}
+                }
             }
-        ));
-        while let Some(event) = stream.next().await {
-            match event.map_err(|e: StreamError| Box::new(e) as Box<dyn std::error::Error>)? {
-                AgentEvent::LLMContentChunk(s) => {
-                    print!("{s}");
-                    io::stdout().flush()?;
+
+            match suspended_checkpoint {
+                None => break, // stream completed normally
+                Some(checkpoint) => {
+                    let decision = prompt_approval(&checkpoint.pending_calls)?;
+                    let thread_id = checkpoint.thread_id.clone();
+                    stream = Box::pin(agent.resume(checkpoint, decision, make_config(thread_id)));
                 }
-                AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
-                    println!();
-                }
-                AgentEvent::ToolCallStart(c) => {
-                    debug!(
-                        "tool call: id={} name={} arguments={:?}",
-                        c.id, c.name, c.arguments
-                    );
-                    println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
-                }
-                AgentEvent::ToolCallEnd(m) => {
-                    debug!(
-                        "tool result: id={} name={} result={}",
-                        m.id, m.name, m.result
-                    );
-                }
-                _ => {}
             }
         }
-
-        debug!("messages: {:?}", agent.messages().await.last());
     }
 
     Ok(())
