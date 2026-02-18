@@ -120,6 +120,7 @@ pub struct ToolManager {
 }
 
 impl ToolManager {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         ToolManager {
             tools: BTreeMap::new(),

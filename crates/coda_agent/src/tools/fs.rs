@@ -23,6 +23,7 @@ pub struct ReadFileToolParams {
 }
 
 impl ReadFileTool {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let schema = schemars::schema_for!(ReadFileToolParams);
         debug!("ReadFileTool schema: {:?}", schema);
@@ -112,6 +113,7 @@ pub struct WriteFileToolParams {
 }
 
 impl WriteFileTool {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let schema = schemars::schema_for!(WriteFileToolParams);
         debug!("WriteFileTool schema: {:?}", schema);
@@ -180,6 +182,7 @@ pub struct ListDirectoryToolParams {
 }
 
 impl ListDirectoryTool {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let schema = schemars::schema_for!(ListDirectoryToolParams);
         debug!("ListDirectoryTool schema: {:?}", schema);

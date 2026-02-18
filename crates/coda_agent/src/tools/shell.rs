@@ -15,6 +15,7 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let description =
             "Execute shell commands and return stdout and stderr. Your are in a Unix environment."
