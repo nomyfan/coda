@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = { workspace = true }
 coda_core = { workspace = true }
 coda_openai = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 schemars = "1.2.1"
 serde = { workspace = true }

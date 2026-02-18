@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 async-openai = { version = "0.32.4", features = ["chat-completion"] }
+async-stream = { workspace = true }
 coda_core = { workspace = true }
 futures = { workspace = true }

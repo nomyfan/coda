@@ -1,8 +1,12 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use coda_core::llm::{LLMProvider, Message};
+use coda_core::llm::{
+    AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
+    ToolCall, ToolMessage, UserMessage,
+};
 use coda_core::tool::ToolManager;
+use futures::{Stream, StreamExt};
 
 use crate::tools::{
     GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
@@ -20,10 +24,25 @@ pub struct AgentState {
     pub todos: Vec<TodoItem>,
 }
 
+/// Events produced by `Agent::run`.
+pub enum AgentEvent {
+    LLMStart(ChatCompletionRequest),
+    LLMContentChunk(String),
+    LLMEnd(AssistantMessage),
+    ToolCallStart(ToolCall),
+    ToolCallEnd(ToolMessage),
+}
+
 pub struct Agent<P: LLMProvider> {
     pub provider: P,
     pub state: Arc<Mutex<AgentState>>,
     pub tools: ToolManager,
+}
+
+pub struct RunConfig {
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub max_completion_tokens: Option<u32>,
 }
 
 impl<P: LLMProvider> Agent<P> {
@@ -65,5 +84,87 @@ impl<P: LLMProvider> Agent<P> {
 
     pub async fn messages(&self) -> Vec<Message> {
         self.state.lock().await.messages.clone()
+    }
+
+    pub fn run(
+        &self,
+        user_message: UserMessage,
+        config: RunConfig,
+    ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + '_ {
+        async_stream::try_stream! {
+            self.add_message(Message::User(user_message)).await;
+            loop {
+                let request = ChatCompletionRequest {
+                    model: config.model.clone(),
+                    messages: self.messages().await,
+                    tools: self.tools.descriptors(),
+                    max_completion_tokens: config.max_completion_tokens,
+                    temperature: config.temperature,
+                };
+
+                yield AgentEvent::LLMStart(request.clone());
+
+                let mut llm_stream = std::pin::pin!(self.provider.stream(request));
+                let mut assistant_message = None;
+                while let Some(event) = llm_stream.next().await {
+                    match event? {
+                        LLMStreamEvent::ContentChunk(s) => {
+                            yield AgentEvent::LLMContentChunk(s);
+                        }
+                        LLMStreamEvent::Completed(msg) => {
+                            assistant_message = Some(msg);
+                        }
+                    }
+                }
+
+                let assistant_message = assistant_message.ok_or_else(|| {
+                    StreamError::InvalidResponse("LLM stream ended without Completed event".into())
+                })?;
+
+                yield AgentEvent::LLMEnd(assistant_message.clone());
+
+                let stop = assistant_message.tool_calls.is_empty();
+                self.add_message(Message::Assistant(assistant_message.clone())).await;
+
+                if !assistant_message.tool_calls.is_empty() {
+                    // Yield all ToolCallStart events first
+                    for call in &assistant_message.tool_calls {
+                        yield AgentEvent::ToolCallStart(call.clone());
+                    }
+
+                    // Execute all tools in parallel
+                    let futures: Vec<_> = assistant_message
+                        .tool_calls
+                        .into_iter()
+                        .map(|call| {
+                            let tool = self.tools.get(&call.name);
+                            async move {
+                                let result = match tool {
+                                    Some(t) => t
+                                        .execute(call.arguments.unwrap_or_default())
+                                        .await
+                                        .unwrap_or_else(|e| format!("Error: {e}")),
+                                    None => format!("Error: Tool '{}' not found", call.name),
+                                };
+                                ToolMessage {
+                                    id: call.id,
+                                    name: call.name,
+                                    result,
+                                }
+                            }
+                        })
+                        .collect();
+
+                    for tool_message in futures::future::join_all(futures).await {
+                        yield AgentEvent::ToolCallEnd(tool_message.clone());
+                        self.add_message(Message::Tool(tool_message)).await;
+                    }
+                }
+
+                if stop {
+                    break;
+                }
+            }
+        }
     }
 }

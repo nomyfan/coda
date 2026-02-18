@@ -1,3 +1,4 @@
+use futures::Stream;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -91,10 +92,15 @@ impl std::fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
+/// Events produced by `LLMProvider::stream`.
+pub enum LLMStreamEvent {
+    ContentChunk(String),
+    Completed(AssistantMessage),
+}
+
 pub trait LLMProvider: Send + Sync + 'static {
     fn stream(
         &self,
         request: ChatCompletionRequest,
-        on_content: impl AsyncFnMut(String),
-    ) -> impl std::future::Future<Output = Result<AssistantMessage, StreamError>>;
+    ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_;
 }

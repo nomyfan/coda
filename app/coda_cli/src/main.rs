@@ -3,15 +3,15 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::{debug, info, warn};
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
-use coda_agent::agent::Agent;
-use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
-    UserMessage,
-};
+use coda_agent::{Agent, AgentEvent, RunConfig};
+use coda_core::llm::{LLMProviderConfig, Message, StreamError, SystemMessage, UserMessage};
 use coda_openai::OpenAI;
 use coda_skills::Skills;
+use futures::StreamExt;
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -105,77 +105,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Add user message
-        agent
-            .add_message(Message::User(UserMessage(user_input.to_string())))
-            .await;
-        debug!("messages: {:?}", agent.messages().await);
-
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        // AI processing loop
-        loop {
-            let request = ChatCompletionRequest {
+        let mut stream = std::pin::pin!(agent.run(
+            UserMessage(user_input.to_string()),
+            RunConfig {
                 model: model.clone(),
-                messages: agent.messages().await,
-                tools: agent.tools.descriptors(),
-                max_completion_tokens: Some(8000),
-                temperature: Some(0.7),
-            };
-            let on_content = |content: String| async move {
-                print!("{}", content);
-            };
-            let assistant_message = agent.provider.stream(request, on_content).await?;
-            if !assistant_message.content.is_empty() {
-                println!();
+                max_completion_tokens: Some(5000),
+                temperature: Some(0.5),
             }
-            let stop = assistant_message.tool_calls.is_empty();
-            agent
-                .add_message(Message::Assistant(assistant_message.clone()))
-                .await;
-            debug!("messages: {:?}", agent.messages().await);
-
-            if !assistant_message.tool_calls.is_empty() {
-                let futures: Vec<_> = assistant_message
-                    .tool_calls
-                    .into_iter()
-                    .map(|call| {
-                        let tool = agent.tools.get(&call.name);
-                        async move {
-                            match tool {
-                                Some(tool) => {
-                                    let result =
-                                        tool.execute(call.arguments.unwrap_or_default()).await;
-                                    ToolMessage {
-                                        id: call.id,
-                                        name: call.name,
-                                        result: match result {
-                                            Ok(output) => output,
-                                            Err(err) => format!("Error: {}", err),
-                                        },
-                                    }
-                                }
-                                None => ToolMessage {
-                                    id: call.id,
-                                    result: format!("Error: Tool '{}' not found", call.name),
-                                    name: call.name,
-                                },
-                            }
-                        }
-                    })
-                    .collect();
-
-                let results = futures::future::join_all(futures).await;
-                for tool_message in results {
-                    agent.add_message(Message::Tool(tool_message)).await;
+        ));
+        while let Some(event) = stream.next().await {
+            match event.map_err(|e: StreamError| Box::new(e) as Box<dyn std::error::Error>)? {
+                AgentEvent::LLMContentChunk(s) => {
+                    print!("{s}");
+                    io::stdout().flush()?;
                 }
-            }
-            debug!("messages: {:?}", agent.messages().await);
-            if stop {
-                break;
+                AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
+                    println!();
+                }
+                AgentEvent::ToolCallStart(c) => {
+                    debug!(
+                        "tool call: id={} name={} arguments={:?}",
+                        c.id, c.name, c.arguments
+                    );
+                    println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                }
+                AgentEvent::ToolCallEnd(m) => {
+                    debug!(
+                        "tool result: id={} name={} result={}",
+                        m.id, m.name, m.result
+                    );
+                }
+                _ => {}
             }
         }
+
+        debug!("messages: {:?}", agent.messages().await.last());
     }
 
     Ok(())

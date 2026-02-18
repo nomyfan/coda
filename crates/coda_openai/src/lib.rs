@@ -13,9 +13,9 @@ use async_openai::types::chat::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMProviderConfig,
-    Message, StreamError, ToolCall, ToolDefinition,
+    LLMStreamEvent, Message, StreamError, ToolCall, ToolDefinition,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 trait IntoOpenAIType<T> {
     fn into_openai_type(self) -> T;
@@ -105,66 +105,70 @@ pub struct OpenAI {
 }
 
 impl LLMProvider for OpenAI {
-    async fn stream(
+    fn stream(
         &self,
         request: ChatCompletionRequest,
-        mut on_content: impl AsyncFnMut(String),
-    ) -> Result<AssistantMessage, StreamError> {
-        let messages: Vec<ChatCompletionRequestMessage> = request
-            .messages
-            .into_iter()
-            .map(|x| x.into_openai_type())
-            .collect();
-        let tools: Vec<ChatCompletionTools> = request
-            .tools
-            .into_iter()
-            .map(|x| x.into_openai_type())
-            .collect();
-        let mut req = CreateChatCompletionRequestArgs::default();
-        req.model(request.model).messages(messages).tools(tools);
-        if let Some(temperature) = request.temperature {
-            req.temperature(temperature);
-        }
-        if let Some(max_completion_tokens) = request.max_completion_tokens {
-            req.max_completion_tokens(max_completion_tokens);
-        }
-        let req = req.build().unwrap();
-        let mut chat = self.client.chat();
-        if self.stream {
-            chat = chat
-                .header("stream_options", r#"{"include_usage": true}"#)
-                .unwrap();
-        }
-        let mut stream = chat.create_stream(req).await.unwrap();
-        let mut chat_completion = ReducedChatCompletion::new();
-        while let Some(response) = stream.next().await {
-            match response {
-                Ok(mut stream_response) => {
-                    if let Some(usage) = stream_response.usage {
-                        chat_completion.usage = Some(CompletionUsage {
-                            prompt_tokens: usage.prompt_tokens,
-                            completion_tokens: usage.completion_tokens,
-                        });
-                    }
-                    if let Some(choice) = stream_response.choices.pop() {
-                        if let Some(content) = &choice.delta.content {
-                            chat_completion.reduce_content(content);
-                            on_content(content.clone()).await;
+    ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
+        async_stream::stream! {
+            let messages: Vec<ChatCompletionRequestMessage> = request
+                .messages
+                .into_iter()
+                .map(|x| x.into_openai_type())
+                .collect();
+            let tools: Vec<ChatCompletionTools> = request
+                .tools
+                .into_iter()
+                .map(|x| x.into_openai_type())
+                .collect();
+            let mut req = CreateChatCompletionRequestArgs::default();
+            req.model(request.model).messages(messages).tools(tools);
+            if let Some(temperature) = request.temperature {
+                req.temperature(temperature);
+            }
+            if let Some(max_completion_tokens) = request.max_completion_tokens {
+                req.max_completion_tokens(max_completion_tokens);
+            }
+            let req = req.build().unwrap();
+            let mut chat = self.client.chat();
+            if self.stream {
+                chat = chat
+                    .header("stream_options", r#"{"include_usage": true}"#)
+                    .unwrap();
+            }
+            let mut stream = chat.create_stream(req).await.unwrap();
+            let mut chat_completion = ReducedChatCompletion::new();
+            while let Some(response) = stream.next().await {
+                match response {
+                    Ok(mut stream_response) => {
+                        if let Some(usage) = stream_response.usage {
+                            chat_completion.usage = Some(CompletionUsage {
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                            });
                         }
-                        if let Some(calls) = choice.delta.tool_calls {
-                            for chunk in calls {
-                                chat_completion.reduce_chunk(chunk);
+                        if let Some(choice) = stream_response.choices.pop() {
+                            if let Some(content) = &choice.delta.content {
+                                chat_completion.reduce_content(content);
+                                yield Ok(LLMStreamEvent::ContentChunk(content.clone()));
+                            }
+                            if let Some(calls) = choice.delta.tool_calls {
+                                for chunk in calls {
+                                    chat_completion.reduce_chunk(chunk);
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        yield Err(StreamError::StreamingError(format!("{}", e)));
+                        return;
+                    }
                 }
-                Err(e) => return Err(StreamError::StreamingError(format!("{}", e))),
+            }
+            match chat_completion.try_into() {
+                Ok(msg) => yield Ok(LLMStreamEvent::Completed(msg)),
+                Err(e) => yield Err(StreamError::InvalidResponse(e)),
             }
         }
-
-        chat_completion
-            .try_into()
-            .map_err(StreamError::InvalidResponse)
     }
 }
 
