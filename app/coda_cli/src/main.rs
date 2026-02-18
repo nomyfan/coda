@@ -1,3 +1,4 @@
+mod ask_user;
 mod session;
 
 use dotenvy::dotenv;
@@ -9,10 +10,11 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use ask_user::{AskUserParams, AskUserTool};
 use coda_agent::{Agent, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode};
 use coda_core::llm::{
-    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolOutput,
-    UserMessage,
+    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
+    ToolOutput, UserMessage,
 };
 use coda_openai::OpenAI;
 use coda_skills::Skills;
@@ -36,6 +38,43 @@ fn print_logo() {
     println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
     println!("\x1b[2;37m  An AI Agent\x1b[0m");
     println!();
+}
+
+enum AskUserResult {
+    Selected(String),
+    Other,
+}
+
+fn prompt_ask_user(
+    question: &str,
+    options: &[String],
+) -> Result<AskUserResult, Box<dyn std::error::Error>> {
+    println!("\n[User Input Required]\n");
+    println!("{}\n", question);
+    for (i, opt) in options.iter().enumerate() {
+        println!("  {}. {}", i + 1, opt);
+    }
+    println!("  0. Other (type your own response)\n");
+
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input == "0" {
+            return Ok(AskUserResult::Other);
+        }
+        if let Ok(idx) = input.parse::<usize>()
+            && idx >= 1
+            && idx <= options.len()
+        {
+            return Ok(AskUserResult::Selected(options[idx - 1].clone()));
+        }
+        println!("  Please enter a number between 0 and {}.", options.len());
+    }
 }
 
 fn prompt_approval(calls: &[ToolCall]) -> Result<ApprovalDecision, Box<dyn std::error::Error>> {
@@ -217,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let agent = Agent::new_with_default_tools(
+    let mut agent = Agent::new_with_default_tools(
         OpenAI::new(LLMProviderConfig {
             api_key,
             base_url,
@@ -225,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         workspace_str.clone(),
     );
+    agent.tools.register(AskUserTool::new());
 
     agent
         .add_message(Message::System(SystemMessage(system_prompt)))
@@ -290,7 +330,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             temperature: Some(0.5),
             thread_id,
             tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-                call.name == "shell"
+                info!(
+                    "deciding whether to require approval for tool call: {}",
+                    call.name
+                );
+                call.name == "shell" || call.name == "ask_user"
             })),
         };
 
@@ -335,9 +379,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match suspended_checkpoint {
                 None => break, // stream completed normally
                 Some(checkpoint) => {
-                    let decision = prompt_approval(&checkpoint.pending_calls)?;
-                    let thread_id = checkpoint.thread_id.clone();
-                    stream = Box::pin(agent.resume(checkpoint, decision, make_config(thread_id)));
+                    // TODO: LLM might not follow the instruction and dispatch multiple tool calls in one turn.
+                    // Solo ask_user call: handle interactively without resume().
+                    if checkpoint.pending_calls.len() == 1
+                        && checkpoint.pending_calls[0].name == "ask_user"
+                    {
+                        let call = &checkpoint.pending_calls[0];
+                        let mut return_control_to_user = false;
+                        let output = match serde_json::from_str::<AskUserParams>(
+                            call.arguments.as_deref().unwrap_or("{}"),
+                        ) {
+                            Ok(params) => match prompt_ask_user(&params.question, &params.options)? {
+                                AskUserResult::Selected(value) => ToolOutput::Ok(value),
+                                AskUserResult::Other => {
+                                    return_control_to_user = true;
+                                    ToolOutput::Err("User wants to provide custom input".to_string())
+                                }
+                            },
+                            Err(err) => {
+                                ToolOutput::Err(format!("Invalid ask_user arguments: {err}"))
+                            }
+                        };
+                        agent
+                            .add_message(Message::Tool(ToolMessage {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                output,
+                                outcome: ToolCallOutcome::Auto,
+                            }))
+                            .await;
+                        if return_control_to_user {
+                            break; // return control to user input
+                        }
+                        let thread_id = checkpoint.thread_id.clone();
+                        stream = Box::pin(agent.continue_run(make_config(thread_id)));
+                    } else {
+                        let decision = prompt_approval(&checkpoint.pending_calls)?;
+                        let thread_id = checkpoint.thread_id.clone();
+                        stream =
+                            Box::pin(agent.resume(checkpoint, decision, make_config(thread_id)));
+                    }
                 }
             }
         }

@@ -9,7 +9,7 @@ coda_core = { workspace = true }
 coda_openai = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
-schemars = "1.2.1"
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
