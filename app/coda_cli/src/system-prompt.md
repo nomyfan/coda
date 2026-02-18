@@ -3,7 +3,7 @@ You are a AI agent to help get things done.
 # System Information
 
 OS: {{OS}}
-CWD: {{CWD}}
+Workspace directory: {{WORKSPACE_DIR}}
 
 # Tool Usage Policy
 

@@ -6,10 +6,6 @@ use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use coda_agent::agent::Agent;
-use coda_agent::tools::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
-    WriteTodosTool,
-};
 use coda_core::llm::{
     ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
     UserMessage,
@@ -53,13 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-    let mut system_prompt = format!(
-        "{}",
-        SYSTEM_PROMPT
-            .replace("{{OS}}", &format!("{}({})", os, arch))
-            .replace("{{CWD}}", &cwd),
-    );
+    let workspace_dir = std::env::current_dir()?.to_string_lossy().into_owned();
+    let mut system_prompt = SYSTEM_PROMPT
+        .replace("{{OS}}", &format!("{}({})", os, arch))
+        .replace("{{WORKSPACE_DIR}}", &workspace_dir);
 
     match Skills::from_dir(&PathBuf::from_str("./skills").unwrap()) {
         Ok(skills) => {
@@ -74,25 +67,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut agent = Agent::new(OpenAI::new(LLMProviderConfig {
-        api_key,
-        base_url,
-        stream: true,
-    }));
+    let agent = Agent::new_with_default_tools(
+        OpenAI::new(LLMProviderConfig {
+            api_key,
+            base_url,
+            stream: true,
+        }),
+        workspace_dir,
+    );
 
     agent
         .add_message(Message::System(SystemMessage(system_prompt)))
         .await;
-
-    let state = agent.state();
-    agent.tools.register(ShellTool::new());
-    agent.tools.register(ReadFileTool::new());
-    agent.tools.register(WriteFileTool::new());
-    agent.tools.register(ListDirectoryTool::new());
-    agent.tools.register(GrepTool::new(cwd.clone()));
-    agent.tools.register(GlobTool::new(cwd));
-    agent.tools.register(ReadTodosTool::new(state.clone()));
-    agent.tools.register(WriteTodosTool::new(state));
 
     print_logo();
     println!("Type 'quit', 'exit', or 'q' to stop");
