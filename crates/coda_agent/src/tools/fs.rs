@@ -154,7 +154,7 @@ impl Tool for WriteFileTool {
                 })?;
             }
 
-            let bytes = params.content.as_bytes().len();
+            let bytes = params.content.len();
             tokio::fs::write(path, &params.content)
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;

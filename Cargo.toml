@@ -3,6 +3,7 @@ members = [
   "crates/coda_core",
   "crates/coda_openai",
   "crates/coda_agent",
+  "crates/coda_skills",
   "app/coda_cli",
 ]
 resolver = "3"
@@ -11,6 +12,7 @@ resolver = "3"
 coda_agent = { path = "crates/coda_agent" }
 coda_core = { path = "crates/coda_core" }
 coda_openai = { path = "crates/coda_openai" }
+coda_skills = { path = "crates/coda_skills" }
 futures = "0.3.31"
 serde = "1.0.228"
 serde_json = { version = "1.0.149", features = ["preserve_order"] }

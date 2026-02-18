@@ -1,7 +1,9 @@
 use dotenvy::dotenv;
 use std::env;
 use std::io::{self, Write};
-use tracing::debug;
+use std::path::PathBuf;
+use std::str::FromStr;
+use tracing::{debug, info, warn};
 
 use coda_agent::agent::Agent;
 use coda_agent::tools::{
@@ -13,8 +15,10 @@ use coda_core::llm::{
     UserMessage,
 };
 use coda_openai::OpenAI;
+use coda_skills::Skills;
 
-static SYSTEM_PROMPT: &str = include_str!("./system-prompt.md");
+static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
+static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
 
 const LOGO: &str = r#"
   ██████╗ ██████╗ ██████╗  █████╗
@@ -47,21 +51,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let mut system_prompt = format!(
+        "{}",
+        SYSTEM_PROMPT
+            .replace("{{OS}}", &format!("{}({})", os, arch))
+            .replace("{{CWD}}", &cwd),
+    );
+
+    match Skills::from_dir(&PathBuf::from_str("./skills").unwrap()) {
+        Ok(skills) => {
+            info!("Loaded skills {:?}", skills.0);
+            system_prompt.push_str("\n---\n");
+            system_prompt.push_str(AGENT_SKILLS_PROMPT);
+            system_prompt.push('\n');
+            system_prompt.push_str(&skills.to_xml());
+        }
+        Err(err) => {
+            warn!("Failed to load skills, proceeding without them: {}", err);
+        }
+    }
+
     let mut agent = Agent::new(OpenAI::new(LLMProviderConfig {
         api_key,
         base_url,
         stream: true,
     }));
 
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
     agent
-        .add_message(Message::System(SystemMessage(
-            SYSTEM_PROMPT
-                .replace("{{OS}}", &format!("{}({})", os, arch))
-                .replace("{{CWD}}", &cwd),
-        )))
+        .add_message(Message::System(SystemMessage(system_prompt)))
         .await;
 
     let state = agent.state();
