@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -8,12 +8,12 @@ use tracing::debug;
 
 // ---- ReadFile ----
 
-pub(crate) struct ReadFileTool {
+pub struct ReadFileTool {
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct ReadFileToolParams {
+pub struct ReadFileToolParams {
     /// The absolute path to the file to read.
     file_path: String,
     /// The line number to start reading from (1-based). If not specified, reads from the beginning.
@@ -23,7 +23,7 @@ pub(crate) struct ReadFileToolParams {
 }
 
 impl ReadFileTool {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let schema = schemars::schema_for!(ReadFileToolParams);
         debug!("ReadFileTool schema: {:?}", schema);
         ReadFileTool { schema }
@@ -99,12 +99,12 @@ impl Tool for ReadFileTool {
 
 // ---- WriteFile ----
 
-pub(crate) struct WriteFileTool {
+pub struct WriteFileTool {
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct WriteFileToolParams {
+pub struct WriteFileToolParams {
     /// The absolute path to the file to write.
     file_path: String,
     /// The content to write to the file. This will overwrite the existing file content.
@@ -112,7 +112,7 @@ pub(crate) struct WriteFileToolParams {
 }
 
 impl WriteFileTool {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let schema = schemars::schema_for!(WriteFileToolParams);
         debug!("WriteFileTool schema: {:?}", schema);
         WriteFileTool { schema }
@@ -169,18 +169,18 @@ impl Tool for WriteFileTool {
 
 // ---- ListDirectory ----
 
-pub(crate) struct ListDirectoryTool {
+pub struct ListDirectoryTool {
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct ListDirectoryToolParams {
+pub struct ListDirectoryToolParams {
     /// The absolute path to the directory to list.
     path: String,
 }
 
 impl ListDirectoryTool {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let schema = schemars::schema_for!(ListDirectoryToolParams);
         debug!("ListDirectoryTool schema: {:?}", schema);
         ListDirectoryTool { schema }

@@ -1,50 +1,50 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolDefinition {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) parameter_schema: Value,
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameter_schema: Value,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SystemMessage(pub(crate) String);
+pub struct SystemMessage(pub String);
 
 #[derive(Debug, Clone)]
-pub(crate) struct UserMessage(pub(crate) String);
+pub struct UserMessage(pub String);
 
 /// A message representing a response from the AI, which may include tool calls.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct AssistantMessage {
-    pub(crate) content: String,
-    pub(crate) tool_calls: Vec<ToolCall>,
-    pub(crate) usage: Option<CompletionUsage>,
+pub struct AssistantMessage {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<CompletionUsage>,
 }
 
 /// A message representing a tool call from the AI.
 #[derive(Debug, Clone)]
-pub(crate) struct ToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) arguments: Option<String>,
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CompletionUsage {
-    pub(crate) prompt_tokens: u32,
-    pub(crate) completion_tokens: u32,
+pub struct CompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// A message representing the result of a tool execution.
 #[derive(Debug, Clone)]
-pub(crate) struct ToolMessage {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) result: String,
+pub struct ToolMessage {
+    pub id: String,
+    pub name: String,
+    pub result: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Message {
+pub enum Message {
     /// System message.
     System(SystemMessage),
     /// User message.
@@ -57,23 +57,23 @@ pub(crate) enum Message {
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone)]
-pub(crate) struct LLMProviderConfig {
-    pub(crate) api_key: String,
-    pub(crate) base_url: String,
-    pub(crate) stream: bool,
+pub struct LLMProviderConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ChatCompletionRequest {
-    pub(crate) model: String,
-    pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<ToolDefinition>,
-    pub(crate) max_completion_tokens: Option<u32>,
-    pub(crate) temperature: Option<f32>,
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDefinition>,
+    pub max_completion_tokens: Option<u32>,
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum StreamError {
+pub enum StreamError {
     /// Error occurred during streaming the response from the LLM.
     StreamingError(String),
     /// Error occurred while parsing the LLM's response.
@@ -91,10 +91,10 @@ impl std::fmt::Display for StreamError {
 
 impl std::error::Error for StreamError {}
 
-pub(crate) trait LLMProvider: Send + Sync + 'static {
-    async fn stream(
+pub trait LLMProvider: Send + Sync + 'static {
+    fn stream(
         &self,
         request: ChatCompletionRequest,
         on_content: impl AsyncFnMut(String),
-    ) -> Result<AssistantMessage, StreamError>;
+    ) -> impl std::future::Future<Output = Result<AssistantMessage, StreamError>>;
 }

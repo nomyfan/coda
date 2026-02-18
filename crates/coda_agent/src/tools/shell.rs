@@ -1,21 +1,21 @@
-use crate::core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::debug;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct ShellToolParams {
+pub struct ShellToolParams {
     command: String,
 }
 
-pub(crate) struct ShellTool {
+pub struct ShellTool {
     schema: Schema,
     description: String,
 }
 
 impl ShellTool {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let description =
             "Execute shell commands and return stdout and stderr. Your are in a Unix environment."
                 .to_string();

@@ -1,7 +1,3 @@
-use crate::core::llm::{
-    AssistantMessage, CompletionUsage, LLMProvider, Message, StreamError, ToolCall, ToolDefinition,
-};
-use crate::core::llm::{ChatCompletionRequest, LLMProviderConfig};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::traits::RequestOptionsBuilder;
@@ -15,11 +11,19 @@ use async_openai::types::chat::{
     ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionCall, FunctionCallStream,
     FunctionObject,
 };
+use coda_core::llm::{
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMProviderConfig,
+    Message, StreamError, ToolCall, ToolDefinition,
+};
 use futures::StreamExt;
 
-impl From<Message> for ChatCompletionRequestMessage {
-    fn from(value: Message) -> Self {
-        match value {
+trait IntoOpenAIType<T> {
+    fn into_openai_type(self) -> T;
+}
+
+impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
+    fn into_openai_type(self) -> ChatCompletionRequestMessage {
+        match self {
             Message::System(system_message) => {
                 //
                 ChatCompletionRequestSystemMessage {
@@ -81,20 +85,20 @@ impl From<Message> for ChatCompletionRequestMessage {
     }
 }
 
-impl From<ToolDefinition> for ChatCompletionTools {
-    fn from(value: ToolDefinition) -> Self {
+impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
+    fn into_openai_type(self) -> ChatCompletionTools {
         ChatCompletionTools::Function(ChatCompletionTool {
             function: FunctionObject {
-                name: value.name,
-                description: Some(value.description),
-                parameters: Some(value.parameter_schema),
+                name: self.name,
+                description: Some(self.description),
+                parameters: Some(self.parameter_schema),
                 strict: Some(true),
             },
         })
     }
 }
 
-pub(crate) struct OpenAI {
+pub struct OpenAI {
     client: Client<OpenAIConfig>,
     /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
     stream: bool,
@@ -106,9 +110,16 @@ impl LLMProvider for OpenAI {
         request: ChatCompletionRequest,
         mut on_content: impl AsyncFnMut(String),
     ) -> Result<AssistantMessage, StreamError> {
-        let messages: Vec<ChatCompletionRequestMessage> =
-            request.messages.into_iter().map(|x| x.into()).collect();
-        let tools: Vec<ChatCompletionTools> = request.tools.into_iter().map(|x| x.into()).collect();
+        let messages: Vec<ChatCompletionRequestMessage> = request
+            .messages
+            .into_iter()
+            .map(|x| x.into_openai_type())
+            .collect();
+        let tools: Vec<ChatCompletionTools> = request
+            .tools
+            .into_iter()
+            .map(|x| x.into_openai_type())
+            .collect();
         let mut req = CreateChatCompletionRequestArgs::default();
         req.model(request.model).messages(messages).tools(tools);
         if let Some(temperature) = request.temperature {
@@ -158,7 +169,7 @@ impl LLMProvider for OpenAI {
 }
 
 impl OpenAI {
-    pub(crate) fn new(config: LLMProviderConfig) -> Self {
+    pub fn new(config: LLMProviderConfig) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_base(config.base_url)
             .with_api_key(config.api_key);

@@ -10,7 +10,7 @@ use tracing::{Instrument, Span, info, info_span};
 use super::llm::ToolDefinition;
 
 #[derive(Debug)]
-pub(crate) enum ToolError {
+pub enum ToolError {
     InvalidParameters(String),
     ExecutionError(String),
 }
@@ -24,7 +24,7 @@ impl Display for ToolError {
     }
 }
 
-pub(crate) type ToolResult<T> = Result<T, ToolError>;
+pub type ToolResult<T> = Result<T, ToolError>;
 
 impl<T> From<ToolError> for ToolResult<T> {
     fn from(value: ToolError) -> Self {
@@ -32,7 +32,7 @@ impl<T> From<ToolError> for ToolResult<T> {
     }
 }
 
-pub(crate) trait Tool: Send + Sync + 'static {
+pub trait Tool: Send + Sync + 'static {
     type Parameters: DeserializeOwned + Send;
     type Output: Display + Send;
 
@@ -45,7 +45,7 @@ pub(crate) trait Tool: Send + Sync + 'static {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static;
 }
 
-pub(crate) trait ToolObject {
+pub trait ToolObject {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameter_schema(&self) -> &serde_json::Value;
@@ -115,27 +115,27 @@ impl<T: Tool> From<T> for ToolWrapper<T> {
     }
 }
 
-pub(crate) struct ToolManager {
+pub struct ToolManager {
     tools: BTreeMap<String, Arc<dyn ToolObject>>,
 }
 
 impl ToolManager {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         ToolManager {
             tools: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn register<T: Tool>(&mut self, tool: T) {
+    pub fn register<T: Tool>(&mut self, tool: T) {
         self.tools
             .insert(tool.name().to_string(), Arc::new(ToolWrapper::from(tool)));
     }
 
-    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn ToolObject>> {
+    pub fn get(&self, name: &str) -> Option<Arc<dyn ToolObject>> {
         self.tools.get(name).cloned()
     }
 
-    pub(crate) fn descriptors(&self) -> Vec<ToolDefinition> {
+    pub fn descriptors(&self) -> Vec<ToolDefinition> {
         self.tools
             .values()
             .map(|tool| ToolDefinition {

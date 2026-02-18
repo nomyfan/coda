@@ -6,19 +6,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::agent::{AgentState, TodoItem};
-use crate::core::tool::{Tool, ToolResult};
+use coda_core::tool::{Tool, ToolResult};
 
 // --- ReadTodosTool ---
 
-pub(crate) struct ReadTodosTool {
+pub struct ReadTodosTool {
     state: Arc<Mutex<AgentState>>,
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct ReadTodosParams {}
+pub struct ReadTodosParams {}
 
-pub(crate) struct ReadTodosOutput(Vec<TodoItem>);
+pub struct ReadTodosOutput(Vec<TodoItem>);
 
 impl Display for ReadTodosOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,7 +34,7 @@ impl Display for ReadTodosOutput {
 }
 
 impl ReadTodosTool {
-    pub(crate) fn new(state: Arc<Mutex<AgentState>>) -> Self {
+    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
         let schema = schemars::schema_for!(ReadTodosParams);
         ReadTodosTool { state, schema }
     }
@@ -72,13 +72,13 @@ impl Tool for ReadTodosTool {
 
 // --- WriteTodosTool ---
 
-pub(crate) struct WriteTodosTool {
+pub struct WriteTodosTool {
     state: Arc<Mutex<AgentState>>,
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct WriteTodosItem {
+pub struct WriteTodosItem {
     /// The title of the todo item.
     title: String,
     /// Whether the todo item is done.
@@ -86,13 +86,13 @@ pub(crate) struct WriteTodosItem {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct WriteTodosParams {
+pub struct WriteTodosParams {
     /// The complete list of todo items to replace the current list.
     todos: Vec<WriteTodosItem>,
 }
 
 impl WriteTodosTool {
-    pub(crate) fn new(state: Arc<Mutex<AgentState>>) -> Self {
+    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
         let schema = schemars::schema_for!(WriteTodosParams);
         WriteTodosTool { state, schema }
     }

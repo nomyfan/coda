@@ -1,22 +1,18 @@
-mod agent;
-mod core;
-mod provider;
-
 use dotenvy::dotenv;
 use std::env;
 use std::io::{self, Write};
 use tracing::debug;
 
-use crate::agent::Agent;
-use crate::agent::tools::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteTodosTool,
-    WriteFileTool,
+use coda_agent::agent::Agent;
+use coda_agent::tools::{
+    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
+    WriteTodosTool,
 };
-use crate::core::llm::{
+use coda_core::llm::{
     ChatCompletionRequest, LLMProvider, LLMProviderConfig, Message, SystemMessage, ToolMessage,
     UserMessage,
 };
-use crate::provider::openai::OpenAI;
+use coda_openai::OpenAI;
 
 static SYSTEM_PROMPT: &str = include_str!("./system-prompt.md");
 

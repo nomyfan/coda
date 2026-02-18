@@ -1,16 +1,16 @@
-use crate::core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
 
-pub(crate) struct GlobTool {
+pub struct GlobTool {
     cwd: String,
     schema: Schema,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct GlobToolParams {
+pub struct GlobToolParams {
     /// The glob pattern to match files against, e.g. "**/*.rs", "src/**/*.ts".
     pattern: String,
     /// The directory to search in. Defaults to the current working directory if not specified.
@@ -18,7 +18,7 @@ pub(crate) struct GlobToolParams {
 }
 
 impl GlobTool {
-    pub(crate) fn new(cwd: String) -> Self {
+    pub fn new(cwd: String) -> Self {
         let schema = schemars::schema_for!(GlobToolParams);
         debug!("GlobTool schema: {:?}", schema);
         GlobTool { cwd, schema }
@@ -50,9 +50,7 @@ impl Tool for GlobTool {
 
         async move {
             let mut cmd = Command::new("fd");
-            cmd.arg("--color=never")
-                .arg("--glob")
-                .arg(&params.pattern);
+            cmd.arg("--color=never").arg("--glob").arg(&params.pattern);
 
             if let Some(ref path) = params.path {
                 cmd.arg(path);

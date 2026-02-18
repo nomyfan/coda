@@ -1,0 +1,14 @@
+[package]
+name = "coda_cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coda_core = { workspace = true }
+coda_openai = { workspace = true }
+coda_agent = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+dotenvy = "0.15.7"

@@ -1,10 +1,10 @@
-use crate::core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
 
-pub(crate) struct GrepTool {
+pub struct GrepTool {
     /// Absolute path to the directory where the grep command should be executed.
     cwd: String,
     /// JSON schema for the parameters of the grep tool.
@@ -12,7 +12,7 @@ pub(crate) struct GrepTool {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct GrepToolParams {
+pub struct GrepToolParams {
     /// The regex pattern to search for.
     pattern: String,
     /// The directory or file path to search in. Defaults to the current working directory if not specified.
@@ -22,7 +22,7 @@ pub(crate) struct GrepToolParams {
 }
 
 impl GrepTool {
-    pub(crate) fn new(cwd: String) -> Self {
+    pub fn new(cwd: String) -> Self {
         let schema = schemars::schema_for!(GrepToolParams);
         debug!("GrepTool schema: {:?}", schema);
         GrepTool { cwd, schema }

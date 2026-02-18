@@ -1,0 +1,13 @@
+[package]
+name = "coda_agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coda_core = { workspace = true }
+coda_openai = { workspace = true }
+tokio = { workspace = true }
+schemars = "1.2.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
