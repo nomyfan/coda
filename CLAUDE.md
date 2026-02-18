@@ -40,5 +40,5 @@ coda_cli (app binary)
 - **`coda_core`** — shared protocol and abstractions for model interaction and tools.
 - **`coda_openai`** — OpenAI-compatible model provider implementation.
 - **`coda_agent`** — agent runtime: conversation state, tool orchestration, and approval-aware execution flow.
-- **`coda_skills`** — discovers local skills from `./skills/` and injects them into prompts.
-- **`coda_cli`** — interactive terminal app that wires provider + agent + skills, streams responses, and handles user approval for sensitive tool calls.
+- **`coda_skills`** — loads and parses skills.
+- **`coda_cli`** — interactive terminal app that wires provider + agent + skills, currently loads skills from `./.coda/skills/`, streams responses, and handles user approval for sensitive tool calls.

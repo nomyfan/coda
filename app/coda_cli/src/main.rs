@@ -1,7 +1,9 @@
+mod session;
+
 use dotenvy::dotenv;
 use std::env;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::debug;
 use tracing::info;
@@ -88,6 +90,97 @@ fn prompt_approval(calls: &[ToolCall]) -> Result<ApprovalDecision, Box<dyn std::
     Ok(ApprovalDecision { approved, rejected })
 }
 
+/// Show the session picker. Returns the session id to resume, or None for a new session.
+/// Returns Err if the user chose to quit.
+fn prompt_session_choice(
+    workspace_dir: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let sessions = session::list_sessions(workspace_dir);
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+
+    println!("Available sessions (most recent first):\n");
+    for (i, s) in sessions.iter().enumerate() {
+        let datetime = format_timestamp(s.updated_at);
+        // message_count counts User+Assistant+Tool messages; approximate "turns" as User msgs.
+        println!(
+            "  {}. [{}] {}  ({} messages)",
+            i + 1,
+            datetime,
+            s.title,
+            s.message_count,
+        );
+    }
+    println!("\n  n. New session");
+    println!("  q. Quit");
+
+    loop {
+        print!("\n> ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        let n = io::stdin().read_line(&mut input)?;
+        if n == 0 {
+            // EOF
+            std::process::exit(0);
+        }
+        let input = input.trim().to_lowercase();
+
+        if input == "q" {
+            std::process::exit(0);
+        }
+        if input == "n" {
+            return Ok(None);
+        }
+        if let Ok(idx) = input.parse::<usize>()
+            && idx >= 1
+            && idx <= sessions.len()
+        {
+            return Ok(Some(sessions[idx - 1].id.clone()));
+        }
+        println!(
+            "  Please enter a number between 1 and {}, 'n', or 'q'.",
+            sessions.len()
+        );
+    }
+}
+
+fn format_timestamp(secs: u64) -> String {
+    // Simple UTC formatting without external deps.
+    // secs since Unix epoch → YYYY-MM-DD HH:MM
+    let s = secs;
+    let mins = s / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+
+    let minute = (mins % 60) as u32;
+    let hour = (hours % 24) as u32;
+
+    // Days since epoch → Gregorian date (Zeller-like)
+    let (year, month, day) = days_to_ymd(days);
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        year, month, day, hour, minute
+    )
+}
+
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv()?;
@@ -104,12 +197,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let workspace_dir = std::env::current_dir()?.to_string_lossy().into_owned();
+    let workspace_dir = std::env::current_dir()?;
+    let workspace_str = workspace_dir.to_string_lossy().into_owned();
     let mut system_prompt = SYSTEM_PROMPT
         .replace("{{OS}}", &format!("{}({})", os, arch))
-        .replace("{{WORKSPACE_DIR}}", &workspace_dir);
+        .replace("{{WORKSPACE_DIR}}", &workspace_str);
 
-    match Skills::from_dir(&PathBuf::from_str("./skills").unwrap()) {
+    match Skills::from_dir(&PathBuf::from_str(".coda/skills").unwrap()) {
         Ok(skills) => {
             info!("Loaded skills {:?}", skills.0);
             system_prompt.push_str("\n---\n");
@@ -128,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url,
             stream: true,
         }),
-        workspace_dir,
+        workspace_str.clone(),
     );
 
     agent
@@ -136,6 +230,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     print_logo();
+
+    // Session picker: let the user choose an existing session or start new.
+    let session_id: Option<String> = match prompt_session_choice(&workspace_dir)? {
+        Some(id) => match session::load_session(&workspace_dir, &id) {
+            Ok(data) => {
+                println!("Resuming: {}\n", data.title);
+                agent.restore_history(data.messages, data.todos).await;
+                Some(id)
+            }
+            Err(e) => {
+                warn!("Failed to load session {}: {}", id, e);
+                println!("Could not load session, starting new.\n");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // session_id tracks the id of the current session for saving on exit.
+    let mut current_session_id: Option<String> = session_id;
+
     println!("Type 'quit', 'exit', or 'q' to stop");
 
     // Main conversation loop
@@ -144,7 +259,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush()?;
 
         let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
+        let n = io::stdin().read_line(&mut user_input)?;
+
+        // EOF
+        if n == 0 {
+            save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
+        }
+
         let user_input = user_input.trim();
 
         if user_input.is_empty() {
@@ -154,8 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || user_input.eq_ignore_ascii_case("exit")
             || user_input.eq_ignore_ascii_case("q")
         {
-            println!("Goodbye!");
-            break;
+            save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
         }
 
         print!("Assistant: ");
@@ -219,7 +339,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-    }
 
-    Ok(())
+        // After each turn, persist the session so it survives unexpected exits.
+        let messages = agent.messages().await;
+        let todos = {
+            let state = agent.state.lock().await;
+            state.todos.clone()
+        };
+        match session::save_session(
+            &workspace_dir,
+            current_session_id.as_deref(),
+            &messages,
+            &todos,
+        ) {
+            Ok(id) => current_session_id = Some(id),
+            Err(e) => warn!("Failed to save session: {}", e),
+        }
+    }
+}
+
+async fn save_and_exit(agent: &Agent<OpenAI>, workspace_dir: &Path, session_id: Option<&str>) -> ! {
+    let messages = agent.messages().await;
+    let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
+    if has_user_msg {
+        let todos = agent.state.lock().await.todos.clone();
+        match session::save_session(workspace_dir, session_id, &messages, &todos) {
+            Ok(_) => println!("\nSession saved."),
+            Err(e) => eprintln!("\nFailed to save session: {}", e),
+        }
+    }
+    println!("Goodbye!");
+    std::process::exit(0);
 }

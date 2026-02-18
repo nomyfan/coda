@@ -170,6 +170,8 @@ dependencies = [
  "coda_skills",
  "dotenvy",
  "futures",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

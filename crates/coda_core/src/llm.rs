@@ -1,4 +1,5 @@
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -8,14 +9,14 @@ pub struct ToolDefinition {
     pub parameter_schema: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMessage(pub String);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage(pub String);
 
 /// A message representing a response from the AI, which may include tool calls.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
@@ -23,28 +24,28 @@ pub struct AssistantMessage {
 }
 
 /// A message representing a tool call from the AI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 }
 
 /// A message representing the result of a tool execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMessage {
     pub id: String,
     pub name: String,
     pub result: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     /// System message.
     System(SystemMessage),

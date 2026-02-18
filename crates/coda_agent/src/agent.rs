@@ -15,7 +15,7 @@ use crate::tools::{
     WriteTodosTool,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub title: String,
     pub done: bool,
@@ -115,6 +115,14 @@ impl<P: LLMProvider> Agent<P> {
 
     pub async fn messages(&self) -> Vec<Message> {
         self.state.lock().await.messages.clone()
+    }
+
+    /// Append previously saved (non-system) messages and restore todos.
+    /// The system message must already have been added before calling this.
+    pub async fn restore_history(&self, messages: Vec<Message>, todos: Vec<TodoItem>) {
+        let mut state = self.state.lock().await;
+        state.messages.extend(messages);
+        state.todos = todos;
     }
 
     /// Core run loop shared by `run` and `resume`. Drives the LLM ↔ tool execution cycle
