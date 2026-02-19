@@ -2,6 +2,7 @@ mod ask_user;
 
 use dotenvy::dotenv;
 use either::Either;
+use rustyline::error::ReadlineError;
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -44,6 +45,7 @@ fn print_logo() {
 }
 
 fn prompt_ask_user(
+    rl: &mut rustyline::DefaultEditor,
     question: &str,
     options: &[String],
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -55,18 +57,11 @@ fn prompt_ask_user(
     println!("  0. Other (type your own response)\n");
 
     loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+        let input = rl.readline("> ")?;
+        let input = input.trim().to_string();
 
         if input == "0" {
-            print!("Your response: ");
-            io::stdout().flush()?;
-            let mut custom = String::new();
-            io::stdin().read_line(&mut custom)?;
+            let custom = rl.readline("Your response: ")?;
             return Ok(custom.trim().to_string());
         }
         if let Ok(idx) = input.parse::<usize>()
@@ -80,6 +75,7 @@ fn prompt_ask_user(
 }
 
 fn prompt_approval(
+    rl: &mut rustyline::DefaultEditor,
     call: &ToolCall,
 ) -> Result<Either<String, RejectedCall>, Box<dyn std::error::Error>> {
     println!(
@@ -89,21 +85,14 @@ fn prompt_approval(
     );
 
     loop {
-        print!("     Approve? [y/n]: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let input = rl.readline("     Approve? [y/n]: ")?;
 
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" => {
                 return Ok(Either::Left(call.id.clone()));
             }
             "n" | "no" => {
-                print!("     Reason (optional, Enter to skip): ");
-                io::stdout().flush()?;
-                let mut reason = String::new();
-                io::stdin().read_line(&mut reason)?;
+                let reason = rl.readline("     Reason (optional, Enter to skip): ")?;
                 let reason = reason.trim().to_string();
                 return Ok(Either::Right(RejectedCall {
                     id: call.id.clone(),
@@ -122,6 +111,7 @@ fn prompt_approval(
 /// Show the session picker. Returns the session id to resume, or None for a new session.
 /// Returns Err if the user chose to quit.
 fn prompt_session_choice(
+    rl: &mut rustyline::DefaultEditor,
     store: &SessionStore,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let sessions = store.list();
@@ -149,15 +139,13 @@ fn prompt_session_choice(
     println!("  q. Quit");
 
     loop {
-        print!("\n> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        let n = io::stdin().read_line(&mut input)?;
-        if n == 0 {
-            // EOF
-            std::process::exit(0);
-        }
+        let input = match rl.readline("\n> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                std::process::exit(0);
+            }
+            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+        };
         let input = input.trim().to_lowercase();
 
         if input == "q" {
@@ -231,9 +219,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_logo();
 
+    let mut rl = rustyline::DefaultEditor::new()?;
+
     // Session picker: let the user choose an existing session or start new.
     let mut initial_checkpoint: Option<AgentCheckpoint> = None;
-    let session_id: Option<String> = match prompt_session_choice(&session_store)? {
+    let session_id: Option<String> = match prompt_session_choice(&mut rl, &session_store)? {
         Some(id) => match session_store.load(&id) {
             Ok(data) => {
                 println!("Resuming: {}\n", data.title);
@@ -293,18 +283,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok::<AgentEvent, StreamError>(AgentEvent::Suspended(cp))
             }))
         } else {
-            print!("\nYou: ");
-            io::stdout().flush()?;
+            let raw_input = match rl.readline("\nYou: ") {
+                Ok(line) => line,
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                    save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
+                }
+                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+            };
 
-            let mut user_input = String::new();
-            let n = io::stdin().read_line(&mut user_input)?;
-
-            // EOF
-            if n == 0 {
-                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
-            }
-
-            let user_input = user_input.trim();
+            let user_input = raw_input.trim();
 
             if user_input.is_empty() {
                 continue;
@@ -375,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pending_call.arguments.as_deref().unwrap_or("{}"),
                             ) {
                                 Ok(params) => ToolOutput::Ok(prompt_ask_user(
+                                    &mut rl,
                                     &params.question,
                                     &params.options,
                                 )?),
@@ -389,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 outcome: ToolCallOutcome::Auto,
                             });
                         } else {
-                            match prompt_approval(pending_call)? {
+                            match prompt_approval(&mut rl, pending_call)? {
                                 Either::Left(id) => approved.push(id),
                                 Either::Right(reject) => rejected.push(reject),
                             }
