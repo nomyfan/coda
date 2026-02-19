@@ -1,11 +1,10 @@
 mod ask_user;
-mod session;
 
 use dotenvy::dotenv;
 use either::Either;
 use std::env;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::debug;
 use tracing::info;
@@ -13,7 +12,8 @@ use tracing::warn;
 
 use ask_user::{AskUserParams, AskUserTool};
 use coda_agent::{
-    Agent, AgentCheckpoint, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode,
+    Agent, AgentCheckpoint, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, SessionStore,
+    ToolApprovalMode,
 };
 use coda_core::llm::{
     LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
@@ -122,21 +122,25 @@ fn prompt_approval(
 /// Show the session picker. Returns the session id to resume, or None for a new session.
 /// Returns Err if the user chose to quit.
 fn prompt_session_choice(
-    workspace_dir: &Path,
+    store: &SessionStore,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let sessions = session::list_sessions(workspace_dir);
+    let sessions = store.list();
     if sessions.is_empty() {
         return Ok(None);
     }
 
     println!("Available sessions (most recent first):\n");
     for (i, s) in sessions.iter().enumerate() {
-        let datetime = format_timestamp(s.updated_at);
         // message_count counts User+Assistant+Tool messages; approximate "turns" as User msgs.
         println!(
             "  {}. [{}] {}  ({} messages)",
             i + 1,
-            datetime,
+            jiff::Timestamp::from_second(s.updated_at as i64)
+                .map(|ts| ts
+                    .to_zoned(jiff::tz::TimeZone::UTC)
+                    .strftime("%Y-%m-%d %H:%M")
+                    .to_string())
+                .unwrap_or_default(),
             s.title,
             s.message_count,
         );
@@ -175,41 +179,6 @@ fn prompt_session_choice(
     }
 }
 
-fn format_timestamp(secs: u64) -> String {
-    // Simple UTC formatting without external deps.
-    // secs since Unix epoch → YYYY-MM-DD HH:MM
-    let s = secs;
-    let mins = s / 60;
-    let hours = mins / 60;
-    let days = hours / 24;
-
-    let minute = (mins % 60) as u32;
-    let hour = (hours % 24) as u32;
-
-    // Days since epoch → Gregorian date (Zeller-like)
-    let (year, month, day) = days_to_ymd(days);
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        year, month, day, hour, minute
-    )
-}
-
-fn days_to_ymd(days: u64) -> (u32, u32, u32) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as u32, m as u32, d as u32)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv()?;
@@ -228,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arch = std::env::consts::ARCH;
     let workspace_dir = std::env::current_dir()?;
     let workspace_str = workspace_dir.to_string_lossy().into_owned();
+    let session_store = SessionStore::new(workspace_dir.join(".coda").join("sessions"));
     let mut system_prompt = SYSTEM_PROMPT
         .replace("{{OS}}", &format!("{}({})", os, arch))
         .replace("{{WORKSPACE_DIR}}", &workspace_str);
@@ -263,8 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Session picker: let the user choose an existing session or start new.
     let mut initial_checkpoint: Option<AgentCheckpoint> = None;
-    let session_id: Option<String> = match prompt_session_choice(&workspace_dir)? {
-        Some(id) => match session::load_session(&workspace_dir, &id) {
+    let session_id: Option<String> = match prompt_session_choice(&session_store)? {
+        Some(id) => match session_store.load(&id) {
             Ok(data) => {
                 println!("Resuming: {}\n", data.title);
                 print_history(&data.messages);
@@ -331,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // EOF
             if n == 0 {
-                save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
+                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
             }
 
             let user_input = user_input.trim();
@@ -343,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || user_input.eq_ignore_ascii_case("exit")
                 || user_input.eq_ignore_ascii_case("q")
             {
-                save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
+                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
             }
 
             print!("Assistant: ");
@@ -380,14 +350,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AgentEvent::Suspended(checkpoint) => {
                         // Persist the checkpoint so it survives process restarts.
-                        match session::save_session(
-                            &workspace_dir,
-                            current_session_id.as_deref(),
-                            &checkpoint.messages,
-                            &checkpoint.todos,
-                            &checkpoint.pending_calls,
-                            &checkpoint.auto_calls,
-                        ) {
+                        match session_store
+                            .save_checkpoint(current_session_id.as_deref(), &checkpoint)
+                        {
                             Ok(id) => current_session_id = Some(id),
                             Err(e) => warn!("Failed to save checkpoint: {}", e),
                         }
@@ -451,14 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state = agent.state.lock().await;
             state.todos.clone()
         };
-        match session::save_session(
-            &workspace_dir,
-            current_session_id.as_deref(),
-            &messages,
-            &todos,
-            &[],
-            &[],
-        ) {
+        match session_store.save(current_session_id.as_deref(), &messages, &todos) {
             Ok(id) => current_session_id = Some(id),
             Err(e) => warn!("Failed to save session: {}", e),
         }
@@ -502,12 +460,12 @@ fn print_history(messages: &[Message]) {
     println!();
 }
 
-async fn save_and_exit(agent: &Agent<OpenAI>, workspace_dir: &Path, session_id: Option<&str>) -> ! {
+async fn save_and_exit(agent: &Agent<OpenAI>, store: &SessionStore, session_id: Option<&str>) -> ! {
     let messages = agent.messages().await;
     let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
     if has_user_msg {
         let todos = agent.state.lock().await.todos.clone();
-        match session::save_session(workspace_dir, session_id, &messages, &todos, &[], &[]) {
+        match store.save(session_id, &messages, &todos) {
             Ok(_) => println!("\nSession saved."),
             Err(e) => eprintln!("\nFailed to save session: {}", e),
         }

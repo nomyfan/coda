@@ -21,3 +21,5 @@ serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tracing = "0.1.44"
 tokio = { version = "1.49.0", features = ["full"] }
 schemars = "1.2.1"
+jiff = "0.2"
+uuid = { version = "1", features = ["v4"] }

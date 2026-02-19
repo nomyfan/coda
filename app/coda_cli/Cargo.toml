@@ -14,7 +14,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 dotenvy = "0.15.7"
-uuid = { version = "1", features = ["v4"] }
+jiff = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
