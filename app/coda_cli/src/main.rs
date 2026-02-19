@@ -12,7 +12,9 @@ use tracing::info;
 use tracing::warn;
 
 use ask_user::{AskUserParams, AskUserTool};
-use coda_agent::{Agent, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode};
+use coda_agent::{
+    Agent, AgentCheckpoint, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, ToolApprovalMode,
+};
 use coda_core::llm::{
     LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
     ToolOutput, UserMessage,
@@ -260,12 +262,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_logo();
 
     // Session picker: let the user choose an existing session or start new.
+    let mut initial_checkpoint: Option<AgentCheckpoint> = None;
     let session_id: Option<String> = match prompt_session_choice(&workspace_dir)? {
         Some(id) => match session::load_session(&workspace_dir, &id) {
             Ok(data) => {
                 println!("Resuming: {}\n", data.title);
                 print_history(&data.messages);
+                let pending_calls = data.pending_calls.clone();
+                let auto_calls = data.auto_calls.clone();
                 agent.restore_history(data.messages, data.todos).await;
+                if !pending_calls.is_empty() {
+                    let todos = agent.state.lock().await.todos.clone();
+                    initial_checkpoint = Some(AgentCheckpoint {
+                        thread_id: id.clone(),
+                        messages: agent.messages().await,
+                        pending_calls,
+                        auto_calls,
+                        todos,
+                    });
+                }
                 Some(id)
             }
             Err(e) => {
@@ -282,53 +297,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Type 'quit', 'exit', or 'q' to stop");
 
+    let make_config = |thread_id: String| RunConfig {
+        model: model.clone(),
+        max_completion_tokens: Some(5000),
+        temperature: Some(0.5),
+        thread_id,
+        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+            info!(
+                "deciding whether to require approval for tool call: {}",
+                call.name
+            );
+            call.name == "shell" || call.name == "ask_user"
+        })),
+    };
+
     // Main conversation loop
     loop {
-        print!("\nYou: ");
-        io::stdout().flush()?;
-
-        let mut user_input = String::new();
-        let n = io::stdin().read_line(&mut user_input)?;
-
-        // EOF
-        if n == 0 {
-            save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
-        }
-
-        let user_input = user_input.trim();
-
-        if user_input.is_empty() {
-            continue;
-        }
-        if user_input.eq_ignore_ascii_case("quit")
-            || user_input.eq_ignore_ascii_case("exit")
-            || user_input.eq_ignore_ascii_case("q")
-        {
-            save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
-        }
-
-        print!("Assistant: ");
-        io::stdout().flush()?;
-
-        let thread_id = uuid::Uuid::new_v4().to_string();
-        let make_config = |thread_id: String| RunConfig {
-            model: model.clone(),
-            max_completion_tokens: Some(5000),
-            temperature: Some(0.5),
-            thread_id,
-            tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-                info!(
-                    "deciding whether to require approval for tool call: {}",
-                    call.name
-                );
-                call.name == "shell" || call.name == "ask_user"
-            })),
-        };
-
         // Explicit dyn Stream type so run() and resume() can be assigned to the same variable.
         let mut stream: std::pin::Pin<
             Box<dyn Stream<Item = Result<AgentEvent, StreamError>> + '_>,
-        > = Box::pin(agent.run(UserMessage(user_input.to_string()), make_config(thread_id)));
+        > = if let Some(cp) = initial_checkpoint.take() {
+            // Restored from a saved session: surface the checkpoint immediately without
+            // starting a new LLM turn or reading user input.
+            Box::pin(futures::stream::once(async move {
+                Ok::<AgentEvent, StreamError>(AgentEvent::Suspended(cp))
+            }))
+        } else {
+            print!("\nYou: ");
+            io::stdout().flush()?;
+
+            let mut user_input = String::new();
+            let n = io::stdin().read_line(&mut user_input)?;
+
+            // EOF
+            if n == 0 {
+                save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
+            }
+
+            let user_input = user_input.trim();
+
+            if user_input.is_empty() {
+                continue;
+            }
+            if user_input.eq_ignore_ascii_case("quit")
+                || user_input.eq_ignore_ascii_case("exit")
+                || user_input.eq_ignore_ascii_case("q")
+            {
+                save_and_exit(&agent, &workspace_dir, current_session_id.as_deref()).await;
+            }
+
+            print!("Assistant: ");
+            io::stdout().flush()?;
+
+            let thread_id = uuid::Uuid::new_v4().to_string();
+            Box::pin(agent.run(UserMessage(user_input.to_string()), make_config(thread_id)))
+        };
 
         loop {
             let mut suspended_checkpoint = None;
@@ -356,6 +379,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     AgentEvent::Suspended(checkpoint) => {
+                        // Persist the checkpoint so it survives process restarts.
+                        match session::save_session(
+                            &workspace_dir,
+                            current_session_id.as_deref(),
+                            &checkpoint.messages,
+                            &checkpoint.todos,
+                            &checkpoint.pending_calls,
+                            &checkpoint.auto_calls,
+                        ) {
+                            Ok(id) => current_session_id = Some(id),
+                            Err(e) => warn!("Failed to save checkpoint: {}", e),
+                        }
                         suspended_checkpoint = Some(checkpoint);
                         break;
                     }
@@ -410,7 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // After each turn, persist the session so it survives unexpected exits.
+        // After each turn, persist the session (without checkpoint — turn completed normally).
         let messages = agent.messages().await;
         let todos = {
             let state = agent.state.lock().await;
@@ -421,6 +456,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             current_session_id.as_deref(),
             &messages,
             &todos,
+            &[],
+            &[],
         ) {
             Ok(id) => current_session_id = Some(id),
             Err(e) => warn!("Failed to save session: {}", e),
@@ -470,7 +507,7 @@ async fn save_and_exit(agent: &Agent<OpenAI>, workspace_dir: &Path, session_id: 
     let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
     if has_user_msg {
         let todos = agent.state.lock().await.todos.clone();
-        match session::save_session(workspace_dir, session_id, &messages, &todos) {
+        match session::save_session(workspace_dir, session_id, &messages, &todos, &[], &[]) {
             Ok(_) => println!("\nSession saved."),
             Err(e) => eprintln!("\nFailed to save session: {}", e),
         }

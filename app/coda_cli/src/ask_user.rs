@@ -33,8 +33,7 @@ impl Tool for AskUserTool {
 
     fn description(&self) -> &str {
         "Present the user with a question and a numbered list of options to choose from. \
-         Use this when you need a decision from the user before proceeding. \
-         Call this tool alone, not alongside other tool calls."
+         Use this when you need a decision from the user before proceeding."
     }
 
     fn parameter_schema(&self) -> &Value {

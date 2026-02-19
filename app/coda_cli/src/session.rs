@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use coda_agent::TodoItem;
-use coda_core::llm::Message;
+use coda_core::llm::{Message, ToolCall};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +14,12 @@ pub struct SessionData {
     /// Conversation messages excluding the System message (regenerated on startup).
     pub messages: Vec<Message>,
     pub todos: Vec<TodoItem>,
+    /// Tool calls awaiting user approval at the time the process exited.
+    /// When present, the session resumes directly into the approval flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_calls: Vec<ToolCall>,
 }
 
 /// Lightweight metadata used for the session picker list.
@@ -88,6 +94,8 @@ pub fn save_session(
     session_id: Option<&str>,
     messages: &[Message],
     todos: &[TodoItem],
+    pending_calls: &[ToolCall],
+    auto_calls: &[ToolCall],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let dir = sessions_dir(workspace_dir);
     std::fs::create_dir_all(&dir)?;
@@ -120,6 +128,8 @@ pub fn save_session(
         updated_at: now,
         messages,
         todos: todos.to_vec(),
+        pending_calls: pending_calls.to_vec(),
+        auto_calls: auto_calls.to_vec(),
     };
 
     let path = dir.join(format!("{}.json", id));

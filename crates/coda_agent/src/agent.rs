@@ -40,6 +40,7 @@ pub struct ApprovalDecision {
     pub handled: Vec<ToolMessage>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCheckpoint {
     pub thread_id: String,
     pub messages: Vec<Message>,
