@@ -2,6 +2,7 @@ mod ask_user;
 mod session;
 
 use dotenvy::dotenv;
+use either::Either;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -40,15 +41,10 @@ fn print_logo() {
     println!();
 }
 
-enum AskUserResult {
-    Selected(String),
-    Other,
-}
-
 fn prompt_ask_user(
     question: &str,
     options: &[String],
-) -> Result<AskUserResult, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     println!("\n[User Input Required]\n");
     println!("{}\n", question);
     for (i, opt) in options.iter().enumerate() {
@@ -65,69 +61,60 @@ fn prompt_ask_user(
         let input = input.trim();
 
         if input == "0" {
-            return Ok(AskUserResult::Other);
+            print!("Your response: ");
+            io::stdout().flush()?;
+            let mut custom = String::new();
+            io::stdin().read_line(&mut custom)?;
+            return Ok(custom.trim().to_string());
         }
         if let Ok(idx) = input.parse::<usize>()
             && idx >= 1
             && idx <= options.len()
         {
-            return Ok(AskUserResult::Selected(options[idx - 1].clone()));
+            return Ok(options[idx - 1].clone());
         }
         println!("  Please enter a number between 0 and {}.", options.len());
     }
 }
 
-fn prompt_approval(calls: &[ToolCall]) -> Result<ApprovalDecision, Box<dyn std::error::Error>> {
+fn prompt_approval(
+    call: &ToolCall,
+) -> Result<Either<String, RejectedCall>, Box<dyn std::error::Error>> {
     println!(
-        "\n[Approval Required] The agent wants to run {} tool call(s):",
-        calls.len()
+        "\n  {}: {}",
+        call.name,
+        call.arguments.as_deref().unwrap_or("{}")
     );
 
-    let mut approved = vec![];
-    let mut rejected = vec![];
+    loop {
+        print!("     Approve? [y/n]: ");
+        io::stdout().flush()?;
 
-    for (i, call) in calls.iter().enumerate() {
-        println!(
-            "\n  {}. {}: {}",
-            i + 1,
-            call.name,
-            call.arguments.as_deref().unwrap_or("{}")
-        );
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
 
-        loop {
-            print!("     Approve? [y/n]: ");
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            match input.trim().to_lowercase().as_str() {
-                "y" | "yes" => {
-                    approved.push(call.id.clone());
-                    break;
-                }
-                "n" | "no" => {
-                    print!("     Reason (optional, Enter to skip): ");
-                    io::stdout().flush()?;
-                    let mut reason = String::new();
-                    io::stdin().read_line(&mut reason)?;
-                    let reason = reason.trim().to_string();
-                    rejected.push(RejectedCall {
-                        id: call.id.clone(),
-                        reason: if reason.is_empty() {
-                            None
-                        } else {
-                            Some(reason)
-                        },
-                    });
-                    break;
-                }
-                _ => println!("     Please enter 'y' or 'n'."),
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                return Ok(Either::Left(call.id.clone()));
             }
+            "n" | "no" => {
+                print!("     Reason (optional, Enter to skip): ");
+                io::stdout().flush()?;
+                let mut reason = String::new();
+                io::stdin().read_line(&mut reason)?;
+                let reason = reason.trim().to_string();
+                return Ok(Either::Right(RejectedCall {
+                    id: call.id.clone(),
+                    reason: if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
+                }));
+            }
+            _ => println!("     Please enter 'y' or 'n'."),
         }
     }
-
-    Ok(ApprovalDecision { approved, rejected })
 }
 
 /// Show the session picker. Returns the session id to resume, or None for a new session.
@@ -379,46 +366,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match suspended_checkpoint {
                 None => break, // stream completed normally
                 Some(checkpoint) => {
-                    // TODO: LLM might not follow the instruction and dispatch multiple tool calls in one turn.
-                    // Solo ask_user call: handle interactively without resume().
-                    if checkpoint.pending_calls.len() == 1
-                        && checkpoint.pending_calls[0].name == "ask_user"
-                    {
-                        let call = &checkpoint.pending_calls[0];
-                        let mut return_control_to_user = false;
-                        let output = match serde_json::from_str::<AskUserParams>(
-                            call.arguments.as_deref().unwrap_or("{}"),
-                        ) {
-                            Ok(params) => match prompt_ask_user(&params.question, &params.options)? {
-                                AskUserResult::Selected(value) => ToolOutput::Ok(value),
-                                AskUserResult::Other => {
-                                    return_control_to_user = true;
-                                    ToolOutput::Err("User wants to provide custom input".to_string())
+                    let mut approved = vec![];
+                    let mut rejected = vec![];
+                    let mut handled = vec![];
+                    for pending_call in &checkpoint.pending_calls {
+                        if pending_call.name == "ask_user" {
+                            let output = match serde_json::from_str::<AskUserParams>(
+                                pending_call.arguments.as_deref().unwrap_or("{}"),
+                            ) {
+                                Ok(params) => ToolOutput::Ok(prompt_ask_user(
+                                    &params.question,
+                                    &params.options,
+                                )?),
+                                Err(err) => {
+                                    ToolOutput::Err(format!("Invalid ask_user arguments: {err}"))
                                 }
-                            },
-                            Err(err) => {
-                                ToolOutput::Err(format!("Invalid ask_user arguments: {err}"))
-                            }
-                        };
-                        agent
-                            .add_message(Message::Tool(ToolMessage {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
+                            };
+                            handled.push(ToolMessage {
+                                id: pending_call.id.clone(),
+                                name: pending_call.name.clone(),
                                 output,
                                 outcome: ToolCallOutcome::Auto,
-                            }))
-                            .await;
-                        if return_control_to_user {
-                            break; // return control to user input
+                            });
+                        } else {
+                            match prompt_approval(pending_call)? {
+                                Either::Left(id) => approved.push(id),
+                                Either::Right(reject) => rejected.push(reject),
+                            }
                         }
-                        let thread_id = checkpoint.thread_id.clone();
-                        stream = Box::pin(agent.continue_run(make_config(thread_id)));
-                    } else {
-                        let decision = prompt_approval(&checkpoint.pending_calls)?;
-                        let thread_id = checkpoint.thread_id.clone();
-                        stream =
-                            Box::pin(agent.resume(checkpoint, decision, make_config(thread_id)));
                     }
+
+                    let thread_id = checkpoint.thread_id.clone();
+                    stream = Box::pin(agent.resume(
+                        checkpoint,
+                        ApprovalDecision {
+                            approved,
+                            rejected,
+                            handled,
+                        },
+                        make_config(thread_id),
+                    ));
                 }
             }
         }

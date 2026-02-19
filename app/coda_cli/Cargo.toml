@@ -8,6 +8,7 @@ coda_core = { workspace = true }
 coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }
+either = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

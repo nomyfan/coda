@@ -35,12 +35,18 @@ pub struct RejectedCall {
 pub struct ApprovalDecision {
     pub approved: Vec<String>,
     pub rejected: Vec<RejectedCall>,
+    /// Tool calls already handled by the caller (e.g. interactive ask_user).
+    /// Their ToolMessages are injected directly without re-execution.
+    pub handled: Vec<ToolMessage>,
 }
 
 pub struct AgentCheckpoint {
     pub thread_id: String,
     pub messages: Vec<Message>,
+    /// Tool calls that require human approval before execution.
     pub pending_calls: Vec<ToolCall>,
+    /// Tool calls that can be executed automatically without approval.
+    pub auto_calls: Vec<ToolCall>,
     pub todos: Vec<TodoItem>,
 }
 
@@ -166,20 +172,21 @@ impl<P: LLMProvider> Agent<P> {
                 self.add_message(Message::Assistant(assistant_message.clone())).await;
 
                 if !assistant_message.tool_calls.is_empty() {
-                    let needs_suspension = match &config.tool_approval {
-                        ToolApprovalMode::Auto => false,
-                        ToolApprovalMode::Manual => true,
+                    let (pending_calls, auto_calls): (Vec<ToolCall>, Vec<ToolCall>) = match &config.tool_approval {
+                        ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls.clone()),
+                        ToolApprovalMode::Manual => (assistant_message.tool_calls.clone(), vec![]),
                         ToolApprovalMode::RequireWhen(predicate) => {
-                            assistant_message.tool_calls.iter().any(|c| predicate(c))
+                            assistant_message.tool_calls.clone().into_iter().partition(|c| predicate(c))
                         }
                     };
 
-                    if needs_suspension {
+                    if !pending_calls.is_empty() {
                         let state = self.state.lock().await;
                         let checkpoint = AgentCheckpoint {
                             thread_id: config.thread_id.clone(),
                             messages: state.messages.clone(),
-                            pending_calls: assistant_message.tool_calls.clone(),
+                            pending_calls,
+                            auto_calls,
                             todos: state.todos.clone(),
                         };
                         drop(state);
@@ -280,57 +287,18 @@ impl<P: LLMProvider> Agent<P> {
                 state.todos = checkpoint.todos;
             }
 
+            // Inject handled ToolMessages first (e.g. ask_user results resolved by CLI).
+            for tool_message in decision.handled {
+                yield AgentEvent::ToolCallEnd(tool_message.clone());
+                self.add_message(Message::Tool(tool_message)).await;
+            }
+
             let approved: HashSet<String> = decision.approved.into_iter().collect();
             let rejected: HashMap<String, Option<String>> = decision
                 .rejected
                 .into_iter()
                 .map(|r| (r.id, r.reason))
                 .collect();
-
-            // Execute approved calls in parallel.
-            let approved_calls: Vec<ToolCall> = checkpoint
-                .pending_calls
-                .iter()
-                .filter(|c| approved.contains(&c.id))
-                .cloned()
-                .collect();
-
-            for call in &approved_calls {
-                yield AgentEvent::ToolCallStart(call.clone());
-            }
-
-            let futures: Vec<_> = approved_calls
-                .into_iter()
-                .map(|call| {
-                    let tool = self.tools.get(&call.name);
-                    async move {
-                        let output = match tool {
-                            Some(t) => match t
-                                .execute(call.arguments.unwrap_or_default())
-                                .await
-                            {
-                                Ok(s) => ToolOutput::Ok(s),
-                                Err(e) => ToolOutput::Err(e.to_string()),
-                            },
-                            None => ToolOutput::Err(format!(
-                                "Tool '{}' not found",
-                                call.name
-                            )),
-                        };
-                        ToolMessage {
-                            id: call.id,
-                            name: call.name,
-                            output,
-                            outcome: ToolCallOutcome::Approved,
-                        }
-                    }
-                })
-                .collect();
-
-            for tool_message in futures::future::join_all(futures).await {
-                yield AgentEvent::ToolCallEnd(tool_message.clone());
-                self.add_message(Message::Tool(tool_message)).await;
-            }
 
             // Inject rejection messages so the LLM knows which calls were denied.
             for call in checkpoint
@@ -352,6 +320,57 @@ impl<P: LLMProvider> Agent<P> {
                     },
                 }))
                 .await;
+            }
+
+            // Execute approved pending_calls and all auto_calls together.
+            let calls_to_execute: Vec<ToolCall> = checkpoint
+                .pending_calls
+                .iter()
+                .filter(|c| approved.contains(&c.id))
+                .cloned()
+                .chain(checkpoint.auto_calls.into_iter())
+                .collect();
+
+            for call in &calls_to_execute {
+                yield AgentEvent::ToolCallStart(call.clone());
+            }
+
+            let futures: Vec<_> = calls_to_execute
+                .into_iter()
+                .map(|call| {
+                    let tool = self.tools.get(&call.name);
+                    let is_approved = approved.contains(&call.id);
+                    async move {
+                        let output = match tool {
+                            Some(t) => match t
+                                .execute(call.arguments.unwrap_or_default())
+                                .await
+                            {
+                                Ok(s) => ToolOutput::Ok(s),
+                                Err(e) => ToolOutput::Err(e.to_string()),
+                            },
+                            None => ToolOutput::Err(format!(
+                                "Tool '{}' not found",
+                                call.name
+                            )),
+                        };
+                        ToolMessage {
+                            id: call.id,
+                            name: call.name,
+                            output,
+                            outcome: if is_approved {
+                                ToolCallOutcome::Approved
+                            } else {
+                                ToolCallOutcome::Auto
+                            },
+                        }
+                    }
+                })
+                .collect();
+
+            for tool_message in futures::future::join_all(futures).await {
+                yield AgentEvent::ToolCallEnd(tool_message.clone());
+                self.add_message(Message::Tool(tool_message)).await;
             }
 
             // Continue the run loop with the same config.
