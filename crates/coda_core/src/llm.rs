@@ -52,9 +52,11 @@ pub enum ToolOutput {
 pub enum ToolCallOutcome {
     /// Executed automatically without requiring user approval.
     Auto,
-    /// Executed after explicit user approval.
+    /// Suspended, then the caller instructed the agent to execute.
     Approved,
-    /// Rejected by the user; execution was skipped.
+    /// Suspended, then the caller provided the result directly.
+    Resolved,
+    /// Suspended, then the caller rejected execution.
     Rejected { reason: Option<String> },
 }
 

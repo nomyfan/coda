@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -8,7 +8,7 @@ use coda_core::llm::{
 };
 use coda_core::tool::ToolManager;
 use futures::{Stream, StreamExt};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::tools::{
     GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
@@ -27,17 +27,19 @@ pub enum ToolApprovalMode {
     RequireWhen(Arc<dyn Fn(&ToolCall) -> bool + Send + Sync>),
 }
 
-pub struct RejectedCall {
-    pub id: String,
-    pub reason: Option<String>,
+/// Caller's resolution for a single suspended tool call.
+pub enum ToolCallResolution {
+    /// The agent should execute this call.
+    Execute,
+    /// The caller already handled it; use this result directly.
+    Resolved(ToolOutput),
+    /// The caller rejected execution.
+    Rejected { reason: Option<String> },
 }
 
-pub struct ApprovalDecision {
-    pub approved: Vec<String>,
-    pub rejected: Vec<RejectedCall>,
-    /// Tool calls already handled by the caller (e.g. interactive ask_user).
-    /// Their ToolMessages are injected directly without re-execution.
-    pub handled: Vec<ToolMessage>,
+/// Caller's response to all suspended tool calls, replacing `ApprovalDecision`.
+pub struct ResumeDecision {
+    pub resolutions: Vec<(String, ToolCallResolution)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,7 +66,7 @@ pub enum AgentEvent {
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
     /// Emitted when tool calls require human approval. The stream terminates after this event.
-    /// Call `Agent::resume` with the checkpoint and an `ApprovalDecision` to continue.
+    /// Call `Agent::resume` with the checkpoint and a `ResumeDecision` to continue.
     Suspended(AgentCheckpoint),
 }
 
@@ -270,17 +272,31 @@ impl<P: LLMProvider> Agent<P> {
         }
     }
 
-    /// Resume from a checkpoint after receiving human approval decisions.
+    /// Resume from a checkpoint after the caller has resolved all suspended tool calls.
     ///
-    /// Approved tool calls are executed; rejected ones inject an error message so the
-    /// LLM can respond accordingly. The run loop then continues as normal.
+    /// Each pending call is matched against its `ToolCallResolution`:
+    /// - `Execute` → queued for agent execution (outcome: `Approved`)
+    /// - `Resolved(output)` → injected directly (outcome: `Resolved`)
+    /// - `Rejected { reason }` → error injected (outcome: `Rejected`)
+    ///
+    /// Auto calls from the checkpoint are always executed (outcome: `Auto`).
     pub fn resume(
         &self,
         checkpoint: AgentCheckpoint,
-        decision: ApprovalDecision,
+        decision: ResumeDecision,
         config: RunConfig,
     ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + '_ {
         async_stream::try_stream! {
+            let mut resolution_map: HashMap<String, ToolCallResolution> =
+                decision.resolutions.into_iter().collect();
+
+            // Every pending call must have a resolution. If not, re-suspend
+            // with the original checkpoint so the caller can fix the issue.
+            if checkpoint.pending_calls.iter().any(|c| !resolution_map.contains_key(&c.id)) {
+                yield AgentEvent::Suspended(checkpoint);
+                return;
+            }
+
             // Restore conversation state from checkpoint.
             {
                 let mut state = self.state.lock().await;
@@ -288,49 +304,46 @@ impl<P: LLMProvider> Agent<P> {
                 state.todos = checkpoint.todos;
             }
 
-            // Inject handled ToolMessages first (e.g. ask_user results resolved by CLI).
-            for tool_message in decision.handled {
-                yield AgentEvent::ToolCallEnd(tool_message.clone());
-                self.add_message(Message::Tool(tool_message)).await;
-            }
-
-            let approved: HashSet<String> = decision.approved.into_iter().collect();
-            let rejected: HashMap<String, Option<String>> = decision
-                .rejected
-                .into_iter()
-                .map(|r| (r.id, r.reason))
-                .collect();
-
-            // Inject rejection messages so the LLM knows which calls were denied.
-            for call in checkpoint
-                .pending_calls
-                .iter()
-                .filter(|c| rejected.contains_key(&c.id))
-            {
-                let rejection_reason = rejected.get(&call.id).and_then(|r| r.clone());
-                let err_msg = match &rejection_reason {
-                    Some(r) => format!("tool call rejected by user, reason: {r}"),
-                    None => "tool call rejected by user".to_string(),
-                };
-                self.add_message(Message::Tool(ToolMessage {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: ToolOutput::Err(err_msg),
-                    outcome: ToolCallOutcome::Rejected {
-                        reason: rejection_reason,
+            // Process each pending call according to its resolution.
+            let mut calls_to_execute: Vec<ToolCall> = Vec::new();
+            for call in checkpoint.pending_calls {
+                match resolution_map.remove(&call.id) {
+                    Some(ToolCallResolution::Resolved(output)) => {
+                        let tool_message = ToolMessage {
+                            id: call.id,
+                            name: call.name,
+                            output,
+                            outcome: ToolCallOutcome::Resolved,
+                        };
+                        yield AgentEvent::ToolCallEnd(tool_message.clone());
+                        self.add_message(Message::Tool(tool_message)).await;
+                    }
+                    Some(ToolCallResolution::Rejected { reason }) => {
+                        let err_msg = match &reason {
+                            Some(r) => format!("tool call rejected by user, reason: {r}"),
+                            None => "tool call rejected by user".to_string(),
+                        };
+                        let tool_message = ToolMessage {
+                            id: call.id,
+                            name: call.name,
+                            output: ToolOutput::Err(err_msg),
+                            outcome: ToolCallOutcome::Rejected { reason },
+                        };
+                        yield AgentEvent::ToolCallEnd(tool_message.clone());
+                        self.add_message(Message::Tool(tool_message)).await;
+                    }
+                    Some(ToolCallResolution::Execute) => {
+                        calls_to_execute.push(call);
+                    }
+                    None => {
+                        error!("every pending call should have a resolution, but call ID {} is missing", call.id);
                     },
-                }))
-                .await;
+                }
             }
 
-            // Execute approved pending_calls and all auto_calls together.
-            let calls_to_execute: Vec<ToolCall> = checkpoint
-                .pending_calls
-                .iter()
-                .filter(|c| approved.contains(&c.id))
-                .cloned()
-                .chain(checkpoint.auto_calls.into_iter())
-                .collect();
+            // Track how many are approved (from pending Execute) before appending auto_calls.
+            let approved_count = calls_to_execute.len();
+            calls_to_execute.extend(checkpoint.auto_calls);
 
             for call in &calls_to_execute {
                 yield AgentEvent::ToolCallStart(call.clone());
@@ -338,9 +351,10 @@ impl<P: LLMProvider> Agent<P> {
 
             let futures: Vec<_> = calls_to_execute
                 .into_iter()
-                .map(|call| {
+                .enumerate()
+                .map(|(i, call)| {
                     let tool = self.tools.get(&call.name);
-                    let is_approved = approved.contains(&call.id);
+                    let is_approved = i < approved_count;
                     async move {
                         let output = match tool {
                             Some(t) => match t

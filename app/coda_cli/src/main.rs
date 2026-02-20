@@ -13,8 +13,8 @@ use tracing::warn;
 
 use ask_user::{AskUserParams, AskUserTool};
 use coda_agent::{
-    Agent, AgentCheckpoint, AgentEvent, ApprovalDecision, RejectedCall, RunConfig, SessionStore,
-    ToolApprovalMode,
+    Agent, AgentCheckpoint, AgentEvent, ResumeDecision, RunConfig, SessionStore,
+    ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
@@ -77,7 +77,7 @@ fn prompt_ask_user(
 fn prompt_approval(
     rl: &mut rustyline::DefaultEditor,
     call: &ToolCall,
-) -> Result<Either<String, RejectedCall>, Box<dyn std::error::Error>> {
+) -> Result<Either<String, (String, Option<String>)>, Box<dyn std::error::Error>> {
     println!(
         "\n  {}: {}",
         call.name,
@@ -94,14 +94,14 @@ fn prompt_approval(
             "n" | "no" => {
                 let reason = rl.readline("     Reason (optional, Enter to skip): ")?;
                 let reason = reason.trim().to_string();
-                return Ok(Either::Right(RejectedCall {
-                    id: call.id.clone(),
-                    reason: if reason.is_empty() {
+                return Ok(Either::Right((
+                    call.id.clone(),
+                    if reason.is_empty() {
                         None
                     } else {
                         Some(reason)
                     },
-                }));
+                )));
             }
             _ => println!("     Please enter 'y' or 'n'."),
         }
@@ -353,9 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match suspended_checkpoint {
                 None => break, // stream completed normally
                 Some(checkpoint) => {
-                    let mut approved = vec![];
-                    let mut rejected = vec![];
-                    let mut handled = vec![];
+                    let mut resolutions = vec![];
                     for pending_call in &checkpoint.pending_calls {
                         if pending_call.name == "ask_user" {
                             let output = match serde_json::from_str::<AskUserParams>(
@@ -370,16 +368,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ToolOutput::Err(format!("Invalid ask_user arguments: {err}"))
                                 }
                             };
-                            handled.push(ToolMessage {
-                                id: pending_call.id.clone(),
-                                name: pending_call.name.clone(),
-                                output,
-                                outcome: ToolCallOutcome::Auto,
-                            });
+                            resolutions.push((
+                                pending_call.id.clone(),
+                                ToolCallResolution::Resolved(output),
+                            ));
                         } else {
                             match prompt_approval(&mut rl, pending_call)? {
-                                Either::Left(id) => approved.push(id),
-                                Either::Right(reject) => rejected.push(reject),
+                                Either::Left(id) => {
+                                    resolutions.push((id, ToolCallResolution::Execute));
+                                }
+                                Either::Right((id, reason)) => {
+                                    resolutions.push((
+                                        id,
+                                        ToolCallResolution::Rejected { reason },
+                                    ));
+                                }
                             }
                         }
                     }
@@ -387,11 +390,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let thread_id = checkpoint.thread_id.clone();
                     stream = Box::pin(agent.resume(
                         checkpoint,
-                        ApprovalDecision {
-                            approved,
-                            rejected,
-                            handled,
-                        },
+                        ResumeDecision { resolutions },
                         make_config(thread_id),
                     ));
                 }
@@ -412,6 +411,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_history(messages: &[Message]) {
+    use std::collections::HashMap;
+
+    // Index tool results by call id so we can pair them with their calls.
+    let tool_results: HashMap<&str, &ToolMessage> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool(t) => Some((t.id.as_str(), t)),
+            _ => None,
+        })
+        .collect();
+
     for msg in messages {
         match msg {
             Message::System(_) => {}
@@ -424,25 +434,27 @@ fn print_history(messages: &[Message]) {
                 }
                 for call in &a.tool_calls {
                     println!("\n[Tool: {}]: {:?}", call.name, call.arguments);
+                    if let Some(t) = tool_results.get(call.id.as_str()) {
+                        let status = match &t.outcome {
+                            ToolCallOutcome::Rejected { reason } => match reason {
+                                Some(r) => format!("rejected: {r}"),
+                                None => "rejected".to_string(),
+                            },
+                            _ => match &t.output {
+                                ToolOutput::Ok(_) => "ok".to_string(),
+                                ToolOutput::Err(e) => format!("err: {e}"),
+                            },
+                        };
+                        let tag = match &t.outcome {
+                            ToolCallOutcome::Approved => " (approved)",
+                            ToolCallOutcome::Resolved => " (resolved)",
+                            _ => "",
+                        };
+                        println!("  -> {status}{tag}");
+                    }
                 }
             }
-            Message::Tool(t) => {
-                let status = match &t.outcome {
-                    ToolCallOutcome::Rejected { reason } => match reason {
-                        Some(r) => format!("rejected: {r}"),
-                        None => "rejected".to_string(),
-                    },
-                    _ => match &t.output {
-                        ToolOutput::Ok(_) => "ok".to_string(),
-                        ToolOutput::Err(e) => format!("err: {e}"),
-                    },
-                };
-                let approved_tag = match &t.outcome {
-                    ToolCallOutcome::Approved => " (approved)",
-                    _ => "",
-                };
-                println!("  -> {status}{approved_tag}");
-            }
+            Message::Tool(_) => {} // already printed above
         }
     }
     println!();
