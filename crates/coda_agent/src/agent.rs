@@ -135,6 +135,11 @@ impl<P: LLMProvider> Agent<P> {
         self.state.lock().await.messages.push(message);
     }
 
+    pub async fn add_messages(&self, messages: Vec<Message>) {
+        debug!("Adding messages: {:?}", messages);
+        self.state.lock().await.messages.extend(messages);
+    }
+
     pub async fn messages(&self) -> Vec<Message> {
         self.state.lock().await.messages.clone()
     }
@@ -210,8 +215,8 @@ impl<P: LLMProvider> Agent<P> {
                         match result {
                             Some(tool_message) => {
                                 pending_ids.remove(&tool_message.id);
-                                yield AgentEvent::ToolCallEnd(tool_message.clone());
-                                self.add_message(Message::Tool(tool_message)).await;
+                                self.add_message(Message::Tool(tool_message.clone())).await;
+                                yield AgentEvent::ToolCallEnd(tool_message);
                             }
                             None => break,
                         }
@@ -223,21 +228,24 @@ impl<P: LLMProvider> Agent<P> {
                 // Drain any results that completed concurrently.
                 while let Some(tool_message) = tool_futs.next().now_or_never().flatten() {
                     pending_ids.remove(&tool_message.id);
-                    yield AgentEvent::ToolCallEnd(tool_message.clone());
-                    self.add_message(Message::Tool(tool_message)).await;
+                    self.add_message(Message::Tool(tool_message.clone())).await;
+                    yield AgentEvent::ToolCallEnd(tool_message);
                 }
 
                 // Write aborted results for unfinished tool calls.
                 let aborted_ids: Vec<String> = pending_ids.keys().cloned().collect();
-                for (id, name) in pending_ids {
-                    let tool_message = ToolMessage {
-                        id,
-                        name,
-                        output: ToolOutput::Err("Aborted by user".to_string()),
-                        outcome: ToolCallOutcome::Aborted,
-                    };
-                    self.add_message(Message::Tool(tool_message)).await;
-                }
+                let aborted_messages: Vec<Message> = pending_ids
+                    .into_iter()
+                    .map(|(id, name)| {
+                        Message::Tool(ToolMessage {
+                            id,
+                            name,
+                            output: ToolOutput::Err("Aborted by user".to_string()),
+                            outcome: ToolCallOutcome::Aborted,
+                        })
+                    })
+                    .collect();
+                self.add_messages(aborted_messages).await;
 
                 yield AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids));
             }
@@ -457,8 +465,8 @@ impl<P: LLMProvider> Agent<P> {
                             output,
                             outcome: ToolCallOutcome::Resolved,
                         };
-                        yield AgentEvent::ToolCallEnd(tool_message.clone());
-                        self.add_message(Message::Tool(tool_message)).await;
+                        self.add_message(Message::Tool(tool_message.clone())).await;
+                        yield AgentEvent::ToolCallEnd(tool_message);
                     }
                     Some(ToolCallResolution::Rejected { reason }) => {
                         let err_msg = match &reason {
@@ -471,8 +479,8 @@ impl<P: LLMProvider> Agent<P> {
                             output: ToolOutput::Err(err_msg),
                             outcome: ToolCallOutcome::Rejected { reason },
                         };
-                        yield AgentEvent::ToolCallEnd(tool_message.clone());
-                        self.add_message(Message::Tool(tool_message)).await;
+                        self.add_message(Message::Tool(tool_message.clone())).await;
+                        yield AgentEvent::ToolCallEnd(tool_message);
                     }
                     Some(ToolCallResolution::Execute) => {
                         calls_to_execute.push((call, ToolCallOutcome::Approved));
