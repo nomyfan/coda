@@ -60,8 +60,7 @@ impl SessionStore {
 
     /// Return all sessions sorted by `updated_at` descending (most recent first).
     pub fn list(&self) -> Vec<SessionMeta> {
-        let dir = &self.dir;
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return vec![];
         };
 
@@ -126,7 +125,7 @@ impl SessionStore {
         auto_calls: &[ToolCall],
     ) -> Result<String, Box<dyn std::error::Error>> {
         let dir = &self.dir;
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir)?;
 
         // Filter out System messages.
         let messages: Vec<Message> = messages

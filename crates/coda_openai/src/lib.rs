@@ -4,7 +4,8 @@ use async_openai::traits::RequestOptionsBuilder;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionTool,
@@ -41,11 +42,31 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 .into()
             }
             Message::Assistant(assistant_message) => {
-                //
-                ChatCompletionRequestAssistantMessage {
-                    content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                let content = if assistant_message.aborted {
+                    // Aborted messages use array form so the abort marker is a
+                    // separate content part the model won't confuse with normal output.
+                    let mut parts = vec![];
+                    if !assistant_message.content.is_empty() {
+                        parts.push(ChatCompletionRequestAssistantMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText {
+                                text: assistant_message.content,
+                            },
+                        ));
+                    }
+                    parts.push(ChatCompletionRequestAssistantMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText {
+                            text: "Error: Aborted by user".to_string(),
+                        },
+                    ));
+                    Some(ChatCompletionRequestAssistantMessageContent::Array(parts))
+                } else {
+                    Some(ChatCompletionRequestAssistantMessageContent::Text(
                         assistant_message.content,
-                    )),
+                    ))
+                };
+
+                ChatCompletionRequestAssistantMessage {
+                    content,
                     tool_calls: Some(
                         assistant_message
                             .tool_calls
@@ -278,6 +299,7 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
             content: value.content,
             tool_calls,
             usage: value.usage,
+            aborted: false,
         })
     }
 }

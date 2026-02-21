@@ -21,6 +21,10 @@ pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<CompletionUsage>,
+    /// Whether LLM generation for this assistant message was interrupted by user abort
+    /// before a normal completion was produced.
+    #[serde(default)]
+    pub aborted: bool,
 }
 
 /// A message representing a tool call from the AI.
@@ -58,6 +62,8 @@ pub enum ToolCallOutcome {
     Resolved,
     /// Suspended, then the caller rejected execution.
     Rejected { reason: Option<String> },
+    /// Execution was interrupted by user abort.
+    Aborted,
 }
 
 /// A message representing the result of a tool execution.

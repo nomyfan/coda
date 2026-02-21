@@ -13,7 +13,7 @@ use tracing::warn;
 
 use ask_user::{AskUserParams, AskUserTool};
 use coda_agent::{
-    Agent, AgentCheckpoint, AgentEvent, ResumeDecision, RunConfig, SessionStore,
+    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, ResumeDecision, RunConfig, SessionStore,
     ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
@@ -310,48 +310,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::pin(agent.run(UserMessage(user_input.to_string()), make_config(thread_id)))
         };
 
+        let mut abort_requested = false;
+
         loop {
             let mut suspended_checkpoint = None;
 
-            while let Some(event) = stream.next().await {
-                match event.map_err(|e: StreamError| Box::new(e) as Box<dyn std::error::Error>)? {
-                    AgentEvent::LLMContentChunk(s) => {
-                        print!("{s}");
-                        io::stdout().flush()?;
-                    }
-                    AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
-                        println!();
-                    }
-                    AgentEvent::ToolCallStart(c) => {
-                        debug!(
-                            "tool call: id={} name={} arguments={:?}",
-                            c.id, c.name, c.arguments
-                        );
-                        println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
-                    }
-                    AgentEvent::ToolCallEnd(m) => {
-                        debug!(
-                            "tool result: id={} name={} output={:?}",
-                            m.id, m.name, m.output
-                        );
-                    }
-                    AgentEvent::Suspended(checkpoint) => {
-                        // Persist the checkpoint so it survives process restarts.
-                        match session_store
-                            .save_checkpoint(current_session_id.as_deref(), &checkpoint)
-                        {
-                            Ok(id) => current_session_id = Some(id),
-                            Err(e) => warn!("Failed to save checkpoint: {}", e),
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        if abort_requested {
+                            // Second Ctrl+C: force exit.
+                            drop(stream);
+                            save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
                         }
-                        suspended_checkpoint = Some(checkpoint);
-                        break;
+                        abort_requested = true;
+                        agent.abort();
+                        // Continue consuming the stream to receive the Aborted event.
                     }
-                    _ => {}
+                    event = stream.next() => {
+                        match event {
+                            None => break,
+                            Some(Err(e)) => {
+                                return Err(Box::new(e) as Box<dyn std::error::Error>);
+                            }
+                            Some(Ok(event)) => match event {
+                                AgentEvent::LLMContentChunk(s) => {
+                                    print!("{s}");
+                                    io::stdout().flush()?;
+                                }
+                                AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
+                                    println!();
+                                }
+                                AgentEvent::ToolCallStart(c) => {
+                                    debug!(
+                                        "tool call: id={} name={} arguments={:?}",
+                                        c.id, c.name, c.arguments
+                                    );
+                                    println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                                }
+                                AgentEvent::ToolCallEnd(m) => {
+                                    debug!(
+                                        "tool result: id={} name={} output={:?}",
+                                        m.id, m.name, m.output
+                                    );
+                                }
+                                AgentEvent::Suspended(checkpoint) => {
+                                    match session_store
+                                        .save_checkpoint(current_session_id.as_deref(), &checkpoint)
+                                    {
+                                        Ok(id) => current_session_id = Some(id),
+                                        Err(e) => warn!("Failed to save checkpoint: {}", e),
+                                    }
+                                    suspended_checkpoint = Some(checkpoint);
+                                    break;
+                                }
+                                AgentEvent::Aborted(target) => {
+                                    match &target {
+                                        AbortedTarget::Generation => {
+                                            println!("\n\n[Aborted: generation interrupted]");
+                                        }
+                                        AbortedTarget::ToolCalls(ids) => {
+                                            println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
+                                        }
+                                    }
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
 
             match suspended_checkpoint {
-                None => break, // stream completed normally
+                None => break, // stream completed normally or aborted
                 Some(checkpoint) => {
                     let mut resolutions = vec![];
                     for pending_call in &checkpoint.pending_calls {
@@ -378,10 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     resolutions.push((id, ToolCallResolution::Execute));
                                 }
                                 Either::Right((id, reason)) => {
-                                    resolutions.push((
-                                        id,
-                                        ToolCallResolution::Rejected { reason },
-                                    ));
+                                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
                                 }
                             }
                         }
@@ -448,6 +478,7 @@ fn print_history(messages: &[Message]) {
                         let tag = match &t.outcome {
                             ToolCallOutcome::Approved => " (approved)",
                             ToolCallOutcome::Resolved => " (resolved)",
+                            ToolCallOutcome::Aborted => " (aborted)",
                             _ => "",
                         };
                         println!("  -> {status}{tag}");
