@@ -51,10 +51,10 @@ pub struct AgentCheckpoint {
     pub todos: Vec<TodoItem>,
 }
 
-pub struct AgentState {
+pub struct AgentState<S> {
     pub messages: Vec<Message>,
     pub todos: Vec<TodoItem>,
-    // TODO: custom opaque state
+    pub opaque: S,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -79,8 +79,8 @@ pub enum AgentEvent {
     Aborted(AbortedTarget),
 }
 
-pub struct Agent {
-    pub state: Arc<Mutex<AgentState>>,
+pub struct Agent<S> {
+    pub state: Arc<Mutex<AgentState<S>>>,
     pub tools: ToolManager,
 }
 
@@ -93,11 +93,12 @@ pub struct RunConfig<P: LLMProvider> {
     pub tool_approval: ToolApprovalMode,
 }
 
-impl Agent {
-    pub fn new() -> Self {
+impl<S: Send + 'static> Agent<S> {
+    pub fn new(state: S) -> Self {
         let state = Arc::new(Mutex::new(AgentState {
             messages: vec![],
             todos: vec![],
+            opaque: state,
         }));
 
         Agent {
@@ -106,22 +107,22 @@ impl Agent {
         }
     }
 
-    pub fn new_with_default_tools(workspace_dir: impl Into<String>) -> Self {
-        let mut agent = Self::new();
+    pub fn with_default_tools(&mut self, workspace_dir: impl Into<String>) {
         let cwd = workspace_dir.into();
-        let state = agent.state.clone();
-        agent.tools.register(ShellTool::new());
-        agent.tools.register(ReadFileTool::new());
-        agent.tools.register(WriteFileTool::new());
-        agent.tools.register(ListDirectoryTool::new());
-        agent.tools.register(GrepTool::new(cwd.clone()));
-        agent.tools.register(GlobTool::new(cwd));
-        agent.tools.register(ReadTodosTool::new(state.clone()));
-        agent.tools.register(WriteTodosTool::new(state));
-        agent
+        self.tools.register(ShellTool::new());
+        self.tools.register(ReadFileTool::new());
+        self.tools.register(WriteFileTool::new());
+        self.tools.register(ListDirectoryTool::new());
+        self.tools.register(GrepTool::new(cwd.clone()));
+        self.tools.register(GlobTool::new(cwd));
+        let state = self.state.clone();
+        self.tools.register(ReadTodosTool::new(state.clone()));
+        self.tools.register(WriteTodosTool::new(state));
     }
+}
 
-    pub fn state(&self) -> Arc<Mutex<AgentState>> {
+impl<S> Agent<S> {
+    pub fn state(&self) -> Arc<Mutex<AgentState<S>>> {
         self.state.clone()
     }
 

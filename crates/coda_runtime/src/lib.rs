@@ -25,9 +25,9 @@ impl AgentRuntime {
     /// Completed results are yielded as `ToolCallEnd` and written to history immediately.
     /// On cancellation, already-completed results are preserved; unfinished calls get
     /// `ToolCallOutcome::Aborted` and the stream ends with `AgentEvent::Aborted`.
-    fn execute_tool_calls<'a>(
+    fn execute_tool_calls<'a, S>(
         &'a self,
-        agent: &'a mut Agent,
+        agent: &'a mut Agent<S>,
         calls: Vec<(ToolCall, ToolCallOutcome)>,
         cancel: &'a CancellationToken,
     ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + 'a {
@@ -116,9 +116,9 @@ impl AgentRuntime {
 
     /// Core run loop shared by `run` and `resume`. Drives the LLM ↔ tool execution cycle
     /// until the model stops requesting tools or a suspension point is reached.
-    fn run_loop<'a, P: LLMProvider>(
+    fn run_loop<'a, P: LLMProvider, S>(
         &'a self,
-        agent: &'a mut Agent,
+        agent: &'a mut Agent<S>,
         config: &'a RunConfig<P>,
         cancel_token: &'a CancellationToken,
     ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + 'a {
@@ -253,9 +253,9 @@ impl AgentRuntime {
     /// Continue the run loop from the current state, without requiring a new user message.
     /// Use this after manually injecting a `ToolMessage` into the conversation (e.g. for
     /// interactive tools handled entirely on the CLI side).
-    pub fn continue_run<'a, P: LLMProvider>(
+    pub fn continue_run<'a, P: LLMProvider, S>(
         &'a self,
-        agent: &'a mut Agent,
+        agent: &'a mut Agent<S>,
         config: RunConfig<P>,
         cancel_token: CancellationToken,
     ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + 'a {
@@ -267,9 +267,9 @@ impl AgentRuntime {
         }
     }
 
-    pub fn run_agent<'a, P: LLMProvider>(
+    pub fn run_agent<'a, P: LLMProvider, S>(
         &'a self,
-        agent: &'a mut Agent,
+        agent: &'a mut Agent<S>,
         config: RunConfig<P>,
         cancel_token: CancellationToken,
     ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + 'a {
@@ -289,9 +289,9 @@ impl AgentRuntime {
     /// - `Rejected { reason }` → error injected (outcome: `Rejected`)
     ///
     /// Auto calls from the checkpoint are always executed (outcome: `Auto`).
-    pub fn resume<'a, P: LLMProvider>(
+    pub fn resume<'a, P: LLMProvider, S>(
         &'a self,
-        agent: &'a mut Agent,
+        agent: &'a mut Agent<S>,
         checkpoint: AgentCheckpoint,
         decision: ResumeDecision,
         config: RunConfig<P>,

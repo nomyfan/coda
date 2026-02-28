@@ -210,7 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_url,
         stream: true,
     });
-    let mut agent = Agent::new_with_default_tools(workspace_str.clone());
+    let mut agent = Agent::new(());
+    agent.with_default_tools(workspace_str.clone());
     agent.tools.register(AskUserTool::new());
 
     agent
@@ -522,7 +523,7 @@ fn resolve_pending_calls(
     Ok(resolutions)
 }
 
-async fn save_and_exit(agent: &Agent, store: &SessionStore, session_id: Option<&str>) -> ! {
+async fn save_and_exit<S>(agent: &Agent<S>, store: &SessionStore, session_id: Option<&str>) -> ! {
     let messages = agent.messages().await;
     let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
     if has_user_msg {
