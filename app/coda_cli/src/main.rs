@@ -21,8 +21,10 @@ use coda_core::llm::{
     ToolOutput, UserMessage,
 };
 use coda_openai::OpenAI;
+use coda_runtime::AgentRuntime;
 use coda_skills::Skills;
 use futures::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -203,19 +205,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut agent = Agent::new_with_default_tools(
-        OpenAI::new(LLMProviderConfig {
-            api_key,
-            base_url,
-            stream: true,
-        }),
-        workspace_str.clone(),
-    );
+    let privoder = OpenAI::new(LLMProviderConfig {
+        api_key,
+        base_url,
+        stream: true,
+    });
+    let mut agent = Agent::new_with_default_tools(workspace_str.clone());
     agent.tools.register(AskUserTool::new());
 
     agent
         .add_message(Message::System(SystemMessage(system_prompt)))
         .await;
+    let runtime = AgentRuntime::new();
 
     print_logo();
 
@@ -258,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Type 'quit', 'exit', or 'q' to stop");
 
     let make_config = |thread_id: String| RunConfig {
+        provider: privoder.clone(),
         model: model.clone(),
         max_completion_tokens: Some(5000),
         temperature: Some(0.5),
@@ -273,15 +275,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main conversation loop
     loop {
-        // Explicit dyn Stream type so run() and resume() can be assigned to the same variable.
-        let mut stream: std::pin::Pin<
-            Box<dyn Stream<Item = Result<AgentEvent, StreamError>> + '_>,
-        > = if let Some(cp) = initial_checkpoint.take() {
-            // Restored from a saved session: surface the checkpoint immediately without
-            // starting a new LLM turn or reading user input.
-            Box::pin(futures::stream::once(async move {
-                Ok::<AgentEvent, StreamError>(AgentEvent::Suspended(cp))
-            }))
+        let cancel_token = CancellationToken::new();
+        let mut abort_requested = false;
+
+        // Determine the first action: restore a checkpoint or read new user input.
+        let mut pending_resume: Option<(AgentCheckpoint, ResumeDecision)> = None;
+
+        if let Some(cp) = initial_checkpoint.take() {
+            // Restored from a saved session: go straight to approval prompting
+            // without starting a new LLM turn.
+            match session_store.save_checkpoint(current_session_id.as_deref(), &cp) {
+                Ok(id) => current_session_id = Some(id),
+                Err(e) => warn!("Failed to save checkpoint: {}", e),
+            }
+            let resolutions = resolve_pending_calls(&mut rl, &cp)?;
+            pending_resume = Some((cp, ResumeDecision { resolutions }));
         } else {
             let raw_input = match rl.readline("\nYou: ") {
                 Ok(line) => line,
@@ -306,123 +314,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("Assistant: ");
             io::stdout().flush()?;
 
-            let thread_id = uuid::Uuid::new_v4().to_string();
-            Box::pin(agent.run(UserMessage(user_input.to_string()), make_config(thread_id)))
-        };
+            agent
+                .add_message(Message::User(UserMessage(user_input.to_string())))
+                .await;
+        }
 
-        let mut abort_requested = false;
-
+        // Stream / resume cycle. Each iteration creates a scoped stream so the
+        // mutable borrow on `agent` is released before the next iteration or
+        // the session-save code after the loop.
         loop {
             let mut suspended_checkpoint = None;
 
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => {
-                        if abort_requested {
-                            // Second Ctrl+C: force exit.
-                            drop(stream);
-                            save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
-                        }
-                        abort_requested = true;
-                        agent.abort();
-                        // Continue consuming the stream to receive the Aborted event.
-                    }
-                    event = stream.next() => {
-                        match event {
-                            None => break,
-                            Some(Err(e)) => {
-                                return Err(Box::new(e) as Box<dyn std::error::Error>);
+            {
+                // Scope the stream so `&mut agent` is released when the block ends.
+                let mut stream: std::pin::Pin<
+                    Box<dyn Stream<Item = Result<AgentEvent, StreamError>> + '_>,
+                > = if let Some((cp, decision)) = pending_resume.take() {
+                    let thread_id = cp.thread_id.clone();
+                    Box::pin(runtime.resume(
+                        &mut agent,
+                        cp,
+                        decision,
+                        make_config(thread_id),
+                        cancel_token.clone(),
+                    ))
+                } else {
+                    let thread_id = uuid::Uuid::new_v4().to_string();
+                    Box::pin(runtime.run_agent(
+                        &mut agent,
+                        make_config(thread_id),
+                        cancel_token.clone(),
+                    ))
+                };
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => {
+                            if abort_requested {
+                                // Second Ctrl+C: force exit.
+                                drop(stream);
+                                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
                             }
-                            Some(Ok(event)) => match event {
-                                AgentEvent::LLMContentChunk(s) => {
-                                    print!("{s}");
-                                    io::stdout().flush()?;
+                            abort_requested = true;
+                            cancel_token.cancel();
+                            // Continue consuming the stream to receive the Aborted event.
+                        }
+                        event = stream.next() => {
+                            match event {
+                                None => break,
+                                Some(Err(e)) => {
+                                    return Err(Box::new(e) as Box<dyn std::error::Error>);
                                 }
-                                AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
-                                    println!();
-                                }
-                                AgentEvent::ToolCallStart(c) => {
-                                    debug!(
-                                        "tool call: id={} name={} arguments={:?}",
-                                        c.id, c.name, c.arguments
-                                    );
-                                    println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
-                                }
-                                AgentEvent::ToolCallEnd(m) => {
-                                    debug!(
-                                        "tool result: id={} name={} output={:?}",
-                                        m.id, m.name, m.output
-                                    );
-                                }
-                                AgentEvent::Suspended(checkpoint) => {
-                                    match session_store
-                                        .save_checkpoint(current_session_id.as_deref(), &checkpoint)
-                                    {
-                                        Ok(id) => current_session_id = Some(id),
-                                        Err(e) => warn!("Failed to save checkpoint: {}", e),
+                                Some(Ok(event)) => match event {
+                                    AgentEvent::LLMContentChunk(s) => {
+                                        print!("{s}");
+                                        io::stdout().flush()?;
                                     }
-                                    suspended_checkpoint = Some(checkpoint);
-                                    break;
-                                }
-                                AgentEvent::Aborted(target) => {
-                                    match &target {
-                                        AbortedTarget::Generation => {
-                                            println!("\n\n[Aborted: generation interrupted]");
-                                        }
-                                        AbortedTarget::ToolCalls(ids) => {
-                                            println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
-                                        }
+                                    AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
+                                        println!();
                                     }
-                                    break;
+                                    AgentEvent::ToolCallStart(c) => {
+                                        debug!(
+                                            "tool call: id={} name={} arguments={:?}",
+                                            c.id, c.name, c.arguments
+                                        );
+                                        println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                                    }
+                                    AgentEvent::ToolCallEnd(m) => {
+                                        debug!(
+                                            "tool result: id={} name={} output={:?}",
+                                            m.id, m.name, m.output
+                                        );
+                                    }
+                                    AgentEvent::Suspended(checkpoint) => {
+                                        match session_store
+                                            .save_checkpoint(current_session_id.as_deref(), &checkpoint)
+                                        {
+                                            Ok(id) => current_session_id = Some(id),
+                                            Err(e) => warn!("Failed to save checkpoint: {}", e),
+                                        }
+                                        suspended_checkpoint = Some(checkpoint);
+                                        break;
+                                    }
+                                    AgentEvent::Aborted(target) => {
+                                        match &target {
+                                            AbortedTarget::Generation => {
+                                                println!("\n\n[Aborted: generation interrupted]");
+                                            }
+                                            AbortedTarget::ToolCalls(ids) => {
+                                                println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
                     }
                 }
-            }
+            } // stream dropped here — `&mut agent` borrow released
 
             match suspended_checkpoint {
                 None => break, // stream completed normally or aborted
                 Some(checkpoint) => {
-                    let mut resolutions = vec![];
-                    for pending_call in &checkpoint.pending_calls {
-                        if pending_call.name == "ask_user" {
-                            let output = match serde_json::from_str::<AskUserParams>(
-                                pending_call.arguments.as_deref().unwrap_or("{}"),
-                            ) {
-                                Ok(params) => ToolOutput::Ok(prompt_ask_user(
-                                    &mut rl,
-                                    &params.question,
-                                    &params.options,
-                                )?),
-                                Err(err) => {
-                                    ToolOutput::Err(format!("Invalid ask_user arguments: {err}"))
-                                }
-                            };
-                            resolutions.push((
-                                pending_call.id.clone(),
-                                ToolCallResolution::Resolved(output),
-                            ));
-                        } else {
-                            match prompt_approval(&mut rl, pending_call)? {
-                                Either::Left(id) => {
-                                    resolutions.push((id, ToolCallResolution::Execute));
-                                }
-                                Either::Right((id, reason)) => {
-                                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
-                                }
-                            }
-                        }
-                    }
-
-                    let thread_id = checkpoint.thread_id.clone();
-                    stream = Box::pin(agent.resume(
-                        checkpoint,
-                        ResumeDecision { resolutions },
-                        make_config(thread_id),
-                    ));
+                    let resolutions = resolve_pending_calls(&mut rl, &checkpoint)?;
+                    pending_resume = Some((checkpoint, ResumeDecision { resolutions }));
                 }
             }
         }
@@ -491,7 +489,40 @@ fn print_history(messages: &[Message]) {
     println!();
 }
 
-async fn save_and_exit(agent: &Agent<OpenAI>, store: &SessionStore, session_id: Option<&str>) -> ! {
+fn resolve_pending_calls(
+    rl: &mut rustyline::DefaultEditor,
+    checkpoint: &AgentCheckpoint,
+) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
+    let mut resolutions = vec![];
+    for pending_call in &checkpoint.pending_calls {
+        if pending_call.name == "ask_user" {
+            let output = match serde_json::from_str::<AskUserParams>(
+                pending_call.arguments.as_deref().unwrap_or("{}"),
+            ) {
+                Ok(params) => {
+                    ToolOutput::Ok(prompt_ask_user(rl, &params.question, &params.options)?)
+                }
+                Err(err) => ToolOutput::Err(format!("Invalid ask_user arguments: {err}")),
+            };
+            resolutions.push((
+                pending_call.id.clone(),
+                ToolCallResolution::Resolved(output),
+            ));
+        } else {
+            match prompt_approval(rl, pending_call)? {
+                Either::Left(id) => {
+                    resolutions.push((id, ToolCallResolution::Execute));
+                }
+                Either::Right((id, reason)) => {
+                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
+                }
+            }
+        }
+    }
+    Ok(resolutions)
+}
+
+async fn save_and_exit(agent: &Agent, store: &SessionStore, session_id: Option<&str>) -> ! {
     let messages = agent.messages().await;
     let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
     if has_user_msg {

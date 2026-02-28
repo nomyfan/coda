@@ -7,10 +7,12 @@ edition = "2024"
 coda_core = { workspace = true }
 coda_openai = { workspace = true }
 coda_agent = { workspace = true }
+coda_runtime = { workspace = true }
 coda_skills = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 dotenvy = "0.15.7"

@@ -179,6 +179,7 @@ dependencies = [
  "coda_agent",
  "coda_core",
  "coda_openai",
+ "coda_runtime",
  "coda_skills",
  "dotenvy",
  "either",
@@ -189,6 +190,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -212,6 +214,19 @@ dependencies = [
  "async-stream",
  "coda_core",
  "futures",
+]
+
+[[package]]
+name = "coda_runtime"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "coda_agent",
+ "coda_core",
+ "futures",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

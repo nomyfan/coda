@@ -121,6 +121,7 @@ impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct OpenAI {
     client: Client<OpenAIConfig>,
     /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
