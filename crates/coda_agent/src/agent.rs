@@ -1,17 +1,25 @@
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMProvider, Message, ToolCall, ToolMessage,
-    ToolOutput,
+    AssistantMessage, ChatCompletionRequest, LLMProvider, Message, SystemMessage, ToolCall,
+    ToolDefinition, ToolMessage, ToolOutput,
 };
-use coda_core::tool::ToolManager;
+use coda_core::tool::ToolSet;
 use tracing::debug;
 
 use crate::tools::{
     GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
     WriteTodosTool,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static NEXT_AGENT_ID: AtomicU32 = AtomicU32::new(0);
+
+fn next_agent_id() -> u32 {
+    NEXT_AGENT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
@@ -80,8 +88,12 @@ pub enum AgentEvent {
 }
 
 pub struct Agent<S> {
+    name: String,
+    pub agent_id: u32,
+    pub system_prompt: Option<String>,
     pub state: Arc<Mutex<AgentState<S>>>,
-    pub tools: ToolManager,
+    pub tools: ToolSet,
+    pub subagents: SubAgents,
 }
 
 pub struct RunConfig<P: LLMProvider> {
@@ -94,7 +106,7 @@ pub struct RunConfig<P: LLMProvider> {
 }
 
 impl<S: Send + 'static> Agent<S> {
-    pub fn new(state: S) -> Self {
+    pub fn new(name: impl ToString, state: S) -> Self {
         let state = Arc::new(Mutex::new(AgentState {
             messages: vec![],
             todos: vec![],
@@ -102,8 +114,12 @@ impl<S: Send + 'static> Agent<S> {
         }));
 
         Agent {
+            agent_id: next_agent_id(),
+            name: name.to_string(),
+            system_prompt: None,
             state,
-            tools: ToolManager::new(),
+            tools: ToolSet::default(),
+            subagents: SubAgents::default(),
         }
     }
 
@@ -126,6 +142,10 @@ impl<S> Agent<S> {
         self.state.clone()
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub async fn add_message(&self, message: Message) {
         debug!("Adding message: {:?}", message);
         self.state.lock().await.messages.push(message);
@@ -137,7 +157,11 @@ impl<S> Agent<S> {
     }
 
     pub async fn messages(&self) -> Vec<Message> {
-        self.state.lock().await.messages.clone()
+        let mut messages = self.state.lock().await.messages.clone();
+        if let Some(system_prompt) = &self.system_prompt {
+            messages.insert(0, Message::System(SystemMessage(system_prompt.clone())));
+        }
+        return messages;
     }
 
     /// Append previously saved (non-system) messages and restore todos.
@@ -146,5 +170,72 @@ impl<S> Agent<S> {
         let mut state = self.state.lock().await;
         state.messages.extend(messages);
         state.todos = todos;
+    }
+}
+
+pub enum SubAgent<S> {
+    // TODO: 是否有必要用 Mutex
+    Stateful(Mutex<Agent<S>>),
+    Stateless(Mutex<Agent<()>>),
+}
+
+pub struct SubAgentTool<S> {
+    pub name: String,
+    pub description: String,
+    pub agent: SubAgent<S>,
+}
+
+pub trait SubAgentObject: Send + Sync + 'static {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+}
+
+struct SubAgentToolWrapper<S>(SubAgentTool<S>);
+
+impl<S: Send + Sync + 'static> SubAgentObject for SubAgentToolWrapper<S> {
+    fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    fn description(&self) -> &str {
+        &self.0.description
+    }
+}
+
+pub struct SubAgents(Vec<Arc<dyn SubAgentObject>>);
+
+impl Default for SubAgents {
+    fn default() -> Self {
+        Self(vec![])
+    }
+}
+
+impl SubAgents {
+    pub fn register<S: Send + Sync + 'static>(&mut self, subagent: SubAgentTool<S>) {
+        self.0.push(Arc::new(SubAgentToolWrapper(subagent)));
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn SubAgentObject>> {
+        self.0.iter().find(|agent| agent.name() == name).cloned()
+    }
+
+    pub fn descriptors(&self) -> Vec<ToolDefinition> {
+        self.0
+            .iter()
+            .map(|subagent| ToolDefinition {
+                name: subagent.name().to_string(),
+                description: subagent.description().to_string(),
+                parameter_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The task to delegate to the sub-agent.",
+                        },
+                    },
+                    "required": ["task"],
+                }),
+            })
+            .collect()
     }
 }

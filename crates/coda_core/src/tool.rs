@@ -45,7 +45,7 @@ pub trait Tool: Send + Sync + 'static {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static;
 }
 
-pub trait ToolObject {
+pub trait ToolObject: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameter_schema(&self) -> &serde_json::Value;
@@ -115,18 +115,20 @@ impl<T: Tool> From<T> for ToolWrapper<T> {
     }
 }
 
-pub struct ToolManager {
+#[derive(Clone)]
+pub struct ToolSet {
     tools: BTreeMap<String, Arc<dyn ToolObject>>,
 }
 
-impl ToolManager {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        ToolManager {
-            tools: BTreeMap::new(),
+impl Default for ToolSet {
+    fn default() -> Self {
+        Self {
+            tools: Default::default(),
         }
     }
+}
 
+impl ToolSet {
     pub fn register<T: Tool>(&mut self, tool: T) {
         self.tools
             .insert(tool.name().to_string(), Arc::new(ToolWrapper::from(tool)));

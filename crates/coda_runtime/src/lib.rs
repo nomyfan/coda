@@ -250,23 +250,6 @@ impl AgentRuntime {
         }
     }
 
-    /// Continue the run loop from the current state, without requiring a new user message.
-    /// Use this after manually injecting a `ToolMessage` into the conversation (e.g. for
-    /// interactive tools handled entirely on the CLI side).
-    pub fn continue_run<'a, P: LLMProvider, S>(
-        &'a self,
-        agent: &'a mut Agent<S>,
-        config: RunConfig<P>,
-        cancel_token: CancellationToken,
-    ) -> impl Stream<Item = Result<AgentEvent, StreamError>> + 'a {
-        async_stream::try_stream! {
-            let mut inner = std::pin::pin!(self.run_loop(agent, &config, &cancel_token));
-            while let Some(event) = inner.next().await {
-                yield event?;
-            }
-        }
-    }
-
     pub fn run_agent<'a, P: LLMProvider, S>(
         &'a self,
         agent: &'a mut Agent<S>,

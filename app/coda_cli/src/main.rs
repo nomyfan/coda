@@ -17,8 +17,8 @@ use coda_agent::{
     ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
-    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
-    ToolOutput, UserMessage,
+    LLMProviderConfig, Message, StreamError, ToolCall, ToolCallOutcome, ToolMessage, ToolOutput,
+    UserMessage,
 };
 use coda_openai::OpenAI;
 use coda_runtime::AgentRuntime;
@@ -210,13 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_url,
         stream: true,
     });
-    let mut agent = Agent::new(());
+    let mut agent = Agent::new("coda", ());
     agent.with_default_tools(workspace_str.clone());
     agent.tools.register(AskUserTool::new());
-
-    agent
-        .add_message(Message::System(SystemMessage(system_prompt)))
-        .await;
+    agent.system_prompt = Some(system_prompt.clone());
     let runtime = AgentRuntime::new();
 
     print_logo();
