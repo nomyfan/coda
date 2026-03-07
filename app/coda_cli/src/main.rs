@@ -1,4 +1,4 @@
-use coda_agent::{Agent, AgentEvent, Envelope, RunConfig, Sender};
+use coda_agent::{Agent, AgentEvent, Envelope, RunConfig, Sender, SubAgentTool};
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_runtime::{AgentCommand, AgentRuntime};
@@ -66,15 +66,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let provider = OpenAI::new(LLMProviderConfig {
+    let provider = std::sync::Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
         base_url,
         stream: true,
-    });
+    }));
 
-    let mut agent = Agent::new("coda", ());
+    // Create a subagent for research tasks
+    let mut researcher = Agent::new("researcher");
+    researcher.with_default_tools(workspace_str.clone());
+    researcher.system_prompt = Some(
+        "You are a research assistant. You can read files, search code, and list directories. \
+         Summarize your findings concisely."
+            .to_string(),
+    );
+
+    let mut agent = Agent::new("coda");
     agent.with_default_tools(workspace_str.clone());
     agent.system_prompt = Some(system_prompt);
+    agent.subagents.register(SubAgentTool {
+        name: "researcher".to_string(),
+        description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".to_string(),
+        agent: tokio::sync::Mutex::new(researcher),
+    });
 
     let runtime = AgentRuntime::new();
     let handle = runtime
@@ -117,8 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Subscribe before sending to avoid missing events
-        let mut event_rx = handle.subscribe();
+        // Subscribe to all agents (including subagents spawned later)
+        let mut event_rx = runtime.subscribe();
 
         handle
             .send_message(Envelope::new(|id| Envelope {
@@ -144,28 +158,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(0);
                     }
                     abort_requested = true;
-                    let _ = handle.send_command(AgentCommand::Abort).await;
+                    runtime.broadcast_command(AgentCommand::Abort).await;
                 }
                 event = event_rx.recv() => {
                     match event {
                         Err(_) => break,
-                        Ok(AgentEvent::LLMContentChunk(s)) => {
-                            print!("{s}");
+                        Ok((aid, AgentEvent::LLMContentChunk(s))) => {
+                            if aid == *handle.agent_id() {
+                                print!("{s}");
+                            } else {
+                                print!("\x1b[36m{s}\x1b[0m");
+                            }
                             io::stdout().flush()?;
                         }
-                        Ok(AgentEvent::LLMEnd(msg)) => {
+                        Ok((aid, AgentEvent::LLMEnd(msg))) => {
                             if !msg.content.is_empty() {
                                 println!();
                             }
-                            if msg.tool_calls.is_empty() {
+                            // Only the main agent finishing means the turn is done.
+                            if aid == *handle.agent_id() && msg.tool_calls.is_empty() {
                                 break;
                             }
                         }
-                        Ok(AgentEvent::ToolCallStart(c)) => {
-                            println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                        Ok((aid, AgentEvent::ToolCallStart(c))) => {
+                            let is_main = aid == *handle.agent_id();
+                            if is_main {
+                                println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                            } else {
+                                println!("\n\x1b[36m[Sub-agent Tool: {}]: {:?}\x1b[0m", c.name, c.arguments);
+                            }
                         }
-                        Ok(AgentEvent::ToolCallEnd(_)) => {}
-                        Ok(AgentEvent::Aborted(target)) => {
+                        Ok((_, AgentEvent::ToolCallEnd(_))) => {}
+                        Ok((aid, AgentEvent::Aborted(target))) if aid == *handle.agent_id() => {
                             match &target {
                                 coda_agent::AbortedTarget::Generation => {
                                     println!("\n\n[Aborted: generation interrupted]");
@@ -176,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             break;
                         }
-                        Ok(AgentEvent::Error(err)) => {
+                        Ok((aid, AgentEvent::Error(err))) if aid == *handle.agent_id() => {
                             eprintln!("\nError: {}", err);
                             break;
                         }

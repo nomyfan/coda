@@ -53,10 +53,9 @@ pub struct AgentCheckpoint {
     pub todos: Vec<TodoItem>,
 }
 
-pub struct AgentState<S> {
+pub struct AgentState {
     pub messages: Vec<Message>,
     pub todos: Vec<TodoItem>,
-    pub opaque: S,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -133,10 +132,10 @@ pub enum AgentEvent {
     AgentToAgent(Envelope),
 }
 
-pub struct Agent<S> {
+pub struct Agent {
     name: String,
     pub system_prompt: Option<String>,
-    pub state: Arc<Mutex<AgentState<S>>>,
+    pub state: Arc<Mutex<AgentState>>,
     pub tools: ToolSet,
     pub subagents: SubAgents,
 }
@@ -149,12 +148,23 @@ pub struct RunConfig<P: LLMProvider> {
     pub thread_id: String,
 }
 
-impl<S: Send + 'static> Agent<S> {
-    pub fn new(name: impl ToString, state: S) -> Self {
+impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
+    fn clone(&self) -> Self {
+        RunConfig {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            max_completion_tokens: self.max_completion_tokens,
+            thread_id: self.thread_id.clone(),
+        }
+    }
+}
+
+impl Agent {
+    pub fn new(name: impl ToString) -> Self {
         let state = Arc::new(Mutex::new(AgentState {
             messages: vec![],
             todos: vec![],
-            opaque: state,
         }));
 
         Agent {
@@ -163,6 +173,20 @@ impl<S: Send + 'static> Agent<S> {
             state,
             tools: ToolSet::default(),
             subagents: SubAgents::default(),
+        }
+    }
+
+    /// Create a fresh agent from this template, sharing tools/subagents but with empty state.
+    pub fn clone_as_template(&self) -> Self {
+        Agent {
+            name: self.name.clone(),
+            system_prompt: self.system_prompt.clone(),
+            state: Arc::new(Mutex::new(AgentState {
+                messages: vec![],
+                todos: vec![],
+            })),
+            tools: self.tools.clone(),
+            subagents: self.subagents.clone(),
         }
     }
 
@@ -180,8 +204,8 @@ impl<S: Send + 'static> Agent<S> {
     }
 }
 
-impl<S> Agent<S> {
-    pub fn state(&self) -> Arc<Mutex<AgentState<S>>> {
+impl Agent {
+    pub fn state(&self) -> Arc<Mutex<AgentState>> {
         self.state.clone()
     }
 
@@ -216,26 +240,21 @@ impl<S> Agent<S> {
     }
 }
 
-pub enum SubAgent<S> {
-    // TODO: 是否有必要用 Mutex
-    Stateful(Mutex<Agent<S>>),
-    Stateless(Mutex<Agent<()>>),
-}
-
-pub struct SubAgentTool<S> {
+pub struct SubAgentTool {
     pub name: String,
     pub description: String,
-    pub agent: SubAgent<S>,
+    pub agent: Mutex<Agent>,
 }
 
 pub trait SubAgentObject: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn agent(&self) -> &Mutex<Agent>;
 }
 
-struct SubAgentToolWrapper<S>(SubAgentTool<S>);
+struct SubAgentToolWrapper(SubAgentTool);
 
-impl<S: Send + Sync + 'static> SubAgentObject for SubAgentToolWrapper<S> {
+impl SubAgentObject for SubAgentToolWrapper {
     fn name(&self) -> &str {
         &self.0.name
     }
@@ -243,13 +262,17 @@ impl<S: Send + Sync + 'static> SubAgentObject for SubAgentToolWrapper<S> {
     fn description(&self) -> &str {
         &self.0.description
     }
+
+    fn agent(&self) -> &Mutex<Agent> {
+        &self.0.agent
+    }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SubAgents(Vec<Arc<dyn SubAgentObject>>);
 
 impl SubAgents {
-    pub fn register<S: Send + Sync + 'static>(&mut self, subagent: SubAgentTool<S>) {
+    pub fn register(&mut self, subagent: SubAgentTool) {
         self.0.push(Arc::new(SubAgentToolWrapper(subagent)));
     }
 

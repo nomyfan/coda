@@ -135,3 +135,12 @@ pub trait LLMProvider: Send + Sync + 'static {
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_;
 }
+
+impl<P: LLMProvider> LLMProvider for std::sync::Arc<P> {
+    fn stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
+        (**self).stream(request)
+    }
+}

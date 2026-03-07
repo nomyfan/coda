@@ -224,6 +224,7 @@ dependencies = [
  "coda_agent",
  "coda_core",
  "futures",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
