@@ -274,7 +274,6 @@ async fn run_agent<P: LLMProvider + Clone>(
 ) {
     // Wait for incoming messages, then process them in the agent loop.
     while let Some(envelope) = message_rx.recv().await {
-
         // Add the envelope body as a user message to the conversation.
         agent
             .add_message(Message::User(UserMessage(envelope.body)))
@@ -437,19 +436,21 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
                     Err(e) => ToolOutput::Err(e.to_string()),
                 },
                 None => match subagent {
-                    Some(subagent) => {
-                        let task = tc
-                            .arguments
-                            .as_deref()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                            .and_then(|v| v.get("task")?.as_str().map(String::from))
-                            .unwrap_or_default();
-                        match run_subagent(caller_agent_id, &subagent, &task, config, runtime).await
-                        {
-                            Ok(content) => ToolOutput::Ok(content),
-                            Err(e) => ToolOutput::Err(e),
+                    Some(subagent) => match tc.arguments.as_deref() {
+                        Some(s) => {
+                            let task = serde_json::from_str::<serde_json::Value>(s)
+                                .ok()
+                                .and_then(|v| v.get("task")?.as_str().map(String::from))
+                                .unwrap_or_else(|| s.to_string());
+                            match run_subagent(caller_agent_id, &subagent, &task, config, runtime)
+                                .await
+                            {
+                                Ok(content) => ToolOutput::Ok(content),
+                                Err(e) => ToolOutput::Err(e),
+                            }
                         }
-                    }
+                        None => ToolOutput::Err("Missing arguments".to_string()),
+                    },
                     None => ToolOutput::Err(format!("Tool '{}' not found", tc.name)),
                 },
             };
@@ -594,10 +595,7 @@ fn run_subagent<'a, P: LLMProvider + Clone>(
                     });
                     let sent_id = envelope.id.clone();
 
-                    if let Err(e) = runtime
-                        .send_message(&derived_id, envelope)
-                        .await
-                    {
+                    if let Err(e) = runtime.send_message(&derived_id, envelope).await {
                         let _ = result_tx.send(Err(e.to_string()));
                         return;
                     }
