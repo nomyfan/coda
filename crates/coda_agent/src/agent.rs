@@ -302,7 +302,14 @@ impl SubAgents {
             .iter()
             .map(|subagent| ToolDefinition {
                 name: subagent.name().to_string(),
-                description: subagent.description().to_string(),
+                description: if subagent.mode() == SubAgentMode::Stateful {
+                    format!(
+                        "{}\n\nIMPORTANT: This sub-agent does NOT support concurrent invocation. Do NOT call this tool more than once in the same tool-call batch. If you need to invoke it multiple times, call it sequentially — one at a time.",
+                        subagent.description()
+                    )
+                } else {
+                    subagent.description().to_string()
+                },
                 parameter_schema: json!({
                     "type": "object",
                     "properties": {

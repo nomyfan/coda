@@ -422,14 +422,45 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     config: &RunConfig<P>,
     runtime: &AgentRuntime,
 ) -> Result<(), bool> {
+    // Detect duplicate subagent calls within the same batch.
+    let mut subagent_call_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for tc in &tool_calls {
+        if let Some(sa) = agent.subagents.get(&tc.name) {
+            if sa.mode() == SubAgentMode::Stateful {
+                *subagent_call_counts.entry(tc.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let concurrent_subagents: std::collections::HashSet<String> = subagent_call_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect();
+
     let tool_futs = futures::stream::FuturesUnordered::new();
     let mut pending_ids: HashMap<String, String> = HashMap::new();
     for tc in tool_calls {
         pending_ids.insert(tc.id.clone(), tc.name.clone());
         let _ = event_sender.send(AgentEvent::ToolCallStart(tc.clone()));
+
         let tool = agent.tools.get(&tc.name);
         let subagent = agent.subagents.get(&tc.name);
-        tool_futs.push(async {
+        let is_concurrent_call = concurrent_subagents.contains(&tc.name);
+        tool_futs.push(async move {
+            if is_concurrent_call {
+                return ToolMessage {
+                    id: tc.id,
+                    name: tc.name.clone(),
+                    output: ToolOutput::Err(format!(
+                        "Concurrent invocation of sub-agent '{}' is not allowed. \
+                        You called this sub-agent more than once in the same tool-call batch. \
+                        Call sub-agents sequentially — one at a time.",
+                        tc.name
+                    )),
+                    outcome: ToolCallOutcome::Auto,
+                };
+            }
             let output = match tool {
                 Some(t) => match t.execute(tc.arguments.unwrap_or_default()).await {
                     Ok(s) => ToolOutput::Ok(s),
