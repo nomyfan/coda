@@ -1,6 +1,7 @@
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, Message, SystemMessage, ToolCall,
@@ -13,13 +14,6 @@ use crate::tools::{
     GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
     WriteTodosTool,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static NEXT_AGENT_ID: AtomicU32 = AtomicU32::new(0);
-
-fn next_agent_id() -> u32 {
-    NEXT_AGENT_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
@@ -66,6 +60,7 @@ pub struct AgentState<S> {
 }
 
 /// Identifies what was interrupted by an abort.
+#[derive(Debug, Clone)]
 pub enum AbortedTarget {
     /// LLM generation was interrupted.
     Generation,
@@ -73,7 +68,55 @@ pub enum AbortedTarget {
     ToolCalls(Vec<String>),
 }
 
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+pub struct AgentID(String);
+
+impl Default for AgentID {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentID {
+    pub fn new() -> Self {
+        AgentID(Uuid::new_v4().to_string())
+    }
+}
+
+/// The sender of an envelope.
+#[derive(Debug, Clone)]
+pub enum Sender {
+    /// Message from the user.
+    User,
+    /// Message from another agent.
+    Agent(AgentID),
+}
+
+pub type Receiver = Sender;
+
+/// An envelope is a message delivered to an agent, containing the message body and metadata.
+#[derive(Debug, Clone)]
+pub struct Envelope {
+    /// A unique identifier for this message, used for tracking and replying.
+    pub id: String,
+    /// Sender of the message.
+    pub from: Sender,
+    /// Receiver of the message.
+    pub to: Receiver,
+    /// If this message is a reply to another message, this field contains the ID of the original message. Otherwise, it is None.
+    pub reply_to: Option<String>,
+    /// The actual content of the message.
+    pub body: String,
+}
+
+impl Envelope {
+    pub fn new(f: impl FnOnce(String) -> Self) -> Self {
+        f(Uuid::new_v4().to_string())
+    }
+}
+
 /// Events produced by `Agent::run` and `Agent::resume`.
+#[derive(Debug, Clone)]
 pub enum AgentEvent {
     LLMStart(ChatCompletionRequest),
     LLMContentChunk(String),
@@ -85,11 +128,13 @@ pub enum AgentEvent {
     Suspended(AgentCheckpoint),
     /// Emitted when the run is aborted by the user. The stream terminates after this event.
     Aborted(AbortedTarget),
+    Error(String), // TODO: make this more structured
+    // TODO: 可能需要一个事件表示子 agent 发消息了
+    AgentToAgent(Envelope),
 }
 
 pub struct Agent<S> {
     name: String,
-    pub agent_id: u32,
     pub system_prompt: Option<String>,
     pub state: Arc<Mutex<AgentState<S>>>,
     pub tools: ToolSet,
@@ -102,7 +147,6 @@ pub struct RunConfig<P: LLMProvider> {
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
     pub thread_id: String,
-    pub tool_approval: ToolApprovalMode,
 }
 
 impl<S: Send + 'static> Agent<S> {
@@ -114,7 +158,6 @@ impl<S: Send + 'static> Agent<S> {
         }));
 
         Agent {
-            agent_id: next_agent_id(),
             name: name.to_string(),
             system_prompt: None,
             state,
@@ -161,7 +204,7 @@ impl<S> Agent<S> {
         if let Some(system_prompt) = &self.system_prompt {
             messages.insert(0, Message::System(SystemMessage(system_prompt.clone())));
         }
-        return messages;
+        messages
     }
 
     /// Append previously saved (non-system) messages and restore todos.
@@ -202,13 +245,8 @@ impl<S: Send + Sync + 'static> SubAgentObject for SubAgentToolWrapper<S> {
     }
 }
 
+#[derive(Default)]
 pub struct SubAgents(Vec<Arc<dyn SubAgentObject>>);
-
-impl Default for SubAgents {
-    fn default() -> Self {
-        Self(vec![])
-    }
-}
 
 impl SubAgents {
     pub fn register<S: Send + Sync + 'static>(&mut self, subagent: SubAgentTool<S>) {

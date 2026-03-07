@@ -115,17 +115,9 @@ impl<T: Tool> From<T> for ToolWrapper<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ToolSet {
     tools: BTreeMap<String, Arc<dyn ToolObject>>,
-}
-
-impl Default for ToolSet {
-    fn default() -> Self {
-        Self {
-            tools: Default::default(),
-        }
-    }
 }
 
 impl ToolSet {
