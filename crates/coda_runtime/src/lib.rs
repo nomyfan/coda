@@ -1,4 +1,4 @@
-use coda_agent::{AbortedTarget, Agent, AgentEvent, AgentID, Envelope, Sender};
+use coda_agent::{AbortedTarget, Agent, AgentEvent, AgentID, Envelope, RunConfig, Sender};
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
     ToolCall, ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
@@ -99,10 +99,10 @@ impl AgentRuntime {
         }
     }
 
-    pub async fn spawn_agent<S: Send + 'static>(
+    pub async fn spawn_agent<S: Send + 'static, P: LLMProvider>(
         &self,
         agent: Agent<S>,
-        llm_provider: impl LLMProvider,
+        config: RunConfig<P>,
     ) -> AgentHandle {
         let agent_id = AgentID::new();
         let (command_tx, command_rx) = mpsc::channel(10);
@@ -120,12 +120,12 @@ impl AgentRuntime {
         let event_tx_for_task = event_tx.clone();
         let agent_id_for_task = agent_id.clone();
         tokio::spawn(async move {
-            run_agent(
+            agent_loop(
                 agent_id_for_task,
                 agent,
                 command_rx,
                 event_tx_for_task,
-                llm_provider,
+                config,
             )
             .await;
         });
@@ -186,15 +186,15 @@ impl AgentRuntime {
     }
 }
 
-async fn run_agent<S>(
+async fn agent_loop<S>(
     agent_id: AgentID,
     mut agent: Agent<S>,
-    mut command_receiver: mpsc::Receiver<AgentCommand>,
-    event_sender: broadcast::Sender<AgentEvent>,
-    llm_provider: impl LLMProvider,
+    mut command_rx: mpsc::Receiver<AgentCommand>,
+    event_tx: broadcast::Sender<AgentEvent>,
+    config: RunConfig<impl LLMProvider>,
 ) {
     // Wait for incoming messages, then process them in the agent loop.
-    while let Some(cmd) = command_receiver.recv().await {
+    while let Some(cmd) = command_rx.recv().await {
         let envelope = match cmd {
             AgentCommand::Message(envelope) => envelope,
             AgentCommand::Abort => continue,
@@ -207,15 +207,14 @@ async fn run_agent<S>(
 
         'agent_loop: loop {
             let request = ChatCompletionRequest {
-                // TODO: make this configurable per-agent
-                model: "google/gemini-3-flash-preview".to_string(),
-                max_completion_tokens: Some(5000),
-                temperature: Some(0.7),
+                model: config.model.clone(),
+                max_completion_tokens: config.max_completion_tokens,
+                temperature: config.temperature,
                 messages: agent.messages().await,
                 tools: agent.tools.descriptors(),
             };
 
-            let _ = event_sender.send(AgentEvent::LLMStart(request.clone()));
+            let _ = event_tx.send(AgentEvent::LLMStart(request.clone()));
 
             let mut assistant_message = None;
             let mut partial_content = String::new();
@@ -224,12 +223,12 @@ async fn run_agent<S>(
 
             // LLM stream
             {
-                let mut llm_stream = std::pin::pin!(llm_provider.stream(request));
+                let mut llm_stream = std::pin::pin!(config.provider.stream(request));
                 'llm_stream: loop {
                     // We select on both the LLM stream and the command receiver, so that we can react to commands (like abort) while waiting for the LLM response.
                     tokio::select! {
                         biased;
-                        Some(cmd) = command_receiver.recv() => {
+                        Some(cmd) = command_rx.recv() => {
                             match cmd {
                                 AgentCommand::Abort => {
                                     aborted_in_llm = true;
@@ -244,7 +243,7 @@ async fn run_agent<S>(
                             match event {
                                 Some(Ok(LLMStreamEvent::ContentChunk(s))) => {
                                     partial_content.push_str(&s);
-                                    let _ = event_sender.send(AgentEvent::LLMContentChunk(s));
+                                    let _ = event_tx.send(AgentEvent::LLMContentChunk(s));
                                 }
                                 Some(Ok(LLMStreamEvent::Completed(msg))) => {
                                     assistant_message = Some(msg);
@@ -264,7 +263,7 @@ async fn run_agent<S>(
             }
 
             if let Some(err) = llm_error {
-                let _ = event_sender.send(AgentEvent::Error(format!("{}", err)));
+                let _ = event_tx.send(AgentEvent::Error(format!("{}", err)));
                 break 'agent_loop;
             }
 
@@ -277,7 +276,7 @@ async fn run_agent<S>(
                         ..Default::default()
                     };
                     agent.add_message(Message::Assistant(partial_msg)).await;
-                    let _ = event_sender.send(AgentEvent::Aborted(AbortedTarget::Generation));
+                    let _ = event_tx.send(AgentEvent::Aborted(AbortedTarget::Generation));
                     break 'agent_loop;
                 }
             }
@@ -286,14 +285,14 @@ async fn run_agent<S>(
                 StreamError::InvalidResponse("LLM stream ended without Completed event".into())
             }) {
                 Err(err) => {
-                    let _ = event_sender.send(AgentEvent::Error(format!("{}", err)));
+                    let _ = event_tx.send(AgentEvent::Error(format!("{}", err)));
                     break 'agent_loop;
                 }
                 Ok(assistant_message) => {
                     agent
                         .add_message(Message::Assistant(assistant_message.clone()))
                         .await;
-                    let _ = event_sender.send(AgentEvent::LLMEnd(assistant_message.clone()));
+                    let _ = event_tx.send(AgentEvent::LLMEnd(assistant_message.clone()));
 
                     let stop = assistant_message.tool_calls.is_empty();
 
@@ -302,12 +301,12 @@ async fn run_agent<S>(
                         if let Err(true) = execute_tool_calls(
                             &mut agent,
                             assistant_message.tool_calls,
-                            &mut command_receiver,
-                            &event_sender,
+                            &mut command_rx,
+                            &event_tx,
                         )
                         .await
                         {
-                            let _ = event_sender
+                            let _ = event_tx
                                 .send(AgentEvent::Aborted(AbortedTarget::ToolCalls(vec![])));
                             break 'agent_loop;
                         }
@@ -325,7 +324,7 @@ async fn run_agent<S>(
                             reply_to: Some(envelope.id.clone()),
                             body: assistant_message.content,
                         };
-                        let _ = event_sender.send(AgentEvent::AgentToAgent(reply));
+                        let _ = event_tx.send(AgentEvent::AgentToAgent(reply));
                     }
                 }
             }

@@ -1,4 +1,4 @@
-use coda_agent::{Agent, AgentEvent, Envelope, Sender};
+use coda_agent::{Agent, AgentEvent, Envelope, RunConfig, Sender};
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_runtime::{AgentCommand, AgentRuntime};
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
     let base_url = env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
-    let _model = env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
+    let model = env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -77,7 +77,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agent.system_prompt = Some(system_prompt);
 
     let runtime = AgentRuntime::new();
-    let handle = runtime.spawn_agent(agent, provider).await;
+    let handle = runtime
+        .spawn_agent(
+            agent,
+            RunConfig {
+                provider,
+                model,
+                max_completion_tokens: Some(5000),
+                temperature: Some(0.7),
+                thread_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .await;
 
     print_logo();
 
