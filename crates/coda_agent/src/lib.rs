@@ -4,7 +4,7 @@ pub mod tools;
 
 pub use agent::{
     AbortedTarget, Agent, AgentCheckpoint, AgentEvent, AgentID, Envelope, ResumeDecision,
-    RunConfig, Sender, SubAgentObject, SubAgentTool, TodoItem, ToolApprovalMode,
+    RunConfig, Sender, SubAgentMode, SubAgentObject, SubAgentTool, TodoItem, ToolApprovalMode,
     ToolCallResolution,
 };
 pub use session::{SessionData, SessionMeta, SessionStore};

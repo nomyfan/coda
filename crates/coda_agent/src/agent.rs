@@ -80,6 +80,11 @@ impl AgentID {
     pub fn new() -> Self {
         AgentID(Uuid::new_v4().to_string())
     }
+
+    pub fn from_uuid5(namespace: &AgentID, name: &str) -> Self {
+        let ns = Uuid::parse_str(&namespace.0).unwrap_or(Uuid::nil());
+        AgentID(Uuid::new_v5(&ns, name.as_bytes()).to_string())
+    }
 }
 
 /// The sender of an envelope.
@@ -240,16 +245,24 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubAgentMode {
+    Stateless,
+    Stateful,
+}
+
 pub struct SubAgentTool {
     pub name: String,
     pub description: String,
     pub agent: Mutex<Agent>,
+    pub mode: SubAgentMode,
 }
 
 pub trait SubAgentObject: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn agent(&self) -> &Mutex<Agent>;
+    fn mode(&self) -> SubAgentMode;
 }
 
 struct SubAgentToolWrapper(SubAgentTool);
@@ -265,6 +278,10 @@ impl SubAgentObject for SubAgentToolWrapper {
 
     fn agent(&self) -> &Mutex<Agent> {
         &self.0.agent
+    }
+
+    fn mode(&self) -> SubAgentMode {
+        self.0.mode.clone()
     }
 }
 

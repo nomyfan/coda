@@ -1,7 +1,7 @@
 use coda_agent::{Agent, AgentEvent, Envelope, RunConfig, Sender, SubAgentTool};
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
-use coda_runtime::{AgentCommand, AgentRuntime};
+use coda_runtime::{AgentControl, AgentRuntime};
 use coda_skills::Skills;
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
@@ -88,6 +88,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "researcher".to_string(),
         description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".to_string(),
         agent: tokio::sync::Mutex::new(researcher),
+        mode: coda_agent::SubAgentMode::Stateless,
+    });
+
+    let mut memo = Agent::new("memo");
+    memo.system_prompt = Some(
+        "You are a simple memo agent. Your only job is to remember what the user tells you and \
+         answer questions about it. Keep your replies very brief."
+            .to_string(),
+    );
+
+    agent.subagents.register(SubAgentTool {
+        name: "memo".to_string(),
+        description: "A stateful memo agent that remembers information across calls. \
+                      Use it to store and recall facts across turns."
+            .to_string(),
+        agent: tokio::sync::Mutex::new(memo),
+        mode: coda_agent::SubAgentMode::Stateful,
     });
 
     let runtime = AgentRuntime::new();
@@ -158,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(0);
                     }
                     abort_requested = true;
-                    runtime.broadcast_command(AgentCommand::Abort).await;
+                    runtime.broadcast_command(AgentControl::Abort).await;
                 }
                 event = event_rx.recv() => {
                     match event {

@@ -1,5 +1,6 @@
 use coda_agent::{
-    AbortedTarget, Agent, AgentEvent, AgentID, Envelope, RunConfig, Sender, SubAgentObject,
+    AbortedTarget, Agent, AgentEvent, AgentID, Envelope, RunConfig, Sender, SubAgentMode,
+    SubAgentObject,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
@@ -14,12 +15,10 @@ use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub enum AgentCommand {
+pub enum AgentControl {
     Abort,
     /// Shut down the agent loop entirely.
     Exit,
-    /// Deliver a message to the agent, triggering a new turn.
-    Message(Envelope),
 }
 
 #[derive(Debug)]
@@ -41,7 +40,8 @@ impl std::error::Error for SendCommandError {}
 
 pub struct AgentHandle {
     agent_id: AgentID,
-    command_sender: mpsc::Sender<AgentCommand>,
+    control_sender: mpsc::Sender<AgentControl>,
+    message_sender: mpsc::Sender<Envelope>,
     event_sender: broadcast::Sender<AgentEvent>,
 }
 
@@ -50,8 +50,8 @@ impl AgentHandle {
         &self.agent_id
     }
 
-    pub async fn send_command(&self, cmd: AgentCommand) -> Result<(), SendCommandError> {
-        self.command_sender
+    pub async fn send_command(&self, cmd: AgentControl) -> Result<(), SendCommandError> {
+        self.control_sender
             .send(cmd)
             .await
             .map_err(|_| SendCommandError::ChannelClosed)
@@ -59,7 +59,10 @@ impl AgentHandle {
 
     /// Send a message to this agent, triggering a new turn.
     pub async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
-        self.send_command(AgentCommand::Message(envelope)).await
+        self.message_sender
+            .send(envelope)
+            .await
+            .map_err(|_| SendCommandError::ChannelClosed)
     }
 
     /// Opt-in subscribe to this agent's event stream.
@@ -69,7 +72,8 @@ impl AgentHandle {
 }
 
 struct AgentEntry {
-    command_sender: mpsc::Sender<AgentCommand>,
+    control_sender: mpsc::Sender<AgentControl>,
+    message_sender: mpsc::Sender<Envelope>,
 }
 
 #[derive(Clone)]
@@ -105,13 +109,15 @@ impl AgentRuntime {
         config: RunConfig<P>,
     ) -> AgentHandle {
         let agent_id = AgentID::new();
-        let (command_tx, command_rx) = mpsc::channel(10);
+        let (control_tx, control_rx) = mpsc::channel(10);
+        let (message_tx, message_rx) = mpsc::channel(32);
         let (event_tx, _) = broadcast::channel(64);
 
         self.agents.lock().await.insert(
             agent_id.clone(),
             AgentEntry {
-                command_sender: command_tx.clone(),
+                control_sender: control_tx.clone(),
+                message_sender: message_tx.clone(),
             },
         );
 
@@ -136,7 +142,8 @@ impl AgentRuntime {
             run_agent(
                 agent_id_for_task,
                 agent,
-                command_rx,
+                control_rx,
+                message_rx,
                 event_tx_for_task,
                 &config,
                 &runtime,
@@ -148,24 +155,42 @@ impl AgentRuntime {
 
         AgentHandle {
             agent_id,
-            command_sender: command_tx,
+            control_sender: control_tx,
+            message_sender: message_tx,
             event_sender: event_tx,
         }
     }
 
-    /// Send a command to a specific agent by ID.
+    /// Send a control command to a specific agent by ID.
     pub async fn send_command(
         &self,
         agent_id: &AgentID,
-        cmd: AgentCommand,
+        cmd: AgentControl,
     ) -> Result<(), SendCommandError> {
         let agents = self.agents.lock().await;
         let entry = agents
             .get(agent_id)
             .ok_or(SendCommandError::AgentNotFound)?;
         entry
-            .command_sender
+            .control_sender
             .send(cmd)
+            .await
+            .map_err(|_| SendCommandError::ChannelClosed)
+    }
+
+    /// Send a message to a specific agent by ID, triggering a new turn.
+    pub async fn send_message(
+        &self,
+        agent_id: &AgentID,
+        envelope: Envelope,
+    ) -> Result<(), SendCommandError> {
+        let agents = self.agents.lock().await;
+        let entry = agents
+            .get(agent_id)
+            .ok_or(SendCommandError::AgentNotFound)?;
+        entry
+            .message_sender
+            .send(envelope)
             .await
             .map_err(|_| SendCommandError::ChannelClosed)
     }
@@ -174,11 +199,66 @@ impl AgentRuntime {
         self.agents.lock().await.remove(agent_id);
     }
 
-    /// Broadcast a command to all agents.
-    pub async fn broadcast_command(&self, cmd: AgentCommand) {
+    /// Spawn an agent with a specific ID if it doesn't already exist (idempotent).
+    pub async fn get_or_spawn_agent_with_id<P: LLMProvider + Clone>(
+        &self,
+        agent_id: AgentID,
+        agent: Agent,
+        config: RunConfig<P>,
+    ) {
+        let mut agents = self.agents.lock().await;
+        if agents.contains_key(&agent_id) {
+            return;
+        }
+
+        let (control_tx, control_rx) = mpsc::channel(10);
+        let (message_tx, message_rx) = mpsc::channel(32);
+        let (event_tx, _) = broadcast::channel(64);
+
+        agents.insert(
+            agent_id.clone(),
+            AgentEntry {
+                control_sender: control_tx,
+                message_sender: message_tx,
+            },
+        );
+        drop(agents);
+
+        let event_tx_for_task = event_tx.clone();
+        let agent_id_for_task = agent_id.clone();
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let forward_task = {
+                let mut event_rx = event_tx_for_task.subscribe();
+                let global_tx = runtime.global_event_tx.clone();
+                let aid = agent_id_for_task.clone();
+                tokio::spawn(async move {
+                    while let Ok(event) = event_rx.recv().await {
+                        let _ = global_tx.send((aid.clone(), event));
+                    }
+                })
+            };
+
+            run_agent(
+                agent_id_for_task,
+                agent,
+                control_rx,
+                message_rx,
+                event_tx_for_task,
+                &config,
+                &runtime,
+            )
+            .await;
+
+            forward_task.abort();
+        });
+    }
+
+    /// Broadcast a control command to all agents.
+    pub async fn broadcast_command(&self, cmd: AgentControl) {
         let agents = self.agents.lock().await;
         for entry in agents.values() {
-            let _ = entry.command_sender.send(cmd.clone()).await;
+            let _ = entry.control_sender.send(cmd.clone()).await;
         }
     }
 }
@@ -186,18 +266,14 @@ impl AgentRuntime {
 async fn run_agent<P: LLMProvider + Clone>(
     agent_id: AgentID,
     mut agent: Agent,
-    mut command_rx: mpsc::Receiver<AgentCommand>,
+    mut control_rx: mpsc::Receiver<AgentControl>,
+    mut message_rx: mpsc::Receiver<Envelope>,
     event_tx: broadcast::Sender<AgentEvent>,
     config: &RunConfig<P>,
     runtime: &AgentRuntime,
 ) {
     // Wait for incoming messages, then process them in the agent loop.
-    while let Some(cmd) = command_rx.recv().await {
-        let envelope = match cmd {
-            AgentCommand::Message(envelope) => envelope,
-            AgentCommand::Abort => continue,
-            AgentCommand::Exit => break,
-        };
+    while let Some(envelope) = message_rx.recv().await {
 
         // Add the envelope body as a user message to the conversation.
         agent
@@ -231,14 +307,11 @@ async fn run_agent<P: LLMProvider + Clone>(
                     // We select on both the LLM stream and the command receiver, so that we can react to commands (like abort) while waiting for the LLM response.
                     tokio::select! {
                         biased;
-                        Some(cmd) = command_rx.recv() => {
+                        Some(cmd) = control_rx.recv() => {
                             match cmd {
-                                AgentCommand::Abort | AgentCommand::Exit => {
+                                AgentControl::Abort | AgentControl::Exit => {
                                     aborted_in_llm = true;
                                     break 'llm_stream;
-                                }
-                                AgentCommand::Message(_) => {
-                                    // Ignore messages while LLM is streaming; they'll be handled in the next turn.
                                 }
                             }
                         }
@@ -305,7 +378,7 @@ async fn run_agent<P: LLMProvider + Clone>(
                             &agent_id,
                             &mut agent,
                             assistant_message.tool_calls,
-                            &mut command_rx,
+                            &mut control_rx,
                             &event_tx,
                             config,
                             runtime,
@@ -345,7 +418,7 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     caller_agent_id: &AgentID,
     agent: &mut Agent,
     tool_calls: Vec<ToolCall>,
-    command_receiver: &mut mpsc::Receiver<AgentCommand>,
+    control_receiver: &mut mpsc::Receiver<AgentControl>,
     event_sender: &broadcast::Sender<AgentEvent>,
     config: &RunConfig<P>,
     runtime: &AgentRuntime,
@@ -395,15 +468,11 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     loop {
         tokio::select! {
             biased;
-            Some(cmd) = command_receiver.recv() => {
+            Some(cmd) = control_receiver.recv() => {
                 match cmd {
-                    AgentCommand::Abort | AgentCommand::Exit => {
+                    AgentControl::Abort | AgentControl::Exit => {
                         aborted = true;
                         break;
-                    }
-                    AgentCommand::Message(_) => {
-                        // TODO: maybe buffer messages
-                        // Ignore messages while executing tool calls.
                     }
                 }
             }
@@ -449,6 +518,7 @@ fn run_subagent<'a, P: LLMProvider + Clone>(
     runtime: &'a AgentRuntime,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
     Box::pin(async move {
+        let mode = subagent.mode();
         let cloned_agent = {
             let agent = subagent.agent().lock().await;
             agent.clone_as_template()
@@ -458,48 +528,111 @@ fn run_subagent<'a, P: LLMProvider + Clone>(
         let config = config.clone();
         let runtime = runtime.clone();
         let task = task.to_string();
+        let subagent_name = subagent.name().to_string();
 
         // Spawn in a separate task so all captured values are 'static.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let handle = runtime.spawn_agent(cloned_agent, config).await;
-            let mut event_rx = handle.subscribe();
+            match mode {
+                SubAgentMode::Stateless => {
+                    let handle = runtime.spawn_agent(cloned_agent, config).await;
+                    let mut event_rx = handle.subscribe();
 
-            let envelope = Envelope::new(|id| Envelope {
-                id,
-                from: Sender::Agent(caller_agent_id),
-                to: Sender::Agent(handle.agent_id().clone()),
-                reply_to: None,
-                body: task,
-            });
-            if let Err(e) = handle.send_message(envelope).await {
-                let _ = result_tx.send(Err(e.to_string()));
-                return;
-            }
-
-            let mut last_content = String::new();
-            while let Ok(event) = event_rx.recv().await {
-                match event {
-                    AgentEvent::AgentToAgent(reply) => {
-                        last_content = reply.body;
-                        break;
-                    }
-                    AgentEvent::Error(e) => {
-                        let _ = handle.send_command(AgentCommand::Exit).await;
-                        let _ = result_tx.send(Err(e));
+                    let envelope = Envelope::new(|id| Envelope {
+                        id,
+                        from: Sender::Agent(caller_agent_id),
+                        to: Sender::Agent(handle.agent_id().clone()),
+                        reply_to: None,
+                        body: task,
+                    });
+                    if let Err(e) = handle.send_message(envelope).await {
+                        let _ = result_tx.send(Err(e.to_string()));
                         return;
                     }
-                    AgentEvent::Aborted(_) => {
-                        let _ = handle.send_command(AgentCommand::Exit).await;
-                        let _ = result_tx.send(Err("Subagent aborted".into()));
+
+                    let mut last_content = String::new();
+                    while let Ok(event) = event_rx.recv().await {
+                        match event {
+                            AgentEvent::AgentToAgent(reply) => {
+                                last_content = reply.body;
+                                break;
+                            }
+                            AgentEvent::Error(e) => {
+                                let _ = handle.send_command(AgentControl::Exit).await;
+                                let _ = result_tx.send(Err(e));
+                                return;
+                            }
+                            AgentEvent::Aborted(_) => {
+                                let _ = handle.send_command(AgentControl::Exit).await;
+                                let _ = result_tx.send(Err("Subagent aborted".into()));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Shut down the subagent loop.
+                    let _ = handle.send_command(AgentControl::Exit).await;
+                    let _ = result_tx.send(Ok(last_content));
+                }
+                SubAgentMode::Stateful => {
+                    let derived_id = AgentID::from_uuid5(&caller_agent_id, &subagent_name);
+
+                    // Ensure the stateful subagent is alive (idempotent).
+                    runtime
+                        .get_or_spawn_agent_with_id(derived_id.clone(), cloned_agent, config)
+                        .await;
+
+                    // Subscribe to global bus BEFORE sending to avoid missing the reply.
+                    let mut global_rx = runtime.subscribe();
+
+                    let envelope = Envelope::new(|id| Envelope {
+                        id,
+                        from: Sender::Agent(caller_agent_id),
+                        to: Sender::Agent(derived_id.clone()),
+                        reply_to: None,
+                        body: task,
+                    });
+                    let sent_id = envelope.id.clone();
+
+                    if let Err(e) = runtime
+                        .send_message(&derived_id, envelope)
+                        .await
+                    {
+                        let _ = result_tx.send(Err(e.to_string()));
                         return;
                     }
-                    _ => {}
+
+                    loop {
+                        match global_rx.recv().await {
+                            Ok((id, AgentEvent::AgentToAgent(reply)))
+                                if id == derived_id
+                                    && reply.reply_to.as_deref() == Some(&sent_id) =>
+                            {
+                                let _ = result_tx.send(Ok(reply.body));
+                                return;
+                            }
+                            Ok((id, AgentEvent::Error(e))) if id == derived_id => {
+                                let _ = result_tx.send(Err(e));
+                                return;
+                            }
+                            Ok((id, AgentEvent::Aborted(_))) if id == derived_id => {
+                                let _ = result_tx.send(Err("Subagent aborted".into()));
+                                return;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                let _ = result_tx.send(Err("Subagent is unavailable".into()));
+                                return;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Some messages were dropped due to a slow receiver;
+                                // the reply may still arrive, so keep waiting.
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Stateful agent is NOT sent Exit — it persists for future calls.
                 }
             }
-            // Shut down the subagent loop.
-            let _ = handle.send_command(AgentCommand::Exit).await;
-            let _ = result_tx.send(Ok(last_content));
         });
 
         result_rx.await.map_err(|e| e.to_string())?

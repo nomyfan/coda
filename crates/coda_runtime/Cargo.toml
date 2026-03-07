@@ -12,4 +12,4 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
-uuid = { version = "1.22", features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v5"] }
