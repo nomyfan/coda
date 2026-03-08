@@ -19,20 +19,14 @@ pub trait ToolSpec: Send + Sync {
     fn build(&self, state: &Arc<Mutex<AgentState>>, ctx: &BuildContext) -> Box<dyn ToolObject>;
 }
 
-/// Specification for a sub-agent.
-pub struct SubAgentSpec {
-    pub name: String,
-    pub description: String,
-    pub mode: SubAgentMode,
-    pub agent: AgentSpec,
-}
-
 /// Declarative specification for building an agent.
 pub struct AgentSpec {
     pub name: String,
+    pub description: String,
     pub system_prompt: String,
+    pub mode: SubAgentMode,
     pub tools: Vec<Box<dyn ToolSpec>>,
-    pub subagents: Vec<SubAgentSpec>,
+    pub subagents: Vec<AgentSpec>,
 }
 
 impl AgentSpec {
@@ -47,7 +41,7 @@ impl AgentSpec {
 
         // Recursively build and register subagents
         for sub_spec in &self.subagents {
-            let sub_agent = sub_spec.agent.build(ctx);
+            let sub_agent = sub_spec.build(ctx);
             agent.subagents.register(SubAgentTool {
                 name: sub_spec.name.clone(),
                 description: sub_spec.description.clone(),

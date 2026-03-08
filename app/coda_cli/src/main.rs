@@ -3,7 +3,7 @@ mod ask_user;
 use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
     AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision, RunConfig,
-    Sender, SubAgentMode, SubAgentSpec, ToolApprovalMode, ToolCallResolution, builtin_specs,
+    Sender, SubAgentMode, ToolApprovalMode, ToolCallResolution, builtin_specs,
 };
 use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
@@ -183,43 +183,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let spec = AgentSpec {
         name: "coda".into(),
+        description: String::new(),
         system_prompt,
+        mode: SubAgentMode::Stateful,
         tools: {
             let mut t = builtin_specs();
             t.push(Box::new(AskUserToolSpec));
             t
         },
         subagents: vec![
-            SubAgentSpec {
+            AgentSpec {
                 name: "researcher".into(),
                 description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".into(),
+                system_prompt:
+                    "You are a research assistant. You can read files, search code, and list directories. \
+                     Summarize your findings concisely."
+                        .to_string(),
                 mode: SubAgentMode::Stateless,
-                agent: AgentSpec {
-                    name: "researcher".into(),
-                    system_prompt:
-                        "You are a research assistant. You can read files, search code, and list directories. \
-                         Summarize your findings concisely."
-                            .to_string(),
-                    tools: builtin_specs(),
-                    subagents: vec![],
-                },
+                tools: builtin_specs(),
+                subagents: vec![],
             },
-            SubAgentSpec {
+            AgentSpec {
                 name: "memo".into(),
                 description: "A stateful memo agent that remembers information across calls. \
                               Use it to store and recall facts across turns."
                     .into(),
+                system_prompt:
+                    "You are a simple memo agent. Your only job is to remember what the user tells you and \
+                     answer questions about it. Keep your replies very brief."
+                        .to_string(),
                 mode: SubAgentMode::Stateful,
-                agent: AgentSpec {
-                    name: "memo".into(),
-                    system_prompt: (
-                        "You are a simple memo agent. Your only job is to remember what the user tells you and \
-                         answer questions about it. Keep your replies very brief."
-                            .to_string()
-                    ),
-                    tools: vec![],
-                    subagents: vec![],
-                },
+                tools: vec![],
+                subagents: vec![],
             },
         ],
     };

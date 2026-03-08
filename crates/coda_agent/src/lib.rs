@@ -9,4 +9,4 @@ pub use agent::{
     ToolApprovalMode, ToolCallResolution,
 };
 pub use session::{SessionData, SessionMeta, SessionStore};
-pub use spec::{AgentSpec, BuildContext, SubAgentSpec, ToolSpec, builtin_specs};
+pub use spec::{AgentSpec, BuildContext, ToolSpec, builtin_specs};
