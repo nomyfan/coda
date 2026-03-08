@@ -1,9 +1,9 @@
 mod ask_user;
 
-use ask_user::{AskUserParams, AskUserTool};
+use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
-    Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, SubAgentTool,
-    ToolApprovalMode, ToolCallResolution,
+    AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision, RunConfig,
+    Sender, SubAgentMode, SubAgentSpec, ToolApprovalMode, ToolCallResolution, builtin_specs,
 };
 use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
@@ -177,41 +177,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream: true,
     }));
 
-    // Create a subagent for research tasks
-    let mut researcher = Agent::new("researcher");
-    researcher.with_default_tools(workspace_str.clone());
-    researcher.system_prompt = Some(
-        "You are a research assistant. You can read files, search code, and list directories. \
-         Summarize your findings concisely."
-            .to_string(),
-    );
+    let ctx = BuildContext {
+        workspace_dir: workspace_str.clone(),
+    };
 
-    let mut agent = Agent::new("coda");
-    agent.with_default_tools(workspace_str.clone());
-    agent.tools.register(AskUserTool::new());
-    agent.system_prompt = Some(system_prompt);
-    agent.subagents.register(SubAgentTool {
-        name: "researcher".to_string(),
-        description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".to_string(),
-        agent: tokio::sync::Mutex::new(researcher),
-        mode: coda_agent::SubAgentMode::Stateless,
-    });
+    let spec = AgentSpec {
+        name: "coda".into(),
+        system_prompt,
+        tools: {
+            let mut t = builtin_specs();
+            t.push(Box::new(AskUserToolSpec));
+            t
+        },
+        subagents: vec![
+            SubAgentSpec {
+                name: "researcher".into(),
+                description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".into(),
+                mode: SubAgentMode::Stateless,
+                agent: AgentSpec {
+                    name: "researcher".into(),
+                    system_prompt:
+                        "You are a research assistant. You can read files, search code, and list directories. \
+                         Summarize your findings concisely."
+                            .to_string(),
+                    tools: builtin_specs(),
+                    subagents: vec![],
+                },
+            },
+            SubAgentSpec {
+                name: "memo".into(),
+                description: "A stateful memo agent that remembers information across calls. \
+                              Use it to store and recall facts across turns."
+                    .into(),
+                mode: SubAgentMode::Stateful,
+                agent: AgentSpec {
+                    name: "memo".into(),
+                    system_prompt: (
+                        "You are a simple memo agent. Your only job is to remember what the user tells you and \
+                         answer questions about it. Keep your replies very brief."
+                            .to_string()
+                    ),
+                    tools: vec![],
+                    subagents: vec![],
+                },
+            },
+        ],
+    };
 
-    let mut memo = Agent::new("memo");
-    memo.system_prompt = Some(
-        "You are a simple memo agent. Your only job is to remember what the user tells you and \
-         answer questions about it. Keep your replies very brief."
-            .to_string(),
-    );
-
-    agent.subagents.register(SubAgentTool {
-        name: "memo".to_string(),
-        description: "A stateful memo agent that remembers information across calls. \
-                      Use it to store and recall facts across turns."
-            .to_string(),
-        agent: tokio::sync::Mutex::new(memo),
-        mode: coda_agent::SubAgentMode::Stateful,
-    });
+    let agent = spec.build(&ctx);
 
     let runtime = AgentRuntime::new();
     let handle = runtime

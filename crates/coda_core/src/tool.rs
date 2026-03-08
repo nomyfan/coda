@@ -55,7 +55,7 @@ pub trait ToolObject: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
 }
 
-struct ToolWrapper<T: Tool>(T);
+pub struct ToolWrapper<T: Tool>(T);
 
 impl<T: Tool> ToolObject for ToolWrapper<T> {
     #[inline]
@@ -121,9 +121,8 @@ pub struct ToolSet {
 }
 
 impl ToolSet {
-    pub fn register<T: Tool>(&mut self, tool: T) {
-        self.tools
-            .insert(tool.name().to_string(), Arc::new(ToolWrapper::from(tool)));
+    pub fn register(&mut self, tool: Box<dyn ToolObject>) {
+        self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn ToolObject>> {

@@ -10,11 +10,6 @@ use coda_core::llm::{
 use coda_core::tool::ToolSet;
 use tracing::debug;
 
-use crate::tools::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
-    WriteTodosTool,
-};
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub title: String,
@@ -143,7 +138,7 @@ pub enum AgentEvent {
 
 pub struct Agent {
     name: String,
-    pub system_prompt: Option<String>,
+    pub system_prompt: String,
     pub state: Arc<Mutex<AgentState>>,
     pub tools: ToolSet,
     pub subagents: SubAgents,
@@ -172,7 +167,7 @@ impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
 }
 
 impl Agent {
-    pub fn new(name: impl ToString) -> Self {
+    pub fn new(name: impl ToString, system_prompt: String) -> Self {
         let state = Arc::new(Mutex::new(AgentState {
             messages: vec![],
             todos: vec![],
@@ -180,7 +175,7 @@ impl Agent {
 
         Agent {
             name: name.to_string(),
-            system_prompt: None,
+            system_prompt,
             state,
             tools: ToolSet::default(),
             subagents: SubAgents::default(),
@@ -199,19 +194,6 @@ impl Agent {
             tools: self.tools.clone(),
             subagents: self.subagents.clone(),
         }
-    }
-
-    pub fn with_default_tools(&mut self, workspace_dir: impl Into<String>) {
-        let cwd = workspace_dir.into();
-        self.tools.register(ShellTool::new());
-        self.tools.register(ReadFileTool::new());
-        self.tools.register(WriteFileTool::new());
-        self.tools.register(ListDirectoryTool::new());
-        self.tools.register(GrepTool::new(cwd.clone()));
-        self.tools.register(GlobTool::new(cwd));
-        let state = self.state.clone();
-        self.tools.register(ReadTodosTool::new(state.clone()));
-        self.tools.register(WriteTodosTool::new(state));
     }
 }
 
@@ -236,9 +218,10 @@ impl Agent {
 
     pub async fn messages(&self) -> Vec<Message> {
         let mut messages = self.state.lock().await.messages.clone();
-        if let Some(system_prompt) = &self.system_prompt {
-            messages.insert(0, Message::System(SystemMessage(system_prompt.clone())));
-        }
+        messages.insert(
+            0,
+            Message::System(SystemMessage(self.system_prompt.clone())),
+        );
         messages
     }
 
