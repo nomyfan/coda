@@ -21,13 +21,16 @@ pub struct TodoItem {
     pub done: bool,
 }
 
+#[derive(Clone, Default)]
 pub enum ToolApprovalMode {
+    #[default]
     Auto,
     Manual,
     RequireWhen(Arc<dyn Fn(&ToolCall) -> bool + Send + Sync>),
 }
 
 /// Caller's resolution for a single suspended tool call.
+#[derive(Clone)]
 pub enum ToolCallResolution {
     /// The agent should execute this call.
     Execute,
@@ -38,6 +41,7 @@ pub enum ToolCallResolution {
 }
 
 /// Caller's response to all suspended tool calls, replacing `ApprovalDecision`.
+#[derive(Clone)]
 pub struct ResumeDecision {
     pub resolutions: Vec<(String, ToolCallResolution)>,
 }
@@ -151,6 +155,7 @@ pub struct RunConfig<P: LLMProvider> {
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
     pub thread_id: String,
+    pub tool_approval: ToolApprovalMode,
 }
 
 impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
@@ -161,6 +166,7 @@ impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
             thread_id: self.thread_id.clone(),
+            tool_approval: self.tool_approval.clone(),
         }
     }
 }

@@ -1,9 +1,16 @@
-use coda_agent::{Agent, AgentEvent, Envelope, RunConfig, Sender, SubAgentTool};
-use coda_core::llm::LLMProviderConfig;
+mod ask_user;
+
+use ask_user::{AskUserParams, AskUserTool};
+use coda_agent::{
+    Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, SubAgentTool,
+    ToolApprovalMode, ToolCallResolution,
+};
+use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
 use coda_runtime::{AgentControl, AgentRuntime};
 use coda_skills::Skills;
 use dotenvy::dotenv;
+use either::Either;
 use rustyline::error::ReadlineError;
 use std::env;
 use std::io::{self, Write};
@@ -29,6 +36,104 @@ fn print_logo() {
     println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
     println!("\x1b[2;37m  An AI Agent\x1b[0m");
     println!();
+}
+
+fn prompt_ask_user(
+    rl: &mut rustyline::DefaultEditor,
+    question: &str,
+    options: &[String],
+) -> Result<String, Box<dyn std::error::Error>> {
+    println!("\n[User Input Required]\n");
+    println!("{}\n", question);
+    for (i, opt) in options.iter().enumerate() {
+        println!("  {}. {}", i + 1, opt);
+    }
+    println!("  0. Other (type your own response)\n");
+
+    loop {
+        let input = rl.readline("> ")?;
+        let input = input.trim().to_string();
+
+        if input == "0" {
+            let custom = rl.readline("Your response: ")?;
+            return Ok(custom.trim().to_string());
+        }
+        if let Ok(idx) = input.parse::<usize>()
+            && idx >= 1
+            && idx <= options.len()
+        {
+            return Ok(options[idx - 1].clone());
+        }
+        println!("  Please enter a number between 0 and {}.", options.len());
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn prompt_approval(
+    rl: &mut rustyline::DefaultEditor,
+    call: &ToolCall,
+) -> Result<Either<String, (String, Option<String>)>, Box<dyn std::error::Error>> {
+    println!(
+        "\n  {}: {}",
+        call.name,
+        call.arguments.as_deref().unwrap_or("{}")
+    );
+
+    loop {
+        let input = rl.readline("     Approve? [y/n]: ")?;
+
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                return Ok(Either::Left(call.id.clone()));
+            }
+            "n" | "no" => {
+                let reason = rl.readline("     Reason (optional, Enter to skip): ")?;
+                let reason = reason.trim().to_string();
+                return Ok(Either::Right((
+                    call.id.clone(),
+                    if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
+                )));
+            }
+            _ => println!("     Please enter 'y' or 'n'."),
+        }
+    }
+}
+
+fn resolve_pending_calls(
+    rl: &mut rustyline::DefaultEditor,
+    checkpoint: &AgentCheckpoint,
+) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
+    let mut resolutions = vec![];
+    for pending_call in &checkpoint.pending_calls {
+        if pending_call.name == "ask_user" {
+            let output = match serde_json::from_str::<AskUserParams>(
+                pending_call.arguments.as_deref().unwrap_or("{}"),
+            ) {
+                Ok(params) => {
+                    ToolOutput::Ok(prompt_ask_user(rl, &params.question, &params.options)?)
+                }
+                Err(err) => ToolOutput::Err(format!("Invalid ask_user arguments: {err}")),
+            };
+            resolutions.push((
+                pending_call.id.clone(),
+                ToolCallResolution::Resolved(output),
+            ));
+        } else {
+            match prompt_approval(rl, pending_call)? {
+                Either::Left(id) => {
+                    resolutions.push((id, ToolCallResolution::Execute));
+                }
+                Either::Right((id, reason)) => {
+                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
+                }
+            }
+        }
+    }
+    Ok(resolutions)
 }
 
 #[tokio::main]
@@ -83,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut agent = Agent::new("coda");
     agent.with_default_tools(workspace_str.clone());
+    agent.tools.register(AskUserTool::new());
     agent.system_prompt = Some(system_prompt);
     agent.subagents.register(SubAgentTool {
         name: "researcher".to_string(),
@@ -117,6 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_completion_tokens: Some(5000),
                 temperature: Some(0.7),
                 thread_id: uuid::Uuid::new_v4().to_string(),
+                tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+                    call.name == "shell" || call.name == "ask_user"
+                })),
             },
         )
         .await;
@@ -206,6 +315,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Ok((_, AgentEvent::ToolCallEnd(_))) => {}
+                        Ok((aid, AgentEvent::Suspended(checkpoint))) => {
+                            let is_main = aid == *handle.agent_id();
+                            let label = if is_main { "" } else { " (sub-agent)" };
+                            println!("\n[{} tool call(s) require approval{}]", checkpoint.pending_calls.len(), label);
+                            let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    // Ctrl+C during approval prompt — abort all agents
+                                    // (the suspended one and any parent waiting on it).
+                                    runtime.broadcast_command(AgentControl::Abort).await;
+                                    println!("\n[Aborted: approval interrupted]");
+                                    // Drain until the main agent's Aborted event so the
+                                    // outer loop doesn't see stale events.
+                                    while let Ok((a, ev)) = event_rx.try_recv() {
+                                        if a == *handle.agent_id() && matches!(ev, AgentEvent::Aborted(_)) {
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            };
+                            let decision = ResumeDecision { resolutions };
+                            if let Err(e) = runtime.send_command(&aid, AgentControl::Resume(decision)).await {
+                                warn!("{}", e);
+                                println!("\n[Error: failed to resume agent: {}]", e);
+                                break;
+                            }
+                        }
                         Ok((aid, AgentEvent::Aborted(target))) if aid == *handle.agent_id() => {
                             match &target {
                                 coda_agent::AbortedTarget::Generation => {
@@ -218,7 +355,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         Ok((aid, AgentEvent::Error(err))) if aid == *handle.agent_id() => {
-                            eprintln!("\nError: {}", err);
+                            warn!("{}", err);
+                            println!("\n[Error: {}]", err);
                             break;
                         }
                         Ok(_) => {}

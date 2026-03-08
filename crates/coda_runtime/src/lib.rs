@@ -1,6 +1,6 @@
 use coda_agent::{
-    AbortedTarget, Agent, AgentEvent, AgentID, Envelope, RunConfig, Sender, SubAgentMode,
-    SubAgentObject,
+    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, AgentID, Envelope, ResumeDecision,
+    RunConfig, Sender, SubAgentMode, SubAgentObject, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
@@ -19,6 +19,8 @@ pub enum AgentControl {
     Abort,
     /// Shut down the agent loop entirely.
     Exit,
+    /// Resume a suspended agent with the caller's decisions on pending tool calls.
+    Resume(ResumeDecision),
 }
 
 #[derive(Debug)]
@@ -61,6 +63,14 @@ impl AgentHandle {
     pub async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         self.message_sender
             .send(envelope)
+            .await
+            .map_err(|_| SendCommandError::ChannelClosed)
+    }
+
+    /// Resume a suspended agent with the caller's decisions on pending tool calls.
+    pub async fn resume(&self, decision: ResumeDecision) -> Result<(), SendCommandError> {
+        self.control_sender
+            .send(AgentControl::Resume(decision))
             .await
             .map_err(|_| SendCommandError::ChannelClosed)
     }
@@ -273,6 +283,9 @@ async fn run_agent<P: LLMProvider + Clone>(
     config: &RunConfig<P>,
     runtime: &AgentRuntime,
 ) {
+    // When set to true, the agent will exit after the current agent_loop iteration.
+    let mut should_exit = false;
+
     // Wait for incoming messages, then process them in the agent loop.
     while let Some(envelope) = message_rx.recv().await {
         // Add the envelope body as a user message to the conversation.
@@ -309,9 +322,17 @@ async fn run_agent<P: LLMProvider + Clone>(
                         biased;
                         Some(cmd) = control_rx.recv() => {
                             match cmd {
-                                AgentControl::Abort | AgentControl::Exit => {
+                                AgentControl::Abort => {
                                     aborted_in_llm = true;
                                     break 'llm_stream;
+                                }
+                                AgentControl::Exit => {
+                                    aborted_in_llm = true;
+                                    should_exit = true;
+                                    break 'llm_stream;
+                                }
+                                AgentControl::Resume(_) => {
+                                    // Resume is not meaningful during LLM streaming; ignore.
                                 }
                             }
                         }
@@ -375,11 +396,107 @@ async fn run_agent<P: LLMProvider + Clone>(
                     let stop = assistant_message.tool_calls.is_empty();
 
                     if !assistant_message.tool_calls.is_empty() {
-                        // TODO: HITL for tool calls
-                        if let Err(true) = execute_tool_calls(
+                        // Partition tool calls into pending (need approval) and auto (execute immediately).
+                        let (pending_calls, auto_calls) = match &config.tool_approval {
+                            ToolApprovalMode::Auto => {
+                                (vec![], assistant_message.tool_calls.clone())
+                            }
+                            ToolApprovalMode::Manual => {
+                                (assistant_message.tool_calls.clone(), vec![])
+                            }
+                            ToolApprovalMode::RequireWhen(pred) => assistant_message
+                                .tool_calls
+                                .clone()
+                                .into_iter()
+                                .partition(|c| pred(c)),
+                        };
+
+                        if !pending_calls.is_empty() {
+                            // Emit Suspended event with checkpoint, then block waiting for Resume.
+                            let checkpoint = {
+                                let state_arc = agent.state();
+                                let state = state_arc.lock().await;
+                                AgentCheckpoint {
+                                    thread_id: config.thread_id.clone(),
+                                    messages: state.messages.clone(),
+                                    pending_calls: pending_calls.clone(),
+                                    auto_calls: auto_calls.clone(),
+                                    todos: state.todos.clone(),
+                                }
+                            };
+                            let _ = event_tx.send(AgentEvent::Suspended(checkpoint));
+
+                            // Wait for Resume/Abort/Exit on control channel.
+                            let decision = match control_rx.recv().await {
+                                Some(AgentControl::Resume(d)) => Some(d),
+                                Some(AgentControl::Abort) => None,
+                                Some(AgentControl::Exit) | None => {
+                                    should_exit = true;
+                                    None
+                                }
+                            };
+
+                            match decision {
+                                None => {
+                                    // Aborted during suspension — write aborted tool messages
+                                    // for all pending + auto calls so history stays consistent.
+                                    let all_calls = pending_calls.into_iter().chain(auto_calls);
+                                    let aborted_msgs: Vec<Message> = all_calls
+                                        .map(|tc| {
+                                            Message::Tool(ToolMessage {
+                                                id: tc.id,
+                                                name: tc.name,
+                                                output: ToolOutput::Err(
+                                                    "Aborted by user".to_string(),
+                                                ),
+                                                outcome: ToolCallOutcome::Aborted,
+                                            })
+                                        })
+                                        .collect();
+                                    let aborted_ids: Vec<String> = aborted_msgs
+                                        .iter()
+                                        .filter_map(|m| match m {
+                                            Message::Tool(t) => Some(t.id.clone()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    agent.add_messages(aborted_msgs).await;
+                                    let _ = event_tx.send(AgentEvent::Aborted(
+                                        AbortedTarget::ToolCalls(aborted_ids),
+                                    ));
+                                    break 'agent_loop;
+                                }
+                                Some(decision) => {
+                                    let result = process_resume(
+                                        &agent_id,
+                                        &mut agent,
+                                        decision,
+                                        pending_calls,
+                                        auto_calls,
+                                        &mut control_rx,
+                                        &event_tx,
+                                        config,
+                                        runtime,
+                                    )
+                                    .await;
+                                    match result {
+                                        InterruptKind::Completed => continue 'agent_loop,
+                                        InterruptKind::Aborted => break 'agent_loop,
+                                        InterruptKind::Exited => {
+                                            should_exit = true;
+                                            break 'agent_loop;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // All auto — execute as before.
+                        match execute_tool_calls(
                             &agent_id,
                             &mut agent,
-                            assistant_message.tool_calls,
+                            auto_calls,
+                            ToolCallOutcome::Auto,
                             &mut control_rx,
                             &event_tx,
                             config,
@@ -387,9 +504,12 @@ async fn run_agent<P: LLMProvider + Clone>(
                         )
                         .await
                         {
-                            let _ = event_tx
-                                .send(AgentEvent::Aborted(AbortedTarget::ToolCalls(vec![])));
-                            break 'agent_loop;
+                            InterruptKind::Completed => {}
+                            InterruptKind::Aborted => break 'agent_loop,
+                            InterruptKind::Exited => {
+                                should_exit = true;
+                                break 'agent_loop;
+                            }
                         }
                     }
 
@@ -409,6 +529,10 @@ async fn run_agent<P: LLMProvider + Clone>(
                 }
             }
         } // 'agent_loop
+
+        if should_exit {
+            break;
+        }
     } // while let
 
     info!("Agent exiting");
@@ -416,16 +540,136 @@ async fn run_agent<P: LLMProvider + Clone>(
     runtime.remove_agent(&agent_id).await;
 }
 
+/// Result of an operation that can be interrupted by Abort or Exit.
+enum InterruptKind {
+    /// Completed normally.
+    Completed,
+    /// Interrupted by Abort (cancel current turn, agent stays alive).
+    Aborted,
+    /// Interrupted by Exit or channel closed (agent should shut down).
+    Exited,
+}
+
+/// Process a resume decision: for each pending call, apply the caller's resolution,
+/// then execute approved + auto calls together.
+#[allow(clippy::too_many_arguments)]
+async fn process_resume<P: LLMProvider + Clone>(
+    caller_agent_id: &AgentID,
+    agent: &mut Agent,
+    decision: ResumeDecision,
+    pending_calls: Vec<ToolCall>,
+    auto_calls: Vec<ToolCall>,
+    control_rx: &mut mpsc::Receiver<AgentControl>,
+    event_tx: &broadcast::Sender<AgentEvent>,
+    config: &RunConfig<P>,
+    runtime: &AgentRuntime,
+) -> InterruptKind {
+    let resolution_map: HashMap<String, ToolCallResolution> =
+        decision.resolutions.into_iter().collect();
+
+    let mut approved_calls = vec![];
+
+    for tc in pending_calls {
+        match resolution_map.get(&tc.id) {
+            Some(ToolCallResolution::Execute) => {
+                approved_calls.push(tc);
+            }
+            None => {
+                // Missing resolution for a pending call — reject to preserve the approval boundary.
+                let tool_msg = ToolMessage {
+                    id: tc.id,
+                    name: tc.name,
+                    output: ToolOutput::Err(
+                        "The user did not approve or reject this tool call. \
+                         Do not retry without explicit user permission."
+                            .to_string(),
+                    ),
+                    outcome: ToolCallOutcome::Rejected {
+                        reason: Some("No resolution provided".to_string()),
+                    },
+                };
+                agent.add_message(Message::Tool(tool_msg.clone())).await;
+                let _ = event_tx.send(AgentEvent::ToolCallEnd(tool_msg));
+            }
+            Some(ToolCallResolution::Resolved(output)) => {
+                let tool_msg = ToolMessage {
+                    id: tc.id,
+                    name: tc.name,
+                    output: output.clone(),
+                    outcome: ToolCallOutcome::Resolved,
+                };
+                agent.add_message(Message::Tool(tool_msg.clone())).await;
+                let _ = event_tx.send(AgentEvent::ToolCallEnd(tool_msg));
+            }
+            Some(ToolCallResolution::Rejected { reason }) => {
+                let err_msg = reason
+                    .clone()
+                    .unwrap_or_else(|| "Rejected by user".to_string());
+                let tool_msg = ToolMessage {
+                    id: tc.id,
+                    name: tc.name,
+                    output: ToolOutput::Err(err_msg.clone()),
+                    outcome: ToolCallOutcome::Rejected {
+                        reason: Some(err_msg),
+                    },
+                };
+                agent.add_message(Message::Tool(tool_msg.clone())).await;
+                let _ = event_tx.send(AgentEvent::ToolCallEnd(tool_msg));
+            }
+        }
+    }
+
+    // Execute approved pending calls first.
+    if !approved_calls.is_empty() {
+        let result = execute_tool_calls(
+            caller_agent_id,
+            agent,
+            approved_calls,
+            ToolCallOutcome::Approved,
+            control_rx,
+            event_tx,
+            config,
+            runtime,
+        )
+        .await;
+        if !matches!(result, InterruptKind::Completed) {
+            return result;
+        }
+    }
+
+    // Then execute auto calls.
+    if !auto_calls.is_empty() {
+        let result = execute_tool_calls(
+            caller_agent_id,
+            agent,
+            auto_calls,
+            ToolCallOutcome::Auto,
+            control_rx,
+            event_tx,
+            config,
+            runtime,
+        )
+        .await;
+        if !matches!(result, InterruptKind::Completed) {
+            return result;
+        }
+    }
+
+    InterruptKind::Completed
+}
+
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(caller_agent_id = ?caller_agent_id))]
 async fn execute_tool_calls<P: LLMProvider + Clone>(
     caller_agent_id: &AgentID,
     agent: &mut Agent,
     tool_calls: Vec<ToolCall>,
+    outcome: ToolCallOutcome,
     control_receiver: &mut mpsc::Receiver<AgentControl>,
     event_sender: &broadcast::Sender<AgentEvent>,
     config: &RunConfig<P>,
     runtime: &AgentRuntime,
-) -> Result<(), bool> {
+) -> InterruptKind {
     // Detect duplicate subagent calls within the same batch.
     let mut subagent_call_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -451,6 +695,7 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
         let tool = agent.tools.get(&tc.name);
         let subagent = agent.subagents.get(&tc.name);
         let is_concurrent_call = concurrent_subagents.contains(&tc.name);
+        let outcome = outcome.clone();
         tool_futs.push(async move {
             if is_concurrent_call {
                 return ToolMessage {
@@ -462,7 +707,7 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
                         Call sub-agents sequentially — one at a time.",
                         tc.name
                     )),
-                    outcome: ToolCallOutcome::Auto,
+                    outcome,
                 };
             }
             let output = match tool {
@@ -493,12 +738,12 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
                 id: tc.id,
                 name: tc.name,
                 output,
-                outcome: ToolCallOutcome::Auto, // TODO: no HITL now
+                outcome,
             }
         });
     }
 
-    let mut aborted = false;
+    let mut interrupt: Option<InterruptKind> = None;
     let mut tool_futs = std::pin::pin!(tool_futs);
 
     loop {
@@ -506,9 +751,16 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
             biased;
             Some(cmd) = control_receiver.recv() => {
                 match cmd {
-                    AgentControl::Abort | AgentControl::Exit => {
-                        aborted = true;
+                    AgentControl::Abort => {
+                        interrupt = Some(InterruptKind::Aborted);
                         break;
+                    }
+                    AgentControl::Exit => {
+                        interrupt = Some(InterruptKind::Exited);
+                        break;
+                    }
+                    AgentControl::Resume(_) => {
+                        // Resume is not meaningful during tool execution; ignore.
                     }
                 }
             }
@@ -525,7 +777,7 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
         }
     }
 
-    if aborted {
+    if let Some(kind) = interrupt {
         // Write aborted results for unfinished tool calls.
         let aborted_ids: Vec<String> = pending_ids.keys().cloned().collect();
         let aborted_messages: Vec<Message> = pending_ids
@@ -541,9 +793,10 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
             .collect();
         agent.add_messages(aborted_messages).await;
         let _ = event_sender.send(AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids)));
+        return kind;
     }
 
-    Ok(())
+    InterruptKind::Completed
 }
 
 // TODO: 因为通过 channel 进行通信，会导致 trace 丢失上下级关系
