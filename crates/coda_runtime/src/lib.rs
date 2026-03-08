@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
-use tracing::info;
+use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -263,6 +263,7 @@ impl AgentRuntime {
     }
 }
 
+#[instrument(skip_all, fields(agent_id = ?agent_id, agent_name = agent.name(), model = config.model, thread_id = config.thread_id))]
 async fn run_agent<P: LLMProvider + Clone>(
     agent_id: AgentID,
     mut agent: Agent,
@@ -338,7 +339,9 @@ async fn run_agent<P: LLMProvider + Clone>(
             }
 
             if let Some(err) = llm_error {
-                let _ = event_tx.send(AgentEvent::Error(format!("{}", err)));
+                let err_string = format!("{}", err);
+                error!("LLM stream error in agent {}", err_string);
+                let _ = event_tx.send(AgentEvent::Error(err_string));
                 break 'agent_loop;
             }
 
@@ -408,11 +411,12 @@ async fn run_agent<P: LLMProvider + Clone>(
         } // 'agent_loop
     } // while let
 
-    info!("Agent {} {:?} exiting", agent.name(), agent_id);
+    info!("Agent exiting");
     // Unregister this agent from the runtime.
     runtime.remove_agent(&agent_id).await;
 }
 
+#[instrument(skip_all, fields(caller_agent_id = ?caller_agent_id))]
 async fn execute_tool_calls<P: LLMProvider + Clone>(
     caller_agent_id: &AgentID,
     agent: &mut Agent,
@@ -426,10 +430,10 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     let mut subagent_call_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for tc in &tool_calls {
-        if let Some(sa) = agent.subagents.get(&tc.name) {
-            if sa.mode() == SubAgentMode::Stateful {
-                *subagent_call_counts.entry(tc.name.clone()).or_insert(0) += 1;
-            }
+        if let Some(sa) = agent.subagents.get(&tc.name)
+            && sa.mode() == SubAgentMode::Stateful
+        {
+            *subagent_call_counts.entry(tc.name.clone()).or_insert(0) += 1;
         }
     }
     let concurrent_subagents: std::collections::HashSet<String> = subagent_call_counts
@@ -542,6 +546,8 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     Ok(())
 }
 
+// TODO: 因为通过 channel 进行通信，会导致 trace 丢失上下级关系
+#[instrument(skip_all, fields(caller_agent_id = ?caller_agent_id, subagent_name = subagent.name(), task = task))]
 fn run_subagent<'a, P: LLMProvider + Clone>(
     caller_agent_id: &'a AgentID,
     subagent: &'a Arc<dyn SubAgentObject>,
@@ -551,6 +557,7 @@ fn run_subagent<'a, P: LLMProvider + Clone>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
     Box::pin(async move {
         let mode = subagent.mode();
+        // TODO: stateful 的还要 clone 吗？
         let cloned_agent = {
             let agent = subagent.agent().lock().await;
             agent.clone_as_template()
