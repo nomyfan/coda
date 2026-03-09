@@ -1,4 +1,4 @@
-use coda_agent::{
+use crate::{
     AbortedTarget, Agent, AgentCheckpoint, AgentEvent, AgentID, Envelope, ResumeDecision,
     RunConfig, Sender, SubAgentMode, SubAgentObject, ToolApprovalMode, ToolCallResolution,
 };

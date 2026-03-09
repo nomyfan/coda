@@ -192,6 +192,7 @@ impl Agent {
                 todos: vec![],
             })),
             tools: self.tools.clone(),
+            // FIXME: 这里浅拷贝可能存在问题
             subagents: self.subagents.clone(),
         }
     }

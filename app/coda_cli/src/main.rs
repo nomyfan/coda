@@ -4,10 +4,10 @@ use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
     AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision, RunConfig,
     Sender, SubAgentMode, ToolApprovalMode, ToolCallResolution, builtin_specs,
+    runtime::{AgentControl, AgentRuntime},
 };
 use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
-use coda_runtime::{AgentControl, AgentRuntime};
 use coda_skills::Skills;
 use dotenvy::dotenv;
 use either::Either;
