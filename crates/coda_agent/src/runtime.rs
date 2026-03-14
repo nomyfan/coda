@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, instrument};
+use tracing::{Instrument, error, info, instrument};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -134,6 +134,7 @@ impl AgentRuntime {
         let event_tx_for_task = event_tx.clone();
         let agent_id_for_task = agent_id.clone();
         let runtime = self.clone();
+        let span = tracing::Span::current();
         tokio::spawn(async move {
             // Forward per-agent events to the global event bus.
             let forward_task = {
@@ -161,7 +162,7 @@ impl AgentRuntime {
             .await;
 
             forward_task.abort();
-        });
+        }.instrument(span));
 
         AgentHandle {
             agent_id,
@@ -237,6 +238,7 @@ impl AgentRuntime {
         let event_tx_for_task = event_tx.clone();
         let agent_id_for_task = agent_id.clone();
         let runtime = self.clone();
+        let span = tracing::Span::current();
         tokio::spawn(async move {
             let forward_task = {
                 let mut event_rx = event_tx_for_task.subscribe();
@@ -261,7 +263,7 @@ impl AgentRuntime {
             .await;
 
             forward_task.abort();
-        });
+        }.instrument(span));
     }
 
     /// Broadcast a control command to all agents.
@@ -799,7 +801,6 @@ async fn execute_tool_calls<P: LLMProvider + Clone>(
     InterruptKind::Completed
 }
 
-// TODO: 因为通过 channel 进行通信，会导致 trace 丢失上下级关系
 #[instrument(skip_all, fields(caller_agent_id = ?caller_agent_id, subagent_name = subagent.name(), task = task))]
 fn run_subagent<'a, P: LLMProvider + Clone>(
     caller_agent_id: &'a AgentID,
@@ -823,106 +824,110 @@ fn run_subagent<'a, P: LLMProvider + Clone>(
         let subagent_name = subagent.name().to_string();
 
         // Spawn in a separate task so all captured values are 'static.
+        let span = tracing::Span::current();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            match mode {
-                SubAgentMode::Stateless => {
-                    let handle = runtime.spawn_agent(cloned_agent, config).await;
-                    let mut event_rx = handle.subscribe();
+        tokio::spawn(
+            async move {
+                match mode {
+                    SubAgentMode::Stateless => {
+                        let handle = runtime.spawn_agent(cloned_agent, config).await;
+                        let mut event_rx = handle.subscribe();
 
-                    let envelope = Envelope::new(|id| Envelope {
-                        id,
-                        from: Sender::Agent(caller_agent_id),
-                        to: Sender::Agent(handle.agent_id().clone()),
-                        reply_to: None,
-                        body: task,
-                    });
-                    if let Err(e) = handle.send_message(envelope).await {
-                        let _ = result_tx.send(Err(e.to_string()));
-                        return;
-                    }
-
-                    let mut last_content = String::new();
-                    while let Ok(event) = event_rx.recv().await {
-                        match event {
-                            AgentEvent::AgentToAgent(reply) => {
-                                last_content = reply.body;
-                                break;
-                            }
-                            AgentEvent::Error(e) => {
-                                let _ = handle.send_command(AgentControl::Exit).await;
-                                let _ = result_tx.send(Err(e));
-                                return;
-                            }
-                            AgentEvent::Aborted(_) => {
-                                let _ = handle.send_command(AgentControl::Exit).await;
-                                let _ = result_tx.send(Err("Subagent aborted".into()));
-                                return;
-                            }
-                            _ => {}
+                        let envelope = Envelope::new(|id| Envelope {
+                            id,
+                            from: Sender::Agent(caller_agent_id),
+                            to: Sender::Agent(handle.agent_id().clone()),
+                            reply_to: None,
+                            body: task,
+                        });
+                        if let Err(e) = handle.send_message(envelope).await {
+                            let _ = result_tx.send(Err(e.to_string()));
+                            return;
                         }
-                    }
-                    // Shut down the subagent loop.
-                    let _ = handle.send_command(AgentControl::Exit).await;
-                    let _ = result_tx.send(Ok(last_content));
-                }
-                SubAgentMode::Stateful => {
-                    let derived_id = AgentID::from_uuid5(&caller_agent_id, &subagent_name);
 
-                    // Ensure the stateful subagent is alive (idempotent).
-                    runtime
-                        .get_or_spawn_agent_with_id(derived_id.clone(), cloned_agent, config)
-                        .await;
-
-                    // Subscribe to global bus BEFORE sending to avoid missing the reply.
-                    let mut global_rx = runtime.subscribe();
-
-                    let envelope = Envelope::new(|id| Envelope {
-                        id,
-                        from: Sender::Agent(caller_agent_id),
-                        to: Sender::Agent(derived_id.clone()),
-                        reply_to: None,
-                        body: task,
-                    });
-                    let sent_id = envelope.id.clone();
-
-                    if let Err(e) = runtime.send_message(&derived_id, envelope).await {
-                        let _ = result_tx.send(Err(e.to_string()));
-                        return;
-                    }
-
-                    loop {
-                        match global_rx.recv().await {
-                            Ok((id, AgentEvent::AgentToAgent(reply)))
-                                if id == derived_id
-                                    && reply.reply_to.as_deref() == Some(&sent_id) =>
-                            {
-                                let _ = result_tx.send(Ok(reply.body));
-                                return;
+                        let mut last_content = String::new();
+                        while let Ok(event) = event_rx.recv().await {
+                            match event {
+                                AgentEvent::AgentToAgent(reply) => {
+                                    last_content = reply.body;
+                                    break;
+                                }
+                                AgentEvent::Error(e) => {
+                                    let _ = handle.send_command(AgentControl::Exit).await;
+                                    let _ = result_tx.send(Err(e));
+                                    return;
+                                }
+                                AgentEvent::Aborted(_) => {
+                                    let _ = handle.send_command(AgentControl::Exit).await;
+                                    let _ = result_tx.send(Err("Subagent aborted".into()));
+                                    return;
+                                }
+                                _ => {}
                             }
-                            Ok((id, AgentEvent::Error(e))) if id == derived_id => {
-                                let _ = result_tx.send(Err(e));
-                                return;
-                            }
-                            Ok((id, AgentEvent::Aborted(_))) if id == derived_id => {
-                                let _ = result_tx.send(Err("Subagent aborted".into()));
-                                return;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                let _ = result_tx.send(Err("Subagent is unavailable".into()));
-                                return;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                // Some messages were dropped due to a slow receiver;
-                                // the reply may still arrive, so keep waiting.
-                            }
-                            _ => {}
                         }
+                        // Shut down the subagent loop.
+                        let _ = handle.send_command(AgentControl::Exit).await;
+                        let _ = result_tx.send(Ok(last_content));
                     }
-                    // Stateful agent is NOT sent Exit — it persists for future calls.
+                    SubAgentMode::Stateful => {
+                        let derived_id = AgentID::from_uuid5(&caller_agent_id, &subagent_name);
+
+                        // Ensure the stateful subagent is alive (idempotent).
+                        runtime
+                            .get_or_spawn_agent_with_id(derived_id.clone(), cloned_agent, config)
+                            .await;
+
+                        // Subscribe to global bus BEFORE sending to avoid missing the reply.
+                        let mut global_rx = runtime.subscribe();
+
+                        let envelope = Envelope::new(|id| Envelope {
+                            id,
+                            from: Sender::Agent(caller_agent_id),
+                            to: Sender::Agent(derived_id.clone()),
+                            reply_to: None,
+                            body: task,
+                        });
+                        let sent_id = envelope.id.clone();
+
+                        if let Err(e) = runtime.send_message(&derived_id, envelope).await {
+                            let _ = result_tx.send(Err(e.to_string()));
+                            return;
+                        }
+
+                        loop {
+                            match global_rx.recv().await {
+                                Ok((id, AgentEvent::AgentToAgent(reply)))
+                                    if id == derived_id
+                                        && reply.reply_to.as_deref() == Some(&sent_id) =>
+                                {
+                                    let _ = result_tx.send(Ok(reply.body));
+                                    return;
+                                }
+                                Ok((id, AgentEvent::Error(e))) if id == derived_id => {
+                                    let _ = result_tx.send(Err(e));
+                                    return;
+                                }
+                                Ok((id, AgentEvent::Aborted(_))) if id == derived_id => {
+                                    let _ = result_tx.send(Err("Subagent aborted".into()));
+                                    return;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    let _ = result_tx.send(Err("Subagent is unavailable".into()));
+                                    return;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    // Some messages were dropped due to a slow receiver;
+                                    // the reply may still arrive, so keep waiting.
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Stateful agent is NOT sent Exit — it persists for future calls.
+                    }
                 }
             }
-        });
+            .instrument(span),
+        );
 
         result_rx.await.map_err(|e| e.to_string())?
     })
