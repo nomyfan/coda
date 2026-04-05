@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -8,6 +9,29 @@ use crate::tools::{
     GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
     WriteTodosTool,
 };
+
+/// Errors that can occur while building an agent tree from its spec.
+#[derive(Debug)]
+pub enum BuildError {
+    /// Two agents in the spec tree share the same name.
+    DuplicateAgentName(String),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::DuplicateAgentName(name) => {
+                write!(
+                    f,
+                    "Duplicate agent name '{}': agent names must be globally unique",
+                    name
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
 
 /// Runtime context for building agents and tools.
 pub struct BuildContext {
@@ -30,27 +54,51 @@ pub struct AgentSpec {
 }
 
 impl AgentSpec {
-    pub fn build(&self, ctx: &BuildContext) -> Agent {
-        let mut agent = Agent::new(&self.name, self.system_prompt.to_string());
-        agent.system_prompt = self.system_prompt.clone();
+    pub fn build(&self, ctx: &BuildContext) -> Result<HashMap<String, Agent>, BuildError> {
+        let mut agents = HashMap::new();
+        self.build_agent(ctx, &mut agents)?;
+        Ok(agents)
+    }
 
-        // Build and register tools
+    fn build_agent(
+        &self,
+        ctx: &BuildContext,
+        agents: &mut HashMap<String, Agent>,
+    ) -> Result<(), BuildError> {
+        if agents.contains_key(&self.name) {
+            return Err(BuildError::DuplicateAgentName(self.name.clone()));
+        }
+
+        let state = Arc::new(Mutex::new(AgentState {
+            messages: vec![],
+            todos: vec![],
+        }));
+
+        let mut agent = Agent {
+            name: self.name.clone(),
+            mode: self.mode.clone(),
+            system_prompt: self.system_prompt.clone(),
+            state,
+            tools: Default::default(),
+            subagents: Default::default(),
+        };
+
         for tool_spec in &self.tools {
             agent.tools.register(tool_spec.build(&agent.state, ctx));
         }
-
-        // Recursively build and register subagents
         for sub_spec in &self.subagents {
-            let sub_agent = sub_spec.build(ctx);
             agent.subagents.register(SubAgentTool {
                 name: sub_spec.name.clone(),
                 description: sub_spec.description.clone(),
-                agent: Mutex::new(sub_agent),
                 mode: sub_spec.mode.clone(),
             });
         }
+        agents.insert(self.name.clone(), agent);
 
-        agent
+        for sub_spec in &self.subagents {
+            sub_spec.build_agent(ctx, agents)?;
+        }
+        Ok(())
     }
 }
 

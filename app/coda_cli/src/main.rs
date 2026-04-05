@@ -2,9 +2,11 @@ mod ask_user;
 
 use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
-    AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision, RunConfig,
-    Sender, SubAgentMode, ToolApprovalMode, ToolCallResolution, builtin_specs,
-    runtime::{AgentControl, AgentRuntime},
+    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision,
+    RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
+    agent::{EnvelopeBody, Receiver, ResumePoint},
+    builtin_specs,
+    runtime::{AgentControl, AgentRuntime, MemoryStorage},
 };
 use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
@@ -12,10 +14,10 @@ use coda_skills::Skills;
 use dotenvy::dotenv;
 use either::Either;
 use rustyline::error::ReadlineError;
-use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{env, time::Duration};
 use tracing::{info, warn};
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
@@ -107,8 +109,16 @@ fn resolve_pending_calls(
     rl: &mut rustyline::DefaultEditor,
     checkpoint: &AgentCheckpoint,
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
+    let ResumePoint::PendingApproval {
+        pending_approval_calls,
+        ..
+    } = &checkpoint.resume_point
+    else {
+        return Ok(vec![]);
+    };
+
     let mut resolutions = vec![];
-    for pending_call in &checkpoint.pending_calls {
+    for pending_call in pending_approval_calls {
         if pending_call.name == "ask_user" {
             let output = match serde_json::from_str::<AskUserParams>(
                 pending_call.arguments.as_deref().unwrap_or("{}"),
@@ -193,10 +203,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         subagents: vec![
             AgentSpec {
-                name: "researcher".into(),
-                description: "A research sub-agent that can read files, search code, and explore the codebase. Delegate research tasks to it.".into(),
+                name: "explore".into(),
+                description: "An explore sub-agent that can read files, search code, and explore the codebase. Delegate exploration and research tasks to it.".into(),
                 system_prompt:
-                    "You are a research assistant. You can read files, search code, and list directories. \
+                    "You are an exploration assistant. You can read files, search code, and list directories. \
                      Summarize your findings concisely."
                         .to_string(),
                 mode: SubAgentMode::Stateless,
@@ -219,35 +229,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     };
 
-    let agent = spec.build(&ctx);
+    let agents = spec.build(&ctx)?;
 
-    let runtime = AgentRuntime::new();
-    let handle = runtime
-        .spawn_agent(
-            agent,
-            RunConfig {
-                provider,
-                model,
-                max_completion_tokens: Some(5000),
-                temperature: Some(0.7),
-                thread_id: uuid::Uuid::new_v4().to_string(),
-                tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-                    call.name == "shell" || call.name == "ask_user"
-                })),
-            },
-        )
-        .await;
+    let config = RunConfig {
+        provider,
+        model,
+        max_completion_tokens: Some(5000),
+        temperature: Some(0.7),
+        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+            call.name == "shell" || call.name == "ask_user"
+        })),
+    };
+    let mut runtime = AgentRuntime::new(MemoryStorage::default());
+    runtime.bootstrap(agents, config).await;
 
     print_logo();
 
     let mut rl = rustyline::DefaultEditor::new()?;
     println!("Type 'quit', 'exit', or 'q' to stop\n");
 
+    let thread_id = ThreadId::new();
+
     loop {
         let raw_input = match rl.readline("You: ") {
             Ok(line) => line,
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
                 println!("Goodbye!");
+                runtime.broadcast_command(AgentControl::Exit).await;
                 break;
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
@@ -262,19 +270,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || user_input.eq_ignore_ascii_case("q")
         {
             println!("Goodbye!");
+            runtime.broadcast_command(AgentControl::Exit).await;
             break;
         }
 
-        // Subscribe to all agents (including subagents spawned later)
         let mut event_rx = runtime.subscribe();
 
-        handle
+        runtime
             .send_message(Envelope::new(|id| Envelope {
                 id,
                 from: Sender::User,
-                to: Sender::Agent(handle.agent_id().clone()),
+                to: Receiver {
+                    name: "coda".into(),
+                    thread_id: thread_id.clone(),
+                },
                 reply_to: None,
-                body: user_input.to_string(),
+                body: EnvelopeBody::Task(user_input.to_string()),
             }))
             .await?;
 
@@ -289,7 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = tokio::signal::ctrl_c() => {
                     if abort_requested {
                         println!("\nGoodbye!");
-                        std::process::exit(0);
+                        runtime.broadcast_command(AgentControl::Exit).await;
+                        break;
                     }
                     abort_requested = true;
                     runtime.broadcast_command(AgentControl::Abort).await;
@@ -297,47 +309,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event = event_rx.recv() => {
                     match event {
                         Err(_) => break,
-                        Ok((aid, AgentEvent::LLMContentChunk(s))) => {
-                            if aid == *handle.agent_id() {
+                        Ok((agent_name, _, AgentEvent::LLMContentChunk(s))) => {
+                            if agent_name == "coda" {
                                 print!("{s}");
                             } else {
                                 print!("\x1b[36m{s}\x1b[0m");
                             }
                             io::stdout().flush()?;
                         }
-                        Ok((aid, AgentEvent::LLMEnd(msg))) => {
+                        Ok((agent_name, _, AgentEvent::LLMEnd(msg))) => {
                             if !msg.content.is_empty() {
                                 println!();
                             }
-                            // Only the main agent finishing means the turn is done.
-                            if aid == *handle.agent_id() && msg.tool_calls.is_empty() {
+                            if agent_name == "coda" && msg.tool_calls.is_empty() {
                                 break;
                             }
                         }
-                        Ok((aid, AgentEvent::ToolCallStart(c))) => {
-                            let is_main = aid == *handle.agent_id();
-                            if is_main {
+                        Ok((agent_name, _, AgentEvent::ToolCallStart(c))) => {
+                            if agent_name == "coda" {
                                 println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
                             } else {
-                                println!("\n\x1b[36m[Sub-agent Tool: {}]: {:?}\x1b[0m", c.name, c.arguments);
+                                println!("\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m", agent_name,c.name, c.arguments);
                             }
                         }
-                        Ok((_, AgentEvent::ToolCallEnd(_))) => {}
-                        Ok((aid, AgentEvent::Suspended(checkpoint))) => {
-                            let is_main = aid == *handle.agent_id();
+                        Ok((_, _, AgentEvent::ToolCallEnd(_))) => {}
+                        Ok((_, _, AgentEvent::Suspended(checkpoint))) => {
+                            let is_main = checkpoint.agent_name == "coda";
                             let label = if is_main { "" } else { " (sub-agent)" };
-                            println!("\n[{} tool call(s) require approval{}]", checkpoint.pending_calls.len(), label);
+                            let ResumePoint::PendingApproval { pending_approval_calls, .. } = &checkpoint.resume_point else {
+                                continue;
+                            };
+                            println!("\n[{} tool call(s) require approval{}]", pending_approval_calls.len(), label);
                             let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    // Ctrl+C during approval prompt — abort all agents
-                                    // (the suspended one and any parent waiting on it).
                                     runtime.broadcast_command(AgentControl::Abort).await;
                                     println!("\n[Aborted: approval interrupted]");
-                                    // Drain until the main agent's Aborted event so the
-                                    // outer loop doesn't see stale events.
-                                    while let Ok((a, ev)) = event_rx.try_recv() {
-                                        if a == *handle.agent_id() && matches!(ev, AgentEvent::Aborted(_)) {
+                                    while let Ok((name, _, ev)) = event_rx.try_recv() {
+                                        if name == "coda" && matches!(ev, AgentEvent::Aborted(_)) {
                                             break;
                                         }
                                     }
@@ -345,24 +354,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             };
                             let decision = ResumeDecision { resolutions };
-                            if let Err(e) = runtime.send_command(&aid, AgentControl::Resume(decision)).await {
+                            if let Err(e) = runtime
+                                .send_message(Envelope::new(|id| Envelope {
+                                    id,
+                                    from: Sender::User,
+                                    to: Receiver {
+                                        name: checkpoint.agent_name.clone(),
+                                        thread_id: ThreadId::from(checkpoint.thread_id.clone()),
+                                    },
+                                    reply_to: None,
+                                    body: EnvelopeBody::Resume(decision),
+                                }))
+                                .await
+                            {
                                 warn!("{}", e);
                                 println!("\n[Error: failed to resume agent: {}]", e);
                                 break;
                             }
                         }
-                        Ok((aid, AgentEvent::Aborted(target))) if aid == *handle.agent_id() => {
+                        Ok((agent_name, _, AgentEvent::Aborted(target))) if agent_name == "coda" => {
                             match &target {
-                                coda_agent::AbortedTarget::Generation => {
+                                AbortedTarget::Generation => {
                                     println!("\n\n[Aborted: generation interrupted]");
                                 }
-                                coda_agent::AbortedTarget::ToolCalls(ids) => {
+                                AbortedTarget::ToolCalls(ids) => {
                                     println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
                                 }
                             }
                             break;
                         }
-                        Ok((aid, AgentEvent::Error(err))) if aid == *handle.agent_id() => {
+                        Ok((agent_name, _, AgentEvent::Error(err))) if agent_name == "coda" => {
                             warn!("{}", err);
                             println!("\n[Error: {}]", err);
                             break;
@@ -375,6 +396,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!();
     }
+
+    // Wait a moment for agents to process the exit gracefully before shutting down the runtime.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     Ok(())
 }
