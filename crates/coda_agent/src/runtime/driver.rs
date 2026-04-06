@@ -86,7 +86,7 @@ pub(crate) async fn run_agent(
 
 enum AgentLoopState {
     Next(ResumePoint),
-    Done,
+    Done(ResumePoint),
 }
 
 struct AgentLoop<'a, C: LLMProvider + Clone> {
@@ -115,22 +115,28 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .restore_history(checkpoint.messages.clone(), checkpoint.todos.clone())
             .await;
         self.reply_target = checkpoint.reply_target.clone();
-        match self.handle_envelope(&mut checkpoint).await {
+        let resume_point = std::mem::take(&mut checkpoint.resume_point);
+        match self.handle_envelope(resume_point).await {
             AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-            AgentLoopState::Done => {
+            AgentLoopState::Done(resume_point) => {
+                checkpoint.resume_point = resume_point;
                 self.save_checkpoint(checkpoint).await;
                 return Ok(());
             }
         }
 
         loop {
-            match &checkpoint.resume_point {
+            let resume_point = std::mem::take(&mut checkpoint.resume_point);
+            match resume_point {
                 ResumePoint::Generation => match self.handle_generation().await {
                     AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-                    AgentLoopState::Done => break,
+                    AgentLoopState::Done(resume_point) => {
+                        checkpoint.resume_point = resume_point;
+                        break;
+                    }
                 },
                 ResumePoint::ToolExecution(tool_execution_state) => match self
-                    .handle_tool_execution(tool_execution_state.clone())
+                    .handle_tool_execution(tool_execution_state)
                     .await
                 {
                     AgentLoopState::Next(resume_point @ ResumePoint::ToolExecution(_)) => {
@@ -138,17 +144,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         break;
                     }
                     AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-                    AgentLoopState::Done => {
-                        // Aborted; reset so no stale ToolExecution state is persisted.
-                        checkpoint.resume_point = ResumePoint::Generation;
+                    AgentLoopState::Done(resume_point) => {
+                        checkpoint.resume_point = resume_point;
                         break;
                     }
                 },
                 ResumePoint::PendingApproval {
                     pending_approval_calls,
-                    ..
+                    pending_calls,
                 } => {
-                    if !pending_approval_calls.is_empty() {
+                    let has_pending = !pending_approval_calls.is_empty();
+                    checkpoint.resume_point = ResumePoint::PendingApproval {
+                        pending_approval_calls,
+                        pending_calls,
+                    };
+                    if has_pending {
                         checkpoint.todos = self.agent.todos().await;
                         checkpoint.messages = self.agent.history().await;
                         self.runtime.emit_event(
@@ -185,8 +195,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
     }
 
-    async fn handle_envelope(&mut self, checkpoint: &mut AgentCheckpoint) -> AgentLoopState {
-        match &mut checkpoint.resume_point {
+    async fn handle_envelope(&mut self, resume_point: ResumePoint) -> AgentLoopState {
+        match resume_point {
             ResumePoint::Generation => {
                 match &self.envelope.body {
                     EnvelopeBody::Task(task) => {
@@ -203,12 +213,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                     _ => {
                         warn!("unexpected envelope {:?}", self.envelope);
-                        return AgentLoopState::Done;
+                        return AgentLoopState::Done(ResumePoint::Generation);
                     }
                 }
                 AgentLoopState::Next(ResumePoint::Generation)
             }
-            ResumePoint::ToolExecution(tool_execution) => {
+            ResumePoint::ToolExecution(mut tool_execution) => {
                 if !tool_execution.pending_replies.is_empty() {
                     match &self.envelope {
                         Envelope {
@@ -269,18 +279,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         }
                         _ => {
                             warn!("expect a reply envelope but got a {:?}", self.envelope);
-                            return AgentLoopState::Done;
+                            return AgentLoopState::Done(ResumePoint::ToolExecution(
+                                tool_execution,
+                            ));
                         }
                     }
                 }
                 if tool_execution.pending_replies.is_empty() {
                     return AgentLoopState::Next(ResumePoint::Generation);
                 }
-                AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution.clone()))
+                AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution))
             }
             ResumePoint::PendingApproval {
-                pending_approval_calls,
-                pending_calls,
+                mut pending_approval_calls,
+                mut pending_calls,
             } => {
                 match &self.envelope.body {
                     EnvelopeBody::Task(task) | EnvelopeBody::ToolCall { task, .. } => {
@@ -372,7 +384,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             "unexpected envelope while suspended for approval: {:?}",
                             self.envelope
                         );
-                        AgentLoopState::Done
+                        AgentLoopState::Done(ResumePoint::PendingApproval {
+                            pending_approval_calls,
+                            pending_calls,
+                        })
                     }
                 }
             }
@@ -468,7 +483,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             error!("Failed to send LLM reply: {}", err);
                         }
                     }
-                    AgentLoopState::Done
+                    AgentLoopState::Done(ResumePoint::Generation)
                 } else {
                     let (pending_approval_calls, auto_calls) = {
                         match &self.config.tool_approval {
@@ -537,7 +552,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         AgentEvent::Error(err),
                     );
                 }
-                AgentLoopState::Done
+                AgentLoopState::Done(ResumePoint::Generation)
             }
         }
     }
@@ -727,7 +742,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.thread_id.clone(),
                 AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids)),
             );
-            return AgentLoopState::Done;
+            return AgentLoopState::Done(ResumePoint::Generation);
         }
 
         if !tool_execution.pending_replies.is_empty() {
