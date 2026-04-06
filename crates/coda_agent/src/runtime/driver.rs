@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 
+use super::AgentControl;
 use crate::{
     AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, RunConfig, Sender, SubAgentMode,
     ThreadId, ToolApprovalMode, ToolCallResolution,
@@ -19,7 +20,7 @@ use crate::{
         EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget, ResumePoint,
         ToolExecutionState,
     },
-    runtime::{AgentControl, AgentRuntime},
+    runtime::AgentRuntime,
 };
 
 #[instrument(skip_all, fields(agent = %agent.name))]

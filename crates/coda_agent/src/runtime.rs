@@ -13,7 +13,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
 #[derive(Clone)]
-pub enum AgentControl {
+enum AgentControl {
     Abort,
     /// Shut down the agent loop entirely.
     Exit,
@@ -36,14 +36,13 @@ impl std::fmt::Display for SendCommandError {
 
 impl std::error::Error for SendCommandError {}
 
-pub struct AgentHandle {
+struct AgentHandle {
     control_sender: mpsc::Sender<AgentControl>,
     message_sender: mpsc::Sender<Envelope>,
-    event_sender: broadcast::Sender<(ThreadId, AgentEvent)>,
 }
 
 impl AgentHandle {
-    pub async fn send_command(&self, cmd: AgentControl) -> Result<(), SendCommandError> {
+    async fn send_command(&self, cmd: AgentControl) -> Result<(), SendCommandError> {
         self.control_sender
             .send(cmd)
             .await
@@ -56,11 +55,6 @@ impl AgentHandle {
             .send(envelope)
             .await
             .map_err(|_| SendCommandError::ChannelClosed)
-    }
-
-    /// Opt-in subscribe to this agent's event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<(ThreadId, AgentEvent)> {
-        self.event_sender.subscribe()
     }
 }
 
@@ -139,34 +133,18 @@ impl AgentRuntime {
             info!("Bootstrapping agent: {}", name);
             let (control_tx, control_rx) = mpsc::channel(10);
             let (envelope_tx, envelope_rx) = mpsc::channel(10);
-            let (event_tx, mut event_rx) = broadcast::channel(64);
             let runtime = self.clone();
 
-            let name_clone = name.clone();
             let task_name = name.clone();
             let config = config.clone();
             self.agent_tasks.lock().await.spawn(async move {
-                // Forward per-agent events to the global event bus.
-                let forward_task = {
-                    let global_tx = runtime.global_event_tx.clone();
-                    tokio::spawn(async move {
-                        while let Ok((thread_id, event)) = event_rx.recv().await {
-                            // Ignore send errors — there may temporarily be no subscribers
-                            // between turns.
-                            let _ = global_tx.send((name_clone.clone(), thread_id, event));
-                        }
-                    })
-                };
-
                 driver::run_agent(runtime, agent, control_rx, envelope_rx, config).await;
-                forward_task.abort();
                 task_name
             });
 
             let handle = AgentHandle {
                 control_sender: control_tx,
                 message_sender: envelope_tx,
-                event_sender: event_tx,
             };
             self.agents.lock().await.insert(name, handle);
         }
@@ -177,15 +155,24 @@ impl AgentRuntime {
         self.global_event_tx.subscribe()
     }
 
-    /// Broadcast a control command to all agents.
-    pub async fn broadcast_command(&self, cmd: AgentControl) {
+    async fn broadcast_command(&self, cmd: AgentControl) {
         let agents = self.agents.lock().await;
         for entry in agents.values() {
-            let err = entry.control_sender.send(cmd.clone()).await;
+            let err = entry.send_command(cmd.clone()).await;
             if let Err(e) = err {
                 info!("Failed to send command to agent: {}", e);
             }
         }
+    }
+
+    /// Abort the current work for this runtime.
+    pub async fn abort(&self) {
+        self.broadcast_command(AgentControl::Abort).await;
+    }
+
+    /// Request this runtime to exit all agent loops.
+    pub async fn exit(&self) {
+        self.broadcast_command(AgentControl::Exit).await;
     }
 
     /// Send a message to a specific agent.

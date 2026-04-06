@@ -588,7 +588,7 @@ where
     }
 
     async fn shutdown(&self) {
-        self.runtime.broadcast_command(AgentControl::Exit).await;
+        self.runtime.exit().await;
         assert!(
             self.runtime
                 .wait_for_exit(Some(Duration::from_secs(2)))
@@ -626,7 +626,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
 
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
 
-    runtime.broadcast_command(AgentControl::Exit).await;
+    runtime.exit().await;
     assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }
 
@@ -913,7 +913,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
                 ("coda", AgentEvent::ToolCallStart(tool)) => {
                     started.insert(tool.id);
                     if started.contains("call_slow") && started.contains("call_explore") {
-                        harness.runtime.broadcast_command(AgentControl::Abort).await;
+                        harness.runtime.abort().await;
                     }
                 }
                 ("coda", AgentEvent::Aborted(AbortedTarget::ToolCalls(ids))) => {
@@ -980,7 +980,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                 ("coda", AgentEvent::LLMContentChunk(chunk)) => {
                     assert_eq!(chunk, "partial");
                     saw_chunk = true;
-                    harness.runtime.broadcast_command(AgentControl::Abort).await;
+                    harness.runtime.abort().await;
                 }
                 ("coda", AgentEvent::Aborted(AbortedTarget::Generation)) => {
                     assert!(

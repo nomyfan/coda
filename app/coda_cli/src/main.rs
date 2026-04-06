@@ -6,7 +6,7 @@ use coda_agent::{
     RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{EnvelopeBody, Receiver, ResumePoint},
     builtin_specs,
-    runtime::{AgentControl, AgentRuntime, MemoryStorage},
+    runtime::{AgentRuntime, MemoryStorage},
 };
 use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
 use coda_openai::OpenAI;
@@ -255,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => line,
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
                 println!("Goodbye!");
-                runtime.broadcast_command(AgentControl::Exit).await;
+                runtime.exit().await;
                 break;
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
@@ -270,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || user_input.eq_ignore_ascii_case("q")
         {
             println!("Goodbye!");
-            runtime.broadcast_command(AgentControl::Exit).await;
+            runtime.exit().await;
             break;
         }
 
@@ -292,19 +292,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        let mut abort_requested = false;
-
         loop {
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => {
-                    if abort_requested {
-                        println!("\nGoodbye!");
-                        runtime.broadcast_command(AgentControl::Exit).await;
-                        break;
-                    }
-                    abort_requested = true;
-                    runtime.broadcast_command(AgentControl::Abort).await;
+                    runtime.abort().await;
                 }
                 event = event_rx.recv() => {
                     match event {
@@ -343,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    runtime.broadcast_command(AgentControl::Abort).await;
+                                    runtime.abort().await;
                                     println!("\n[Aborted: approval interrupted]");
                                     while let Ok((name, _, ev)) = event_rx.try_recv() {
                                         if name == "coda" && matches!(ev, AgentEvent::Aborted(_)) {
