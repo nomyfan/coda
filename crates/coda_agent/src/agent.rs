@@ -191,7 +191,7 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn new(f: impl FnOnce(String) -> Self) -> Self {
+    pub fn with_id(f: impl FnOnce(String) -> Self) -> Self {
         f(Uuid::new_v4().to_string())
     }
 }

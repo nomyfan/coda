@@ -446,7 +446,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     if let Some(reply_target) = self.reply_target.take() {
                         let err = self
                             .runtime
-                            .send_message(Envelope::new(|id| Envelope {
+                            .send_message(Envelope::with_id(|id| Envelope {
                                 id,
                                 from: Sender::Agent {
                                     name: self.agent.name.clone(),
@@ -513,7 +513,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 if let Some(reply_target) = self.reply_target.take() {
                     let ret = self
                         .runtime
-                        .send_message(Envelope::new(|id| Envelope {
+                        .send_message(Envelope::with_id(|id| Envelope {
                             id,
                             from: Sender::Agent {
                                 name: self.agent.name.clone(),
@@ -580,7 +580,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     // sub-agent session persists across calls within the same conversation.
                     ThreadId::from_uuid5(&self.thread_id, &tc.tool_call.name)
                 };
-                let subagent_tool_call_envelope = Envelope::new(|id| Envelope {
+                let subagent_tool_call_envelope = Envelope::with_id(|id| Envelope {
                     id,
                     from: Sender::Agent {
                         name: self.agent.name.clone(),

@@ -277,7 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut event_rx = runtime.subscribe();
 
         runtime
-            .send_message(Envelope::new(|id| Envelope {
+            .send_message(Envelope::with_id(|id| Envelope {
                 id,
                 from: Sender::User,
                 to: Receiver {
@@ -355,7 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let decision = ResumeDecision { resolutions };
                             if let Err(e) = runtime
-                                .send_message(Envelope::new(|id| Envelope {
+                                .send_message(Envelope::with_id(|id| Envelope {
                                     id,
                                     from: Sender::User,
                                     to: Receiver {

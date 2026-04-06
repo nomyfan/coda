@@ -497,7 +497,7 @@ fn describe_tools(messages: &[Message]) -> String {
 }
 
 fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
-    Envelope::new(|id| Envelope {
+    Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
         to: Receiver {
@@ -569,7 +569,7 @@ where
         resolutions: Vec<(String, ToolCallResolution)>,
     ) {
         self.runtime
-            .send_message(Envelope::new(|id| Envelope {
+            .send_message(Envelope::with_id(|id| Envelope {
                 id,
                 from: Sender::User,
                 to: Receiver {
