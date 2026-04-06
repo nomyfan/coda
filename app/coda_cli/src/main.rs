@@ -1,4 +1,5 @@
 mod ask_user;
+mod storage;
 
 use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
@@ -6,9 +7,11 @@ use coda_agent::{
     RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{EnvelopeBody, Receiver, ResumePoint},
     builtin_specs,
-    runtime::{AgentRuntime, MemoryStorage},
+    runtime::{AgentRuntime, SessionStorage},
 };
-use coda_core::llm::{LLMProviderConfig, ToolCall, ToolOutput};
+use coda_core::llm::{
+    CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
+};
 use coda_openai::OpenAI;
 use coda_skills::Skills;
 use dotenvy::dotenv;
@@ -18,7 +21,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::{env, time::Duration};
+use storage::JsonFileStorage;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -146,8 +151,125 @@ fn resolve_pending_calls(
     Ok(resolutions)
 }
 
+fn render_message(message: &Message) {
+    match message {
+        Message::System(_) => {}
+        Message::User(msg) => {
+            println!("You: {}", msg.0);
+        }
+        Message::Assistant(msg) => {
+            if !msg.content.is_empty() {
+                println!("Assistant: {}", msg.content);
+            }
+            for tool_call in &msg.tool_calls {
+                println!(
+                    "[Tool: {}]: {}",
+                    tool_call.name,
+                    tool_call.arguments.as_deref().unwrap_or("{}")
+                );
+            }
+            if let Some(usage) = &msg.usage {
+                println!("{}", token_usage_line(None, usage));
+            }
+            if msg.aborted {
+                println!("[Assistant generation was interrupted]");
+            }
+        }
+        Message::Tool(msg) => {
+            let status = match &msg.outcome {
+                ToolCallOutcome::Auto => "auto",
+                ToolCallOutcome::Approved => "approved",
+                ToolCallOutcome::Resolved => "resolved",
+                ToolCallOutcome::Rejected { .. } => "rejected",
+                ToolCallOutcome::Aborted => "aborted",
+            };
+            match &msg.output {
+                ToolOutput::Ok(output) => {
+                    println!("[Tool Result: {}][{}] {}", msg.name, status, output)
+                }
+                ToolOutput::Err(output) => {
+                    println!("[Tool Error: {}][{}] {}", msg.name, status, output)
+                }
+            }
+        }
+    }
+}
+
+fn token_usage_summary(usage: &CompletionUsage) -> String {
+    let total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    format!(
+        "prompt: {} | completion: {} | total: {}",
+        usage.prompt_tokens, usage.completion_tokens, total_tokens
+    )
+}
+
+fn token_usage_line(agent_name: Option<&str>, usage: &CompletionUsage) -> String {
+    match agent_name {
+        Some(name) if name != "coda" => {
+            format!("[Token Usage: {name}] {}", token_usage_summary(usage))
+        }
+        _ => format!("[Token Usage] {}", token_usage_summary(usage)),
+    }
+}
+
+fn render_checkpoint_history(checkpoint: &AgentCheckpoint) {
+    if checkpoint.messages.is_empty() {
+        return;
+    }
+
+    println!("Resumed conversation:\n");
+    for message in &checkpoint.messages {
+        render_message(message);
+    }
+    println!();
+}
+
+fn print_usage(program: &str) {
+    println!("Usage: {program} [--resume <uuid>]");
+}
+
+fn parse_thread_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<ThreadId>, String> {
+    let mut args = args.into_iter();
+    let mut thread_id = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--resume" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --resume".to_string())?;
+                Uuid::parse_str(&value)
+                    .map_err(|err| format!("invalid thread id '{value}': {err}"))?;
+                if thread_id.replace(ThreadId::from(value)).is_some() {
+                    return Err("thread id can only be provided once".to_string());
+                }
+            }
+            "-h" | "--help" => return Err(String::new()),
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+
+    Ok(thread_id)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let program = env::args().next().unwrap_or_else(|| "coda".into());
+    let resumed_thread_id = match parse_thread_id_arg(env::args().skip(1)) {
+        Ok(Some(thread_id)) => Some(thread_id),
+        Ok(None) => None,
+        Err(err) if err.is_empty() => {
+            print_usage(&program);
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            print_usage(&program);
+            return Err(err.into());
+        }
+    };
+    let thread_id = resumed_thread_id.clone().unwrap_or_default();
+
     dotenv()?;
 
     let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
@@ -240,15 +362,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             call.name == "shell" || call.name == "ask_user"
         })),
     };
-    let mut runtime = AgentRuntime::new(MemoryStorage::default());
+    let checkpoint_dir = workspace_dir.join(".coda").join("checkpoints");
+    let storage = JsonFileStorage::new(checkpoint_dir);
+    let resumed_checkpoint = if resumed_thread_id.is_some() {
+        match storage.load_checkpoint(thread_id.as_ref()).await {
+            Ok(checkpoint) => checkpoint,
+            Err(err) => {
+                warn!("Failed to load checkpoint for history rendering: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut runtime = AgentRuntime::new(storage);
     runtime.bootstrap(agents, config).await;
 
     print_logo();
 
     let mut rl = rustyline::DefaultEditor::new()?;
     println!("Type 'quit', 'exit', or 'q' to stop\n");
-
-    let thread_id = ThreadId::new();
+    println!("Session thread id: {}\n", thread_id.as_ref());
+    if resumed_thread_id.is_some()
+        && let Some(ref checkpoint) = resumed_checkpoint
+    {
+        render_checkpoint_history(checkpoint)
+    }
 
     loop {
         let raw_input = match rl.readline("You: ") {
@@ -310,8 +450,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             io::stdout().flush()?;
                         }
                         Ok((agent_name, _, AgentEvent::LLMEnd(msg))) => {
-                            if !msg.content.is_empty() {
+                            if !msg.content.is_empty() || msg.usage.is_some() {
                                 println!();
+                            }
+                            if let Some(usage) = &msg.usage {
+                                let usage_line = token_usage_line(Some(agent_name.as_str()), usage);
+                                if agent_name == "coda" {
+                                    println!("{usage_line}");
+                                } else {
+                                    println!("\x1b[36m{usage_line}\x1b[0m");
+                                }
                             }
                             if agent_name == "coda" && msg.tool_calls.is_empty() {
                                 break;
@@ -392,6 +540,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !runtime.wait_for_exit(Some(Duration::from_secs(2))).await {
         warn!("Timed out waiting for agents to exit");
     }
+
+    println!("Current session thread id: {}", thread_id.as_ref());
 
     Ok(())
 }

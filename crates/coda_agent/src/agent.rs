@@ -46,7 +46,6 @@ pub struct ResumeDecision {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentCheckpoint {
     pub thread_id: String,
-    pub root_thread_id: String,
     pub agent_name: String,
     #[serde(default)]
     pub reply_target: Option<ReplyTarget>,
