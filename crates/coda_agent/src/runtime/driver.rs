@@ -30,6 +30,7 @@ pub(crate) async fn run_agent(
     mut envelope_rx: mpsc::Receiver<Envelope>,
     config: RunConfig<impl LLMProvider + Clone>,
 ) {
+    info!("Agent {} is running", agent.name);
     loop {
         // Wait for the next envelope, but allow Exit to break the loop.
         let envelope = tokio::select! {
@@ -361,12 +362,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 }
                             }
                         }
-                        AgentLoopState::Next(ResumePoint::ToolExecution(
-                            ToolExecutionState {
-                                pending_replies: vec![],
-                                tool_calls: pending_calls.clone(),
-                            },
-                        ))
+                        AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            pending_replies: vec![],
+                            tool_calls: pending_calls.clone(),
+                        }))
                     }
                     _ => {
                         warn!(
@@ -493,18 +492,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .collect(),
                         })
                     } else {
-                        AgentLoopState::Next(ResumePoint::ToolExecution(
-                            ToolExecutionState {
-                                pending_replies: vec![],
-                                tool_calls: auto_calls
-                                    .into_iter()
-                                    .map(|call| PendingToolCall {
-                                        tool_call: call,
-                                        outcome: ToolCallOutcome::Auto,
-                                    })
-                                    .collect(),
-                            },
-                        ))
+                        AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            pending_replies: vec![],
+                            tool_calls: auto_calls
+                                .into_iter()
+                                .map(|call| PendingToolCall {
+                                    tool_call: call,
+                                    outcome: ToolCallOutcome::Auto,
+                                })
+                                .collect(),
+                        }))
                     }
                 }
             }

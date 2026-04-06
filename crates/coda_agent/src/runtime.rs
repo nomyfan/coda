@@ -8,7 +8,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
-use tracing::info;
+use tokio::task::JoinSet;
+use tokio::time::{Duration, timeout};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub enum AgentControl {
@@ -107,6 +109,7 @@ impl SessionStorage for MemoryStorage {
 pub struct AgentRuntime {
     /// Key: unique agent name
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
+    agent_tasks: Arc<Mutex<JoinSet<String>>>,
     /// Global event bus — all agents forward their events here.
     global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
@@ -117,6 +120,7 @@ impl AgentRuntime {
         let (global_event_tx, _) = broadcast::channel(256);
         AgentRuntime {
             agents: Arc::new(Mutex::new(HashMap::new())),
+            agent_tasks: Arc::new(Mutex::new(JoinSet::new())),
             global_event_tx,
             session_storage: Arc::new(session_storage),
         }
@@ -139,8 +143,9 @@ impl AgentRuntime {
             let runtime = self.clone();
 
             let name_clone = name.clone();
+            let task_name = name.clone();
             let config = config.clone();
-            tokio::spawn(async move {
+            self.agent_tasks.lock().await.spawn(async move {
                 // Forward per-agent events to the global event bus.
                 let forward_task = {
                     let global_tx = runtime.global_event_tx.clone();
@@ -155,6 +160,7 @@ impl AgentRuntime {
 
                 driver::run_agent(runtime, agent, control_rx, envelope_rx, config).await;
                 forward_task.abort();
+                task_name
             });
 
             let handle = AgentHandle {
@@ -189,6 +195,33 @@ impl AgentRuntime {
             handle.send_message(envelope).await
         } else {
             Err(SendCommandError::AgentNotFound)
+        }
+    }
+
+    /// Wait for all bootstrapped agent tasks to exit.
+    ///
+    /// Returns `false` if the timeout elapses before every agent stops.
+    pub async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
+        let mut agent_tasks = self.agent_tasks.lock().await;
+        if agent_tasks.is_empty() {
+            return true;
+        }
+
+        let wait_for_exit = async {
+            while let Some(result) = agent_tasks.join_next().await {
+                match result {
+                    Ok(agent_name) => info!("Agent {} exited", agent_name),
+                    Err(err) => warn!("Agent task failed to join: {}", err),
+                }
+            }
+        };
+
+        match timeout_duration {
+            Some(duration) => timeout(duration, wait_for_exit).await.is_ok(),
+            None => {
+                wait_for_exit.await;
+                true
+            }
         }
     }
 }

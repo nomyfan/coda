@@ -589,7 +589,45 @@ where
 
     async fn shutdown(&self) {
         self.runtime.broadcast_command(AgentControl::Exit).await;
+        assert!(
+            self.runtime
+                .wait_for_exit(Some(Duration::from_secs(2)))
+                .await,
+            "timed out waiting for runtime shutdown"
+        );
     }
+}
+
+#[tokio::test]
+async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
+    let agents = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec![],
+    }
+    .build(&BuildContext {
+        workspace_dir: ".".into(),
+    })
+    .expect("build agent tree");
+
+    let config = RunConfig {
+        provider: TestProvider::default(),
+        model: "fake".into(),
+        temperature: None,
+        max_completion_tokens: None,
+        tool_approval: ToolApprovalMode::Auto,
+    };
+
+    let mut runtime = AgentRuntime::new(MemoryStorage::default());
+    runtime.bootstrap(agents, config).await;
+
+    assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
+
+    runtime.broadcast_command(AgentControl::Exit).await;
+    assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }
 
 fn explore_read_todos_spec(main_prompt: &str) -> AgentSpec {

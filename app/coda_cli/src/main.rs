@@ -397,8 +397,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    // Wait a moment for agents to process the exit gracefully before shutting down the runtime.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    if !runtime.wait_for_exit(Some(Duration::from_secs(2))).await {
+        warn!("Timed out waiting for agents to exit");
+    }
 
     Ok(())
 }
