@@ -205,7 +205,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         return AgentLoopState::Done;
                     }
                 }
-                return AgentLoopState::Next(ResumePoint::Generation);
+                AgentLoopState::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(tool_execution) => {
                 if !tool_execution.pending_replies.is_empty() {
@@ -275,7 +275,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 if tool_execution.pending_replies.is_empty() {
                     return AgentLoopState::Next(ResumePoint::Generation);
                 }
-                return AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution.clone()));
+                AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution.clone()))
             }
             ResumePoint::PendingApproval {
                 pending_approval_calls,
@@ -318,7 +318,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         self.agent
                             .add_message(Message::User(UserMessage(task.clone())))
                             .await;
-                        return AgentLoopState::Next(ResumePoint::Generation);
+                        AgentLoopState::Next(ResumePoint::Generation)
                     }
                     EnvelopeBody::Resume(decision) => {
                         let resolution_map: HashMap<String, ToolCallResolution> =
@@ -361,19 +361,19 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 }
                             }
                         }
-                        return AgentLoopState::Next(ResumePoint::ToolExecution(
+                        AgentLoopState::Next(ResumePoint::ToolExecution(
                             ToolExecutionState {
                                 pending_replies: vec![],
                                 tool_calls: pending_calls.clone(),
                             },
-                        ));
+                        ))
                     }
                     _ => {
                         warn!(
                             "unexpected envelope while suspended for approval: {:?}",
                             self.envelope
                         );
-                        return AgentLoopState::Done;
+                        AgentLoopState::Done
                     }
                 }
             }
@@ -469,7 +469,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             error!("Failed to send LLM reply: {}", err);
                         }
                     }
-                    return AgentLoopState::Done;
+                    AgentLoopState::Done
                 } else {
                     let (pending_approval_calls, auto_calls) = {
                         match &self.config.tool_approval {
@@ -482,7 +482,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         }
                     };
                     if !pending_approval_calls.is_empty() {
-                        return AgentLoopState::Next(ResumePoint::PendingApproval {
+                        AgentLoopState::Next(ResumePoint::PendingApproval {
                             pending_approval_calls: pending_approval_calls.into(),
                             pending_calls: auto_calls
                                 .into_iter()
@@ -491,9 +491,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     outcome: ToolCallOutcome::Auto,
                                 })
                                 .collect(),
-                        });
+                        })
                     } else {
-                        return AgentLoopState::Next(ResumePoint::ToolExecution(
+                        AgentLoopState::Next(ResumePoint::ToolExecution(
                             ToolExecutionState {
                                 pending_replies: vec![],
                                 tool_calls: auto_calls
@@ -504,7 +504,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     })
                                     .collect(),
                             },
-                        ));
+                        ))
                     }
                 }
             }
@@ -540,7 +540,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         AgentEvent::Error(err),
                     );
                 }
-                return AgentLoopState::Done;
+                AgentLoopState::Done
             }
         }
     }
@@ -734,9 +734,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
 
         if !tool_execution.pending_replies.is_empty() {
-            return AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution.clone()));
+            AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution.clone()))
         } else {
-            return AgentLoopState::Next(ResumePoint::Generation);
+            AgentLoopState::Next(ResumePoint::Generation)
         }
     }
 }

@@ -592,47 +592,22 @@ where
     }
 }
 
-fn boxed<T: ToolSpec + 'static>(tool: T) -> Box<dyn ToolSpec> {
-    Box::new(tool)
-}
-
-fn agent_spec(
-    name: &str,
-    prompt: &str,
-    mode: SubAgentMode,
-    tools: Vec<Box<dyn ToolSpec>>,
-    subagents: Vec<AgentSpec>,
-) -> AgentSpec {
-    AgentSpec {
-        name: name.into(),
-        description: String::new(),
-        system_prompt: prompt.into(),
-        mode,
-        tools,
-        subagents,
-    }
-}
-
 fn explore_read_todos_spec(main_prompt: &str) -> AgentSpec {
-    agent_spec(
-        "coda",
-        main_prompt,
-        SubAgentMode::Stateful,
-        vec![],
-        vec![agent_spec(
-            "explore",
-            "explore-system",
-            SubAgentMode::Stateless,
-            vec![boxed(ReadTodosToolSpec)],
-            vec![],
-        )],
-    )
-}
-
-fn wait_timeout<T>(
-    fut: impl Future<Output = T>,
-) -> impl Future<Output = Result<T, tokio::time::error::Elapsed>> {
-    timeout(Duration::from_secs(2), fut)
+    AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: main_prompt.into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "explore-system".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        }],
+    }
 }
 
 async fn wait_for_completion_after_explore_reply(
@@ -644,7 +619,7 @@ async fn wait_for_completion_after_explore_reply(
     let mut saw_parent_tool_reply = false;
     let mut observed = Vec::new();
 
-    let result = wait_timeout(async {
+    let result = timeout(Duration::from_secs(2), async {
         loop {
             let (agent_name, _, event) = harness.next_event().await;
             observed.push(format!("{} {:?}", agent_name, event));
@@ -736,20 +711,21 @@ async fn stateless_subagent_replies_after_approval_resume() {
 async fn pending_approval_supports_mixed_resolutions() {
     let mut harness = Harness::start(
         MemoryStorage::default(),
-        agent_spec(
-            "coda",
-            "approval-main",
-            SubAgentMode::Stateful,
-            vec![boxed(ReadTodosToolSpec), boxed(EchoToolSpec)],
-            vec![],
-        ),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "approval-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec), Box::new(EchoToolSpec)],
+            subagents: vec![],
+        },
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
         "inspect approvals",
     )
     .await;
 
-    let result = wait_timeout(async {
+    let result = timeout(Duration::from_secs(2), async {
         let mut saw_tool_end_ids = HashSet::new();
 
         loop {
@@ -808,26 +784,28 @@ async fn pending_approval_supports_mixed_resolutions() {
 async fn new_task_replaces_pending_approval_and_pending_reply() {
     let mut harness = Harness::start(
         MemoryStorage::default(),
-        agent_spec(
-            "coda",
-            "interrupt-main",
-            SubAgentMode::Stateful,
-            vec![boxed(ReadTodosToolSpec)],
-            vec![agent_spec(
-                "explore",
-                "hold-subagent",
-                SubAgentMode::Stateless,
-                vec![],
-                vec![],
-            )],
-        ),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "hold-subagent".into(),
+                mode: SubAgentMode::Stateless,
+                tools: vec![],
+                subagents: vec![],
+            }],
+        },
         TestProvider::with_hold_subagent(Arc::new(Notify::new())),
         ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
         "phase1",
     )
     .await;
 
-    let result = wait_timeout(async {
+    let result = timeout(Duration::from_secs(2), async {
         let mut sent_phase2 = false;
         let mut sent_phase3 = false;
 
@@ -865,28 +843,30 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
     let mut harness = Harness::start(
         storage.clone(),
-        agent_spec(
-            "coda",
-            "abort-main",
-            SubAgentMode::Stateful,
-            vec![boxed(SlowToolSpec {
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(SlowToolSpec {
                 gate: Arc::new(Notify::new()),
             })],
-            vec![agent_spec(
-                "explore",
-                "hold-subagent",
-                SubAgentMode::Stateless,
-                vec![],
-                vec![],
-            )],
-        ),
+            subagents: vec![AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "hold-subagent".into(),
+                mode: SubAgentMode::Stateless,
+                tools: vec![],
+                subagents: vec![],
+            }],
+        },
         TestProvider::with_hold_subagent(Arc::new(Notify::new())),
         ToolApprovalMode::Auto,
         "abort",
     )
     .await;
 
-    let result = wait_timeout(async {
+    let result = timeout(Duration::from_secs(2), async {
         let mut started = HashSet::new();
 
         loop {
@@ -909,7 +889,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     })
     .await;
 
-    let checkpoint = wait_timeout(async {
+    let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
                 && matches!(checkpoint.resume_point, ResumePoint::Generation)
@@ -939,20 +919,21 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     let storage = TestStorage::default();
     let mut harness = Harness::start(
         storage.clone(),
-        agent_spec(
-            "coda",
-            "abort-generation-main",
-            SubAgentMode::Stateful,
-            vec![],
-            vec![],
-        ),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
         TestProvider::with_hold_generation(Arc::new(Notify::new())),
         ToolApprovalMode::Auto,
         "abort generation",
     )
     .await;
 
-    let result = wait_timeout(async {
+    let result = timeout(Duration::from_secs(2), async {
         let mut saw_chunk = false;
 
         loop {
@@ -976,7 +957,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     })
     .await;
 
-    let checkpoint = wait_timeout(async {
+    let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
                 && let Some(Message::Assistant(message)) = checkpoint.messages.last()
@@ -1006,14 +987,21 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     let mut root = Harness::start(
         MemoryStorage::default(),
-        agent_spec("coda", "error-main", SubAgentMode::Stateful, vec![], vec![]),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "error-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
         TestProvider::default(),
         ToolApprovalMode::Auto,
         "root error",
     )
     .await;
 
-    let root_result = wait_timeout(async {
+    let root_result = timeout(Duration::from_secs(2), async {
         loop {
             let (agent_name, _, event) = root.next_event().await;
             if agent_name == "coda"
@@ -1030,26 +1018,28 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
 
     let mut parent = Harness::start(
         MemoryStorage::default(),
-        agent_spec(
-            "coda",
-            "error-parent-main",
-            SubAgentMode::Stateful,
-            vec![],
-            vec![agent_spec(
-                "explore",
-                "error-subagent",
-                SubAgentMode::Stateless,
-                vec![],
-                vec![],
-            )],
-        ),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "error-parent-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "error-subagent".into(),
+                mode: SubAgentMode::Stateless,
+                tools: vec![],
+                subagents: vec![],
+            }],
+        },
         TestProvider::default(),
         ToolApprovalMode::Auto,
         "subagent error",
     )
     .await;
 
-    let parent_result = wait_timeout(async {
+    let parent_result = timeout(Duration::from_secs(2), async {
         let mut saw_explore_error = false;
 
         loop {
