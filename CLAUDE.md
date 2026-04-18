@@ -15,14 +15,6 @@ cargo fmt
 
 ## Runtime Config
 
-A `.env` file is required with:
-
-```
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=...
-OPENAI_MODEL=...
-```
-
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling depends on `fd`, `rg` (ripgrep), and `sh`.
 
 ## Architecture
