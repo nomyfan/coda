@@ -52,7 +52,7 @@ impl AgentHandle {
     }
 
     /// Send a message to this agent, triggering a new turn.
-    pub async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
+    pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         self.message_sender
             .send(envelope)
             .await
@@ -170,7 +170,7 @@ impl SessionStorage for MemoryStorage {
 }
 
 #[derive(Clone, Default)]
-pub struct ExitBarrier {
+pub(crate) struct ExitBarrier {
     inner: Arc<AtomicBool>,
 }
 
@@ -194,7 +194,7 @@ pub struct AgentRuntimeSnapshot {
 }
 
 #[derive(Clone)]
-pub struct AgentRuntime {
+pub(crate) struct AgentRuntime {
     session_id: String,
     /// Key: unique agent name
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
@@ -207,7 +207,7 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    pub fn new(session_storage: impl SessionStorage + 'static, session_id: String) -> Self {
+    pub(crate) fn new(session_storage: impl SessionStorage + 'static, session_id: String) -> Self {
         let (global_event_tx, _) = broadcast::channel(128);
         AgentRuntime {
             session_id,
@@ -229,7 +229,7 @@ impl AgentRuntime {
         let _ = self.global_event_tx.send((agent_name, thread_id, event));
     }
 
-    pub async fn bootstrap(
+    pub(crate) async fn bootstrap(
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
@@ -283,7 +283,7 @@ impl AgentRuntime {
     }
 
     /// Subscribe to events from all agents
-    pub fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, AgentEvent)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, AgentEvent)> {
         self.global_event_tx.subscribe()
     }
 
@@ -298,18 +298,18 @@ impl AgentRuntime {
     }
 
     /// Abort the current work for this runtime.
-    pub async fn request_abort(&self) {
+    pub(crate) async fn request_abort(&self) {
         self.broadcast_command(AgentControl::Abort).await;
     }
 
     /// Request this runtime to exit all agent loops.
-    pub async fn request_exit(&self) {
+    pub(crate) async fn request_exit(&self) {
         self.exit_barrier.enter_exiting();
         self.broadcast_command(AgentControl::Exit).await;
     }
 
     /// Send a message to a specific agent.
-    pub async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
+    pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         if self.exit_barrier.is_exiting() {
             // During the suspension draining phase, we buffer incoming messages instead of sending them to agents.
             let receiver = envelope.to.name.clone();
@@ -329,7 +329,7 @@ impl AgentRuntime {
         }
     }
 
-    pub async fn save_agent_snapshot(
+    pub(crate) async fn save_agent_snapshot(
         &self,
         agent_name: String,
         envelopes: Vec<Envelope>,
@@ -351,7 +351,7 @@ impl AgentRuntime {
     /// Wait for all bootstrapped agent tasks to exit.
     ///
     /// Returns `false` if the timeout elapses before every agent stops.
-    pub async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
+    pub(crate) async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
         let mut agent_tasks = self.agent_tasks.lock().await;
         if agent_tasks.is_empty() {
             return true;

@@ -318,12 +318,6 @@ impl Session {
         self.inner.resumed_checkpoint.as_ref()
     }
 
-    /// Escape hatch for advanced use (direct envelope sends, custom
-    /// subscriptions, etc.).
-    pub fn runtime(&self) -> &AgentRuntime {
-        &self.inner.runtime
-    }
-
     /// Send a user task to the root agent.
     pub async fn send(&self, task: impl Into<String>) -> Result<(), SendCommandError> {
         let task = task.into();
