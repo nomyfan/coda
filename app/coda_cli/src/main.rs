@@ -3,11 +3,9 @@ mod storage;
 
 use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, Envelope, ResumeDecision,
-    RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
-    agent::{EnvelopeBody, Receiver, ResumePoint},
-    builtin_specs,
-    runtime::{AgentRuntime, SessionStorage, SuspensionPolicy},
+    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, ResumeDecision, RunConfig,
+    Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    agent::ResumePoint, builtin_specs,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -354,8 +352,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     };
 
-    let agents = spec.build(&ctx)?;
-
     let config = RunConfig {
         provider,
         model,
@@ -367,25 +363,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
-    let resumed_checkpoint = if resumed_session_id.is_some() {
-        match storage.load_checkpoint(session_id.as_ref()).await {
-            Ok(checkpoint) => checkpoint,
-            Err(err) => {
-                warn!("Failed to load checkpoint for history rendering: {}", err);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
-    let mut runtime = AgentRuntime::new(
-        storage.clone(),
-        session_id.clone(),
-        SuspensionPolicy::KeepRunning,
-    );
-    let snapshot = storage.load_session_snapshot(&session_id).await?;
-    runtime.bootstrap(agents, snapshot, config).await;
+    let session = Session::builder()
+        .storage(storage)
+        .root(spec)
+        .build_context(ctx)
+        .run_config(config)
+        .session_id(session_id.clone())
+        .open()
+        .await?;
 
     print_logo();
 
@@ -393,7 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {}\n", session_id);
     if resumed_session_id.is_some()
-        && let Some(ref checkpoint) = resumed_checkpoint
+        && let Some(checkpoint) = session.resumed_checkpoint()
     {
         render_checkpoint_history(checkpoint)
     }
@@ -403,7 +389,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => line,
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
                 println!("Goodbye!");
-                runtime.request_exit().await;
                 break;
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
@@ -418,24 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || user_input.eq_ignore_ascii_case("q")
         {
             println!("Goodbye!");
-            runtime.request_exit().await;
             break;
         }
 
-        let mut event_rx = runtime.subscribe();
-
-        runtime
-            .send_message(Envelope::with_id(|id| Envelope {
-                id,
-                from: Sender::User,
-                to: Receiver {
-                    name: "coda".into(),
-                    thread_id: session_id.clone().into(),
-                },
-                reply_to: None,
-                body: EnvelopeBody::Task(user_input.to_string()),
-            }))
-            .await?;
+        session.send(user_input.to_string()).await?;
 
         print!("Assistant: ");
         io::stdout().flush()?;
@@ -444,99 +415,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => {
-                    runtime.request_abort().await;
+                    session.abort().await;
                 }
-                event = event_rx.recv() => {
-                    match event {
-                        Err(_) => break,
-                        Ok((agent_name, _, AgentEvent::LLMContentChunk(s))) => {
-                            if agent_name == "coda" {
+                event = session.recv() => {
+                    let Some(SessionEvent { origin, kind, .. }) = event else { break };
+                    match kind {
+                        AgentEvent::LLMContentChunk(s) => {
+                            if origin.is_root() {
                                 print!("{s}");
                             } else {
                                 print!("\x1b[36m{s}\x1b[0m");
                             }
                             io::stdout().flush()?;
                         }
-                        Ok((agent_name, _, AgentEvent::LLMEnd(msg))) => {
+                        AgentEvent::LLMEnd(msg) => {
                             if !msg.content.is_empty() || msg.usage.is_some() {
                                 println!();
                             }
                             if let Some(usage) = &msg.usage {
-                                let usage_line = token_usage_line(Some(agent_name.as_str()), usage);
-                                if agent_name == "coda" {
+                                let usage_line =
+                                    token_usage_line(origin.subagent_name(), usage);
+                                if origin.is_root() {
                                     println!("{usage_line}");
                                 } else {
                                     println!("\x1b[36m{usage_line}\x1b[0m");
                                 }
                             }
-                            if agent_name == "coda" && msg.tool_calls.is_empty() {
+                            if origin.is_root() && msg.tool_calls.is_empty() {
                                 break;
                             }
                         }
-                        Ok((agent_name, _, AgentEvent::ToolCallStart(c))) => {
-                            if agent_name == "coda" {
+                        AgentEvent::ToolCallStart(c) => {
+                            if origin.is_root() {
                                 println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
                             } else {
-                                println!("\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m", agent_name,c.name, c.arguments);
+                                let name = origin.subagent_name().unwrap_or_default();
+                                println!(
+                                    "\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m",
+                                    name, c.name, c.arguments
+                                );
                             }
                         }
-                        Ok((_, _, AgentEvent::ToolCallEnd(_))) => {}
-                        Ok((_, _, AgentEvent::Suspended(checkpoint))) => {
-                            let is_main = checkpoint.agent_name == "coda";
-                            let label = if is_main { "" } else { " (sub-agent)" };
-                            let ResumePoint::PendingApproval { pending_approval_calls, .. } = &checkpoint.resume_point else {
+                        AgentEvent::ToolCallEnd(_) => {}
+                        AgentEvent::Suspended(checkpoint) => {
+                            let label = if origin.is_root() { "" } else { " (sub-agent)" };
+                            let ResumePoint::PendingApproval {
+                                pending_approval_calls,
+                                ..
+                            } = &checkpoint.resume_point
+                            else {
                                 continue;
                             };
-                            println!("\n[{} tool call(s) require approval{}]", pending_approval_calls.len(), label);
+                            println!(
+                                "\n[{} tool call(s) require approval{}]",
+                                pending_approval_calls.len(),
+                                label
+                            );
                             let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    runtime.request_abort().await;
+                                    session.abort().await;
                                     println!("\n[Aborted: approval interrupted]");
-                                    while let Ok((name, _, ev)) = event_rx.try_recv() {
-                                        if name == "coda" && matches!(ev, AgentEvent::Aborted(_)) {
-                                            break;
-                                        }
-                                    }
                                     break;
                                 }
                             };
-                            let decision = ResumeDecision { resolutions };
-                            if let Err(e) = runtime
-                                .send_message(Envelope::with_id(|id| Envelope {
-                                    id,
-                                    from: Sender::User,
-                                    to: Receiver {
-                                        name: checkpoint.agent_name.clone(),
-                                        thread_id: ThreadId::from(checkpoint.thread_id.clone()),
-                                    },
-                                    reply_to: None,
-                                    body: EnvelopeBody::Resume(decision),
-                                }))
-                                .await
+                            if let Err(e) =
+                                session.resume(&checkpoint, ResumeDecision { resolutions }).await
                             {
                                 warn!("{}", e);
                                 println!("\n[Error: failed to resume agent: {}]", e);
                                 break;
                             }
                         }
-                        Ok((agent_name, _, AgentEvent::Aborted(target))) if agent_name == "coda" => {
-                            match &target {
-                                AbortedTarget::Generation => {
-                                    println!("\n\n[Aborted: generation interrupted]");
-                                }
-                                AbortedTarget::ToolCalls(ids) => {
-                                    println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
-                                }
+                        AgentEvent::Aborted(target) if origin.is_root() => match &target {
+                            AbortedTarget::Generation => {
+                                println!("\n\n[Aborted: generation interrupted]");
+                                break;
                             }
-                            break;
-                        }
-                        Ok((agent_name, _, AgentEvent::Error(err))) if agent_name == "coda" => {
+                            AbortedTarget::ToolCalls(ids) => {
+                                println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
+                                break;
+                            }
+                        },
+                        AgentEvent::Error(err) if origin.is_root() => {
                             warn!("{}", err);
                             println!("\n[Error: {}]", err);
                             break;
                         }
-                        Ok(_) => {}
+                        _ => {}
                     }
                 }
             }
@@ -546,7 +512,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Current session id: {}", session_id);
-    runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
+    session
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
     println!("Session ended. You can resume this session later with `--resume {session_id}`");
 
     Ok(())

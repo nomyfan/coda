@@ -83,6 +83,39 @@ pub trait SessionStorage: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>;
 }
 
+impl SessionStorage for Arc<dyn SessionStorage> {
+    fn save_checkpoint(
+        &self,
+        thread_id: String,
+        checkpoint: AgentCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        (**self).save_checkpoint(thread_id, checkpoint)
+    }
+
+    fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>> {
+        (**self).load_checkpoint(thread_id)
+    }
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: AgentRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        (**self).save_session_snapshot(session_id, snapshot)
+    }
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    {
+        (**self).load_session_snapshot(session_id)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
     checkpoints: Arc<Mutex<HashMap<String, AgentCheckpoint>>>,
@@ -161,18 +194,6 @@ pub struct AgentRuntimeSnapshot {
 }
 
 #[derive(Clone)]
-pub enum SuspensionPolicy {
-    KeepRunning,
-    ExitGracefully,
-}
-
-impl SuspensionPolicy {
-    fn should_exit_on_suspend(&self) -> bool {
-        matches!(self, SuspensionPolicy::ExitGracefully)
-    }
-}
-
-#[derive(Clone)]
 pub struct AgentRuntime {
     session_id: String,
     /// Key: unique agent name
@@ -181,26 +202,19 @@ pub struct AgentRuntime {
     /// Global event bus — all agents forward their events here.
     global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
-    // TODO: better names
-    suspension_policy: SuspensionPolicy,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
 }
 
 impl AgentRuntime {
-    pub fn new(
-        session_storage: impl SessionStorage + 'static,
-        session_id: String,
-        suspension_policy: SuspensionPolicy,
-    ) -> Self {
-        let (global_event_tx, _) = broadcast::channel(256);
+    pub fn new(session_storage: impl SessionStorage + 'static, session_id: String) -> Self {
+        let (global_event_tx, _) = broadcast::channel(128);
         AgentRuntime {
             session_id,
             agents: Arc::new(Mutex::new(HashMap::new())),
             agent_tasks: Arc::new(Mutex::new(JoinSet::new())),
             global_event_tx,
             session_storage: Arc::new(session_storage),
-            suspension_policy,
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
         }
@@ -212,12 +226,6 @@ impl AgentRuntime {
         thread_id: ThreadId,
         event: AgentEvent,
     ) {
-        if self.suspension_policy.should_exit_on_suspend()
-            && matches!(event, AgentEvent::Suspended(_))
-            && !self.exit_barrier.is_exiting()
-        {
-            self.request_exit().await;
-        }
         let _ = self.global_event_tx.send((agent_name, thread_id, event));
     }
 
@@ -367,12 +375,16 @@ impl AgentRuntime {
         };
         // TODO: abort any remaining agents if timeout occurs and return early, instead of waiting for them to exit on their own.
         // Root cause: graceful exit awaits each agent's current run_fut to completion, which deadlocks
-        // when an agent is stuck on a slow/hung LLM stream or external API. Until this is addressed,
-        // callers must combine request_abort + request_exit manually to guarantee termination.
-        self.session_storage
+        // when an agent is stuck on a slow/hung LLM stream or external API. Session::shutdown with
+        // OnTimeout::Abort covers this at the session layer; at the runtime layer, callers must still
+        // combine request_abort + request_exit manually to guarantee termination.
+        if let Err(err) = self
+            .session_storage
             .save_session_snapshot(self.session_id.clone(), self.snapshot.lock().await.clone())
             .await
-            .expect("TODO:");
+        {
+            warn!("Failed to persist session snapshot: {}", err);
+        }
 
         ret
     }

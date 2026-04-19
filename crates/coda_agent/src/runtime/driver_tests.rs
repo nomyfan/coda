@@ -2,9 +2,7 @@ use super::*;
 use crate::{
     AgentCheckpoint, AgentEvent, AgentSpec, AgentState, BuildContext, RunConfig, Sender,
     SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    runtime::{
-        AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage, SuspensionPolicy,
-    },
+    runtime::{AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage},
     spec::{ReadTodosToolSpec, ToolSpec},
 };
 use coda_core::{
@@ -568,11 +566,7 @@ where
         };
 
         let thread_id = ThreadId::new();
-        let mut runtime = AgentRuntime::new(
-            storage.clone(),
-            thread_id.as_ref().to_string(),
-            SuspensionPolicy::KeepRunning,
-        );
+        let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
         runtime.bootstrap(agents, None, config).await;
 
         let events = runtime.subscribe();
@@ -654,11 +648,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         tool_approval: ToolApprovalMode::Auto,
     };
 
-    let mut runtime = AgentRuntime::new(
-        MemoryStorage::default(),
-        "test-session".into(),
-        SuspensionPolicy::KeepRunning,
-    );
+    let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
     runtime.bootstrap(agents, None, config).await;
 
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);

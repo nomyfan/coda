@@ -101,7 +101,6 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
                     Ok(output) => span.record("output", output.to_string()),
                     Err(err) => span.record("error", err.to_string()),
                 };
-                info!("finished executing tool");
                 result.map(|output| output.to_string())
             }
             .instrument(span),
