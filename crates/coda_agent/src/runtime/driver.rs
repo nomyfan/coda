@@ -26,53 +26,84 @@ use crate::{
 #[instrument(skip_all, fields(agent = %agent.name))]
 pub(crate) async fn run_agent(
     runtime: AgentRuntime,
+    active_thread: Option<ThreadId>,
     mut agent: Agent,
     mut control_rx: mpsc::Receiver<AgentControl>,
     mut envelope_rx: mpsc::Receiver<Envelope>,
     config: RunConfig<impl LLMProvider + Clone>,
 ) {
     info!("Agent {} is running", agent.name);
+    let mut active_thread = active_thread;
     loop {
-        // Wait for the next envelope, but allow Exit to break the loop.
-        let envelope = tokio::select! {
-            biased;
-            cmd = control_rx.recv() => {
-                if let Some(AgentControl::Exit) = cmd { break; }
-                continue;
-            }
-            envelope = envelope_rx.recv() => match envelope {
-                Some(e) => e,
-                None => break,
-            },
+        // If there's an active thread to continue, just run it without waiting for a new envelope.
+        let (thread_id, envelope) = if let Some(active_thread) = active_thread.take() {
+            (active_thread, None)
+        } else {
+            // Wait for the next envelope, but allow Exit to break the loop.
+            let envelop = tokio::select! {
+                biased;
+                cmd = control_rx.recv() => {
+                    if let Some(AgentControl::Exit) = cmd { break; }
+                    continue;
+                }
+                envelope = envelope_rx.recv() => match envelope {
+                    Some(e) => e,
+                    None => break,
+                },
+            };
+
+            (envelop.to.thread_id.clone(), Some(envelop))
         };
 
         let cancel = CancellationToken::new();
+        active_thread = Some(thread_id.clone());
         let mut agent_loop = AgentLoop {
             runtime: runtime.clone(),
             agent: &mut agent,
             cancel: cancel.clone(),
             config: config.clone(),
-            thread_id: envelope.to.thread_id.clone(),
-            envelope,
+            thread_id: thread_id,
             reply_target: None,
         };
-        let mut run_fut = std::pin::pin!(agent_loop.run());
+        let mut run_fut = std::pin::pin!(agent_loop.run(envelope));
 
         // Race the agent loop against incoming control signals.
         let should_exit = tokio::select! {
             biased;
             cmd = control_rx.recv() => {
-                // Signal cancellation and wait for the loop to clean up
-                // (emit events, save checkpoint) before proceeding.
-                cancel.cancel();
-                if let Err(err) = (&mut run_fut).await {
-                    error!("Error in agent loop: {}", err);
+                let mut should_exit = false;
+                match cmd {
+                    Some(AgentControl::Abort) | None => {
+                        cancel.cancel();
+                        active_thread = None;
+                    }
+                    Some(AgentControl::Exit) => {
+                        // Wait the agent loop to exit gracefully.
+                        should_exit = true;
+                    }
                 }
-                matches!(cmd, Some(AgentControl::Exit))
+                match (&mut run_fut).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        active_thread = None;
+                    }
+                    Err(err) => {
+                        error!("Error in agent loop: {}", err);
+                        active_thread = None;
+                    }
+                }
+                should_exit
             }
             ret = &mut run_fut => {
-                if let Err(err) = ret {
-                    error!("Error in agent loop: {}", err);
+                match ret{
+                    Ok(true) => {}
+                    Ok(false) => {
+                        active_thread = None;
+                    }
+                    Err(err) => {
+                        error!("Error in agent loop: {}", err);
+                        active_thread = None;
+                    }
                 }
                 false
             }
@@ -82,7 +113,17 @@ pub(crate) async fn run_agent(
             break;
         }
     }
+
     info!("Agent {} exiting", agent.name);
+    // Drain all remaining envelopes and send them to runtime.
+    let mut envelopes = Vec::new();
+    while let Ok(envelope) = envelope_rx.try_recv() {
+        envelopes.push(envelope);
+    }
+    runtime
+        .save_agent_snapshot(agent.name.clone(), envelopes, active_thread)
+        .await;
+    info!("Agent {} has exited", agent.name);
 }
 
 enum AgentLoopState {
@@ -96,12 +137,11 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
     cancel: CancellationToken,
     config: RunConfig<C>,
     thread_id: ThreadId,
-    envelope: Envelope,
     reply_target: Option<ReplyTarget>,
 }
 
 impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
-    async fn run(&mut self) -> Result<(), String> {
+    async fn run(&mut self, envelope: Option<Envelope>) -> Result<bool, String> {
         let mut checkpoint = self
             .runtime
             .session_storage
@@ -117,16 +157,23 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .await;
         self.reply_target = checkpoint.reply_target.clone();
         let resume_point = std::mem::take(&mut checkpoint.resume_point);
-        match self.handle_envelope(resume_point).await {
-            AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-            AgentLoopState::Done(resume_point) => {
-                checkpoint.resume_point = resume_point;
-                self.save_checkpoint(checkpoint).await;
-                return Ok(());
+        if let Some(envelope) = envelope {
+            match self.handle_envelope(resume_point, envelope).await {
+                AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
+                AgentLoopState::Done(resume_point) => {
+                    checkpoint.resume_point = resume_point;
+                    self.save_checkpoint(checkpoint).await;
+                    return Ok(false);
+                }
             }
         }
 
+        let mut exit_acquired = false;
         loop {
+            if self.runtime.exit_barrier.is_exiting() {
+                exit_acquired = true;
+                break;
+            }
             let resume_point = std::mem::take(&mut checkpoint.resume_point);
             match resume_point {
                 ResumePoint::Generation => match self.handle_generation().await {
@@ -162,11 +209,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     if has_pending {
                         checkpoint.todos = self.agent.todos().await;
                         checkpoint.messages = self.agent.history().await;
-                        self.runtime.emit_event(
-                            self.agent.name.clone(),
-                            self.thread_id.clone(),
-                            AgentEvent::Suspended(checkpoint.clone()),
-                        );
+                        self.runtime
+                            .emit_event(
+                                self.agent.name.clone(),
+                                self.thread_id.clone(),
+                                AgentEvent::Suspended(checkpoint.clone()),
+                            )
+                            .await;
                     }
                     break;
                 }
@@ -174,13 +223,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
 
         self.save_checkpoint(checkpoint).await;
-        Ok(())
+        Ok(exit_acquired)
     }
 
     async fn save_checkpoint(&self, mut checkpoint: AgentCheckpoint) {
         checkpoint.todos = self.agent.todos().await;
         checkpoint.messages = self.agent.history().await;
         checkpoint.reply_target = self.reply_target.clone();
+        // TODO: suspended_at is overwritten on every save, so it no longer reflects
+        // when the agent actually entered PendingApproval. Only stamp it when the
+        // resume_point transitions into PendingApproval.
         checkpoint.suspended_at = jiff::Timestamp::now();
         if let Err(err) = self
             .runtime
@@ -196,10 +248,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
     }
 
-    async fn handle_envelope(&mut self, resume_point: ResumePoint) -> AgentLoopState {
+    async fn handle_envelope(
+        &mut self,
+        resume_point: ResumePoint,
+        envelope: Envelope,
+    ) -> AgentLoopState {
         match resume_point {
             ResumePoint::Generation => {
-                match &self.envelope.body {
+                match &envelope.body {
                     EnvelopeBody::Task(task) => {
                         self.reply_target = None;
                         self.agent
@@ -207,13 +263,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             .await
                     }
                     EnvelopeBody::ToolCall { task, .. } => {
-                        self.reply_target = reply_target_from_envelope(&self.envelope);
+                        self.reply_target = reply_target_from_envelope(&envelope);
                         self.agent
                             .add_message(Message::User(UserMessage(task.clone())))
                             .await
                     }
                     _ => {
-                        warn!("unexpected envelope {:?}", self.envelope);
+                        warn!("unexpected envelope {:?}", envelope);
                         return AgentLoopState::Done(ResumePoint::Generation);
                     }
                 }
@@ -221,7 +277,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
                 if !tool_execution.pending_replies.is_empty() {
-                    match &self.envelope {
+                    match &envelope {
                         Envelope {
                             body: EnvelopeBody::Reply { call_id, output },
                             ..
@@ -241,11 +297,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 self.agent
                                     .add_message(Message::Tool(tool_message.clone()))
                                     .await;
-                                self.runtime.emit_event(
-                                    self.agent.name.clone(),
-                                    self.thread_id.clone(),
-                                    AgentEvent::ToolCallEnd(tool_message),
-                                );
+                                self.runtime
+                                    .emit_event(
+                                        self.agent.name.clone(),
+                                        self.thread_id.clone(),
+                                        AgentEvent::ToolCallEnd(tool_message),
+                                    )
+                                    .await;
                             }
                         }
                         Envelope {
@@ -272,14 +330,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     }))
                                     .await;
                             }
-                            self.reply_target = reply_target_from_envelope(&self.envelope);
+                            self.reply_target = reply_target_from_envelope(&envelope);
                             self.agent
                                 .add_message(Message::User(UserMessage(task.clone())))
                                 .await;
                             return AgentLoopState::Next(ResumePoint::Generation);
                         }
                         _ => {
-                            warn!("expect a reply envelope but got a {:?}", self.envelope);
+                            warn!("expect a reply envelope but got a {:?}", envelope);
                             return AgentLoopState::Done(ResumePoint::ToolExecution(
                                 tool_execution,
                             ));
@@ -295,7 +353,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 mut pending_approval_calls,
                 mut pending_calls,
             } => {
-                match &self.envelope.body {
+                match &envelope.body {
                     EnvelopeBody::Task(task) | EnvelopeBody::ToolCall { task, .. } => {
                         // Stale PendingApproval state: new task or sub-agent re-invocation
                         // arrived (e.g. after abort). Write aborted ToolMessages for all
@@ -328,7 +386,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 }))
                                 .await;
                         }
-                        self.reply_target = reply_target_from_envelope(&self.envelope);
+                        self.reply_target = reply_target_from_envelope(&envelope);
                         self.agent
                             .add_message(Message::User(UserMessage(task.clone())))
                             .await;
@@ -383,7 +441,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     _ => {
                         warn!(
                             "unexpected envelope while suspended for approval: {:?}",
-                            self.envelope
+                            envelope
                         );
                         AgentLoopState::Done(ResumePoint::PendingApproval {
                             pending_approval_calls,
@@ -408,11 +466,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 tools
             },
         };
-        self.runtime.emit_event(
-            self.agent.name.clone(),
-            thread_id.clone(),
-            AgentEvent::LLMStart(request.clone()),
-        );
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                thread_id.clone(),
+                AgentEvent::LLMStart(request.clone()),
+            )
+            .await;
 
         let mut llm_stream = std::pin::pin!(self.config.provider.stream(request));
         let mut partial_content = String::new();
@@ -420,7 +480,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
-                    self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::Aborted(AbortedTarget::Generation));
+                    self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::Aborted(AbortedTarget::Generation)).await;
                     if !partial_content.is_empty() {
                         self.agent.add_message(Message::Assistant(coda_core::llm::AssistantMessage {
                             content: partial_content + "\n[Generation was interrupted by the user]",
@@ -434,7 +494,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     match event {
                         Some(Ok(LLMStreamEvent::ContentChunk(chunk))) => {
                             partial_content.push_str(&chunk);
-                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk));
+                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(message),
                         Some(Err(err)) => break Err(err.to_string()),
@@ -451,11 +511,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.agent
                     .add_message(Message::Assistant(assistant_message.clone()))
                     .await;
-                self.runtime.emit_event(
-                    self.agent.name.clone(),
-                    thread_id.clone(),
-                    AgentEvent::LLMEnd(assistant_message.clone()),
-                );
+                self.runtime
+                    .emit_event(
+                        self.agent.name.clone(),
+                        thread_id.clone(),
+                        AgentEvent::LLMEnd(assistant_message.clone()),
+                    )
+                    .await;
 
                 if assistant_message.tool_calls.is_empty() {
                     if let Some(reply_target) = self.reply_target.take() {
@@ -547,11 +609,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         error!("Failed to send LLM error reply: {}", err);
                     }
                 } else {
-                    self.runtime.emit_event(
-                        self.agent.name.clone(),
-                        self.thread_id.clone(),
-                        AgentEvent::Error(err),
-                    );
+                    self.runtime
+                        .emit_event(
+                            self.agent.name.clone(),
+                            self.thread_id.clone(),
+                            AgentEvent::Error(err),
+                        )
+                        .await;
                 }
                 AgentLoopState::Done(ResumePoint::Generation)
             }
@@ -633,11 +697,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         }))
                         .await;
                 } else {
-                    self.runtime.emit_event(
-                        self.agent.name.clone(),
-                        self.thread_id.clone(),
-                        AgentEvent::ToolCallStart(tc.tool_call.clone()),
-                    );
+                    self.runtime
+                        .emit_event(
+                            self.agent.name.clone(),
+                            self.thread_id.clone(),
+                            AgentEvent::ToolCallStart(tc.tool_call.clone()),
+                        )
+                        .await;
                     tool_execution.pending_replies.push(PendingReply {
                         call_id: tc.tool_call.id.clone(),
                         tool_name: tc.tool_call.name.clone(),
@@ -645,11 +711,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     });
                 }
             } else if let Some(tool) = self.agent.tools.get(&tc.tool_call.name) {
-                self.runtime.emit_event(
-                    self.agent.name.clone(),
-                    self.thread_id.clone(),
-                    AgentEvent::ToolCallStart(tc.tool_call.clone()),
-                );
+                self.runtime
+                    .emit_event(
+                        self.agent.name.clone(),
+                        self.thread_id.clone(),
+                        AgentEvent::ToolCallStart(tc.tool_call.clone()),
+                    )
+                    .await;
                 pending_local.insert(tc.tool_call.id.clone(), tc.clone());
                 let tc = tc.clone();
                 let future = async move {
@@ -704,7 +772,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         self.agent.name.clone(),
                         self.thread_id.clone(),
                         AgentEvent::ToolCallEnd(message),
-                    );
+                    ).await;
                 }
             }
         };
@@ -738,11 +806,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }))
                     .await;
             }
-            self.runtime.emit_event(
-                self.agent.name.clone(),
-                self.thread_id.clone(),
-                AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids)),
-            );
+            self.runtime
+                .emit_event(
+                    self.agent.name.clone(),
+                    self.thread_id.clone(),
+                    AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids)),
+                )
+                .await;
             return AgentLoopState::Done(ResumePoint::Generation);
         }
 

@@ -17,7 +17,11 @@ impl JsonFileStorage {
     }
 
     fn checkpoint_path(&self, thread_id: &str) -> PathBuf {
-        self.root_dir.join(format!("{thread_id}.json"))
+        self.root_dir.join(format!("thread_{thread_id}.json"))
+    }
+
+    fn snapshot_path(&self, session_id: &str) -> PathBuf {
+        self.root_dir.join(format!("session_{session_id}.json"))
     }
 }
 
@@ -66,6 +70,55 @@ impl SessionStorage for JsonFileStorage {
             serde_json::from_slice(&payload)
                 .map(Some)
                 .map_err(|err| format!("failed to parse checkpoint {}: {err}", path.display()))
+        })
+    }
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: coda_agent::runtime::AgentRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            fs::create_dir_all(&self.root_dir).await.map_err(|err| {
+                format!(
+                    "failed to create snapshot directory {}: {err}",
+                    self.root_dir.display()
+                )
+            })?;
+
+            let payload = serde_json::to_vec_pretty(&snapshot)
+                .map_err(|err| format!("failed to serialize snapshot {session_id}: {err}"))?;
+            let path = self.snapshot_path(&session_id);
+            fs::write(&path, payload)
+                .await
+                .map_err(|err| format!("failed to write snapshot {}: {err}", path.display()))?;
+
+            Ok(())
+        })
+    }
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<coda_agent::runtime::AgentRuntimeSnapshot>, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        let path = self.snapshot_path(session_id);
+        Box::pin(async move {
+            let payload = match fs::read(&path).await {
+                Ok(payload) => payload,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(format!("failed to read snapshot {}: {err}", path.display()));
+                }
+            };
+            serde_json::from_slice(&payload)
+                .map(Some)
+                .map_err(|err| format!("failed to parse snapshot {}: {err}", path.display()))
         })
     }
 }

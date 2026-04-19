@@ -27,7 +27,7 @@ pub enum ToolApprovalMode {
 }
 
 /// Caller's resolution for a single suspended tool call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolCallResolution {
     /// The agent should execute this call.
     Execute,
@@ -38,7 +38,7 @@ pub enum ToolCallResolution {
 }
 
 /// Caller's response to all suspended tool calls, replacing `ApprovalDecision`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeDecision {
     pub resolutions: Vec<(String, ToolCallResolution)>,
 }
@@ -111,7 +111,7 @@ pub enum AbortedTarget {
     ToolCalls(Vec<String>),
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+#[derive(Eq, Hash, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct ThreadId(pub(crate) String);
 
 impl Default for ThreadId {
@@ -144,7 +144,7 @@ impl From<String> for ThreadId {
 }
 
 /// The sender of an envelope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Sender {
     /// Message from the user.
     User,
@@ -152,13 +152,13 @@ pub enum Sender {
     Agent { name: String, thread_id: ThreadId },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receiver {
     pub name: String,
     pub thread_id: ThreadId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnvelopeBody {
     Task(String),
     /// Call agent as a tool
@@ -175,7 +175,7 @@ pub enum EnvelopeBody {
 }
 
 /// An envelope is a message delivered to an agent, containing the message body and metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     /// A unique identifier for this message, used for tracking and replying.
     pub id: String,

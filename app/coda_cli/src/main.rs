@@ -7,7 +7,7 @@ use coda_agent::{
     RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{EnvelopeBody, Receiver, ResumePoint},
     builtin_specs,
-    runtime::{AgentRuntime, SessionStorage},
+    runtime::{AgentRuntime, SessionStorage, SuspensionPolicy},
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -228,9 +228,9 @@ fn print_usage(program: &str) {
     println!("Usage: {program} [--resume <uuid>]");
 }
 
-fn parse_thread_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<ThreadId>, String> {
+fn parse_session_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<String>, String> {
     let mut args = args.into_iter();
-    let mut thread_id = None;
+    let mut session_id = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -240,8 +240,8 @@ fn parse_thread_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<
                     .ok_or_else(|| "missing value for --resume".to_string())?;
                 Uuid::parse_str(&value)
                     .map_err(|err| format!("invalid thread id '{value}': {err}"))?;
-                if thread_id.replace(ThreadId::from(value)).is_some() {
-                    return Err("thread id can only be provided once".to_string());
+                if session_id.replace(value).is_some() {
+                    return Err("session id can only be provided once".to_string());
                 }
             }
             "-h" | "--help" => return Err(String::new()),
@@ -249,13 +249,14 @@ fn parse_thread_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<
         }
     }
 
-    Ok(thread_id)
+    Ok(session_id)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = env::args().next().unwrap_or_else(|| "coda".into());
-    let resumed_thread_id = match parse_thread_id_arg(env::args().skip(1)) {
+    // session id is also the thread id for the main agent
+    let resumed_session_id = match parse_session_id_arg(env::args().skip(1)) {
         Ok(Some(thread_id)) => Some(thread_id),
         Ok(None) => None,
         Err(err) if err.is_empty() => {
@@ -268,7 +269,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(err.into());
         }
     };
-    let thread_id = resumed_thread_id.clone().unwrap_or_default();
+    let session_id = resumed_session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     dotenv()?;
 
@@ -362,10 +365,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             call.name == "shell" || call.name == "ask_user"
         })),
     };
-    let checkpoint_dir = workspace_dir.join(".coda").join("checkpoints");
+    let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
-    let resumed_checkpoint = if resumed_thread_id.is_some() {
-        match storage.load_checkpoint(thread_id.as_ref()).await {
+    let resumed_checkpoint = if resumed_session_id.is_some() {
+        match storage.load_checkpoint(session_id.as_ref()).await {
             Ok(checkpoint) => checkpoint,
             Err(err) => {
                 warn!("Failed to load checkpoint for history rendering: {}", err);
@@ -376,15 +379,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let mut runtime = AgentRuntime::new(storage);
-    runtime.bootstrap(agents, config).await;
+    let mut runtime = AgentRuntime::new(
+        storage.clone(),
+        session_id.clone(),
+        SuspensionPolicy::KeepRunning,
+    );
+    let snapshot = storage.load_session_snapshot(&session_id).await?;
+    runtime.bootstrap(agents, snapshot, config).await;
 
     print_logo();
 
     let mut rl = rustyline::DefaultEditor::new()?;
     println!("Type 'quit', 'exit', or 'q' to stop\n");
-    println!("Session thread id: {}\n", thread_id.as_ref());
-    if resumed_thread_id.is_some()
+    println!("Session id: {}\n", session_id);
+    if resumed_session_id.is_some()
         && let Some(ref checkpoint) = resumed_checkpoint
     {
         render_checkpoint_history(checkpoint)
@@ -395,7 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => line,
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
                 println!("Goodbye!");
-                runtime.exit().await;
+                runtime.request_exit().await;
                 break;
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
@@ -410,7 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || user_input.eq_ignore_ascii_case("q")
         {
             println!("Goodbye!");
-            runtime.exit().await;
+            runtime.request_exit().await;
             break;
         }
 
@@ -422,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 from: Sender::User,
                 to: Receiver {
                     name: "coda".into(),
-                    thread_id: thread_id.clone(),
+                    thread_id: session_id.clone().into(),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Task(user_input.to_string()),
@@ -436,7 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => {
-                    runtime.abort().await;
+                    runtime.request_abort().await;
                 }
                 event = event_rx.recv() => {
                     match event {
@@ -483,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    runtime.abort().await;
+                                    runtime.request_abort().await;
                                     println!("\n[Aborted: approval interrupted]");
                                     while let Ok((name, _, ev)) = event_rx.try_recv() {
                                         if name == "coda" && matches!(ev, AgentEvent::Aborted(_)) {
@@ -537,11 +545,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    if !runtime.wait_for_exit(Some(Duration::from_secs(2))).await {
-        warn!("Timed out waiting for agents to exit");
-    }
-
-    println!("Current session thread id: {}", thread_id.as_ref());
+    println!("Current session id: {}", session_id);
+    runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
+    println!("Session ended. You can resume this session later with `--resume {session_id}`");
 
     Ok(())
 }

@@ -2,10 +2,12 @@ mod driver;
 
 use crate::{Agent, AgentCheckpoint, AgentEvent, Envelope, RunConfig, ThreadId};
 use coda_core::llm::LLMProvider;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
@@ -15,7 +17,7 @@ use tracing::{info, warn};
 #[derive(Clone)]
 enum AgentControl {
     Abort,
-    /// Shut down the agent loop entirely.
+    /// Shutdown the agent gracefully.
     Exit,
 }
 
@@ -68,11 +70,23 @@ pub trait SessionStorage: Send + Sync {
         &self,
         thread_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>>;
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: AgentRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>;
 }
 
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
     checkpoints: Arc<Mutex<HashMap<String, AgentCheckpoint>>>,
+    snapshots: Arc<Mutex<HashMap<String, AgentRuntimeSnapshot>>>,
 }
 
 impl SessionStorage for MemoryStorage {
@@ -97,48 +111,158 @@ impl SessionStorage for MemoryStorage {
             Ok(checkpoint)
         })
     }
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: AgentRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.snapshots.lock().await.insert(session_id, snapshot);
+            Ok(())
+        })
+    }
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let snapshot = self.snapshots.lock().await.get(&session_id).cloned();
+            Ok(snapshot)
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ExitBarrier {
+    inner: Arc<AtomicBool>,
+}
+
+impl ExitBarrier {
+    fn enter_exiting(&self) -> bool {
+        self.inner
+            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.inner.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct AgentRuntimeSnapshot {
+    pub drained_envelopes: HashMap<String, Vec<Envelope>>,
+    pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
+    pub active_threads: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub enum SuspensionPolicy {
+    KeepRunning,
+    ExitGracefully,
+}
+
+impl SuspensionPolicy {
+    fn should_exit_on_suspend(&self) -> bool {
+        matches!(self, SuspensionPolicy::ExitGracefully)
+    }
 }
 
 #[derive(Clone)]
 pub struct AgentRuntime {
+    session_id: String,
     /// Key: unique agent name
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     agent_tasks: Arc<Mutex<JoinSet<String>>>,
     /// Global event bus — all agents forward their events here.
     global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
+    // TODO: better names
+    suspension_policy: SuspensionPolicy,
+    exit_barrier: ExitBarrier,
+    snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
 }
 
 impl AgentRuntime {
-    pub fn new(session_storage: impl SessionStorage + 'static) -> Self {
+    pub fn new(
+        session_storage: impl SessionStorage + 'static,
+        session_id: String,
+        suspension_policy: SuspensionPolicy,
+    ) -> Self {
         let (global_event_tx, _) = broadcast::channel(256);
         AgentRuntime {
+            session_id,
             agents: Arc::new(Mutex::new(HashMap::new())),
             agent_tasks: Arc::new(Mutex::new(JoinSet::new())),
             global_event_tx,
             session_storage: Arc::new(session_storage),
+            suspension_policy,
+            exit_barrier: ExitBarrier::default(),
+            snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
         }
     }
 
-    pub(crate) fn emit_event(&self, agent_name: String, thread_id: ThreadId, event: AgentEvent) {
+    pub(crate) async fn emit_event(
+        &self,
+        agent_name: String,
+        thread_id: ThreadId,
+        event: AgentEvent,
+    ) {
+        if self.suspension_policy.should_exit_on_suspend()
+            && matches!(event, AgentEvent::Suspended(_))
+            && !self.exit_barrier.is_exiting()
+        {
+            self.request_exit().await;
+        }
         let _ = self.global_event_tx.send((agent_name, thread_id, event));
     }
 
     pub async fn bootstrap(
         &mut self,
         agents: HashMap<String, Agent>,
+        mut snapshot: Option<AgentRuntimeSnapshot>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
         for (name, agent) in agents {
             info!("Bootstrapping agent: {}", name);
-            let (control_tx, control_rx) = mpsc::channel(10);
-            let (envelope_tx, envelope_rx) = mpsc::channel(10);
             let runtime = self.clone();
 
             let task_name = name.clone();
             let config = config.clone();
+            let active_thread = snapshot
+                .as_ref()
+                .and_then(|s| s.active_threads.get(&name))
+                .map(|id| ThreadId(id.clone()));
+            let init_envelopes = snapshot
+                .as_mut()
+                .and_then(|s| {
+                    let mut first = s.agent_drained_envelopes.remove(&name).unwrap_or_default();
+                    let second = s.drained_envelopes.remove(&name).unwrap_or_default();
+                    first.extend(second);
+                    Some(first)
+                })
+                .unwrap_or_default();
+
+            let (control_tx, control_rx) = mpsc::channel(8);
+            // For simplicity, we just replay the drained envelopes by putting them back to to agent's inbox.
+            let (envelope_tx, envelope_rx) = mpsc::channel(8.max(init_envelopes.len() + 8));
+            for envelope in init_envelopes {
+                let _ = envelope_tx.send(envelope).await;
+            }
             self.agent_tasks.lock().await.spawn(async move {
-                driver::run_agent(runtime, agent, control_rx, envelope_rx, config).await;
+                driver::run_agent(
+                    runtime,
+                    active_thread,
+                    agent,
+                    control_rx,
+                    envelope_rx,
+                    config,
+                )
+                .await;
                 task_name
             });
 
@@ -166,23 +290,54 @@ impl AgentRuntime {
     }
 
     /// Abort the current work for this runtime.
-    pub async fn abort(&self) {
+    pub async fn request_abort(&self) {
         self.broadcast_command(AgentControl::Abort).await;
     }
 
     /// Request this runtime to exit all agent loops.
-    pub async fn exit(&self) {
+    pub async fn request_exit(&self) {
+        self.exit_barrier.enter_exiting();
         self.broadcast_command(AgentControl::Exit).await;
     }
 
     /// Send a message to a specific agent.
     pub async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
+        if self.exit_barrier.is_exiting() {
+            // During the suspension draining phase, we buffer incoming messages instead of sending them to agents.
+            let receiver = envelope.to.name.clone();
+            let mut snapshot = self.snapshot.lock().await;
+            snapshot
+                .drained_envelopes
+                .entry(receiver.clone())
+                .or_default()
+                .push(envelope);
+            return Ok(());
+        }
         let agents = self.agents.lock().await;
         if let Some(handle) = agents.get(envelope.to.name.as_str()) {
             handle.send_message(envelope).await
         } else {
             Err(SendCommandError::AgentNotFound)
         }
+    }
+
+    pub async fn save_agent_snapshot(
+        &self,
+        agent_name: String,
+        envelopes: Vec<Envelope>,
+        active_thread: Option<ThreadId>,
+    ) {
+        let mut snapshot = self.snapshot.lock().await;
+        snapshot
+            .agent_drained_envelopes
+            .insert(agent_name.clone(), envelopes);
+        if let Some(thread_id) = active_thread {
+            snapshot.active_threads.insert(agent_name, thread_id.0);
+        }
+        // TODO: snapshot is only persisted in wait_for_exit, so a crash between
+        // suspension and clean exit loses drained_envelopes / active_threads.
+        // For robust async HITL, persist the snapshot here (and in send_message's
+        // buffering branch) so state survives process restarts.
     }
 
     /// Wait for all bootstrapped agent tasks to exit.
@@ -203,12 +358,22 @@ impl AgentRuntime {
             }
         };
 
-        match timeout_duration {
+        let ret = match timeout_duration {
             Some(duration) => timeout(duration, wait_for_exit).await.is_ok(),
             None => {
                 wait_for_exit.await;
                 true
             }
-        }
+        };
+        // TODO: abort any remaining agents if timeout occurs and return early, instead of waiting for them to exit on their own.
+        // Root cause: graceful exit awaits each agent's current run_fut to completion, which deadlocks
+        // when an agent is stuck on a slow/hung LLM stream or external API. Until this is addressed,
+        // callers must combine request_abort + request_exit manually to guarantee termination.
+        self.session_storage
+            .save_session_snapshot(self.session_id.clone(), self.snapshot.lock().await.clone())
+            .await
+            .expect("TODO:");
+
+        ret
     }
 }

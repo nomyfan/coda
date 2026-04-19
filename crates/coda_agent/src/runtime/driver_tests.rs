@@ -2,7 +2,9 @@ use super::*;
 use crate::{
     AgentCheckpoint, AgentEvent, AgentSpec, AgentState, BuildContext, RunConfig, Sender,
     SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    runtime::{AgentRuntime, MemoryStorage, SessionStorage},
+    runtime::{
+        AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage, SuspensionPolicy,
+    },
     spec::{ReadTodosToolSpec, ToolSpec},
 };
 use coda_core::{
@@ -30,6 +32,7 @@ use tokio::{
 #[derive(Clone, Default)]
 struct TestStorage {
     checkpoints: Arc<Mutex<HashMap<String, AgentCheckpoint>>>,
+    snapshots: Arc<Mutex<HashMap<String, AgentRuntimeSnapshot>>>,
 }
 
 impl TestStorage {
@@ -62,6 +65,29 @@ impl SessionStorage for TestStorage {
         Box::pin(async move {
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
             Ok(checkpoint)
+        })
+    }
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: AgentRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.snapshots.lock().await.insert(session_id, snapshot);
+            Ok(())
+        })
+    }
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    {
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            let snapshot = self.snapshots.lock().await.get(&session_id).cloned();
+            Ok(snapshot)
         })
     }
 }
@@ -541,11 +567,15 @@ where
             tool_approval: approval,
         };
 
-        let mut runtime = AgentRuntime::new(storage.clone());
-        runtime.bootstrap(agents, config).await;
+        let thread_id = ThreadId::new();
+        let mut runtime = AgentRuntime::new(
+            storage.clone(),
+            thread_id.as_ref().to_string(),
+            SuspensionPolicy::KeepRunning,
+        );
+        runtime.bootstrap(agents, None, config).await;
 
         let events = runtime.subscribe();
-        let thread_id = ThreadId::new();
         let harness = Self {
             runtime,
             events,
@@ -588,7 +618,10 @@ where
     }
 
     async fn shutdown(&self) {
-        self.runtime.exit().await;
+        // Abort first so any in-flight work (e.g. a subagent blocked on a hold
+        // gate) is cancelled; then request graceful exit.
+        self.runtime.request_abort().await;
+        self.runtime.request_exit().await;
         assert!(
             self.runtime
                 .wait_for_exit(Some(Duration::from_secs(2)))
@@ -621,12 +654,16 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         tool_approval: ToolApprovalMode::Auto,
     };
 
-    let mut runtime = AgentRuntime::new(MemoryStorage::default());
-    runtime.bootstrap(agents, config).await;
+    let mut runtime = AgentRuntime::new(
+        MemoryStorage::default(),
+        "test-session".into(),
+        SuspensionPolicy::KeepRunning,
+    );
+    runtime.bootstrap(agents, None, config).await;
 
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
 
-    runtime.exit().await;
+    runtime.request_exit().await;
     assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }
 
@@ -913,7 +950,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
                 ("coda", AgentEvent::ToolCallStart(tool)) => {
                     started.insert(tool.id);
                     if started.contains("call_slow") && started.contains("call_explore") {
-                        harness.runtime.abort().await;
+                        harness.runtime.request_abort().await;
                     }
                 }
                 ("coda", AgentEvent::Aborted(AbortedTarget::ToolCalls(ids))) => {
@@ -980,7 +1017,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                 ("coda", AgentEvent::LLMContentChunk(chunk)) => {
                     assert_eq!(chunk, "partial");
                     saw_chunk = true;
-                    harness.runtime.abort().await;
+                    harness.runtime.request_abort().await;
                 }
                 ("coda", AgentEvent::Aborted(AbortedTarget::Generation)) => {
                     assert!(
