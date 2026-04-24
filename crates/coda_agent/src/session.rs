@@ -10,7 +10,7 @@
 //! [`Session::runtime`].
 
 use crate::agent::{EnvelopeBody, Receiver, ResumePoint};
-use crate::runtime::{AgentRuntime, SendCommandError, SessionStorage};
+use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
     Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, BuildError, Envelope,
     ResumeDecision, RunConfig, Sender, ThreadId,
@@ -100,6 +100,12 @@ pub enum OpenError {
     Build(BuildError),
     Storage(String),
     UnknownRoot(String),
+    /// One or more agents have a checkpoint in `PendingApproval` state but the
+    /// builder's `resume_decisions` did not cover them. The runtime is NOT
+    /// started in this case; the caller should collect resume decisions for the
+    /// returned checkpoints (keyed by `thread_id`) and rebuild the session with
+    /// `SessionBuilder::resume_decisions`.
+    PendingApprovalsRequired(Vec<AgentCheckpoint>),
 }
 
 impl std::fmt::Display for OpenError {
@@ -110,6 +116,13 @@ impl std::fmt::Display for OpenError {
             OpenError::Storage(err) => write!(f, "storage error: {err}"),
             OpenError::UnknownRoot(name) => {
                 write!(f, "root '{name}' not present in provided agents")
+            }
+            OpenError::PendingApprovalsRequired(ckpts) => {
+                write!(
+                    f,
+                    "session has {} pending approval(s) without resume decisions",
+                    ckpts.len()
+                )
             }
         }
     }
@@ -136,6 +149,7 @@ pub struct SessionBuilder<P: LLMProvider + Clone> {
     pending_spec: Option<AgentSpec>,
     run_config: Option<RunConfig<P>>,
     session_id: Option<String>,
+    resume_decisions: HashMap<String, ResumeDecision>,
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<P> {
@@ -147,6 +161,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<P> {
             pending_spec: None,
             run_config: None,
             session_id: None,
+            resume_decisions: HashMap::new(),
         }
     }
 }
@@ -202,6 +217,18 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
         self
     }
 
+    /// Provide resume decisions for any agents whose restored checkpoint is in
+    /// `PendingApproval` state. Keys are `AgentCheckpoint::thread_id` values
+    /// (use those returned by [`OpenError::PendingApprovalsRequired`]).
+    ///
+    /// If `open` finds pending-approval checkpoints that are not covered by
+    /// this map, it fails with [`OpenError::PendingApprovalsRequired`] and
+    /// the agent runtime is NOT started.
+    pub fn resume_decisions(mut self, decisions: HashMap<String, ResumeDecision>) -> Self {
+        self.resume_decisions = decisions;
+        self
+    }
+
     pub async fn open(mut self) -> Result<Session, OpenError> {
         let storage = self
             .storage
@@ -243,27 +270,52 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
             .take()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Load resumed state BEFORE bootstrap so we can populate `resumed_checkpoint`
-        // and `has_pending_approval` on the returned Session.
+        // Load resumed state BEFORE bootstrap so we can (a) surface root history
+        // via `resumed_checkpoint` and (b) detect pending approvals on *any*
+        // agent in the snapshot, not just the root.
         let snapshot = storage
             .load_session_snapshot(&session_id)
             .await
             .map_err(OpenError::Storage)?;
+
         let resumed_checkpoint = storage
             .load_checkpoint(&session_id)
             .await
             .map_err(OpenError::Storage)?;
-        // TODO: 这里的 has_pending_approval 语义有问题，应该是任意 agent 存在 pending approval 就是存在，应该可以和另外一个没有记录多个 agents 有 suspend 的问题一起修复。
-        let has_pending_approval = matches!(
-            resumed_checkpoint.as_ref().map(|c| &c.resume_point),
-            Some(ResumePoint::PendingApproval { .. })
-        );
+
+        let pending_approvals =
+            collect_pending_approvals(storage.as_ref(), &session_id, &root_name, snapshot.as_ref())
+                .await?;
+
+        let mut resume_decisions = self.resume_decisions;
+        let uncovered: Vec<AgentCheckpoint> = pending_approvals
+            .iter()
+            .filter(|c| !resume_decisions.contains_key(&c.thread_id))
+            .cloned()
+            .collect();
+        if !uncovered.is_empty() {
+            return Err(OpenError::PendingApprovalsRequired(uncovered));
+        }
+        // Drop decisions that don't match any pending approval so stale entries
+        // can't mask coverage bugs by silently disappearing into bootstrap.
+        resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
+
+        let has_resuming_agents = snapshot.as_ref().map_or(false, |snapshot| {
+            !snapshot.active_threads.is_empty()
+                || snapshot
+                    .agent_drained_envelopes
+                    .values()
+                    .any(|v| !v.is_empty())
+                || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
+        });
 
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();
-        runtime.bootstrap(agents, snapshot, run_config).await;
+        runtime
+            .bootstrap(agents, snapshot, resume_decisions, run_config)
+            .await;
 
         Ok(Session {
             inner: Arc::new(SessionInner {
@@ -271,11 +323,50 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 root_name,
                 session_id,
                 resumed_checkpoint,
-                has_pending_approval,
+                has_resuming_agents,
                 events_rx: Mutex::new(events_rx),
             }),
         })
     }
+}
+
+/// Walks root + snapshot-tracked agent threads, loads each checkpoint, and
+/// returns those still sitting in `PendingApproval`.
+async fn collect_pending_approvals(
+    storage: &dyn SessionStorage,
+    session_id: &str,
+    root_name: &str,
+    snapshot: Option<&AgentRuntimeSnapshot>,
+) -> Result<Vec<AgentCheckpoint>, OpenError> {
+    let mut seen_thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut threads: Vec<String> = Vec::new();
+    // Root always has thread_id == session_id.
+    threads.push(session_id.to_string());
+    seen_thread_ids.insert(session_id.to_string());
+    if let Some(snap) = snapshot {
+        for (agent_name, tid) in &snap.active_threads {
+            if agent_name == root_name {
+                continue;
+            }
+            if seen_thread_ids.insert(tid.clone()) {
+                threads.push(tid.clone());
+            }
+        }
+    }
+
+    let mut pending = Vec::new();
+    for tid in threads {
+        let ckpt = storage
+            .load_checkpoint(&tid)
+            .await
+            .map_err(OpenError::Storage)?;
+        if let Some(ckpt) = ckpt
+            && matches!(ckpt.resume_point, ResumePoint::PendingApproval { .. })
+        {
+            pending.push(ckpt);
+        }
+    }
+    Ok(pending)
 }
 
 struct SessionInner {
@@ -283,7 +374,7 @@ struct SessionInner {
     root_name: String,
     session_id: String,
     resumed_checkpoint: Option<AgentCheckpoint>,
-    has_pending_approval: bool,
+    has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, AgentEvent)>>,
 }
 
@@ -306,14 +397,19 @@ impl Session {
         &self.inner.root_name
     }
 
-    /// `true` when the root agent's loaded checkpoint is sitting in
-    /// `PendingApproval` — the event stream will emit a `Suspended` event
-    /// without needing an initial `send`.
-    pub fn has_pending_approval(&self) -> bool {
-        self.inner.has_pending_approval
+    /// `true` when the snapshot indicates that at least one agent has in-flight
+    /// work (active thread, or queued envelopes) and will therefore emit events
+    /// immediately after `open` — without waiting for a `send`. Callers should
+    /// enter the event loop directly instead of prompting for user input first.
+    pub fn has_resuming_agents(&self) -> bool {
+        self.inner.has_resuming_agents
     }
 
-    /// The root agent's checkpoint at open time, if one was on disk.
+    /// The root agent's checkpoint at open time, if one was on disk. Intended
+    /// for callers that want to render prior conversation history; pending
+    /// approvals (on root or any sub-agent) are handled at `open` time via
+    /// [`SessionBuilder::resume_decisions`], so this checkpoint's
+    /// `resume_point` is never `PendingApproval` once `open` succeeds.
     pub fn resumed_checkpoint(&self) -> Option<&AgentCheckpoint> {
         self.inner.resumed_checkpoint.as_ref()
     }
@@ -375,7 +471,6 @@ impl Session {
     /// Lagged receivers drop overflowed events (logged via `tracing::warn`)
     /// rather than block runtime emitters.
     pub async fn recv(&self) -> Option<SessionEvent> {
-        // TODO: 处理多个 agent 触发 suspend 的场景
         let mut rx = self.inner.events_rx.lock().await;
         loop {
             match rx.recv().await {

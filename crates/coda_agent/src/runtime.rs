@@ -1,6 +1,6 @@
 mod driver;
 
-use crate::{Agent, AgentCheckpoint, AgentEvent, Envelope, RunConfig, ThreadId};
+use crate::{Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
 use coda_core::llm::LLMProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -233,6 +233,7 @@ impl AgentRuntime {
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
+        mut resume_decisions: HashMap<String, ResumeDecision>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
         for (name, agent) in agents {
@@ -245,6 +246,9 @@ impl AgentRuntime {
                 .as_ref()
                 .and_then(|s| s.active_threads.get(&name))
                 .map(|id| ThreadId(id.clone()));
+            let resume_decision = active_thread
+                .as_ref()
+                .and_then(|tid| resume_decisions.remove(tid.as_ref()));
             let init_envelopes = snapshot
                 .as_mut()
                 .and_then(|s| {
@@ -264,7 +268,7 @@ impl AgentRuntime {
             self.agent_tasks.lock().await.spawn(async move {
                 driver::run_agent(
                     runtime,
-                    active_thread,
+                    (active_thread, resume_decision),
                     agent,
                     control_rx,
                     envelope_rx,

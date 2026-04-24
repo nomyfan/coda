@@ -14,8 +14,8 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, RunConfig, Sender, SubAgentMode,
-    ThreadId, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender,
+    SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget, ResumePoint,
         ToolExecutionState,
@@ -26,17 +26,49 @@ use crate::{
 #[instrument(skip_all, fields(agent = %agent.name))]
 pub(crate) async fn run_agent(
     runtime: AgentRuntime,
-    active_thread: Option<ThreadId>,
+    active: (Option<ThreadId>, Option<ResumeDecision>),
     mut agent: Agent,
     mut control_rx: mpsc::Receiver<AgentControl>,
     mut envelope_rx: mpsc::Receiver<Envelope>,
     config: RunConfig<impl LLMProvider + Clone>,
 ) {
     info!("Agent {} is running", agent.name);
-    let mut active_thread = active_thread;
+    let (mut active_thread, resume_decision) = active;
+    // When a resume decision is provided alongside the active thread, turn it into
+    // a Resume envelope for the first iteration so the agent drops straight from
+    // PendingApproval into ToolExecution without re-emitting `Suspended`.
+    let mut pending_resume_envelope: Option<Envelope> = match (&active_thread, resume_decision) {
+        (Some(tid), Some(decision)) => Some(Envelope::with_id(|id| Envelope {
+            id,
+            from: Sender::User,
+            to: Receiver {
+                name: agent.name.clone(),
+                thread_id: tid.clone(),
+            },
+            reply_to: None,
+            body: EnvelopeBody::Resume(decision),
+        })),
+        (None, Some(_)) => {
+            warn!(
+                "run_agent for {} got a resume decision without an active thread; discarding",
+                agent.name
+            );
+            None
+        }
+        _ => None,
+    };
+    if pending_resume_envelope.is_some() {
+        // The resume envelope carries the thread_id into the first run; clear the
+        // raw active_thread so we don't also trigger a bare `run(None)` that would
+        // emit Suspended.
+        active_thread = None;
+    }
     loop {
-        // If there's an active thread to continue, just run it without waiting for a new envelope.
-        let (thread_id, envelope) = if let Some(active_thread) = active_thread.take() {
+        // First: if we have a queued resume envelope, run with it.
+        // Otherwise: if there's an active thread to continue, just run it without waiting for a new envelope.
+        let (thread_id, envelope) = if let Some(envelope) = pending_resume_envelope.take() {
+            (envelope.to.thread_id.clone(), Some(envelope))
+        } else if let Some(active_thread) = active_thread.take() {
             (active_thread, None)
         } else {
             // Wait for the next envelope, but allow Exit to break the loop.

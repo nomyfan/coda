@@ -567,7 +567,9 @@ where
 
         let thread_id = ThreadId::new();
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
-        runtime.bootstrap(agents, None, config).await;
+        runtime
+            .bootstrap(agents, None, HashMap::new(), config)
+            .await;
 
         let events = runtime.subscribe();
         let harness = Self {
@@ -649,7 +651,9 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     };
 
     let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
-    runtime.bootstrap(agents, None, config).await;
+    runtime
+        .bootstrap(agents, None, HashMap::new(), config)
+        .await;
 
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
 

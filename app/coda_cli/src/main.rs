@@ -3,8 +3,8 @@ mod storage;
 
 use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, ResumeDecision, RunConfig,
-    Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, OpenError, ResumeDecision,
+    RunConfig, Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     agent::ResumePoint, builtin_specs,
 };
 use coda_core::llm::{
@@ -15,6 +15,7 @@ use coda_skills::Skills;
 use dotenvy::dotenv;
 use either::Either;
 use rustyline::error::ReadlineError;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -222,6 +223,46 @@ fn render_checkpoint_history(checkpoint: &AgentCheckpoint) {
     println!();
 }
 
+fn build_agent_spec(system_prompt: String) -> AgentSpec {
+    AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt,
+        mode: SubAgentMode::Stateful,
+        tools: {
+            let mut t = builtin_specs();
+            t.push(Box::new(AskUserToolSpec));
+            t
+        },
+        subagents: vec![
+            AgentSpec {
+                name: "explore".into(),
+                description: "An explore sub-agent that can read files, search code, and explore the codebase. Delegate exploration and research tasks to it.".into(),
+                system_prompt:
+                    "You are an exploration assistant. You can read files, search code, and list directories. \
+                     Summarize your findings concisely."
+                        .to_string(),
+                mode: SubAgentMode::Stateless,
+                tools: builtin_specs(),
+                subagents: vec![],
+            },
+            AgentSpec {
+                name: "memo".into(),
+                description: "A stateful memo agent that remembers information across calls. \
+                              Use it to store and recall facts across turns."
+                    .into(),
+                system_prompt:
+                    "You are a simple memo agent. Your only job is to remember what the user tells you and \
+                     answer questions about it. Keep your replies very brief."
+                        .to_string(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec![],
+            },
+        ],
+    }
+}
+
 fn print_usage(program: &str) {
     println!("Usage: {program} [--resume <uuid>]");
 }
@@ -310,72 +351,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream: true,
     }));
 
-    let ctx = BuildContext {
-        workspace_dir: workspace_str.clone(),
-    };
-
-    let spec = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt,
-        mode: SubAgentMode::Stateful,
-        tools: {
-            let mut t = builtin_specs();
-            t.push(Box::new(AskUserToolSpec));
-            t
-        },
-        subagents: vec![
-            AgentSpec {
-                name: "explore".into(),
-                description: "An explore sub-agent that can read files, search code, and explore the codebase. Delegate exploration and research tasks to it.".into(),
-                system_prompt:
-                    "You are an exploration assistant. You can read files, search code, and list directories. \
-                     Summarize your findings concisely."
-                        .to_string(),
-                mode: SubAgentMode::Stateless,
-                tools: builtin_specs(),
-                subagents: vec![],
-            },
-            AgentSpec {
-                name: "memo".into(),
-                description: "A stateful memo agent that remembers information across calls. \
-                              Use it to store and recall facts across turns."
-                    .into(),
-                system_prompt:
-                    "You are a simple memo agent. Your only job is to remember what the user tells you and \
-                     answer questions about it. Keep your replies very brief."
-                        .to_string(),
-                mode: SubAgentMode::Stateful,
-                tools: vec![],
-                subagents: vec![],
-            },
-        ],
-    };
-
-    let config = RunConfig {
-        provider,
-        model,
-        max_completion_tokens: Some(5000),
-        temperature: Some(0.7),
-        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-            call.name == "shell" || call.name == "ask_user"
-        })),
-    };
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
 
-    let session = Session::builder()
-        .storage(storage)
-        .root(spec)
-        .build_context(ctx)
-        .run_config(config)
-        .session_id(session_id.clone())
-        .open()
-        .await?;
-
     print_logo();
-
     let mut rl = rustyline::DefaultEditor::new()?;
+
+    let mut resume_decisions: HashMap<String, ResumeDecision> = HashMap::new();
+    let session = loop {
+        let ctx = BuildContext {
+            workspace_dir: workspace_str.clone(),
+        };
+        let spec = build_agent_spec(system_prompt.clone());
+        let config = RunConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+            max_completion_tokens: Some(5000),
+            temperature: Some(0.7),
+            tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+                call.name == "shell" || call.name == "ask_user"
+            })),
+        };
+        match Session::builder()
+            .storage(storage.clone())
+            .root(spec)
+            .build_context(ctx)
+            .run_config(config)
+            .session_id(session_id.clone())
+            .resume_decisions(std::mem::take(&mut resume_decisions))
+            .open()
+            .await
+        {
+            Ok(s) => break s,
+            Err(OpenError::PendingApprovalsRequired(ckpts)) => {
+                println!(
+                    "\n[Resuming session — {} pending approval(s) to resolve]",
+                    ckpts.len()
+                );
+                for ckpt in ckpts {
+                    let resolutions = match resolve_pending_calls(&mut rl, &ckpt) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            println!("\n[Aborted: approval interrupted: {e}]");
+                            return Err(e);
+                        }
+                    };
+                    resume_decisions.insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
+                }
+            }
+            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+        }
+    };
+
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {}\n", session_id);
     if resumed_session_id.is_some()
@@ -384,32 +411,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         render_checkpoint_history(checkpoint)
     }
 
+    // Skip the first readline if agents are already running after resume.
+    let mut skip_input = session.has_resuming_agents();
+
     loop {
-        let raw_input = match rl.readline("You: ") {
-            Ok(line) => line,
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+        if !skip_input {
+            let raw_input = match rl.readline("You: ") {
+                Ok(line) => line,
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                    println!("Goodbye!");
+                    break;
+                }
+                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+            };
+
+            let user_input = raw_input.trim();
+            if user_input.is_empty() {
+                continue;
+            }
+            if user_input.eq_ignore_ascii_case("quit")
+                || user_input.eq_ignore_ascii_case("exit")
+                || user_input.eq_ignore_ascii_case("q")
+            {
                 println!("Goodbye!");
                 break;
             }
-            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-        };
 
-        let user_input = raw_input.trim();
-        if user_input.is_empty() {
-            continue;
+            session.send(user_input.to_string()).await?;
+
+            print!("Assistant: ");
+            io::stdout().flush()?;
         }
-        if user_input.eq_ignore_ascii_case("quit")
-            || user_input.eq_ignore_ascii_case("exit")
-            || user_input.eq_ignore_ascii_case("q")
-        {
-            println!("Goodbye!");
-            break;
-        }
-
-        session.send(user_input.to_string()).await?;
-
-        print!("Assistant: ");
-        io::stdout().flush()?;
+        skip_input = false;
 
         loop {
             tokio::select! {
