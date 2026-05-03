@@ -381,9 +381,9 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
   - 目的：验证急切快照持久化正确且不引入竞争
   - 验证：agent 挂起退出后，用相同 session_id 执行新 `Session::open`，能找到正确的 `active_threads` 和 `drained_envelopes`
 
-- [ ] [core] 新增 `PendingApproval` 类型，修改 `AgentEvent::Suspended` 携带它，修改 `OpenError::PendingApprovalsRequired` 携带 `Vec<PendingApproval>`
+- [x] [core] 新增 `PendingApproval` 类型，修改 `AgentEvent::Suspended` 携带它，修改 `OpenError::PendingApprovalsRequired` 携带 `Vec<PendingApproval>`
   - 目的：弱化 caller 对 checkpoint 的感知
-  - 验证：编译通过，现有测试适配后通过
+  - 验证：编译通过，现有测试适配后通过（8/8 通过，coda_cli 无警告编译）
 
 - [ ] [core] 修改 agent 循环：`PendingApproval` 状态下 agent 直接退出，不等待 Resume envelope
   - 目的：实现 "每次 turn 一个 session 生命周期"

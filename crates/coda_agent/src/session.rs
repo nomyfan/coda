@@ -13,7 +13,7 @@ use crate::agent::{EnvelopeBody, Receiver, ResumePoint};
 use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
     Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, BuildError, Envelope,
-    ResumeDecision, RunConfig, Sender, ThreadId,
+    PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
 };
 use coda_core::llm::LLMProvider;
 use std::collections::HashMap;
@@ -103,9 +103,9 @@ pub enum OpenError {
     /// One or more agents have a checkpoint in `PendingApproval` state but the
     /// builder's `resume_decisions` did not cover them. The runtime is NOT
     /// started in this case; the caller should collect resume decisions for the
-    /// returned checkpoints (keyed by `thread_id`) and rebuild the session with
-    /// `SessionBuilder::resume_decisions`.
-    PendingApprovalsRequired(Vec<AgentCheckpoint>),
+    /// returned pending approvals (keyed by `thread_id`) and rebuild the session
+    /// with `SessionBuilder::resume_decisions`.
+    PendingApprovalsRequired(Vec<PendingApproval>),
 }
 
 impl std::fmt::Display for OpenError {
@@ -218,7 +218,7 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
     }
 
     /// Provide resume decisions for any agents whose restored checkpoint is in
-    /// `PendingApproval` state. Keys are `AgentCheckpoint::thread_id` values
+    /// `PendingApproval` state. Keys are `PendingApproval::thread_id` values
     /// (use those returned by [`OpenError::PendingApprovalsRequired`]).
     ///
     /// If `open` finds pending-approval checkpoints that are not covered by
@@ -288,7 +288,7 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 .await?;
 
         let mut resume_decisions = self.resume_decisions;
-        let uncovered: Vec<AgentCheckpoint> = pending_approvals
+        let uncovered: Vec<PendingApproval> = pending_approvals
             .iter()
             .filter(|c| !resume_decisions.contains_key(&c.thread_id))
             .cloned()
@@ -337,7 +337,7 @@ async fn collect_pending_approvals(
     session_id: &str,
     root_name: &str,
     snapshot: Option<&AgentRuntimeSnapshot>,
-) -> Result<Vec<AgentCheckpoint>, OpenError> {
+) -> Result<Vec<PendingApproval>, OpenError> {
     let mut seen_thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut threads: Vec<String> = Vec::new();
     // Root always has thread_id == session_id.
@@ -360,10 +360,21 @@ async fn collect_pending_approvals(
             .load_checkpoint(&tid)
             .await
             .map_err(OpenError::Storage)?;
-        if let Some(ckpt) = ckpt
-            && matches!(ckpt.resume_point, ResumePoint::PendingApproval { .. })
-        {
-            pending.push(ckpt);
+        if let Some(ckpt) = ckpt {
+            if let ResumePoint::PendingApproval {
+                ref pending_approval_calls,
+                ..
+            } = ckpt.resume_point
+            {
+                if !pending_approval_calls.is_empty() {
+                    pending.push(PendingApproval {
+                        thread_id: ckpt.thread_id,
+                        agent_name: ckpt.agent_name,
+                        calls: pending_approval_calls.iter().cloned().collect(),
+                        suspended_at: ckpt.suspended_at,
+                    });
+                }
+            }
         }
     }
     Ok(pending)
@@ -442,16 +453,39 @@ impl Session {
         checkpoint: &AgentCheckpoint,
         decision: ResumeDecision,
     ) -> Result<(), SendCommandError> {
-        let agent_name = checkpoint.agent_name.clone();
-        let thread_id = ThreadId::from(checkpoint.thread_id.clone());
+        self.send_resume_envelope(&checkpoint.agent_name, &checkpoint.thread_id, decision)
+            .await
+    }
+
+    /// Resume a suspended agent by `agent_name` and `thread_id`.
+    ///
+    /// This is the preferred API when the caller has a [`PendingApproval`]
+    /// instead of an [`AgentCheckpoint`]. Use [`Session::resume`] when you
+    /// still have the checkpoint from a prior `Suspended` event.
+    pub async fn resume_by_id(
+        &self,
+        agent_name: &str,
+        thread_id: &str,
+        decision: ResumeDecision,
+    ) -> Result<(), SendCommandError> {
+        self.send_resume_envelope(agent_name, thread_id, decision)
+            .await
+    }
+
+    async fn send_resume_envelope(
+        &self,
+        agent_name: &str,
+        thread_id: &str,
+        decision: ResumeDecision,
+    ) -> Result<(), SendCommandError> {
         self.inner
             .runtime
             .send_message(Envelope::with_id(|id| Envelope {
                 id,
                 from: Sender::User,
                 to: Receiver {
-                    name: agent_name,
-                    thread_id,
+                    name: agent_name.to_string(),
+                    thread_id: ThreadId::from(thread_id.to_string()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(decision),

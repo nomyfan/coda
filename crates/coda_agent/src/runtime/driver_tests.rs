@@ -591,7 +591,8 @@ where
 
     async fn send_resume(
         &self,
-        checkpoint: &AgentCheckpoint,
+        agent_name: &str,
+        thread_id: &str,
         resolutions: Vec<(String, ToolCallResolution)>,
     ) {
         self.runtime
@@ -599,8 +600,8 @@ where
                 id,
                 from: Sender::User,
                 to: Receiver {
-                    name: checkpoint.agent_name.clone(),
-                    thread_id: ThreadId::from(checkpoint.thread_id.clone()),
+                    name: agent_name.to_string(),
+                    thread_id: ThreadId::from(thread_id.to_string()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision { resolutions }),
@@ -693,20 +694,14 @@ async fn wait_for_completion_after_explore_reply(
             let (agent_name, _, event) = harness.next_event().await;
             observed.push(format!("{} {:?}", agent_name, event));
             match (agent_name.as_str(), event) {
-                ("explore", AgentEvent::Suspended(checkpoint)) if require_resume => {
-                    let ResumePoint::PendingApproval {
-                        pending_approval_calls,
-                        ..
-                    } = &checkpoint.resume_point
-                    else {
-                        panic!("unexpected checkpoint state");
-                    };
+                ("explore", AgentEvent::Suspended(pending)) if require_resume => {
                     approval_resumed = true;
                     harness
                         .send_resume(
-                            &checkpoint,
+                            &pending.agent_name,
+                            &pending.thread_id,
                             vec![(
-                                pending_approval_calls[0].id.clone(),
+                                pending.calls[0].id.clone(),
                                 ToolCallResolution::Execute,
                             )],
                         )
@@ -800,18 +795,12 @@ async fn pending_approval_supports_mixed_resolutions() {
         loop {
             let (agent_name, _, event) = harness.next_event().await;
             match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::Suspended(checkpoint)) => {
-                    let ResumePoint::PendingApproval {
-                        pending_approval_calls,
-                        ..
-                    } = &checkpoint.resume_point
-                    else {
-                        panic!("unexpected checkpoint state");
-                    };
-                    assert_eq!(pending_approval_calls.len(), 4);
+                ("coda", AgentEvent::Suspended(pending)) => {
+                    assert_eq!(pending.calls.len(), 4);
                     harness
                         .send_resume(
-                            &checkpoint,
+                            &pending.agent_name,
+                            &pending.thread_id,
                             vec![
                                 ("call_exec".into(), ToolCallResolution::Execute),
                                 (

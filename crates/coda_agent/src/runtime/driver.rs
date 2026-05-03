@@ -14,8 +14,8 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender,
-    SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, PendingApproval, ResumeDecision,
+    RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget, ResumePoint,
         ToolExecutionState,
@@ -234,19 +234,25 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     pending_calls,
                 } => {
                     let has_pending = !pending_approval_calls.is_empty();
+                    let pending = PendingApproval {
+                        thread_id: checkpoint.thread_id.clone(),
+                        agent_name: checkpoint.agent_name.clone(),
+                        calls: pending_approval_calls.iter().cloned().collect(),
+                        suspended_at: jiff::Timestamp::now(),
+                    };
                     checkpoint.resume_point = ResumePoint::PendingApproval {
                         pending_approval_calls,
                         pending_calls,
                     };
                     if has_pending {
-                        checkpoint.suspended_at = jiff::Timestamp::now();
+                        checkpoint.suspended_at = pending.suspended_at;
                         checkpoint.todos = self.agent.todos().await;
                         checkpoint.messages = self.agent.history().await;
                         self.runtime
                             .emit_event(
                                 self.agent.name.clone(),
                                 self.thread_id.clone(),
-                                AgentEvent::Suspended(checkpoint.clone()),
+                                AgentEvent::Suspended(pending),
                             )
                             .await;
                     }

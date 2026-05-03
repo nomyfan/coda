@@ -43,6 +43,18 @@ pub struct ResumeDecision {
     pub resolutions: Vec<(String, ToolCallResolution)>,
 }
 
+/// Lightweight view of an agent thread waiting for approval.
+///
+/// This is the public-facing type; `AgentCheckpoint` is the internal
+/// persistence format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub thread_id: String,
+    pub agent_name: String,
+    pub calls: Vec<ToolCall>,
+    pub suspended_at: jiff::Timestamp,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentCheckpoint {
     pub thread_id: String,
@@ -203,9 +215,10 @@ pub enum AgentEvent {
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
-    /// Emitted when tool calls require human approval. The stream terminates after this event.
-    /// Call `Agent::resume` with the checkpoint and a `ResumeDecision` to continue.
-    Suspended(AgentCheckpoint),
+    /// Emitted when tool calls require human approval. The agent thread exits
+    /// after this event. The caller should shut down the session, collect
+    /// decisions, and open a new session with `resume_decisions` to continue.
+    Suspended(PendingApproval),
     /// Emitted when the run is aborted by the user. The stream terminates after this event.
     Aborted(AbortedTarget),
     Error(String), // TODO: make this more structured

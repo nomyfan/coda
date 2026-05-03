@@ -5,9 +5,9 @@ pub mod spec;
 pub mod tools;
 
 pub use agent::{
-    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, AgentState, Envelope, ResumeDecision,
-    RunConfig, Sender, SubAgentMode, SubAgentTool, ThreadId, TodoItem, ToolApprovalMode,
-    ToolCallResolution,
+    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, AgentState, Envelope, PendingApproval,
+    ResumeDecision, RunConfig, Sender, SubAgentMode, SubAgentTool, ThreadId, TodoItem,
+    ToolApprovalMode, ToolCallResolution,
 };
 pub use session::{
     EventOrigin, OnTimeout, OpenError, Session, SessionBuilder, SessionEvent, Shutdown,

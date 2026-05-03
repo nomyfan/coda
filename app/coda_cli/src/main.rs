@@ -5,7 +5,7 @@ use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
     AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, OpenError, ResumeDecision,
     RunConfig, Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    agent::ResumePoint, builtin_specs,
+    builtin_specs,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -111,18 +111,10 @@ fn prompt_approval(
 
 fn resolve_pending_calls(
     rl: &mut rustyline::DefaultEditor,
-    checkpoint: &AgentCheckpoint,
+    pending_calls: &[ToolCall],
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
-    let ResumePoint::PendingApproval {
-        pending_approval_calls,
-        ..
-    } = &checkpoint.resume_point
-    else {
-        return Ok(vec![]);
-    };
-
     let mut resolutions = vec![];
-    for pending_call in pending_approval_calls {
+    for pending_call in pending_calls {
         if pending_call.name == "ask_user" {
             let output = match serde_json::from_str::<AskUserParams>(
                 pending_call.arguments.as_deref().unwrap_or("{}"),
@@ -389,7 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ckpts.len()
                 );
                 for ckpt in ckpts {
-                    let resolutions = match resolve_pending_calls(&mut rl, &ckpt) {
+                    let resolutions = match resolve_pending_calls(&mut rl, &ckpt.calls) {
                         Ok(r) => r,
                         Err(e) => {
                             println!("\n[Aborted: approval interrupted: {e}]");
@@ -490,21 +482,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         AgentEvent::ToolCallEnd(_) => {}
-                        AgentEvent::Suspended(checkpoint) => {
+                        AgentEvent::Suspended(pending) => {
                             let label = if origin.is_root() { "" } else { " (sub-agent)" };
-                            let ResumePoint::PendingApproval {
-                                pending_approval_calls,
-                                ..
-                            } = &checkpoint.resume_point
-                            else {
-                                continue;
-                            };
                             println!(
                                 "\n[{} tool call(s) require approval{}]",
-                                pending_approval_calls.len(),
+                                pending.calls.len(),
                                 label
                             );
-                            let resolutions = match resolve_pending_calls(&mut rl, &checkpoint) {
+                            let resolutions = match resolve_pending_calls(&mut rl, &pending.calls) {
                                 Ok(r) => r,
                                 Err(_) => {
                                     session.abort().await;
@@ -512,8 +497,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     break;
                                 }
                             };
-                            if let Err(e) =
-                                session.resume(&checkpoint, ResumeDecision { resolutions }).await
+                            if let Err(e) = session
+                                .resume_by_id(
+                                    &pending.agent_name,
+                                    &pending.thread_id,
+                                    ResumeDecision { resolutions },
+                                )
+                                .await
                             {
                                 warn!("{}", e);
                                 println!("\n[Error: failed to resume agent: {}]", e);
