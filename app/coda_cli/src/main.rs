@@ -363,6 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
                 call.name == "shell" || call.name == "ask_user"
             })),
+            approval_timeout: None,
         };
         match Session::builder()
             .storage(storage.clone())

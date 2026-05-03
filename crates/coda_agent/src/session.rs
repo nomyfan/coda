@@ -13,13 +13,13 @@ use crate::agent::{EnvelopeBody, Receiver, ResumePoint};
 use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
     Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, BuildError, Envelope,
-    PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
+    PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId, ToolCallResolution,
 };
 use coda_core::llm::LLMProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
-use tokio::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -288,6 +288,37 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 .await?;
 
         let mut resume_decisions = self.resume_decisions;
+
+        // Auto-reject timed-out pending approvals that the caller didn't cover.
+        if let Some(timeout) = run_config.approval_timeout {
+            for p in &pending_approvals {
+                if resume_decisions.contains_key(&p.thread_id) {
+                    continue;
+                }
+                let elapsed_ms =
+                    (jiff::Timestamp::now().as_millisecond() - p.suspended_at.as_millisecond())
+                        as u64;
+                if elapsed_ms > timeout.as_millis() as u64 {
+                    let resolutions = p
+                        .calls
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.id.clone(),
+                                ToolCallResolution::Rejected {
+                                    reason: Some("approval timed out".into()),
+                                },
+                            )
+                        })
+                        .collect();
+                    resume_decisions.insert(
+                        p.thread_id.clone(),
+                        ResumeDecision { resolutions },
+                    );
+                }
+            }
+        }
+
         let uncovered: Vec<PendingApproval> = pending_approvals
             .iter()
             .filter(|c| !resume_decisions.contains_key(&c.thread_id))

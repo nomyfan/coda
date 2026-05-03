@@ -239,6 +239,9 @@ pub struct RunConfig<P: LLMProvider> {
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
     pub tool_approval: ToolApprovalMode,
+    /// If set, pending approvals older than this duration are auto-rejected
+    /// when opening a session.
+    pub approval_timeout: Option<std::time::Duration>,
 }
 
 impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
@@ -249,6 +252,7 @@ impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
             tool_approval: self.tool_approval.clone(),
+            approval_timeout: self.approval_timeout,
         }
     }
 }

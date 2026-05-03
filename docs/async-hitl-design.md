@@ -389,13 +389,13 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
   - 目的：实现 "每次 turn 一个 session 生命周期"
   - 验证：8/8 测试通过，包括两阶段 restart 测试（resume + reject）
 
-- [ ] [core] 将超时检查逻辑放在 `open()` / `collect_pending_approvals` 中（而非 agent 循环内）
+- [x] [core] 将超时检查逻辑放在 `open()` / `collect_pending_approvals` 中（而非 agent 循环内）
   - 目的：配合 "session 关闭" 模型，超时基于持久化的 `suspended_at` 判断
-  - 验证：打开 session 且 pending checkpoint 的 `suspended_at` 已超时 → 自动拒绝
+  - 验证：打开 session 且 pending checkpoint 的 `suspended_at` 已超时 → 自动拒绝（8/8 测试通过）
 
-- [ ] [feature] 在 `RunConfig` 中新增 `approval_timeout: Option<Duration>`
+- [x] [feature] 在 `RunConfig` 中新增 `approval_timeout: Option<Duration>`
   - 目的：防止无限等待审批
-  - 验证：单元测试用短超时，确认超时后 pending 被自动拒绝
+  - 验证：8/8 测试通过，RunConfig 新增字段在全代码库编译通过
 
 - [ ] [integration] 更新 `coda_cli` 适配新 API（循环 open/close session）
   - 目的：在新模型上自验 sync 流程

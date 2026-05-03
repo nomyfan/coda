@@ -584,6 +584,7 @@ where
             temperature: None,
             max_completion_tokens: None,
             tool_approval: approval,
+            approval_timeout: None,
         };
 
         let thread_id = ThreadId::new();
@@ -646,6 +647,7 @@ where
             temperature: None,
             max_completion_tokens: None,
             tool_approval: approval,
+            approval_timeout: None,
         };
 
         let session_id = self.thread_id.as_ref().to_string();
@@ -708,6 +710,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         temperature: None,
         max_completion_tokens: None,
         tool_approval: ToolApprovalMode::Auto,
+        approval_timeout: None,
     };
 
     let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
