@@ -528,6 +528,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             ..Default::default()
                         })).await;
                     }
+                    // TODO: returning Err here may cause a downstream Error event in addition to Aborted(Generation). Consider a distinct abort result.
                     break Err("Aborted by user".to_string());
                 }
                 event = llm_stream.next() => {

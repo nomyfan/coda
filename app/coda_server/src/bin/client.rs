@@ -71,7 +71,11 @@ fn render_history(messages: &[Message]) {
 
 fn render_event(event: &WireEvent, root_name: &str) {
     match event {
-        WireEvent::LlmContentChunk { content, agent_name, .. } => {
+        WireEvent::LlmContentChunk {
+            content,
+            agent_name,
+            ..
+        } => {
             if agent_name == root_name {
                 print!("{content}");
             } else {
@@ -79,7 +83,11 @@ fn render_event(event: &WireEvent, root_name: &str) {
             }
             io::stdout().flush().ok();
         }
-        WireEvent::LlmEnd { message, agent_name, .. } => {
+        WireEvent::LlmEnd {
+            message,
+            agent_name,
+            ..
+        } => {
             if !message.content.is_empty() || message.usage.is_some() {
                 println!();
             }
@@ -99,7 +107,9 @@ fn render_event(event: &WireEvent, root_name: &str) {
                 println!("[Generation interrupted]");
             }
         }
-        WireEvent::ToolCallStart { call, agent_name, .. } => {
+        WireEvent::ToolCallStart {
+            call, agent_name, ..
+        } => {
             if agent_name == root_name {
                 println!(
                     "\n[Tool: {}]: {}",
@@ -263,8 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(format!("{server_url}/history/{session_id}"))
         .send()
         .await
-    {
-        if let Ok(history) = resp.json::<HistoryResponse>().await {
+        && let Ok(history) = resp.json::<HistoryResponse>().await {
             render_history(&history.messages);
             if !history.pending_approvals.is_empty() {
                 println!(
@@ -278,13 +287,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         p.agent_name
                     );
                     let resolutions = resolve_pending_calls(&mut rl, &p.calls)?;
-                    pending_decisions
-                        .insert(p.thread_id.clone(), ResumeDecision { resolutions });
+                    pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
                 }
                 println!();
             }
         }
-    }
 
     loop {
         let (task, resume_decisions) = if pending_decisions.is_empty() {

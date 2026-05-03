@@ -328,7 +328,7 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
         // can't mask coverage bugs by silently disappearing into bootstrap.
         resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
 
-        let has_resuming_agents = snapshot.as_ref().map_or(false, |snapshot| {
+        let has_resuming_agents = snapshot.as_ref().is_some_and(|snapshot| {
             !snapshot.active_threads.is_empty()
                 || snapshot
                     .agent_drained_envelopes
@@ -388,13 +388,12 @@ async fn collect_pending_approvals(
             .load_checkpoint(&tid)
             .await
             .map_err(OpenError::Storage)?;
-        if let Some(ckpt) = ckpt {
-            if let ResumePoint::PendingApproval {
+        if let Some(ckpt) = ckpt
+            && let ResumePoint::PendingApproval {
                 ref pending_approval_calls,
                 ..
             } = ckpt.resume_point
-            {
-                if !pending_approval_calls.is_empty() {
+                && !pending_approval_calls.is_empty() {
                     pending.push(PendingApproval {
                         thread_id: ckpt.thread_id,
                         agent_name: ckpt.agent_name,
@@ -402,8 +401,6 @@ async fn collect_pending_approvals(
                         suspended_at: ckpt.suspended_at,
                     });
                 }
-            }
-        }
     }
     Ok(pending)
 }

@@ -251,11 +251,11 @@ impl AgentRuntime {
                 .and_then(|tid| resume_decisions.remove(tid.as_ref()));
             let init_envelopes = snapshot
                 .as_mut()
-                .and_then(|s| {
+                .map(|s| {
                     let mut first = s.agent_drained_envelopes.remove(&name).unwrap_or_default();
                     let second = s.drained_envelopes.remove(&name).unwrap_or_default();
                     first.extend(second);
-                    Some(first)
+                    first
                 })
                 .unwrap_or_default();
 
@@ -354,8 +354,13 @@ impl AgentRuntime {
         snapshot
             .agent_drained_envelopes
             .insert(agent_name.clone(), envelopes);
-        if let Some(thread_id) = active_thread {
-            snapshot.active_threads.insert(agent_name, thread_id.0);
+        match active_thread {
+            Some(thread_id) => {
+                snapshot.active_threads.insert(agent_name, thread_id.0);
+            }
+            None => {
+                snapshot.active_threads.remove(&agent_name);
+            }
         }
         if let Err(err) = self
             .session_storage

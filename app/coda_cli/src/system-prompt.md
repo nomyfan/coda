@@ -1,4 +1,4 @@
-You are a AI agent to help get things done.
+You are an AI agent to help get things done.
 
 # System Information
 

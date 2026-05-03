@@ -120,8 +120,8 @@ async fn chat_handler(
 
     info!("session opened, consuming events...");
 
-    if let Some(task) = &req.task {
-        if session.send(task.clone()).await.is_err() {
+    if let Some(task) = &req.task
+        && session.send(task.clone()).await.is_err() {
             let _ = session.shutdown(Shutdown::Abort).await;
             return Ok(Json(ChatResponse {
                 status: ChatStatus::Error("failed to send task".into()),
@@ -129,7 +129,6 @@ async fn chat_handler(
                 pending_approvals: vec![],
             }));
         }
-    }
 
     let mut events: Vec<WireEvent> = Vec::new();
     let mut pending_approvals: Vec<coda_agent::PendingApproval> = Vec::new();
@@ -187,13 +186,12 @@ async fn history_handler(
     seen.insert(session_id.clone());
 
     // Check root checkpoint for pending approval.
-    if let Some(ref ckpt) = checkpoint {
-        if let coda_agent::agent::ResumePoint::PendingApproval {
+    if let Some(ref ckpt) = checkpoint
+        && let coda_agent::agent::ResumePoint::PendingApproval {
             ref pending_approval_calls,
             ..
         } = ckpt.resume_point
-        {
-            if !pending_approval_calls.is_empty() {
+            && !pending_approval_calls.is_empty() {
                 pending_approvals.push(coda_agent::PendingApproval {
                     thread_id: ckpt.thread_id.clone(),
                     agent_name: ckpt.agent_name.clone(),
@@ -201,8 +199,6 @@ async fn history_handler(
                     suspended_at: ckpt.suspended_at,
                 });
             }
-        }
-    }
 
     // Check snapshot for subagent pending approvals.
     if let Some(snapshot) = state
@@ -221,13 +217,11 @@ async fn history_handler(
                 .load_checkpoint(tid)
                 .await
                 .map_err(|e| format!("storage error: {e}"))?
-            {
-                if let coda_agent::agent::ResumePoint::PendingApproval {
+                && let coda_agent::agent::ResumePoint::PendingApproval {
                     ref pending_approval_calls,
                     ..
                 } = ckpt.resume_point
-                {
-                    if !pending_approval_calls.is_empty() {
+                    && !pending_approval_calls.is_empty() {
                         pending_approvals.push(coda_agent::PendingApproval {
                             thread_id: ckpt.thread_id.clone(),
                             agent_name: ckpt.agent_name.clone(),
@@ -235,8 +229,6 @@ async fn history_handler(
                             suspended_at: ckpt.suspended_at,
                         });
                     }
-                }
-            }
         }
     }
 

@@ -13,7 +13,6 @@ resolver = "3"
 coda_agent = { path = "crates/coda_agent" }
 coda_core = { path = "crates/coda_core" }
 coda_openai = { path = "crates/coda_openai" }
-coda_runtime = { path = "crates/coda_runtime" }
 coda_skills = { path = "crates/coda_skills" }
 async-stream = "0.3"
 either = "1.15.0"
