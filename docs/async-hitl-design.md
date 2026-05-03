@@ -377,7 +377,7 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
   - 目的：使超时判断有意义
   - 验证：单元测试 —— 确认 `suspended_at` 在后续 checkpoint 保存中不被覆盖（8/8 通过）
 
-- [ ] [bugfix] 在 `save_agent_snapshot()` 中持久化 `AgentRuntimeSnapshot`（runtime.rs ~349 行）
+- [x] [bugfix] 在 `save_agent_snapshot()` 中持久化 `AgentRuntimeSnapshot`（runtime.rs ~349 行）
   - 目的：验证急切快照持久化正确且不引入竞争
   - 验证：agent 挂起退出后，用相同 session_id 执行新 `Session::open`，能找到正确的 `active_threads` 和 `drained_envelopes`
 

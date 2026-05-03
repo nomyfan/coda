@@ -315,7 +315,8 @@ impl AgentRuntime {
     /// Send a message to a specific agent.
     pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         if self.exit_barrier.is_exiting() {
-            // During the suspension draining phase, we buffer incoming messages instead of sending them to agents.
+            // During the exit draining phase, buffer incoming messages and persist
+            // immediately so they survive a crash before shutdown completes.
             let receiver = envelope.to.name.clone();
             let mut snapshot = self.snapshot.lock().await;
             snapshot
@@ -323,6 +324,13 @@ impl AgentRuntime {
                 .entry(receiver.clone())
                 .or_default()
                 .push(envelope);
+            if let Err(err) = self
+                .session_storage
+                .save_session_snapshot(self.session_id.clone(), snapshot.clone())
+                .await
+            {
+                warn!("Failed to persist session snapshot on buffered message: {}", err);
+            }
             return Ok(());
         }
         let agents = self.agents.lock().await;
@@ -344,12 +352,17 @@ impl AgentRuntime {
             .agent_drained_envelopes
             .insert(agent_name.clone(), envelopes);
         if let Some(thread_id) = active_thread {
-            snapshot.active_threads.insert(agent_name, thread_id.0);
+            snapshot
+                .active_threads
+                .insert(agent_name, thread_id.0);
         }
-        // TODO: snapshot is only persisted in wait_for_exit, so a crash between
-        // suspension and clean exit loses drained_envelopes / active_threads.
-        // For robust async HITL, persist the snapshot here (and in send_message's
-        // buffering branch) so state survives process restarts.
+        if let Err(err) = self
+            .session_storage
+            .save_session_snapshot(self.session_id.clone(), snapshot.clone())
+            .await
+        {
+            warn!("Failed to persist session snapshot: {}", err);
+        }
     }
 
     /// Wait for all bootstrapped agent tasks to exit.
