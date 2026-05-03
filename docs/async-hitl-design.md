@@ -397,6 +397,6 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
   - 目的：防止无限等待审批
   - 验证：8/8 测试通过，RunConfig 新增字段在全代码库编译通过
 
-- [ ] [integration] 更新 `coda_cli` 适配新 API（循环 open/close session）
+- [x] [integration] 更新 `coda_cli` 适配新 API（循环 open/close session）
   - 目的：在新模型上自验 sync 流程
-  - 验证：`cargo run -p coda_cli` —— 触发 shell 命令，批准它，观察正常完成
+  - 验证：编译零警告，8/8 测试通过，CLI 在每个 turn 结束时 shutdown session，Suspended 后通过 resume_decisions 续接

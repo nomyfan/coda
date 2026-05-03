@@ -349,66 +349,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_logo();
     let mut rl = rustyline::DefaultEditor::new()?;
 
-    let mut resume_decisions: HashMap<String, ResumeDecision> = HashMap::new();
-    let session = loop {
-        let ctx = BuildContext {
-            workspace_dir: workspace_str.clone(),
-        };
-        let spec = build_agent_spec(system_prompt.clone());
-        let config = RunConfig {
-            provider: provider.clone(),
-            model: model.clone(),
-            max_completion_tokens: Some(5000),
-            temperature: Some(0.7),
-            tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-                call.name == "shell" || call.name == "ask_user"
-            })),
-            approval_timeout: None,
-        };
-        match Session::builder()
-            .storage(storage.clone())
-            .root(spec)
-            .build_context(ctx)
-            .run_config(config)
-            .session_id(session_id.clone())
-            .resume_decisions(std::mem::take(&mut resume_decisions))
-            .open()
-            .await
-        {
-            Ok(s) => break s,
-            Err(OpenError::PendingApprovalsRequired(ckpts)) => {
-                println!(
-                    "\n[Resuming session — {} pending approval(s) to resolve]",
-                    ckpts.len()
-                );
-                for ckpt in ckpts {
-                    let resolutions = match resolve_pending_calls(&mut rl, &ckpt.calls) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            println!("\n[Aborted: approval interrupted: {e}]");
-                            return Err(e);
-                        }
-                    };
-                    resume_decisions.insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
-                }
-            }
-            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-        }
-    };
-
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {}\n", session_id);
-    if resumed_session_id.is_some()
-        && let Some(checkpoint) = session.resumed_checkpoint()
-    {
-        render_checkpoint_history(checkpoint)
-    }
 
-    // Skip the first readline if agents are already running after resume.
-    let mut skip_input = session.has_resuming_agents();
+    let mut resume_decisions: HashMap<String, ResumeDecision> = HashMap::new();
+    let mut first_open = true;
 
     loop {
-        if !skip_input {
+        let session = {
+            let config = RunConfig {
+                provider: provider.clone(),
+                model: model.clone(),
+                max_completion_tokens: Some(5000),
+                temperature: Some(0.7),
+                tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+                    call.name == "shell" || call.name == "ask_user"
+                })),
+                approval_timeout: None,
+            };
+            let mut pending_decisions = std::mem::take(&mut resume_decisions);
+            loop {
+                let ctx = BuildContext {
+                    workspace_dir: workspace_str.clone(),
+                };
+                let spec = build_agent_spec(system_prompt.clone());
+                match Session::builder()
+                    .storage(storage.clone())
+                    .root(spec)
+                    .build_context(ctx)
+                    .run_config(config.clone())
+                    .session_id(session_id.clone())
+                    .resume_decisions(std::mem::take(&mut pending_decisions))
+                    .open()
+                    .await
+                {
+                    Ok(s) => break s,
+                    Err(OpenError::PendingApprovalsRequired(ckpts)) => {
+                        println!(
+                            "\n[Resuming session — {} pending approval(s) to resolve]",
+                            ckpts.len()
+                        );
+                        for ckpt in &ckpts {
+                            let resolutions =
+                                match resolve_pending_calls(&mut rl, &ckpt.calls) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        println!("\n[Aborted: approval interrupted: {e}]");
+                                        return Err(e);
+                                    }
+                                };
+                            pending_decisions
+                                .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
+                        }
+                    }
+                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+                }
+            }
+        };
+
+        // Render history on first open if resuming from a prior session.
+        if first_open
+            && let Some(checkpoint) = session.resumed_checkpoint()
+        {
+            render_checkpoint_history(checkpoint);
+        }
+        first_open = false;
+
+        let skip_input = session.has_resuming_agents();
+
+        let suspended = if !skip_input {
             let raw_input = match rl.readline("You: ") {
                 Ok(line) => line,
                 Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
@@ -420,6 +429,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let user_input = raw_input.trim();
             if user_input.is_empty() {
+                session
+                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                    .await;
                 continue;
             }
             if user_input.eq_ignore_ascii_case("quit")
@@ -427,6 +439,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || user_input.eq_ignore_ascii_case("q")
             {
                 println!("Goodbye!");
+                session
+                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                    .await;
                 break;
             }
 
@@ -434,112 +449,131 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             print!("Assistant: ");
             io::stdout().flush()?;
-        }
-        skip_input = false;
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = tokio::signal::ctrl_c() => {
-                    session.abort().await;
-                }
-                event = session.recv() => {
-                    let Some(SessionEvent { origin, kind, .. }) = event else { break };
-                    match kind {
-                        AgentEvent::LLMContentChunk(s) => {
-                            if origin.is_root() {
-                                print!("{s}");
-                            } else {
-                                print!("\x1b[36m{s}\x1b[0m");
-                            }
-                            io::stdout().flush()?;
-                        }
-                        AgentEvent::LLMEnd(msg) => {
-                            if !msg.content.is_empty() || msg.usage.is_some() {
-                                println!();
-                            }
-                            if let Some(usage) = &msg.usage {
-                                let usage_line =
-                                    token_usage_line(origin.subagent_name(), usage);
-                                if origin.is_root() {
-                                    println!("{usage_line}");
-                                } else {
-                                    println!("\x1b[36m{usage_line}\x1b[0m");
-                                }
-                            }
-                            if origin.is_root() && msg.tool_calls.is_empty() {
-                                break;
-                            }
-                        }
-                        AgentEvent::ToolCallStart(c) => {
-                            if origin.is_root() {
-                                println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
-                            } else {
-                                let name = origin.subagent_name().unwrap_or_default();
-                                println!(
-                                    "\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m",
-                                    name, c.name, c.arguments
-                                );
-                            }
-                        }
-                        AgentEvent::ToolCallEnd(_) => {}
-                        AgentEvent::Suspended(pending) => {
-                            let label = if origin.is_root() { "" } else { " (sub-agent)" };
-                            println!(
-                                "\n[{} tool call(s) require approval{}]",
-                                pending.calls.len(),
-                                label
-                            );
-                            let resolutions = match resolve_pending_calls(&mut rl, &pending.calls) {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    session.abort().await;
-                                    println!("\n[Aborted: approval interrupted]");
-                                    break;
-                                }
-                            };
-                            if let Err(e) = session
-                                .resume_by_id(
-                                    &pending.agent_name,
-                                    &pending.thread_id,
-                                    ResumeDecision { resolutions },
-                                )
-                                .await
-                            {
-                                warn!("{}", e);
-                                println!("\n[Error: failed to resume agent: {}]", e);
-                                break;
-                            }
-                        }
-                        AgentEvent::Aborted(target) if origin.is_root() => match &target {
-                            AbortedTarget::Generation => {
-                                println!("\n\n[Aborted: generation interrupted]");
-                                break;
-                            }
-                            AbortedTarget::ToolCalls(ids) => {
-                                println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
-                                break;
-                            }
-                        },
-                        AgentEvent::Error(err) if origin.is_root() => {
-                            warn!("{}", err);
-                            println!("\n[Error: {}]", err);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            false
+        } else {
+            true
+        };
+
+        let suspended = consume_events(&mut rl, &session, &mut resume_decisions, suspended).await;
+
+        session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+            .await;
+
+        if suspended {
+            // Keep decisions for the next session open.
+        } else {
+            resume_decisions.clear();
         }
 
         println!();
     }
 
     println!("Current session id: {}", session_id);
-    session
-        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
-        .await;
     println!("Session ended. You can resume this session later with `--resume {session_id}`");
 
     Ok(())
+}
+
+/// Consume events from `session` until the current turn ends.
+///
+/// Suspended decisions are accumulated into `resume_decisions`.
+/// Returns `true` if the turn ended because of a [`AgentEvent::Suspended`],
+/// `false` if the turn ended normally.
+async fn consume_events(
+    rl: &mut rustyline::DefaultEditor,
+    session: &Session,
+    resume_decisions: &mut HashMap<String, ResumeDecision>,
+    mut suspended: bool,
+) -> bool {
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                session.abort().await;
+            }
+            event = session.recv() => {
+                let Some(SessionEvent { origin, kind, .. }) = event else { break };
+                match kind {
+                    AgentEvent::LLMContentChunk(s) => {
+                        if origin.is_root() {
+                            print!("{s}");
+                        } else {
+                            print!("\x1b[36m{s}\x1b[0m");
+                        }
+                        io::stdout().flush().ok();
+                    }
+                    AgentEvent::LLMEnd(msg) => {
+                        if !msg.content.is_empty() || msg.usage.is_some() {
+                            println!();
+                        }
+                        if let Some(usage) = &msg.usage {
+                            let usage_line =
+                                token_usage_line(origin.subagent_name(), usage);
+                            if origin.is_root() {
+                                println!("{usage_line}");
+                            } else {
+                                println!("\x1b[36m{usage_line}\x1b[0m");
+                            }
+                        }
+                        if origin.is_root() && msg.tool_calls.is_empty() {
+                            break;
+                        }
+                    }
+                    AgentEvent::ToolCallStart(c) => {
+                        if origin.is_root() {
+                            println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                        } else {
+                            let name = origin.subagent_name().unwrap_or_default();
+                            println!(
+                                "\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m",
+                                name, c.name, c.arguments
+                            );
+                        }
+                    }
+                    AgentEvent::ToolCallEnd(_) => {}
+                    AgentEvent::Suspended(pending) => {
+                        let label = if origin.is_root() { "" } else { " (sub-agent)" };
+                        println!(
+                            "\n[{} tool call(s) require approval{}]",
+                            pending.calls.len(),
+                            label
+                        );
+                        let resolutions = match resolve_pending_calls(rl, &pending.calls) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                session.abort().await;
+                                println!("\n[Aborted: approval interrupted]");
+                                return false;
+                            }
+                        };
+                        resume_decisions.insert(
+                            pending.thread_id.clone(),
+                            ResumeDecision { resolutions },
+                        );
+                        suspended = true;
+                        break;
+                    }
+                    AgentEvent::Aborted(target) if origin.is_root() => match &target {
+                        AbortedTarget::Generation => {
+                            println!("\n\n[Aborted: generation interrupted]");
+                            break;
+                        }
+                        AbortedTarget::ToolCalls(ids) => {
+                            println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
+                            break;
+                        }
+                    },
+                    AgentEvent::Error(err) if origin.is_root() => {
+                        warn!("{}", err);
+                        println!("\n[Error: {}]", err);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    suspended
 }
