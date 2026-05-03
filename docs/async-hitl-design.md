@@ -373,9 +373,9 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
 
 ## 实现路线图
 
-- [ ] [bugfix] 修复 `driver.rs` 中的 `suspended_at` —— 仅在进入 `PendingApproval` 时设置一次
+- [x] [bugfix] 修复 `driver.rs` 中的 `suspended_at` —— 仅在进入 `PendingApproval` 时设置一次
   - 目的：使超时判断有意义
-  - 验证：单元测试 —— 确认 `suspended_at` 在后续 checkpoint 保存中不被覆盖
+  - 验证：单元测试 —— 确认 `suspended_at` 在后续 checkpoint 保存中不被覆盖（8/8 通过）
 
 - [ ] [bugfix] 在 `save_agent_snapshot()` 中持久化 `AgentRuntimeSnapshot`（runtime.rs ~349 行）
   - 目的：验证急切快照持久化正确且不引入竞争

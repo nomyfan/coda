@@ -239,6 +239,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         pending_calls,
                     };
                     if has_pending {
+                        checkpoint.suspended_at = jiff::Timestamp::now();
                         checkpoint.todos = self.agent.todos().await;
                         checkpoint.messages = self.agent.history().await;
                         self.runtime
@@ -262,10 +263,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         checkpoint.todos = self.agent.todos().await;
         checkpoint.messages = self.agent.history().await;
         checkpoint.reply_target = self.reply_target.clone();
-        // TODO: suspended_at is overwritten on every save, so it no longer reflects
-        // when the agent actually entered PendingApproval. Only stamp it when the
-        // resume_point transitions into PendingApproval.
-        checkpoint.suspended_at = jiff::Timestamp::now();
         if let Err(err) = self
             .runtime
             .session_storage
