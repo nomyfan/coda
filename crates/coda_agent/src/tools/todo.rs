@@ -10,8 +10,8 @@ use coda_core::tool::{Tool, ToolResult};
 
 // --- ReadTodosTool ---
 
-pub struct ReadTodosTool<S> {
-    state: Arc<Mutex<AgentState<S>>>,
+pub struct ReadTodosTool {
+    state: Arc<Mutex<AgentState>>,
     schema: Schema,
 }
 
@@ -33,14 +33,14 @@ impl Display for ReadTodosOutput {
     }
 }
 
-impl<S> ReadTodosTool<S> {
-    pub fn new(state: Arc<Mutex<AgentState<S>>>) -> Self {
+impl ReadTodosTool {
+    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
         let schema = schemars::schema_for!(ReadTodosParams);
         ReadTodosTool { state, schema }
     }
 }
 
-impl<S: Send + 'static> Tool for ReadTodosTool<S> {
+impl Tool for ReadTodosTool {
     type Parameters = ReadTodosParams;
     type Output = ReadTodosOutput;
 
@@ -72,8 +72,8 @@ impl<S: Send + 'static> Tool for ReadTodosTool<S> {
 
 // --- WriteTodosTool ---
 
-pub struct WriteTodosTool<S> {
-    state: Arc<Mutex<AgentState<S>>>,
+pub struct WriteTodosTool {
+    state: Arc<Mutex<AgentState>>,
     schema: Schema,
 }
 
@@ -91,14 +91,14 @@ pub struct WriteTodosParams {
     todos: Vec<WriteTodosItem>,
 }
 
-impl<S> WriteTodosTool<S> {
-    pub fn new(state: Arc<Mutex<AgentState<S>>>) -> Self {
+impl WriteTodosTool {
+    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
         let schema = schemars::schema_for!(WriteTodosParams);
         WriteTodosTool { state, schema }
     }
 }
 
-impl<S: Send + 'static> Tool for WriteTodosTool<S> {
+impl Tool for WriteTodosTool {
     type Parameters = WriteTodosParams;
     type Output = String;
 

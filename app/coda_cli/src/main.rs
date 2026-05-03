@@ -1,30 +1,28 @@
 mod ask_user;
+mod storage;
 
+use ask_user::{AskUserParams, AskUserToolSpec};
+use coda_agent::{
+    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, OpenError, ResumeDecision,
+    RunConfig, Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    builtin_specs,
+};
+use coda_core::llm::{
+    CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
+};
+use coda_openai::OpenAI;
+use coda_skills::Skills;
 use dotenvy::dotenv;
 use either::Either;
 use rustyline::error::ReadlineError;
-use std::env;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::debug;
-use tracing::info;
-use tracing::warn;
-
-use ask_user::{AskUserParams, AskUserTool};
-use coda_agent::{
-    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, ResumeDecision, RunConfig, SessionStore,
-    ToolApprovalMode, ToolCallResolution,
-};
-use coda_core::llm::{
-    LLMProviderConfig, Message, StreamError, SystemMessage, ToolCall, ToolCallOutcome, ToolMessage,
-    ToolOutput, UserMessage,
-};
-use coda_openai::OpenAI;
-use coda_runtime::AgentRuntime;
-use coda_skills::Skills;
-use futures::{Stream, StreamExt};
-use tokio_util::sync::CancellationToken;
+use std::{env, time::Duration};
+use storage::JsonFileStorage;
+use tracing::{info, warn};
+use uuid::Uuid;
 
 static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -76,6 +74,7 @@ fn prompt_ask_user(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn prompt_approval(
     rl: &mut rustyline::DefaultEditor,
     call: &ToolCall,
@@ -110,392 +109,12 @@ fn prompt_approval(
     }
 }
 
-/// Show the session picker. Returns the session id to resume, or None for a new session.
-/// Returns Err if the user chose to quit.
-fn prompt_session_choice(
-    rl: &mut rustyline::DefaultEditor,
-    store: &SessionStore,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let sessions = store.list();
-    if sessions.is_empty() {
-        return Ok(None);
-    }
-
-    println!("Available sessions (most recent first):\n");
-    for (i, s) in sessions.iter().enumerate() {
-        // message_count counts User+Assistant+Tool messages; approximate "turns" as User msgs.
-        println!(
-            "  {}. [{}] {}  ({} messages)",
-            i + 1,
-            jiff::Timestamp::from_second(s.updated_at as i64)
-                .map(|ts| ts
-                    .to_zoned(jiff::tz::TimeZone::UTC)
-                    .strftime("%Y-%m-%d %H:%M")
-                    .to_string())
-                .unwrap_or_default(),
-            s.title,
-            s.message_count,
-        );
-    }
-    println!("\n  n. New session");
-    println!("  q. Quit");
-
-    loop {
-        let input = match rl.readline("\n> ") {
-            Ok(line) => line,
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
-                std::process::exit(0);
-            }
-            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-        };
-        let input = input.trim().to_lowercase();
-
-        if input == "q" {
-            std::process::exit(0);
-        }
-        if input == "n" {
-            return Ok(None);
-        }
-        if let Ok(idx) = input.parse::<usize>()
-            && idx >= 1
-            && idx <= sessions.len()
-        {
-            return Ok(Some(sessions[idx - 1].id.clone()));
-        }
-        println!(
-            "  Please enter a number between 1 and {}, 'n', or 'q'.",
-            sessions.len()
-        );
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv()?;
-
-    let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
-    let base_url = env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
-    let model = env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
-
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(io::stderr)
-        .with_ansi(false)
-        .init();
-
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let workspace_dir = std::env::current_dir()?;
-    let workspace_str = workspace_dir.to_string_lossy().into_owned();
-    let session_store = SessionStore::new(workspace_dir.join(".coda").join("sessions"));
-    let mut system_prompt = SYSTEM_PROMPT
-        .replace("{{OS}}", &format!("{}({})", os, arch))
-        .replace("{{WORKSPACE_DIR}}", &workspace_str);
-
-    match Skills::from_dir(&PathBuf::from_str(".coda/skills").unwrap()) {
-        Ok(skills) => {
-            info!("Loaded skills {:?}", skills.0);
-            system_prompt.push_str("\n---\n");
-            system_prompt.push_str(AGENT_SKILLS_PROMPT);
-            system_prompt.push('\n');
-            system_prompt.push_str(&skills.to_xml());
-        }
-        Err(err) => {
-            warn!("Failed to load skills, proceeding without them: {}", err);
-        }
-    }
-
-    let privoder = OpenAI::new(LLMProviderConfig {
-        api_key,
-        base_url,
-        stream: true,
-    });
-    let mut agent = Agent::new(());
-    agent.with_default_tools(workspace_str.clone());
-    agent.tools.register(AskUserTool::new());
-
-    agent
-        .add_message(Message::System(SystemMessage(system_prompt)))
-        .await;
-    let runtime = AgentRuntime::new();
-
-    print_logo();
-
-    let mut rl = rustyline::DefaultEditor::new()?;
-
-    // Session picker: let the user choose an existing session or start new.
-    let mut initial_checkpoint: Option<AgentCheckpoint> = None;
-    let session_id: Option<String> = match prompt_session_choice(&mut rl, &session_store)? {
-        Some(id) => match session_store.load(&id) {
-            Ok(data) => {
-                println!("Resuming: {}\n", data.title);
-                print_history(&data.messages);
-                let pending_calls = data.pending_calls.clone();
-                let auto_calls = data.auto_calls.clone();
-                agent.restore_history(data.messages, data.todos).await;
-                if !pending_calls.is_empty() {
-                    let todos = agent.state.lock().await.todos.clone();
-                    initial_checkpoint = Some(AgentCheckpoint {
-                        thread_id: id.clone(),
-                        messages: agent.messages().await,
-                        pending_calls,
-                        auto_calls,
-                        todos,
-                    });
-                }
-                Some(id)
-            }
-            Err(e) => {
-                warn!("Failed to load session {}: {}", id, e);
-                println!("Could not load session, starting new.\n");
-                None
-            }
-        },
-        None => None,
-    };
-
-    // session_id tracks the id of the current session for saving on exit.
-    let mut current_session_id: Option<String> = session_id;
-
-    println!("Type 'quit', 'exit', or 'q' to stop");
-
-    let make_config = |thread_id: String| RunConfig {
-        provider: privoder.clone(),
-        model: model.clone(),
-        max_completion_tokens: Some(5000),
-        temperature: Some(0.5),
-        thread_id,
-        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-            info!(
-                "deciding whether to require approval for tool call: {}",
-                call.name
-            );
-            call.name == "shell" || call.name == "ask_user"
-        })),
-    };
-
-    // Main conversation loop
-    loop {
-        let cancel_token = CancellationToken::new();
-        let mut abort_requested = false;
-
-        // Determine the first action: restore a checkpoint or read new user input.
-        let mut pending_resume: Option<(AgentCheckpoint, ResumeDecision)> = None;
-
-        if let Some(cp) = initial_checkpoint.take() {
-            // Restored from a saved session: go straight to approval prompting
-            // without starting a new LLM turn.
-            match session_store.save_checkpoint(current_session_id.as_deref(), &cp) {
-                Ok(id) => current_session_id = Some(id),
-                Err(e) => warn!("Failed to save checkpoint: {}", e),
-            }
-            let resolutions = resolve_pending_calls(&mut rl, &cp)?;
-            pending_resume = Some((cp, ResumeDecision { resolutions }));
-        } else {
-            let raw_input = match rl.readline("\nYou: ") {
-                Ok(line) => line,
-                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
-                    save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
-                }
-                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-            };
-
-            let user_input = raw_input.trim();
-
-            if user_input.is_empty() {
-                continue;
-            }
-            if user_input.eq_ignore_ascii_case("quit")
-                || user_input.eq_ignore_ascii_case("exit")
-                || user_input.eq_ignore_ascii_case("q")
-            {
-                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
-            }
-
-            print!("Assistant: ");
-            io::stdout().flush()?;
-
-            agent
-                .add_message(Message::User(UserMessage(user_input.to_string())))
-                .await;
-        }
-
-        // Stream / resume cycle. Each iteration creates a scoped stream so the
-        // mutable borrow on `agent` is released before the next iteration or
-        // the session-save code after the loop.
-        loop {
-            let mut suspended_checkpoint = None;
-
-            {
-                // Scope the stream so `&mut agent` is released when the block ends.
-                let mut stream: std::pin::Pin<
-                    Box<dyn Stream<Item = Result<AgentEvent, StreamError>> + '_>,
-                > = if let Some((cp, decision)) = pending_resume.take() {
-                    let thread_id = cp.thread_id.clone();
-                    Box::pin(runtime.resume(
-                        &mut agent,
-                        cp,
-                        decision,
-                        make_config(thread_id),
-                        cancel_token.clone(),
-                    ))
-                } else {
-                    let thread_id = uuid::Uuid::new_v4().to_string();
-                    Box::pin(runtime.run_agent(
-                        &mut agent,
-                        make_config(thread_id),
-                        cancel_token.clone(),
-                    ))
-                };
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => {
-                            if abort_requested {
-                                // Second Ctrl+C: force exit.
-                                drop(stream);
-                                save_and_exit(&agent, &session_store, current_session_id.as_deref()).await;
-                            }
-                            abort_requested = true;
-                            cancel_token.cancel();
-                            // Continue consuming the stream to receive the Aborted event.
-                        }
-                        event = stream.next() => {
-                            match event {
-                                None => break,
-                                Some(Err(e)) => {
-                                    return Err(Box::new(e) as Box<dyn std::error::Error>);
-                                }
-                                Some(Ok(event)) => match event {
-                                    AgentEvent::LLMContentChunk(s) => {
-                                        print!("{s}");
-                                        io::stdout().flush()?;
-                                    }
-                                    AgentEvent::LLMEnd(msg) if !msg.content.is_empty() => {
-                                        println!();
-                                    }
-                                    AgentEvent::ToolCallStart(c) => {
-                                        debug!(
-                                            "tool call: id={} name={} arguments={:?}",
-                                            c.id, c.name, c.arguments
-                                        );
-                                        println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
-                                    }
-                                    AgentEvent::ToolCallEnd(m) => {
-                                        debug!(
-                                            "tool result: id={} name={} output={:?}",
-                                            m.id, m.name, m.output
-                                        );
-                                    }
-                                    AgentEvent::Suspended(checkpoint) => {
-                                        match session_store
-                                            .save_checkpoint(current_session_id.as_deref(), &checkpoint)
-                                        {
-                                            Ok(id) => current_session_id = Some(id),
-                                            Err(e) => warn!("Failed to save checkpoint: {}", e),
-                                        }
-                                        suspended_checkpoint = Some(checkpoint);
-                                        break;
-                                    }
-                                    AgentEvent::Aborted(target) => {
-                                        match &target {
-                                            AbortedTarget::Generation => {
-                                                println!("\n\n[Aborted: generation interrupted]");
-                                            }
-                                            AbortedTarget::ToolCalls(ids) => {
-                                                println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            } // stream dropped here — `&mut agent` borrow released
-
-            match suspended_checkpoint {
-                None => break, // stream completed normally or aborted
-                Some(checkpoint) => {
-                    let resolutions = resolve_pending_calls(&mut rl, &checkpoint)?;
-                    pending_resume = Some((checkpoint, ResumeDecision { resolutions }));
-                }
-            }
-        }
-
-        // After each turn, persist the session (without checkpoint — turn completed normally).
-        let messages = agent.messages().await;
-        let todos = {
-            let state = agent.state.lock().await;
-            state.todos.clone()
-        };
-        match session_store.save(current_session_id.as_deref(), &messages, &todos) {
-            Ok(id) => current_session_id = Some(id),
-            Err(e) => warn!("Failed to save session: {}", e),
-        }
-    }
-}
-
-fn print_history(messages: &[Message]) {
-    use std::collections::HashMap;
-
-    // Index tool results by call id so we can pair them with their calls.
-    let tool_results: HashMap<&str, &ToolMessage> = messages
-        .iter()
-        .filter_map(|m| match m {
-            Message::Tool(t) => Some((t.id.as_str(), t)),
-            _ => None,
-        })
-        .collect();
-
-    for msg in messages {
-        match msg {
-            Message::System(_) => {}
-            Message::User(u) => {
-                println!("\nYou: {}", u.0);
-            }
-            Message::Assistant(a) => {
-                if !a.content.is_empty() {
-                    println!("Assistant: {}", a.content);
-                }
-                for call in &a.tool_calls {
-                    println!("\n[Tool: {}]: {:?}", call.name, call.arguments);
-                    if let Some(t) = tool_results.get(call.id.as_str()) {
-                        let status = match &t.outcome {
-                            ToolCallOutcome::Rejected { reason } => match reason {
-                                Some(r) => format!("rejected: {r}"),
-                                None => "rejected".to_string(),
-                            },
-                            _ => match &t.output {
-                                ToolOutput::Ok(_) => "ok".to_string(),
-                                ToolOutput::Err(e) => format!("err: {e}"),
-                            },
-                        };
-                        let tag = match &t.outcome {
-                            ToolCallOutcome::Approved => " (approved)",
-                            ToolCallOutcome::Resolved => " (resolved)",
-                            ToolCallOutcome::Aborted => " (aborted)",
-                            _ => "",
-                        };
-                        println!("  -> {status}{tag}");
-                    }
-                }
-            }
-            Message::Tool(_) => {} // already printed above
-        }
-    }
-    println!();
-}
-
 fn resolve_pending_calls(
     rl: &mut rustyline::DefaultEditor,
-    checkpoint: &AgentCheckpoint,
+    pending_calls: &[ToolCall],
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
-    for pending_call in &checkpoint.pending_calls {
+    for pending_call in pending_calls {
         if pending_call.name == "ask_user" {
             let output = match serde_json::from_str::<AskUserParams>(
                 pending_call.arguments.as_deref().unwrap_or("{}"),
@@ -523,16 +142,429 @@ fn resolve_pending_calls(
     Ok(resolutions)
 }
 
-async fn save_and_exit<S>(agent: &Agent<S>, store: &SessionStore, session_id: Option<&str>) -> ! {
-    let messages = agent.messages().await;
-    let has_user_msg = messages.iter().any(|m| matches!(m, Message::User(_)));
-    if has_user_msg {
-        let todos = agent.state.lock().await.todos.clone();
-        match store.save(session_id, &messages, &todos) {
-            Ok(_) => println!("\nSession saved."),
-            Err(e) => eprintln!("\nFailed to save session: {}", e),
+fn render_message(message: &Message) {
+    match message {
+        Message::System(_) => {}
+        Message::User(msg) => {
+            println!("You: {}", msg.0);
+        }
+        Message::Assistant(msg) => {
+            if !msg.content.is_empty() {
+                println!("Assistant: {}", msg.content);
+            }
+            for tool_call in &msg.tool_calls {
+                println!(
+                    "[Tool: {}]: {}",
+                    tool_call.name,
+                    tool_call.arguments.as_deref().unwrap_or("{}")
+                );
+            }
+            if let Some(usage) = &msg.usage {
+                println!("{}", token_usage_line(None, usage));
+            }
+            if msg.aborted {
+                println!("[Assistant generation was interrupted]");
+            }
+        }
+        Message::Tool(msg) => {
+            let status = match &msg.outcome {
+                ToolCallOutcome::Auto => "auto",
+                ToolCallOutcome::Approved => "approved",
+                ToolCallOutcome::Resolved => "resolved",
+                ToolCallOutcome::Rejected { .. } => "rejected",
+                ToolCallOutcome::Aborted => "aborted",
+            };
+            match &msg.output {
+                ToolOutput::Ok(output) => {
+                    println!("[Tool Result: {}][{}] {}", msg.name, status, output)
+                }
+                ToolOutput::Err(output) => {
+                    println!("[Tool Error: {}][{}] {}", msg.name, status, output)
+                }
+            }
         }
     }
-    println!("Goodbye!");
-    std::process::exit(0);
+}
+
+fn token_usage_summary(usage: &CompletionUsage) -> String {
+    let total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    format!(
+        "prompt: {} | completion: {} | total: {}",
+        usage.prompt_tokens, usage.completion_tokens, total_tokens
+    )
+}
+
+fn token_usage_line(agent_name: Option<&str>, usage: &CompletionUsage) -> String {
+    match agent_name {
+        Some(name) if name != "coda" => {
+            format!("[Token Usage: {name}] {}", token_usage_summary(usage))
+        }
+        _ => format!("[Token Usage] {}", token_usage_summary(usage)),
+    }
+}
+
+fn render_checkpoint_history(checkpoint: &AgentCheckpoint) {
+    if checkpoint.messages.is_empty() {
+        return;
+    }
+
+    println!("Resumed conversation:\n");
+    for message in &checkpoint.messages {
+        render_message(message);
+    }
+    println!();
+}
+
+fn build_agent_spec(system_prompt: String) -> AgentSpec {
+    AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt,
+        mode: SubAgentMode::Stateful,
+        tools: {
+            let mut t = builtin_specs();
+            t.push(Box::new(AskUserToolSpec));
+            t
+        },
+        subagents: vec![
+            AgentSpec {
+                name: "explore".into(),
+                description: "An explore sub-agent that can read files, search code, and explore the codebase. Delegate exploration and research tasks to it.".into(),
+                system_prompt:
+                    "You are an exploration assistant. You can read files, search code, and list directories. \
+                     Summarize your findings concisely."
+                        .to_string(),
+                mode: SubAgentMode::Stateless,
+                tools: builtin_specs(),
+                subagents: vec![],
+            },
+            AgentSpec {
+                name: "memo".into(),
+                description: "A stateful memo agent that remembers information across calls. \
+                              Use it to store and recall facts across turns."
+                    .into(),
+                system_prompt:
+                    "You are a simple memo agent. Your only job is to remember what the user tells you and \
+                     answer questions about it. Keep your replies very brief."
+                        .to_string(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec![],
+            },
+        ],
+    }
+}
+
+fn print_usage(program: &str) {
+    println!("Usage: {program} [--resume <uuid>]");
+}
+
+fn parse_session_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<String>, String> {
+    let mut args = args.into_iter();
+    let mut session_id = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--resume" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --resume".to_string())?;
+                Uuid::parse_str(&value)
+                    .map_err(|err| format!("invalid thread id '{value}': {err}"))?;
+                if session_id.replace(value).is_some() {
+                    return Err("session id can only be provided once".to_string());
+                }
+            }
+            "-h" | "--help" => return Err(String::new()),
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+
+    Ok(session_id)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let program = env::args().next().unwrap_or_else(|| "coda".into());
+    // session id is also the thread id for the main agent
+    let resumed_session_id = match parse_session_id_arg(env::args().skip(1)) {
+        Ok(Some(thread_id)) => Some(thread_id),
+        Ok(None) => None,
+        Err(err) if err.is_empty() => {
+            print_usage(&program);
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            print_usage(&program);
+            return Err(err.into());
+        }
+    };
+    let session_id = resumed_session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    dotenv()?;
+
+    let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let base_url = env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
+    let model = env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .init();
+
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let workspace_dir = std::env::current_dir()?;
+    let workspace_str = workspace_dir.to_string_lossy().into_owned();
+    let mut system_prompt = SYSTEM_PROMPT
+        .replace("{{OS}}", &format!("{}({})", os, arch))
+        .replace("{{WORKSPACE_DIR}}", &workspace_str);
+
+    match Skills::from_dir(&PathBuf::from_str(".coda/skills").unwrap()) {
+        Ok(skills) => {
+            info!("Loaded skills {:?}", skills.0);
+            system_prompt.push_str("\n---\n");
+            system_prompt.push_str(AGENT_SKILLS_PROMPT);
+            system_prompt.push('\n');
+            system_prompt.push_str(&skills.to_xml());
+        }
+        Err(err) => {
+            warn!("Failed to load skills, proceeding without them: {}", err);
+        }
+    }
+
+    let provider = std::sync::Arc::new(OpenAI::new(LLMProviderConfig {
+        api_key,
+        base_url,
+        stream: true,
+    }));
+
+    let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
+    let storage = JsonFileStorage::new(checkpoint_dir);
+
+    print_logo();
+    let mut rl = rustyline::DefaultEditor::new()?;
+
+    println!("Type 'quit', 'exit', or 'q' to stop\n");
+    println!("Session id: {}\n", session_id);
+
+    let mut resume_decisions: HashMap<String, ResumeDecision> = HashMap::new();
+    let mut first_open = true;
+
+    loop {
+        let session = {
+            let config = RunConfig {
+                provider: provider.clone(),
+                model: model.clone(),
+                max_completion_tokens: Some(5000),
+                temperature: Some(0.7),
+                tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+                    call.name == "shell" || call.name == "ask_user"
+                })),
+                approval_timeout: None,
+            };
+            let mut pending_decisions = std::mem::take(&mut resume_decisions);
+            loop {
+                let ctx = BuildContext {
+                    workspace_dir: workspace_str.clone(),
+                };
+                let spec = build_agent_spec(system_prompt.clone());
+                match Session::builder()
+                    .storage(storage.clone())
+                    .root(spec)
+                    .build_context(ctx)
+                    .run_config(config.clone())
+                    .session_id(session_id.clone())
+                    .resume_decisions(std::mem::take(&mut pending_decisions))
+                    .open()
+                    .await
+                {
+                    Ok(s) => break s,
+                    Err(OpenError::PendingApprovalsRequired(ckpts)) => {
+                        println!(
+                            "\n[Resuming session — {} pending approval(s) to resolve]",
+                            ckpts.len()
+                        );
+                        for ckpt in &ckpts {
+                            let resolutions = match resolve_pending_calls(&mut rl, &ckpt.calls) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    println!("\n[Aborted: approval interrupted: {e}]");
+                                    return Err(e);
+                                }
+                            };
+                            pending_decisions
+                                .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
+                        }
+                    }
+                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+                }
+            }
+        };
+
+        // Render history on first open if resuming from a prior session.
+        if first_open && let Some(checkpoint) = session.resumed_checkpoint() {
+            render_checkpoint_history(checkpoint);
+        }
+        first_open = false;
+
+        let skip_input = session.has_resuming_agents();
+
+        if !skip_input {
+            let raw_input = match rl.readline("You: ") {
+                Ok(line) => line,
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                    println!("Goodbye!");
+                    break;
+                }
+                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+            };
+
+            let user_input = raw_input.trim();
+            if user_input.is_empty() {
+                session
+                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                    .await;
+                continue;
+            }
+            if user_input.eq_ignore_ascii_case("quit")
+                || user_input.eq_ignore_ascii_case("exit")
+                || user_input.eq_ignore_ascii_case("q")
+            {
+                println!("Goodbye!");
+                session
+                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                    .await;
+                break;
+            }
+
+            session.send(user_input.to_string()).await?;
+
+            print!("Assistant: ");
+            io::stdout().flush()?;
+        }
+
+        let new_suspension = consume_events(&mut rl, &session, &mut resume_decisions).await;
+
+        session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+            .await;
+
+        if !new_suspension {
+            resume_decisions.clear();
+        }
+
+        println!();
+    }
+
+    println!("Current session id: {}", session_id);
+    println!("Session ended. You can resume this session later with `--resume {session_id}`");
+
+    Ok(())
+}
+
+/// Consume events from `session` until the current turn ends.
+///
+/// Suspended decisions are accumulated into `resume_decisions`.
+/// Returns `true` if a new [`AgentEvent::Suspended`] was encountered,
+/// `false` if the turn ended normally.
+async fn consume_events(
+    rl: &mut rustyline::DefaultEditor,
+    session: &Session,
+    resume_decisions: &mut HashMap<String, ResumeDecision>,
+) -> bool {
+    let mut suspended = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                session.abort().await;
+            }
+            event = session.recv() => {
+                let Some(SessionEvent { origin, kind, .. }) = event else { break };
+                match kind {
+                    AgentEvent::LLMContentChunk(s) => {
+                        if origin.is_root() {
+                            print!("{s}");
+                        } else {
+                            print!("\x1b[36m{s}\x1b[0m");
+                        }
+                        io::stdout().flush().ok();
+                    }
+                    AgentEvent::LLMEnd(msg) => {
+                        if !msg.content.is_empty() || msg.usage.is_some() {
+                            println!();
+                        }
+                        if let Some(usage) = &msg.usage {
+                            let usage_line =
+                                token_usage_line(origin.subagent_name(), usage);
+                            if origin.is_root() {
+                                println!("{usage_line}");
+                            } else {
+                                println!("\x1b[36m{usage_line}\x1b[0m");
+                            }
+                        }
+                        if origin.is_root() && msg.tool_calls.is_empty() {
+                            break;
+                        }
+                    }
+                    AgentEvent::ToolCallStart(c) => {
+                        if origin.is_root() {
+                            println!("\n[Tool: {}]: {:?}", c.name, c.arguments);
+                        } else {
+                            let name = origin.subagent_name().unwrap_or_default();
+                            println!(
+                                "\n\x1b[36m[Sub-agent {}: {}]: {:?}\x1b[0m",
+                                name, c.name, c.arguments
+                            );
+                        }
+                    }
+                    AgentEvent::ToolCallEnd(_) => {}
+                    AgentEvent::Suspended(pending) => {
+                        let label = if origin.is_root() { "" } else { " (sub-agent)" };
+                        println!(
+                            "\n[{} tool call(s) require approval{}]",
+                            pending.calls.len(),
+                            label
+                        );
+                        let resolutions = match resolve_pending_calls(rl, &pending.calls) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                session.abort().await;
+                                println!("\n[Aborted: approval interrupted]");
+                                return false;
+                            }
+                        };
+                        resume_decisions.insert(
+                            pending.thread_id.clone(),
+                            ResumeDecision { resolutions },
+                        );
+                        suspended = true;
+                        break;
+                    }
+                    AgentEvent::Aborted(target) if origin.is_root() => match &target {
+                        AbortedTarget::Generation => {
+                            println!("\n\n[Aborted: generation interrupted]");
+                            break;
+                        }
+                        AbortedTarget::ToolCalls(ids) => {
+                            println!("\n[Aborted: {} tool call(s) interrupted]", ids.len());
+                            break;
+                        }
+                    },
+                    AgentEvent::Error(err) if origin.is_root() => {
+                        warn!("{}", err);
+                        println!("\n[Error: {}]", err);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    suspended
 }

@@ -45,7 +45,7 @@ pub trait Tool: Send + Sync + 'static {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static;
 }
 
-pub trait ToolObject {
+pub trait ToolObject: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameter_schema(&self) -> &serde_json::Value;
@@ -55,7 +55,7 @@ pub trait ToolObject {
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
 }
 
-struct ToolWrapper<T: Tool>(T);
+pub struct ToolWrapper<T: Tool>(T);
 
 impl<T: Tool> ToolObject for ToolWrapper<T> {
     #[inline]
@@ -101,7 +101,6 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
                     Ok(output) => span.record("output", output.to_string()),
                     Err(err) => span.record("error", err.to_string()),
                 };
-                info!("finished executing tool");
                 result.map(|output| output.to_string())
             }
             .instrument(span),
@@ -115,21 +114,14 @@ impl<T: Tool> From<T> for ToolWrapper<T> {
     }
 }
 
-pub struct ToolManager {
+#[derive(Clone, Default)]
+pub struct ToolSet {
     tools: BTreeMap<String, Arc<dyn ToolObject>>,
 }
 
-impl ToolManager {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        ToolManager {
-            tools: BTreeMap::new(),
-        }
-    }
-
-    pub fn register<T: Tool>(&mut self, tool: T) {
-        self.tools
-            .insert(tool.name().to_string(), Arc::new(ToolWrapper::from(tool)));
+impl ToolSet {
+    pub fn register(&mut self, tool: Box<dyn ToolObject>) {
+        self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn ToolObject>> {
