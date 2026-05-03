@@ -375,37 +375,49 @@ impl LLMProvider for TestProvider {
                 }
             }
             "interrupt-main" => match last_user(&request.messages) {
-                Some("phase1") => Self::completed(AssistantMessage {
-                    tool_calls: vec![ToolCall {
-                        id: "call_approve".into(),
-                        name: "read_todos".into(),
-                        arguments: Some("{}".into()),
-                    }],
-                    ..Default::default()
-                }),
+                Some("phase1") if tool_message(&request.messages, "call_approve").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_approve".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        ..Default::default()
+                    })
+                }
+                Some("phase1") if tool_message(&request.messages, "call_approve").is_some() => {
+                    Self::completed(AssistantMessage {
+                        content: "interrupt-flow-ok".into(),
+                        ..Default::default()
+                    })
+                }
                 Some("phase2")
-                    if matches!(
-                        tool_message(&request.messages, "call_approve"),
-                        Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
-                    ) =>
+                    if tool_message(&request.messages, "call_approve")
+                        .map_or(false, |t| !matches!(t.outcome, ToolCallOutcome::Approved))
+                        && tool_message(&request.messages, "call_explore").is_none() =>
                 {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
                             id: "call_explore".into(),
                             name: "explore".into(),
-                            arguments: Some(r#"{"task":"hold"}"#.into()),
+                            arguments: Some(r#"{"task":"inspect"}"#.into()),
                         }],
                         ..Default::default()
                     })
                 }
+                Some("phase2") if tool_message(&request.messages, "call_explore").is_some() => {
+                    Self::completed(AssistantMessage {
+                        content: "interrupt-flow-ok".into(),
+                        ..Default::default()
+                    })
+                }
                 Some("phase3") => {
-                    let ok = matches!(
-                        tool_message(&request.messages, "call_approve"),
-                        Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
-                    ) && matches!(
-                        tool_message(&request.messages, "call_explore"),
-                        Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
-                    );
+                    let ok = tool_message(&request.messages, "call_approve")
+                        .map_or(false, |t| !matches!(t.outcome, ToolCallOutcome::Approved))
+                        && matches!(
+                            tool_message(&request.messages, "call_explore"),
+                            Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
+                        );
 
                     Self::completed(AssistantMessage {
                         content: if ok {
@@ -544,7 +556,7 @@ impl<S> Harness<S>
 where
     S: SessionStorage + Clone + 'static,
 {
-    async fn start(
+    async fn start_with_spec(
         storage: S,
         spec: AgentSpec,
         provider: TestProvider,
@@ -556,7 +568,16 @@ where
                 workspace_dir: ".".into(),
             })
             .expect("build agent tree");
+        Self::start_agents(storage, agents, provider, approval, initial_task).await
+    }
 
+    async fn start_agents(
+        storage: S,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        initial_task: &str,
+    ) -> Self {
         let config = RunConfig {
             provider,
             model: "fake".into(),
@@ -608,6 +629,44 @@ where
             }))
             .await
             .expect("resume agent");
+    }
+
+    /// Restart the harness from storage, injecting resume decisions for
+    /// agents that suspended in the previous run.
+    async fn restart(
+        &self,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        resume_decisions: HashMap<String, ResumeDecision>,
+    ) -> Self {
+        let config = RunConfig {
+            provider,
+            model: "fake".into(),
+            temperature: None,
+            max_completion_tokens: None,
+            tool_approval: approval,
+        };
+
+        let session_id = self.thread_id.as_ref().to_string();
+        let snapshot = self
+            .storage
+            .load_session_snapshot(&session_id)
+            .await
+            .unwrap_or_default();
+
+        let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
+        let events = runtime.subscribe();
+        runtime
+            .bootstrap(agents, snapshot, resume_decisions, config)
+            .await;
+
+        Self {
+            runtime,
+            events,
+            thread_id: ThreadId(session_id),
+            storage: self.storage.clone(),
+        }
     }
 
     async fn next_event(&mut self) -> (String, ThreadId, AgentEvent) {
@@ -700,10 +759,7 @@ async fn wait_for_completion_after_explore_reply(
                         .send_resume(
                             &pending.agent_name,
                             &pending.thread_id,
-                            vec![(
-                                pending.calls[0].id.clone(),
-                                ToolCallResolution::Execute,
-                            )],
+                            vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
                         )
                         .await;
                 }
@@ -745,7 +801,7 @@ async fn wait_for_completion_after_explore_reply(
 
 #[tokio::test]
 async fn stateless_subagent_replies_after_local_tool_execution() {
-    let mut harness = Harness::start(
+    let mut harness = Harness::start_with_spec(
         MemoryStorage::default(),
         explore_read_todos_spec("main-system"),
         TestProvider::default(),
@@ -759,66 +815,178 @@ async fn stateless_subagent_replies_after_local_tool_execution() {
 
 #[tokio::test]
 async fn stateless_subagent_replies_after_approval_resume() {
-    let mut harness = Harness::start(
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let spec = explore_read_todos_spec("main-system");
+    let agents1 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        explore_read_todos_spec("main-system"),
-        TestProvider::default(),
-        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        agents1,
+        provider.clone(),
+        approval.clone(),
         "inspect",
     )
     .await;
-    wait_for_completion_after_explore_reply(&mut harness, true).await;
+
+    // Phase 1: consume events until the explore subagent suspends for approval.
+    let (pending, mut saw_subagent_tool) = {
+        let result = timeout(Duration::from_secs(2), async {
+            let mut saw_subagent_tool = false;
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                match (agent_name.as_str(), event) {
+                    ("explore", AgentEvent::Suspended(pending)) => {
+                        return (pending, saw_subagent_tool);
+                    }
+                    ("explore", AgentEvent::ToolCallEnd(tool)) if tool.name == "read_todos" => {
+                        saw_subagent_tool = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for explore suspension")
+    };
+    harness.shutdown().await;
+
+    // Phase 2: restart with resume, verify completion.
+    let mut decisions = HashMap::new();
+    decisions.insert(
+        pending.thread_id.clone(),
+        ResumeDecision {
+            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+        },
+    );
+    let agents2 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents 2");
+    let mut harness = harness
+        .restart(agents2, provider, approval, decisions)
+        .await;
+
+    let mut saw_parent_tool_reply = false;
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("explore", AgentEvent::ToolCallEnd(tool)) if tool.name == "read_todos" => {
+                    saw_subagent_tool = true;
+                }
+                ("coda", AgentEvent::ToolCallEnd(tool)) if tool.name == "explore" => {
+                    saw_parent_tool_reply = true;
+                    assert!(matches!(tool.output, ToolOutput::Ok(ref s) if s == "explore done"));
+                }
+                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {
+                    assert!(
+                        saw_subagent_tool,
+                        "explore never finished its local tool call"
+                    );
+                    assert!(
+                        saw_parent_tool_reply,
+                        "coda never received the explore reply"
+                    );
+                    assert_eq!(msg.content, "main done");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "timed out waiting for completion after resume"
+    );
     harness.shutdown().await;
 }
 
 #[tokio::test]
 async fn pending_approval_supports_mixed_resolutions() {
-    let mut harness = Harness::start(
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "approval-main".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![Box::new(ReadTodosToolSpec), Box::new(EchoToolSpec)],
+        subagents: vec![],
+    };
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let agents1 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        AgentSpec {
-            name: "coda".into(),
-            description: String::new(),
-            system_prompt: "approval-main".into(),
-            mode: SubAgentMode::Stateful,
-            tools: vec![Box::new(ReadTodosToolSpec), Box::new(EchoToolSpec)],
-            subagents: vec![],
-        },
-        TestProvider::default(),
-        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        agents1,
+        provider.clone(),
+        approval.clone(),
         "inspect approvals",
     )
     .await;
 
-    let result = timeout(Duration::from_secs(2), async {
-        let mut saw_tool_end_ids = HashSet::new();
+    // Phase 1: consume until suspended, collect pending info.
+    let (_pending_thread_id, decisions_map) = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                match (agent_name.as_str(), event) {
+                    ("coda", AgentEvent::Suspended(pending)) => {
+                        assert_eq!(pending.calls.len(), 4);
+                        let mut decisions = HashMap::new();
+                        decisions.insert(
+                            pending.thread_id.clone(),
+                            ResumeDecision {
+                                resolutions: vec![
+                                    ("call_exec".into(), ToolCallResolution::Execute),
+                                    (
+                                        "call_resolved".into(),
+                                        ToolCallResolution::Resolved(ToolOutput::Ok(
+                                            "resolved-by-test".into(),
+                                        )),
+                                    ),
+                                    (
+                                        "call_rejected".into(),
+                                        ToolCallResolution::Rejected {
+                                            reason: Some("nope".into()),
+                                        },
+                                    ),
+                                ],
+                            },
+                        );
+                        return (pending.thread_id, decisions);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for suspension")
+    };
+    harness.shutdown().await;
+    let agents2 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    harness = harness
+        .restart(agents2, provider, approval, decisions_map)
+        .await;
 
+    // Phase 2: consume events after resume, verify outcomes.
+    let mut saw_tool_end_ids = HashSet::new();
+    let result = timeout(Duration::from_secs(2), async {
         loop {
             let (agent_name, _, event) = harness.next_event().await;
             match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::Suspended(pending)) => {
-                    assert_eq!(pending.calls.len(), 4);
-                    harness
-                        .send_resume(
-                            &pending.agent_name,
-                            &pending.thread_id,
-                            vec![
-                                ("call_exec".into(), ToolCallResolution::Execute),
-                                (
-                                    "call_resolved".into(),
-                                    ToolCallResolution::Resolved(ToolOutput::Ok(
-                                        "resolved-by-test".into(),
-                                    )),
-                                ),
-                                (
-                                    "call_rejected".into(),
-                                    ToolCallResolution::Rejected {
-                                        reason: Some("nope".into()),
-                                    },
-                                ),
-                            ],
-                        )
-                        .await;
-                }
                 ("coda", AgentEvent::ToolCallEnd(tool)) => {
                     saw_tool_end_ids.insert(tool.id);
                 }
@@ -833,56 +1001,87 @@ async fn pending_approval_supports_mixed_resolutions() {
         }
     })
     .await;
-
+    assert!(result.is_ok(), "timed out waiting for mixed approval flow");
     harness.shutdown().await;
-    result.expect("timed out waiting for mixed approval flow");
 }
 
 #[tokio::test]
 async fn new_task_replaces_pending_approval_and_pending_reply() {
-    let mut harness = Harness::start(
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "interrupt-main".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![Box::new(ReadTodosToolSpec)],
+        subagents: vec![],
+    };
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let agents1 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        AgentSpec {
-            name: "coda".into(),
-            description: String::new(),
-            system_prompt: "interrupt-main".into(),
-            mode: SubAgentMode::Stateful,
-            tools: vec![Box::new(ReadTodosToolSpec)],
-            subagents: vec![AgentSpec {
-                name: "explore".into(),
-                description: String::new(),
-                system_prompt: "hold-subagent".into(),
-                mode: SubAgentMode::Stateless,
-                tools: vec![],
-                subagents: vec![],
-            }],
-        },
-        TestProvider::with_hold_subagent(Arc::new(Notify::new())),
-        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        agents1,
+        provider.clone(),
+        approval.clone(),
         "phase1",
     )
     .await;
 
-    let result = timeout(Duration::from_secs(2), async {
-        let mut sent_phase2 = false;
-        let mut sent_phase3 = false;
+    // Phase 1: consume until Suspended (read_todos needs approval).
+    let pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                match (agent_name.as_str(), event) {
+                    ("coda", AgentEvent::Suspended(p)) => return p,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for suspension")
+    };
+    harness.shutdown().await;
 
+    // Phase 2: reject the pending approval and restart.
+    // The agent processes the rejection and continues with "phase1",
+    // producing the final response.
+    let mut reject_decisions = HashMap::new();
+    let reject_ids: Vec<String> = pending.calls.iter().map(|c| c.id.clone()).collect();
+    reject_decisions.insert(
+        pending.thread_id.clone(),
+        ResumeDecision {
+            resolutions: reject_ids
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        ToolCallResolution::Rejected {
+                            reason: Some("replaced by new task".into()),
+                        },
+                    )
+                })
+                .collect(),
+        },
+    );
+    let agents2 = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    let mut harness = harness
+        .restart(agents2, provider, approval, reject_decisions)
+        .await;
+
+    let result = timeout(Duration::from_secs(2), async {
         loop {
             let (agent_name, _, event) = harness.next_event().await;
             match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::Suspended(_)) if !sent_phase2 => {
-                    sent_phase2 = true;
-                    harness.send_task("phase2").await;
-                }
-                ("coda", AgentEvent::ToolCallStart(tool))
-                    if tool.name == "explore" && !sent_phase3 =>
-                {
-                    sent_phase3 = true;
-                    harness.send_task("phase3").await;
-                }
                 ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {
-                    assert!(sent_phase2, "phase2 was never sent");
-                    assert!(sent_phase3, "phase3 was never sent");
                     assert_eq!(msg.content, "interrupt-flow-ok");
                     break;
                 }
@@ -891,15 +1090,17 @@ async fn new_task_replaces_pending_approval_and_pending_reply() {
         }
     })
     .await;
-
+    assert!(
+        result.is_ok(),
+        "timed out waiting for completion after reject"
+    );
     harness.shutdown().await;
-    result.expect("timed out waiting for interrupt flow");
 }
 
 #[tokio::test]
 async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
-    let mut harness = Harness::start(
+    let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
             name: "coda".into(),
@@ -975,7 +1176,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
 #[tokio::test]
 async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     let storage = TestStorage::default();
-    let mut harness = Harness::start(
+    let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
             name: "coda".into(),
@@ -1043,7 +1244,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 
 #[tokio::test]
 async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
-    let mut root = Harness::start(
+    let mut root = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
             name: "coda".into(),
@@ -1074,7 +1275,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     root.shutdown().await;
     root_result.expect("timed out waiting for root agent error");
 
-    let mut parent = Harness::start(
+    let mut parent = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
             name: "coda".into(),

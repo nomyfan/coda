@@ -94,7 +94,7 @@ pub(crate) async fn run_agent(
             agent: &mut agent,
             cancel: cancel.clone(),
             config: config.clone(),
-            thread_id: thread_id,
+            thread_id,
             reply_target: None,
         };
         let mut run_fut = std::pin::pin!(agent_loop.run(envelope));
@@ -127,8 +127,11 @@ pub(crate) async fn run_agent(
                 should_exit
             }
             ret = &mut run_fut => {
+                let mut should_exit = false;
                 match ret{
-                    Ok(true) => {}
+                    Ok(true) => {
+                        should_exit = true;
+                    }
                     Ok(false) => {
                         active_thread = None;
                     }
@@ -137,7 +140,7 @@ pub(crate) async fn run_agent(
                         active_thread = None;
                     }
                 }
-                false
+                should_exit
             }
         };
 
@@ -201,6 +204,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
 
         let mut exit_acquired = false;
+        let mut suspended = false;
         loop {
             if self.runtime.exit_barrier.is_exiting() {
                 exit_acquired = true;
@@ -245,6 +249,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         pending_calls,
                     };
                     if has_pending {
+                        suspended = true;
                         checkpoint.suspended_at = pending.suspended_at;
                         checkpoint.todos = self.agent.todos().await;
                         checkpoint.messages = self.agent.history().await;
@@ -262,7 +267,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
 
         self.save_checkpoint(checkpoint).await;
-        Ok(exit_acquired)
+        Ok(exit_acquired || suspended)
     }
 
     async fn save_checkpoint(&self, mut checkpoint: AgentCheckpoint) {

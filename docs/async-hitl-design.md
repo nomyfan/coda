@@ -385,9 +385,9 @@ Request 2: POST /resume { session_id: "abc", decisions: { thread_id: [approved] 
   - 目的：弱化 caller 对 checkpoint 的感知
   - 验证：编译通过，现有测试适配后通过（8/8 通过，coda_cli 无警告编译）
 
-- [ ] [core] 修改 agent 循环：`PendingApproval` 状态下 agent 直接退出，不等待 Resume envelope
+- [x] [core] 修改 agent 循环：`PendingApproval` 状态下 agent 直接退出，不等待 Resume envelope
   - 目的：实现 "每次 turn 一个 session 生命周期"
-  - 验证：集成测试 —— session.send() 触发审批 → recv 收到 Suspended → shutdown → 新 session open 带 resume_decisions → agent 继续执行完成
+  - 验证：8/8 测试通过，包括两阶段 restart 测试（resume + reject）
 
 - [ ] [core] 将超时检查逻辑放在 `open()` / `collect_pending_approvals` 中（而非 agent 循环内）
   - 目的：配合 "session 关闭" 模型，超时基于持久化的 `suspended_at` 判断
