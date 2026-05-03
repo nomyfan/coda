@@ -295,9 +295,9 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 if resume_decisions.contains_key(&p.thread_id) {
                     continue;
                 }
-                let elapsed_ms =
-                    (jiff::Timestamp::now().as_millisecond() - p.suspended_at.as_millisecond())
-                        .max(0) as u128;
+                let elapsed_ms = (jiff::Timestamp::now().as_millisecond()
+                    - p.suspended_at.as_millisecond())
+                .max(0) as u128;
                 if elapsed_ms > timeout.as_millis() {
                     let resolutions = p
                         .calls
@@ -311,10 +311,7 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                             )
                         })
                         .collect();
-                    resume_decisions.insert(
-                        p.thread_id.clone(),
-                        ResumeDecision { resolutions },
-                    );
+                    resume_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
                 }
             }
         }

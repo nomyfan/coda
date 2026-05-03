@@ -5,6 +5,7 @@ members = [
   "crates/coda_agent",
   "crates/coda_skills",
   "app/coda_cli",
+  "app/coda_server",
 ]
 resolver = "3"
 

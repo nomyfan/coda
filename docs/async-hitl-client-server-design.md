@@ -171,8 +171,7 @@ pub enum WireEvent {
     LlmStart {
         agent_name: String,
         thread_id: String,
-        #[serde(flatten)]
-        request: ChatCompletionRequest,
+        model: String,
     },
     #[serde(rename = "llm_chunk")]
     LlmContentChunk {
@@ -265,7 +264,9 @@ impl From<SessionEvent> for WireEvent {
 
         match event.kind {
             AgentEvent::LLMStart(req) => WireEvent::LlmStart {
-                agent_name, thread_id, request: req,
+                agent_name,
+                thread_id,
+                model: req.model,
             },
             AgentEvent::LLMContentChunk(content) => WireEvent::LlmContentChunk {
                 agent_name, thread_id, content,
@@ -316,7 +317,7 @@ impl From<AbortedTarget> for AbortedTargetWire {
 | `ToolCall` | `coda_core::llm` | 工具调用描述 |
 | `ToolMessage` | `coda_core::llm` | 工具执行结果 |
 | `AssistantMessage` | `coda_core::llm` | LLM 回复 |
-| `ChatCompletionRequest` | `coda_core::llm` | LLM 请求参数 |
+| `ChatCompletionRequest` | `coda_core::llm` | ~~LLM 请求参数~~ 不序列化，LlmStart 只取 `model` 字段 |
 
 ### 存储
 
@@ -342,14 +343,14 @@ impl From<AbortedTarget> for AbortedTargetWire {
 
 ## Implementation Roadmap
 
-- [ ] [wire types] 在 `app/coda_server/src/lib.rs` 中定义 `WireEvent`、`AbortedTargetWire`、`ChatRequest`、`ChatResponse`、`ChatStatus`，实现 `From<SessionEvent> for WireEvent`
+- [x] [wire types] 在 `app/coda_server/src/lib.rs` 中定义 `WireEvent`、`AbortedTargetWire`、`ChatRequest`、`ChatResponse`、`ChatStatus`，实现 `From<SessionEvent> for WireEvent`
   - Purpose: 建立传输层数据模型，server 和 client 两个 bin 共享
   - Verification: 编译通过，`serde_json::to_string` + round-trip 正确
 
-- [ ] [server + client] 实现 `app/coda_server`：拷贝 JsonFileStorage、server bin（axum `/chat` endpoint）、client bin（reqwest CLI）
+- [x] [server + client] 实现 `app/coda_server`：拷贝 JsonFileStorage、server bin（axum `/chat` endpoint）、client bin（reqwest CLI）
   - Purpose: 第一个可用的 async HITL client-server，coda_agent 零修改
   - Verification: `cargo run -p coda_server --bin server` 启动，`cargo run -p coda_server --bin client` 发起对话
 
-- [ ] [integration] 端到端手动测试：server 后台运行，client 交互式对话，触发审批
+- [x] [integration] 端到端手动测试：server 后台运行，client 交互式对话，触发审批
   - Purpose: 确认整个 async HITL 链路可用
   - Verification: 完整对话 + 审批流程走通

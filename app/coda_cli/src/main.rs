@@ -390,14 +390,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ckpts.len()
                         );
                         for ckpt in &ckpts {
-                            let resolutions =
-                                match resolve_pending_calls(&mut rl, &ckpt.calls) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        println!("\n[Aborted: approval interrupted: {e}]");
-                                        return Err(e);
-                                    }
-                                };
+                            let resolutions = match resolve_pending_calls(&mut rl, &ckpt.calls) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    println!("\n[Aborted: approval interrupted: {e}]");
+                                    return Err(e);
+                                }
+                            };
                             pending_decisions
                                 .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
                         }
@@ -408,9 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Render history on first open if resuming from a prior session.
-        if first_open
-            && let Some(checkpoint) = session.resumed_checkpoint()
-        {
+        if first_open && let Some(checkpoint) = session.resumed_checkpoint() {
             render_checkpoint_history(checkpoint);
         }
         first_open = false;

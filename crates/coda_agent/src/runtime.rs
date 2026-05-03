@@ -329,7 +329,10 @@ impl AgentRuntime {
                 .save_session_snapshot(self.session_id.clone(), snapshot.clone())
                 .await
             {
-                warn!("Failed to persist session snapshot on buffered message: {}", err);
+                warn!(
+                    "Failed to persist session snapshot on buffered message: {}",
+                    err
+                );
             }
             return Ok(());
         }
@@ -352,9 +355,7 @@ impl AgentRuntime {
             .agent_drained_envelopes
             .insert(agent_name.clone(), envelopes);
         if let Some(thread_id) = active_thread {
-            snapshot
-                .active_threads
-                .insert(agent_name, thread_id.0);
+            snapshot.active_threads.insert(agent_name, thread_id.0);
         }
         if let Err(err) = self
             .session_storage
