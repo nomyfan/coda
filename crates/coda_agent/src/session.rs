@@ -297,8 +297,8 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 }
                 let elapsed_ms =
                     (jiff::Timestamp::now().as_millisecond() - p.suspended_at.as_millisecond())
-                        as u64;
-                if elapsed_ms > timeout.as_millis() as u64 {
+                        .max(0) as u128;
+                if elapsed_ms > timeout.as_millis() {
                     let resolutions = p
                         .calls
                         .iter()
@@ -476,24 +476,12 @@ impl Session {
             .await
     }
 
-    /// Resume a suspended agent with the user's decision on its pending
-    /// approvals. The envelope target is derived from `checkpoint` so the
-    /// caller does not build one by hand.
-    pub async fn resume(
-        &self,
-        checkpoint: &AgentCheckpoint,
-        decision: ResumeDecision,
-    ) -> Result<(), SendCommandError> {
-        self.send_resume_envelope(&checkpoint.agent_name, &checkpoint.thread_id, decision)
-            .await
-    }
-
     /// Resume a suspended agent by `agent_name` and `thread_id`.
     ///
-    /// This is the preferred API when the caller has a [`PendingApproval`]
-    /// instead of an [`AgentCheckpoint`]. Use [`Session::resume`] when you
-    /// still have the checkpoint from a prior `Suspended` event.
-    pub async fn resume_by_id(
+    /// The caller gets `agent_name` and `thread_id` from a
+    /// [`PendingApproval`] (received via [`AgentEvent::Suspended`] or
+    /// [`OpenError::PendingApprovalsRequired`]).
+    pub async fn resume(
         &self,
         agent_name: &str,
         thread_id: &str,

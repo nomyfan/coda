@@ -417,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let skip_input = session.has_resuming_agents();
 
-        let suspended = if !skip_input {
+        if !skip_input {
             let raw_input = match rl.readline("You: ") {
                 Ok(line) => line,
                 Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
@@ -449,21 +449,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             print!("Assistant: ");
             io::stdout().flush()?;
+        }
 
-            false
-        } else {
-            true
-        };
-
-        let suspended = consume_events(&mut rl, &session, &mut resume_decisions, suspended).await;
+        let new_suspension = consume_events(&mut rl, &session, &mut resume_decisions).await;
 
         session
             .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
             .await;
 
-        if suspended {
-            // Keep decisions for the next session open.
-        } else {
+        if !new_suspension {
             resume_decisions.clear();
         }
 
@@ -479,14 +473,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Consume events from `session` until the current turn ends.
 ///
 /// Suspended decisions are accumulated into `resume_decisions`.
-/// Returns `true` if the turn ended because of a [`AgentEvent::Suspended`],
+/// Returns `true` if a new [`AgentEvent::Suspended`] was encountered,
 /// `false` if the turn ended normally.
 async fn consume_events(
     rl: &mut rustyline::DefaultEditor,
     session: &Session,
     resume_decisions: &mut HashMap<String, ResumeDecision>,
-    mut suspended: bool,
 ) -> bool {
+    let mut suspended = false;
     loop {
         tokio::select! {
             biased;

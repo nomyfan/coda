@@ -391,43 +391,6 @@ impl LLMProvider for TestProvider {
                         ..Default::default()
                     })
                 }
-                Some("phase2")
-                    if tool_message(&request.messages, "call_approve")
-                        .map_or(false, |t| !matches!(t.outcome, ToolCallOutcome::Approved))
-                        && tool_message(&request.messages, "call_explore").is_none() =>
-                {
-                    Self::completed(AssistantMessage {
-                        tool_calls: vec![ToolCall {
-                            id: "call_explore".into(),
-                            name: "explore".into(),
-                            arguments: Some(r#"{"task":"inspect"}"#.into()),
-                        }],
-                        ..Default::default()
-                    })
-                }
-                Some("phase2") if tool_message(&request.messages, "call_explore").is_some() => {
-                    Self::completed(AssistantMessage {
-                        content: "interrupt-flow-ok".into(),
-                        ..Default::default()
-                    })
-                }
-                Some("phase3") => {
-                    let ok = tool_message(&request.messages, "call_approve")
-                        .map_or(false, |t| !matches!(t.outcome, ToolCallOutcome::Approved))
-                        && matches!(
-                            tool_message(&request.messages, "call_explore"),
-                            Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
-                        );
-
-                    Self::completed(AssistantMessage {
-                        content: if ok {
-                            "interrupt-flow-ok".into()
-                        } else {
-                            format!("interrupt-flow-bad: {}", describe_tools(&request.messages))
-                        },
-                        ..Default::default()
-                    })
-                }
                 other => Self::completed(AssistantMessage {
                     content: format!("unexpected-user-state: {other:?}"),
                     ..Default::default()
@@ -1009,7 +972,7 @@ async fn pending_approval_supports_mixed_resolutions() {
 }
 
 #[tokio::test]
-async fn new_task_replaces_pending_approval_and_pending_reply() {
+async fn reject_pending_approval_via_restart() {
     let spec = AgentSpec {
         name: "coda".into(),
         description: String::new(),

@@ -148,9 +148,11 @@ impl Session {
 }
 ```
 
+**修改的方法**：
+- `Session::resume(&self, agent_name: &str, thread_id: &str, decision: ResumeDecision)` —— 替换了旧的需要 `&AgentCheckpoint` 的签名，现在 caller 只需提供 `agent_name` 和 `thread_id`
+
 **移除的方法**：
-- ~~`Session::resume(&AgentCheckpoint, decision)`~~ —— 所有恢复通过 `SessionBuilder::resume_decisions()` + `open()` 完成
-- ~~`Session::pending_approvals()`~~ —— 不需要了。待审批信息通过两个渠道获取：(1) 运行中的 `Suspended` 事件；(2) 重新 open 时的 `OpenError::PendingApprovalsRequired`
+- ~~`Session::pending_approvals()`~~ —— 待审批信息通过两个渠道获取：(1) 运行中的 `Suspended` 事件；(2) 重新 open 时的 `OpenError::PendingApprovalsRequired`
 
 ### `SessionBuilder` —— 保持现有 API
 
