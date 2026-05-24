@@ -10,13 +10,8 @@ use coda_core::llm::{
     ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
 };
 use coda_core::tool::ToolSet;
+use coda_tools::TodoItem;
 use tracing::debug;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TodoItem {
-    pub title: String,
-    pub done: bool,
-}
 
 #[derive(Clone, Default)]
 pub enum ToolApprovalMode {
@@ -111,7 +106,6 @@ pub enum ResumePoint {
 
 pub struct AgentState {
     pub messages: Vec<Message>,
-    pub todos: Vec<TodoItem>,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -229,6 +223,7 @@ pub struct Agent {
     pub mode: SubAgentMode,
     pub system_prompt: String,
     pub state: Arc<Mutex<AgentState>>,
+    pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
     pub tools: ToolSet,
     pub subagents: SubAgents,
 }
@@ -277,7 +272,7 @@ impl Agent {
     }
 
     pub async fn todos(&self) -> Vec<TodoItem> {
-        self.state.lock().await.todos.clone()
+        self.todo_store.lock().await.clone()
     }
 
     pub async fn messages(&self) -> Vec<Message> {
@@ -301,7 +296,7 @@ impl Agent {
             .into_iter()
             .filter(|m| !matches!(m, Message::System(_)))
             .collect();
-        state.todos = todos;
+        *self.todo_store.lock().await = todos;
     }
 }
 

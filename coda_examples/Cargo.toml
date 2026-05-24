@@ -9,6 +9,7 @@ coda_mcp = { workspace = true }
 coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }
+coda_tools = { workspace = true }
 either = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }

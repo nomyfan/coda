@@ -1,19 +1,12 @@
 [package]
-name = "coda_agent"
+name = "coda_tools"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-stream = { workspace = true }
 coda_core = { workspace = true }
-coda_tools = { workspace = true }
-coda_openai = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-jiff = { workspace = true }
-uuid = { workspace = true }

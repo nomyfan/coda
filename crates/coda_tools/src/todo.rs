@@ -5,13 +5,18 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::agent::{AgentState, TodoItem};
 use coda_core::tool::{Tool, ToolResult};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    pub title: String,
+    pub done: bool,
+}
 
 // --- ReadTodosTool ---
 
 pub struct ReadTodosTool {
-    state: Arc<Mutex<AgentState>>,
+    store: Arc<Mutex<Vec<TodoItem>>>,
     schema: Schema,
 }
 
@@ -34,9 +39,9 @@ impl Display for ReadTodosOutput {
 }
 
 impl ReadTodosTool {
-    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
+    pub fn new(store: Arc<Mutex<Vec<TodoItem>>>) -> Self {
         let schema = schemars::schema_for!(ReadTodosParams);
-        ReadTodosTool { state, schema }
+        ReadTodosTool { store, schema }
     }
 }
 
@@ -61,11 +66,11 @@ impl Tool for ReadTodosTool {
         &self,
         _params: Self::Parameters,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        let state = self.state.clone();
+        let store = self.store.clone();
 
         async move {
-            let s = state.lock().await;
-            Ok(ReadTodosOutput(s.todos.clone()))
+            let todos = store.lock().await;
+            Ok(ReadTodosOutput(todos.clone()))
         }
     }
 }
@@ -73,7 +78,7 @@ impl Tool for ReadTodosTool {
 // --- WriteTodosTool ---
 
 pub struct WriteTodosTool {
-    state: Arc<Mutex<AgentState>>,
+    store: Arc<Mutex<Vec<TodoItem>>>,
     schema: Schema,
 }
 
@@ -92,9 +97,9 @@ pub struct WriteTodosParams {
 }
 
 impl WriteTodosTool {
-    pub fn new(state: Arc<Mutex<AgentState>>) -> Self {
+    pub fn new(store: Arc<Mutex<Vec<TodoItem>>>) -> Self {
         let schema = schemars::schema_for!(WriteTodosParams);
-        WriteTodosTool { state, schema }
+        WriteTodosTool { store, schema }
     }
 }
 
@@ -119,11 +124,11 @@ impl Tool for WriteTodosTool {
         &self,
         params: Self::Parameters,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        let state = self.state.clone();
+        let store = self.store.clone();
 
         async move {
-            let mut s = state.lock().await;
-            s.todos = params
+            let mut todos = store.lock().await;
+            *todos = params
                 .todos
                 .into_iter()
                 .map(|item| TodoItem {
@@ -131,7 +136,7 @@ impl Tool for WriteTodosTool {
                     done: item.done,
                 })
                 .collect();
-            Ok(format!("Todos updated. {} items.", s.todos.len()))
+            Ok(format!("Todos updated. {} items.", todos.len()))
         }
     }
 }

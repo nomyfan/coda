@@ -1,15 +1,11 @@
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
+
 use tokio::sync::Mutex;
 
-use coda_core::tool::{ToolObject, ToolResult, ToolWrapper};
+use coda_tools::{BuildContext, TodoItem, ToolSpec};
 
 use crate::agent::{Agent, AgentState, SubAgentMode, SubAgentTool};
-use crate::tools::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
-    WriteTodosTool,
-};
 
 /// Errors that can occur while building an agent tree from its spec.
 #[derive(Debug)]
@@ -33,17 +29,6 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
-
-/// Runtime context for building agents and tools.
-#[derive(Clone)]
-pub struct BuildContext {
-    pub workspace_dir: String,
-}
-
-/// A factory for creating tool instances.
-pub trait ToolSpec: Send + Sync {
-    fn build(&self, state: &Arc<Mutex<AgentState>>, ctx: &BuildContext) -> Box<dyn ToolObject>;
-}
 
 /// Declarative specification for building an agent.
 pub struct AgentSpec {
@@ -71,22 +56,26 @@ impl AgentSpec {
             return Err(BuildError::DuplicateAgentName(self.name.clone()));
         }
 
-        let state = Arc::new(Mutex::new(AgentState {
-            messages: vec![],
-            todos: vec![],
-        }));
+        let todo_store = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
+        let state = Arc::new(Mutex::new(AgentState { messages: vec![] }));
+
+        let tool_ctx = BuildContext {
+            workspace_dir: ctx.workspace_dir.clone(),
+            todo_store: todo_store.clone(),
+        };
 
         let mut agent = Agent {
             name: self.name.clone(),
             mode: self.mode.clone(),
             system_prompt: self.system_prompt.clone(),
             state,
+            todo_store,
             tools: Default::default(),
             subagents: Default::default(),
         };
 
         for tool_spec in &self.tools {
-            agent.tools.register(tool_spec.build(&agent.state, ctx));
+            agent.tools.register(tool_spec.build(&tool_ctx));
         }
         for sub_spec in &self.subagents {
             agent.subagents.register(SubAgentTool {
@@ -102,124 +91,4 @@ impl AgentSpec {
         }
         Ok(())
     }
-}
-
-// --- Built-in tool specs ---
-
-pub struct ShellToolSpec;
-
-impl ToolSpec for ShellToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ShellTool::new()))
-    }
-}
-
-pub struct ReadFileToolSpec;
-
-impl ToolSpec for ReadFileToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ReadFileTool::new()))
-    }
-}
-
-pub struct WriteFileToolSpec;
-
-impl ToolSpec for WriteFileToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(WriteFileTool::new()))
-    }
-}
-
-pub struct ListDirectoryToolSpec;
-
-impl ToolSpec for ListDirectoryToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ListDirectoryTool::new()))
-    }
-}
-
-pub struct GrepToolSpec;
-
-impl ToolSpec for GrepToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(GrepTool::new(ctx.workspace_dir.clone())))
-    }
-}
-
-pub struct GlobToolSpec;
-
-impl ToolSpec for GlobToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(GlobTool::new(ctx.workspace_dir.clone())))
-    }
-}
-
-pub struct ReadTodosToolSpec;
-
-impl ToolSpec for ReadTodosToolSpec {
-    fn build(&self, state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ReadTodosTool::new(state.clone())))
-    }
-}
-
-pub struct WriteTodosToolSpec;
-
-impl ToolSpec for WriteTodosToolSpec {
-    fn build(&self, state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(WriteTodosTool::new(state.clone())))
-    }
-}
-
-/// Wraps a pre-built `ToolObject` as a `ToolSpec`. The object is yielded on
-/// the first call to `build`; subsequent calls panic (each spec instance
-/// should only be built once during agent construction).
-pub struct PrebuiltToolSpec(Arc<dyn ToolObject>);
-
-impl PrebuiltToolSpec {
-    pub fn new(tool: Box<dyn ToolObject>) -> Self {
-        PrebuiltToolSpec(Arc::from(tool))
-    }
-}
-
-impl ToolSpec for PrebuiltToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(SharedToolObject(self.0.clone()))
-    }
-}
-
-struct SharedToolObject(Arc<dyn ToolObject>);
-
-impl ToolObject for SharedToolObject {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-
-    fn description(&self) -> &str {
-        self.0.description()
-    }
-
-    fn parameter_schema(&self) -> &serde_json::Value {
-        self.0.parameter_schema()
-    }
-
-    fn execute(
-        self: Arc<Self>,
-        params: String,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
-        self.0.clone().execute(params)
-    }
-}
-
-/// Returns builtin tool specs for a standard agent.
-pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
-    vec![
-        Box::new(ShellToolSpec),
-        Box::new(ReadFileToolSpec),
-        Box::new(WriteFileToolSpec),
-        Box::new(ListDirectoryToolSpec),
-        Box::new(GrepToolSpec),
-        Box::new(GlobToolSpec),
-        Box::new(ReadTodosToolSpec),
-        Box::new(WriteTodosToolSpec),
-    ]
 }
