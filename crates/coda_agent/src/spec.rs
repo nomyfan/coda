@@ -169,6 +169,27 @@ impl ToolSpec for WriteTodosToolSpec {
     }
 }
 
+/// Wraps a pre-built `ToolObject` as a `ToolSpec`. The object is yielded on
+/// the first call to `build`; subsequent calls panic (each spec instance
+/// should only be built once during agent construction).
+pub struct PrebuiltToolSpec(std::sync::Mutex<Option<Box<dyn ToolObject>>>);
+
+impl PrebuiltToolSpec {
+    pub fn new(tool: Box<dyn ToolObject>) -> Self {
+        PrebuiltToolSpec(std::sync::Mutex::new(Some(tool)))
+    }
+}
+
+impl ToolSpec for PrebuiltToolSpec {
+    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("PrebuiltToolSpec::build called more than once")
+    }
+}
+
 /// Returns builtin tool specs for a standard agent.
 pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
     vec![

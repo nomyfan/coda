@@ -4,12 +4,13 @@ use axum::{
     routing::{get, post},
 };
 use coda_agent::{
-    AgentEvent, BuildContext, OpenError, RunConfig, Session, Shutdown, ToolApprovalMode,
-    runtime::SessionStorage,
+    AgentEvent, BuildContext, OpenError, PrebuiltToolSpec, RunConfig, Session, Shutdown,
+    ToolApprovalMode, runtime::SessionStorage,
 };
 use coda_core::llm::LLMProviderConfig;
 use coda_examples::{
     build_agent_spec, build_system_prompt,
+    mcp::McpServers,
     storage::JsonFileStorage,
     wire::{ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent},
 };
@@ -24,6 +25,7 @@ struct AppState {
     workspace_str: String,
     provider: Arc<OpenAI>,
     model: String,
+    mcp_servers: McpServers,
 }
 
 async fn chat_handler(
@@ -46,7 +48,13 @@ async fn chat_handler(
         approval_timeout: Some(Duration::from_secs(300)),
     };
 
-    let spec = build_agent_spec(state.system_prompt.clone(), vec![]);
+    let mcp_tool_specs: Vec<Box<dyn coda_agent::ToolSpec>> = state
+        .mcp_servers
+        .tool_objects()
+        .into_iter()
+        .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn coda_agent::ToolSpec>)
+        .collect();
+    let spec = build_agent_spec(state.system_prompt.clone(), mcp_tool_specs);
     let ctx = BuildContext {
         workspace_dir: state.workspace_str.clone(),
     };
@@ -227,12 +235,20 @@ async fn main() {
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
 
+    let mcp_servers = coda_examples::mcp::load_mcp_servers(&workspace_dir)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("failed to load MCP servers: {e}");
+            McpServers::empty()
+        });
+
     let state = Arc::new(AppState {
         storage,
         system_prompt,
         workspace_str,
         provider,
         model,
+        mcp_servers,
     });
 
     let app = Router::new()

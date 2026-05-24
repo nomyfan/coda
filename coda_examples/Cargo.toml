@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 coda_core = { workspace = true }
+coda_mcp = { workspace = true }
 coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }

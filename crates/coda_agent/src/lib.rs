@@ -12,4 +12,4 @@ pub use agent::{
 pub use session::{
     EventOrigin, OnTimeout, OpenError, Session, SessionBuilder, SessionEvent, Shutdown,
 };
-pub use spec::{AgentSpec, BuildContext, BuildError, ToolSpec, builtin_specs};
+pub use spec::{AgentSpec, BuildContext, BuildError, PrebuiltToolSpec, ToolSpec, builtin_specs};

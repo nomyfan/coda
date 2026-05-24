@@ -1,13 +1,16 @@
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, BuildContext, OpenError, ResumeDecision, RunConfig,
-    Session, SessionEvent, Shutdown, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, AgentCheckpoint, AgentEvent, BuildContext, OpenError, PrebuiltToolSpec,
+    ResumeDecision, RunConfig, Session, SessionEvent, Shutdown, ToolApprovalMode,
+    ToolCallResolution,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
 };
 use coda_examples::{
     ask_user::{AskUserParams, AskUserToolSpec},
-    build_agent_spec, build_system_prompt, parse_session_id_arg, print_logo,
+    build_agent_spec, build_system_prompt,
+    mcp::load_mcp_servers,
+    parse_session_id_arg, print_logo,
     storage::JsonFileStorage,
 };
 use coda_openai::OpenAI;
@@ -239,6 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
 
+    let mcp_servers = load_mcp_servers(&workspace_dir).await?;
+
     let config = RunConfig {
         provider: provider.clone(),
         model: model.clone(),
@@ -262,7 +267,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = {
         let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
         loop {
-            let spec = build_agent_spec(system_prompt.clone(), vec![Box::new(AskUserToolSpec)]);
+            let mut extra_tools: Vec<Box<dyn coda_agent::ToolSpec>> =
+                vec![Box::new(AskUserToolSpec)];
+            extra_tools.extend(
+                mcp_servers
+                    .tool_objects()
+                    .into_iter()
+                    .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn coda_agent::ToolSpec>),
+            );
+            let spec = build_agent_spec(system_prompt.clone(), extra_tools);
             match Session::builder()
                 .storage(storage.clone())
                 .root(spec)
@@ -340,6 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
+    mcp_servers.shutdown().await;
 
     println!("Current session id: {}", session_id);
     println!("Session ended. You can resume this session later with `--resume {session_id}`");
