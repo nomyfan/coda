@@ -283,6 +283,7 @@ fn parse_session_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option
     Ok(session_id)
 }
 
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = env::args().next().unwrap_or_else(|| "coda".into());
@@ -337,14 +338,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let provider = std::sync::Arc::new(OpenAI::new(LLMProviderConfig {
+    let provider = OpenAI::new(LLMProviderConfig {
         api_key,
         base_url,
         stream: true,
-    }));
+    });
 
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
+
+    let config = RunConfig {
+        provider: provider.clone(),
+        model: model.clone(),
+        max_completion_tokens: Some(5000),
+        temperature: Some(0.7),
+        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
+            call.name == "shell" || call.name == "ask_user"
+        })),
+        approval_timeout: None,
+    };
+    let ctx = BuildContext {
+        workspace_dir: workspace_str.clone(),
+    };
 
     print_logo();
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -352,114 +367,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {}\n", session_id);
 
-    let mut resume_decisions: HashMap<String, ResumeDecision> = HashMap::new();
-    let mut first_open = true;
-
-    loop {
-        let session = {
-            let config = RunConfig {
-                provider: provider.clone(),
-                model: model.clone(),
-                max_completion_tokens: Some(5000),
-                temperature: Some(0.7),
-                tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-                    call.name == "shell" || call.name == "ask_user"
-                })),
-                approval_timeout: None,
-            };
-            let mut pending_decisions = std::mem::take(&mut resume_decisions);
-            loop {
-                let ctx = BuildContext {
-                    workspace_dir: workspace_str.clone(),
-                };
-                let spec = build_agent_spec(system_prompt.clone());
-                match Session::builder()
-                    .storage(storage.clone())
-                    .root(spec)
-                    .build_context(ctx)
-                    .run_config(config.clone())
-                    .session_id(session_id.clone())
-                    .resume_decisions(std::mem::take(&mut pending_decisions))
-                    .open()
-                    .await
-                {
-                    Ok(s) => break s,
-                    Err(OpenError::PendingApprovalsRequired(ckpts)) => {
-                        println!(
-                            "\n[Resuming session — {} pending approval(s) to resolve]",
-                            ckpts.len()
-                        );
-                        for ckpt in &ckpts {
-                            let resolutions = match resolve_pending_calls(&mut rl, &ckpt.calls) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    println!("\n[Aborted: approval interrupted: {e}]");
-                                    return Err(e);
-                                }
-                            };
-                            pending_decisions
-                                .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
-                        }
+    // Open session, resolving any pending approvals left over from a prior crash.
+    let session = {
+        let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
+        loop {
+            let spec = build_agent_spec(system_prompt.clone());
+            match Session::builder()
+                .storage(storage.clone())
+                .root(spec)
+                .build_context(ctx.clone())
+                .run_config(config.clone())
+                .session_id(session_id.clone())
+                .resume_decisions(std::mem::take(&mut pending_decisions))
+                .open()
+                .await
+            {
+                Ok(s) => break s,
+                Err(OpenError::PendingApprovalsRequired(ckpts)) => {
+                    println!(
+                        "\n[Resuming session — {} pending approval(s) to resolve]",
+                        ckpts.len()
+                    );
+                    for ckpt in &ckpts {
+                        let resolutions = resolve_pending_calls(&mut rl, &ckpt.calls)?;
+                        pending_decisions
+                            .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
                     }
-                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-                }
-            }
-        };
-
-        // Render history on first open if resuming from a prior session.
-        if first_open && let Some(checkpoint) = session.resumed_checkpoint() {
-            render_checkpoint_history(checkpoint);
-        }
-        first_open = false;
-
-        let skip_input = session.has_resuming_agents();
-
-        if !skip_input {
-            let raw_input = match rl.readline("You: ") {
-                Ok(line) => line,
-                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
-                    println!("Goodbye!");
-                    break;
                 }
                 Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-            };
-
-            let user_input = raw_input.trim();
-            if user_input.is_empty() {
-                session
-                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
-                    .await;
-                continue;
             }
-            if user_input.eq_ignore_ascii_case("quit")
-                || user_input.eq_ignore_ascii_case("exit")
-                || user_input.eq_ignore_ascii_case("q")
-            {
-                println!("Goodbye!");
-                session
-                    .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
-                    .await;
-                break;
-            }
-
-            session.send(user_input.to_string()).await?;
-
-            print!("Assistant: ");
-            io::stdout().flush()?;
         }
+    };
 
-        let new_suspension = consume_events(&mut rl, &session, &mut resume_decisions).await;
+    if let Some(checkpoint) = session.resumed_checkpoint() {
+        render_checkpoint_history(checkpoint);
+    }
 
-        session
-            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
-            .await;
-
-        if !new_suspension {
-            resume_decisions.clear();
+    // If agents are resuming from a mid-run snapshot, consume their events first.
+    if session.has_resuming_agents() {
+        if !consume_events(&mut rl, &session).await {
+            session
+                .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                .await;
+            return Ok(());
         }
-
         println!();
     }
+
+    loop {
+        let raw_input = match rl.readline("You: ") {
+            Ok(line) => line,
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                println!("Goodbye!");
+                break;
+            }
+            Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+        };
+
+        let user_input = raw_input.trim();
+        if user_input.is_empty() {
+            continue;
+        }
+        if user_input.eq_ignore_ascii_case("quit")
+            || user_input.eq_ignore_ascii_case("exit")
+            || user_input.eq_ignore_ascii_case("q")
+        {
+            println!("Goodbye!");
+            break;
+        }
+
+        session.send(user_input.to_string()).await?;
+
+        print!("Assistant: ");
+        io::stdout().flush()?;
+
+        if !consume_events(&mut rl, &session).await {
+            break;
+        }
+        println!();
+    }
+
+    session
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
 
     println!("Current session id: {}", session_id);
     println!("Session ended. You can resume this session later with `--resume {session_id}`");
@@ -469,15 +459,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Consume events from `session` until the current turn ends.
 ///
-/// Suspended decisions are accumulated into `resume_decisions`.
-/// Returns `true` if a new [`AgentEvent::Suspended`] was encountered,
-/// `false` if the turn ended normally.
-async fn consume_events(
-    rl: &mut rustyline::DefaultEditor,
-    session: &Session,
-    resume_decisions: &mut HashMap<String, ResumeDecision>,
-) -> bool {
-    let mut suspended = false;
+/// Suspensions are resolved in-place: the user is prompted and `session.resume`
+/// is called immediately, so the turn continues without a shutdown/reopen cycle.
+///
+/// Returns `false` if a fatal error occurred (resume channel closed, approval
+/// input interrupted), signalling the caller to shut down the session rather
+/// than continuing.
+async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) -> bool {
     loop {
         tokio::select! {
             biased;
@@ -539,12 +527,20 @@ async fn consume_events(
                                 return false;
                             }
                         };
-                        resume_decisions.insert(
-                            pending.thread_id.clone(),
-                            ResumeDecision { resolutions },
-                        );
-                        suspended = true;
-                        break;
+                        if let Err(err) = session
+                            .resume(
+                                &pending.agent_name,
+                                &pending.thread_id,
+                                ResumeDecision { resolutions },
+                            )
+                            .await
+                        {
+                            // The agent channel closed unexpectedly; abort to
+                            // prevent leaving the session in a suspended state.
+                            session.abort().await;
+                            println!("\n[Error resuming after approval: {err}]");
+                            return false;
+                        }
                     }
                     AgentEvent::Aborted(target) if origin.is_root() => match &target {
                         AbortedTarget::Generation => {
@@ -566,5 +562,5 @@ async fn consume_events(
             }
         }
     }
-    suspended
+    true
 }

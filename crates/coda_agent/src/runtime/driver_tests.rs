@@ -1293,3 +1293,78 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     parent.shutdown().await;
     parent_result.expect("timed out waiting for subagent error reply");
 }
+
+#[tokio::test]
+async fn in_process_resume_after_suspension() {
+    // Verify that after an agent suspends for approval, sending a Resume
+    // envelope in-process (without shutdown/restart) allows the turn to
+    // complete normally.
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "interrupt-main".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![Box::new(ReadTodosToolSpec)],
+        subagents: vec![],
+    };
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| {
+        call.name == "read_todos"
+    }));
+    let agents = spec
+        .build(&BuildContext {
+            workspace_dir: ".".into(),
+        })
+        .expect("build agents");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        agents,
+        provider,
+        approval,
+        "phase1",
+    )
+    .await;
+
+    // Wait for the Suspended event.
+    let pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for suspension")
+    };
+
+    // Resume in-process — no shutdown/restart.
+    harness
+        .send_resume(
+            &pending.agent_name,
+            &pending.thread_id,
+            vec![(
+                pending.calls[0].id.clone(),
+                ToolCallResolution::Execute,
+            )],
+        )
+        .await;
+
+    // Verify the turn completes after in-process resume.
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event) {
+                if msg.tool_calls.is_empty() {
+                    assert_eq!(msg.content, "interrupt-flow-ok");
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "timed out waiting for completion after in-process resume");
+
+    harness.shutdown().await;
+}

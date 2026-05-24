@@ -34,6 +34,7 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 /// Runtime context for building agents and tools.
+#[derive(Clone)]
 pub struct BuildContext {
     pub workspace_dir: String,
 }
