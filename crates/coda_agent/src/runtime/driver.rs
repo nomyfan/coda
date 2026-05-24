@@ -63,6 +63,11 @@ pub(crate) async fn run_agent(
         // emit Suspended.
         active_thread = None;
     }
+    // When the agent suspends for approval, we clear `active_thread` so the
+    // outer loop waits for the next envelope (a Resume or a new Task). But we
+    // still need the thread_id available if Exit fires during that wait so the
+    // snapshot can record the pending thread for restart-based resume.
+    let mut suspended_thread: Option<ThreadId> = None;
     loop {
         // First: if we have a queued resume envelope, run with it.
         // Otherwise: if there's an active thread to continue, just run it without waiting for a new envelope.
@@ -75,11 +80,21 @@ pub(crate) async fn run_agent(
             let envelop = tokio::select! {
                 biased;
                 cmd = control_rx.recv() => {
-                    if let Some(AgentControl::Exit) = cmd { break; }
-                    continue;
+                    match cmd {
+                        Some(AgentControl::Exit) => {
+                            // Restore thread_id into active_thread so the
+                            // snapshot preserves it for restart-based resume.
+                            active_thread = suspended_thread.take();
+                            break;
+                        }
+                        _ => continue,
+                    }
                 }
                 envelope = envelope_rx.recv() => match envelope {
-                    Some(e) => e,
+                    Some(e) => {
+                        suspended_thread = None;
+                        e
+                    }
                     None => break,
                 },
             };
@@ -94,7 +109,7 @@ pub(crate) async fn run_agent(
             agent: &mut agent,
             cancel: cancel.clone(),
             config: config.clone(),
-            thread_id,
+            thread_id: thread_id.clone(),
             reply_target: None,
         };
         let mut run_fut = std::pin::pin!(agent_loop.run(envelope));
@@ -115,9 +130,13 @@ pub(crate) async fn run_agent(
                     }
                 }
                 match (&mut run_fut).await {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(TurnOutcome::ExitAcquired | TurnOutcome::Completed) => {
                         active_thread = None;
+                    }
+                    Ok(TurnOutcome::Suspended) => {
+                        // The run ended in suspension; Exit was also requested.
+                        // Preserve thread_id in active_thread so the snapshot
+                        // records the pending thread for restart-based resume.
                     }
                     Err(err) => {
                         error!("Error in agent loop: {}", err);
@@ -128,12 +147,21 @@ pub(crate) async fn run_agent(
             }
             ret = &mut run_fut => {
                 let mut should_exit = false;
-                match ret{
-                    Ok(true) => {
+                match ret {
+                    Ok(TurnOutcome::ExitAcquired) => {
                         should_exit = true;
-                    }
-                    Ok(false) => {
                         active_thread = None;
+                    }
+                    Ok(TurnOutcome::Completed) => {
+                        active_thread = None;
+                    }
+                    Ok(TurnOutcome::Suspended) => {
+                        // Agent is now waiting for a Resume envelope. Move the
+                        // thread_id to suspended_thread and clear active_thread
+                        // so the outer loop falls into the envelope-wait branch.
+                        // If Exit arrives during that wait, suspended_thread is
+                        // restored into active_thread for the snapshot.
+                        suspended_thread = active_thread.take();
                     }
                     Err(err) => {
                         error!("Error in agent loop: {}", err);
@@ -166,6 +194,19 @@ enum AgentLoopState {
     Done(ResumePoint),
 }
 
+/// What the agent turn produced, distinguishing suspension from normal
+/// completion so the outer loop knows whether to preserve `active_thread`.
+enum TurnOutcome {
+    /// The turn completed normally; the agent is idle.
+    Completed,
+    /// The agent suspended for approval; `active_thread` must be kept so the
+    /// snapshot records the pending thread and in-process or restart resume can
+    /// find it.
+    Suspended,
+    /// The exit barrier was already set when the turn started or checked.
+    ExitAcquired,
+}
+
 struct AgentLoop<'a, C: LLMProvider + Clone> {
     runtime: AgentRuntime,
     agent: &'a mut Agent,
@@ -176,7 +217,7 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
 }
 
 impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
-    async fn run(&mut self, envelope: Option<Envelope>) -> Result<bool, String> {
+    async fn run(&mut self, envelope: Option<Envelope>) -> Result<TurnOutcome, String> {
         let mut checkpoint = self
             .runtime
             .session_storage
@@ -198,7 +239,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 AgentLoopState::Done(resume_point) => {
                     checkpoint.resume_point = resume_point;
                     self.save_checkpoint(checkpoint).await;
-                    return Ok(false);
+                    return Ok(TurnOutcome::Completed);
                 }
             }
         }
@@ -267,7 +308,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
 
         self.save_checkpoint(checkpoint).await;
-        Ok(exit_acquired || suspended)
+        Ok(if exit_acquired {
+            TurnOutcome::ExitAcquired
+        } else if suspended {
+            TurnOutcome::Suspended
+        } else {
+            TurnOutcome::Completed
+        })
     }
 
     async fn save_checkpoint(&self, mut checkpoint: AgentCheckpoint) {
