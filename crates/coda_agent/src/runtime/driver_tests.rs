@@ -1308,9 +1308,8 @@ async fn in_process_resume_after_suspension() {
         subagents: vec![],
     };
     let provider = TestProvider::default();
-    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| {
-        call.name == "read_todos"
-    }));
+    let approval =
+        ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
     let agents = spec
         .build(&BuildContext {
             workspace_dir: ".".into(),
@@ -1344,10 +1343,7 @@ async fn in_process_resume_after_suspension() {
         .send_resume(
             &pending.agent_name,
             &pending.thread_id,
-            vec![(
-                pending.calls[0].id.clone(),
-                ToolCallResolution::Execute,
-            )],
+            vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         )
         .await;
 
@@ -1364,7 +1360,10 @@ async fn in_process_resume_after_suspension() {
         }
     })
     .await;
-    assert!(result.is_ok(), "timed out waiting for completion after in-process resume");
+    assert!(
+        result.is_ok(),
+        "timed out waiting for completion after in-process resume"
+    );
 
     harness.shutdown().await;
 }

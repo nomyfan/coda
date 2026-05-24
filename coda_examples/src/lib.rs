@@ -50,10 +50,7 @@ pub fn build_system_prompt(workspace_dir: &str) -> String {
     prompt
 }
 
-pub fn build_agent_spec(
-    system_prompt: String,
-    extra_tools: Vec<Box<dyn ToolSpec>>,
-) -> AgentSpec {
+pub fn build_agent_spec(system_prompt: String, extra_tools: Vec<Box<dyn ToolSpec>>) -> AgentSpec {
     let mut tools = builtin_specs();
     tools.extend(extra_tools);
 
@@ -79,10 +76,9 @@ pub fn build_agent_spec(
             },
             AgentSpec {
                 name: "memo".into(),
-                description:
-                    "A stateful memo agent that remembers information across calls. \
+                description: "A stateful memo agent that remembers information across calls. \
                      Use it to store and recall facts across turns."
-                        .into(),
+                    .into(),
                 system_prompt:
                     "You are a simple memo agent. Your only job is to remember what the user \
                      tells you and answer questions about it. Keep your replies very brief."
