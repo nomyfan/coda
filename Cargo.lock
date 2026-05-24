@@ -245,6 +245,7 @@ dependencies = [
  "coda_skills",
  "dotenvy",
  "either",
+ "jiff",
  "reqwest",
  "rustyline",
  "schemars",

@@ -27,12 +27,7 @@ pub fn print_logo(subtitle: &str) {
 }
 
 pub fn build_system_prompt(workspace_dir: &str) -> String {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-
-    let mut prompt = SYSTEM_PROMPT
-        .replace("{{OS}}", &format!("{os}({arch})"))
-        .replace("{{WORKSPACE_DIR}}", workspace_dir);
+    let mut prompt = SYSTEM_PROMPT.to_string();
 
     match Skills::from_dir(&Path::new(workspace_dir).join(".coda").join("skills")) {
         Ok(skills) => {
@@ -47,7 +42,59 @@ pub fn build_system_prompt(workspace_dir: &str) -> String {
         }
     }
 
+    prompt.push_str("\n\n");
+    prompt.push_str(&build_environment_context(workspace_dir));
+
     prompt
+}
+
+fn build_environment_context(workspace_dir: &str) -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let os_version = get_os_version()
+        .map(|v| format!("\n  <os_version>{v}</os_version>"))
+        .unwrap_or_default();
+    let today = jiff::Zoned::now().date();
+    let shell = get_current_shell();
+
+    format!(
+        "\
+<environment_context>
+  <workspace>{workspace_dir}</workspace>
+  <os>{os}({arch})</os>{os_version}
+  <date>{today}</date>
+  <shell>{shell}</shell>
+</environment_context>"
+    )
+}
+
+fn get_current_shell() -> String {
+    let ppid = std::os::unix::process::parent_id();
+    std::process::Command::new("ps")
+        .args(["-p", &ppid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().rsplit('/').next().unwrap_or("unknown").to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn get_os_version() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    } else {
+        std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    }
 }
 
 pub fn build_agent_spec(system_prompt: String, extra_tools: Vec<Box<dyn ToolSpec>>) -> AgentSpec {

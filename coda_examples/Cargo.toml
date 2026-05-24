@@ -9,6 +9,7 @@ coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }
 either = { workspace = true }
+jiff = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
