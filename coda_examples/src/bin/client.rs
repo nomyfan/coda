@@ -1,26 +1,13 @@
 use coda_agent::{ResumeDecision, ToolCallResolution};
 use coda_core::llm::{Message, ToolCall, ToolCallOutcome, ToolOutput};
-use coda_server::{ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent};
+use coda_examples::{
+    parse_session_id_arg, print_logo,
+    wire::{AbortedTargetWire, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent},
+};
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
-use std::env;
 use std::io::{self, Write};
 use uuid::Uuid;
-
-const LOGO: &str = r#"
-  ██████╗ ██████╗ ██████╗  █████╗
- ██╔════╝██╔═══██╗██╔══██╗██╔══██╗
- ██║     ██║   ██║██║  ██║███████║
- ██║     ██║   ██║██║  ██║██╔══██║
- ╚██████╗╚██████╔╝██████╔╝██║  ██║
-  ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
-"#;
-
-fn print_logo() {
-    println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
-    println!("\x1b[2;37m  An AI Agent (client)\x1b[0m");
-    println!();
-}
 
 fn render_message(message: &Message) {
     match message {
@@ -126,11 +113,11 @@ fn render_event(event: &WireEvent, root_name: &str) {
         }
         WireEvent::ToolCallEnd { message, .. } => {
             let status = match message.outcome {
-                coda_core::llm::ToolCallOutcome::Auto => "auto",
-                coda_core::llm::ToolCallOutcome::Approved => "approved",
-                coda_core::llm::ToolCallOutcome::Resolved => "resolved",
-                coda_core::llm::ToolCallOutcome::Rejected { .. } => "rejected",
-                coda_core::llm::ToolCallOutcome::Aborted => "aborted",
+                ToolCallOutcome::Auto => "auto",
+                ToolCallOutcome::Approved => "approved",
+                ToolCallOutcome::Resolved => "resolved",
+                ToolCallOutcome::Rejected { .. } => "rejected",
+                ToolCallOutcome::Aborted => "aborted",
             };
             match &message.output {
                 ToolOutput::Ok(output) => {
@@ -152,10 +139,10 @@ fn render_event(event: &WireEvent, root_name: &str) {
             println!("\n[Error] {message}");
         }
         WireEvent::Aborted { target, .. } => match target {
-            coda_server::AbortedTargetWire::Generation => {
+            AbortedTargetWire::Generation => {
                 println!("\n\n[Aborted: generation interrupted]");
             }
-            coda_server::AbortedTargetWire::ToolCalls { call_ids } => {
+            AbortedTargetWire::ToolCalls { call_ids } => {
                 println!("\n[Aborted: {} tool call(s) interrupted]", call_ids.len());
             }
         },
@@ -212,39 +199,15 @@ fn resolve_pending_calls(
 }
 
 fn print_usage() {
-    println!("Usage: coda_client [--resume <uuid>]");
-}
-
-fn parse_session_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<String>, String> {
-    let mut args = args.into_iter();
-    let mut session_id = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--resume" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "missing value for --resume".to_string())?;
-                Uuid::parse_str(&value)
-                    .map_err(|err| format!("invalid session id '{value}': {err}"))?;
-                if session_id.replace(value).is_some() {
-                    return Err("session id can only be provided once".to_string());
-                }
-            }
-            "-h" | "--help" => return Err(String::new()),
-            other => return Err(format!("unknown argument: {other}")),
-        }
-    }
-
-    Ok(session_id)
+    println!("Usage: coda-client [--resume <uuid>]");
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_url =
-        env::var("CODA_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        std::env::var("CODA_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
-    let session_id = match parse_session_id_arg(env::args().skip(1)) {
+    let session_id = match parse_session_id_arg(std::env::args().skip(1)) {
         Ok(Some(id)) => id,
         Ok(None) => Uuid::new_v4().to_string(),
         Err(err) if err.is_empty() => {
@@ -258,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    print_logo();
+    print_logo("An AI Agent (client)");
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {session_id}\n");
     println!("Server: {server_url}\n");
@@ -268,30 +231,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
 
-    // Fetch history and check for pending approvals on resume.
     if let Ok(resp) = client
         .get(format!("{server_url}/history/{session_id}"))
         .send()
         .await
-        && let Ok(history) = resp.json::<HistoryResponse>().await {
-            render_history(&history.messages);
-            if !history.pending_approvals.is_empty() {
+        && let Ok(history) = resp.json::<HistoryResponse>().await
+    {
+        render_history(&history.messages);
+        if !history.pending_approvals.is_empty() {
+            println!(
+                "\n[Resuming session — {} pending approval(s) to resolve]\n",
+                history.pending_approvals.len()
+            );
+            for p in &history.pending_approvals {
                 println!(
-                    "\n[Resuming session — {} pending approval(s) to resolve]\n",
-                    history.pending_approvals.len()
+                    "[Approval needed: {} call(s) from '{}']",
+                    p.calls.len(),
+                    p.agent_name
                 );
-                for p in &history.pending_approvals {
-                    println!(
-                        "[Approval needed: {} call(s) from '{}']",
-                        p.calls.len(),
-                        p.agent_name
-                    );
-                    let resolutions = resolve_pending_calls(&mut rl, &p.calls)?;
-                    pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
-                }
-                println!();
+                let resolutions = resolve_pending_calls(&mut rl, &p.calls)?;
+                pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
             }
+            println!();
         }
+    }
 
     loop {
         let (task, resume_decisions) = if pending_decisions.is_empty() {
@@ -376,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Session id: {session_id}");
-    println!("You can resume this session with: coda_client --resume {session_id}");
+    println!("You can resume this session with: coda-client --resume {session_id}");
 
     Ok(())
 }

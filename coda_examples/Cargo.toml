@@ -1,5 +1,5 @@
 [package]
-name = "coda_cli"
+name = "coda_examples"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,19 +9,26 @@ coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }
 either = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15.7"
-jiff = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 rustyline = "15"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [[bin]]
-name = 'coda'
-path = 'src/main.rs'
+name = "coda"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "coda-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "coda-client"
+path = "src/bin/client.rs"

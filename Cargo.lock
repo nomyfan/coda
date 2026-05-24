@@ -225,29 +225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coda_cli"
-version = "0.1.0"
-dependencies = [
- "coda_agent",
- "coda_core",
- "coda_openai",
- "coda_skills",
- "dotenvy",
- "either",
- "futures",
- "jiff",
- "rustyline",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "coda_core"
 version = "0.1.0"
 dependencies = [
@@ -258,17 +235,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "coda_openai"
-version = "0.1.0"
-dependencies = [
- "async-openai",
- "async-stream",
- "coda_core",
- "futures",
-]
-
-[[package]]
-name = "coda_server"
+name = "coda_examples"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -277,14 +244,26 @@ dependencies = [
  "coda_openai",
  "coda_skills",
  "dotenvy",
+ "either",
  "reqwest",
  "rustyline",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "coda_openai"
+version = "0.1.0"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "coda_core",
+ "futures",
 ]
 
 [[package]]
