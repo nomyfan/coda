@@ -55,7 +55,7 @@ pub enum McpTransport {
     },
     Http {
         url: String,
-        headers: HashMap<String, String>,
+        headers: HashMap<http::HeaderName, http::HeaderValue>,
     },
 }
 
@@ -83,6 +83,28 @@ pub struct McpServerConfigRaw {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+fn resolve_headers(
+    server: &str,
+    raw: HashMap<String, String>,
+) -> Result<HashMap<http::HeaderName, http::HeaderValue>, McpError> {
+    raw.into_iter()
+        .map(|(k, v)| {
+            let name = http::HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                McpError::InvalidConfig {
+                    server: server.to_string(),
+                    reason: format!("invalid header name '{k}': {e}"),
+                }
+            })?;
+            let value =
+                http::HeaderValue::from_str(&v).map_err(|e| McpError::InvalidConfig {
+                    server: server.to_string(),
+                    reason: format!("invalid header value for '{k}': {e}"),
+                })?;
+            Ok((name, value))
+        })
+        .collect()
 }
 
 impl McpServerConfigRaw {
@@ -114,7 +136,7 @@ impl McpServerConfigRaw {
                     server: self.name.clone(),
                     reason: "type is 'http' but 'url' is missing".into(),
                 })?,
-                headers: self.headers,
+                headers: resolve_headers(&self.name, self.headers)?,
             },
             Some(other) => {
                 return Err(McpError::UnknownTransport {
@@ -122,15 +144,15 @@ impl McpServerConfigRaw {
                     transport: other.to_string(),
                 });
             }
-            None => match (&self.command, &self.url) {
+            None => match (self.command, self.url) {
                 (Some(command), None) => McpTransport::Stdio {
-                    command: command.to_string(),
+                    command,
                     args: self.args,
                     env: self.env,
                 },
                 (None, Some(url)) => McpTransport::Http {
-                    url: url.to_string(),
-                    headers: self.headers,
+                    headers: resolve_headers(&self.name, self.headers)?,
+                    url,
                 },
                 (Some(_), Some(_)) => {
                     return Err(McpError::InvalidConfig {
@@ -214,20 +236,9 @@ impl McpServer {
                     .map_err(|e| McpError::Connect(e.to_string()))?
             }
             McpTransport::Http { url, headers } => {
-                let mut custom_headers = HashMap::new();
-                for (k, v) in headers {
-                    let name = http::HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                        McpError::Connect(format!("invalid header name '{k}': {e}"))
-                    })?;
-                    let value = http::HeaderValue::from_str(v).map_err(|e| {
-                        McpError::Connect(format!("invalid header value for '{k}': {e}"))
-                    })?;
-                    custom_headers.insert(name, value);
-                }
-
                 let http_config =
                     rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                        .custom_headers(custom_headers);
+                        .custom_headers(headers.clone());
                 let transport =
                     rmcp::transport::StreamableHttpClientTransport::from_config(http_config);
 
@@ -340,7 +351,10 @@ mod tests {
         match config.transport {
             McpTransport::Http { url, headers } => {
                 assert_eq!(url, "http://localhost:8080/mcp");
-                assert_eq!(headers.get("Authorization").unwrap(), "Bearer tok");
+                assert_eq!(
+                    headers.get(&http::header::AUTHORIZATION).unwrap(),
+                    "Bearer tok"
+                );
             }
             _ => panic!("expected Http"),
         }
@@ -368,7 +382,12 @@ mod tests {
         match config.transport {
             McpTransport::Http { url, headers } => {
                 assert_eq!(url, "http://example.com/mcp");
-                assert_eq!(headers.get("X-Custom").unwrap(), "v");
+                assert_eq!(
+                    headers
+                        .get(&http::HeaderName::from_static("x-custom"))
+                        .unwrap(),
+                    "v"
+                );
             }
             _ => panic!("expected Http"),
         }
@@ -422,6 +441,29 @@ mod tests {
         let raw = McpServerConfigRaw::new("empty");
         let err = raw.resolve().unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "empty"));
+    }
+
+    #[test]
+    fn resolve_invalid_header_name() {
+        let raw = McpServerConfigRaw {
+            url: Some("http://example.com/mcp".into()),
+            headers: HashMap::from([("bad header\0".into(), "v".into())]),
+            ..McpServerConfigRaw::new("bad")
+        };
+        let err = raw.resolve().unwrap_err();
+        assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
+    }
+
+    #[test]
+    fn resolve_invalid_header_value() {
+        let raw = McpServerConfigRaw {
+            r#type: Some("http".into()),
+            url: Some("http://example.com/mcp".into()),
+            headers: HashMap::from([("X-Ok".into(), "bad\nvalue".into())]),
+            ..McpServerConfigRaw::new("bad")
+        };
+        let err = raw.resolve().unwrap_err();
+        assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
     #[test]
