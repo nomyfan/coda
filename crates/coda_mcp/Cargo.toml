@@ -1,0 +1,12 @@
+[package]
+name = "coda_mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coda_core = { workspace = true }
+rmcp = { version = "1", features = ["client", "transport-child-process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

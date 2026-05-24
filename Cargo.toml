@@ -4,6 +4,7 @@ members = [
   "crates/coda_openai",
   "crates/coda_agent",
   "crates/coda_skills",
+  "crates/coda_mcp",
   "coda_examples",
 ]
 resolver = "3"
@@ -11,6 +12,7 @@ resolver = "3"
 [workspace.dependencies]
 coda_agent = { path = "crates/coda_agent" }
 coda_core = { path = "crates/coda_core" }
+coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
 coda_skills = { path = "crates/coda_skills" }
 async-stream = "0.3"
