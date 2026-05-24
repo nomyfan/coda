@@ -8,6 +8,12 @@ pub struct AskUserTool {
     schema: Schema,
 }
 
+impl Default for AskUserTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AskUserTool {
     pub fn new() -> Self {
         AskUserTool {
