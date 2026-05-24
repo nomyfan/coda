@@ -35,7 +35,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
+          prefix-key: ${{ matrix.os }}-cargo
 
       - name: Build
         run: cargo build
