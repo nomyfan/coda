@@ -34,7 +34,7 @@ pub fn build_system_prompt(workspace_dir: &str) -> String {
         .replace("{{OS}}", &format!("{os}({arch})"))
         .replace("{{WORKSPACE_DIR}}", workspace_dir);
 
-    match Skills::from_dir(&Path::new(workspace_dir).join(".coda/skills")) {
+    match Skills::from_dir(&Path::new(workspace_dir).join(".coda").join("skills")) {
         Ok(skills) => {
             info!("loaded {} skills", skills.0.len());
             prompt.push_str("\n---\n");
