@@ -68,6 +68,7 @@ fn build_environment_context(workspace_dir: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn get_current_shell() -> String {
     let ppid = std::os::unix::process::parent_id();
     std::process::Command::new("ps")
