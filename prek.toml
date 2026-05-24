@@ -1,0 +1,11 @@
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --", types = [
+        "rust",
+    ], stages = [
+        "pre-commit",
+    ] },
+]
