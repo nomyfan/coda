@@ -81,9 +81,11 @@ pub(crate) async fn run_agent(
                 biased;
                 cmd = control_rx.recv() => {
                     match cmd {
-                        Some(AgentControl::Exit) => {
+                        Some(AgentControl::Exit) | None => {
                             // Restore thread_id into active_thread so the
                             // snapshot preserves it for restart-based resume.
+                            // None means all senders were dropped; treat it as
+                            // an exit signal to avoid a tight spin loop.
                             active_thread = suspended_thread.take();
                             break;
                         }
@@ -199,9 +201,11 @@ enum AgentLoopState {
 enum TurnOutcome {
     /// The turn completed normally; the agent is idle.
     Completed,
-    /// The agent suspended for approval; `active_thread` must be kept so the
-    /// snapshot records the pending thread and in-process or restart resume can
-    /// find it.
+    /// The agent suspended for approval. The outer loop moves `active_thread`
+    /// into `suspended_thread` and waits for a Resume envelope so that
+    /// `session.resume()` can deliver the decision in-process. On Exit,
+    /// `suspended_thread` is restored into `active_thread` so the snapshot
+    /// records the pending thread_id for restart-based resume.
     Suspended,
     /// The exit barrier was already set when the turn started or checked.
     ExitAcquired,
