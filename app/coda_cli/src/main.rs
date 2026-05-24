@@ -405,7 +405,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If agents are resuming from a mid-run snapshot, consume their events first.
     if session.has_resuming_agents() {
-        consume_events(&mut rl, &session).await;
+        if !consume_events(&mut rl, &session).await {
+            session
+                .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                .await;
+            return Ok(());
+        }
         println!();
     }
 
@@ -436,7 +441,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        consume_events(&mut rl, &session).await;
+        if !consume_events(&mut rl, &session).await {
+            break;
+        }
         println!();
     }
 
@@ -454,7 +461,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Suspensions are resolved in-place: the user is prompted and `session.resume`
 /// is called immediately, so the turn continues without a shutdown/reopen cycle.
-async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) {
+///
+/// Returns `false` if a fatal error occurred (resume channel closed, approval
+/// input interrupted), signalling the caller to shut down the session rather
+/// than continuing.
+async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) -> bool {
     loop {
         tokio::select! {
             biased;
@@ -513,7 +524,7 @@ async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) {
                             Err(_) => {
                                 session.abort().await;
                                 println!("\n[Aborted: approval interrupted]");
-                                return;
+                                return false;
                             }
                         };
                         if let Err(err) = session
@@ -524,8 +535,11 @@ async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) {
                             )
                             .await
                         {
-                            println!("\n[Error resuming after approval: {}]", err);
-                            return;
+                            // The agent channel closed unexpectedly; abort to
+                            // prevent leaving the session in a suspended state.
+                            session.abort().await;
+                            println!("\n[Error resuming after approval: {err}]");
+                            return false;
                         }
                     }
                     AgentEvent::Aborted(target) if origin.is_root() => match &target {
@@ -548,4 +562,5 @@ async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) {
             }
         }
     }
+    true
 }

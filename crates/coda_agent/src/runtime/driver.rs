@@ -77,7 +77,7 @@ pub(crate) async fn run_agent(
             (active_thread, None)
         } else {
             // Wait for the next envelope, but allow Exit to break the loop.
-            let envelop = tokio::select! {
+            let next_envelope = tokio::select! {
                 biased;
                 cmd = control_rx.recv() => {
                     match cmd {
@@ -101,7 +101,7 @@ pub(crate) async fn run_agent(
                 },
             };
 
-            (envelop.to.thread_id.clone(), Some(envelop))
+            (next_envelope.to.thread_id.clone(), Some(next_envelope))
         };
 
         let cancel = CancellationToken::new();
