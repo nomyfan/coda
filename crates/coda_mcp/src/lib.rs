@@ -65,18 +65,20 @@ impl McpClient {
             .await
             .map_err(|e| McpError::Protocol(e.to_string()))?;
 
-        let text: String = result
+        let parts: Vec<String> = result
             .content
             .iter()
-            .filter_map(|c| c.as_text())
-            .map(|t| t.text.as_ref())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|c| match c.as_text() {
+                Some(t) => t.text.clone(),
+                None => serde_json::to_string(&c.raw).unwrap_or_default(),
+            })
+            .collect();
+        let output = parts.join("\n");
 
         if result.is_error == Some(true) {
-            Err(McpError::Tool(text))
+            Err(McpError::Tool(output))
         } else {
-            Ok(text)
+            Ok(output)
         }
     }
 }

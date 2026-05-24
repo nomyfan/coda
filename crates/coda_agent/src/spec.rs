@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use coda_core::tool::{ToolObject, ToolWrapper};
+use coda_core::tool::{ToolObject, ToolResult, ToolWrapper};
 
 use crate::agent::{Agent, AgentState, SubAgentMode, SubAgentTool};
 use crate::tools::{
@@ -172,21 +173,40 @@ impl ToolSpec for WriteTodosToolSpec {
 /// Wraps a pre-built `ToolObject` as a `ToolSpec`. The object is yielded on
 /// the first call to `build`; subsequent calls panic (each spec instance
 /// should only be built once during agent construction).
-pub struct PrebuiltToolSpec(std::sync::Mutex<Option<Box<dyn ToolObject>>>);
+pub struct PrebuiltToolSpec(Arc<dyn ToolObject>);
 
 impl PrebuiltToolSpec {
     pub fn new(tool: Box<dyn ToolObject>) -> Self {
-        PrebuiltToolSpec(std::sync::Mutex::new(Some(tool)))
+        PrebuiltToolSpec(Arc::from(tool))
     }
 }
 
 impl ToolSpec for PrebuiltToolSpec {
     fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        self.0
-            .lock()
-            .unwrap()
-            .take()
-            .expect("PrebuiltToolSpec::build called more than once")
+        Box::new(SharedToolObject(self.0.clone()))
+    }
+}
+
+struct SharedToolObject(Arc<dyn ToolObject>);
+
+impl ToolObject for SharedToolObject {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn parameter_schema(&self) -> &serde_json::Value {
+        self.0.parameter_schema()
+    }
+
+    fn execute(
+        self: Arc<Self>,
+        params: String,
+    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+        self.0.clone().execute(params)
     }
 }
 
