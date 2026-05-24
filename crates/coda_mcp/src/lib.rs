@@ -97,11 +97,10 @@ fn resolve_headers(
                     reason: format!("invalid header name '{k}': {e}"),
                 }
             })?;
-            let value =
-                http::HeaderValue::from_str(&v).map_err(|e| McpError::InvalidConfig {
-                    server: server.to_string(),
-                    reason: format!("invalid header value for '{k}': {e}"),
-                })?;
+            let value = http::HeaderValue::from_str(&v).map_err(|e| McpError::InvalidConfig {
+                server: server.to_string(),
+                reason: format!("invalid header value for '{k}': {e}"),
+            })?;
             Ok((name, value))
         })
         .collect()
