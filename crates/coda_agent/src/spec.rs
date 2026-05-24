@@ -61,7 +61,7 @@ impl AgentSpec {
 
         let tool_ctx = BuildContext {
             workspace_dir: ctx.workspace_dir.clone(),
-            todo_store: Some(todo_store.clone()),
+            todo_store: todo_store.clone(),
         };
 
         let mut agent = Agent {

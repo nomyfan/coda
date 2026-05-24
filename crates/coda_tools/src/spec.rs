@@ -15,14 +15,14 @@ use crate::{
 #[derive(Clone)]
 pub struct BuildContext {
     pub workspace_dir: String,
-    pub todo_store: Option<Arc<Mutex<Vec<TodoItem>>>>,
+    pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
 }
 
 impl BuildContext {
     pub fn new(workspace_dir: impl Into<String>) -> Self {
         BuildContext {
             workspace_dir: workspace_dir.into(),
-            todo_store: None,
+            todo_store: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -87,7 +87,7 @@ pub struct ReadTodosToolSpec;
 impl ToolSpec for ReadTodosToolSpec {
     fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(ReadTodosTool::new(
-            ctx.todo_store.clone().expect("todo_store must be set"),
+            ctx.todo_store.clone(),
         )))
     }
 }
@@ -97,14 +97,13 @@ pub struct WriteTodosToolSpec;
 impl ToolSpec for WriteTodosToolSpec {
     fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(WriteTodosTool::new(
-            ctx.todo_store.clone().expect("todo_store must be set"),
+            ctx.todo_store.clone(),
         )))
     }
 }
 
-/// Wraps a pre-built `ToolObject` as a `ToolSpec`. The object is yielded on
-/// the first call to `build`; subsequent calls panic (each spec instance
-/// should only be built once during agent construction).
+/// Wraps a pre-built `ToolObject` as a `ToolSpec`. Each call to `build`
+/// returns a shared wrapper around the same underlying tool.
 pub struct PrebuiltToolSpec(Arc<dyn ToolObject>);
 
 impl PrebuiltToolSpec {
