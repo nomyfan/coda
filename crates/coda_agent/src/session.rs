@@ -12,10 +12,11 @@
 use crate::agent::{EnvelopeBody, Receiver, ResumePoint};
 use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
-    Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, BuildError, Envelope,
-    PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId, ToolCallResolution,
+    Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildError, Envelope, PendingApproval,
+    ResumeDecision, RunConfig, Sender, ThreadId, ToolCallResolution,
 };
 use coda_core::llm::LLMProvider;
+use coda_tools::BuildContext;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

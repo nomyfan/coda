@@ -3,8 +3,9 @@ pub mod mcp;
 pub mod storage;
 pub mod wire;
 
-use coda_agent::{AgentSpec, SubAgentMode, ToolSpec, builtin_specs};
+use coda_agent::{AgentSpec, SubAgentMode};
 use coda_skills::Skills;
+use coda_tools::{ToolSpec, builtin_specs};
 use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;

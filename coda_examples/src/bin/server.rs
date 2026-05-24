@@ -4,8 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use coda_agent::{
-    AgentEvent, BuildContext, OpenError, PrebuiltToolSpec, RunConfig, Session, Shutdown,
-    ToolApprovalMode, runtime::SessionStorage,
+    AgentEvent, OpenError, RunConfig, Session, Shutdown, ToolApprovalMode, runtime::SessionStorage,
 };
 use coda_core::llm::LLMProviderConfig;
 use coda_examples::{
@@ -15,6 +14,7 @@ use coda_examples::{
     wire::{ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent},
 };
 use coda_openai::OpenAI;
+use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -48,16 +48,14 @@ async fn chat_handler(
         approval_timeout: Some(Duration::from_secs(300)),
     };
 
-    let mcp_tool_specs: Vec<Box<dyn coda_agent::ToolSpec>> = state
+    let mcp_tool_specs: Vec<Box<dyn ToolSpec>> = state
         .mcp_servers
         .tool_objects()
         .into_iter()
-        .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn coda_agent::ToolSpec>)
+        .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn ToolSpec>)
         .collect();
     let spec = build_agent_spec(state.system_prompt.clone(), mcp_tool_specs);
-    let ctx = BuildContext {
-        workspace_dir: state.workspace_str.clone(),
-    };
+    let ctx = BuildContext::new(state.workspace_str.clone());
 
     let session = match Session::builder()
         .storage(state.storage.clone())

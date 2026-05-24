@@ -1,7 +1,6 @@
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, BuildContext, OpenError, PrebuiltToolSpec,
-    ResumeDecision, RunConfig, Session, SessionEvent, Shutdown, ToolApprovalMode,
-    ToolCallResolution,
+    AbortedTarget, AgentCheckpoint, AgentEvent, OpenError, ResumeDecision, RunConfig, Session,
+    SessionEvent, Shutdown, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -14,6 +13,7 @@ use coda_examples::{
     storage::JsonFileStorage,
 };
 use coda_openai::OpenAI;
+use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
 use either::Either;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
@@ -254,9 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })),
         approval_timeout: None,
     };
-    let ctx = BuildContext {
-        workspace_dir: workspace_str.clone(),
-    };
+    let ctx = BuildContext::new(workspace_str.clone());
 
     print_logo("An AI Agent");
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -267,13 +265,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = {
         let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
         loop {
-            let mut extra_tools: Vec<Box<dyn coda_agent::ToolSpec>> =
-                vec![Box::new(AskUserToolSpec)];
+            let mut extra_tools: Vec<Box<dyn ToolSpec>> = vec![Box::new(AskUserToolSpec)];
             extra_tools.extend(
                 mcp_servers
                     .tool_objects()
                     .into_iter()
-                    .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn coda_agent::ToolSpec>),
+                    .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn ToolSpec>),
             );
             let spec = build_agent_spec(system_prompt.clone(), extra_tools);
             match Session::builder()

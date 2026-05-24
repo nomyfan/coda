@@ -1,9 +1,8 @@
 use super::*;
 use crate::{
-    AgentCheckpoint, AgentEvent, AgentSpec, AgentState, BuildContext, RunConfig, Sender,
-    SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    AgentCheckpoint, AgentEvent, AgentSpec, RunConfig, Sender, SubAgentMode, ToolApprovalMode,
+    ToolCallResolution,
     runtime::{AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage},
-    spec::{ReadTodosToolSpec, ToolSpec},
 };
 use coda_core::{
     llm::{
@@ -12,6 +11,7 @@ use coda_core::{
     },
     tool::{Tool, ToolObject, ToolResult, ToolWrapper},
 };
+use coda_tools::{BuildContext, ReadTodosToolSpec, ToolSpec};
 use futures::{Stream, StreamExt, stream};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -135,7 +135,7 @@ impl Tool for EchoTool {
 struct EchoToolSpec;
 
 impl ToolSpec for EchoToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(EchoTool::new()))
     }
 }
@@ -193,7 +193,7 @@ struct SlowToolSpec {
 }
 
 impl ToolSpec for SlowToolSpec {
-    fn build(&self, _state: &Arc<Mutex<AgentState>>, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(SlowTool::new(self.gate.clone())))
     }
 }
@@ -527,9 +527,7 @@ where
         initial_task: &str,
     ) -> Self {
         let agents = spec
-            .build(&BuildContext {
-                workspace_dir: ".".into(),
-            })
+            .build(&BuildContext::new("."))
             .expect("build agent tree");
         Self::start_agents(storage, agents, provider, approval, initial_task).await
     }
@@ -662,9 +660,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         tools: vec![],
         subagents: vec![],
     }
-    .build(&BuildContext {
-        workspace_dir: ".".into(),
-    })
+    .build(&BuildContext::new("."))
     .expect("build agent tree");
 
     let config = RunConfig {
@@ -784,11 +780,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let spec = explore_read_todos_spec("main-system");
-    let agents1 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -828,11 +820,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
             resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         },
     );
-    let agents2 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents 2");
+    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents 2");
     let mut harness = harness
         .restart(agents2, provider, approval, decisions)
         .await;
@@ -885,11 +873,7 @@ async fn pending_approval_supports_mixed_resolutions() {
     };
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -938,11 +922,7 @@ async fn pending_approval_supports_mixed_resolutions() {
         result.expect("timed out waiting for suspension")
     };
     harness.shutdown().await;
-    let agents2 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
     harness = harness
         .restart(agents2, provider, approval, decisions_map)
         .await;
@@ -983,11 +963,7 @@ async fn reject_pending_approval_via_restart() {
     };
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1034,11 +1010,7 @@ async fn reject_pending_approval_via_restart() {
                 .collect(),
         },
     );
-    let agents2 = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
     let mut harness = harness
         .restart(agents2, provider, approval, reject_decisions)
         .await;
@@ -1310,11 +1282,7 @@ async fn in_process_resume_after_suspension() {
     let provider = TestProvider::default();
     let approval =
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
-    let agents = spec
-        .build(&BuildContext {
-            workspace_dir: ".".into(),
-        })
-        .expect("build agents");
+    let agents = spec.build(&BuildContext::new(".")).expect("build agents");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,

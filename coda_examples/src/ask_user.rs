@@ -1,5 +1,5 @@
-use coda_agent::{BuildContext, ToolSpec};
 use coda_core::tool::{Tool, ToolError, ToolObject, ToolResult, ToolWrapper};
+use coda_tools::{BuildContext, ToolSpec};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,11 +63,7 @@ impl Tool for AskUserTool {
 pub struct AskUserToolSpec;
 
 impl ToolSpec for AskUserToolSpec {
-    fn build(
-        &self,
-        _state: &std::sync::Arc<tokio::sync::Mutex<coda_agent::AgentState>>,
-        _ctx: &BuildContext,
-    ) -> Box<dyn ToolObject> {
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(AskUserTool::new()))
     }
 }

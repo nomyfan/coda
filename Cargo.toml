@@ -5,6 +5,7 @@ members = [
   "crates/coda_agent",
   "crates/coda_skills",
   "crates/coda_mcp",
+  "crates/coda_tools",
   "coda_examples",
 ]
 resolver = "3"
@@ -15,6 +16,7 @@ coda_core = { path = "crates/coda_core" }
 coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
 coda_skills = { path = "crates/coda_skills" }
+coda_tools = { path = "crates/coda_tools" }
 async-stream = "0.3"
 either = "1.15.0"
 futures = "0.3.31"
