@@ -67,12 +67,12 @@ pub struct McpServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
-    pub servers: Vec<McpServerConfigRaw>,
+    #[serde(rename = "mcpServers", default)]
+    pub mcp_servers: HashMap<String, McpServerConfigRaw>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfigRaw {
-    pub name: String,
     #[serde(rename = "type")]
     pub r#type: Option<String>,
     pub command: Option<String>,
@@ -108,9 +108,8 @@ fn resolve_headers(
 
 impl McpServerConfigRaw {
     #[cfg(test)]
-    fn new(name: &str) -> Self {
+    fn empty() -> Self {
         Self {
-            name: name.to_string(),
             r#type: None,
             command: None,
             args: Vec::new(),
@@ -120,26 +119,26 @@ impl McpServerConfigRaw {
         }
     }
 
-    pub fn resolve(self) -> Result<McpServerConfig, McpError> {
+    pub fn resolve(self, name: String) -> Result<McpServerConfig, McpError> {
         let transport = match self.r#type.as_deref() {
             Some("stdio") => McpTransport::Stdio {
                 command: self.command.ok_or_else(|| McpError::InvalidConfig {
-                    server: self.name.clone(),
+                    server: name.clone(),
                     reason: "type is 'stdio' but 'command' is missing".into(),
                 })?,
                 args: self.args,
                 env: self.env,
             },
-            Some("http") => McpTransport::Http {
+            Some("http" | "streamable-http") => McpTransport::Http {
                 url: self.url.ok_or_else(|| McpError::InvalidConfig {
-                    server: self.name.clone(),
+                    server: name.clone(),
                     reason: "type is 'http' but 'url' is missing".into(),
                 })?,
-                headers: resolve_headers(&self.name, self.headers)?,
+                headers: resolve_headers(&name, self.headers)?,
             },
             Some(other) => {
                 return Err(McpError::UnknownTransport {
-                    server: self.name,
+                    server: name,
                     transport: other.to_string(),
                 });
             }
@@ -150,28 +149,25 @@ impl McpServerConfigRaw {
                     env: self.env,
                 },
                 (None, Some(url)) => McpTransport::Http {
-                    headers: resolve_headers(&self.name, self.headers)?,
+                    headers: resolve_headers(&name, self.headers)?,
                     url,
                 },
                 (Some(_), Some(_)) => {
                     return Err(McpError::InvalidConfig {
-                        server: self.name,
+                        server: name,
                         reason: "both 'command' and 'url' are set, specify 'type' to disambiguate"
                             .into(),
                     });
                 }
                 (None, None) => {
                     return Err(McpError::InvalidConfig {
-                        server: self.name,
+                        server: name,
                         reason: "either 'command' or 'url' must be provided".into(),
                     });
                 }
             },
         };
-        Ok(McpServerConfig {
-            name: self.name,
-            transport,
-        })
+        Ok(McpServerConfig { name, transport })
     }
 }
 
@@ -323,9 +319,9 @@ mod tests {
             command: Some("npx".into()),
             args: vec!["-y".into(), "some-server".into()],
             env: HashMap::from([("KEY".into(), "VAL".into())]),
-            ..McpServerConfigRaw::new("s1")
+            ..McpServerConfigRaw::empty()
         };
-        let config = raw.resolve().unwrap();
+        let config = raw.resolve("s1".into()).unwrap();
         assert_eq!(config.name, "s1");
         match config.transport {
             McpTransport::Stdio { command, args, env } => {
@@ -343,9 +339,9 @@ mod tests {
             r#type: Some("http".into()),
             url: Some("http://localhost:8080/mcp".into()),
             headers: HashMap::from([("Authorization".into(), "Bearer tok".into())]),
-            ..McpServerConfigRaw::new("s2")
+            ..McpServerConfigRaw::empty()
         };
-        let config = raw.resolve().unwrap();
+        let config = raw.resolve("s2".into()).unwrap();
         assert_eq!(config.name, "s2");
         match config.transport {
             McpTransport::Http { url, headers } => {
@@ -364,9 +360,9 @@ mod tests {
         let raw = McpServerConfigRaw {
             command: Some("node".into()),
             args: vec!["server.js".into()],
-            ..McpServerConfigRaw::new("s3")
+            ..McpServerConfigRaw::empty()
         };
-        let config = raw.resolve().unwrap();
+        let config = raw.resolve("s3".into()).unwrap();
         assert!(matches!(config.transport, McpTransport::Stdio { .. }));
     }
 
@@ -375,9 +371,9 @@ mod tests {
         let raw = McpServerConfigRaw {
             url: Some("http://example.com/mcp".into()),
             headers: HashMap::from([("X-Custom".into(), "v".into())]),
-            ..McpServerConfigRaw::new("s4")
+            ..McpServerConfigRaw::empty()
         };
-        let config = raw.resolve().unwrap();
+        let config = raw.resolve("s4".into()).unwrap();
         match config.transport {
             McpTransport::Http { url, headers } => {
                 assert_eq!(url, "http://example.com/mcp");
@@ -396,9 +392,9 @@ mod tests {
     fn resolve_stdio_missing_command() {
         let raw = McpServerConfigRaw {
             r#type: Some("stdio".into()),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
@@ -406,9 +402,9 @@ mod tests {
     fn resolve_http_missing_url() {
         let raw = McpServerConfigRaw {
             r#type: Some("http".into()),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
@@ -416,9 +412,9 @@ mod tests {
     fn resolve_unknown_transport() {
         let raw = McpServerConfigRaw {
             r#type: Some("grpc".into()),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(
             matches!(err, McpError::UnknownTransport { server, transport } if server == "bad" && transport == "grpc")
         );
@@ -429,16 +425,16 @@ mod tests {
         let raw = McpServerConfigRaw {
             command: Some("node".into()),
             url: Some("http://localhost/mcp".into()),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
     #[test]
     fn resolve_neither_command_nor_url() {
-        let raw = McpServerConfigRaw::new("empty");
-        let err = raw.resolve().unwrap_err();
+        let raw = McpServerConfigRaw::empty();
+        let err = raw.resolve("empty".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "empty"));
     }
 
@@ -447,9 +443,9 @@ mod tests {
         let raw = McpServerConfigRaw {
             url: Some("http://example.com/mcp".into()),
             headers: HashMap::from([("bad header\0".into(), "v".into())]),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
@@ -459,9 +455,9 @@ mod tests {
             r#type: Some("http".into()),
             url: Some("http://example.com/mcp".into()),
             headers: HashMap::from([("X-Ok".into(), "bad\nvalue".into())]),
-            ..McpServerConfigRaw::new("bad")
+            ..McpServerConfigRaw::empty()
         };
-        let err = raw.resolve().unwrap_err();
+        let err = raw.resolve("bad".into()).unwrap_err();
         assert!(matches!(err, McpError::InvalidConfig { server, .. } if server == "bad"));
     }
 
@@ -471,9 +467,9 @@ mod tests {
             r#type: Some("stdio".into()),
             command: Some("node".into()),
             url: Some("http://ignored".into()),
-            ..McpServerConfigRaw::new("s5")
+            ..McpServerConfigRaw::empty()
         };
-        let config = raw.resolve().unwrap();
+        let config = raw.resolve("s5".into()).unwrap();
         assert!(matches!(config.transport, McpTransport::Stdio { .. }));
     }
 }
