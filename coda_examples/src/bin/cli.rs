@@ -1,48 +1,23 @@
-mod ask_user;
-mod storage;
-
-use ask_user::{AskUserParams, AskUserToolSpec};
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, AgentSpec, BuildContext, OpenError, ResumeDecision,
-    RunConfig, Session, SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    builtin_specs,
+    AbortedTarget, AgentCheckpoint, AgentEvent, BuildContext, OpenError, ResumeDecision, RunConfig,
+    Session, SessionEvent, Shutdown, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
 };
+use coda_examples::{
+    ask_user::{AskUserParams, AskUserToolSpec},
+    build_agent_spec, build_system_prompt, parse_session_id_arg, print_logo,
+    storage::JsonFileStorage,
+};
 use coda_openai::OpenAI;
-use coda_skills::Skills;
-use dotenvy::dotenv;
 use either::Either;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::{env, time::Duration};
-use storage::JsonFileStorage;
-use tracing::{info, warn};
+use std::time::Duration;
+use tracing::warn;
 use uuid::Uuid;
-
-static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
-static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
-
-const LOGO: &str = r#"
-  ██████╗ ██████╗ ██████╗  █████╗
- ██╔════╝██╔═══██╗██╔══██╗██╔══██╗
- ██║     ██║   ██║██║  ██║███████║
- ██║     ██║   ██║██║  ██║██╔══██║
- ╚██████╗╚██████╔╝██████╔╝██║  ██║
-  ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
-"#;
-
-fn print_logo() {
-    // ANSI 真彩色: \x1b[38;2;<R>;<G>;<B>m
-    // #f27b73 = RGB(242, 123, 115) - 浅珊瑚红
-    println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
-    println!("\x1b[2;37m  An AI Agent\x1b[0m");
-    println!();
-}
 
 fn prompt_ask_user(
     rl: &mut rustyline::DefaultEditor,
@@ -215,80 +190,14 @@ fn render_checkpoint_history(checkpoint: &AgentCheckpoint) {
     println!();
 }
 
-fn build_agent_spec(system_prompt: String) -> AgentSpec {
-    AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt,
-        mode: SubAgentMode::Stateful,
-        tools: {
-            let mut t = builtin_specs();
-            t.push(Box::new(AskUserToolSpec));
-            t
-        },
-        subagents: vec![
-            AgentSpec {
-                name: "explore".into(),
-                description: "An explore sub-agent that can read files, search code, and explore the codebase. Delegate exploration and research tasks to it.".into(),
-                system_prompt:
-                    "You are an exploration assistant. You can read files, search code, and list directories. \
-                     Summarize your findings concisely."
-                        .to_string(),
-                mode: SubAgentMode::Stateless,
-                tools: builtin_specs(),
-                subagents: vec![],
-            },
-            AgentSpec {
-                name: "memo".into(),
-                description: "A stateful memo agent that remembers information across calls. \
-                              Use it to store and recall facts across turns."
-                    .into(),
-                system_prompt:
-                    "You are a simple memo agent. Your only job is to remember what the user tells you and \
-                     answer questions about it. Keep your replies very brief."
-                        .to_string(),
-                mode: SubAgentMode::Stateful,
-                tools: vec![],
-                subagents: vec![],
-            },
-        ],
-    }
-}
-
 fn print_usage(program: &str) {
     println!("Usage: {program} [--resume <uuid>]");
 }
 
-fn parse_session_id_arg(args: impl IntoIterator<Item = String>) -> Result<Option<String>, String> {
-    let mut args = args.into_iter();
-    let mut session_id = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--resume" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "missing value for --resume".to_string())?;
-                Uuid::parse_str(&value)
-                    .map_err(|err| format!("invalid thread id '{value}': {err}"))?;
-                if session_id.replace(value).is_some() {
-                    return Err("session id can only be provided once".to_string());
-                }
-            }
-            "-h" | "--help" => return Err(String::new()),
-            other => return Err(format!("unknown argument: {other}")),
-        }
-    }
-
-    Ok(session_id)
-}
-
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let program = env::args().next().unwrap_or_else(|| "coda".into());
-    // session id is also the thread id for the main agent
-    let resumed_session_id = match parse_session_id_arg(env::args().skip(1)) {
+    let program = std::env::args().next().unwrap_or_else(|| "coda".into());
+    let resumed_session_id = match parse_session_id_arg(std::env::args().skip(1)) {
         Ok(Some(thread_id)) => Some(thread_id),
         Ok(None) => None,
         Err(err) if err.is_empty() => {
@@ -305,11 +214,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    dotenv()?;
+    dotenvy::dotenv()?;
 
-    let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
-    let base_url = env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
-    let model = env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
+    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let base_url = std::env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
+    let model = std::env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -317,26 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
     let workspace_dir = std::env::current_dir()?;
     let workspace_str = workspace_dir.to_string_lossy().into_owned();
-    let mut system_prompt = SYSTEM_PROMPT
-        .replace("{{OS}}", &format!("{}({})", os, arch))
-        .replace("{{WORKSPACE_DIR}}", &workspace_str);
-
-    match Skills::from_dir(&PathBuf::from_str(".coda/skills").unwrap()) {
-        Ok(skills) => {
-            info!("Loaded skills {:?}", skills.0);
-            system_prompt.push_str("\n---\n");
-            system_prompt.push_str(AGENT_SKILLS_PROMPT);
-            system_prompt.push('\n');
-            system_prompt.push_str(&skills.to_xml());
-        }
-        Err(err) => {
-            warn!("Failed to load skills, proceeding without them: {}", err);
-        }
-    }
+    let system_prompt = build_system_prompt(&workspace_str);
 
     let provider = OpenAI::new(LLMProviderConfig {
         api_key,
@@ -361,17 +253,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workspace_dir: workspace_str.clone(),
     };
 
-    print_logo();
+    print_logo("An AI Agent");
     let mut rl = rustyline::DefaultEditor::new()?;
 
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {}\n", session_id);
 
-    // Open session, resolving any pending approvals left over from a prior crash.
     let session = {
         let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
         loop {
-            let spec = build_agent_spec(system_prompt.clone());
+            let spec = build_agent_spec(system_prompt.clone(), vec![Box::new(AskUserToolSpec)]);
             match Session::builder()
                 .storage(storage.clone())
                 .root(spec)
@@ -403,7 +294,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         render_checkpoint_history(checkpoint);
     }
 
-    // If agents are resuming from a mid-run snapshot, consume their events first.
     if session.has_resuming_agents() {
         if !consume_events(&mut rl, &session).await {
             session
@@ -457,14 +347,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Consume events from `session` until the current turn ends.
-///
-/// Suspensions are resolved in-place: the user is prompted and `session.resume`
-/// is called immediately, so the turn continues without a shutdown/reopen cycle.
-///
-/// Returns `false` if a fatal error occurred (resume channel closed, approval
-/// input interrupted), signalling the caller to shut down the session rather
-/// than continuing.
 async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) -> bool {
     loop {
         tokio::select! {
@@ -535,8 +417,6 @@ async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) ->
                             )
                             .await
                         {
-                            // The agent channel closed unexpectedly; abort to
-                            // prevent leaving the session in a suspended state.
                             session.abort().await;
                             println!("\n[Error resuming after approval: {err}]");
                             return false;

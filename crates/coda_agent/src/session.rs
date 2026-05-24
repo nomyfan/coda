@@ -393,14 +393,15 @@ async fn collect_pending_approvals(
                 ref pending_approval_calls,
                 ..
             } = ckpt.resume_point
-                && !pending_approval_calls.is_empty() {
-                    pending.push(PendingApproval {
-                        thread_id: ckpt.thread_id,
-                        agent_name: ckpt.agent_name,
-                        calls: pending_approval_calls.iter().cloned().collect(),
-                        suspended_at: ckpt.suspended_at,
-                    });
-                }
+            && !pending_approval_calls.is_empty()
+        {
+            pending.push(PendingApproval {
+                thread_id: ckpt.thread_id,
+                agent_name: ckpt.agent_name,
+                calls: pending_approval_calls.iter().cloned().collect(),
+                suspended_at: ckpt.suspended_at,
+            });
+        }
     }
     Ok(pending)
 }

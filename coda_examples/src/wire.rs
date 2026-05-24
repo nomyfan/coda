@@ -1,10 +1,3 @@
-//! Wire types for the async HITL client-server protocol.
-//!
-//! These types are independent of the agent SDK's internal event types,
-//! so the wire format can evolve separately from the agent runtime.
-
-pub mod storage;
-
 use coda_agent::{
     AbortedTarget, AgentEvent, EventOrigin, PendingApproval, ResumeDecision, SessionEvent,
 };
@@ -12,10 +5,6 @@ use coda_core::llm::{AssistantMessage, Message, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A flat event combining agent identity with event data.
-///
-/// Unlike the SDK's nested `SessionEvent { origin, thread_id, kind: AgentEvent }`,
-/// this is a single tagged enum for cleaner JSON serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WireEvent {
@@ -69,7 +58,6 @@ pub enum WireEvent {
     },
 }
 
-/// Wire version of [`AbortedTarget`], decoupled from the agent SDK type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason")]
 pub enum AbortedTargetWire {
@@ -89,10 +77,6 @@ impl From<AbortedTarget> for AbortedTargetWire {
 }
 
 impl WireEvent {
-    /// Convert a [`SessionEvent`] into a wire event.
-    ///
-    /// `root_name` replaces the opaque `EventOrigin::Root` with the actual
-    /// root agent name.
     pub fn from_session_event(event: SessionEvent, root_name: &str) -> Self {
         let agent_name = match &event.origin {
             EventOrigin::Root => root_name.to_string(),
@@ -148,9 +132,7 @@ impl WireEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub session_id: String,
-    /// `None` when this turn is a pure resume (no new user input).
     pub task: Option<String>,
-    /// Key = `thread_id` from `PendingApproval`.
     #[serde(default)]
     pub resume_decisions: HashMap<String, ResumeDecision>,
 }
@@ -159,7 +141,6 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     pub status: ChatStatus,
     pub events: Vec<WireEvent>,
-    /// Non-empty only when `status == PendingApproval`.
     #[serde(default)]
     pub pending_approvals: Vec<PendingApproval>,
 }
