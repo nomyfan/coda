@@ -23,7 +23,13 @@ fn sanitize_tool_name(prefix: &str, raw_name: &str) -> String {
     let body = format!("{prefix}__{raw_name}");
     let sanitized_body: String = body
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let full = format!("{NAME_PREFIX}{sanitized_body}");
     if full.len() <= MAX_LEN {
@@ -111,10 +117,7 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_valid_chars() {
-        assert_eq!(
-            sanitize_tool_name("fs", "list-dir"),
-            "mcp__fs__list-dir"
-        );
+        assert_eq!(sanitize_tool_name("fs", "list-dir"), "mcp__fs__list-dir");
     }
 
     #[test]
@@ -123,7 +126,11 @@ mod tests {
         let result = sanitize_tool_name("server", &long_name);
         assert!(result.len() <= 64);
         assert!(result.starts_with("mcp__"));
-        assert!(result.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(
+            result
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
     }
 
     #[test]

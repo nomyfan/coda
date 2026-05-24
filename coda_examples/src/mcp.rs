@@ -38,9 +38,16 @@ pub async fn load_mcp_servers(workspace_dir: &Path) -> Result<McpServers, McpErr
         .map_err(|e| McpError::Connect(format!("invalid mcp.json: {e}")))?;
 
     let mut servers = Vec::new();
-    for server_config in &config.servers {
+    for raw in config.servers {
+        let server_config = match raw.resolve() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "invalid MCP server config, skipping");
+                continue;
+            }
+        };
         info!(server = server_config.name, "connecting to MCP server");
-        match McpServer::connect(server_config).await {
+        match McpServer::connect(&server_config).await {
             Ok(server) => {
                 servers.push(server);
             }
