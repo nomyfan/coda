@@ -17,7 +17,7 @@ use coda_examples::{
 use coda_openai::OpenAI;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 struct AppState {
     storage: JsonFileStorage,
@@ -254,11 +254,24 @@ async fn main() {
     let app = Router::new()
         .route("/chat", post(chat_handler))
         .route("/history/{session_id}", get(history_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
     info!("coda_server listening on http://127.0.0.1:3000");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received");
+        })
+        .await
+        .unwrap();
+
+    match Arc::try_unwrap(state) {
+        Ok(app_state) => app_state.mcp_servers.shutdown().await,
+        Err(_) => warn!("cannot shutdown MCP servers: outstanding references"),
+    }
+
+    info!("server stopped");
 }
