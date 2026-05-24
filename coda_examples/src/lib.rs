@@ -4,8 +4,7 @@ pub mod wire;
 
 use coda_agent::{AgentSpec, SubAgentMode, ToolSpec, builtin_specs};
 use coda_skills::Skills;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -35,7 +34,7 @@ pub fn build_system_prompt(workspace_dir: &str) -> String {
         .replace("{{OS}}", &format!("{os}({arch})"))
         .replace("{{WORKSPACE_DIR}}", workspace_dir);
 
-    match Skills::from_dir(&PathBuf::from_str(".coda/skills").unwrap()) {
+    match Skills::from_dir(&Path::new(workspace_dir).join(".coda/skills")) {
         Ok(skills) => {
             info!("loaded {} skills", skills.0.len());
             prompt.push_str("\n---\n");
