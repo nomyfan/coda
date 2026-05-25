@@ -14,12 +14,13 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentCheckpoint, AgentEvent, Envelope, PendingApproval, ResumeDecision,
-    RunConfig, Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender,
+    SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget, ResumePoint,
         ToolExecutionState,
     },
+    persist::StoredCheckpoint,
     runtime::AgentRuntime,
 };
 
@@ -222,27 +223,31 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
 
 impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     async fn run(&mut self, envelope: Option<Envelope>) -> Result<TurnOutcome, String> {
-        let mut checkpoint = self
+        // Load stored checkpoint and scatter its fields into the appropriate
+        // locations. After this block the stored type is gone — only the
+        // `resume_point` local variable carries forward.
+        let stored = self
             .runtime
             .session_storage
             .load_checkpoint(self.thread_id.as_ref())
-            .await?
-            .unwrap_or_else(|| AgentCheckpoint {
-                thread_id: self.thread_id.as_ref().to_string(),
-                agent_name: self.agent.name.to_string(),
-                ..Default::default()
-            });
-        self.agent
-            .restore_history(checkpoint.messages.clone(), checkpoint.todos.clone())
-            .await;
-        self.reply_target = checkpoint.reply_target.clone();
-        let resume_point = std::mem::take(&mut checkpoint.resume_point);
+            .await?;
+        let mut resume_point: ResumePoint = if let Some(stored) = stored {
+            self.agent
+                .restore_history(stored.messages, stored.todos)
+                .await;
+            self.reply_target = stored.reply_target;
+            stored.resume_point.into()
+        } else {
+            ResumePoint::Generation
+        };
+
+        let mut suspended_at = jiff::Timestamp::default();
+
         if let Some(envelope) = envelope {
             match self.handle_envelope(resume_point, envelope).await {
-                AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-                AgentLoopState::Done(resume_point) => {
-                    checkpoint.resume_point = resume_point;
-                    self.save_checkpoint(checkpoint).await;
+                AgentLoopState::Next(rp) => resume_point = rp,
+                AgentLoopState::Done(rp) => {
+                    self.save_checkpoint(rp, suspended_at).await;
                     return Ok(TurnOutcome::Completed);
                 }
             }
@@ -255,49 +260,46 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 exit_acquired = true;
                 break;
             }
-            let resume_point = std::mem::take(&mut checkpoint.resume_point);
-            match resume_point {
+            let current = std::mem::take(&mut resume_point);
+            match current {
                 ResumePoint::Generation => match self.handle_generation().await {
-                    AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-                    AgentLoopState::Done(resume_point) => {
-                        checkpoint.resume_point = resume_point;
+                    AgentLoopState::Next(rp) => resume_point = rp,
+                    AgentLoopState::Done(rp) => {
+                        resume_point = rp;
                         break;
                     }
                 },
-                ResumePoint::ToolExecution(tool_execution_state) => match self
-                    .handle_tool_execution(tool_execution_state)
-                    .await
-                {
-                    AgentLoopState::Next(resume_point @ ResumePoint::ToolExecution(_)) => {
-                        checkpoint.resume_point = resume_point;
-                        break;
+                ResumePoint::ToolExecution(tool_execution_state) => {
+                    match self.handle_tool_execution(tool_execution_state).await {
+                        AgentLoopState::Next(rp @ ResumePoint::ToolExecution(_)) => {
+                            resume_point = rp;
+                            break;
+                        }
+                        AgentLoopState::Next(rp) => resume_point = rp,
+                        AgentLoopState::Done(rp) => {
+                            resume_point = rp;
+                            break;
+                        }
                     }
-                    AgentLoopState::Next(resume_point) => checkpoint.resume_point = resume_point,
-                    AgentLoopState::Done(resume_point) => {
-                        checkpoint.resume_point = resume_point;
-                        break;
-                    }
-                },
+                }
                 ResumePoint::PendingApproval {
                     pending_approval_calls,
                     pending_calls,
                 } => {
                     let has_pending = !pending_approval_calls.is_empty();
                     let pending = PendingApproval {
-                        thread_id: checkpoint.thread_id.clone(),
-                        agent_name: checkpoint.agent_name.clone(),
+                        thread_id: self.thread_id.as_ref().to_string(),
+                        agent_name: self.agent.name.to_string(),
                         calls: pending_approval_calls.iter().cloned().collect(),
                         suspended_at: jiff::Timestamp::now(),
                     };
-                    checkpoint.resume_point = ResumePoint::PendingApproval {
+                    resume_point = ResumePoint::PendingApproval {
                         pending_approval_calls,
                         pending_calls,
                     };
                     if has_pending {
                         suspended = true;
-                        checkpoint.suspended_at = pending.suspended_at;
-                        checkpoint.todos = self.agent.todos().await;
-                        checkpoint.messages = self.agent.history().await;
+                        suspended_at = pending.suspended_at;
                         self.runtime
                             .emit_event(
                                 self.agent.name.clone(),
@@ -311,7 +313,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
         }
 
-        self.save_checkpoint(checkpoint).await;
+        self.save_checkpoint(resume_point, suspended_at).await;
         Ok(if exit_acquired {
             TurnOutcome::ExitAcquired
         } else if suspended {
@@ -321,14 +323,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         })
     }
 
-    async fn save_checkpoint(&self, mut checkpoint: AgentCheckpoint) {
-        checkpoint.todos = self.agent.todos().await;
-        checkpoint.messages = self.agent.history().await;
-        checkpoint.reply_target = self.reply_target.clone();
+    async fn save_checkpoint(&self, resume_point: ResumePoint, suspended_at: jiff::Timestamp) {
+        let stored = StoredCheckpoint {
+            version: 1,
+            thread_id: self.thread_id.as_ref().to_string(),
+            agent_name: self.agent.name.to_string(),
+            reply_target: self.reply_target.clone(),
+            messages: self.agent.history().await,
+            todos: self.agent.todos().await,
+            resume_point: resume_point.into(),
+            suspended_at,
+        };
         if let Err(err) = self
             .runtime
             .session_storage
-            .save_checkpoint(self.thread_id.as_ref().to_string(), checkpoint)
+            .save_checkpoint(self.thread_id.as_ref().to_string(), stored)
             .await
         {
             error!(

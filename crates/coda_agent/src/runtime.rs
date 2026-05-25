@@ -1,8 +1,8 @@
 mod driver;
 
-use crate::{Agent, AgentCheckpoint, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
+use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
+use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
 use coda_core::llm::LLMProvider;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -64,30 +64,30 @@ pub trait SessionStorage: Send + Sync {
     fn save_checkpoint(
         &self,
         thread_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
     fn load_checkpoint(
         &self,
         thread_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>>;
 
     fn save_session_snapshot(
         &self,
         session_id: String,
-        snapshot: AgentRuntimeSnapshot,
+        snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
     fn load_session_snapshot(
         &self,
         session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>;
 }
 
 impl SessionStorage for Arc<dyn SessionStorage> {
     fn save_checkpoint(
         &self,
         thread_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         (**self).save_checkpoint(thread_id, checkpoint)
     }
@@ -95,14 +95,14 @@ impl SessionStorage for Arc<dyn SessionStorage> {
     fn load_checkpoint(
         &self,
         thread_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         (**self).load_checkpoint(thread_id)
     }
 
     fn save_session_snapshot(
         &self,
         session_id: String,
-        snapshot: AgentRuntimeSnapshot,
+        snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         (**self).save_session_snapshot(session_id, snapshot)
     }
@@ -110,7 +110,7 @@ impl SessionStorage for Arc<dyn SessionStorage> {
     fn load_session_snapshot(
         &self,
         session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
     {
         (**self).load_session_snapshot(session_id)
     }
@@ -118,15 +118,15 @@ impl SessionStorage for Arc<dyn SessionStorage> {
 
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
-    checkpoints: Arc<Mutex<HashMap<String, AgentCheckpoint>>>,
-    snapshots: Arc<Mutex<HashMap<String, AgentRuntimeSnapshot>>>,
+    checkpoints: Arc<Mutex<HashMap<String, StoredCheckpoint>>>,
+    snapshots: Arc<Mutex<HashMap<String, StoredRuntimeSnapshot>>>,
 }
 
 impl SessionStorage for MemoryStorage {
     fn save_checkpoint(
         &self,
         thread_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             self.checkpoints.lock().await.insert(thread_id, checkpoint);
@@ -137,7 +137,7 @@ impl SessionStorage for MemoryStorage {
     fn load_checkpoint(
         &self,
         thread_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         let thread_id = thread_id.to_owned();
         Box::pin(async move {
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
@@ -148,7 +148,7 @@ impl SessionStorage for MemoryStorage {
     fn save_session_snapshot(
         &self,
         session_id: String,
-        snapshot: AgentRuntimeSnapshot,
+        snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             self.snapshots.lock().await.insert(session_id, snapshot);
@@ -159,7 +159,7 @@ impl SessionStorage for MemoryStorage {
     fn load_session_snapshot(
         &self,
         session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
     {
         let session_id = session_id.to_owned();
         Box::pin(async move {
@@ -186,7 +186,7 @@ impl ExitBarrier {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct AgentRuntimeSnapshot {
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
@@ -326,7 +326,7 @@ impl AgentRuntime {
                 .push(envelope);
             if let Err(err) = self
                 .session_storage
-                .save_session_snapshot(self.session_id.clone(), snapshot.clone())
+                .save_session_snapshot(self.session_id.clone(), snapshot.clone().into())
                 .await
             {
                 warn!(
@@ -364,7 +364,7 @@ impl AgentRuntime {
         }
         if let Err(err) = self
             .session_storage
-            .save_session_snapshot(self.session_id.clone(), snapshot.clone())
+            .save_session_snapshot(self.session_id.clone(), snapshot.clone().into())
             .await
         {
             warn!("Failed to persist session snapshot: {}", err);
@@ -403,7 +403,10 @@ impl AgentRuntime {
         // combine request_abort + request_exit manually to guarantee termination.
         if let Err(err) = self
             .session_storage
-            .save_session_snapshot(self.session_id.clone(), self.snapshot.lock().await.clone())
+            .save_session_snapshot(
+                self.session_id.clone(),
+                self.snapshot.lock().await.clone().into(),
+            )
             .await
         {
             warn!("Failed to persist session snapshot: {}", err);
