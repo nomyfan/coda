@@ -262,6 +262,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             let current = std::mem::take(&mut resume_point);
             match current {
                 ResumePoint::Generation => match self.handle_generation().await {
+                    AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
+                        suspended_at = jiff::Timestamp::now();
+                        resume_point = rp;
+                    }
                     AgentLoopState::Next(rp) => resume_point = rp,
                     AgentLoopState::Done(rp) => {
                         resume_point = rp;
@@ -290,7 +294,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         thread_id: self.thread_id.as_ref().to_string(),
                         agent_name: self.agent.name.to_string(),
                         calls: pending_approval_calls.iter().cloned().collect(),
-                        suspended_at: jiff::Timestamp::now(),
+                        suspended_at,
                     };
                     resume_point = ResumePoint::PendingApproval {
                         pending_approval_calls,
@@ -298,7 +302,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     };
                     if has_pending {
                         suspended = true;
-                        suspended_at = pending.suspended_at;
                         self.runtime
                             .emit_event(
                                 self.agent.name.clone(),

@@ -1037,6 +1037,64 @@ async fn reject_pending_approval_via_restart() {
 }
 
 #[tokio::test]
+async fn restart_re_emits_pending_approval_with_original_suspended_at() {
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "interrupt-main".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![Box::new(ReadTodosToolSpec)],
+        subagents: vec![],
+    };
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        agents1,
+        provider.clone(),
+        approval.clone(),
+        "phase1",
+    )
+    .await;
+
+    let first_pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for first suspension")
+    };
+    harness.shutdown().await;
+
+    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let mut harness = harness
+        .restart(agents2, provider, approval, HashMap::new())
+        .await;
+
+    let resumed_pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for resumed suspension")
+    };
+
+    assert_eq!(resumed_pending.suspended_at, first_pending.suspended_at);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
     let mut harness = Harness::start_with_spec(
