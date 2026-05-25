@@ -18,6 +18,7 @@ use coda_core::llm::{
 };
 use coda_tools::BuildContext;
 use futures::{Stream, stream};
+use serde_json::json;
 use tokio::time::timeout;
 
 // ---------------------------------------------------------------------------
@@ -82,7 +83,8 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         }
 
         // 2. "read file at <path>" → call read_file, then summarize
-        if user_text.contains("read file at") {
+        if let Some(path) = user_text.strip_prefix("read file at ") {
+            let path = path.trim();
             if has_results {
                 let tool_output = request
                     .messages
@@ -104,23 +106,19 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     ..Default::default()
                 });
             }
-            let path = user_text.strip_prefix("read file at ").unwrap_or("").trim();
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
                     id: "call_read".into(),
                     name: "read_file".into(),
-                    arguments: Some(format!(r#"{{"file_path":"{path}"}}"#)),
+                    arguments: Some(json!({"file_path": path}).to_string()),
                 }],
                 ..Default::default()
             });
         }
 
         // 3. "write then read <path>" → write_file first, then read_file
-        if user_text.contains("write then read") {
-            let path = user_text
-                .strip_prefix("write then read ")
-                .unwrap_or("")
-                .trim();
+        if let Some(path) = user_text.strip_prefix("write then read ") {
+            let path = path.trim();
 
             let has_write = request
                 .messages
@@ -156,7 +154,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     tool_calls: vec![ToolCall {
                         id: "call_read".into(),
                         name: "read_file".into(),
-                        arguments: Some(format!(r#"{{"file_path":"{path}"}}"#)),
+                        arguments: Some(json!({"file_path": path}).to_string()),
                     }],
                     ..Default::default()
                 });
@@ -165,9 +163,9 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     tool_calls: vec![ToolCall {
                         id: "call_write".into(),
                         name: "write_file".into(),
-                        arguments: Some(format!(
-                            r#"{{"file_path":"{path}","content":"e2e-test-data"}}"#
-                        )),
+                        arguments: Some(
+                            json!({"file_path": path, "content": "e2e-test-data"}).to_string(),
+                        ),
                     }],
                     ..Default::default()
                 });
@@ -331,14 +329,16 @@ fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
 
 /// Collect events until the root agent produces a final `LLMEnd` with no tool
 /// calls (i.e., the turn is complete). Returns the final assistant content.
+/// Only considers events from the root agent — sub-agent events are ignored.
 async fn collect_until_done(session: &Session) -> String {
     let deadline = Duration::from_secs(5);
     let result = timeout(deadline, async {
         loop {
-            let Some(SessionEvent { kind, .. }) = session.recv().await else {
+            let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
                 panic!("session closed before turn completed");
             };
-            if let AgentEvent::LLMEnd(msg) = kind
+            if origin.is_root()
+                && let AgentEvent::LLMEnd(msg) = kind
                 && msg.tool_calls.is_empty()
             {
                 return msg.content;
@@ -351,14 +351,17 @@ async fn collect_until_done(session: &Session) -> String {
 
 /// Collect events until the root agent produces a `Suspended` event for
 /// approval. Returns the `PendingApproval`.
+/// Only considers events from the root agent — sub-agent events are ignored.
 async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApproval {
     let deadline = Duration::from_secs(5);
     let result = timeout(deadline, async {
         loop {
-            let Some(SessionEvent { kind, .. }) = session.recv().await else {
+            let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
                 panic!("session closed before suspension");
             };
-            if let AgentEvent::Suspended(pending) = kind {
+            if origin.is_root()
+                && let AgentEvent::Suspended(pending) = kind
+            {
                 return pending;
             }
         }
@@ -612,7 +615,7 @@ async fn session_resume_from_checkpoint() {
 
 /// 7. Approval flow: suspend for approval, resume with Execute, turn completes.
 #[tokio::test]
-async fn session_approval_auto_approve() {
+async fn session_approval_resume_execute() {
     let spec = simple_spec("e2e-system");
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
 
