@@ -337,11 +337,14 @@ async fn collect_until_done(session: &Session) -> String {
             let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
                 panic!("session closed before turn completed");
             };
-            if origin.is_root()
-                && let AgentEvent::LLMEnd(msg) = kind
-                && msg.tool_calls.is_empty()
-            {
-                return msg.content;
+            if !origin.is_root() {
+                continue;
+            }
+            match kind {
+                AgentEvent::LLMEnd(msg) if msg.tool_calls.is_empty() => return msg.content,
+                AgentEvent::Error(err) => panic!("root agent error: {err}"),
+                AgentEvent::Aborted(target) => panic!("root agent aborted: {target:?}"),
+                _ => {}
             }
         }
     })
@@ -359,10 +362,14 @@ async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApprov
             let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
                 panic!("session closed before suspension");
             };
-            if origin.is_root()
-                && let AgentEvent::Suspended(pending) = kind
-            {
-                return pending;
+            if !origin.is_root() {
+                continue;
+            }
+            match kind {
+                AgentEvent::Suspended(pending) => return pending,
+                AgentEvent::Error(err) => panic!("root agent error: {err}"),
+                AgentEvent::Aborted(target) => panic!("root agent aborted: {target:?}"),
+                _ => {}
             }
         }
     })
