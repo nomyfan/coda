@@ -239,6 +239,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.reply_target = stored.reply_target;
                 (stored.resume_point.into(), stored.suspended_at)
             } else {
+                // The Agent instance may be reused across different thread IDs
+                // (e.g. stateless subagent calls), so we must clear any stale
+                // in-memory state to avoid leaking conversation across threads.
+                self.agent.restore_history(vec![], vec![]).await;
+                self.reply_target = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
             };
 
