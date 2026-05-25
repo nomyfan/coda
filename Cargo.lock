@@ -277,6 +277,7 @@ dependencies = [
 name = "coda_examples"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "axum",
  "coda_agent",
  "coda_core",
@@ -286,12 +287,14 @@ dependencies = [
  "coda_tools",
  "dotenvy",
  "either",
+ "futures",
  "jiff",
  "reqwest 0.12.28",
  "rustyline",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
