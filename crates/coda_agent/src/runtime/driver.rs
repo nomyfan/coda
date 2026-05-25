@@ -231,17 +231,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .session_storage
             .load_checkpoint(self.thread_id.as_ref())
             .await?;
-        let mut resume_point: ResumePoint = if let Some(stored) = stored {
-            self.agent
-                .restore_history(stored.messages, stored.todos)
-                .await;
-            self.reply_target = stored.reply_target;
-            stored.resume_point.into()
-        } else {
-            ResumePoint::Generation
-        };
-
-        let mut suspended_at = jiff::Timestamp::default();
+        let (mut resume_point, mut suspended_at): (ResumePoint, jiff::Timestamp) =
+            if let Some(stored) = stored {
+                self.agent
+                    .restore_history(stored.messages, stored.todos)
+                    .await;
+                self.reply_target = stored.reply_target;
+                (stored.resume_point.into(), stored.suspended_at)
+            } else {
+                (ResumePoint::Generation, jiff::Timestamp::default())
+            };
 
         if let Some(envelope) = envelope {
             match self.handle_envelope(resume_point, envelope).await {
