@@ -55,10 +55,11 @@ fn completed(
     Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(msg))]))
 }
 
-/// A fake LLM provider that returns pre-scripted responses based on message content.
+/// A fake LLM provider that returns pre-scripted responses based on message
+/// content.
 ///
-/// Routing logic uses the last user message text (not system prompt) because the
-/// E2E tests use production-style system prompts.
+/// Routing logic uses the last user message text (not system prompt) because
+/// the E2E tests use production-style system prompts.
 #[derive(Clone, Default)]
 struct FakeProvider;
 
@@ -83,7 +84,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         // 2. "read file at <path>" → call read_file, then summarize
         if user_text.contains("read file at") {
             if has_results {
-                // Second turn: tool result received, summarize
                 let tool_output = request
                     .messages
                     .iter()
@@ -104,7 +104,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     ..Default::default()
                 });
             }
-            // First turn: emit read_file tool call
             let path = user_text.strip_prefix("read file at ").unwrap_or("").trim();
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
@@ -123,7 +122,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                 .unwrap_or("")
                 .trim();
 
-            // Check which tool results we already have
             let has_write = request
                 .messages
                 .iter()
@@ -134,7 +132,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                 .any(|m| matches!(m, Message::Tool(t) if t.name == "read_file"));
 
             if has_read {
-                // Both tools done, produce final response
                 let read_output = request
                     .messages
                     .iter()
@@ -155,7 +152,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     ..Default::default()
                 });
             } else if has_write {
-                // Write done, now read
                 return completed(AssistantMessage {
                     tool_calls: vec![ToolCall {
                         id: "call_read".into(),
@@ -165,7 +161,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     ..Default::default()
                 });
             } else {
-                // First turn: write the file
                 return completed(AssistantMessage {
                     tool_calls: vec![ToolCall {
                         id: "call_write".into(),
@@ -243,7 +238,6 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             });
         }
         if user_text.contains("resume test follow") {
-            // Count total messages to verify history was loaded
             let total = request.messages.len();
             return completed(AssistantMessage {
                 content: format!("session-2-reply (history-len: {total})"),
@@ -430,7 +424,6 @@ async fn session_tool_read_file() {
     session.send(task).await.expect("send");
 
     let reply = collect_until_done(&session).await;
-    // The reply should contain the file content (with line numbers from read_file)
     assert!(
         reply.contains("line one"),
         "expected file content in reply, got: {reply}"
@@ -470,13 +463,11 @@ async fn session_tool_write_then_read_file() {
     session.send(task).await.expect("send");
 
     let reply = collect_until_done(&session).await;
-    // The reply should contain the round-tripped content
     assert!(
         reply.contains("e2e-test-data"),
         "expected round-tripped content, got: {reply}"
     );
 
-    // Also verify the file actually exists on disk
     let on_disk = std::fs::read_to_string(&file_path).expect("read from disk");
     assert_eq!(on_disk, "e2e-test-data");
 
@@ -485,10 +476,24 @@ async fn session_tool_write_then_read_file() {
         .await;
 }
 
-/// 4. Delegate a task to the explore sub-agent through the production agent tree.
+/// 4. Delegate a task to the explore sub-agent.
 #[tokio::test]
 async fn session_subagent_explore_delegation() {
-    let spec = coda_examples::build_agent_spec("e2e-system".into(), vec![]);
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "e2e-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec![AgentSpec {
+            name: "explore".into(),
+            description: "An explore sub-agent.".into(),
+            system_prompt: "You are an exploration assistant.".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
+    };
 
     let session = Session::builder()
         .storage(MemoryStorage::default())
@@ -536,7 +541,6 @@ async fn session_multi_turn_conversation() {
         .await
         .expect("send turn 2");
     let reply2 = collect_until_done(&session).await;
-    // The provider should see 2 user messages (system + user1 + assistant1 + user2)
     assert!(
         reply2.contains("saw 2 user messages"),
         "expected 2 user messages in history, got: {reply2}"
@@ -585,7 +589,6 @@ async fn session_resume_from_checkpoint() {
         .await
         .expect("open session 2");
 
-    // The resumed session should have the checkpoint from session 1
     assert!(
         session2.resumed_checkpoint().is_some(),
         "expected a resumed checkpoint"
@@ -593,7 +596,6 @@ async fn session_resume_from_checkpoint() {
 
     session2.send("resume test follow").await.expect("send");
     let reply2 = collect_until_done(&session2).await;
-    // The provider should see prior history (system + user1 + assistant1 + user2)
     assert!(
         reply2.contains("session-2-reply"),
         "expected session-2-reply, got: {reply2}"
@@ -632,12 +634,10 @@ async fn session_approval_auto_approve() {
 
     session.send("approve read_todos").await.expect("send");
 
-    // Should receive Suspended event
     let pending = collect_until_suspended(&session).await;
     assert_eq!(pending.calls.len(), 1);
     assert_eq!(pending.calls[0].name, "read_todos");
 
-    // Resume with Execute
     session
         .resume(
             &pending.agent_name,
@@ -686,7 +686,6 @@ async fn session_approval_timeout_auto_rejects() {
 
     session1.send("timeout approval").await.expect("send");
 
-    // Wait for suspension (don't resume)
     let pending = collect_until_suspended(&session1).await;
     assert_eq!(pending.calls[0].name, "read_todos");
 
@@ -718,7 +717,6 @@ async fn session_approval_timeout_auto_rejects() {
         .await
         .expect("open session 2 (should auto-reject)");
 
-    // The auto-rejected approval should resume the agent. Collect the final reply.
     let reply = collect_until_done(&session2).await;
     assert!(
         reply.contains("Rejected"),
