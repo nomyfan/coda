@@ -332,7 +332,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 
     async fn save_checkpoint(&self, resume_point: ResumePoint, suspended_at: jiff::Timestamp) {
         let stored = StoredCheckpoint {
-            version: 1,
             thread_id: self.thread_id.as_ref().to_string(),
             agent_name: self.agent.name.to_string(),
             reply_target: self.reply_target.clone(),

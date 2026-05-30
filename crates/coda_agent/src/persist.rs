@@ -17,10 +17,6 @@ use crate::agent::{
 };
 use crate::runtime::AgentRuntimeSnapshot;
 
-fn default_version() -> u32 {
-    1
-}
-
 // ---------------------------------------------------------------------------
 // StoredCheckpoint
 // ---------------------------------------------------------------------------
@@ -28,8 +24,6 @@ fn default_version() -> u32 {
 /// On-disk representation of a single agent thread's state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCheckpoint {
-    #[serde(default = "default_version")]
-    pub version: u32,
     pub thread_id: String,
     pub agent_name: String,
     #[serde(default)]
@@ -75,8 +69,6 @@ pub struct StoredPendingToolCall {
 /// On-disk representation of the per-session runtime state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRuntimeSnapshot {
-    #[serde(default = "default_version")]
-    pub version: u32,
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub active_threads: HashMap<String, String>,
@@ -123,7 +115,6 @@ impl From<ResumePoint> for StoredResumePoint {
 impl From<AgentRuntimeSnapshot> for StoredRuntimeSnapshot {
     fn from(s: AgentRuntimeSnapshot) -> Self {
         StoredRuntimeSnapshot {
-            version: 1,
             drained_envelopes: s.drained_envelopes,
             agent_drained_envelopes: s.agent_drained_envelopes,
             active_threads: s.active_threads,
