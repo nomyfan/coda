@@ -275,7 +275,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "coda_examples"
+name = "coda_mcp"
+version = "0.1.0"
+dependencies = [
+ "coda_core",
+ "http",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "coda_openai"
+version = "0.1.0"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "coda_core",
+ "futures",
+]
+
+[[package]]
+name = "coda_server"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -298,29 +321,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "coda_mcp"
-version = "0.1.0"
-dependencies = [
- "coda_core",
- "http",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "coda_openai"
-version = "0.1.0"
-dependencies = [
- "async-openai",
- "async-stream",
- "coda_core",
- "futures",
 ]
 
 [[package]]

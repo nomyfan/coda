@@ -1,6 +1,7 @@
 use coda_agent::{ResumeDecision, ToolCallResolution};
 use coda_core::llm::{Message, ToolCall, ToolCallOutcome, ToolOutput};
-use coda_examples::{
+use coda_server::{
+    ask_user::AskUserParams,
     config::ToolApprovalConfig,
     parse_session_id_arg, print_logo,
     wire::{
@@ -154,6 +155,36 @@ fn render_event(event: &WireEvent, root_name: &str) {
     }
 }
 
+fn prompt_ask_user(
+    rl: &mut rustyline::DefaultEditor,
+    question: &str,
+    options: &[String],
+) -> Result<String, Box<dyn std::error::Error>> {
+    println!("\n[User Input Required]\n");
+    println!("{}\n", question);
+    for (i, opt) in options.iter().enumerate() {
+        println!("  {}. {}", i + 1, opt);
+    }
+    println!("  0. Other (type your own response)\n");
+
+    loop {
+        let input = rl.readline("> ")?;
+        let input = input.trim().to_string();
+
+        if input == "0" {
+            let custom = rl.readline("Your response: ")?;
+            return Ok(custom.trim().to_string());
+        }
+        if let Ok(idx) = input.parse::<usize>()
+            && idx >= 1
+            && idx <= options.len()
+        {
+            return Ok(options[idx - 1].clone());
+        }
+        println!("  Please enter a number between 0 and {}.", options.len());
+    }
+}
+
 enum ApprovalResult {
     Approve(String),
     Reject(String, Option<String>),
@@ -222,6 +253,21 @@ async fn resolve_pending_calls(
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
     for pending_call in pending_calls {
+        if pending_call.name == "ask_user" {
+            let output = match serde_json::from_str::<AskUserParams>(
+                pending_call.arguments.as_deref().unwrap_or("{}"),
+            ) {
+                Ok(params) => {
+                    ToolOutput::Ok(prompt_ask_user(rl, &params.question, &params.options)?)
+                }
+                Err(err) => ToolOutput::Err(format!("Invalid ask_user arguments: {err}")),
+            };
+            resolutions.push((
+                pending_call.id.clone(),
+                ToolCallResolution::Resolved(output),
+            ));
+            continue;
+        }
         loop {
             match prompt_approval(rl, pending_call)? {
                 ApprovalResult::Approve(id) => {

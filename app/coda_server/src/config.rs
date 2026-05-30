@@ -82,7 +82,11 @@ impl ToolApprovalConfig {
     /// The returned closure captures the inner `Arc` so that patterns added via
     /// [`add_allow_pattern`] take effect immediately for subsequent tool calls.
     pub fn into_approval_mode(self) -> ToolApprovalMode {
-        ToolApprovalMode::RequireWhen(Arc::new(move |call| self.requires_approval(call)))
+        ToolApprovalMode::RequireWhen(Arc::new(move |call| {
+            // `ask_user` has no real execution — it must always suspend so the
+            // caller can interactively answer and resolve it.
+            call.name == "ask_user" || self.requires_approval(call)
+        }))
     }
 
     /// Whether `call` should be suspended for human approval.

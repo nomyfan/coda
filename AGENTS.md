@@ -12,10 +12,12 @@ Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (s
 
 ## Architecture
 
-Cargo workspace implementing an AI Agent CLI:
+Cargo workspace implementing an AI Agent:
 
 ```
-coda_examples (example binaries: cli, client, server)
+app/
+  coda_server (server + client binaries)
+crates/
   ├── coda_agent   — agent runtime
   ├── coda_tools   — built-in tool implementations & tool spec system
   ├── coda_core    — shared protocol & abstractions
@@ -32,7 +34,7 @@ coda_examples (example binaries: cli, client, server)
 - **`coda_tools`** — Built-in tool implementations and the tool spec system. Provides 8 built-in tools (shell, file read/write, ls, glob, grep, read_todos, write_todos), `TodoItem`, the `ToolSpec` trait, `BuildContext`, `PrebuiltToolSpec`, and `builtin_specs()`. Depends on `coda_core`.
 - **`coda_skills`** — Loads skill definitions from `.coda/skills/<name>/SKILL.md` directories. Parses YAML frontmatter (name, description, etc.) and generates XML for system-prompt injection.
 - **`coda_mcp`** — MCP (Model Context Protocol) client integration. Supports stdio and HTTP (streamable-http) transports, adapts MCP server tools into `ToolObject` instances via `McpToolAdapter`, auto-prefixes tool names with `mcp__` and truncates to 64 chars. Configuration is read from the `mcpServers` field in a JSON file.
-- **`coda_examples`** — Example applications: interactive CLI entry point, system-prompt construction, MCP server loading, and session persistence (JSON file storage).
+- **`coda_server`** — Application layer: HTTP server (axum), CLI client, system-prompt construction, tool approval config, MCP server loading, wire protocol types, and session persistence (JSON file storage). Located at `app/coda_server`.
 
 ### Key Abstractions
 

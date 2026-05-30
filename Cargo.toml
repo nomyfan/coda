@@ -6,7 +6,7 @@ members = [
   "crates/coda_skills",
   "crates/coda_mcp",
   "crates/coda_tools",
-  "coda_examples",
+  "app/coda_server",
 ]
 resolver = "3"
 

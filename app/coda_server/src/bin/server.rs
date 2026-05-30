@@ -6,7 +6,9 @@ use axum::{
 };
 use coda_agent::{AgentEvent, OpenError, RunConfig, Session, Shutdown, runtime::SessionStorage};
 use coda_core::llm::LLMProviderConfig;
-use coda_examples::{
+use coda_openai::OpenAI;
+use coda_server::{
+    ask_user::AskUserToolSpec,
     build_agent_spec, build_system_prompt,
     config::ToolApprovalConfig,
     mcp::McpServers,
@@ -15,7 +17,6 @@ use coda_examples::{
         AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent,
     },
 };
-use coda_openai::OpenAI;
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,13 +52,15 @@ async fn chat_handler(
         approval_timeout: Some(Duration::from_secs(300)),
     };
 
-    let mcp_tool_specs: Vec<Box<dyn ToolSpec>> = state
-        .mcp_servers
-        .tool_objects()
-        .into_iter()
-        .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn ToolSpec>)
-        .collect();
-    let spec = build_agent_spec(state.system_prompt.clone(), mcp_tool_specs);
+    let mut extra_tools: Vec<Box<dyn ToolSpec>> = vec![Box::new(AskUserToolSpec)];
+    extra_tools.extend(
+        state
+            .mcp_servers
+            .tool_objects()
+            .into_iter()
+            .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn ToolSpec>),
+    );
+    let spec = build_agent_spec(state.system_prompt.clone(), extra_tools);
     let ctx = BuildContext::new(state.workspace_str.clone());
 
     let session = match Session::builder()
@@ -251,7 +254,7 @@ async fn main() {
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = JsonFileStorage::new(checkpoint_dir);
 
-    let mcp_servers = coda_examples::mcp::load_mcp_servers(&workspace_dir)
+    let mcp_servers = coda_server::mcp::load_mcp_servers(&workspace_dir)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!("failed to load MCP servers: {e}");
