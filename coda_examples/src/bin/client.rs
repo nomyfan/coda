@@ -1,8 +1,12 @@
 use coda_agent::{ResumeDecision, ToolCallResolution};
 use coda_core::llm::{Message, ToolCall, ToolCallOutcome, ToolOutput};
 use coda_examples::{
+    config::ToolApprovalConfig,
     parse_session_id_arg, print_logo,
-    wire::{AbortedTargetWire, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent},
+    wire::{
+        AbortedTargetWire, AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus,
+        HistoryResponse, WireEvent,
+    },
 };
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
@@ -150,50 +154,125 @@ fn render_event(event: &WireEvent, root_name: &str) {
     }
 }
 
+enum ApprovalResult {
+    Approve(String),
+    Reject(String, Option<String>),
+    AlwaysAllow,
+}
+
 fn prompt_approval(
     rl: &mut rustyline::DefaultEditor,
     call: &ToolCall,
-) -> Result<(String, ToolCallResolution), Box<dyn std::error::Error>> {
+) -> Result<ApprovalResult, Box<dyn std::error::Error>> {
     println!(
         "  {}: {}",
         call.name,
         call.arguments.as_deref().unwrap_or("{}")
     );
 
+    let prompt = if call.name == "shell" {
+        "     Approve? [y/n/a(lways)]: "
+    } else {
+        "     Approve? [y/n]: "
+    };
+
     loop {
-        let input = rl.readline("     Approve? [y/n]: ")?;
+        let input = rl.readline(prompt)?;
 
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" => {
-                return Ok((call.id.clone(), ToolCallResolution::Execute));
+                return Ok(ApprovalResult::Approve(call.id.clone()));
             }
             "n" | "no" => {
                 let reason = rl.readline("     Reason (optional, Enter to skip): ")?;
                 let reason = reason.trim().to_string();
-                return Ok((
+                return Ok(ApprovalResult::Reject(
                     call.id.clone(),
-                    ToolCallResolution::Rejected {
-                        reason: if reason.is_empty() {
-                            None
-                        } else {
-                            Some(reason)
-                        },
+                    if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
                     },
                 ));
             }
-            _ => println!("     Please enter 'y' or 'n'."),
+            "a" | "always" if call.name == "shell" => {
+                return Ok(ApprovalResult::AlwaysAllow);
+            }
+            _ => println!(
+                "     Please enter 'y' or 'n'{}",
+                if call.name == "shell" { " or 'a'" } else { "" }
+            ),
         }
     }
 }
 
-fn resolve_pending_calls(
+fn extract_shell_command(call: &ToolCall) -> String {
+    let args = call.arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v["command"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+async fn resolve_pending_calls(
     rl: &mut rustyline::DefaultEditor,
     pending_calls: &[ToolCall],
+    client: &reqwest::Client,
+    server_url: &str,
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
-    for call in pending_calls {
-        let (id, resolution) = prompt_approval(rl, call)?;
-        resolutions.push((id, resolution));
+    for pending_call in pending_calls {
+        loop {
+            match prompt_approval(rl, pending_call)? {
+                ApprovalResult::Approve(id) => {
+                    resolutions.push((id, ToolCallResolution::Execute));
+                    break;
+                }
+                ApprovalResult::Reject(id, reason) => {
+                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
+                    break;
+                }
+                ApprovalResult::AlwaysAllow => {
+                    let command = extract_shell_command(pending_call);
+                    let suggested = ToolApprovalConfig::derive_pattern(&command);
+                    match rl.readline(&format!(
+                        "     Allow pattern [{suggested}] (Ctrl+C to cancel): "
+                    )) {
+                        Ok(input) => {
+                            let pattern = if input.trim().is_empty() {
+                                suggested
+                            } else {
+                                input.trim().to_string()
+                            };
+                            match client
+                                .post(format!("{server_url}/permissions/allow"))
+                                .json(&AddAllowPatternRequest {
+                                    pattern: pattern.clone(),
+                                })
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    println!("     Added allow pattern: {pattern}");
+                                }
+                                Ok(resp) => {
+                                    let body = resp.text().await.unwrap_or_default();
+                                    eprintln!("     Failed to save pattern: {body}");
+                                }
+                                Err(e) => {
+                                    eprintln!("     Failed to save pattern: {e}");
+                                }
+                            }
+                            resolutions
+                                .push((pending_call.id.clone(), ToolCallResolution::Execute));
+                            break;
+                        }
+                        Err(ReadlineError::Interrupted) => continue,
+                        Err(e) => return Err(Box::new(e)),
+                    }
+                }
+            }
+        }
     }
     Ok(resolutions)
 }
@@ -249,7 +328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     p.calls.len(),
                     p.agent_name
                 );
-                let resolutions = resolve_pending_calls(&mut rl, &p.calls)?;
+                let resolutions =
+                    resolve_pending_calls(&mut rl, &p.calls, &client, &server_url).await?;
                 pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
             }
             println!();
@@ -325,7 +405,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         p.calls.len(),
                         p.agent_name
                     );
-                    let resolutions = resolve_pending_calls(&mut rl, &p.calls)?;
+                    let resolutions =
+                        resolve_pending_calls(&mut rl, &p.calls, &client, &server_url).await?;
                     pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
                 }
                 println!();

@@ -160,3 +160,8 @@ pub struct HistoryResponse {
     #[serde(default)]
     pub pending_approvals: Vec<PendingApproval>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddAllowPatternRequest {
+    pub pattern: String,
+}
