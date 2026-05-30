@@ -10,7 +10,6 @@ coda_openai = { workspace = true }
 coda_agent = { workspace = true }
 coda_skills = { workspace = true }
 coda_tools = { workspace = true }
-either = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -21,8 +20,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 rustyline = "15"
+toml_edit = "0.25"
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "coda-cli"
