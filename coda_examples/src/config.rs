@@ -229,7 +229,11 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         if pi < p.len() && p[pi] == b'*' {
             star = Some((pi, ti));
             pi += 1;
-        } else if pi < p.len() && (p[pi] == t[ti] || p[pi] == b'?') {
+        } else if pi < p.len()
+            && (p[pi] == t[ti]
+                || p[pi] == b'?'
+                || (p[pi].is_ascii_whitespace() && t[ti].is_ascii_whitespace()))
+        {
             pi += 1;
             ti += 1;
         } else if let Some((spi, ref mut sti)) = star {
@@ -450,14 +454,25 @@ deny = ["rm -rf *"]
 
     #[test]
     fn derive_pattern_with_tab() {
-        assert_eq!(ToolApprovalConfig::derive_pattern("git\tstatus"), "git *");
+        let pattern = ToolApprovalConfig::derive_pattern("git\tstatus");
+        assert_eq!(pattern, "git *");
+        assert!(wildcard_match(&pattern, "git\tstatus"));
+        assert!(wildcard_match(&pattern, "git status"));
+    }
+
+    #[test]
+    fn wildcard_whitespace_matches_any_whitespace() {
+        assert!(wildcard_match("git *", "git\tstatus"));
+        assert!(wildcard_match("rm -rf *", "rm\t-rf /"));
+        assert!(!wildcard_match("git *", "gitk"));
     }
 
     fn shell_call(command: &str) -> ToolCall {
+        let args = serde_json::json!({"command": command}).to_string();
         ToolCall {
             id: "test".into(),
             name: "shell".into(),
-            arguments: Some(format!(r#"{{"command":"{}"}}"#, command)),
+            arguments: Some(args),
         }
     }
 }
