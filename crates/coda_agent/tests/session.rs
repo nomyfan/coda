@@ -1,7 +1,7 @@
-//! End-to-end tests for the agent session lifecycle.
+//! Session lifecycle tests.
 //!
-//! These tests exercise the full `Session` API (builder → open → send → recv →
-//! shutdown) with a fake LLM provider, covering real built-in tools, multi-turn
+//! Exercise the full `Session` API (builder → open → send → recv → shutdown)
+//! with a fake LLM provider, covering real built-in tools, multi-turn
 //! conversations, sub-agent delegation, session resume, and approval flows.
 
 use std::sync::Arc;
@@ -383,7 +383,7 @@ async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApprov
 
 /// 1. Simple text reply through the Session API (no tools).
 #[tokio::test]
-async fn session_simple_text_reply() {
+async fn should_reply_with_text_when_no_tools_needed() {
     let spec = simple_spec("e2e-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
@@ -406,7 +406,7 @@ async fn session_simple_text_reply() {
 
 /// 2. Read a real file through the read_file tool.
 #[tokio::test]
-async fn session_tool_read_file() {
+async fn should_read_file_via_tool_call() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file_path = tmp.path().join("hello.txt");
     std::fs::write(&file_path, "line one\nline two\n").expect("write temp file");
@@ -446,7 +446,7 @@ async fn session_tool_read_file() {
 
 /// 3. Write a file then read it back — validates multi-step tool chaining.
 #[tokio::test]
-async fn session_tool_write_then_read_file() {
+async fn should_write_and_read_back_file() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file_path = tmp.path().join("roundtrip.txt");
 
@@ -488,7 +488,7 @@ async fn session_tool_write_then_read_file() {
 
 /// 4. Delegate a task to the explore sub-agent.
 #[tokio::test]
-async fn session_subagent_explore_delegation() {
+async fn should_delegate_to_explore_subagent() {
     let spec = AgentSpec {
         name: "coda".into(),
         description: String::new(),
@@ -529,7 +529,7 @@ async fn session_subagent_explore_delegation() {
 
 /// 5. Multi-turn conversation: send two tasks, verify both get responses.
 #[tokio::test]
-async fn session_multi_turn_conversation() {
+async fn should_maintain_history_across_turns() {
     let spec = simple_spec("e2e-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
@@ -563,7 +563,7 @@ async fn session_multi_turn_conversation() {
 
 /// 6. Session resume: shutdown, re-open with same session_id, verify history.
 #[tokio::test]
-async fn session_resume_from_checkpoint() {
+async fn should_resume_from_prior_checkpoint() {
     let storage = MemoryStorage::default();
     let session_id = "e2e-resume-test";
 
@@ -622,7 +622,7 @@ async fn session_resume_from_checkpoint() {
 
 /// 7. Approval flow: suspend for approval, resume with Execute, turn completes.
 #[tokio::test]
-async fn session_approval_resume_execute() {
+async fn should_execute_tool_after_approval_resume() {
     let spec = simple_spec("e2e-system");
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
 
@@ -670,7 +670,7 @@ async fn session_approval_resume_execute() {
 /// 8. Approval timeout: pending approval is auto-rejected when session reopens
 ///    after the configured timeout.
 #[tokio::test]
-async fn session_approval_timeout_auto_rejects() {
+async fn should_auto_reject_when_approval_times_out() {
     let storage = MemoryStorage::default();
     let session_id = "e2e-timeout-test";
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
