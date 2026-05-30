@@ -153,7 +153,7 @@ async fn history_handler(
     seen.insert(session_id.clone());
 
     if let Some(ref ckpt) = checkpoint
-        && let coda_agent::agent::ResumePoint::PendingApproval {
+        && let coda_agent::persist::StoredResumePoint::PendingApproval {
             ref pending_approval_calls,
             ..
         } = ckpt.resume_point
@@ -162,7 +162,7 @@ async fn history_handler(
         pending_approvals.push(coda_agent::PendingApproval {
             thread_id: ckpt.thread_id.clone(),
             agent_name: ckpt.agent_name.clone(),
-            calls: pending_approval_calls.iter().cloned().collect(),
+            calls: pending_approval_calls.clone(),
             suspended_at: ckpt.suspended_at,
         });
     }
@@ -183,7 +183,7 @@ async fn history_handler(
                 .load_checkpoint(tid)
                 .await
                 .map_err(|e| format!("storage error: {e}"))?
-                && let coda_agent::agent::ResumePoint::PendingApproval {
+                && let coda_agent::persist::StoredResumePoint::PendingApproval {
                     ref pending_approval_calls,
                     ..
                 } = ckpt.resume_point
@@ -192,7 +192,7 @@ async fn history_handler(
                 pending_approvals.push(coda_agent::PendingApproval {
                     thread_id: ckpt.thread_id.clone(),
                     agent_name: ckpt.agent_name.clone(),
-                    calls: pending_approval_calls.iter().cloned().collect(),
+                    calls: pending_approval_calls.clone(),
                     suspended_at: ckpt.suspended_at,
                 });
             }

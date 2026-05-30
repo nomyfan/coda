@@ -9,13 +9,14 @@
 //! Callers that need finer control can reach the underlying runtime through
 //! [`Session::runtime`].
 
-use crate::agent::{EnvelopeBody, Receiver, ResumePoint};
+use crate::agent::{EnvelopeBody, Receiver};
+use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
-    Agent, AgentCheckpoint, AgentEvent, AgentSpec, BuildError, Envelope, PendingApproval,
-    ResumeDecision, RunConfig, Sender, ThreadId, ToolCallResolution,
+    Agent, AgentEvent, AgentSpec, BuildError, Envelope, PendingApproval, ResumeDecision, RunConfig,
+    Sender, ThreadId, ToolCallResolution,
 };
-use coda_core::llm::LLMProvider;
+use coda_core::llm::{LLMProvider, Message};
 use coda_tools::BuildContext;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -272,17 +273,19 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Load resumed state BEFORE bootstrap so we can (a) surface root history
-        // via `resumed_checkpoint` and (b) detect pending approvals on *any*
+        // via `resumed_messages` and (b) detect pending approvals on *any*
         // agent in the snapshot, not just the root.
-        let snapshot = storage
+        let stored_snapshot: Option<StoredRuntimeSnapshot> = storage
             .load_session_snapshot(&session_id)
             .await
             .map_err(OpenError::Storage)?;
+        let snapshot: Option<AgentRuntimeSnapshot> = stored_snapshot.map(Into::into);
 
-        let resumed_checkpoint = storage
+        let resumed_messages: Option<Vec<Message>> = storage
             .load_checkpoint(&session_id)
             .await
-            .map_err(OpenError::Storage)?;
+            .map_err(OpenError::Storage)?
+            .map(|ckpt| ckpt.messages);
 
         let pending_approvals =
             collect_pending_approvals(storage.as_ref(), &session_id, &root_name, snapshot.as_ref())
@@ -351,7 +354,7 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
                 runtime,
                 root_name,
                 session_id,
-                resumed_checkpoint,
+                resumed_messages,
                 has_resuming_agents,
                 events_rx: Mutex::new(events_rx),
             }),
@@ -385,22 +388,22 @@ async fn collect_pending_approvals(
 
     let mut pending = Vec::new();
     for tid in threads {
-        let ckpt = storage
+        let stored: Option<StoredCheckpoint> = storage
             .load_checkpoint(&tid)
             .await
             .map_err(OpenError::Storage)?;
-        if let Some(ckpt) = ckpt
-            && let ResumePoint::PendingApproval {
+        if let Some(stored) = stored
+            && let StoredResumePoint::PendingApproval {
                 ref pending_approval_calls,
                 ..
-            } = ckpt.resume_point
+            } = stored.resume_point
             && !pending_approval_calls.is_empty()
         {
             pending.push(PendingApproval {
-                thread_id: ckpt.thread_id,
-                agent_name: ckpt.agent_name,
-                calls: pending_approval_calls.iter().cloned().collect(),
-                suspended_at: ckpt.suspended_at,
+                thread_id: stored.thread_id,
+                agent_name: stored.agent_name,
+                calls: pending_approval_calls.clone(),
+                suspended_at: stored.suspended_at,
             });
         }
     }
@@ -411,7 +414,7 @@ struct SessionInner {
     runtime: AgentRuntime,
     root_name: String,
     session_id: String,
-    resumed_checkpoint: Option<AgentCheckpoint>,
+    resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, AgentEvent)>>,
 }
@@ -443,13 +446,11 @@ impl Session {
         self.inner.has_resuming_agents
     }
 
-    /// The root agent's checkpoint at open time, if one was on disk. Intended
-    /// for callers that want to render prior conversation history; pending
-    /// approvals (on root or any sub-agent) are handled at `open` time via
-    /// [`SessionBuilder::resume_decisions`], so this checkpoint's
-    /// `resume_point` is never `PendingApproval` once `open` succeeds.
-    pub fn resumed_checkpoint(&self) -> Option<&AgentCheckpoint> {
-        self.inner.resumed_checkpoint.as_ref()
+    /// The root agent's conversation history at open time, if one was on disk.
+    /// Intended for callers that want to render prior conversation history
+    /// (e.g. an interactive CLI).
+    pub fn resumed_messages(&self) -> Option<&[Message]> {
+        self.inner.resumed_messages.as_deref()
     }
 
     /// Send a user task to the root agent.

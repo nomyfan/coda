@@ -40,25 +40,12 @@ pub struct ResumeDecision {
 
 /// Lightweight view of an agent thread waiting for approval.
 ///
-/// This is the public-facing type; `AgentCheckpoint` is the internal
-/// persistence format.
+/// This is the public-facing type returned via [`AgentEvent::Suspended`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub thread_id: String,
     pub agent_name: String,
     pub calls: Vec<ToolCall>,
-    pub suspended_at: jiff::Timestamp,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentCheckpoint {
-    pub thread_id: String,
-    pub agent_name: String,
-    #[serde(default)]
-    pub reply_target: Option<ReplyTarget>,
-    pub messages: Vec<Message>,
-    pub todos: Vec<TodoItem>,
-    pub resume_point: ResumePoint,
     pub suspended_at: jiff::Timestamp,
 }
 
@@ -78,20 +65,20 @@ pub struct PendingReply {
     pub outcome: ToolCallOutcome,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ToolExecutionState {
     /// Replies waiting from stateful sub-agents.
     pub pending_replies: Vec<PendingReply>,
     pub tool_calls: VecDeque<PendingToolCall>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PendingToolCall {
     pub tool_call: ToolCall,
     pub outcome: ToolCallOutcome,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ResumePoint {
     #[default]
     Generation,

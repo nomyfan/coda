@@ -1,4 +1,5 @@
-use coda_agent::{AgentCheckpoint, runtime::SessionStorage};
+use coda_agent::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
+use coda_agent::runtime::SessionStorage;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -29,7 +30,7 @@ impl SessionStorage for JsonFileStorage {
     fn save_checkpoint(
         &self,
         thread_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             fs::create_dir_all(&self.root_dir).await.map_err(|err| {
@@ -53,7 +54,7 @@ impl SessionStorage for JsonFileStorage {
     fn load_checkpoint(
         &self,
         thread_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         let path = self.checkpoint_path(thread_id);
         Box::pin(async move {
             let payload = match fs::read(&path).await {
@@ -76,7 +77,7 @@ impl SessionStorage for JsonFileStorage {
     fn save_session_snapshot(
         &self,
         session_id: String,
-        snapshot: coda_agent::runtime::AgentRuntimeSnapshot,
+        snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             fs::create_dir_all(&self.root_dir).await.map_err(|err| {
@@ -100,13 +101,8 @@ impl SessionStorage for JsonFileStorage {
     fn load_session_snapshot(
         &self,
         session_id: &str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Option<coda_agent::runtime::AgentRuntimeSnapshot>, String>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
+    {
         let path = self.snapshot_path(session_id);
         Box::pin(async move {
             let payload = match fs::read(&path).await {

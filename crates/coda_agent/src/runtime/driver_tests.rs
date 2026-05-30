@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AgentCheckpoint, AgentEvent, AgentSpec, RunConfig, Sender, SubAgentMode, ToolApprovalMode,
-    ToolCallResolution,
+    AgentEvent, AgentSpec, RunConfig, Sender, StoredCheckpoint, StoredRuntimeSnapshot,
+    SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::{AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage},
 };
 use coda_core::{
@@ -29,12 +29,12 @@ use tokio::{
 
 #[derive(Clone, Default)]
 struct TestStorage {
-    checkpoints: Arc<Mutex<HashMap<String, AgentCheckpoint>>>,
-    snapshots: Arc<Mutex<HashMap<String, AgentRuntimeSnapshot>>>,
+    checkpoints: Arc<Mutex<HashMap<String, StoredCheckpoint>>>,
+    snapshots: Arc<Mutex<HashMap<String, StoredRuntimeSnapshot>>>,
 }
 
 impl TestStorage {
-    async fn checkpoint(&self, thread_id: &ThreadId) -> Option<AgentCheckpoint> {
+    async fn checkpoint(&self, thread_id: &ThreadId) -> Option<StoredCheckpoint> {
         self.checkpoints
             .lock()
             .await
@@ -47,7 +47,7 @@ impl SessionStorage for TestStorage {
     fn save_checkpoint(
         &self,
         thread_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             self.checkpoints.lock().await.insert(thread_id, checkpoint);
@@ -58,7 +58,7 @@ impl SessionStorage for TestStorage {
     fn load_checkpoint(
         &self,
         thread_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentCheckpoint>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         let thread_id = thread_id.to_owned();
         Box::pin(async move {
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
@@ -69,7 +69,7 @@ impl SessionStorage for TestStorage {
     fn save_session_snapshot(
         &self,
         session_id: String,
-        snapshot: AgentRuntimeSnapshot,
+        snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             self.snapshots.lock().await.insert(session_id, snapshot);
@@ -80,7 +80,7 @@ impl SessionStorage for TestStorage {
     fn load_session_snapshot(
         &self,
         session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentRuntimeSnapshot>, String>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
     {
         let session_id = session_id.to_owned();
         Box::pin(async move {
@@ -612,11 +612,12 @@ where
         };
 
         let session_id = self.thread_id.as_ref().to_string();
-        let snapshot = self
+        let snapshot: Option<AgentRuntimeSnapshot> = self
             .storage
             .load_session_snapshot(&session_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .map(Into::into);
 
         let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
         let events = runtime.subscribe();
@@ -1036,6 +1037,64 @@ async fn reject_pending_approval_via_restart() {
 }
 
 #[tokio::test]
+async fn restart_re_emits_pending_approval_with_original_suspended_at() {
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "interrupt-main".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![Box::new(ReadTodosToolSpec)],
+        subagents: vec![],
+    };
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        agents1,
+        provider.clone(),
+        approval.clone(),
+        "phase1",
+    )
+    .await;
+
+    let first_pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for first suspension")
+    };
+    harness.shutdown().await;
+
+    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let mut harness = harness
+        .restart(agents2, provider, approval, HashMap::new())
+        .await;
+
+    let resumed_pending = {
+        let result = timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
+                }
+            }
+        })
+        .await;
+        result.expect("timed out waiting for resumed suspension")
+    };
+
+    assert_eq!(resumed_pending.suspended_at, first_pending.suspended_at);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
     let mut harness = Harness::start_with_spec(
@@ -1089,7 +1148,10 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
-                && matches!(checkpoint.resume_point, ResumePoint::Generation)
+                && matches!(
+                    checkpoint.resume_point,
+                    crate::persist::StoredResumePoint::Generation
+                )
             {
                 break checkpoint;
             }
@@ -1170,7 +1232,10 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 
     harness.shutdown().await;
     result.expect("timed out waiting for generation abort");
-    assert!(matches!(checkpoint.resume_point, ResumePoint::Generation));
+    assert!(matches!(
+        checkpoint.resume_point,
+        crate::persist::StoredResumePoint::Generation
+    ));
     assert!(matches!(
         checkpoint.messages.last(),
         Some(Message::Assistant(message))

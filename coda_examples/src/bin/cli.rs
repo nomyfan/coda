@@ -1,6 +1,6 @@
 use coda_agent::{
-    AbortedTarget, AgentCheckpoint, AgentEvent, OpenError, ResumeDecision, RunConfig, Session,
-    SessionEvent, Shutdown, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, AgentEvent, OpenError, ResumeDecision, RunConfig, Session, SessionEvent,
+    Shutdown, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -181,13 +181,13 @@ fn token_usage_line(agent_name: Option<&str>, usage: &CompletionUsage) -> String
     }
 }
 
-fn render_checkpoint_history(checkpoint: &AgentCheckpoint) {
-    if checkpoint.messages.is_empty() {
+fn render_resumed_history(messages: &[Message]) {
+    if messages.is_empty() {
         return;
     }
 
     println!("Resumed conversation:\n");
-    for message in &checkpoint.messages {
+    for message in messages {
         render_message(message);
     }
     println!();
@@ -300,8 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Some(checkpoint) = session.resumed_checkpoint() {
-        render_checkpoint_history(checkpoint);
+    if let Some(messages) = session.resumed_messages() {
+        render_resumed_history(messages);
     }
 
     if session.has_resuming_agents() {
