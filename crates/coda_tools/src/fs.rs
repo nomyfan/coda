@@ -169,6 +169,120 @@ impl Tool for WriteFileTool {
     }
 }
 
+// ---- EditFile ----
+
+pub struct EditFileTool {
+    schema: Schema,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EditFileToolParams {
+    /// The absolute path to the file to edit.
+    file_path: String,
+    /// The exact text to replace. Must match the file content exactly, including
+    /// indentation and whitespace. Do NOT include the line-number prefix produced
+    /// by `read_file`. Unless `replace_all` is true, this text must be unique in
+    /// the file.
+    old_string: String,
+    /// The text to replace `old_string` with.
+    new_string: String,
+    /// Replace every occurrence of `old_string` instead of requiring a unique
+    /// match. Defaults to false.
+    replace_all: Option<bool>,
+}
+
+impl EditFileTool {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let schema = schemars::schema_for!(EditFileToolParams);
+        debug!("EditFileTool schema: {:?}", schema);
+        EditFileTool { schema }
+    }
+}
+
+impl Tool for EditFileTool {
+    type Parameters = EditFileToolParams;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+
+    fn description(&self) -> &str {
+        "Edit an existing file by replacing an exact string. The file_path must be an absolute path. `old_string` must match the file content exactly (including whitespace and indentation) and must NOT include the line-number prefix from read_file. Unless `replace_all` is true, `old_string` must appear exactly once. To create a new file use write_file instead."
+    }
+
+    fn parameter_schema(&self) -> &serde_json::Value {
+        self.schema.as_value()
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn execute(
+        &self,
+        params: Self::Parameters,
+    ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
+        async move {
+            let path = Path::new(&params.file_path);
+            if !path.is_absolute() {
+                return Err(ToolError::InvalidParameters(
+                    "file_path must be an absolute path".to_string(),
+                ));
+            }
+
+            if params.old_string.is_empty() {
+                return Err(ToolError::InvalidParameters(
+                    "old_string must not be empty".to_string(),
+                ));
+            }
+
+            if params.old_string == params.new_string {
+                return Err(ToolError::InvalidParameters(
+                    "old_string and new_string are identical; nothing to change".to_string(),
+                ));
+            }
+
+            let content = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
+
+            let matches = content.matches(&params.old_string).count();
+            if matches == 0 {
+                return Err(ToolError::InvalidParameters(
+                    "old_string not found in file".to_string(),
+                ));
+            }
+
+            let replace_all = params.replace_all.unwrap_or(false);
+            let (updated, replaced) = if replace_all {
+                (
+                    content.replace(&params.old_string, &params.new_string),
+                    matches,
+                )
+            } else {
+                if matches > 1 {
+                    return Err(ToolError::InvalidParameters(format!(
+                        "old_string is not unique ({} matches); add more surrounding context to make it unique, or pass replace_all",
+                        matches
+                    )));
+                }
+                (
+                    content.replacen(&params.old_string, &params.new_string, 1),
+                    1,
+                )
+            };
+
+            tokio::fs::write(path, &updated)
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+
+            Ok(format!(
+                "Successfully replaced {} occurrence(s) in {}",
+                replaced, params.file_path
+            ))
+        }
+    }
+}
+
 // ---- ListDirectory ----
 
 pub struct ListDirectoryTool {
@@ -241,5 +355,140 @@ impl Tool for ListDirectoryTool {
                 _ => Err(ToolError::ExecutionError(stderr.into_owned())),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(name: &str, content: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("coda_edit_test_{}_{}", std::process::id(), name));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_unique_match() {
+        let path = tmp_file("unique", "hello world\nfoo bar\n");
+        let tool = EditFileTool::new();
+        let result = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "foo bar".to_string(),
+                new_string: "baz qux".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("1 occurrence"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hello world\nbaz qux\n"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_errors_when_not_found() {
+        let path = tmp_file("notfound", "hello world\n");
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "missing".to_string(),
+                new_string: "x".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_errors_on_ambiguous_match() {
+        let path = tmp_file("ambiguous", "x\nx\n");
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "x".to_string(),
+                new_string: "y".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all() {
+        let path = tmp_file("all", "x\nx\nx\n");
+        let tool = EditFileTool::new();
+        let result = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "x".to_string(),
+                new_string: "y".to_string(),
+                replace_all: Some(true),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("3 occurrence"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "y\ny\ny\n");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_errors_on_identical_strings() {
+        let path = tmp_file("identical", "x\n");
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "x".to_string(),
+                new_string: "x".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_requires_absolute_path() {
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: "relative.txt".to_string(),
+                old_string: "a".to_string(),
+                new_string: "b".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+    }
+
+    #[tokio::test]
+    async fn edit_errors_on_empty_old_string() {
+        let path = tmp_file("empty_old", "hello\n");
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                old_string: "".to_string(),
+                new_string: "x".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        std::fs::remove_file(&path).ok();
     }
 }

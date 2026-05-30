@@ -7,8 +7,8 @@ use coda_core::tool::{ToolObject, ToolResult, ToolWrapper};
 
 use crate::todo::TodoItem;
 use crate::{
-    GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool, WriteFileTool,
-    WriteTodosTool,
+    EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
+    WriteFileTool, WriteTodosTool,
 };
 
 /// Runtime context for building tools.
@@ -55,6 +55,14 @@ pub struct WriteFileToolSpec;
 impl ToolSpec for WriteFileToolSpec {
     fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(WriteFileTool::new()))
+    }
+}
+
+pub struct EditFileToolSpec;
+
+impl ToolSpec for EditFileToolSpec {
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(EditFileTool::new()))
     }
 }
 
@@ -147,6 +155,7 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
         Box::new(ShellToolSpec),
         Box::new(ReadFileToolSpec),
         Box::new(WriteFileToolSpec),
+        Box::new(EditFileToolSpec),
         Box::new(ListDirectoryToolSpec),
         Box::new(GrepToolSpec),
         Box::new(GlobToolSpec),
