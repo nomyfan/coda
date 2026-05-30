@@ -133,10 +133,11 @@ impl ToolApprovalConfig {
 
 fn has_shell_operators(command: &str) -> bool {
     command.contains(';')
-        || command.contains("&&")
+        || command.contains('&')
         || command.contains('|')
         || command.contains('`')
         || command.contains("$(")
+        || command.contains('\n')
 }
 
 fn extract_shell_command(call: &ToolCall) -> String {
@@ -435,6 +436,8 @@ deny = ["rm -rf *"]
         assert!(!config.requires_approval(&shell_call("git status")));
         assert!(config.requires_approval(&shell_call("git status; rm -rf /")));
         assert!(config.requires_approval(&shell_call("git status && echo done")));
+        assert!(config.requires_approval(&shell_call("git status & rm -rf /")));
+        assert!(config.requires_approval(&shell_call("git status\nrm -rf /")));
         assert!(config.requires_approval(&shell_call("git log | head")));
         assert!(config.requires_approval(&shell_call("echo `whoami`")));
         assert!(config.requires_approval(&shell_call("echo $(whoami)")));
