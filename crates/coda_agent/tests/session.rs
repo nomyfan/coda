@@ -60,7 +60,7 @@ fn completed(
 /// content.
 ///
 /// Routing logic uses the last user message text (not system prompt) because
-/// the E2E tests use production-style system prompts.
+/// the session integration tests use production-style system prompts.
 #[derive(Clone, Default)]
 struct FakeProvider;
 
@@ -164,7 +164,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                         id: "call_write".into(),
                         name: "write_file".into(),
                         arguments: Some(
-                            json!({"file_path": path, "content": "e2e-test-data"}).to_string(),
+                            json!({"file_path": path, "content": "session-test-data"}).to_string(),
                         ),
                     }],
                     ..Default::default()
@@ -199,14 +199,14 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                 tool_calls: vec![ToolCall {
                     id: "call_explore".into(),
                     name: "explore".into(),
-                    arguments: Some(r#"{"task":"e2e probe"}"#.into()),
+                    arguments: Some(r#"{"task":"session probe"}"#.into()),
                 }],
                 ..Default::default()
             });
         }
 
         // For explore sub-agent: respond with a simple message
-        if user_text.contains("e2e probe") {
+        if user_text.contains("session probe") {
             return completed(AssistantMessage {
                 content: "explore-done".into(),
                 ..Default::default()
@@ -384,7 +384,7 @@ async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApprov
 /// 1. Simple text reply through the Session API (no tools).
 #[tokio::test]
 async fn should_reply_with_text_when_no_tools_needed() {
-    let spec = simple_spec("e2e-system");
+    let spec = simple_spec("session-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
         .root(spec)
@@ -414,7 +414,7 @@ async fn should_read_file_via_tool_call() {
     let spec = AgentSpec {
         name: "coda".into(),
         description: String::new(),
-        system_prompt: "e2e-system".into(),
+        system_prompt: "session-system".into(),
         mode: SubAgentMode::Stateful,
         tools: coda_tools::builtin_specs(),
         subagents: vec![],
@@ -453,7 +453,7 @@ async fn should_write_and_read_back_file() {
     let spec = AgentSpec {
         name: "coda".into(),
         description: String::new(),
-        system_prompt: "e2e-system".into(),
+        system_prompt: "session-system".into(),
         mode: SubAgentMode::Stateful,
         tools: coda_tools::builtin_specs(),
         subagents: vec![],
@@ -474,12 +474,12 @@ async fn should_write_and_read_back_file() {
 
     let reply = collect_until_done(&session).await;
     assert!(
-        reply.contains("e2e-test-data"),
+        reply.contains("session-test-data"),
         "expected round-tripped content, got: {reply}"
     );
 
     let on_disk = std::fs::read_to_string(&file_path).expect("read from disk");
-    assert_eq!(on_disk, "e2e-test-data");
+    assert_eq!(on_disk, "session-test-data");
 
     session
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
@@ -492,7 +492,7 @@ async fn should_delegate_to_explore_subagent() {
     let spec = AgentSpec {
         name: "coda".into(),
         description: String::new(),
-        system_prompt: "e2e-system".into(),
+        system_prompt: "session-system".into(),
         mode: SubAgentMode::Stateful,
         tools: vec![],
         subagents: vec![AgentSpec {
@@ -530,7 +530,7 @@ async fn should_delegate_to_explore_subagent() {
 /// 5. Multi-turn conversation: send two tasks, verify both get responses.
 #[tokio::test]
 async fn should_maintain_history_across_turns() {
-    let spec = simple_spec("e2e-system");
+    let spec = simple_spec("session-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
         .root(spec)
@@ -565,10 +565,10 @@ async fn should_maintain_history_across_turns() {
 #[tokio::test]
 async fn should_resume_from_prior_checkpoint() {
     let storage = MemoryStorage::default();
-    let session_id = "e2e-resume-test";
+    let session_id = "session-resume-test";
 
     // Session 1: send a task and get response
-    let spec = simple_spec("e2e-system");
+    let spec = simple_spec("session-system");
     let session1 = Session::builder()
         .storage(storage.clone())
         .root(spec)
@@ -588,7 +588,7 @@ async fn should_resume_from_prior_checkpoint() {
         .await;
 
     // Session 2: re-open with the same session_id and storage
-    let spec2 = simple_spec("e2e-system");
+    let spec2 = simple_spec("session-system");
     let session2 = Session::builder()
         .storage(storage.clone())
         .root(spec2)
@@ -599,9 +599,25 @@ async fn should_resume_from_prior_checkpoint() {
         .await
         .expect("open session 2");
 
+    let resumed = session2
+        .resumed_messages()
+        .expect("expected resumed messages");
+    let resumed_text: String = resumed
+        .iter()
+        .filter_map(|m| match m {
+            Message::User(u) => Some(u.0.as_str()),
+            Message::Assistant(a) => Some(a.content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
     assert!(
-        session2.resumed_messages().is_some(),
-        "expected resumed messages"
+        resumed_text.contains("resume test start"),
+        "resumed history should contain the first user message, got: {resumed_text}"
+    );
+    assert!(
+        resumed_text.contains("session-1-reply"),
+        "resumed history should contain the first assistant reply, got: {resumed_text}"
     );
 
     session2.send("resume test follow").await.expect("send");
@@ -623,7 +639,7 @@ async fn should_resume_from_prior_checkpoint() {
 /// 7. Approval flow: suspend for approval, resume with Execute, turn completes.
 #[tokio::test]
 async fn should_execute_tool_after_approval_resume() {
-    let spec = simple_spec("e2e-system");
+    let spec = simple_spec("session-system");
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
 
     let session = Session::builder()
@@ -672,11 +688,11 @@ async fn should_execute_tool_after_approval_resume() {
 #[tokio::test]
 async fn should_auto_reject_when_approval_times_out() {
     let storage = MemoryStorage::default();
-    let session_id = "e2e-timeout-test";
+    let session_id = "session-timeout-test";
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
 
     // Session 1: trigger a tool that requires approval, don't resume, shutdown
-    let spec = simple_spec("e2e-system");
+    let spec = simple_spec("session-system");
     let session1 = Session::builder()
         .storage(storage.clone())
         .root(spec)
@@ -703,13 +719,13 @@ async fn should_auto_reject_when_approval_times_out() {
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
 
-    // Small delay so the suspended_at timestamp is clearly in the past
-    // relative to a 1ms timeout.
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    // Ensure the suspended_at timestamp is clearly in the past relative to
+    // a zero timeout.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Session 2: re-open with a tiny approval_timeout so the pending approval
-    // is auto-rejected (elapsed > 1ms since suspension).
-    let spec2 = simple_spec("e2e-system");
+    // Session 2: re-open with approval_timeout = ZERO so the pending approval
+    // is auto-rejected immediately.
+    let spec2 = simple_spec("session-system");
     let session2 = Session::builder()
         .storage(storage.clone())
         .root(spec2)
@@ -720,7 +736,7 @@ async fn should_auto_reject_when_approval_times_out() {
             temperature: None,
             max_completion_tokens: None,
             tool_approval: approval,
-            approval_timeout: Some(Duration::from_millis(1)),
+            approval_timeout: Some(Duration::ZERO),
         })
         .session_id(session_id)
         .open()
