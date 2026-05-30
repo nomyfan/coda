@@ -255,7 +255,7 @@ async fn main() {
 
     let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
         tracing::warn!("failed to load approval config: {e}");
-        ToolApprovalConfig::load(std::path::Path::new("/nonexistent")).unwrap()
+        ToolApprovalConfig::default_for(&workspace_dir)
     });
 
     let state = Arc::new(AppState {

@@ -300,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
         warn!("Failed to load approval config: {e}");
-        ToolApprovalConfig::load(std::path::Path::new("/nonexistent")).unwrap()
+        ToolApprovalConfig::default_for(&workspace_dir)
     });
     let approval_mode = {
         let ac = approval_config.clone();

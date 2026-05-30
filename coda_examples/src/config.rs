@@ -44,6 +44,18 @@ struct Inner {
 }
 
 impl ToolApprovalConfig {
+    /// Create a default config (empty rules → all shell calls require approval)
+    /// that writes to `.coda/config.toml` under the given workspace directory.
+    pub fn default_for(workspace_dir: &Path) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                allow: vec![],
+                deny: vec![],
+                config_path: workspace_dir.join(".coda").join("config.toml"),
+            })),
+        }
+    }
+
     /// Load from `.coda/config.toml` under the given workspace directory.
     /// Returns a default (empty rules → all shell calls require approval)
     /// if the file does not exist.
@@ -83,6 +95,9 @@ impl ToolApprovalConfig {
         if inner.deny.iter().any(|p| wildcard_match(p, &command)) {
             return true;
         }
+        if has_shell_operators(&command) {
+            return true;
+        }
         if inner.allow.iter().any(|p| wildcard_match(p, &command)) {
             return false;
         }
@@ -108,12 +123,20 @@ impl ToolApprovalConfig {
     /// E.g. `git status --short` → `git *`.
     pub fn derive_pattern(command: &str) -> String {
         let first_token = command.split_whitespace().next().unwrap_or(command);
-        if command.contains(' ') {
+        if command.contains(|c: char| c.is_whitespace()) {
             format!("{first_token} *")
         } else {
             first_token.to_string()
         }
     }
+}
+
+fn has_shell_operators(command: &str) -> bool {
+    command.contains(';')
+        || command.contains("&&")
+        || command.contains('|')
+        || command.contains('`')
+        || command.contains("$(")
 }
 
 fn extract_shell_command(call: &ToolCall) -> String {
@@ -400,6 +423,26 @@ deny = ["rm -rf *"]
         let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
         assert!(!reloaded.requires_approval(&shell_call("git push")));
         assert!(reloaded.requires_approval(&shell_call("rm -rf /")));
+    }
+
+    #[test]
+    fn compound_commands_require_approval() {
+        let config = ToolApprovalConfig::default_for(Path::new("/tmp"));
+        {
+            let mut inner = config.inner.lock().unwrap();
+            inner.allow.push("git *".to_string());
+        }
+        assert!(!config.requires_approval(&shell_call("git status")));
+        assert!(config.requires_approval(&shell_call("git status; rm -rf /")));
+        assert!(config.requires_approval(&shell_call("git status && echo done")));
+        assert!(config.requires_approval(&shell_call("git log | head")));
+        assert!(config.requires_approval(&shell_call("echo `whoami`")));
+        assert!(config.requires_approval(&shell_call("echo $(whoami)")));
+    }
+
+    #[test]
+    fn derive_pattern_with_tab() {
+        assert_eq!(ToolApprovalConfig::derive_pattern("git\tstatus"), "git *");
     }
 
     fn shell_call(command: &str) -> ToolCall {
