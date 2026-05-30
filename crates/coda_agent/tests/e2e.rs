@@ -600,8 +600,8 @@ async fn session_resume_from_checkpoint() {
         .expect("open session 2");
 
     assert!(
-        session2.resumed_checkpoint().is_some(),
-        "expected a resumed checkpoint"
+        session2.resumed_messages().is_some(),
+        "expected resumed messages"
     );
 
     session2.send("resume test follow").await.expect("send");
