@@ -30,8 +30,9 @@ impl From<std::io::Error> for ConfigError {
 
 /// Pattern-based permission rules for shell commands.
 ///
-/// Evaluation: deny match → require approval, allow match → auto-approve,
-/// no match → require approval (default).
+/// Evaluation order: deny match → require approval, shell operators
+/// (`;`, `&`, `|`, `>`, `<`, backticks, `$()`, newlines) → require approval,
+/// allow match → auto-approve, no match → require approval (default).
 #[derive(Clone)]
 pub struct ToolApprovalConfig {
     inner: Arc<Mutex<Inner>>,
@@ -135,6 +136,8 @@ fn has_shell_operators(command: &str) -> bool {
     command.contains(';')
         || command.contains('&')
         || command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
         || command.contains('`')
         || command.contains("$(")
         || command.contains('\n')
@@ -439,6 +442,8 @@ deny = ["rm -rf *"]
         assert!(config.requires_approval(&shell_call("git status & rm -rf /")));
         assert!(config.requires_approval(&shell_call("git status\nrm -rf /")));
         assert!(config.requires_approval(&shell_call("git log | head")));
+        assert!(config.requires_approval(&shell_call("git status > /tmp/out")));
+        assert!(config.requires_approval(&shell_call("git status < /dev/null")));
         assert!(config.requires_approval(&shell_call("echo `whoami`")));
         assert!(config.requires_approval(&shell_call("echo $(whoami)")));
     }

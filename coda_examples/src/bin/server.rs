@@ -212,10 +212,15 @@ async fn add_allow_pattern_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddAllowPatternRequest>,
 ) -> Result<(), (StatusCode, String)> {
-    state
-        .approval_config
-        .add_allow_pattern(&req.pattern)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    let config = state.approval_config.clone();
+    let pattern = req.pattern;
+    tokio::task::spawn_blocking(move || {
+        config
+            .add_allow_pattern(&pattern)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
 }
 
 #[tokio::main]
