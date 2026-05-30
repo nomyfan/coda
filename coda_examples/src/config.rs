@@ -378,11 +378,12 @@ deny = ["rm -rf *"]
 
     #[test]
     fn add_allow_not_persisted_on_write_failure() {
-        let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
-        // config_path points to /nonexistent/.coda/config.toml — write will fail
+        let dir = tempfile::tempdir().unwrap();
+        // Place a file where the .coda directory needs to be, so create_dir_all fails.
+        std::fs::write(dir.path().join(".coda"), "blocker").unwrap();
+        let config = ToolApprovalConfig::load(dir.path()).unwrap();
         let result = config.add_allow_pattern("git *");
         assert!(result.is_err());
-        // in-memory state must remain unchanged
         assert!(config.requires_approval(&shell_call("git status")));
     }
 
