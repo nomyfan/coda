@@ -1,4 +1,5 @@
 pub mod ask_user;
+pub mod config;
 pub mod mcp;
 pub mod storage;
 pub mod wire;

@@ -1,6 +1,6 @@
 use coda_agent::{
     AbortedTarget, AgentEvent, OpenError, ResumeDecision, RunConfig, Session, SessionEvent,
-    Shutdown, ToolApprovalMode, ToolCallResolution,
+    Shutdown, ToolCallResolution,
 };
 use coda_core::llm::{
     CompletionUsage, LLMProviderConfig, Message, ToolCall, ToolCallOutcome, ToolOutput,
@@ -8,13 +8,13 @@ use coda_core::llm::{
 use coda_examples::{
     ask_user::{AskUserParams, AskUserToolSpec},
     build_agent_spec, build_system_prompt,
+    config::ToolApprovalConfig,
     mcp::load_mcp_servers,
     parse_session_id_arg, print_logo,
     storage::JsonFileStorage,
 };
 use coda_openai::OpenAI;
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
-use either::Either;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -52,37 +52,54 @@ fn prompt_ask_user(
     }
 }
 
-#[allow(clippy::type_complexity)]
+enum ApprovalResult {
+    Approve(String),
+    Reject(String, Option<String>),
+    AlwaysAllow,
+}
+
 fn prompt_approval(
     rl: &mut rustyline::DefaultEditor,
     call: &ToolCall,
-) -> Result<Either<String, (String, Option<String>)>, Box<dyn std::error::Error>> {
+) -> Result<ApprovalResult, Box<dyn std::error::Error>> {
     println!(
         "\n  {}: {}",
         call.name,
         call.arguments.as_deref().unwrap_or("{}")
     );
 
+    let prompt = if call.name == "shell" {
+        "     Approve? [y/n/a(lways)]: "
+    } else {
+        "     Approve? [y/n]: "
+    };
+
     loop {
-        let input = rl.readline("     Approve? [y/n]: ")?;
+        let input = rl.readline(prompt)?;
 
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" => {
-                return Ok(Either::Left(call.id.clone()));
+                return Ok(ApprovalResult::Approve(call.id.clone()));
             }
             "n" | "no" => {
                 let reason = rl.readline("     Reason (optional, Enter to skip): ")?;
                 let reason = reason.trim().to_string();
-                return Ok(Either::Right((
+                return Ok(ApprovalResult::Reject(
                     call.id.clone(),
                     if reason.is_empty() {
                         None
                     } else {
                         Some(reason)
                     },
-                )));
+                ));
             }
-            _ => println!("     Please enter 'y' or 'n'."),
+            "a" | "always" if call.name == "shell" => {
+                return Ok(ApprovalResult::AlwaysAllow);
+            }
+            _ => println!(
+                "     Please enter 'y' or 'n'{}",
+                if call.name == "shell" { " or 'a'" } else { "" }
+            ),
         }
     }
 }
@@ -90,6 +107,7 @@ fn prompt_approval(
 fn resolve_pending_calls(
     rl: &mut rustyline::DefaultEditor,
     pending_calls: &[ToolCall],
+    approval_config: &ToolApprovalConfig,
 ) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
     for pending_call in pending_calls {
@@ -107,17 +125,53 @@ fn resolve_pending_calls(
                 ToolCallResolution::Resolved(output),
             ));
         } else {
-            match prompt_approval(rl, pending_call)? {
-                Either::Left(id) => {
-                    resolutions.push((id, ToolCallResolution::Execute));
-                }
-                Either::Right((id, reason)) => {
-                    resolutions.push((id, ToolCallResolution::Rejected { reason }));
+            loop {
+                match prompt_approval(rl, pending_call)? {
+                    ApprovalResult::Approve(id) => {
+                        resolutions.push((id, ToolCallResolution::Execute));
+                        break;
+                    }
+                    ApprovalResult::Reject(id, reason) => {
+                        resolutions.push((id, ToolCallResolution::Rejected { reason }));
+                        break;
+                    }
+                    ApprovalResult::AlwaysAllow => {
+                        let command = extract_shell_command(pending_call);
+                        let suggested = ToolApprovalConfig::derive_pattern(&command);
+                        match rl.readline(&format!(
+                            "     Allow pattern [{suggested}] (Ctrl+C to cancel): "
+                        )) {
+                            Ok(input) => {
+                                let pattern = if input.trim().is_empty() {
+                                    suggested
+                                } else {
+                                    input.trim().to_string()
+                                };
+                                match approval_config.add_allow_pattern(&pattern) {
+                                    Ok(()) => println!("     Added allow pattern: {pattern}"),
+                                    Err(e) => warn!("Failed to save allow pattern: {e}"),
+                                }
+                                resolutions
+                                    .push((pending_call.id.clone(), ToolCallResolution::Execute));
+                                break;
+                            }
+                            Err(ReadlineError::Interrupted) => continue,
+                            Err(e) => return Err(Box::new(e)),
+                        }
+                    }
                 }
             }
         }
     }
     Ok(resolutions)
+}
+
+fn extract_shell_command(call: &ToolCall) -> String {
+    let args = call.arguments.as_deref().unwrap_or("{}");
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v["command"].as_str().map(String::from))
+        .unwrap_or_default()
 }
 
 fn render_message(message: &Message) {
@@ -244,14 +298,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mcp_servers = load_mcp_servers(&workspace_dir).await?;
 
+    let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
+        warn!("Failed to load approval config: {e}");
+        ToolApprovalConfig::default_for(&workspace_dir)
+    });
+    let approval_mode = {
+        let ac = approval_config.clone();
+        coda_agent::ToolApprovalMode::RequireWhen(std::sync::Arc::new(move |call| {
+            call.name == "ask_user" || ac.requires_approval(call)
+        }))
+    };
     let config = RunConfig {
         provider: provider.clone(),
         model: model.clone(),
         max_completion_tokens: Some(5000),
         temperature: Some(0.7),
-        tool_approval: ToolApprovalMode::RequireWhen(std::sync::Arc::new(|call| {
-            call.name == "shell" || call.name == "ask_user"
-        })),
+        tool_approval: approval_mode,
         approval_timeout: None,
     };
     let ctx = BuildContext::new(workspace_str.clone());
@@ -290,7 +352,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ckpts.len()
                     );
                     for ckpt in &ckpts {
-                        let resolutions = resolve_pending_calls(&mut rl, &ckpt.calls)?;
+                        let resolutions =
+                            resolve_pending_calls(&mut rl, &ckpt.calls, &approval_config)?;
                         pending_decisions
                             .insert(ckpt.thread_id.clone(), ResumeDecision { resolutions });
                     }
@@ -305,7 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if session.has_resuming_agents() {
-        if !consume_events(&mut rl, &session).await {
+        if !consume_events(&mut rl, &session, &approval_config).await {
             session
                 .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
                 .await;
@@ -341,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        if !consume_events(&mut rl, &session).await {
+        if !consume_events(&mut rl, &session, &approval_config).await {
             break;
         }
         println!();
@@ -358,7 +421,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) -> bool {
+async fn consume_events(
+    rl: &mut rustyline::DefaultEditor,
+    session: &Session,
+    approval_config: &ToolApprovalConfig,
+) -> bool {
     loop {
         tokio::select! {
             biased;
@@ -412,7 +479,7 @@ async fn consume_events(rl: &mut rustyline::DefaultEditor, session: &Session) ->
                             pending.calls.len(),
                             label
                         );
-                        let resolutions = match resolve_pending_calls(rl, &pending.calls) {
+                        let resolutions = match resolve_pending_calls(rl, &pending.calls, approval_config) {
                             Ok(r) => r,
                             Err(_) => {
                                 session.abort().await;

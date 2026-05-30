@@ -1,17 +1,19 @@
+use axum::http::StatusCode;
 use axum::{
     Json, Router,
     extract::{Path, State},
     routing::{get, post},
 };
-use coda_agent::{
-    AgentEvent, OpenError, RunConfig, Session, Shutdown, ToolApprovalMode, runtime::SessionStorage,
-};
+use coda_agent::{AgentEvent, OpenError, RunConfig, Session, Shutdown, runtime::SessionStorage};
 use coda_core::llm::LLMProviderConfig;
 use coda_examples::{
     build_agent_spec, build_system_prompt,
+    config::ToolApprovalConfig,
     mcp::McpServers,
     storage::JsonFileStorage,
-    wire::{ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent},
+    wire::{
+        AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent,
+    },
 };
 use coda_openai::OpenAI;
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
@@ -26,6 +28,7 @@ struct AppState {
     provider: Arc<OpenAI>,
     model: String,
     mcp_servers: McpServers,
+    approval_config: ToolApprovalConfig,
 }
 
 async fn chat_handler(
@@ -44,7 +47,7 @@ async fn chat_handler(
         model: state.model.clone(),
         max_completion_tokens: Some(5000),
         temperature: Some(0.7),
-        tool_approval: ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "shell")),
+        tool_approval: state.approval_config.clone().into_approval_mode(),
         approval_timeout: Some(Duration::from_secs(300)),
     };
 
@@ -205,6 +208,21 @@ async fn history_handler(
     }))
 }
 
+async fn add_allow_pattern_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddAllowPatternRequest>,
+) -> Result<(), (StatusCode, String)> {
+    let config = state.approval_config.clone();
+    let pattern = req.pattern;
+    tokio::task::spawn_blocking(move || {
+        config
+            .add_allow_pattern(&pattern)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -240,6 +258,11 @@ async fn main() {
             McpServers::empty()
         });
 
+    let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
+        tracing::warn!("failed to load approval config: {e}");
+        ToolApprovalConfig::default_for(&workspace_dir)
+    });
+
     let state = Arc::new(AppState {
         storage,
         system_prompt,
@@ -247,11 +270,13 @@ async fn main() {
         provider,
         model,
         mcp_servers,
+        approval_config,
     });
 
     let app = Router::new()
         .route("/chat", post(chat_handler))
         .route("/history/{session_id}", get(history_handler))
+        .route("/permissions/allow", post(add_allow_pattern_handler))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
