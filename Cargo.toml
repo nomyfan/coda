@@ -28,3 +28,9 @@ schemars = "1.2.1"
 jiff = { version = "0.2", features = ["serde"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "v5"] }
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
