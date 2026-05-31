@@ -4,23 +4,16 @@ use coda_server::{
     ask_user::AskUserParams,
     config::ToolApprovalConfig,
     parse_session_id_arg, print_logo,
+    transport::{Transport, WebSocketClientTransport},
     wire::{AbortedTargetWire, ClientMessage, ServerMessage, WireEvent},
 };
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
 use rustyline::error::ReadlineError;
 use std::io::{self, Write};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
 /// The root agent is always named "coda" (see `build_agent_spec`). The snapshot
 /// does not carry the name, so the debug client hardcodes it for rendering.
 const ROOT_NAME: &str = "coda";
-
-type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
-type WsRead = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 fn render_message(message: &LlmMessage) {
     match message {
@@ -254,12 +247,18 @@ fn extract_shell_command(call: &ToolCall) -> String {
 }
 
 async fn send_client(
-    write: &mut WsWrite,
+    transport: &WebSocketClientTransport,
     msg: &ClientMessage,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string(msg)?;
-    write.send(WsMessage::Text(json.into())).await?;
-    Ok(())
+    if transport.send(msg).await {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection closed while sending client message",
+        )
+        .into())
+    }
 }
 
 /// Prompt the user to resolve every call in `approval`, then send a single
@@ -267,7 +266,7 @@ async fn send_client(
 /// pattern to the server.
 async fn resolve_and_resume(
     rl: &mut rustyline::DefaultEditor,
-    write: &mut WsWrite,
+    transport: &WebSocketClientTransport,
     approval: &PendingApproval,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
@@ -307,7 +306,7 @@ async fn resolve_and_resume(
                                 input.trim().to_string()
                             };
                             send_client(
-                                write,
+                                transport,
                                 &ClientMessage::AddAllowPattern {
                                     pattern: pattern.clone(),
                                 },
@@ -326,7 +325,7 @@ async fn resolve_and_resume(
     }
 
     send_client(
-        write,
+        transport,
         &ClientMessage::Resume {
             agent_name: approval.agent_name.clone(),
             thread_id: approval.thread_id.clone(),
@@ -339,7 +338,7 @@ async fn resolve_and_resume(
 
 /// Outcome of consuming the event stream up to a settling point.
 enum TurnState {
-    /// The root agent finished — return to the prompt.
+    /// The root agent finished; return to the prompt.
     Done,
     /// The connection closed.
     Closed,
@@ -349,36 +348,29 @@ enum TurnState {
 /// forwarding Ctrl+C as an `Abort` along the way.
 async fn run_turn(
     rl: &mut rustyline::DefaultEditor,
-    write: &mut WsWrite,
-    read: &mut WsRead,
+    transport: &WebSocketClientTransport,
     root_name: &str,
 ) -> Result<TurnState, Box<dyn std::error::Error>> {
     loop {
-        let text = tokio::select! {
+        let msg = tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => {
-                send_client(write, &ClientMessage::Abort).await?;
+                send_client(transport, &ClientMessage::Abort).await?;
                 continue;
             }
-            msg = read.next() => {
-                match msg {
-                    Some(Ok(WsMessage::Text(text))) => text,
-                    Some(Ok(WsMessage::Close(_))) | None => return Ok(TurnState::Closed),
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => return Err(e.into()),
-                }
-            }
+            msg = transport.recv() => msg,
         };
 
-        let event = match serde_json::from_str::<ServerMessage>(&text)? {
-            ServerMessage::Event { event } => event,
-            ServerMessage::Snapshot { .. } => continue, // only sent once, at connect
+        let event = match msg {
+            Some(ServerMessage::Event { event }) => event,
+            Some(ServerMessage::Snapshot { .. }) => continue, // only sent once, at connect
+            None => return Ok(TurnState::Closed),
         };
         render_event(&event, root_name);
 
         match &event {
             WireEvent::Suspended { approval, .. } => {
-                resolve_and_resume(rl, write, approval).await?;
+                resolve_and_resume(rl, transport, approval).await?;
             }
             WireEvent::LlmEnd {
                 message,
@@ -427,47 +419,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server: {server_url}\n");
 
     let url = format!("{server_url}/ws/{session_id}");
-    let (ws_stream, _) = connect_async(&url).await?;
-    let (mut write, mut read) = ws_stream.split();
+    let transport = WebSocketClientTransport::connect(&url).await?;
 
     let mut rl = rustyline::DefaultEditor::new()?;
 
     // The server's first message is always the snapshot: prior history plus any
     // approvals left pending from a previous suspension.
-    match read.next().await {
-        Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<ServerMessage>(&text)? {
-            ServerMessage::Snapshot {
-                messages,
-                pending_approvals,
-                ..
-            } => {
-                render_history(&messages);
-                if !pending_approvals.is_empty() {
-                    println!(
-                        "[Resuming session — {} pending approval(s) to resolve]\n",
-                        pending_approvals.len()
-                    );
-                    for approval in &pending_approvals {
-                        resolve_and_resume(&mut rl, &mut write, approval).await?;
-                    }
-                    // The session is now resuming; render until it settles.
-                    if let TurnState::Closed =
-                        run_turn(&mut rl, &mut write, &mut read, ROOT_NAME).await?
-                    {
-                        println!("\nConnection closed by server.");
-                        return Ok(());
-                    }
-                    println!();
+    match transport.recv().await {
+        Some(ServerMessage::Snapshot {
+            messages,
+            pending_approvals,
+            ..
+        }) => {
+            render_history(&messages);
+            if !pending_approvals.is_empty() {
+                println!(
+                    "[Resuming session: {} pending approval(s) to resolve]\n",
+                    pending_approvals.len()
+                );
+                for approval in &pending_approvals {
+                    resolve_and_resume(&mut rl, &transport, approval).await?;
                 }
+                // The session is now resuming; render until it settles.
+                if let TurnState::Closed = run_turn(&mut rl, &transport, ROOT_NAME).await? {
+                    println!("\nConnection closed by server.");
+                    return Ok(());
+                }
+                println!();
             }
-            ServerMessage::Event { event } => render_event(&event, ROOT_NAME),
-        },
-        Some(Ok(WsMessage::Close(_))) | None => {
+        }
+        Some(ServerMessage::Event { event }) => render_event(&event, ROOT_NAME),
+        None => {
             eprintln!("Connection closed before snapshot.");
             return Ok(());
         }
-        Some(Ok(_)) => {}
-        Some(Err(e)) => return Err(e.into()),
     }
 
     loop {
@@ -492,7 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         send_client(
-            &mut write,
+            &transport,
             &ClientMessage::Task {
                 task: input.to_string(),
             },
@@ -502,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        match run_turn(&mut rl, &mut write, &mut read, ROOT_NAME).await? {
+        match run_turn(&mut rl, &transport, ROOT_NAME).await? {
             TurnState::Done => println!(),
             TurnState::Closed => {
                 println!("\nConnection closed by server.");

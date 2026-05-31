@@ -115,9 +115,11 @@ async fn dispatch(session: &Session, state: &Arc<AppState>, msg: ClientMessage) 
 /// Read `Resume` commands until every pending thread is covered. Allow-pattern
 /// commands sent alongside (e.g. choosing "always") are persisted in place.
 /// Returns `None` if the client disconnects, or if `cancel` fires (eviction or
-/// shutdown) — bailing here keeps an evicted client from opening a second
+/// shutdown); bailing here keeps an evicted client from opening a second
 /// session by sending late decisions.
-async fn collect_resume_decisions<T: Transport>(
+async fn collect_resume_decisions<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
     transport: &T,
     approval_config: ToolApprovalConfig,
     pending: &[coda_agent::PendingApproval],
@@ -149,7 +151,11 @@ async fn collect_resume_decisions<T: Transport>(
 }
 
 /// Send an `Error` event describing a failed session open.
-async fn send_open_error<T: Transport>(transport: &T, session_id: &str, err: OpenError) {
+async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: &T,
+    session_id: &str,
+    err: OpenError,
+) {
     let event = WireEvent::Error {
         agent_name: String::new(),
         thread_id: session_id.to_string(),
@@ -161,7 +167,7 @@ async fn send_open_error<T: Transport>(transport: &T, session_id: &str, err: Ope
 /// Drive a single client session over `transport`: send a snapshot, resolve any
 /// carried-over pending approvals, then pump commands in and runtime events out
 /// for the connection's lifetime. Transport-agnostic.
-async fn handle_session<T: Transport>(
+async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
     transport: T,
     state: Arc<AppState>,
     session_id: String,
@@ -394,10 +400,10 @@ async fn main() {
         .route("/ws/{session_id}", get(ws_handler))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    info!("coda_server listening on http://127.0.0.1:3000");
+    let listen_addr =
+        std::env::var("CODA_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
+    info!("coda_server listening on ws://{listen_addr}/ws/:session_id");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
