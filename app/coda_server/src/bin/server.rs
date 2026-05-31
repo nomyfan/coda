@@ -1,10 +1,12 @@
-use axum::http::StatusCode;
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    routing::{get, post},
+    Router,
+    extract::{Path, State, ws::WebSocketUpgrade},
+    response::Response,
+    routing::get,
 };
-use coda_agent::{AgentEvent, OpenError, RunConfig, Session, Shutdown, runtime::SessionStorage};
+use coda_agent::{
+    OpenError, ResumeDecision, RunConfig, Session, Shutdown, runtime::SessionStorage,
+};
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_server::{
@@ -13,14 +15,23 @@ use coda_server::{
     config::ToolApprovalConfig,
     mcp::McpServers,
     storage::JsonFileStorage,
-    wire::{
-        AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent,
-    },
+    transport::{Transport, WebSocketTransport},
+    wire::{ClientMessage, ServerMessage, WireEvent},
 };
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+struct CurrentConnection {
+    id: u64,
+    cancel: CancellationToken,
+    done: watch::Receiver<bool>,
+}
 
 struct AppState {
     storage: JsonFileStorage,
@@ -30,19 +41,22 @@ struct AppState {
     model: String,
     mcp_servers: McpServers,
     approval_config: ToolApprovalConfig,
+    /// Cancelled on process shutdown signal; parent of every connection token.
+    shutdown: CancellationToken,
+    /// Cancellation handle of the current connection, if any. Enforces the
+    /// single-client invariant by latest-wins: a new connection cancels it.
+    current: Mutex<Option<CurrentConnection>>,
+    next_connection_id: AtomicU64,
 }
 
-async fn chat_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, String> {
-    info!(
-        session_id = %req.session_id,
-        has_task = req.task.is_some(),
-        decisions = req.resume_decisions.len(),
-        "incoming request"
-    );
-
+/// Open (or resume) the session for `session_id`, seeding it with the built-in
+/// tools, MCP tools, and approval policy. `decisions` covers any pending
+/// approvals carried over from a prior suspension.
+async fn open_session(
+    state: &AppState,
+    session_id: &str,
+    decisions: HashMap<String, ResumeDecision>,
+) -> Result<Session, OpenError> {
     let config = RunConfig {
         provider: state.provider.clone(),
         model: state.model.clone(),
@@ -63,167 +77,344 @@ async fn chat_handler(
     let spec = build_agent_spec(state.system_prompt.clone(), extra_tools);
     let ctx = BuildContext::new(state.workspace_str.clone());
 
-    let session = match Session::builder()
+    Session::builder()
         .storage(state.storage.clone())
         .root(spec)
         .build_context(ctx)
         .run_config(config)
-        .session_id(&req.session_id)
-        .resume_decisions(req.resume_decisions)
+        .session_id(session_id)
+        .resume_decisions(decisions)
         .open()
         .await
-    {
-        Ok(s) => s,
-        Err(OpenError::PendingApprovalsRequired(pending)) => {
-            return Ok(Json(ChatResponse {
-                status: ChatStatus::PendingApproval,
-                events: vec![],
-                pending_approvals: pending,
-            }));
+}
+
+async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || config.add_allow_pattern(&pattern)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            warn!("failed to add allow pattern: {message}");
+            Err(message)
         }
         Err(e) => {
-            return Ok(Json(ChatResponse {
-                status: ChatStatus::Error(format!("failed to open session: {e}")),
-                events: vec![],
-                pending_approvals: vec![],
-            }));
+            let message = format!("failed to join allow-pattern writer: {e}");
+            warn!("{message}");
+            Err(message)
         }
+    }
+}
+
+async fn send_allow_pattern_result<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    approval_config: ToolApprovalConfig,
+    pattern: String,
+) -> bool {
+    let error = add_allow_pattern(approval_config, pattern.clone())
+        .await
+        .err();
+    transport
+        .send(&ServerMessage::AllowPatternResult { pattern, error })
+        .await
+}
+
+/// Read `Resume` commands until every pending thread is covered. Allow-pattern
+/// commands sent alongside (e.g. choosing "always") are persisted in place.
+/// Returns `None` if the client disconnects, or if `cancel` fires (eviction or
+/// shutdown); bailing here keeps an evicted client from opening a second
+/// session by sending late decisions.
+async fn collect_resume_decisions<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    approval_config: ToolApprovalConfig,
+    pending: &[coda_agent::PendingApproval],
+    cancel: &CancellationToken,
+) -> Option<HashMap<String, ResumeDecision>> {
+    let mut needed: HashSet<String> = pending.iter().map(|p| p.thread_id.clone()).collect();
+    let mut decisions: HashMap<String, ResumeDecision> = HashMap::new();
+    while !needed.is_empty() {
+        let msg = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            msg = transport.recv() => msg?,
+        };
+        match msg {
+            ClientMessage::Resume {
+                thread_id,
+                decision,
+                ..
+            } => {
+                needed.remove(&thread_id);
+                decisions.insert(thread_id, decision);
+            }
+            ClientMessage::AddAllowPattern { pattern } => {
+                if send_allow_pattern_result(transport, approval_config.clone(), pattern).await {
+                    continue;
+                }
+                return None;
+            }
+            _ => {} // ignore task/abort while resolving
+        }
+    }
+    Some(decisions)
+}
+
+/// Send an `Error` event describing a failed session open.
+async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: &T,
+    session_id: &str,
+    err: OpenError,
+) {
+    let event = WireEvent::Error {
+        agent_name: String::new(),
+        thread_id: session_id.to_string(),
+        message: format!("failed to open session: {err}"),
+    };
+    transport.send(&ServerMessage::Event { event }).await;
+}
+
+/// Drive a single client session over `transport`: send a snapshot, resolve any
+/// carried-over pending approvals, then pump commands in and runtime events out
+/// for the connection's lifetime. Transport-agnostic.
+async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: T,
+    state: Arc<AppState>,
+    session_id: String,
+    cancel: CancellationToken,
+) {
+    // 1. First open attempt, used both to bring the session up and to discover
+    //    whether it resumed into a pending approval.
+    let first = open_session(&state, &session_id, HashMap::new()).await;
+    let pending = match &first {
+        Err(OpenError::PendingApprovalsRequired(p)) => p.clone(),
+        _ => Vec::new(),
     };
 
-    info!("session opened, consuming events...");
-
-    if let Some(task) = &req.task
-        && session.send(task.clone()).await.is_err()
+    // 2. Send the snapshot: resumed history plus any pending approvals the
+    //    client must answer before the session can resume.
+    let messages = state
+        .storage
+        .load_checkpoint(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.messages)
+        .unwrap_or_default();
+    if !transport
+        .send(&ServerMessage::Snapshot {
+            session_id: session_id.clone(),
+            messages,
+            pending_approvals: pending.clone(),
+        })
+        .await
     {
-        let _ = session.shutdown(Shutdown::Abort).await;
-        return Ok(Json(ChatResponse {
-            status: ChatStatus::Error("failed to send task".into()),
-            events: vec![],
-            pending_approvals: vec![],
-        }));
+        return;
     }
 
-    let mut events: Vec<WireEvent> = Vec::new();
-    let mut pending_approvals: Vec<coda_agent::PendingApproval> = Vec::new();
-    let mut status = ChatStatus::Done;
-    let root_name = session.root_name().to_string();
-
-    while let Some(event) = session.recv().await {
-        let is_terminal = match &event.kind {
-            AgentEvent::Suspended(pending) => {
-                pending_approvals.push(pending.clone());
-                status = ChatStatus::PendingApproval;
-                true
+    // 3. Resolve into a live session, collecting `Resume` decisions for any
+    //    pending approvals (re-prompting via events should the runtime suspend
+    //    again before fully resuming).
+    let session = match first {
+        Ok(s) => s,
+        Err(OpenError::PendingApprovalsRequired(_)) => {
+            let Some(mut decisions) = collect_resume_decisions(
+                &transport,
+                state.approval_config.clone(),
+                &pending,
+                &cancel,
+            )
+            .await
+            else {
+                return;
+            };
+            loop {
+                match open_session(&state, &session_id, std::mem::take(&mut decisions)).await {
+                    Ok(s) => break s,
+                    Err(OpenError::PendingApprovalsRequired(more)) => {
+                        for p in &more {
+                            let event = WireEvent::Suspended {
+                                agent_name: p.agent_name.clone(),
+                                thread_id: p.thread_id.clone(),
+                                approval: p.clone(),
+                            };
+                            if !transport.send(&ServerMessage::Event { event }).await {
+                                return;
+                            }
+                        }
+                        match collect_resume_decisions(
+                            &transport,
+                            state.approval_config.clone(),
+                            &more,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            Some(d) => decisions = d,
+                            None => return,
+                        }
+                    }
+                    Err(e) => {
+                        send_open_error(&transport, &session_id, e).await;
+                        return;
+                    }
+                }
             }
-            AgentEvent::LLMEnd(msg) if event.origin.is_root() && msg.tool_calls.is_empty() => true,
-            _ => false,
-        };
-        events.push(WireEvent::from_session_event(event, &root_name));
-        if is_terminal {
-            break;
+        }
+        Err(e) => {
+            send_open_error(&transport, &session_id, e).await;
+            return;
+        }
+    };
+    let root_name = session.root_name().to_string();
+    info!(session_id = %session_id, "session opened");
+
+    // 4. Pump: client commands in, runtime events out, for the connection's life.
+    //    The cancel token fires when a newer connection evicts us or the process
+    //    is shutting down (it is a child of the global shutdown token).
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            cmd = transport.recv() => {
+                match cmd {
+                    Some(ClientMessage::AddAllowPattern { pattern }) => {
+                        if !send_allow_pattern_result(
+                            &transport,
+                            state.approval_config.clone(),
+                            pattern,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Some(ClientMessage::Task { task }) => {
+                        if let Err(e) = session.send(task).await {
+                            warn!("failed to send task: {e}");
+                        }
+                    }
+                    Some(ClientMessage::Resume {
+                        agent_name,
+                        thread_id,
+                        decision,
+                    }) => {
+                        if let Err(e) = session.resume(&agent_name, &thread_id, decision).await {
+                            warn!("failed to resume: {e}");
+                        }
+                    }
+                    Some(ClientMessage::Abort) => session.abort().await,
+                    None => break, // client disconnected
+                }
+            }
+            event = session.recv() => {
+                match event {
+                    Some(ev) => {
+                        let event = WireEvent::from_session_event(ev, &root_name);
+                        if !transport.send(&ServerMessage::Event { event }).await {
+                            break;
+                        }
+                    }
+                    None => break, // runtime shut down
+                }
+            }
         }
     }
 
     session
-        .shutdown(Shutdown::graceful(Duration::from_secs(5)))
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
         .await;
-
-    info!(
-        events = events.len(),
-        pending = pending_approvals.len(),
-        ?status,
-        "request complete"
-    );
-
-    Ok(Json(ChatResponse {
-        status,
-        events,
-        pending_approvals,
-    }))
+    info!(session_id = %session_id, "connection closed, session shut down");
 }
 
-async fn history_handler(
-    State(state): State<Arc<AppState>>,
-    Path(session_id): Path<String>,
-) -> Result<Json<HistoryResponse>, String> {
-    let checkpoint = state
-        .storage
-        .load_checkpoint(&session_id)
-        .await
-        .map_err(|e| format!("storage error: {e}"))?;
-
-    let messages = checkpoint.as_ref().map_or(vec![], |c| c.messages.clone());
-
-    let mut pending_approvals = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(session_id.clone());
-
-    if let Some(ref ckpt) = checkpoint
-        && let coda_agent::persist::StoredResumePoint::PendingApproval {
-            ref pending_approval_calls,
-            ..
-        } = ckpt.resume_point
-        && !pending_approval_calls.is_empty()
-    {
-        pending_approvals.push(coda_agent::PendingApproval {
-            thread_id: ckpt.thread_id.clone(),
-            agent_name: ckpt.agent_name.clone(),
-            calls: pending_approval_calls.clone(),
-            suspended_at: ckpt.suspended_at,
-        });
+async fn wait_for_connection_done(mut done: watch::Receiver<bool>) {
+    if *done.borrow() {
+        return;
     }
-
-    if let Some(snapshot) = state
-        .storage
-        .load_session_snapshot(&session_id)
-        .await
-        .map_err(|e| format!("storage error: {e}"))?
-    {
-        for tid in snapshot
-            .active_threads
-            .values()
-            .filter(|tid| seen.insert((*tid).clone()))
-        {
-            if let Some(ckpt) = state
-                .storage
-                .load_checkpoint(tid)
-                .await
-                .map_err(|e| format!("storage error: {e}"))?
-                && let coda_agent::persist::StoredResumePoint::PendingApproval {
-                    ref pending_approval_calls,
-                    ..
-                } = ckpt.resume_point
-                && !pending_approval_calls.is_empty()
-            {
-                pending_approvals.push(coda_agent::PendingApproval {
-                    thread_id: ckpt.thread_id.clone(),
-                    agent_name: ckpt.agent_name.clone(),
-                    calls: pending_approval_calls.clone(),
-                    suspended_at: ckpt.suspended_at,
-                });
-            }
+    while done.changed().await.is_ok() {
+        if *done.borrow() {
+            return;
         }
     }
-
-    Ok(Json(HistoryResponse {
-        messages,
-        pending_approvals,
-    }))
 }
 
-async fn add_allow_pattern_handler(
+async fn finish_connection(
+    state: &Arc<AppState>,
+    connection_id: u64,
+    done_tx: watch::Sender<bool>,
+) {
+    let mut current = state.current.lock().await;
+    if current.as_ref().is_some_and(|c| c.id == connection_id) {
+        current.take();
+    }
+    drop(current);
+    let _ = done_tx.send(true);
+}
+
+async fn run_upgraded_socket(
+    socket: axum::extract::ws::WebSocket,
+    state: Arc<AppState>,
+    session_id: String,
+) {
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let cancel = state.shutdown.child_token();
+    let (done_tx, done_rx) = watch::channel(false);
+
+    let previous = state.current.lock().await.replace(CurrentConnection {
+        id: connection_id,
+        cancel: cancel.clone(),
+        done: done_rx,
+    });
+
+    if let Some(previous) = previous {
+        previous.cancel.cancel();
+        info!("evicting previous client connection");
+        wait_for_connection_done(previous.done).await;
+    }
+
+    if !cancel.is_cancelled() {
+        handle_session(
+            WebSocketTransport::new(socket),
+            state.clone(),
+            session_id,
+            cancel,
+        )
+        .await;
+    }
+
+    finish_connection(&state, connection_id, done_tx).await;
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AddAllowPatternRequest>,
-) -> Result<(), (StatusCode, String)> {
-    let config = state.approval_config.clone();
-    let pattern = req.pattern;
-    tokio::task::spawn_blocking(move || {
-        config
-            .add_allow_pattern(&pattern)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    Path(session_id): Path<String>,
+) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        info!(session_id = %session_id, "client connected");
+        run_upgraded_socket(socket, state, session_id).await;
     })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+}
+
+/// Resolve once the process receives SIGINT (Ctrl+C) or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 #[tokio::main]
@@ -266,6 +457,7 @@ async fn main() {
         ToolApprovalConfig::default_for(&workspace_dir)
     });
 
+    let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
         storage,
         system_prompt,
@@ -274,23 +466,32 @@ async fn main() {
         model,
         mcp_servers,
         approval_config,
+        shutdown: shutdown.clone(),
+        current: Mutex::new(None),
+        next_connection_id: AtomicU64::new(1),
+    });
+
+    // On a shutdown signal, cancel the token: this both ends `axum::serve`'s
+    // graceful shutdown and (via child tokens) tears down the live session.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown_signal().await;
+            info!("shutdown signal received");
+            shutdown.cancel();
+        }
     });
 
     let app = Router::new()
-        .route("/chat", post(chat_handler))
-        .route("/history/{session_id}", get(history_handler))
-        .route("/permissions/allow", post(add_allow_pattern_handler))
+        .route("/ws/{session_id}", get(ws_handler))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    info!("coda_server listening on http://127.0.0.1:3000");
+    let listen_addr =
+        std::env::var("CODA_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
+    info!("coda_server listening on ws://{listen_addr}/ws/:session_id");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("shutdown signal received");
-        })
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .unwrap();
 

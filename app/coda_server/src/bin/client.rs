@@ -1,23 +1,24 @@
-use coda_agent::{ResumeDecision, ToolCallResolution};
-use coda_core::llm::{Message, ToolCall, ToolCallOutcome, ToolOutput};
+use coda_agent::{PendingApproval, ResumeDecision, ToolCallResolution};
+use coda_core::llm::{Message as LlmMessage, ToolCall, ToolCallOutcome, ToolOutput};
 use coda_server::{
     ask_user::AskUserParams,
     config::ToolApprovalConfig,
     parse_session_id_arg, print_logo,
-    wire::{
-        AbortedTargetWire, AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus,
-        HistoryResponse, WireEvent,
-    },
+    transport::{Transport, WebSocketClientTransport},
+    wire::{AbortedTargetWire, ClientMessage, ServerMessage, WireEvent},
 };
 use rustyline::error::ReadlineError;
-use std::collections::HashMap;
 use std::io::{self, Write};
 use uuid::Uuid;
 
-fn render_message(message: &Message) {
+/// The root agent is always named "coda" (see `build_agent_spec`). The snapshot
+/// does not carry the name, so the debug client hardcodes it for rendering.
+const ROOT_NAME: &str = "coda";
+
+fn render_message(message: &LlmMessage) {
     match message {
-        Message::User(msg) => println!("You: {}", msg.0),
-        Message::Assistant(msg) => {
+        LlmMessage::User(msg) => println!("You: {}", msg.0),
+        LlmMessage::Assistant(msg) => {
             if !msg.content.is_empty() {
                 println!("Assistant: {}", msg.content);
             }
@@ -29,7 +30,7 @@ fn render_message(message: &Message) {
                 );
             }
         }
-        Message::Tool(msg) => {
+        LlmMessage::Tool(msg) => {
             let status = match msg.outcome {
                 ToolCallOutcome::Auto => "auto",
                 ToolCallOutcome::Approved => "approved",
@@ -50,7 +51,7 @@ fn render_message(message: &Message) {
     }
 }
 
-fn render_history(messages: &[Message]) {
+fn render_history(messages: &[LlmMessage]) {
     if messages.is_empty() {
         return;
     }
@@ -245,31 +246,89 @@ fn extract_shell_command(call: &ToolCall) -> String {
         .unwrap_or_default()
 }
 
-async fn resolve_pending_calls(
+async fn send_client(
+    transport: &WebSocketClientTransport,
+    msg: &ClientMessage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if transport.send(msg).await {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection closed while sending client message",
+        )
+        .into())
+    }
+}
+
+async fn add_allow_pattern(
+    transport: &WebSocketClientTransport,
+    pattern: String,
+    root_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_client(
+        transport,
+        &ClientMessage::AddAllowPattern {
+            pattern: pattern.clone(),
+        },
+    )
+    .await?;
+
+    loop {
+        match transport.recv().await {
+            Some(ServerMessage::AllowPatternResult {
+                pattern: returned,
+                error,
+            }) if returned == pattern => {
+                return match error {
+                    Some(error) => Err(std::io::Error::other(error).into()),
+                    None => Ok(()),
+                };
+            }
+            Some(ServerMessage::AllowPatternResult {
+                error: Some(error), ..
+            }) => {
+                println!("\n[Error] {error}");
+            }
+            Some(ServerMessage::AllowPatternResult { .. }) => {}
+            Some(ServerMessage::Event { event }) => render_event(&event, root_name),
+            Some(ServerMessage::Snapshot { .. }) => {}
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed while waiting for allow pattern result",
+                )
+                .into());
+            }
+        }
+    }
+}
+
+/// Prompt the user to resolve every call in `approval`, then send a single
+/// `Resume` covering them. `AlwaysAllow` additionally pushes the derived allow
+/// pattern to the server.
+async fn resolve_and_resume(
     rl: &mut rustyline::DefaultEditor,
-    pending_calls: &[ToolCall],
-    client: &reqwest::Client,
-    server_url: &str,
-) -> Result<Vec<(String, ToolCallResolution)>, Box<dyn std::error::Error>> {
+    transport: &WebSocketClientTransport,
+    approval: &PendingApproval,
+    root_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
-    for pending_call in pending_calls {
-        if pending_call.name == "ask_user" {
+    for call in &approval.calls {
+        if call.name == "ask_user" {
             let output = match serde_json::from_str::<AskUserParams>(
-                pending_call.arguments.as_deref().unwrap_or("{}"),
+                call.arguments.as_deref().unwrap_or("{}"),
             ) {
                 Ok(params) => {
                     ToolOutput::Ok(prompt_ask_user(rl, &params.question, &params.options)?)
                 }
                 Err(err) => ToolOutput::Err(format!("Invalid ask_user arguments: {err}")),
             };
-            resolutions.push((
-                pending_call.id.clone(),
-                ToolCallResolution::Resolved(output),
-            ));
+            resolutions.push((call.id.clone(), ToolCallResolution::Resolved(output)));
             continue;
         }
         loop {
-            match prompt_approval(rl, pending_call)? {
+            match prompt_approval(rl, call)? {
                 ApprovalResult::Approve(id) => {
                     resolutions.push((id, ToolCallResolution::Execute));
                     break;
@@ -279,7 +338,7 @@ async fn resolve_pending_calls(
                     break;
                 }
                 ApprovalResult::AlwaysAllow => {
-                    let command = extract_shell_command(pending_call);
+                    let command = extract_shell_command(call);
                     let suggested = ToolApprovalConfig::derive_pattern(&command);
                     match rl.readline(&format!(
                         "     Allow pattern [{suggested}] (Ctrl+C to cancel): "
@@ -290,37 +349,98 @@ async fn resolve_pending_calls(
                             } else {
                                 input.trim().to_string()
                             };
-                            match client
-                                .post(format!("{server_url}/permissions/allow"))
-                                .json(&AddAllowPatternRequest {
-                                    pattern: pattern.clone(),
-                                })
-                                .send()
-                                .await
-                            {
-                                Ok(resp) if resp.status().is_success() => {
+                            match add_allow_pattern(transport, pattern.clone(), root_name).await {
+                                Ok(()) => {
                                     println!("     Added allow pattern: {pattern}");
+                                    resolutions
+                                        .push((call.id.clone(), ToolCallResolution::Execute));
+                                    break;
                                 }
-                                Ok(resp) => {
-                                    let body = resp.text().await.unwrap_or_default();
-                                    eprintln!("     Failed to save pattern: {body}");
-                                }
-                                Err(e) => {
-                                    eprintln!("     Failed to save pattern: {e}");
+                                Err(err) => {
+                                    println!("     Failed to add allow pattern: {err}");
+                                    continue;
                                 }
                             }
-                            resolutions
-                                .push((pending_call.id.clone(), ToolCallResolution::Execute));
-                            break;
                         }
                         Err(ReadlineError::Interrupted) => continue,
-                        Err(e) => return Err(Box::new(e)),
+                        Err(e) => return Err(e.into()),
                     }
                 }
             }
         }
     }
-    Ok(resolutions)
+
+    send_client(
+        transport,
+        &ClientMessage::Resume {
+            agent_name: approval.agent_name.clone(),
+            thread_id: approval.thread_id.clone(),
+            decision: ResumeDecision { resolutions },
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Outcome of consuming the event stream up to a settling point.
+enum TurnState {
+    /// The root agent finished; return to the prompt.
+    Done,
+    /// The connection closed.
+    Closed,
+}
+
+/// Render events until the root agent's turn settles, resolving suspensions and
+/// forwarding Ctrl+C as an `Abort` along the way.
+async fn run_turn(
+    rl: &mut rustyline::DefaultEditor,
+    transport: &WebSocketClientTransport,
+    root_name: &str,
+) -> Result<TurnState, Box<dyn std::error::Error>> {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                send_client(transport, &ClientMessage::Abort).await?;
+                continue;
+            }
+            msg = transport.recv() => msg,
+        };
+
+        let event = match msg {
+            Some(ServerMessage::Event { event }) => event,
+            Some(ServerMessage::Snapshot { .. }) => continue, // only sent once, at connect
+            Some(ServerMessage::AllowPatternResult {
+                error: Some(error), ..
+            }) => {
+                println!("\n[Error] {error}");
+                continue;
+            }
+            Some(ServerMessage::AllowPatternResult { .. }) => continue,
+            None => return Ok(TurnState::Closed),
+        };
+        render_event(&event, root_name);
+
+        match &event {
+            WireEvent::Suspended { approval, .. } => {
+                resolve_and_resume(rl, transport, approval, root_name).await?;
+            }
+            WireEvent::LlmEnd {
+                message,
+                agent_name,
+                ..
+            } if agent_name == root_name && message.tool_calls.is_empty() => {
+                return Ok(TurnState::Done);
+            }
+            WireEvent::Aborted { agent_name, .. } if agent_name == root_name => {
+                return Ok(TurnState::Done);
+            }
+            WireEvent::Error { agent_name, .. } if agent_name == root_name => {
+                return Ok(TurnState::Done);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn print_usage() {
@@ -330,7 +450,7 @@ fn print_usage() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_url =
-        std::env::var("CODA_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        std::env::var("CODA_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:3000".to_string());
 
     let session_id = match parse_session_id_arg(std::env::args().skip(1)) {
         Ok(Some(id)) => id,
@@ -351,116 +471,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Session id: {session_id}\n");
     println!("Server: {server_url}\n");
 
+    let url = format!("{server_url}/ws/{session_id}");
+    let transport = WebSocketClientTransport::connect(&url).await?;
+
     let mut rl = rustyline::DefaultEditor::new()?;
-    let client = reqwest::Client::new();
 
-    let mut pending_decisions: HashMap<String, ResumeDecision> = HashMap::new();
-
-    if let Ok(resp) = client
-        .get(format!("{server_url}/history/{session_id}"))
-        .send()
-        .await
-        && let Ok(history) = resp.json::<HistoryResponse>().await
-    {
-        render_history(&history.messages);
-        if !history.pending_approvals.is_empty() {
-            println!(
-                "\n[Resuming session — {} pending approval(s) to resolve]\n",
-                history.pending_approvals.len()
-            );
-            for p in &history.pending_approvals {
+    // The server's first message is always the snapshot: prior history plus any
+    // approvals left pending from a previous suspension.
+    match transport.recv().await {
+        Some(ServerMessage::Snapshot {
+            messages,
+            pending_approvals,
+            ..
+        }) => {
+            render_history(&messages);
+            if !pending_approvals.is_empty() {
                 println!(
-                    "[Approval needed: {} call(s) from '{}']",
-                    p.calls.len(),
-                    p.agent_name
+                    "[Resuming session: {} pending approval(s) to resolve]\n",
+                    pending_approvals.len()
                 );
-                let resolutions =
-                    resolve_pending_calls(&mut rl, &p.calls, &client, &server_url).await?;
-                pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
+                for approval in &pending_approvals {
+                    resolve_and_resume(&mut rl, &transport, approval, ROOT_NAME).await?;
+                }
+                // The session is now resuming; render until it settles.
+                if let TurnState::Closed = run_turn(&mut rl, &transport, ROOT_NAME).await? {
+                    println!("\nConnection closed by server.");
+                    return Ok(());
+                }
+                println!();
             }
-            println!();
+        }
+        Some(ServerMessage::Event { event }) => render_event(&event, ROOT_NAME),
+        Some(ServerMessage::AllowPatternResult {
+            error: Some(error), ..
+        }) => {
+            eprintln!("Unexpected allow pattern result before snapshot: {error}");
+        }
+        Some(ServerMessage::AllowPatternResult { .. }) => {
+            eprintln!("Unexpected allow pattern result before snapshot.");
+        }
+        None => {
+            eprintln!("Connection closed before snapshot.");
+            return Ok(());
         }
     }
 
     loop {
-        let (task, resume_decisions) = if pending_decisions.is_empty() {
-            let input = match rl.readline("You: ") {
-                Ok(line) => line,
-                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
-                    println!("Goodbye!");
-                    break;
-                }
-                Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-            };
-            let input = input.trim().to_string();
-
-            if input.is_empty() {
-                continue;
-            }
-            if input.eq_ignore_ascii_case("quit")
-                || input.eq_ignore_ascii_case("exit")
-                || input.eq_ignore_ascii_case("q")
-            {
+        let input = match rl.readline("You: ") {
+            Ok(line) => line,
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
                 println!("Goodbye!");
                 break;
             }
-
-            (Some(input), HashMap::new())
-        } else {
-            (None, std::mem::take(&mut pending_decisions))
+            Err(e) => return Err(e.into()),
         };
-
-        let req = ChatRequest {
-            session_id: session_id.clone(),
-            task,
-            resume_decisions,
-        };
-
-        let resp = client
-            .post(format!("{server_url}/chat"))
-            .json(&req)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            eprintln!(
-                "Server error: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
-            pending_decisions.clear();
+        let input = input.trim();
+        if input.is_empty() {
             continue;
         }
-
-        let chat_resp: ChatResponse = resp.json().await?;
-
-        for event in &chat_resp.events {
-            render_event(event, "coda");
+        if input.eq_ignore_ascii_case("quit")
+            || input.eq_ignore_ascii_case("exit")
+            || input.eq_ignore_ascii_case("q")
+        {
+            println!("Goodbye!");
+            break;
         }
 
-        match chat_resp.status {
-            ChatStatus::Done => {
-                pending_decisions.clear();
-                println!();
-            }
-            ChatStatus::PendingApproval => {
-                println!();
-                for p in &chat_resp.pending_approvals {
-                    println!(
-                        "[Approval needed: {} call(s) from '{}']",
-                        p.calls.len(),
-                        p.agent_name
-                    );
-                    let resolutions =
-                        resolve_pending_calls(&mut rl, &p.calls, &client, &server_url).await?;
-                    pending_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
-                }
-                println!();
-            }
-            ChatStatus::Error(msg) => {
-                eprintln!("Error: {msg}");
-                pending_decisions.clear();
-                println!();
+        send_client(
+            &transport,
+            &ClientMessage::Task {
+                task: input.to_string(),
+            },
+        )
+        .await?;
+
+        print!("Assistant: ");
+        io::stdout().flush()?;
+
+        match run_turn(&mut rl, &transport, ROOT_NAME).await? {
+            TurnState::Done => println!(),
+            TurnState::Closed => {
+                println!("\nConnection closed by server.");
+                break;
             }
         }
     }
