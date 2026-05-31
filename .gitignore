@@ -1,4 +1,7 @@
 /target
+/node_modules
+/.pnpm-store
+/dist
 .env
 *.log
 /ignoreme
