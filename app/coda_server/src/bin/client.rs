@@ -261,6 +261,49 @@ async fn send_client(
     }
 }
 
+async fn add_allow_pattern(
+    transport: &WebSocketClientTransport,
+    pattern: String,
+    root_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_client(
+        transport,
+        &ClientMessage::AddAllowPattern {
+            pattern: pattern.clone(),
+        },
+    )
+    .await?;
+
+    loop {
+        match transport.recv().await {
+            Some(ServerMessage::AllowPatternResult {
+                pattern: returned,
+                error,
+            }) if returned == pattern => {
+                return match error {
+                    Some(error) => Err(std::io::Error::other(error).into()),
+                    None => Ok(()),
+                };
+            }
+            Some(ServerMessage::AllowPatternResult {
+                error: Some(error), ..
+            }) => {
+                println!("\n[Error] {error}");
+            }
+            Some(ServerMessage::AllowPatternResult { .. }) => {}
+            Some(ServerMessage::Event { event }) => render_event(&event, root_name),
+            Some(ServerMessage::Snapshot { .. }) => {}
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed while waiting for allow pattern result",
+                )
+                .into());
+            }
+        }
+    }
+}
+
 /// Prompt the user to resolve every call in `approval`, then send a single
 /// `Resume` covering them. `AlwaysAllow` additionally pushes the derived allow
 /// pattern to the server.
@@ -268,6 +311,7 @@ async fn resolve_and_resume(
     rl: &mut rustyline::DefaultEditor,
     transport: &WebSocketClientTransport,
     approval: &PendingApproval,
+    root_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut resolutions = vec![];
     for call in &approval.calls {
@@ -305,16 +349,18 @@ async fn resolve_and_resume(
                             } else {
                                 input.trim().to_string()
                             };
-                            send_client(
-                                transport,
-                                &ClientMessage::AddAllowPattern {
-                                    pattern: pattern.clone(),
-                                },
-                            )
-                            .await?;
-                            println!("     Added allow pattern: {pattern}");
-                            resolutions.push((call.id.clone(), ToolCallResolution::Execute));
-                            break;
+                            match add_allow_pattern(transport, pattern.clone(), root_name).await {
+                                Ok(()) => {
+                                    println!("     Added allow pattern: {pattern}");
+                                    resolutions
+                                        .push((call.id.clone(), ToolCallResolution::Execute));
+                                    break;
+                                }
+                                Err(err) => {
+                                    println!("     Failed to add allow pattern: {err}");
+                                    continue;
+                                }
+                            }
                         }
                         Err(ReadlineError::Interrupted) => continue,
                         Err(e) => return Err(e.into()),
@@ -364,13 +410,20 @@ async fn run_turn(
         let event = match msg {
             Some(ServerMessage::Event { event }) => event,
             Some(ServerMessage::Snapshot { .. }) => continue, // only sent once, at connect
+            Some(ServerMessage::AllowPatternResult {
+                error: Some(error), ..
+            }) => {
+                println!("\n[Error] {error}");
+                continue;
+            }
+            Some(ServerMessage::AllowPatternResult { .. }) => continue,
             None => return Ok(TurnState::Closed),
         };
         render_event(&event, root_name);
 
         match &event {
             WireEvent::Suspended { approval, .. } => {
-                resolve_and_resume(rl, transport, approval).await?;
+                resolve_and_resume(rl, transport, approval, root_name).await?;
             }
             WireEvent::LlmEnd {
                 message,
@@ -438,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending_approvals.len()
                 );
                 for approval in &pending_approvals {
-                    resolve_and_resume(&mut rl, &transport, approval).await?;
+                    resolve_and_resume(&mut rl, &transport, approval, ROOT_NAME).await?;
                 }
                 // The session is now resuming; render until it settles.
                 if let TurnState::Closed = run_turn(&mut rl, &transport, ROOT_NAME).await? {
@@ -449,6 +502,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(ServerMessage::Event { event }) => render_event(&event, ROOT_NAME),
+        Some(ServerMessage::AllowPatternResult {
+            error: Some(error), ..
+        }) => {
+            eprintln!("Unexpected allow pattern result before snapshot: {error}");
+        }
+        Some(ServerMessage::AllowPatternResult { .. }) => {
+            eprintln!("Unexpected allow pattern result before snapshot.");
+        }
         None => {
             eprintln!("Connection closed before snapshot.");
             return Ok(());

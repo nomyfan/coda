@@ -21,10 +21,17 @@ use coda_server::{
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+struct CurrentConnection {
+    id: u64,
+    cancel: CancellationToken,
+    done: watch::Receiver<bool>,
+}
 
 struct AppState {
     storage: JsonFileStorage,
@@ -38,7 +45,8 @@ struct AppState {
     shutdown: CancellationToken,
     /// Cancellation handle of the current connection, if any. Enforces the
     /// single-client invariant by latest-wins: a new connection cancels it.
-    current: Mutex<Option<CancellationToken>>,
+    current: Mutex<Option<CurrentConnection>>,
+    next_connection_id: AtomicU64,
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -80,12 +88,35 @@ async fn open_session(
         .await
 }
 
-async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) {
+async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) -> Result<(), String> {
     match tokio::task::spawn_blocking(move || config.add_allow_pattern(&pattern)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("failed to add allow pattern: {e}"),
-        Err(e) => warn!("failed to join allow-pattern writer: {e}"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            warn!("failed to add allow pattern: {message}");
+            Err(message)
+        }
+        Err(e) => {
+            let message = format!("failed to join allow-pattern writer: {e}");
+            warn!("{message}");
+            Err(message)
+        }
     }
+}
+
+async fn send_allow_pattern_result<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    approval_config: ToolApprovalConfig,
+    pattern: String,
+) -> bool {
+    let error = add_allow_pattern(approval_config, pattern.clone())
+        .await
+        .err();
+    transport
+        .send(&ServerMessage::AllowPatternResult { pattern, error })
+        .await
 }
 
 /// Apply a client command to the live session.
@@ -107,7 +138,7 @@ async fn dispatch(session: &Session, state: &Arc<AppState>, msg: ClientMessage) 
         }
         ClientMessage::Abort => session.abort().await,
         ClientMessage::AddAllowPattern { pattern } => {
-            add_allow_pattern(state.approval_config.clone(), pattern).await;
+            let _ = add_allow_pattern(state.approval_config.clone(), pattern).await;
         }
     }
 }
@@ -142,7 +173,10 @@ async fn collect_resume_decisions<
                 decisions.insert(thread_id, decision);
             }
             ClientMessage::AddAllowPattern { pattern } => {
-                add_allow_pattern(approval_config.clone(), pattern).await;
+                match send_allow_pattern_result(transport, approval_config.clone(), pattern).await {
+                    true => {}
+                    false => return None,
+                }
             }
             _ => {} // ignore task/abort while resolving
         }
@@ -267,6 +301,17 @@ async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = Server
             _ = cancel.cancelled() => break,
             cmd = transport.recv() => {
                 match cmd {
+                    Some(ClientMessage::AddAllowPattern { pattern }) => {
+                        if !send_allow_pattern_result(
+                            &transport,
+                            state.approval_config.clone(),
+                            pattern,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
                     Some(msg) => dispatch(&session, &state, msg).await,
                     None => break, // client disconnected
                 }
@@ -291,22 +336,72 @@ async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = Server
     info!(session_id = %session_id, "connection closed, session shut down");
 }
 
+async fn wait_for_connection_done(mut done: watch::Receiver<bool>) {
+    if *done.borrow() {
+        return;
+    }
+    while done.changed().await.is_ok() {
+        if *done.borrow() {
+            return;
+        }
+    }
+}
+
+async fn finish_connection(
+    state: &Arc<AppState>,
+    connection_id: u64,
+    done_tx: watch::Sender<bool>,
+) {
+    let mut current = state.current.lock().await;
+    if current.as_ref().is_some_and(|c| c.id == connection_id) {
+        current.take();
+    }
+    drop(current);
+    let _ = done_tx.send(true);
+}
+
+async fn run_upgraded_socket(
+    socket: axum::extract::ws::WebSocket,
+    state: Arc<AppState>,
+    session_id: String,
+) {
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let cancel = state.shutdown.child_token();
+    let (done_tx, done_rx) = watch::channel(false);
+
+    let previous = state.current.lock().await.replace(CurrentConnection {
+        id: connection_id,
+        cancel: cancel.clone(),
+        done: done_rx,
+    });
+
+    if let Some(previous) = previous {
+        previous.cancel.cancel();
+        info!("evicting previous client connection");
+        wait_for_connection_done(previous.done).await;
+    }
+
+    if !cancel.is_cancelled() {
+        handle_session(
+            WebSocketTransport::new(socket),
+            state.clone(),
+            session_id,
+            cancel,
+        )
+        .await;
+    }
+
+    finish_connection(&state, connection_id, done_tx).await;
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
-    // Latest-wins: install this connection's token and cancel any predecessor so
-    // its session is torn down. The token is a child of the global shutdown
-    // token, so a process signal cancels it too.
-    let cancel = state.shutdown.child_token();
-    if let Some(previous) = state.current.lock().await.replace(cancel.clone()) {
-        previous.cancel();
-        info!("evicting previous client connection");
-    }
-    info!(session_id = %session_id, "client connected");
-    ws.on_upgrade(move |socket| {
-        handle_session(WebSocketTransport::new(socket), state, session_id, cancel)
+    ws.on_upgrade(move |socket| async move {
+        info!(session_id = %session_id, "client connected");
+        run_upgraded_socket(socket, state, session_id).await;
     })
 }
 
@@ -383,6 +478,7 @@ async fn main() {
         approval_config,
         shutdown: shutdown.clone(),
         current: Mutex::new(None),
+        next_connection_id: AtomicU64::new(1),
     });
 
     // On a shutdown signal, cancel the token: this both ends `axum::serve`'s

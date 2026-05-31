@@ -164,6 +164,12 @@ pub enum ServerMessage {
     /// A live runtime event. Nested under `event` rather than flattened so the
     /// inner `type` tag of [`WireEvent`] does not collide with this enum's tag.
     Event { event: WireEvent },
+    /// Result of a requested shell allow-list update.
+    AllowPatternResult {
+        pattern: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -257,6 +263,27 @@ mod tests {
                 event: WireEvent::LlmContentChunk { content, .. },
             } => {
                 assert_eq!(content, "hi");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_allow_pattern_result_roundtrips() {
+        let ok = ServerMessage::AllowPatternResult {
+            pattern: "git *".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"allow_pattern_result","pattern":"git *","error":null}"#
+        );
+
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::AllowPatternResult { pattern, error } => {
+                assert_eq!(pattern, "git *");
+                assert!(error.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
