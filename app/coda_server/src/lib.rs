@@ -2,6 +2,7 @@ pub mod ask_user;
 pub mod config;
 pub mod mcp;
 pub mod storage;
+pub mod transport;
 pub mod wire;
 
 use coda_agent::{AgentSpec, SubAgentMode};

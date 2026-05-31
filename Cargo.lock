@@ -330,6 +330,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml_edit",
  "tracing",
  "tracing-subscriber",

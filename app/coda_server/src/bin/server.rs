@@ -1,11 +1,7 @@
 use axum::{
     Router,
-    extract::{
-        Path, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    extract::{Path, State, ws::WebSocketUpgrade},
+    response::Response,
     routing::get,
 };
 use coda_agent::{
@@ -19,15 +15,15 @@ use coda_server::{
     config::ToolApprovalConfig,
     mcp::McpServers,
     storage::JsonFileStorage,
+    transport::{Transport, WebSocketTransport},
     wire::{ClientMessage, ServerMessage, WireEvent},
 };
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 struct AppState {
@@ -38,18 +34,11 @@ struct AppState {
     model: String,
     mcp_servers: McpServers,
     approval_config: ToolApprovalConfig,
-    /// Guards the single-client invariant: one server instance is bound to one
-    /// workspace and serves at most one live connection at a time.
-    active: Arc<AtomicBool>,
-}
-
-/// Resets the single-client flag when the connection task ends, however it ends.
-struct ActiveGuard(Arc<AtomicBool>);
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
+    /// Cancelled on process shutdown signal; parent of every connection token.
+    shutdown: CancellationToken,
+    /// Cancellation handle of the current connection, if any. Enforces the
+    /// single-client invariant by latest-wins: a new connection cancels it.
+    current: Mutex<Option<CancellationToken>>,
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -91,25 +80,6 @@ async fn open_session(
         .await
 }
 
-/// Serialize and send a server message. Returns `false` when the socket is
-/// gone and the connection should be torn down.
-async fn send_server_msg(sink: &mut SplitSink<WebSocket, Message>, msg: &ServerMessage) -> bool {
-    let json = match serde_json::to_string(msg) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!("failed to serialize server message: {e}");
-            return true;
-        }
-    };
-    match sink.send(Message::Text(json.into())).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("websocket send error: {e}");
-            false
-        }
-    }
-}
-
 async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) {
     match tokio::task::spawn_blocking(move || config.add_allow_pattern(&pattern)).await {
         Ok(Ok(())) => {}
@@ -142,65 +112,61 @@ async fn dispatch(session: &Session, state: &Arc<AppState>, msg: ClientMessage) 
     }
 }
 
-/// Read `Resume` commands off the socket until every pending thread is covered.
-/// Returns `None` if the client disconnects first.
-async fn collect_resume_decisions(
-    stream: &mut SplitStream<WebSocket>,
+/// Read `Resume` commands until every pending thread is covered. Allow-pattern
+/// commands sent alongside (e.g. choosing "always") are persisted in place.
+/// Returns `None` if the client disconnects, or if `cancel` fires (eviction or
+/// shutdown) — bailing here keeps an evicted client from opening a second
+/// session by sending late decisions.
+async fn collect_resume_decisions<T: Transport>(
+    transport: &T,
     approval_config: ToolApprovalConfig,
     pending: &[coda_agent::PendingApproval],
+    cancel: &CancellationToken,
 ) -> Option<HashMap<String, ResumeDecision>> {
     let mut needed: HashSet<String> = pending.iter().map(|p| p.thread_id.clone()).collect();
     let mut decisions: HashMap<String, ResumeDecision> = HashMap::new();
     while !needed.is_empty() {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::Resume {
-                    thread_id,
-                    decision,
-                    ..
-                }) => {
-                    needed.remove(&thread_id);
-                    decisions.insert(thread_id, decision);
-                }
-                Ok(ClientMessage::AddAllowPattern { pattern }) => {
-                    add_allow_pattern(approval_config.clone(), pattern).await;
-                }
-                Ok(_) => {} // ignore non-resume commands while resolving
-                Err(e) => warn!("ignoring malformed client message: {e}"),
-            },
-            Some(Ok(Message::Close(_))) | None => return None,
-            Some(Ok(_)) => {} // ping/pong/binary
-            Some(Err(e)) => {
-                warn!("websocket read error: {e}");
-                return None;
+        let msg = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            msg = transport.recv() => msg?,
+        };
+        match msg {
+            ClientMessage::Resume {
+                thread_id,
+                decision,
+                ..
+            } => {
+                needed.remove(&thread_id);
+                decisions.insert(thread_id, decision);
             }
+            ClientMessage::AddAllowPattern { pattern } => {
+                add_allow_pattern(approval_config.clone(), pattern).await;
+            }
+            _ => {} // ignore task/abort while resolving
         }
     }
     Some(decisions)
 }
 
 /// Send an `Error` event describing a failed session open.
-async fn send_open_error(
-    sink: &mut SplitSink<WebSocket, Message>,
-    session_id: &str,
-    err: OpenError,
-) {
+async fn send_open_error<T: Transport>(transport: &T, session_id: &str, err: OpenError) {
     let event = WireEvent::Error {
         agent_name: String::new(),
         thread_id: session_id.to_string(),
         message: format!("failed to open session: {err}"),
     };
-    send_server_msg(sink, &ServerMessage::Event { event }).await;
+    transport.send(&ServerMessage::Event { event }).await;
 }
 
-async fn handle_socket(
-    socket: WebSocket,
+/// Drive a single client session over `transport`: send a snapshot, resolve any
+/// carried-over pending approvals, then pump commands in and runtime events out
+/// for the connection's lifetime. Transport-agnostic.
+async fn handle_session<T: Transport>(
+    transport: T,
     state: Arc<AppState>,
     session_id: String,
-    _guard: ActiveGuard,
+    cancel: CancellationToken,
 ) {
-    let (mut sink, mut stream) = socket.split();
-
     // 1. First open attempt, used both to bring the session up and to discover
     //    whether it resumed into a pending approval.
     let first = open_session(&state, &session_id, HashMap::new()).await;
@@ -219,15 +185,13 @@ async fn handle_socket(
         .flatten()
         .map(|c| c.messages)
         .unwrap_or_default();
-    if !send_server_msg(
-        &mut sink,
-        &ServerMessage::Snapshot {
+    if !transport
+        .send(&ServerMessage::Snapshot {
             session_id: session_id.clone(),
             messages,
             pending_approvals: pending.clone(),
-        },
-    )
-    .await
+        })
+        .await
     {
         return;
     }
@@ -238,9 +202,13 @@ async fn handle_socket(
     let session = match first {
         Ok(s) => s,
         Err(OpenError::PendingApprovalsRequired(_)) => {
-            let Some(mut decisions) =
-                collect_resume_decisions(&mut stream, state.approval_config.clone(), &pending)
-                    .await
+            let Some(mut decisions) = collect_resume_decisions(
+                &transport,
+                state.approval_config.clone(),
+                &pending,
+                &cancel,
+            )
+            .await
             else {
                 return;
             };
@@ -254,14 +222,15 @@ async fn handle_socket(
                                 thread_id: p.thread_id.clone(),
                                 approval: p.clone(),
                             };
-                            if !send_server_msg(&mut sink, &ServerMessage::Event { event }).await {
+                            if !transport.send(&ServerMessage::Event { event }).await {
                                 return;
                             }
                         }
                         match collect_resume_decisions(
-                            &mut stream,
+                            &transport,
                             state.approval_config.clone(),
                             &more,
+                            &cancel,
                         )
                         .await
                         {
@@ -270,44 +239,37 @@ async fn handle_socket(
                         }
                     }
                     Err(e) => {
-                        send_open_error(&mut sink, &session_id, e).await;
+                        send_open_error(&transport, &session_id, e).await;
                         return;
                     }
                 }
             }
         }
         Err(e) => {
-            send_open_error(&mut sink, &session_id, e).await;
+            send_open_error(&transport, &session_id, e).await;
             return;
         }
     };
     let root_name = session.root_name().to_string();
     info!(session_id = %session_id, "session opened");
 
-    // 3. Pump: client commands in, runtime events out, for the connection's life.
+    // 4. Pump: client commands in, runtime events out, for the connection's life.
+    //    The cancel token fires when a newer connection evicts us or the process
+    //    is shutting down (it is a child of the global shutdown token).
     loop {
         tokio::select! {
-            inbound = stream.next() => {
-                match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(msg) => dispatch(&session, &state, msg).await,
-                            Err(e) => warn!("ignoring malformed client message: {e}"),
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {} // ping/pong/binary
-                    Some(Err(e)) => {
-                        warn!("websocket read error: {e}");
-                        break;
-                    }
+            _ = cancel.cancelled() => break,
+            cmd = transport.recv() => {
+                match cmd {
+                    Some(msg) => dispatch(&session, &state, msg).await,
+                    None => break, // client disconnected
                 }
             }
             event = session.recv() => {
                 match event {
                     Some(ev) => {
                         let event = WireEvent::from_session_event(ev, &root_name);
-                        if !send_server_msg(&mut sink, &ServerMessage::Event { event }).await {
+                        if !transport.send(&ServerMessage::Event { event }).await {
                             break;
                         }
                     }
@@ -328,17 +290,40 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
-    if state
-        .active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        warn!("rejecting connection: a client is already connected");
-        return (StatusCode::CONFLICT, "a client is already connected").into_response();
+    // Latest-wins: install this connection's token and cancel any predecessor so
+    // its session is torn down. The token is a child of the global shutdown
+    // token, so a process signal cancels it too.
+    let cancel = state.shutdown.child_token();
+    if let Some(previous) = state.current.lock().await.replace(cancel.clone()) {
+        previous.cancel();
+        info!("evicting previous client connection");
     }
-    let guard = ActiveGuard(state.active.clone());
     info!(session_id = %session_id, "client connected");
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, guard))
+    ws.on_upgrade(move |socket| {
+        handle_session(WebSocketTransport::new(socket), state, session_id, cancel)
+    })
+}
+
+/// Resolve once the process receives SIGINT (Ctrl+C) or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 #[tokio::main]
@@ -381,6 +366,7 @@ async fn main() {
         ToolApprovalConfig::default_for(&workspace_dir)
     });
 
+    let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
         storage,
         system_prompt,
@@ -389,7 +375,19 @@ async fn main() {
         model,
         mcp_servers,
         approval_config,
-        active: Arc::new(AtomicBool::new(false)),
+        shutdown: shutdown.clone(),
+        current: Mutex::new(None),
+    });
+
+    // On a shutdown signal, cancel the token: this both ends `axum::serve`'s
+    // graceful shutdown and (via child tokens) tears down the live session.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown_signal().await;
+            info!("shutdown signal received");
+            shutdown.cancel();
+        }
     });
 
     let app = Router::new()
@@ -401,10 +399,7 @@ async fn main() {
         .unwrap();
     info!("coda_server listening on http://127.0.0.1:3000");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("shutdown signal received");
-        })
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .unwrap();
 
