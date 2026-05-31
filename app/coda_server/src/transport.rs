@@ -36,9 +36,8 @@ pub trait Transport {
     /// Malformed or non-data frames are logged and skipped internally.
     fn recv(&self) -> impl Future<Output = Option<Self::Incoming>> + Send;
 
-    /// Send a message. Returns `false` once the connection is gone and the
-    /// caller should tear down. A serialization failure is logged but treated
-    /// as non-fatal (`true`).
+    /// Send a message. Returns `false` once the message cannot be delivered and
+    /// the caller should tear down.
     fn send(&self, msg: &Self::Outgoing) -> impl Future<Output = bool> + Send;
 }
 
@@ -156,7 +155,7 @@ where
         Ok(j) => j,
         Err(e) => {
             warn!("failed to serialize message: {e}");
-            return true;
+            return false;
         }
     };
     let mut sink = sink.lock().await;

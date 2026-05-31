@@ -119,30 +119,6 @@ async fn send_allow_pattern_result<
         .await
 }
 
-/// Apply a client command to the live session.
-async fn dispatch(session: &Session, state: &Arc<AppState>, msg: ClientMessage) {
-    match msg {
-        ClientMessage::Task { task } => {
-            if let Err(e) = session.send(task).await {
-                warn!("failed to send task: {e}");
-            }
-        }
-        ClientMessage::Resume {
-            agent_name,
-            thread_id,
-            decision,
-        } => {
-            if let Err(e) = session.resume(&agent_name, &thread_id, decision).await {
-                warn!("failed to resume: {e}");
-            }
-        }
-        ClientMessage::Abort => session.abort().await,
-        ClientMessage::AddAllowPattern { pattern } => {
-            let _ = add_allow_pattern(state.approval_config.clone(), pattern).await;
-        }
-    }
-}
-
 /// Read `Resume` commands until every pending thread is covered. Allow-pattern
 /// commands sent alongside (e.g. choosing "always") are persisted in place.
 /// Returns `None` if the client disconnects, or if `cancel` fires (eviction or
@@ -173,10 +149,10 @@ async fn collect_resume_decisions<
                 decisions.insert(thread_id, decision);
             }
             ClientMessage::AddAllowPattern { pattern } => {
-                match send_allow_pattern_result(transport, approval_config.clone(), pattern).await {
-                    true => {}
-                    false => return None,
+                if send_allow_pattern_result(transport, approval_config.clone(), pattern).await {
+                    continue;
                 }
+                return None;
             }
             _ => {} // ignore task/abort while resolving
         }
@@ -312,7 +288,21 @@ async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = Server
                             break;
                         }
                     }
-                    Some(msg) => dispatch(&session, &state, msg).await,
+                    Some(ClientMessage::Task { task }) => {
+                        if let Err(e) = session.send(task).await {
+                            warn!("failed to send task: {e}");
+                        }
+                    }
+                    Some(ClientMessage::Resume {
+                        agent_name,
+                        thread_id,
+                        decision,
+                    }) => {
+                        if let Err(e) = session.resume(&agent_name, &thread_id, decision).await {
+                            warn!("failed to resume: {e}");
+                        }
+                    }
+                    Some(ClientMessage::Abort) => session.abort().await,
                     None => break, // client disconnected
                 }
             }
