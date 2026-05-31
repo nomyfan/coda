@@ -1,10 +1,16 @@
-use axum::http::StatusCode;
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    routing::{get, post},
+    Router,
+    extract::{
+        Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
 };
-use coda_agent::{AgentEvent, OpenError, RunConfig, Session, Shutdown, runtime::SessionStorage};
+use coda_agent::{
+    OpenError, ResumeDecision, RunConfig, Session, Shutdown, runtime::SessionStorage,
+};
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_server::{
@@ -13,12 +19,14 @@ use coda_server::{
     config::ToolApprovalConfig,
     mcp::McpServers,
     storage::JsonFileStorage,
-    wire::{
-        AddAllowPatternRequest, ChatRequest, ChatResponse, ChatStatus, HistoryResponse, WireEvent,
-    },
+    wire::{ClientMessage, ServerMessage, WireEvent},
 };
 use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -30,19 +38,28 @@ struct AppState {
     model: String,
     mcp_servers: McpServers,
     approval_config: ToolApprovalConfig,
+    /// Guards the single-client invariant: one server instance is bound to one
+    /// workspace and serves at most one live connection at a time.
+    active: Arc<AtomicBool>,
 }
 
-async fn chat_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, String> {
-    info!(
-        session_id = %req.session_id,
-        has_task = req.task.is_some(),
-        decisions = req.resume_decisions.len(),
-        "incoming request"
-    );
+/// Resets the single-client flag when the connection task ends, however it ends.
+struct ActiveGuard(Arc<AtomicBool>);
 
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Open (or resume) the session for `session_id`, seeding it with the built-in
+/// tools, MCP tools, and approval policy. `decisions` covers any pending
+/// approvals carried over from a prior suspension.
+async fn open_session(
+    state: &AppState,
+    session_id: &str,
+    decisions: HashMap<String, ResumeDecision>,
+) -> Result<Session, OpenError> {
     let config = RunConfig {
         provider: state.provider.clone(),
         model: state.model.clone(),
@@ -63,167 +80,265 @@ async fn chat_handler(
     let spec = build_agent_spec(state.system_prompt.clone(), extra_tools);
     let ctx = BuildContext::new(state.workspace_str.clone());
 
-    let session = match Session::builder()
+    Session::builder()
         .storage(state.storage.clone())
         .root(spec)
         .build_context(ctx)
         .run_config(config)
-        .session_id(&req.session_id)
-        .resume_decisions(req.resume_decisions)
+        .session_id(session_id)
+        .resume_decisions(decisions)
         .open()
         .await
-    {
-        Ok(s) => s,
-        Err(OpenError::PendingApprovalsRequired(pending)) => {
-            return Ok(Json(ChatResponse {
-                status: ChatStatus::PendingApproval,
-                events: vec![],
-                pending_approvals: pending,
-            }));
-        }
+}
+
+/// Serialize and send a server message. Returns `false` when the socket is
+/// gone and the connection should be torn down.
+async fn send_server_msg(sink: &mut SplitSink<WebSocket, Message>, msg: &ServerMessage) -> bool {
+    let json = match serde_json::to_string(msg) {
+        Ok(j) => j,
         Err(e) => {
-            return Ok(Json(ChatResponse {
-                status: ChatStatus::Error(format!("failed to open session: {e}")),
-                events: vec![],
-                pending_approvals: vec![],
-            }));
+            warn!("failed to serialize server message: {e}");
+            return true;
         }
     };
+    match sink.send(Message::Text(json.into())).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("websocket send error: {e}");
+            false
+        }
+    }
+}
 
-    info!("session opened, consuming events...");
+async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) {
+    match tokio::task::spawn_blocking(move || config.add_allow_pattern(&pattern)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to add allow pattern: {e}"),
+        Err(e) => warn!("failed to join allow-pattern writer: {e}"),
+    }
+}
 
-    if let Some(task) = &req.task
-        && session.send(task.clone()).await.is_err()
+/// Apply a client command to the live session.
+async fn dispatch(session: &Session, state: &Arc<AppState>, msg: ClientMessage) {
+    match msg {
+        ClientMessage::Task { task } => {
+            if let Err(e) = session.send(task).await {
+                warn!("failed to send task: {e}");
+            }
+        }
+        ClientMessage::Resume {
+            agent_name,
+            thread_id,
+            decision,
+        } => {
+            if let Err(e) = session.resume(&agent_name, &thread_id, decision).await {
+                warn!("failed to resume: {e}");
+            }
+        }
+        ClientMessage::Abort => session.abort().await,
+        ClientMessage::AddAllowPattern { pattern } => {
+            add_allow_pattern(state.approval_config.clone(), pattern).await;
+        }
+    }
+}
+
+/// Read `Resume` commands off the socket until every pending thread is covered.
+/// Returns `None` if the client disconnects first.
+async fn collect_resume_decisions(
+    stream: &mut SplitStream<WebSocket>,
+    approval_config: ToolApprovalConfig,
+    pending: &[coda_agent::PendingApproval],
+) -> Option<HashMap<String, ResumeDecision>> {
+    let mut needed: HashSet<String> = pending.iter().map(|p| p.thread_id.clone()).collect();
+    let mut decisions: HashMap<String, ResumeDecision> = HashMap::new();
+    while !needed.is_empty() {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(ClientMessage::Resume {
+                    thread_id,
+                    decision,
+                    ..
+                }) => {
+                    needed.remove(&thread_id);
+                    decisions.insert(thread_id, decision);
+                }
+                Ok(ClientMessage::AddAllowPattern { pattern }) => {
+                    add_allow_pattern(approval_config.clone(), pattern).await;
+                }
+                Ok(_) => {} // ignore non-resume commands while resolving
+                Err(e) => warn!("ignoring malformed client message: {e}"),
+            },
+            Some(Ok(Message::Close(_))) | None => return None,
+            Some(Ok(_)) => {} // ping/pong/binary
+            Some(Err(e)) => {
+                warn!("websocket read error: {e}");
+                return None;
+            }
+        }
+    }
+    Some(decisions)
+}
+
+/// Send an `Error` event describing a failed session open.
+async fn send_open_error(
+    sink: &mut SplitSink<WebSocket, Message>,
+    session_id: &str,
+    err: OpenError,
+) {
+    let event = WireEvent::Error {
+        agent_name: String::new(),
+        thread_id: session_id.to_string(),
+        message: format!("failed to open session: {err}"),
+    };
+    send_server_msg(sink, &ServerMessage::Event { event }).await;
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    session_id: String,
+    _guard: ActiveGuard,
+) {
+    let (mut sink, mut stream) = socket.split();
+
+    // 1. First open attempt, used both to bring the session up and to discover
+    //    whether it resumed into a pending approval.
+    let first = open_session(&state, &session_id, HashMap::new()).await;
+    let pending = match &first {
+        Err(OpenError::PendingApprovalsRequired(p)) => p.clone(),
+        _ => Vec::new(),
+    };
+
+    // 2. Send the snapshot: resumed history plus any pending approvals the
+    //    client must answer before the session can resume.
+    let messages = state
+        .storage
+        .load_checkpoint(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.messages)
+        .unwrap_or_default();
+    if !send_server_msg(
+        &mut sink,
+        &ServerMessage::Snapshot {
+            session_id: session_id.clone(),
+            messages,
+            pending_approvals: pending.clone(),
+        },
+    )
+    .await
     {
-        let _ = session.shutdown(Shutdown::Abort).await;
-        return Ok(Json(ChatResponse {
-            status: ChatStatus::Error("failed to send task".into()),
-            events: vec![],
-            pending_approvals: vec![],
-        }));
+        return;
     }
 
-    let mut events: Vec<WireEvent> = Vec::new();
-    let mut pending_approvals: Vec<coda_agent::PendingApproval> = Vec::new();
-    let mut status = ChatStatus::Done;
-    let root_name = session.root_name().to_string();
-
-    while let Some(event) = session.recv().await {
-        let is_terminal = match &event.kind {
-            AgentEvent::Suspended(pending) => {
-                pending_approvals.push(pending.clone());
-                status = ChatStatus::PendingApproval;
-                true
+    // 3. Resolve into a live session, collecting `Resume` decisions for any
+    //    pending approvals (re-prompting via events should the runtime suspend
+    //    again before fully resuming).
+    let session = match first {
+        Ok(s) => s,
+        Err(OpenError::PendingApprovalsRequired(_)) => {
+            let Some(mut decisions) =
+                collect_resume_decisions(&mut stream, state.approval_config.clone(), &pending)
+                    .await
+            else {
+                return;
+            };
+            loop {
+                match open_session(&state, &session_id, std::mem::take(&mut decisions)).await {
+                    Ok(s) => break s,
+                    Err(OpenError::PendingApprovalsRequired(more)) => {
+                        for p in &more {
+                            let event = WireEvent::Suspended {
+                                agent_name: p.agent_name.clone(),
+                                thread_id: p.thread_id.clone(),
+                                approval: p.clone(),
+                            };
+                            if !send_server_msg(&mut sink, &ServerMessage::Event { event }).await {
+                                return;
+                            }
+                        }
+                        match collect_resume_decisions(
+                            &mut stream,
+                            state.approval_config.clone(),
+                            &more,
+                        )
+                        .await
+                        {
+                            Some(d) => decisions = d,
+                            None => return,
+                        }
+                    }
+                    Err(e) => {
+                        send_open_error(&mut sink, &session_id, e).await;
+                        return;
+                    }
+                }
             }
-            AgentEvent::LLMEnd(msg) if event.origin.is_root() && msg.tool_calls.is_empty() => true,
-            _ => false,
-        };
-        events.push(WireEvent::from_session_event(event, &root_name));
-        if is_terminal {
-            break;
+        }
+        Err(e) => {
+            send_open_error(&mut sink, &session_id, e).await;
+            return;
+        }
+    };
+    let root_name = session.root_name().to_string();
+    info!(session_id = %session_id, "session opened");
+
+    // 3. Pump: client commands in, runtime events out, for the connection's life.
+    loop {
+        tokio::select! {
+            inbound = stream.next() => {
+                match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(msg) => dispatch(&session, &state, msg).await,
+                            Err(e) => warn!("ignoring malformed client message: {e}"),
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {} // ping/pong/binary
+                    Some(Err(e)) => {
+                        warn!("websocket read error: {e}");
+                        break;
+                    }
+                }
+            }
+            event = session.recv() => {
+                match event {
+                    Some(ev) => {
+                        let event = WireEvent::from_session_event(ev, &root_name);
+                        if !send_server_msg(&mut sink, &ServerMessage::Event { event }).await {
+                            break;
+                        }
+                    }
+                    None => break, // runtime shut down
+                }
+            }
         }
     }
 
     session
-        .shutdown(Shutdown::graceful(Duration::from_secs(5)))
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
         .await;
-
-    info!(
-        events = events.len(),
-        pending = pending_approvals.len(),
-        ?status,
-        "request complete"
-    );
-
-    Ok(Json(ChatResponse {
-        status,
-        events,
-        pending_approvals,
-    }))
+    info!(session_id = %session_id, "connection closed, session shut down");
 }
 
-async fn history_handler(
+async fn ws_handler(
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-) -> Result<Json<HistoryResponse>, String> {
-    let checkpoint = state
-        .storage
-        .load_checkpoint(&session_id)
-        .await
-        .map_err(|e| format!("storage error: {e}"))?;
-
-    let messages = checkpoint.as_ref().map_or(vec![], |c| c.messages.clone());
-
-    let mut pending_approvals = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(session_id.clone());
-
-    if let Some(ref ckpt) = checkpoint
-        && let coda_agent::persist::StoredResumePoint::PendingApproval {
-            ref pending_approval_calls,
-            ..
-        } = ckpt.resume_point
-        && !pending_approval_calls.is_empty()
+) -> Response {
+    if state
+        .active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
-        pending_approvals.push(coda_agent::PendingApproval {
-            thread_id: ckpt.thread_id.clone(),
-            agent_name: ckpt.agent_name.clone(),
-            calls: pending_approval_calls.clone(),
-            suspended_at: ckpt.suspended_at,
-        });
+        warn!("rejecting connection: a client is already connected");
+        return (StatusCode::CONFLICT, "a client is already connected").into_response();
     }
-
-    if let Some(snapshot) = state
-        .storage
-        .load_session_snapshot(&session_id)
-        .await
-        .map_err(|e| format!("storage error: {e}"))?
-    {
-        for tid in snapshot
-            .active_threads
-            .values()
-            .filter(|tid| seen.insert((*tid).clone()))
-        {
-            if let Some(ckpt) = state
-                .storage
-                .load_checkpoint(tid)
-                .await
-                .map_err(|e| format!("storage error: {e}"))?
-                && let coda_agent::persist::StoredResumePoint::PendingApproval {
-                    ref pending_approval_calls,
-                    ..
-                } = ckpt.resume_point
-                && !pending_approval_calls.is_empty()
-            {
-                pending_approvals.push(coda_agent::PendingApproval {
-                    thread_id: ckpt.thread_id.clone(),
-                    agent_name: ckpt.agent_name.clone(),
-                    calls: pending_approval_calls.clone(),
-                    suspended_at: ckpt.suspended_at,
-                });
-            }
-        }
-    }
-
-    Ok(Json(HistoryResponse {
-        messages,
-        pending_approvals,
-    }))
-}
-
-async fn add_allow_pattern_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AddAllowPatternRequest>,
-) -> Result<(), (StatusCode, String)> {
-    let config = state.approval_config.clone();
-    let pattern = req.pattern;
-    tokio::task::spawn_blocking(move || {
-        config
-            .add_allow_pattern(&pattern)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+    let guard = ActiveGuard(state.active.clone());
+    info!(session_id = %session_id, "client connected");
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, guard))
 }
 
 #[tokio::main]
@@ -274,12 +389,11 @@ async fn main() {
         model,
         mcp_servers,
         approval_config,
+        active: Arc::new(AtomicBool::new(false)),
     });
 
     let app = Router::new()
-        .route("/chat", post(chat_handler))
-        .route("/history/{session_id}", get(history_handler))
-        .route("/permissions/allow", post(add_allow_pattern_handler))
+        .route("/ws/{session_id}", get(ws_handler))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")

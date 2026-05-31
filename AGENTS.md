@@ -34,7 +34,7 @@ crates/
 - **`coda_tools`** — Built-in tool implementations and the tool spec system. Provides 8 built-in tools (shell, file read/write, ls, glob, grep, read_todos, write_todos), `TodoItem`, the `ToolSpec` trait, `BuildContext`, `PrebuiltToolSpec`, and `builtin_specs()`. Depends on `coda_core`.
 - **`coda_skills`** — Loads skill definitions from `.coda/skills/<name>/SKILL.md` directories. Parses YAML frontmatter (name, description, etc.) and generates XML for system-prompt injection.
 - **`coda_mcp`** — MCP (Model Context Protocol) client integration. Supports stdio and HTTP (streamable-http) transports, adapts MCP server tools into `ToolObject` instances via `McpToolAdapter`, auto-prefixes tool names with `mcp__` and truncates to 64 chars. Configuration is read from the `mcpServers` field in a JSON file.
-- **`coda_server`** — Application layer: HTTP server (axum), CLI client, system-prompt construction, tool approval config, MCP server loading, wire protocol types, and session persistence (JSON file storage). Located at `app/coda_server`.
+- **`coda_server`** — Application layer: WebSocket server (axum) holding one live `Session` per connection (single-client, single-workspace), CLI client, ask_user tool, system-prompt construction, tool approval config, MCP server loading, wire protocol types (`ClientMessage`/`ServerMessage`), and session persistence (JSON file storage). Located at `app/coda_server`.
 
 ### Key Abstractions
 
