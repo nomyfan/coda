@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use coda_tools::{BuildContext, TodoItem, ToolSpec};
 
-use crate::agent::{Agent, AgentState, SubAgentMode, SubAgentTool};
+use crate::agent::{Agent, AgentState, SubAgentMode, SubAgentTool, SystemPrompt};
 
 /// Errors that can occur while building an agent tree from its spec.
 #[derive(Debug)]
@@ -34,7 +34,7 @@ impl std::error::Error for BuildError {}
 pub struct AgentSpec {
     pub name: String,
     pub description: String,
-    pub system_prompt: String,
+    pub system_prompt: SystemPrompt,
     pub mode: SubAgentMode,
     pub tools: Vec<Box<dyn ToolSpec>>,
     pub subagents: Vec<AgentSpec>,

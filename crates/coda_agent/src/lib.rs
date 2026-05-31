@@ -6,7 +6,8 @@ pub mod spec;
 
 pub use agent::{
     AbortedTarget, Agent, AgentEvent, AgentState, Envelope, PendingApproval, ResumeDecision,
-    RunConfig, Sender, SubAgentMode, SubAgentTool, ThreadId, ToolApprovalMode, ToolCallResolution,
+    RunConfig, Sender, SharedSystemPrompt, SubAgentMode, SubAgentTool, SystemPrompt, ThreadId,
+    ToolApprovalMode, ToolCallResolution,
 };
 pub use persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 pub use session::{
