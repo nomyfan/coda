@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 coda_core = { workspace = true }
 http = "1"
-rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1", features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
