@@ -5,7 +5,8 @@ use axum::{
     routing::get,
 };
 use coda_agent::{
-    OpenError, ResumeDecision, RunConfig, Session, Shutdown, runtime::SessionStorage,
+    OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt, Shutdown,
+    runtime::SessionStorage,
 };
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
@@ -35,7 +36,10 @@ struct CurrentConnection {
 
 struct AppState {
     storage: JsonFileStorage,
-    system_prompt: String,
+    /// Shared system prompt, refreshed in place by the `AGENTS.md` watcher. The
+    /// root agent reads it at the start of every turn, so both newly opened and
+    /// already-live sessions pick up changes on their next turn.
+    system_prompt: SharedSystemPrompt,
     workspace_str: String,
     provider: Arc<OpenAI>,
     model: String,
@@ -395,6 +399,34 @@ async fn ws_handler(
     })
 }
 
+/// Poll the workspace's `AGENTS.md` for content changes and refresh the shared
+/// system prompt in place whenever it changes. Polling (over an OS watcher)
+/// keeps this dependency-free and robust to editor atomic-saves; the few-second
+/// latency is immaterial since the prompt is only read at the start of a turn.
+fn spawn_custom_instructions_watcher(
+    workspace_str: String,
+    system_prompt: SharedSystemPrompt,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut last = coda_server::read_custom_instructions(&workspace_str);
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    let current = coda_server::read_custom_instructions(&workspace_str);
+                    if current != last {
+                        last = current;
+                        system_prompt.set(build_system_prompt(&workspace_str));
+                        info!("AGENTS.md changed, system prompt reloaded");
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Resolve once the process receives SIGINT (Ctrl+C) or SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -434,7 +466,7 @@ async fn main() {
 
     let workspace_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let workspace_str = workspace_dir.to_string_lossy().into_owned();
-    let system_prompt = build_system_prompt(&workspace_str);
+    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str));
 
     let provider = Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
@@ -458,6 +490,12 @@ async fn main() {
     });
 
     let shutdown = CancellationToken::new();
+    spawn_custom_instructions_watcher(
+        workspace_str.clone(),
+        system_prompt.clone(),
+        shutdown.clone(),
+    );
+
     let state = Arc::new(AppState {
         storage,
         system_prompt,

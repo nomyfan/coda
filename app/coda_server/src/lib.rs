@@ -5,7 +5,7 @@ pub mod storage;
 pub mod transport;
 pub mod wire;
 
-use coda_agent::{AgentSpec, SubAgentMode};
+use coda_agent::{AgentSpec, SubAgentMode, SystemPrompt};
 use coda_skills::Skills;
 use coda_tools::{ToolSpec, builtin_specs};
 use std::path::Path;
@@ -30,6 +30,27 @@ pub fn print_logo(subtitle: &str) {
     println!();
 }
 
+/// Name of the custom-instructions file read from the workspace root.
+pub const CUSTOM_INSTRUCTIONS_FILE: &str = "AGENTS.md";
+
+/// Read the workspace's custom-instructions file (`AGENTS.md`), returning its
+/// trimmed contents. Returns `None` when the file is absent, unreadable, or
+/// blank so callers can simply skip the section.
+pub fn read_custom_instructions(workspace_dir: &str) -> Option<String> {
+    let path = Path::new(workspace_dir).join(CUSTOM_INSTRUCTIONS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            warn!("failed to read {CUSTOM_INSTRUCTIONS_FILE}: {err}");
+            None
+        }
+    }
+}
+
 pub fn build_system_prompt(workspace_dir: &str) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
 
@@ -44,6 +65,13 @@ pub fn build_system_prompt(workspace_dir: &str) -> String {
         Err(err) => {
             warn!("failed to load skills, proceeding without them: {err}");
         }
+    }
+
+    if let Some(instructions) = read_custom_instructions(workspace_dir) {
+        info!("loaded custom instructions from {CUSTOM_INSTRUCTIONS_FILE}");
+        prompt.push_str("\n\n<custom_instructions>\n");
+        prompt.push_str(&instructions);
+        prompt.push_str("\n</custom_instructions>");
     }
 
     prompt.push_str("\n\n");
@@ -102,14 +130,17 @@ fn get_os_version() -> Option<String> {
     }
 }
 
-pub fn build_agent_spec(system_prompt: String, extra_tools: Vec<Box<dyn ToolSpec>>) -> AgentSpec {
+pub fn build_agent_spec(
+    system_prompt: impl Into<SystemPrompt>,
+    extra_tools: Vec<Box<dyn ToolSpec>>,
+) -> AgentSpec {
     let mut tools = builtin_specs();
     tools.extend(extra_tools);
 
     AgentSpec {
         name: "coda".into(),
         description: String::new(),
-        system_prompt,
+        system_prompt: system_prompt.into(),
         mode: SubAgentMode::Stateful,
         tools,
         subagents: vec![
@@ -121,7 +152,7 @@ pub fn build_agent_spec(system_prompt: String, extra_tools: Vec<Box<dyn ToolSpec
                 system_prompt:
                     "You are an exploration assistant. You can read files, search code, and list \
                      directories. Summarize your findings concisely."
-                        .to_string(),
+                        .into(),
                 mode: SubAgentMode::Stateless,
                 tools: builtin_specs(),
                 subagents: vec![],
@@ -134,7 +165,7 @@ pub fn build_agent_spec(system_prompt: String, extra_tools: Vec<Box<dyn ToolSpec
                 system_prompt:
                     "You are a simple memo agent. Your only job is to remember what the user \
                      tells you and answer questions about it. Keep your replies very brief."
-                        .to_string(),
+                        .into(),
                 mode: SubAgentMode::Stateful,
                 tools: vec![],
                 subagents: vec![],
@@ -167,4 +198,47 @@ pub fn parse_session_id_arg(
     }
 
     Ok(session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_custom_instructions_reads_trimmed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CUSTOM_INSTRUCTIONS_FILE),
+            "\n  be concise.\n\n",
+        )
+        .unwrap();
+        let workspace = dir.path().to_string_lossy();
+        assert_eq!(
+            read_custom_instructions(&workspace),
+            Some("be concise.".to_string())
+        );
+    }
+
+    #[test]
+    fn read_custom_instructions_missing_or_blank_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_string_lossy().into_owned();
+        assert_eq!(read_custom_instructions(&workspace), None);
+
+        std::fs::write(dir.path().join(CUSTOM_INSTRUCTIONS_FILE), "   \n\t\n").unwrap();
+        assert_eq!(read_custom_instructions(&workspace), None);
+    }
+
+    #[test]
+    fn build_system_prompt_includes_custom_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CUSTOM_INSTRUCTIONS_FILE),
+            "always write tests.",
+        )
+        .unwrap();
+        let prompt = build_system_prompt(&dir.path().to_string_lossy());
+        assert!(prompt.contains("<custom_instructions>"));
+        assert!(prompt.contains("always write tests."));
+    }
 }

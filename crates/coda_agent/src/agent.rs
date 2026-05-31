@@ -205,10 +205,69 @@ pub enum AgentEvent {
     Error(String), // TODO: make this more structured
 }
 
+/// The system prompt an agent prepends to its messages at the start of every
+/// turn.
+///
+/// `Static` is fixed for the agent's lifetime. `Shared` reads through a handle
+/// an outside owner can update (e.g. when `AGENTS.md` changes), so the next
+/// turn picks up the new text without rebuilding the agent.
+#[derive(Clone)]
+pub enum SystemPrompt {
+    Static(String),
+    Shared(SharedSystemPrompt),
+}
+
+impl SystemPrompt {
+    /// The current prompt text.
+    pub fn resolve(&self) -> String {
+        match self {
+            SystemPrompt::Static(s) => s.clone(),
+            SystemPrompt::Shared(s) => s.get(),
+        }
+    }
+}
+
+impl From<&str> for SystemPrompt {
+    fn from(s: &str) -> Self {
+        SystemPrompt::Static(s.to_string())
+    }
+}
+
+impl From<String> for SystemPrompt {
+    fn from(s: String) -> Self {
+        SystemPrompt::Static(s)
+    }
+}
+
+impl From<SharedSystemPrompt> for SystemPrompt {
+    fn from(s: SharedSystemPrompt) -> Self {
+        SystemPrompt::Shared(s)
+    }
+}
+
+/// A mutable, shareable system prompt. Clones share the same storage; a `set`
+/// from any holder is observed by every agent built from it on their next turn.
+#[derive(Clone)]
+pub struct SharedSystemPrompt(Arc<std::sync::RwLock<String>>);
+
+impl SharedSystemPrompt {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        SharedSystemPrompt(Arc::new(std::sync::RwLock::new(prompt.into())))
+    }
+
+    pub fn set(&self, prompt: impl Into<String>) {
+        *self.0.write().unwrap() = prompt.into();
+    }
+
+    pub fn get(&self) -> String {
+        self.0.read().unwrap().clone()
+    }
+}
+
 pub struct Agent {
     pub name: String,
     pub mode: SubAgentMode,
-    pub system_prompt: String,
+    pub system_prompt: SystemPrompt,
     pub state: Arc<Mutex<AgentState>>,
     pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
     pub tools: ToolSet,
@@ -266,7 +325,7 @@ impl Agent {
         let mut messages = self.state.lock().await.messages.clone();
         messages.insert(
             0,
-            Message::System(SystemMessage(self.system_prompt.clone())),
+            Message::System(SystemMessage(self.system_prompt.resolve())),
         );
         messages
     }
