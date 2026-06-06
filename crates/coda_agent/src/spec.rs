@@ -18,9 +18,6 @@ pub enum BuildError {
     /// a name. Tools and sub-agents occupy the same LLM tool namespace, so the
     /// name would be ambiguous at dispatch.
     NameConflict { agent: String, name: String },
-    /// One or more sub-agents cannot be reached from the root (e.g. a reference
-    /// cycle with no entry point), so they could never be invoked.
-    UnreachableAgents(Vec<String>),
 }
 
 impl std::fmt::Display for BuildError {
@@ -46,14 +43,6 @@ impl std::fmt::Display for BuildError {
                     "Agent '{}' has two entries named '{}' (tools and sub-agents \
                      share one namespace)",
                     agent, name
-                )
-            }
-            BuildError::UnreachableAgents(names) => {
-                write!(
-                    f,
-                    "sub-agents unreachable from the root (no entry point — check for \
-                     reference cycles): {}",
-                    names.join(", ")
                 )
             }
         }
@@ -95,7 +84,7 @@ impl AgentTeam {
     /// side effects), returning a validated team or the first [`BuildError`].
     /// There is deliberately no way to obtain an `AgentTeam` without passing this
     /// gate.
-    pub fn new(root: AgentSpec, subagents: Vec<AgentSpec>) -> Result<Self, BuildError> {
+    pub fn new(root: AgentSpec, mut subagents: Vec<AgentSpec>) -> Result<Self, BuildError> {
         // Index every spec by name, rejecting duplicates across root + subagents.
         let mut by_name: HashMap<&str, &AgentSpec> = HashMap::new();
         for spec in std::iter::once(&root).chain(&subagents) {
@@ -133,25 +122,29 @@ impl AgentTeam {
             }
         }
 
-        // Every sub-agent must be reachable from the root; otherwise it could
-        // never be invoked. A visited set keeps cycles from looping forever.
-        let mut reachable: HashSet<&str> = HashSet::new();
+        // Walk the reference graph from the root. Sub-agents that can't be
+        // reached (e.g. a reference cycle with no entry point) could never be
+        // invoked, so they're dropped rather than failing the whole team.
+        // A visited set keeps cycles from looping forever.
+        let mut reachable: HashSet<String> = HashSet::new();
         let mut stack = vec![root.name.as_str()];
         while let Some(name) = stack.pop() {
-            if reachable.insert(name)
+            if reachable.insert(name.to_string())
                 && let Some(spec) = by_name.get(name)
             {
                 stack.extend(spec.subagents.iter().map(String::as_str));
             }
         }
-        let unreachable: Vec<String> = subagents
-            .iter()
-            .filter(|s| !reachable.contains(s.name.as_str()))
-            .map(|s| s.name.clone())
-            .collect();
-        if !unreachable.is_empty() {
-            return Err(BuildError::UnreachableAgents(unreachable));
-        }
+        subagents.retain(|s| {
+            let keep = reachable.contains(&s.name);
+            if !keep {
+                tracing::warn!(
+                    agent = %s.name,
+                    "ignoring sub-agent unreachable from the root (no entry point — check for reference cycles)"
+                );
+            }
+            keep
+        });
 
         Ok(AgentTeam { root, subagents })
     }

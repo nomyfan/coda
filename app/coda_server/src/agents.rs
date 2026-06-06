@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_agents_are_rejected_as_unreachable() {
+    fn cyclic_agents_are_dropped_as_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         write_agent(
             dir.path(),
@@ -555,11 +555,11 @@ mod tests {
             "---\ndescription: x\nmode: stateful\nsubagents: [a]\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let result = build_agent_team("root".into(), &ToolRegistry::new(), files, None, None);
-        assert!(matches!(
-            result,
-            Err(LoadError::Build(BuildError::UnreachableAgents(_)))
-        ));
+        // `a` and `b` reference each other but neither is reachable from the
+        // root, so both are dropped (with a warning) and the team still builds.
+        let team =
+            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
+        assert!(team.root().subagents.is_empty());
     }
 
     #[test]
