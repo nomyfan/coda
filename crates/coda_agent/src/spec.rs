@@ -43,8 +43,8 @@ impl std::fmt::Display for BuildError {
             BuildError::NameConflict { agent, name } => {
                 write!(
                     f,
-                    "Agent '{}' has a tool and sub-agent both named '{}' (tools and \
-                     sub-agents share one namespace)",
+                    "Agent '{}' has two entries named '{}' (tools and sub-agents \
+                     share one namespace)",
                     agent, name
                 )
             }

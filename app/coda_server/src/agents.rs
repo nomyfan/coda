@@ -257,9 +257,17 @@ pub fn build_agent_team(
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
 ) -> Result<AgentTeam, LoadError> {
+    // "Referenced by another agent" — self-references don't count, so an agent
+    // that lists itself (a self-loop) still attaches to `coda` as a root rather
+    // than being orphaned and rejected as unreachable.
     let referenced: HashSet<&str> = files
         .iter()
-        .flat_map(|f| f.subagents.iter().map(String::as_str))
+        .flat_map(|f| {
+            f.subagents
+                .iter()
+                .map(String::as_str)
+                .filter(move |&child| child != f.name.as_str())
+        })
         .collect();
 
     let roots: Vec<String> = files
@@ -414,6 +422,21 @@ mod tests {
 
         // Only `boss` is a direct sub-agent of coda; `worker` hangs under boss.
         assert_eq!(team.root().subagents, vec!["boss".to_string()]);
+    }
+
+    #[test]
+    fn self_referencing_agent_attaches_to_coda() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "loop",
+            "---\ndescription: x\nmode: stateful\nsubagents: [loop]\n---\nbody",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        let team = build_agent_team("root".into(), &ToolRegistry::new(), files).unwrap();
+        // A self-loop doesn't count as "referenced by another agent", so `loop`
+        // is still a root under coda (and thus reachable), not orphaned.
+        assert_eq!(team.root().subagents, vec!["loop".to_string()]);
     }
 
     #[test]
