@@ -13,11 +13,10 @@ use crate::agent::{EnvelopeBody, Receiver};
 use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
 use crate::{
-    Agent, AgentEvent, AgentSpec, BuildError, Envelope, PendingApproval, ResumeDecision, RunConfig,
-    Sender, ThreadId, ToolCallResolution,
+    AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
+    ToolCallResolution,
 };
 use coda_core::llm::{LLMProvider, Message};
-use coda_tools::BuildContext;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,9 +98,7 @@ impl Shutdown {
 #[derive(Debug)]
 pub enum OpenError {
     MissingField(&'static str),
-    Build(BuildError),
     Storage(String),
-    UnknownRoot(String),
     /// One or more agents have a checkpoint in `PendingApproval` state but the
     /// builder's `resume_decisions` did not cover them. The runtime is NOT
     /// started in this case; the caller should collect resume decisions for the
@@ -114,11 +111,7 @@ impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenError::MissingField(name) => write!(f, "missing required field '{name}'"),
-            OpenError::Build(err) => write!(f, "failed to build agents: {err}"),
             OpenError::Storage(err) => write!(f, "storage error: {err}"),
-            OpenError::UnknownRoot(name) => {
-                write!(f, "root '{name}' not present in provided agents")
-            }
             OpenError::PendingApprovalsRequired(ckpts) => {
                 write!(
                     f,
@@ -132,35 +125,21 @@ impl std::fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
-enum AgentSource {
-    Spec {
-        spec: AgentSpec,
-        ctx: BuildContext,
-    },
-    PreBuilt {
-        agents: HashMap<String, Agent>,
-        root_name: String,
-    },
-}
-
-/// Hand-written builder for [`Session`].
-pub struct SessionBuilder<P: LLMProvider + Clone> {
+/// Hand-written builder for [`Session`]. Borrows the [`AgentTeam`] (`'a`) until
+/// [`open`](SessionBuilder::open), which builds it into the session's agents.
+pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
     storage: Option<Arc<dyn SessionStorage>>,
-    source: Option<AgentSource>,
-    build_context: Option<BuildContext>,
-    pending_spec: Option<AgentSpec>,
+    team: Option<(&'a AgentTeam, String)>,
     run_config: Option<RunConfig<P>>,
     session_id: Option<String>,
     resume_decisions: HashMap<String, ResumeDecision>,
 }
 
-impl<P: LLMProvider + Clone> Default for SessionBuilder<P> {
+impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
     fn default() -> Self {
         Self {
             storage: None,
-            source: None,
-            build_context: None,
-            pending_spec: None,
+            team: None,
             run_config: None,
             session_id: None,
             resume_decisions: HashMap::new(),
@@ -168,7 +147,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<P> {
     }
 }
 
-impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
+impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -178,32 +157,12 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
         self
     }
 
-    /// Normal path: hand the session a root [`AgentSpec`]; the whole subagent
-    /// tree is derived from it.
-    ///
-    /// Mutually exclusive with [`SessionBuilder::agents`] — whichever is set
-    /// last wins.
-    pub fn root(mut self, spec: AgentSpec) -> Self {
-        self.pending_spec = Some(spec);
-        self.source = None;
-        self
-    }
-
-    /// Required when using [`SessionBuilder::root`]; ignored with
-    /// [`SessionBuilder::agents`].
-    pub fn build_context(mut self, ctx: BuildContext) -> Self {
-        self.build_context = Some(ctx);
-        self
-    }
-
-    /// Escape hatch for advanced / test use: provide pre-built [`Agent`]
-    /// instances and name the root. Bypasses `root` + `build_context`.
-    pub fn agents(mut self, agents: HashMap<String, Agent>, root_name: impl Into<String>) -> Self {
-        self.source = Some(AgentSource::PreBuilt {
-            agents,
-            root_name: root_name.into(),
-        });
-        self.pending_spec = None;
+    /// Register the validated [`AgentTeam`] to run, and the workspace its tools
+    /// build against. The team is borrowed and built into fresh agents at
+    /// [`open`](SessionBuilder::open); the team carries its own root, so there is
+    /// no root name to pass and no way to name a root that isn't present.
+    pub fn team(mut self, team: &'a AgentTeam, workspace_dir: &str) -> Self {
+        self.team = Some((team, workspace_dir.to_string()));
         self
     }
 
@@ -241,31 +200,9 @@ impl<P: LLMProvider + Clone + 'static> SessionBuilder<P> {
             .take()
             .ok_or(OpenError::MissingField("run_config"))?;
 
-        let source = match (self.source.take(), self.pending_spec.take()) {
-            (Some(pre), _) => pre,
-            (None, Some(spec)) => {
-                let ctx = self
-                    .build_context
-                    .take()
-                    .ok_or(OpenError::MissingField("build_context"))?;
-                AgentSource::Spec { spec, ctx }
-            }
-            (None, None) => return Err(OpenError::MissingField("root")),
-        };
-
-        let (agents, root_name) = match source {
-            AgentSource::Spec { spec, ctx } => {
-                let root_name = spec.name.clone();
-                let agents = spec.build(&ctx).map_err(OpenError::Build)?;
-                (agents, root_name)
-            }
-            AgentSource::PreBuilt { agents, root_name } => {
-                if !agents.contains_key(&root_name) {
-                    return Err(OpenError::UnknownRoot(root_name));
-                }
-                (agents, root_name)
-            }
-        };
+        let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
+        let agents = team.build(&workspace_dir);
+        let root_name = team.root().name.to_string();
 
         let session_id = self
             .session_id
@@ -426,7 +363,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn builder<P: LLMProvider + Clone + 'static>() -> SessionBuilder<P> {
+    pub fn builder<'a, P: LLMProvider + Clone + 'static>() -> SessionBuilder<'a, P> {
         SessionBuilder::new()
     }
 

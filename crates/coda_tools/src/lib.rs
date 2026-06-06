@@ -10,8 +10,8 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use shell::ShellTool;
 pub use spec::{
-    BuildContext, EditFileToolSpec, GlobToolSpec, GrepToolSpec, ListDirectoryToolSpec,
-    PrebuiltToolSpec, ReadFileToolSpec, ReadTodosToolSpec, ShellToolSpec, ToolSpec,
-    WriteFileToolSpec, WriteTodosToolSpec, builtin_specs,
+    BUILTIN_TOOL_NAMES, BuildContext, EditFileToolSpec, GlobToolSpec, GrepToolSpec,
+    ListDirectoryToolSpec, PrebuiltToolSpec, ReadFileToolSpec, ReadTodosToolSpec, ShellToolSpec,
+    ToolSpec, WriteFileToolSpec, WriteTodosToolSpec, builtin_specs, spec_by_name,
 };
 pub use todo::{ReadTodosTool, TodoItem, WriteTodosTool};

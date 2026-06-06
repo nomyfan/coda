@@ -13,4 +13,4 @@ pub use persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 pub use session::{
     EventOrigin, OnTimeout, OpenError, Session, SessionBuilder, SessionEvent, Shutdown,
 };
-pub use spec::{AgentSpec, BuildError};
+pub use spec::{AgentSpec, AgentTeam, BuildError};

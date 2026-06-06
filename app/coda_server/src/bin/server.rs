@@ -5,21 +5,22 @@ use axum::{
     routing::get,
 };
 use coda_agent::{
-    OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt, Shutdown,
-    runtime::SessionStorage,
+    AgentTeam, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt, Shutdown,
+    SystemPrompt, runtime::SessionStorage,
 };
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_server::{
+    agents::{ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
     ask_user::AskUserToolSpec,
-    build_agent_spec, build_system_prompt,
+    build_system_prompt,
     config::ToolApprovalConfig,
     mcp::McpServers,
     storage::JsonFileStorage,
     transport::{Transport, WebSocketTransport},
     wire::{ClientMessage, ServerMessage, WireEvent},
 };
-use coda_tools::{BuildContext, PrebuiltToolSpec, ToolSpec};
+use coda_tools::{BuildContext, ToolSpec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,14 +37,18 @@ struct CurrentConnection {
 
 struct AppState {
     storage: JsonFileStorage,
-    /// Shared system prompt, refreshed in place by the `AGENTS.md` watcher. The
-    /// root agent reads it at the start of every turn, so both newly opened and
-    /// already-live sessions pick up changes on their next turn.
-    system_prompt: SharedSystemPrompt,
     workspace_str: String,
     provider: Arc<OpenAI>,
     model: String,
+    /// Kept alive for the process lifetime so the MCP connections behind the
+    /// prebuilt tools in `agent_team` stay open; torn down on shutdown.
     mcp_servers: McpServers,
+    /// Validated team rooted at the top-level `coda` agent, with all
+    /// file-configured sub-agents. Built into fresh `Agent` instances for every
+    /// session. The `coda` spec holds the shared system prompt the `AGENTS.md`
+    /// watcher updates, so live and newly opened sessions both pick up changes on
+    /// their next turn.
+    agent_team: AgentTeam,
     approval_config: ToolApprovalConfig,
     /// Cancelled on process shutdown signal; parent of every connection token.
     shutdown: CancellationToken,
@@ -70,21 +75,9 @@ async fn open_session(
         approval_timeout: Some(Duration::from_secs(300)),
     };
 
-    let mut extra_tools: Vec<Box<dyn ToolSpec>> = vec![Box::new(AskUserToolSpec)];
-    extra_tools.extend(
-        state
-            .mcp_servers
-            .tool_objects()
-            .into_iter()
-            .map(|t| Box::new(PrebuiltToolSpec::new(t)) as Box<dyn ToolSpec>),
-    );
-    let spec = build_agent_spec(state.system_prompt.clone(), extra_tools);
-    let ctx = BuildContext::new(state.workspace_str.clone());
-
     Session::builder()
         .storage(state.storage.clone())
-        .root(spec)
-        .build_context(ctx)
+        .team(&state.agent_team, &state.workspace_str)
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
@@ -405,6 +398,7 @@ async fn ws_handler(
 /// latency is immaterial since the prompt is only read at the start of a turn.
 fn spawn_custom_instructions_watcher(
     workspace_str: String,
+    base_prompt: String,
     system_prompt: SharedSystemPrompt,
     shutdown: CancellationToken,
 ) {
@@ -418,7 +412,7 @@ fn spawn_custom_instructions_watcher(
                     let current = coda_server::read_custom_instructions(&workspace_str);
                     if current != last {
                         last = current;
-                        system_prompt.set(build_system_prompt(&workspace_str));
+                        system_prompt.set(build_system_prompt(&workspace_str, &base_prompt));
                         info!("AGENTS.md changed, system prompt reloaded");
                     }
                 }
@@ -466,7 +460,19 @@ async fn main() {
 
     let workspace_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let workspace_str = workspace_dir.to_string_lossy().into_owned();
-    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str));
+
+    // Load the optional top-level `.coda/agents/AGENT.md` (coda's own config); a
+    // bad parse is fatal at startup. Its body overrides the built-in base prompt;
+    // its tools/subagents overrides are applied when assembling the team below.
+    let root_agent = load_root_agent_file(&workspace_dir).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let base_prompt = root_agent
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
+    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str, &base_prompt));
 
     let provider = Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
@@ -484,6 +490,36 @@ async fn main() {
             McpServers::empty()
         });
 
+    // Build the tool registry: `ask_user` plus every connected MCP tool, each
+    // keyed by name so configured agents can request them individually.
+    let registry_ctx = BuildContext::new(workspace_str.clone());
+    let mut registry = ToolRegistry::new();
+    registry.insert(AskUserToolSpec.build(&registry_ctx));
+    for tool in mcp_servers.tool_objects() {
+        registry.insert(tool);
+    }
+
+    // Load file-configured sub-agents and assemble the validated agent team. A
+    // bad configuration (unknown tool, dangling reference, namespace conflict,
+    // unreachable agent, parse error) is fatal at startup rather than surfacing
+    // per session. Holding the resulting `AgentTeam` proves it is sound, so each
+    // session's `build` cannot fail.
+    let agent_files = load_agent_files(&workspace_dir).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let agent_team = build_agent_team(
+        SystemPrompt::from(system_prompt.clone()),
+        &registry,
+        agent_files,
+        root_agent.tools,
+        root_agent.subagents,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+
     let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
         tracing::warn!("failed to load approval config: {e}");
         ToolApprovalConfig::default_for(&workspace_dir)
@@ -492,17 +528,18 @@ async fn main() {
     let shutdown = CancellationToken::new();
     spawn_custom_instructions_watcher(
         workspace_str.clone(),
+        base_prompt,
         system_prompt.clone(),
         shutdown.clone(),
     );
 
     let state = Arc::new(AppState {
         storage,
-        system_prompt,
         workspace_str,
         provider,
         model,
         mcp_servers,
+        agent_team,
         approval_config,
         shutdown: shutdown.clone(),
         current: Mutex::new(None),

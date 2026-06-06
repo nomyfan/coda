@@ -63,6 +63,9 @@ impl Tool for AskUserTool {
 pub struct AskUserToolSpec;
 
 impl ToolSpec for AskUserToolSpec {
+    fn name(&self) -> &str {
+        "ask_user"
+    }
     fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(AskUserTool::new()))
     }
