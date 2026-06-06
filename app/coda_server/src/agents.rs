@@ -1,10 +1,16 @@
-//! File-based sub-agent definitions.
+//! File-based agent definitions.
 //!
-//! Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`.
-//! Each file is YAML frontmatter (description, mode, tools, subagents) followed
-//! by a markdown body used as the agent's system prompt. The top-level `coda`
-//! agent is *not* file-configurable; configured agents become its sub-agents
-//! (and may reference one another by name to form deeper trees).
+//! Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`:
+//! YAML frontmatter (description, mode, tools, subagents) followed by a markdown
+//! body used as the agent's system prompt. They become sub-agents of the
+//! top-level `coda` agent and may reference one another by name to form deeper
+//! graphs.
+//!
+//! The top-level `coda` agent itself is configured by an optional
+//! `.coda/agents/AGENT.md` (a bare file, distinct from the per-agent directories).
+//! Its `tools`, `subagents`, and body each *explicitly override* a default when
+//! present; otherwise the built-ins apply (all tools, auto-attached unreferenced
+//! agents, and the built-in base prompt respectively). `coda` is always present.
 //!
 //! A [`ToolRegistry`] resolves the `tools` list: built-in tools by name, plus
 //! any prebuilt tools (MCP, `ask_user`) registered at startup. An unknown tool
@@ -156,6 +162,29 @@ pub struct AgentFile {
     system_prompt: String,
 }
 
+/// Frontmatter of the optional top-level `.coda/agents/AGENT.md`. Both fields are
+/// `Option` so "absent" (use the default) is distinct from an explicit empty
+/// list (override to nothing).
+#[derive(Deserialize, Default)]
+struct RootFrontmatter {
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    subagents: Option<Vec<String>>,
+}
+
+/// Parsed top-level `coda` configuration. Each field is an explicit override of a
+/// default when `Some`/non-empty; otherwise the built-in behavior applies. See
+/// [`build_agent_team`] (tools, sub-agents) and the system-prompt assembly (body).
+#[derive(Default)]
+pub struct RootAgentFile {
+    pub tools: Option<Vec<String>>,
+    pub subagents: Option<Vec<String>>,
+    /// The body, used as the root agent's base system prompt; `None` when the
+    /// file is absent or its body is empty (fall back to the built-in default).
+    pub system_prompt: Option<String>,
+}
+
 /// True if `name` is a syntactically valid agent name (lowercase alphanumerics
 /// and hyphens, not starting or ending with a hyphen).
 fn is_valid_name(name: &str) -> bool {
@@ -245,39 +274,116 @@ pub fn load_agent_files(workspace_dir: &Path) -> Result<Vec<AgentFile>, LoadErro
     Ok(files)
 }
 
-/// Assemble a validated [`AgentTeam`] rooted at the top-level `coda` agent
-/// (built-in + all prebuilt tools), whose direct sub-agents are the configured
-/// agents that no other agent references; the remaining configured agents hang
-/// beneath them by name. Fallible for unknown tool names ([`LoadError::UnknownTool`])
-/// and for any structural problem [`AgentTeam::new`] rejects — duplicate names,
-/// dangling references, tool/sub-agent conflicts, or agents left unreachable from
-/// `coda` ([`LoadError::Build`]).
+fn parse_root_agent_file(content: &str) -> Result<RootAgentFile, LoadError> {
+    let parse_err = |reason: String| LoadError::Parse {
+        agent: ROOT_AGENT_NAME.to_string(),
+        reason,
+    };
+
+    let (frontmatter, body) = split_frontmatter(content).map_err(parse_err)?;
+    let fm: RootFrontmatter = serde_yml::from_str(frontmatter)
+        .map_err(|e| parse_err(format!("invalid frontmatter: {e}")))?;
+
+    if let Some(reserved) = fm
+        .subagents
+        .iter()
+        .flatten()
+        .find(|s| *s == ROOT_AGENT_NAME)
+    {
+        return Err(LoadError::ReservedName(reserved.clone()));
+    }
+
+    Ok(RootAgentFile {
+        tools: fm.tools,
+        subagents: fm.subagents,
+        system_prompt: (!body.is_empty()).then(|| body.to_string()),
+    })
+}
+
+/// Load the optional top-level `.coda/agents/AGENT.md` that configures the `coda`
+/// agent itself. Returns all-default ([`RootAgentFile::default`]) when absent.
+pub fn load_root_agent_file(workspace_dir: &Path) -> Result<RootAgentFile, LoadError> {
+    let path = workspace_dir
+        .join(".coda")
+        .join(AGENTS_SUBDIR)
+        .join(AGENT_FILE);
+    if !path.exists() {
+        return Ok(RootAgentFile::default());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    info!("loaded top-level {AGENT_FILE} for '{ROOT_AGENT_NAME}'");
+    parse_root_agent_file(&content)
+}
+
+/// Resolve a list of tool names to [`ToolSpec`] factories via `registry`, failing
+/// with [`LoadError::UnknownTool`] (attributed to `agent`) on the first miss.
+fn resolve_tools(
+    registry: &ToolRegistry,
+    agent: &str,
+    names: &[String],
+) -> Result<Vec<Box<dyn ToolSpec>>, LoadError> {
+    let mut tools = Vec::with_capacity(names.len());
+    for name in names {
+        match registry.resolve(name) {
+            Some(spec) => tools.push(spec),
+            None => {
+                return Err(LoadError::UnknownTool {
+                    agent: agent.to_string(),
+                    tool: name.clone(),
+                });
+            }
+        }
+    }
+    Ok(tools)
+}
+
+/// Assemble a validated [`AgentTeam`] rooted at the top-level `coda` agent.
+///
+/// `root_tools` / `root_subagents` come from the optional `.coda/agents/AGENT.md`
+/// and each *explicitly override* a default when present:
+/// - tools default to all built-ins + every prebuilt tool;
+/// - direct sub-agents default to the configured agents that no *other* agent
+///   references (self-references don't count, so a self-loop still attaches).
+///
+/// Fallible for unknown tool names ([`LoadError::UnknownTool`]) and for any
+/// structural problem [`AgentTeam::new`] rejects — duplicate names, dangling
+/// references, tool/sub-agent conflicts, or agents unreachable from `coda`
+/// ([`LoadError::Build`]).
 pub fn build_agent_team(
     root_system_prompt: SystemPrompt,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
+    root_tools: Option<Vec<String>>,
+    root_subagents: Option<Vec<String>>,
 ) -> Result<AgentTeam, LoadError> {
-    // "Referenced by another agent" — self-references don't count, so an agent
-    // that lists itself (a self-loop) still attaches to `coda` as a root rather
-    // than being orphaned and rejected as unreachable.
-    let referenced: HashSet<&str> = files
-        .iter()
-        .flat_map(|f| {
-            f.subagents
+    let roots = match root_subagents {
+        Some(explicit) => explicit,
+        None => {
+            let referenced: HashSet<&str> = files
                 .iter()
-                .map(String::as_str)
-                .filter(move |&child| child != f.name.as_str())
-        })
-        .collect();
+                .flat_map(|f| {
+                    f.subagents
+                        .iter()
+                        .map(String::as_str)
+                        .filter(move |&child| child != f.name.as_str())
+                })
+                .collect();
+            files
+                .iter()
+                .filter(|f| !referenced.contains(f.name.as_str()))
+                .map(|f| f.name.clone())
+                .collect()
+        }
+    };
 
-    let roots: Vec<String> = files
-        .iter()
-        .filter(|f| !referenced.contains(f.name.as_str()))
-        .map(|f| f.name.clone())
-        .collect();
-
-    let mut root_tools = builtin_specs();
-    root_tools.extend(registry.all_prebuilt());
+    let root_tools = match root_tools {
+        Some(names) => resolve_tools(registry, ROOT_AGENT_NAME, &names)?,
+        None => {
+            let mut tools = builtin_specs();
+            tools.extend(registry.all_prebuilt());
+            tools
+        }
+    };
 
     let root = AgentSpec {
         name: ROOT_AGENT_NAME.to_string(),
@@ -290,18 +396,7 @@ pub fn build_agent_team(
 
     let mut subagents = Vec::with_capacity(files.len());
     for file in files {
-        let mut tools = Vec::with_capacity(file.tools.len());
-        for tool in &file.tools {
-            match registry.resolve(tool) {
-                Some(spec) => tools.push(spec),
-                None => {
-                    return Err(LoadError::UnknownTool {
-                        agent: file.name.clone(),
-                        tool: tool.clone(),
-                    });
-                }
-            }
-        }
+        let tools = resolve_tools(registry, &file.name, &file.tools)?;
         subagents.push(AgentSpec {
             name: file.name,
             description: file.description,
@@ -323,6 +418,12 @@ mod tests {
         let agent_dir = dir.join(".coda").join("agents").join(name);
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("AGENT.md"), content).unwrap();
+    }
+
+    fn write_root_agent(dir: &Path, content: &str) {
+        let agents_dir = dir.join(".coda").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("AGENT.md"), content).unwrap();
     }
 
     #[test]
@@ -399,7 +500,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let result = build_agent_team("root".into(), &registry, files);
+        let result = build_agent_team("root".into(), &registry, files, None, None);
         assert!(matches!(result, Err(LoadError::UnknownTool { .. })));
     }
 
@@ -418,7 +519,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let team = build_agent_team("root".into(), &registry, files).unwrap();
+        let team = build_agent_team("root".into(), &registry, files, None, None).unwrap();
 
         // Only `boss` is a direct sub-agent of coda; `worker` hangs under boss.
         assert_eq!(team.root().subagents, vec!["boss".to_string()]);
@@ -433,7 +534,8 @@ mod tests {
             "---\ndescription: x\nmode: stateful\nsubagents: [loop]\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team = build_agent_team("root".into(), &ToolRegistry::new(), files).unwrap();
+        let team =
+            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
         // A self-loop doesn't count as "referenced by another agent", so `loop`
         // is still a root under coda (and thus reachable), not orphaned.
         assert_eq!(team.root().subagents, vec!["loop".to_string()]);
@@ -453,7 +555,7 @@ mod tests {
             "---\ndescription: x\nmode: stateful\nsubagents: [a]\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let result = build_agent_team("root".into(), &ToolRegistry::new(), files);
+        let result = build_agent_team("root".into(), &ToolRegistry::new(), files, None, None);
         assert!(matches!(
             result,
             Err(LoadError::Build(BuildError::UnreachableAgents(_)))
@@ -473,7 +575,7 @@ mod tests {
         let files = load_agent_files(dir.path()).unwrap();
         // Team construction catches the conflict from spec metadata alone — no
         // build.
-        let result = build_agent_team("root".into(), &ToolRegistry::new(), files);
+        let result = build_agent_team("root".into(), &ToolRegistry::new(), files, None, None);
         assert!(matches!(
             result,
             Err(LoadError::Build(BuildError::NameConflict { .. }))
@@ -499,10 +601,104 @@ mod tests {
             "---\ndescription: x\nmode: stateless\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team = build_agent_team("root".into(), &ToolRegistry::new(), files).unwrap();
+        let team =
+            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
         let agents = team.build(".");
         assert!(agents.contains_key("shared"));
         assert!(agents.contains_key("a"));
         assert!(agents.contains_key("b"));
+    }
+
+    #[test]
+    fn no_root_agent_file_is_all_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = load_root_agent_file(dir.path()).unwrap();
+        assert!(root.tools.is_none());
+        assert!(root.subagents.is_none());
+        assert!(root.system_prompt.is_none());
+    }
+
+    #[test]
+    fn root_agent_file_parses_overrides_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        write_root_agent(
+            dir.path(),
+            "---\ntools: [shell, read_file]\nsubagents: [explore]\n---\nYou are coda.",
+        );
+        let root = load_root_agent_file(dir.path()).unwrap();
+        assert_eq!(
+            root.tools,
+            Some(vec!["shell".to_string(), "read_file".to_string()])
+        );
+        assert_eq!(root.subagents, Some(vec!["explore".to_string()]));
+        assert_eq!(root.system_prompt.as_deref(), Some("You are coda."));
+    }
+
+    #[test]
+    fn root_agent_file_empty_body_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_root_agent(dir.path(), "---\ntools: []\n---\n");
+        let root = load_root_agent_file(dir.path()).unwrap();
+        // Explicit empty list overrides to "no tools"; empty body falls back.
+        assert_eq!(root.tools, Some(vec![]));
+        assert!(root.system_prompt.is_none());
+    }
+
+    #[test]
+    fn root_subagents_override_enables_root_sharing() {
+        // `shared` is referenced by `boss`, so the default heuristic would hide
+        // it from coda. An explicit root `subagents` list mounts it under coda
+        // too — the same agent shared by root and another agent.
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "boss",
+            "---\ndescription: x\nmode: stateful\nsubagents: [shared]\n---\nbody",
+        );
+        write_agent(
+            dir.path(),
+            "shared",
+            "---\ndescription: x\nmode: stateless\n---\nbody",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        let team = build_agent_team(
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            None,
+            Some(vec!["boss".into(), "shared".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            team.root().subagents,
+            vec!["boss".to_string(), "shared".to_string()]
+        );
+    }
+
+    #[test]
+    fn root_tools_override_unknown_tool_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = load_agent_files(dir.path()).unwrap();
+        let result = build_agent_team(
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            Some(vec!["no_such_tool".into()]),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(LoadError::UnknownTool { agent, .. }) if agent == ROOT_AGENT_NAME
+        ));
+    }
+
+    #[test]
+    fn root_subagents_referencing_reserved_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_root_agent(dir.path(), "---\nsubagents: [coda]\n---\nbody");
+        assert!(matches!(
+            load_root_agent_file(dir.path()),
+            Err(LoadError::ReservedName(_))
+        ));
     }
 }

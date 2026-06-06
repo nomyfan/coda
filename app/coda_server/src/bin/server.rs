@@ -11,7 +11,7 @@ use coda_agent::{
 use coda_core::llm::LLMProviderConfig;
 use coda_openai::OpenAI;
 use coda_server::{
-    agents::{ToolRegistry, build_agent_team, load_agent_files},
+    agents::{ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
     ask_user::AskUserToolSpec,
     build_system_prompt,
     config::ToolApprovalConfig,
@@ -398,6 +398,7 @@ async fn ws_handler(
 /// latency is immaterial since the prompt is only read at the start of a turn.
 fn spawn_custom_instructions_watcher(
     workspace_str: String,
+    base_prompt: String,
     system_prompt: SharedSystemPrompt,
     shutdown: CancellationToken,
 ) {
@@ -411,7 +412,7 @@ fn spawn_custom_instructions_watcher(
                     let current = coda_server::read_custom_instructions(&workspace_str);
                     if current != last {
                         last = current;
-                        system_prompt.set(build_system_prompt(&workspace_str));
+                        system_prompt.set(build_system_prompt(&workspace_str, &base_prompt));
                         info!("AGENTS.md changed, system prompt reloaded");
                     }
                 }
@@ -459,7 +460,19 @@ async fn main() {
 
     let workspace_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let workspace_str = workspace_dir.to_string_lossy().into_owned();
-    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str));
+
+    // Load the optional top-level `.coda/agents/AGENT.md` (coda's own config); a
+    // bad parse is fatal at startup. Its body overrides the built-in base prompt;
+    // its tools/subagents overrides are applied when assembling the team below.
+    let root_agent = load_root_agent_file(&workspace_dir).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let base_prompt = root_agent
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
+    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str, &base_prompt));
 
     let provider = Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
@@ -499,6 +512,8 @@ async fn main() {
         SystemPrompt::from(system_prompt.clone()),
         &registry,
         agent_files,
+        root_agent.tools,
+        root_agent.subagents,
     )
     .unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -513,6 +528,7 @@ async fn main() {
     let shutdown = CancellationToken::new();
     spawn_custom_instructions_watcher(
         workspace_str.clone(),
+        base_prompt,
         system_prompt.clone(),
         shutdown.clone(),
     );

@@ -50,8 +50,12 @@ pub fn read_custom_instructions(workspace_dir: &str) -> Option<String> {
     }
 }
 
-pub fn build_system_prompt(workspace_dir: &str) -> String {
-    let mut prompt = SYSTEM_PROMPT.to_string();
+/// Compose the root agent's full system prompt: `base` (the root agent's base
+/// instructions — either the configured `.coda/agents/AGENT.md` body or the
+/// built-in [`SYSTEM_PROMPT`]) followed by skills, workspace custom
+/// instructions (`AGENTS.md`), and environment context.
+pub fn build_system_prompt(workspace_dir: &str, base: &str) -> String {
+    let mut prompt = base.to_string();
 
     match Skills::from_dir(&Path::new(workspace_dir).join(".coda").join("skills")) {
         Ok(skills) => {
@@ -192,7 +196,7 @@ mod tests {
             "always write tests.",
         )
         .unwrap();
-        let prompt = build_system_prompt(&dir.path().to_string_lossy());
+        let prompt = build_system_prompt(&dir.path().to_string_lossy(), SYSTEM_PROMPT);
         assert!(prompt.contains("<custom_instructions>"));
         assert!(prompt.contains("always write tests."));
     }
