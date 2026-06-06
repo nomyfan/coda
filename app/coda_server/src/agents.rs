@@ -51,9 +51,7 @@ pub enum LoadError {
         tool: String,
     },
     /// The assembled team failed structural validation: duplicate names,
-    /// dangling sub-agent references, tool/sub-agent namespace conflicts, or an
-    /// agent left unreachable from the top-level `coda` agent (e.g. a reference
-    /// cycle with no entry point).
+    /// dangling sub-agent references, or tool/sub-agent namespace conflicts.
     Build(BuildError),
 }
 
@@ -347,8 +345,8 @@ fn resolve_tools(
 ///
 /// Fallible for unknown tool names ([`LoadError::UnknownTool`]) and for any
 /// structural problem [`AgentTeam::new`] rejects — duplicate names, dangling
-/// references, tool/sub-agent conflicts, or agents unreachable from `coda`
-/// ([`LoadError::Build`]).
+/// references, or tool/sub-agent conflicts ([`LoadError::Build`]).
+/// Agents unreachable from `coda` are ignored with a warning.
 pub fn build_agent_team(
     root_system_prompt: SystemPrompt,
     registry: &ToolRegistry,

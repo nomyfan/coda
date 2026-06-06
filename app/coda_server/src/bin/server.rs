@@ -501,9 +501,9 @@ async fn main() {
 
     // Load file-configured sub-agents and assemble the validated agent team. A
     // bad configuration (unknown tool, dangling reference, namespace conflict,
-    // unreachable agent, parse error) is fatal at startup rather than surfacing
-    // per session. Holding the resulting `AgentTeam` proves it is sound, so each
-    // session's `build` cannot fail.
+    // parse error) is fatal at startup rather than surfacing per session.
+    // Unreachable agents are ignored with a warning. Holding the resulting
+    // `AgentTeam` proves it is sound, so each session's `build` cannot fail.
     let agent_files = load_agent_files(&workspace_dir).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
