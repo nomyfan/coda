@@ -202,7 +202,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
 
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
         let agents = team.build(&workspace_dir);
-        let root_name = team.root_name().to_string();
+        let root_name = team.root().name.to_string();
 
         let session_id = self
             .session_id

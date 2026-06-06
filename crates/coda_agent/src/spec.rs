@@ -161,16 +161,6 @@ impl AgentTeam {
         &self.root
     }
 
-    /// The root agent's name.
-    pub fn root_name(&self) -> &str {
-        &self.root.name
-    }
-
-    /// The non-root agent specs.
-    pub fn subagents(&self) -> &[AgentSpec] {
-        &self.subagents
-    }
-
     /// Build every spec into a fresh [`Agent`], keyed by name, with tools rooted
     /// at `workspace_dir`. Each spec is built exactly once, so the same agent may
     /// be a sub-agent of several parents. Cycles are fine: sub-agents are
