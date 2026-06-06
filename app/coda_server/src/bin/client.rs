@@ -11,8 +11,9 @@ use rustyline::error::ReadlineError;
 use std::io::{self, Write};
 use uuid::Uuid;
 
-/// The root agent is always named "coda" (see `build_agent_spec`). The snapshot
-/// does not carry the name, so the debug client hardcodes it for rendering.
+/// The root agent is always named "coda" (see `agents::ROOT_AGENT_NAME`). The
+/// snapshot does not carry the name, so the debug client hardcodes it for
+/// rendering.
 const ROOT_NAME: &str = "coda";
 
 fn render_message(message: &LlmMessage) {

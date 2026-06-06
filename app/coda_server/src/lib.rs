@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod ask_user;
 pub mod config;
 pub mod mcp;
@@ -5,9 +6,7 @@ pub mod storage;
 pub mod transport;
 pub mod wire;
 
-use coda_agent::{AgentSpec, SubAgentMode, SystemPrompt};
 use coda_skills::Skills;
-use coda_tools::{ToolSpec, builtin_specs};
 use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -127,50 +126,6 @@ fn get_os_version() -> Option<String> {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
-    }
-}
-
-pub fn build_agent_spec(
-    system_prompt: impl Into<SystemPrompt>,
-    extra_tools: Vec<Box<dyn ToolSpec>>,
-) -> AgentSpec {
-    let mut tools = builtin_specs();
-    tools.extend(extra_tools);
-
-    AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: system_prompt.into(),
-        mode: SubAgentMode::Stateful,
-        tools,
-        subagents: vec![
-            AgentSpec {
-                name: "explore".into(),
-                description: "An explore sub-agent that can read files, search code, and explore \
-                              the codebase. Delegate exploration and research tasks to it."
-                    .into(),
-                system_prompt:
-                    "You are an exploration assistant. You can read files, search code, and list \
-                     directories. Summarize your findings concisely."
-                        .into(),
-                mode: SubAgentMode::Stateless,
-                tools: builtin_specs(),
-                subagents: vec![],
-            },
-            AgentSpec {
-                name: "memo".into(),
-                description: "A stateful memo agent that remembers information across calls. \
-                     Use it to store and recall facts across turns."
-                    .into(),
-                system_prompt:
-                    "You are a simple memo agent. Your only job is to remember what the user \
-                     tells you and answer questions about it. Keep your replies very brief."
-                        .into(),
-                mode: SubAgentMode::Stateful,
-                tools: vec![],
-                subagents: vec![],
-            },
-        ],
     }
 }
 

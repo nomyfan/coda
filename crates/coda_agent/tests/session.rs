@@ -9,14 +9,13 @@ use std::time::Duration;
 
 use coda_agent::runtime::MemoryStorage;
 use coda_agent::{
-    AgentEvent, AgentSpec, ResumeDecision, RunConfig, Session, SessionEvent, Shutdown,
+    AgentEvent, AgentSpec, AgentTeam, ResumeDecision, RunConfig, Session, SessionEvent, Shutdown,
     SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, StreamError, ToolCall,
     ToolOutput,
 };
-use coda_tools::BuildContext;
 use futures::{Stream, stream};
 use serde_json::json;
 use tokio::time::timeout;
@@ -316,6 +315,11 @@ fn simple_spec(system_prompt: &str) -> AgentSpec {
     }
 }
 
+/// A single-agent team (no sub-agents) for the `.team(...)` builder entry.
+fn solo_team(spec: AgentSpec) -> AgentTeam {
+    AgentTeam::new(spec, vec![]).expect("valid team")
+}
+
 fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
     RunConfig {
         provider: FakeProvider,
@@ -387,8 +391,7 @@ async fn should_reply_with_text_when_no_tools_needed() {
     let spec = simple_spec("session-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec), ".")
         .run_config(run_config(ToolApprovalMode::Auto))
         .open()
         .await
@@ -419,12 +422,9 @@ async fn should_read_file_via_tool_call() {
         tools: coda_tools::builtin_specs(),
         subagents: vec![],
     };
-    let ctx = BuildContext::new(tmp.path().to_string_lossy());
-
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(ctx)
+        .team(&solo_team(spec), &tmp.path().to_string_lossy())
         .run_config(run_config(ToolApprovalMode::Auto))
         .open()
         .await
@@ -458,12 +458,9 @@ async fn should_write_and_read_back_file() {
         tools: coda_tools::builtin_specs(),
         subagents: vec![],
     };
-    let ctx = BuildContext::new(tmp.path().to_string_lossy());
-
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(ctx)
+        .team(&solo_team(spec), &tmp.path().to_string_lossy())
         .run_config(run_config(ToolApprovalMode::Auto))
         .open()
         .await
@@ -489,26 +486,27 @@ async fn should_write_and_read_back_file() {
 /// 4. Delegate a task to the explore sub-agent.
 #[tokio::test]
 async fn should_delegate_to_explore_subagent() {
-    let spec = AgentSpec {
+    let coda = AgentSpec {
         name: "coda".into(),
         description: String::new(),
         system_prompt: "session-system".into(),
         mode: SubAgentMode::Stateful,
         tools: vec![],
-        subagents: vec![AgentSpec {
-            name: "explore".into(),
-            description: "An explore sub-agent.".into(),
-            system_prompt: "You are an exploration assistant.".into(),
-            mode: SubAgentMode::Stateless,
-            tools: vec![],
-            subagents: vec![],
-        }],
+        subagents: vec!["explore".into()],
     };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: "An explore sub-agent.".into(),
+        system_prompt: "You are an exploration assistant.".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let team = AgentTeam::new(coda, vec![explore]).expect("valid team");
 
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&team, ".")
         .run_config(run_config(ToolApprovalMode::Auto))
         .open()
         .await
@@ -533,8 +531,7 @@ async fn should_maintain_history_across_turns() {
     let spec = simple_spec("session-system");
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec), ".")
         .run_config(run_config(ToolApprovalMode::Auto))
         .open()
         .await
@@ -571,8 +568,7 @@ async fn should_resume_from_prior_checkpoint() {
     let spec = simple_spec("session-system");
     let session1 = Session::builder()
         .storage(storage.clone())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec), ".")
         .run_config(run_config(ToolApprovalMode::Auto))
         .session_id(session_id)
         .open()
@@ -591,8 +587,7 @@ async fn should_resume_from_prior_checkpoint() {
     let spec2 = simple_spec("session-system");
     let session2 = Session::builder()
         .storage(storage.clone())
-        .root(spec2)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec2), ".")
         .run_config(run_config(ToolApprovalMode::Auto))
         .session_id(session_id)
         .open()
@@ -644,8 +639,7 @@ async fn should_execute_tool_after_approval_resume() {
 
     let session = Session::builder()
         .storage(MemoryStorage::default())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec), ".")
         .run_config(RunConfig {
             provider: FakeProvider,
             model: "fake".into(),
@@ -695,8 +689,7 @@ async fn should_auto_reject_when_approval_times_out() {
     let spec = simple_spec("session-system");
     let session1 = Session::builder()
         .storage(storage.clone())
-        .root(spec)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec), ".")
         .run_config(RunConfig {
             provider: FakeProvider,
             model: "fake".into(),
@@ -728,8 +721,7 @@ async fn should_auto_reject_when_approval_times_out() {
     let spec2 = simple_spec("session-system");
     let session2 = Session::builder()
         .storage(storage.clone())
-        .root(spec2)
-        .build_context(BuildContext::new("."))
+        .team(&solo_team(spec2), ".")
         .run_config(RunConfig {
             provider: FakeProvider,
             model: "fake".into(),

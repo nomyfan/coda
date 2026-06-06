@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    AgentEvent, AgentSpec, RunConfig, Sender, StoredCheckpoint, StoredRuntimeSnapshot,
+    AgentEvent, AgentSpec, AgentTeam, RunConfig, Sender, StoredCheckpoint, StoredRuntimeSnapshot,
     SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::{AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage},
 };
@@ -135,6 +135,9 @@ impl Tool for EchoTool {
 struct EchoToolSpec;
 
 impl ToolSpec for EchoToolSpec {
+    fn name(&self) -> &str {
+        "echo"
+    }
     fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(EchoTool::new()))
     }
@@ -193,6 +196,9 @@ struct SlowToolSpec {
 }
 
 impl ToolSpec for SlowToolSpec {
+    fn name(&self) -> &str {
+        "slow_tool"
+    }
     fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(SlowTool::new(self.gate.clone())))
     }
@@ -526,9 +532,20 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let agents = spec
-            .build(&BuildContext::new("."))
-            .expect("build agent tree");
+        Self::start_with_team(storage, spec, vec![], provider, approval, initial_task).await
+    }
+
+    async fn start_with_team(
+        storage: S,
+        root: AgentSpec,
+        subagents: Vec<AgentSpec>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        initial_task: &str,
+    ) -> Self {
+        let agents = AgentTeam::new(root, subagents)
+            .expect("valid team")
+            .build(".");
         Self::start_agents(storage, agents, provider, approval, initial_task).await
     }
 
@@ -653,16 +670,19 @@ where
 
 #[tokio::test]
 async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
-    let agents = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: "main-system".into(),
-        mode: SubAgentMode::Stateful,
-        tools: vec![],
-        subagents: vec![],
-    }
-    .build(&BuildContext::new("."))
-    .expect("build agent tree");
+    let agents = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team")
+    .build(".");
 
     let config = RunConfig {
         provider: TestProvider::default(),
@@ -684,22 +704,26 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }
 
-fn explore_read_todos_spec(main_prompt: &str) -> AgentSpec {
-    AgentSpec {
+/// Returns `(root, subagents)` for a `coda` root delegating to a single
+/// `explore` sub-agent that owns the `read_todos` tool.
+fn explore_read_todos_specs(main_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
+    let coda = AgentSpec {
         name: "coda".into(),
         description: String::new(),
         system_prompt: main_prompt.into(),
         mode: SubAgentMode::Stateful,
         tools: vec![],
-        subagents: vec![AgentSpec {
-            name: "explore".into(),
-            description: String::new(),
-            system_prompt: "explore-system".into(),
-            mode: SubAgentMode::Stateless,
-            tools: vec![Box::new(ReadTodosToolSpec)],
-            subagents: vec![],
-        }],
-    }
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "explore-system".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![Box::new(ReadTodosToolSpec)],
+        subagents: vec![],
+    };
+    (coda, vec![explore])
 }
 
 async fn wait_for_completion_after_explore_reply(
@@ -764,9 +788,11 @@ async fn wait_for_completion_after_explore_reply(
 
 #[tokio::test]
 async fn stateless_subagent_replies_after_local_tool_execution() {
-    let mut harness = Harness::start_with_spec(
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let mut harness = Harness::start_with_team(
         MemoryStorage::default(),
-        explore_read_todos_spec("main-system"),
+        root,
+        subagents,
         TestProvider::default(),
         ToolApprovalMode::Auto,
         "inspect",
@@ -780,8 +806,9 @@ async fn stateless_subagent_replies_after_local_tool_execution() {
 async fn stateless_subagent_replies_after_approval_resume() {
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let spec = explore_read_todos_spec("main-system");
-    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let team = AgentTeam::new(root, subagents).expect("valid team");
+    let agents1 = team.build(".");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -821,7 +848,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
             resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         },
     );
-    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents 2");
+    let agents2 = team.build(".");
     let mut harness = harness
         .restart(agents2, provider, approval, decisions)
         .await;
@@ -864,17 +891,21 @@ async fn stateless_subagent_replies_after_approval_resume() {
 
 #[tokio::test]
 async fn pending_approval_supports_mixed_resolutions() {
-    let spec = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: "approval-main".into(),
-        mode: SubAgentMode::Stateful,
-        tools: vec![Box::new(ReadTodosToolSpec), Box::new(EchoToolSpec)],
-        subagents: vec![],
-    };
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "approval-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec), Box::new(EchoToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents1 = team.build(".");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -923,7 +954,7 @@ async fn pending_approval_supports_mixed_resolutions() {
         result.expect("timed out waiting for suspension")
     };
     harness.shutdown().await;
-    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents2 = team.build(".");
     harness = harness
         .restart(agents2, provider, approval, decisions_map)
         .await;
@@ -954,17 +985,21 @@ async fn pending_approval_supports_mixed_resolutions() {
 
 #[tokio::test]
 async fn reject_pending_approval_via_restart() {
-    let spec = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: "interrupt-main".into(),
-        mode: SubAgentMode::Stateful,
-        tools: vec![Box::new(ReadTodosToolSpec)],
-        subagents: vec![],
-    };
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents1 = team.build(".");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1011,7 +1046,7 @@ async fn reject_pending_approval_via_restart() {
                 .collect(),
         },
     );
-    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents2 = team.build(".");
     let mut harness = harness
         .restart(agents2, provider, approval, reject_decisions)
         .await;
@@ -1038,17 +1073,21 @@ async fn reject_pending_approval_via_restart() {
 
 #[tokio::test]
 async fn restart_re_emits_pending_approval_with_original_suspended_at() {
-    let spec = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: "interrupt-main".into(),
-        mode: SubAgentMode::Stateful,
-        tools: vec![Box::new(ReadTodosToolSpec)],
-        subagents: vec![],
-    };
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents1 = team.build(".");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1072,7 +1111,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     };
     harness.shutdown().await;
 
-    let agents2 = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents2 = team.build(".");
     let mut harness = harness
         .restart(agents2, provider, approval, HashMap::new())
         .await;
@@ -1097,7 +1136,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
 #[tokio::test]
 async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
-    let mut harness = Harness::start_with_spec(
+    let mut harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
             name: "coda".into(),
@@ -1107,15 +1146,16 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
             tools: vec![Box::new(SlowToolSpec {
                 gate: Arc::new(Notify::new()),
             })],
-            subagents: vec![AgentSpec {
-                name: "explore".into(),
-                description: String::new(),
-                system_prompt: "hold-subagent".into(),
-                mode: SubAgentMode::Stateless,
-                tools: vec![],
-                subagents: vec![],
-            }],
+            subagents: vec!["explore".into()],
         },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "hold-subagent".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
         TestProvider::with_hold_subagent(Arc::new(Notify::new())),
         ToolApprovalMode::Auto,
         "abort",
@@ -1278,7 +1318,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     root.shutdown().await;
     root_result.expect("timed out waiting for root agent error");
 
-    let mut parent = Harness::start_with_spec(
+    let mut parent = Harness::start_with_team(
         MemoryStorage::default(),
         AgentSpec {
             name: "coda".into(),
@@ -1286,15 +1326,16 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
             system_prompt: "error-parent-main".into(),
             mode: SubAgentMode::Stateful,
             tools: vec![],
-            subagents: vec![AgentSpec {
-                name: "explore".into(),
-                description: String::new(),
-                system_prompt: "error-subagent".into(),
-                mode: SubAgentMode::Stateless,
-                tools: vec![],
-                subagents: vec![],
-            }],
+            subagents: vec!["explore".into()],
         },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "error-subagent".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
         TestProvider::default(),
         ToolApprovalMode::Auto,
         "subagent error",
@@ -1336,18 +1377,22 @@ async fn in_process_resume_after_suspension() {
     // Verify that after an agent suspends for approval, sending a Resume
     // envelope in-process (without shutdown/restart) allows the turn to
     // complete normally.
-    let spec = AgentSpec {
-        name: "coda".into(),
-        description: String::new(),
-        system_prompt: "interrupt-main".into(),
-        mode: SubAgentMode::Stateful,
-        tools: vec![Box::new(ReadTodosToolSpec)],
-        subagents: vec![],
-    };
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
     let provider = TestProvider::default();
     let approval =
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
-    let agents = spec.build(&BuildContext::new(".")).expect("build agents");
+    let agents = team.build(".");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,
