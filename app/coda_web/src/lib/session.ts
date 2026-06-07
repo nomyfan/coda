@@ -775,7 +775,8 @@ function normalizeWsUrl(input: string) {
       : base.startsWith("https://")
         ? base.replace(/^https:\/\//, "wss://")
         : base;
-    return `${wsBase}/ws`;
+    // Don't double-append when the user already pasted the `/ws` endpoint.
+    return wsBase.endsWith("/ws") ? wsBase : `${wsBase}/ws`;
   }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/ws`;

@@ -7,6 +7,27 @@ use std::pin::Pin;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 
+/// Reject session IDs that are unsafe to use as a path component.
+///
+/// `session_id` is client-controlled and gets joined under the workspace's
+/// session root to read, write, and delete files. A value containing path
+/// separators or `..` would escape that root (directory traversal → arbitrary
+/// file overwrite or recursive deletion), so callers must validate before any
+/// filesystem use. A single component that is not `.`/`..` and contains no
+/// separator or NUL byte cannot escape its parent directory.
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    let unsafe_id = session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0');
+    if unsafe_id {
+        return Err(format!("invalid session id: {session_id:?}"));
+    }
+    Ok(())
+}
+
 /// Persistence for all sessions of a single workspace. Each session lives in its
 /// own subdirectory (`<root>/<session_id>/`) holding the runtime snapshot and the
 /// per-thread checkpoints.
@@ -36,6 +57,7 @@ impl WorkspaceStorage {
 
     /// Remove a session's directory and everything in it.
     pub async fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        validate_session_id(session_id)?;
         let dir = self.root_dir.join(session_id);
         match fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
@@ -216,5 +238,39 @@ impl SessionStorage for JsonFileStorage {
                 .map(Some)
                 .map_err(|err| format!("failed to parse snapshot {}: {err}", path.display()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_session_id_accepts_uuid_like_ids() {
+        assert!(validate_session_id("3c4e75c-abcd-1234").is_ok());
+        assert!(validate_session_id("session_42").is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_traversal_and_separators() {
+        for bad in ["", ".", "..", "../escape", "a/b", "a\\b", "x\0y"] {
+            assert!(
+                validate_session_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_traversal_without_touching_filesystem() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sentinel = workspace.path().join("keep.txt");
+        std::fs::write(&sentinel, b"important").unwrap();
+
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        // `..` would resolve to the workspace dir; the guard must reject it
+        // before `remove_dir_all` runs.
+        assert!(storage.delete_session("..").await.is_err());
+        assert!(sentinel.exists(), "traversal must not delete outside root");
     }
 }

@@ -16,7 +16,7 @@ use coda_server::{
     build_system_prompt,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
     mcp::McpServers,
-    storage::WorkspaceStorage,
+    storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{ClientMessage, ServerMessage, SessionSummaryWire, WireEvent, WorkspaceSummaryWire},
 };
@@ -414,6 +414,10 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
         } => {
+            if let Err(err) = validate_session_id(&session_id) {
+                warn!(workspace_id = %workspace_id, "rejecting open: {err}");
+                return true;
+            }
             let key = (workspace_id.clone(), session_id.clone());
             if active.contains_key(&key) || pending.contains_key(&key) {
                 return true;
@@ -544,6 +548,10 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
         } => {
+            if let Err(err) = validate_session_id(&session_id) {
+                warn!(workspace_id = %workspace_id, "rejecting delete: {err}");
+                return true;
+            }
             let key = (workspace_id.clone(), session_id.clone());
             // Stop a live session before removing its files so no checkpoint is
             // written back after deletion.
