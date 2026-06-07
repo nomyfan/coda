@@ -1,6 +1,6 @@
 import { useCallback, useEffect } from "react";
-import { createStore, type StoreApi } from "zustand/vanilla";
 import { useStore } from "zustand";
+import type { Draft } from "immer";
 import {
   approvalKey,
   type ClientMessage,
@@ -19,6 +19,7 @@ import {
   outputText,
 } from "./protocol";
 import { useImmutableRef } from "@callcc/toolkit-js/react/useImmutableRef";
+import { create, type Store } from "@/store/utils";
 
 export type { WorkspaceSession, WorkspaceSummary } from "./protocol";
 
@@ -149,11 +150,13 @@ const initialState: CodaState = {
   order: [],
 };
 
-const initialStoreState: CodaStoreState = {
-  ...initialState,
-  wsMap: {},
-  autoConnected: false,
-};
+function initialStoreState(): CodaStoreState {
+  return {
+    ...initialState,
+    wsMap: {},
+    autoConnected: false,
+  };
+}
 
 const serversStorageKey = "coda.servers";
 const legacyServerKey = "coda.serverUrl";
@@ -218,44 +221,6 @@ function addStored(list: StoredServer[], url: string): StoredServer[] {
 
 function liveKey(agentName: string, threadId: string) {
   return `${agentName}:${threadId}`;
-}
-
-function updateServer(
-  state: CodaState,
-  server: string,
-  updater: (server: ServerState) => ServerState
-): CodaState {
-  const current = state.servers[server];
-  if (!current) {
-    return state;
-  }
-  return {
-    ...state,
-    servers: {
-      ...state.servers,
-      [server]: updater(current),
-    },
-  };
-}
-
-function updateServerSession(
-  state: CodaState,
-  server: string,
-  key: SessionKey,
-  updater: (session: OpenedSession) => OpenedSession
-): CodaState {
-  return updateServer(state, server, (current) => {
-    const { workspaceId, sessionId } = splitKey(key);
-    const session =
-      current.sessions[key] ?? blankSession(workspaceId, sessionId);
-    return {
-      ...current,
-      sessions: {
-        ...current.sessions,
-        [key]: updater(session),
-      },
-    };
-  });
 }
 
 function addActivity(
@@ -686,35 +651,76 @@ function mergeCatalog(
   });
 }
 
-type CodaStore = StoreApi<CodaStoreState>;
+type CodaStore = Store<CodaStoreState>;
+type CodaDraft = Draft<CodaStoreState>;
 
-function updateState(store: CodaStore, updater: (state: CodaState) => CodaState) {
-  store.setState((state) => updater(state), false);
+function updateState(
+  store: CodaStore,
+  updater: (state: CodaDraft) => void
+) {
+  store.setState(updater);
+}
+
+function currentSocket(store: CodaStore, server: string) {
+  return store.getState().wsMap[server];
+}
+
+function setSocket(store: CodaStore, server: string, socket: WebSocket) {
+  updateState(store, (state) => {
+    state.wsMap[server] = socket;
+  });
+}
+
+function closeSocket(store: CodaStore, server: string) {
+  currentSocket(store, server)?.close();
+}
+
+function removeSocket(store: CodaStore, server: string) {
+  updateState(store, (state) => {
+    delete state.wsMap[server];
+  });
+}
+
+function markAutoConnected(store: CodaStore) {
+  updateState(store, (state) => {
+    state.autoConnected = true;
+  });
+}
+
+function draftSession(
+  state: CodaDraft,
+  server: string,
+  key: SessionKey
+) {
+  const current = state.servers[server];
+  if (!current) {
+    return undefined;
+  }
+  const { workspaceId, sessionId } = splitKey(key);
+  current.sessions[key] ??= blankSession(workspaceId, sessionId);
+  return current.sessions[key];
 }
 
 function markConnecting(store: CodaStore, server: string, alias?: string) {
   updateState(store, (state) => {
     const existing = state.servers[server];
-    return {
-      ...state,
-      order: existing ? state.order : [...state.order, server],
-      servers: {
-        ...state.servers,
-        [server]: {
-          ...(existing ?? blankServer(server)),
-          alias: alias ?? existing?.alias,
-          status: "connecting",
-          error: undefined,
-        },
-      },
-    };
+    if (!existing) {
+      state.order.push(server);
+      state.servers[server] = blankServer(server);
+    }
+    state.servers[server].alias = alias ?? existing?.alias;
+    state.servers[server].status = "connecting";
+    state.servers[server].error = undefined;
   });
 }
 
 function setServerAlias(store: CodaStore, server: string, alias?: string) {
-  updateState(store, (state) =>
-    updateServer(state, server, (current) => ({ ...current, alias }))
-  );
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (current) {
+      current.alias = alias;
+    }
+  });
 }
 
 function setServerStatus(
@@ -723,29 +729,27 @@ function setServerStatus(
   status: ConnectionStatus,
   error?: string
 ) {
-  updateState(store, (state) =>
-    updateServer(state, server, (current) => ({
-      ...current,
-      status,
-      error: status === "error" ? error : undefined,
-    }))
-  );
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (current) {
+      current.status = status;
+      current.error = status === "error" ? error : undefined;
+    }
+  });
 }
 
 function removeServerState(store: CodaStore, server: string) {
   updateState(store, (state) => {
     if (!state.servers[server]) {
-      return state;
+      return;
     }
-    const { [server]: _removed, ...servers } = state.servers;
     const clearingActive = state.activeServer === server;
-    return {
-      ...state,
-      servers,
-      order: state.order.filter((url) => url !== server),
-      activeServer: clearingActive ? undefined : state.activeServer,
-      activeKey: clearingActive ? undefined : state.activeKey,
-    };
+    delete state.servers[server];
+    state.order = state.order.filter((url) => url !== server);
+    if (clearingActive) {
+      state.activeServer = undefined;
+      state.activeKey = undefined;
+    }
   });
 }
 
@@ -754,12 +758,12 @@ function setCatalog(
   server: string,
   workspaces: WorkspaceSummary[]
 ) {
-  updateState(store, (state) =>
-    updateServer(state, server, (current) => ({
-      ...current,
-      catalog: mergeCatalog(workspaces, current.sessions),
-    }))
-  );
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (current) {
+      current.catalog = mergeCatalog(workspaces, current.sessions);
+    }
+  });
 }
 
 function createDraftSession(
@@ -769,54 +773,52 @@ function createDraftSession(
   sessionId: string
 ) {
   const key = sessionKey(workspaceId, sessionId);
-  updateState(store, (state) =>
-    updateServer(
-      { ...state, activeServer: server, activeKey: key },
-      server,
-      (current) => {
-        const sessions: Record<SessionKey, OpenedSession> = {};
-        for (const [existingKey, session] of Object.entries(
-          current.sessions
-        ) as [SessionKey, OpenedSession][]) {
-          if (
-            existingKey !== key &&
-            session.draft &&
-            session.workspaceId === workspaceId &&
-            session.entries.length === 0
-          ) {
-            continue;
-          }
-          sessions[existingKey] = session;
-        }
-        sessions[key] = { ...blankSession(workspaceId, sessionId), draft: true };
-        return { ...current, sessions };
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    state.activeServer = server;
+    state.activeKey = key;
+    for (const [existingKey, session] of Object.entries(current.sessions) as [
+      SessionKey,
+      OpenedSession,
+    ][]) {
+      if (
+        existingKey !== key &&
+        session.draft &&
+        session.workspaceId === workspaceId &&
+        session.entries.length === 0
+      ) {
+        delete current.sessions[existingKey];
       }
-    )
-  );
+    }
+    current.sessions[key] = {
+      ...blankSession(workspaceId, sessionId),
+      draft: true,
+    };
+  });
 }
 
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
   updateState(store, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
     const { workspaceId, sessionId } = splitKey(key);
-    const next = updateServer(state, server, (current) => {
-      const { [key]: _removed, ...sessions } = current.sessions;
-      return {
-        ...current,
-        sessions,
-        catalog: current.catalog.map((workspace) =>
-          workspace.id === workspaceId
-            ? {
-                ...workspace,
-                sessions: workspace.sessions.filter(
-                  (session) => session.id !== sessionId
-                ),
-              }
-            : workspace
-        ),
-      };
-    });
+    delete current.sessions[key];
+    for (const workspace of current.catalog) {
+      if (workspace.id === workspaceId) {
+        workspace.sessions = workspace.sessions.filter(
+          (session) => session.id !== sessionId
+        );
+      }
+    }
     const clearingActive = state.activeServer === server && state.activeKey === key;
-    return clearingActive ? { ...next, activeKey: undefined } : next;
+    if (clearingActive) {
+      state.activeKey = undefined;
+    }
   });
 }
 
@@ -827,14 +829,13 @@ function selectSession(
   sessionId: string
 ) {
   const key = sessionKey(workspaceId, sessionId);
-  updateState(store, (state) =>
-    updateServerSession(
-      { ...state, activeServer: server, activeKey: key },
-      server,
-      key,
-      (session) => session
-    )
-  );
+  updateState(store, (state) => {
+    if (state.servers[server]) {
+      state.activeServer = server;
+      state.activeKey = key;
+      draftSession(state, server, key);
+    }
+  });
 }
 
 function applySnapshot(
@@ -852,19 +853,27 @@ function applySnapshot(
     .filter((entry): entry is TranscriptEntry => Boolean(entry));
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
-    const withCatalog = updateServer(state, server, (current) => ({
-      ...current,
-      status: "connected",
-      catalog: upsertCatalogSession(current.catalog, workspaceId, sessionId),
-    }));
-    return updateServerSession(withCatalog, server, key, (session) => ({
-      ...session,
-      draft: false,
-      entries: hasHistory ? mapped : session.entries,
-      approvals: hasHistory ? approvals : session.approvals,
-      drafts: hasHistory ? {} : session.drafts,
-      running: hasHistory ? false : session.running,
-    }));
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    current.status = "connected";
+    current.catalog = upsertCatalogSession(
+      current.catalog,
+      workspaceId,
+      sessionId
+    );
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.draft = false;
+    if (hasHistory) {
+      session.entries = mapped;
+      session.approvals = approvals;
+      session.drafts = {};
+      session.running = false;
+    }
   });
 }
 
@@ -876,11 +885,12 @@ function applyEvent(
   event: WireEvent
 ) {
   const key = sessionKey(workspaceId, sessionId);
-  updateState(store, (state) =>
-    updateServerSession(state, server, key, (session) =>
-      reduceEvent(session, event)
-    )
-  );
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      state.servers[server].sessions[key] = reduceEvent(session, event);
+    }
+  });
 }
 
 function addAllowResultActivity(
@@ -892,18 +902,19 @@ function addAllowResultActivity(
 ) {
   updateState(store, (state) => {
     if (state.activeServer !== server || !state.activeKey) {
-      return state;
+      return;
     }
     if (splitKey(state.activeKey).workspaceId !== workspaceId) {
-      return state;
+      return;
     }
-    return updateServerSession(state, server, state.activeKey, (session) =>
-      addActivity(session, {
+    const session = draftSession(state, server, state.activeKey);
+    if (session) {
+      state.servers[server].sessions[state.activeKey] = addActivity(session, {
         tone: error ? "danger" : "success",
         label: error ? "allow pattern failed" : "allow pattern saved",
         detail: error || pattern,
-      })
-    );
+      });
+    }
   });
 }
 
@@ -913,34 +924,25 @@ function appendUserMessage(
   key: SessionKey,
   content: string
 ) {
-  updateState(store, (state) =>
-    updateServer(state, server, (current) => {
-      const { workspaceId, sessionId } = splitKey(key);
-      const previous =
-        current.sessions[key] ?? blankSession(workspaceId, sessionId);
-      const firstUserMessage = previous.firstUserMessage ?? content;
-      const session: OpenedSession = {
-        ...previous,
-        draft: false,
-        running: true,
-        firstUserMessage,
-        entries: [
-          ...previous.entries,
-          { id: newId("user"), kind: "user", content },
-        ],
-      };
-      return {
-        ...current,
-        sessions: { ...current.sessions, [key]: session },
-        catalog: upsertCatalogTitled(
-          current.catalog,
-          workspaceId,
-          sessionId,
-          firstUserMessage
-        ),
-      };
-    })
-  );
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    const session = draftSession(state, server, key);
+    if (!current || !session) {
+      return;
+    }
+    const { workspaceId, sessionId } = splitKey(key);
+    const firstUserMessage = session.firstUserMessage ?? content;
+    session.draft = false;
+    session.running = true;
+    session.firstUserMessage = firstUserMessage;
+    session.entries.push({ id: newId("user"), kind: "user", content });
+    current.catalog = upsertCatalogTitled(
+      current.catalog,
+      workspaceId,
+      sessionId,
+      firstUserMessage
+    );
+  });
 }
 
 function setDraftResolution(
@@ -951,19 +953,15 @@ function setDraftResolution(
   call: ToolCall,
   resolution: ToolCallResolution
 ) {
-  updateState(store, (state) =>
-    updateServerSession(state, server, key, (session) => {
-      const approvalId = approvalKey(approval);
-      const current = session.drafts[approvalId] ?? {};
-      return {
-        ...session,
-        drafts: {
-          ...session.drafts,
-          [approvalId]: { ...current, [call.id]: resolution },
-        },
-      };
-    })
-  );
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const approvalId = approvalKey(approval);
+    session.drafts[approvalId] ??= {};
+    session.drafts[approvalId][call.id] = resolution;
+  });
 }
 
 function clearApprovalState(
@@ -972,19 +970,17 @@ function clearApprovalState(
   key: SessionKey,
   approval: PendingApproval
 ) {
-  updateState(store, (state) =>
-    updateServerSession(state, server, key, (session) => {
-      const approvalId = approvalKey(approval);
-      const { [approvalId]: _removed, ...drafts } = session.drafts;
-      return {
-        ...session,
-        drafts,
-        approvals: session.approvals.filter(
-          (item) => approvalKey(item) !== approvalId
-        ),
-      };
-    })
-  );
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const approvalId = approvalKey(approval);
+    delete session.drafts[approvalId];
+    session.approvals = session.approvals.filter(
+      (item) => approvalKey(item) !== approvalId
+    );
+  });
 }
 
 function normalizeWsUrl(input: string) {
@@ -1009,7 +1005,7 @@ function encode(message: ClientMessage) {
 
 export function useCodaSession() {
   const store = useImmutableRef(() =>
-    createStore<CodaStoreState>(() => initialStoreState)
+    create<CodaStoreState>(initialStoreState)
   );
   const state = useStore(store);
 
@@ -1024,8 +1020,7 @@ export function useCodaSession() {
 
   const send = useCallback(
     (server: string, message: ClientMessage) => {
-      const { wsMap } = store.getState();
-      const socket = wsMap[server];
+      const socket = currentSocket(store, server);
       if (socket?.readyState === WebSocket.OPEN) {
         socket.send(encode(message));
         return true;
@@ -1042,8 +1037,7 @@ export function useCodaSession() {
       if (!server) {
         return;
       }
-      const { wsMap } = store.getState();
-      wsMap[server]?.close();
+      closeSocket(store, server);
       const stored = loadStoredServers();
       storeServers(addStored(stored, server));
       markConnecting(
@@ -1053,14 +1047,14 @@ export function useCodaSession() {
       );
 
       const socket = new WebSocket(normalizeWsUrl(server));
-      wsMap[server] = socket;
+      setSocket(store, server, socket);
 
       socket.onopen = () => {
         setServerStatus(store, server, "connected");
         socket.send(encode({ type: "list_workspaces" }));
       };
       socket.onclose = () => {
-        if (store.getState().wsMap[server] === socket) {
+        if (currentSocket(store, server) === socket) {
           setServerStatus(store, server, "closed");
         }
       };
@@ -1120,9 +1114,8 @@ export function useCodaSession() {
       if (!server) {
         return;
       }
-      const { wsMap } = store.getState();
-      wsMap[server]?.close();
-      delete wsMap[server];
+      closeSocket(store, server);
+      removeSocket(store, server);
       storeServers(loadStoredServers().filter((entry) => entry.url !== server));
       removeServerState(store, server);
     },
@@ -1135,9 +1128,8 @@ export function useCodaSession() {
       if (!server) {
         return;
       }
-      const { wsMap } = store.getState();
-      wsMap[server]?.close();
-      delete wsMap[server];
+      closeSocket(store, server);
+      removeSocket(store, server);
       setServerStatus(store, server, "closed");
     },
     [store]
@@ -1167,7 +1159,7 @@ export function useCodaSession() {
     if (runtime.autoConnected) {
       return;
     }
-    runtime.autoConnected = true;
+    markAutoConnected(store);
     for (const { url } of loadStoredServers()) {
       connectServer(url);
     }

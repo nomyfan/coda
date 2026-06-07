@@ -1,6 +1,6 @@
-import { createStore } from "zustand/vanilla";
 import { useStore } from "zustand";
 import type { ServerState } from "@/lib/session";
+import { create } from "@/store/utils";
 
 export type NewSessionTarget = {
   serverUrl: string;
@@ -49,7 +49,7 @@ function writeRecentTarget(target: NewSessionTarget) {
   }
 }
 
-export const newSessionStore = createStore<NewSessionState>(() => ({
+export const newSessionStore = create<NewSessionState>(() => ({
   target: null,
   recentTarget: loadRecentTarget(),
 }));
@@ -91,7 +91,9 @@ export function rememberNewSessionTarget(target: NewSessionTarget) {
   if (!validTarget(target)) {
     return;
   }
-  newSessionStore.setState({ recentTarget: target });
+  newSessionStore.setState((state) => {
+    state.recentTarget = target;
+  });
   writeRecentTarget(target);
 }
 
@@ -104,15 +106,21 @@ export function beginNewSession(
     newSessionStore.getState().recentTarget,
     fallbackServer
   );
-  newSessionStore.setState({ target });
+  newSessionStore.setState((state) => {
+    state.target = target;
+  });
   rememberNewSessionTarget(target);
 }
 
 export function setNewSessionTarget(target: NewSessionTarget) {
-  newSessionStore.setState({ target });
+  newSessionStore.setState((state) => {
+    state.target = target;
+  });
   rememberNewSessionTarget(target);
 }
 
 export function clearNewSessionTarget() {
-  newSessionStore.setState({ target: null });
+  newSessionStore.setState((state) => {
+    state.target = null;
+  });
 }
