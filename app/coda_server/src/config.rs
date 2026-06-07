@@ -28,6 +28,81 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceConfig {
+    pub id: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub workspaces: Vec<WorkspaceConfig>,
+}
+
+pub fn load_server_config(path: &Path) -> Result<ServerConfig, ConfigError> {
+    let content = std::fs::read_to_string(path)?;
+    parse_server_config(&content, path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, ConfigError> {
+    let doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let workspaces = doc
+        .get("workspaces")
+        .and_then(|item| item.as_array_of_tables())
+        .ok_or_else(|| ConfigError::Parse("missing [[workspaces]] table".to_string()))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut parsed = Vec::new();
+    for workspace in workspaces {
+        let id = workspace
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ConfigError::Parse("workspace id must be a string".to_string()))?
+            .to_string();
+        if !is_workspace_id(&id) {
+            return Err(ConfigError::Parse(format!(
+                "workspace id '{id}' may only contain letters, digits, '.', '_', and '-'"
+            )));
+        }
+        if !seen.insert(id.clone()) {
+            return Err(ConfigError::Parse(format!("duplicate workspace id '{id}'")));
+        }
+
+        let raw_path = workspace
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ConfigError::Parse(format!("workspace '{id}' path must be a string")))?;
+        let path = resolve_workspace_path(base_dir, raw_path);
+        parsed.push(WorkspaceConfig { id, path });
+    }
+
+    if parsed.is_empty() {
+        return Err(ConfigError::Parse(
+            "server config must define at least one workspace".to_string(),
+        ));
+    }
+
+    Ok(ServerConfig { workspaces: parsed })
+}
+
+fn is_workspace_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
 /// Pattern-based permission rules for shell commands.
 ///
 /// Evaluation order: deny match → require approval, shell operators
@@ -294,6 +369,56 @@ mod tests {
         let (allow, deny) = parse_permissions("").unwrap();
         assert!(allow.is_empty());
         assert!(deny.is_empty());
+    }
+
+    #[test]
+    fn parse_server_config_resolves_workspaces() {
+        let config = parse_server_config(
+            r#"
+[[workspaces]]
+id = "coda"
+path = "projects/coda"
+
+[[workspaces]]
+id = "scratch"
+path = "/tmp/scratch"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.workspaces,
+            vec![
+                WorkspaceConfig {
+                    id: "coda".to_string(),
+                    path: PathBuf::from("/srv/projects/coda"),
+                },
+                WorkspaceConfig {
+                    id: "scratch".to_string(),
+                    path: PathBuf::from("/tmp/scratch"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_server_config_rejects_duplicate_ids() {
+        let err = parse_server_config(
+            r#"
+[[workspaces]]
+id = "coda"
+path = "/tmp/a"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/b"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate workspace id"));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+[[workspaces]]
+id = "coda"
+path = "/path/to/coda"
+
+[[workspaces]]
+id = "scratch"
+path = "/path/to/scratch"

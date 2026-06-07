@@ -8,3 +8,4 @@
 skills/
 .coda
 .claude/worktrees/
+coda-server.toml

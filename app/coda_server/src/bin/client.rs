@@ -264,12 +264,14 @@ async fn send_client(
 
 async fn add_allow_pattern(
     transport: &WebSocketClientTransport,
+    workspace_id: &str,
     pattern: String,
     root_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send_client(
         transport,
         &ClientMessage::AddAllowPattern {
+            workspace_id: workspace_id.to_string(),
             pattern: pattern.clone(),
         },
     )
@@ -280,6 +282,7 @@ async fn add_allow_pattern(
             Some(ServerMessage::AllowPatternResult {
                 pattern: returned,
                 error,
+                ..
             }) if returned == pattern => {
                 return match error {
                     Some(error) => Err(std::io::Error::other(error).into()),
@@ -292,8 +295,9 @@ async fn add_allow_pattern(
                 println!("\n[Error] {error}");
             }
             Some(ServerMessage::AllowPatternResult { .. }) => {}
-            Some(ServerMessage::Event { event }) => render_event(&event, root_name),
+            Some(ServerMessage::Event { event, .. }) => render_event(&event, root_name),
             Some(ServerMessage::Snapshot { .. }) => {}
+            Some(ServerMessage::WorkspaceCatalog { .. }) => {}
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -311,6 +315,8 @@ async fn add_allow_pattern(
 async fn resolve_and_resume(
     rl: &mut rustyline::DefaultEditor,
     transport: &WebSocketClientTransport,
+    workspace_id: &str,
+    session_id: &str,
     approval: &PendingApproval,
     root_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -350,7 +356,14 @@ async fn resolve_and_resume(
                             } else {
                                 input.trim().to_string()
                             };
-                            match add_allow_pattern(transport, pattern.clone(), root_name).await {
+                            match add_allow_pattern(
+                                transport,
+                                workspace_id,
+                                pattern.clone(),
+                                root_name,
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     println!("     Added allow pattern: {pattern}");
                                     resolutions
@@ -374,6 +387,8 @@ async fn resolve_and_resume(
     send_client(
         transport,
         &ClientMessage::Resume {
+            workspace_id: workspace_id.to_string(),
+            session_id: session_id.to_string(),
             agent_name: approval.agent_name.clone(),
             thread_id: approval.thread_id.clone(),
             decision: ResumeDecision { resolutions },
@@ -396,20 +411,28 @@ enum TurnState {
 async fn run_turn(
     rl: &mut rustyline::DefaultEditor,
     transport: &WebSocketClientTransport,
+    workspace_id: &str,
+    session_id: &str,
     root_name: &str,
 ) -> Result<TurnState, Box<dyn std::error::Error>> {
     loop {
         let msg = tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => {
-                send_client(transport, &ClientMessage::Abort).await?;
+                send_client(
+                    transport,
+                    &ClientMessage::Abort {
+                        workspace_id: workspace_id.to_string(),
+                        session_id: session_id.to_string(),
+                    },
+                ).await?;
                 continue;
             }
             msg = transport.recv() => msg,
         };
 
         let event = match msg {
-            Some(ServerMessage::Event { event }) => event,
+            Some(ServerMessage::Event { event, .. }) => event,
             Some(ServerMessage::Snapshot { .. }) => continue, // only sent once, at connect
             Some(ServerMessage::AllowPatternResult {
                 error: Some(error), ..
@@ -418,13 +441,15 @@ async fn run_turn(
                 continue;
             }
             Some(ServerMessage::AllowPatternResult { .. }) => continue,
+            Some(ServerMessage::WorkspaceCatalog { .. }) => continue,
             None => return Ok(TurnState::Closed),
         };
         render_event(&event, root_name);
 
         match &event {
             WireEvent::Suspended { approval, .. } => {
-                resolve_and_resume(rl, transport, approval, root_name).await?;
+                resolve_and_resume(rl, transport, workspace_id, session_id, approval, root_name)
+                    .await?;
             }
             WireEvent::LlmEnd {
                 message,
@@ -452,6 +477,7 @@ fn print_usage() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_url =
         std::env::var("CODA_SERVER_URL").unwrap_or_else(|_| "ws://127.0.0.1:3000".to_string());
+    let workspace_id = std::env::var("CODA_WORKSPACE_ID").unwrap_or_else(|_| "coda".to_string());
 
     let session_id = match parse_session_id_arg(std::env::args().skip(1)) {
         Ok(Some(id)) => id,
@@ -470,16 +496,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_logo("An AI Agent (client)");
     println!("Type 'quit', 'exit', or 'q' to stop\n");
     println!("Session id: {session_id}\n");
+    println!("Workspace: {workspace_id}\n");
     println!("Server: {server_url}\n");
 
-    let url = format!("{server_url}/ws/{session_id}");
+    let url = format!("{server_url}/ws");
     let transport = WebSocketClientTransport::connect(&url).await?;
+    send_client(
+        &transport,
+        &ClientMessage::OpenSession {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+        },
+    )
+    .await?;
 
     let mut rl = rustyline::DefaultEditor::new()?;
 
     // The server's first message is always the snapshot: prior history plus any
     // approvals left pending from a previous suspension.
     match transport.recv().await {
+        Some(ServerMessage::WorkspaceCatalog { .. }) => match transport.recv().await {
+            Some(ServerMessage::Snapshot {
+                messages,
+                pending_approvals,
+                ..
+            }) => {
+                render_history(&messages);
+                if !pending_approvals.is_empty() {
+                    println!(
+                        "[Resuming session: {} pending approval(s) to resolve]\n",
+                        pending_approvals.len()
+                    );
+                    for approval in &pending_approvals {
+                        resolve_and_resume(
+                            &mut rl,
+                            &transport,
+                            &workspace_id,
+                            &session_id,
+                            approval,
+                            ROOT_NAME,
+                        )
+                        .await?;
+                    }
+                    if let TurnState::Closed =
+                        run_turn(&mut rl, &transport, &workspace_id, &session_id, ROOT_NAME).await?
+                    {
+                        println!("\nConnection closed by server.");
+                        return Ok(());
+                    }
+                    println!();
+                }
+            }
+            Some(ServerMessage::Event { event, .. }) => render_event(&event, ROOT_NAME),
+            Some(ServerMessage::AllowPatternResult {
+                error: Some(error), ..
+            }) => {
+                eprintln!("Unexpected allow pattern result before snapshot: {error}");
+            }
+            Some(ServerMessage::AllowPatternResult { .. }) => {
+                eprintln!("Unexpected allow pattern result before snapshot.");
+            }
+            Some(ServerMessage::WorkspaceCatalog { .. }) => {}
+            None => {
+                eprintln!("Connection closed before snapshot.");
+                return Ok(());
+            }
+        },
         Some(ServerMessage::Snapshot {
             messages,
             pending_approvals,
@@ -492,17 +574,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pending_approvals.len()
                 );
                 for approval in &pending_approvals {
-                    resolve_and_resume(&mut rl, &transport, approval, ROOT_NAME).await?;
+                    resolve_and_resume(
+                        &mut rl,
+                        &transport,
+                        &workspace_id,
+                        &session_id,
+                        approval,
+                        ROOT_NAME,
+                    )
+                    .await?;
                 }
                 // The session is now resuming; render until it settles.
-                if let TurnState::Closed = run_turn(&mut rl, &transport, ROOT_NAME).await? {
+                if let TurnState::Closed =
+                    run_turn(&mut rl, &transport, &workspace_id, &session_id, ROOT_NAME).await?
+                {
                     println!("\nConnection closed by server.");
                     return Ok(());
                 }
                 println!();
             }
         }
-        Some(ServerMessage::Event { event }) => render_event(&event, ROOT_NAME),
+        Some(ServerMessage::Event { event, .. }) => render_event(&event, ROOT_NAME),
         Some(ServerMessage::AllowPatternResult {
             error: Some(error), ..
         }) => {
@@ -541,6 +633,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         send_client(
             &transport,
             &ClientMessage::Task {
+                workspace_id: workspace_id.clone(),
+                session_id: session_id.clone(),
                 task: input.to_string(),
             },
         )
@@ -549,7 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        match run_turn(&mut rl, &transport, ROOT_NAME).await? {
+        match run_turn(&mut rl, &transport, &workspace_id, &session_id, ROOT_NAME).await? {
             TurnState::Done => println!(),
             TurnState::Closed => {
                 println!("\nConnection closed by server.");
