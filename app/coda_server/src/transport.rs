@@ -2,10 +2,9 @@
 //!
 //! A [`Transport`] hides connection setup, framing, and (de)serialization
 //! behind a tiny typed interface. Each side names what it receives and what it
-//! sends via the `Incoming`/`Outgoing` associated types, so the same concept
-//! serves both the server (`ClientMessage` in, `ServerMessage` out) and the
-//! client (the mirror). Today the wire is WebSocket; a future Unix-domain-socket
-//! transport can plug in by implementing this trait.
+//! sends via the `Incoming`/`Outgoing` associated types (the server takes
+//! `ClientMessage` in, `ServerMessage` out). Today the wire is WebSocket; a
+//! future Unix-domain-socket transport can plug in by implementing this trait.
 
 use crate::wire::{ClientMessage, ServerMessage};
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
@@ -15,11 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use std::future::Future;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Error as TungError;
-use tokio_tungstenite::tungstenite::Message as TungMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::warn;
 
 /// A bidirectional, message-framed channel to the peer.
@@ -94,52 +89,6 @@ impl Transport for WebSocketTransport {
 
     async fn send(&self, msg: &ServerMessage) -> bool {
         send_text(&self.sink, msg, |t| AxumMessage::Text(t.into())).await
-    }
-}
-
-/// [`Transport`] over a tokio-tungstenite WebSocket (client side).
-pub struct WebSocketClientTransport {
-    sink: Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, TungMessage>>,
-    stream: Mutex<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-}
-
-impl WebSocketClientTransport {
-    /// Connect to `url` (e.g. `ws://127.0.0.1:3000/ws/<session_id>`).
-    pub async fn connect(url: &str) -> Result<Self, TungError> {
-        let (socket, _) = connect_async(url).await?;
-        let (sink, stream) = socket.split();
-        Ok(Self {
-            sink: Mutex::new(sink),
-            stream: Mutex::new(stream),
-        })
-    }
-}
-
-impl Transport for WebSocketClientTransport {
-    type Incoming = ServerMessage;
-    type Outgoing = ClientMessage;
-
-    async fn recv(&self) -> Option<ServerMessage> {
-        let mut stream = self.stream.lock().await;
-        loop {
-            match stream.next().await {
-                Some(Ok(TungMessage::Text(text))) => {
-                    if let Some(msg) = decode(&text) {
-                        return Some(msg);
-                    }
-                }
-                Some(Ok(TungMessage::Close(_))) | None => return None,
-                Some(Ok(_)) => {} // ping/pong/binary: ignore
-                Some(Err(e)) => {
-                    warn!("websocket read error: {e}");
-                    return None;
-                }
-            }
-        }
-    }
-
-    async fn send(&self, msg: &ClientMessage) -> bool {
-        send_text(&self.sink, msg, |t| TungMessage::Text(t.into())).await
     }
 }
 
