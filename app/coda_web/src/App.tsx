@@ -1046,7 +1046,9 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <EntryIcon entry={entry} />
-              <span className="shrink-0 truncate text-sm font-medium">{title}</span>
+              <span className="shrink-0 truncate text-sm font-medium">
+                {title}
+              </span>
               <EntryDetail entry={entry} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -1287,7 +1289,7 @@ function ApprovalPanel({
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-full px-4">
-      <div className="pointer-events-auto mx-auto w-full max-w-4xl overflow-hidden rounded-t-lg border border-b-0 border-amber-500/50 bg-card shadow-lg ring-1 ring-amber-500/10">
+      <div className="pointer-events-auto mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-amber-500/50 bg-card shadow-lg ring-1 ring-amber-500/10">
         <div className="flex max-h-[60vh] flex-col bg-amber-500/5">
           <div className="flex items-center justify-between px-4 pt-2.5">
             <h2 className="flex items-center gap-2 text-sm font-medium">
@@ -1307,7 +1309,7 @@ function ApprovalPanel({
               onAllowPattern={onAllowPattern}
             />
           </div>
-          <div className="flex items-center justify-between gap-2 border-t border-amber-500/20 px-4 py-2">
+          <div className="flex items-center justify-between gap-2 px-4 py-2">
             <div className="flex items-center gap-1">
               <Button
                 variant="ghost"
@@ -1362,7 +1364,9 @@ function ApprovalCall({
   );
   const askUser = call.name === "ask_user" ? parseAskUserParams(call) : null;
   const approved = decision === "Execute";
-  const rejected = Boolean(decision && decision !== "Execute" && "Rejected" in decision);
+  const rejected = Boolean(
+    decision && decision !== "Execute" && "Rejected" in decision
+  );
 
   if (askUser) {
     const chosen =
@@ -1445,7 +1449,9 @@ function ApprovalCall({
           if (value === "run") {
             onDraft("Execute");
           } else if (value === "reject") {
-            onDraft({ Rejected: { reason: reason.trim() ? reason.trim() : null } });
+            onDraft({
+              Rejected: { reason: reason.trim() ? reason.trim() : null },
+            });
           }
         }}
         className="grid grid-cols-2 gap-2"
