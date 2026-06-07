@@ -65,29 +65,29 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                     ))
                 };
 
+                let tool_calls: Vec<ChatCompletionMessageToolCalls> = assistant_message
+                    .tool_calls
+                    .into_iter()
+                    .map(|x| {
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                            id: x.id,
+                            function: FunctionCall {
+                                name: x.name,
+                                arguments: if let Some(arguments) = x.arguments {
+                                    arguments.clone()
+                                } else {
+                                    "".to_string()
+                                },
+                            },
+                        })
+                    })
+                    .collect();
+
                 ChatCompletionRequestAssistantMessage {
                     content,
-                    tool_calls: Some(
-                        assistant_message
-                            .tool_calls
-                            .into_iter()
-                            .map(|x| {
-                                ChatCompletionMessageToolCalls::Function(
-                                    ChatCompletionMessageToolCall {
-                                        id: x.id,
-                                        function: FunctionCall {
-                                            name: x.name,
-                                            arguments: if let Some(arguments) = x.arguments {
-                                                arguments.clone()
-                                            } else {
-                                                "".to_string()
-                                            },
-                                        },
-                                    },
-                                )
-                            })
-                            .collect(),
-                    ),
+                    // Omit the field entirely when empty: some providers (e.g. DeepSeek)
+                    // reject `"tool_calls": []` with a 400.
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                     ..Default::default()
                 }
                 .into()

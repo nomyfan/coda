@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::{Path, State, ws::WebSocketUpgrade},
+    extract::{State, ws::WebSocketUpgrade},
     response::Response,
     routing::get,
 };
@@ -14,32 +14,32 @@ use coda_server::{
     agents::{ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
     ask_user::AskUserToolSpec,
     build_system_prompt,
-    config::ToolApprovalConfig,
+    config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
     mcp::McpServers,
-    storage::JsonFileStorage,
+    storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
-    wire::{ClientMessage, ServerMessage, WireEvent},
+    wire::{ClientMessage, ServerMessage, SessionSummaryWire, WireEvent, WorkspaceSummaryWire},
 };
 use coda_tools::{BuildContext, ToolSpec};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-struct CurrentConnection {
-    id: u64,
-    cancel: CancellationToken,
-    done: watch::Receiver<bool>,
-}
-
 struct AppState {
-    storage: JsonFileStorage,
-    workspace_str: String,
     provider: Arc<OpenAI>,
     model: String,
+    shutdown: CancellationToken,
+    workspaces: HashMap<String, Arc<WorkspaceState>>,
+}
+
+struct WorkspaceState {
+    id: String,
+    storage: WorkspaceStorage,
+    workspace_str: String,
     /// Kept alive for the process lifetime so the MCP connections behind the
     /// prebuilt tools in `agent_team` stay open; torn down on shutdown.
     mcp_servers: McpServers,
@@ -50,34 +50,64 @@ struct AppState {
     /// their next turn.
     agent_team: AgentTeam,
     approval_config: ToolApprovalConfig,
-    /// Cancelled on process shutdown signal; parent of every connection token.
-    shutdown: CancellationToken,
-    /// Cancellation handle of the current connection, if any. Enforces the
-    /// single-client invariant by latest-wins: a new connection cancels it.
-    current: Mutex<Option<CurrentConnection>>,
-    next_connection_id: AtomicU64,
+}
+
+struct ActiveSession {
+    generation: u64,
+    session: Session,
+    root_name: String,
+    turn_running: bool,
+}
+
+struct PendingOpen {
+    workspace: Arc<WorkspaceState>,
+    session_id: String,
+    needed: HashSet<String>,
+    decisions: HashMap<String, ResumeDecision>,
+}
+
+enum OpenedSession {
+    Live(Session),
+    Pending(Vec<coda_agent::PendingApproval>),
+}
+
+enum SessionEnvelope {
+    Event {
+        workspace_id: String,
+        session_id: String,
+        generation: u64,
+        event: WireEvent,
+    },
+    Closed {
+        workspace_id: String,
+        session_id: String,
+        generation: u64,
+    },
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
 /// tools, MCP tools, and approval policy. `decisions` covers any pending
 /// approvals carried over from a prior suspension.
 async fn open_session(
-    state: &AppState,
+    app: &AppState,
+    workspace: &WorkspaceState,
     session_id: &str,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Result<Session, OpenError> {
     let config = RunConfig {
-        provider: state.provider.clone(),
-        model: state.model.clone(),
+        provider: app.provider.clone(),
+        model: app.model.clone(),
         max_completion_tokens: Some(5000),
         temperature: Some(0.7),
-        tool_approval: state.approval_config.clone().into_approval_mode(),
-        approval_timeout: Some(Duration::from_secs(300)),
+        tool_approval: workspace.approval_config.clone().into_approval_mode(),
+        // Disabled: approvals never auto-reject; a pending ask_user/tool call
+        // waits indefinitely until the user resolves it.
+        approval_timeout: None,
     };
 
     Session::builder()
-        .storage(state.storage.clone())
-        .team(&state.agent_team, &state.workspace_str)
+        .storage(workspace.storage.session(session_id))
+        .team(&workspace.agent_team, &workspace.workspace_str)
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
@@ -105,6 +135,7 @@ async fn send_allow_pattern_result<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
     transport: &T,
+    workspace_id: String,
     approval_config: ToolApprovalConfig,
     pattern: String,
 ) -> bool {
@@ -112,54 +143,18 @@ async fn send_allow_pattern_result<
         .await
         .err();
     transport
-        .send(&ServerMessage::AllowPatternResult { pattern, error })
+        .send(&ServerMessage::AllowPatternResult {
+            workspace_id,
+            pattern,
+            error,
+        })
         .await
-}
-
-/// Read `Resume` commands until every pending thread is covered. Allow-pattern
-/// commands sent alongside (e.g. choosing "always") are persisted in place.
-/// Returns `None` if the client disconnects, or if `cancel` fires (eviction or
-/// shutdown); bailing here keeps an evicted client from opening a second
-/// session by sending late decisions.
-async fn collect_resume_decisions<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
-    transport: &T,
-    approval_config: ToolApprovalConfig,
-    pending: &[coda_agent::PendingApproval],
-    cancel: &CancellationToken,
-) -> Option<HashMap<String, ResumeDecision>> {
-    let mut needed: HashSet<String> = pending.iter().map(|p| p.thread_id.clone()).collect();
-    let mut decisions: HashMap<String, ResumeDecision> = HashMap::new();
-    while !needed.is_empty() {
-        let msg = tokio::select! {
-            _ = cancel.cancelled() => return None,
-            msg = transport.recv() => msg?,
-        };
-        match msg {
-            ClientMessage::Resume {
-                thread_id,
-                decision,
-                ..
-            } => {
-                needed.remove(&thread_id);
-                decisions.insert(thread_id, decision);
-            }
-            ClientMessage::AddAllowPattern { pattern } => {
-                if send_allow_pattern_result(transport, approval_config.clone(), pattern).await {
-                    continue;
-                }
-                return None;
-            }
-            _ => {} // ignore task/abort while resolving
-        }
-    }
-    Some(decisions)
 }
 
 /// Send an `Error` event describing a failed session open.
 async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
     transport: &T,
+    workspace_id: &str,
     session_id: &str,
     err: OpenError,
 ) {
@@ -168,227 +163,565 @@ async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = Serve
         thread_id: session_id.to_string(),
         message: format!("failed to open session: {err}"),
     };
-    transport.send(&ServerMessage::Event { event }).await;
+    transport
+        .send(&ServerMessage::Event {
+            workspace_id: workspace_id.to_string(),
+            session_id: session_id.to_string(),
+            event,
+        })
+        .await;
 }
 
-/// Drive a single client session over `transport`: send a snapshot, resolve any
-/// carried-over pending approvals, then pump commands in and runtime events out
-/// for the connection's lifetime. Transport-agnostic.
-async fn handle_session<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
-    transport: T,
-    state: Arc<AppState>,
-    session_id: String,
-    cancel: CancellationToken,
-) {
-    // 1. First open attempt, used both to bring the session up and to discover
-    //    whether it resumed into a pending approval.
-    let first = open_session(&state, &session_id, HashMap::new()).await;
+async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
+    let mut ids: Vec<_> = app.workspaces.keys().cloned().collect();
+    ids.sort();
+
+    let mut workspaces = Vec::new();
+    for id in ids {
+        let workspace = app
+            .workspaces
+            .get(&id)
+            .expect("workspace id came from workspace map");
+        let sessions = match workspace.storage.list_sessions().await {
+            Ok(sessions) => sessions
+                .into_iter()
+                .map(|session| SessionSummaryWire {
+                    id: session.session_id,
+                    updated_at_ms: session.updated_at_ms,
+                    first_user_message: session.first_user_message,
+                })
+                .collect(),
+            Err(err) => {
+                warn!(workspace_id = %workspace.id, "failed to list sessions: {err}");
+                Vec::new()
+            }
+        };
+        workspaces.push(WorkspaceSummaryWire {
+            id: workspace.id.clone(),
+            path: workspace.workspace_str.clone(),
+            sessions,
+        });
+    }
+
+    workspaces
+}
+
+async fn send_workspace_catalog<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    app: &AppState,
+) -> bool {
+    transport
+        .send(&ServerMessage::WorkspaceCatalog {
+            workspaces: workspace_catalog(app).await,
+        })
+        .await
+}
+
+async fn open_session_and_send_snapshot<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    app: &AppState,
+    workspace: &WorkspaceState,
+    session_id: &str,
+    decisions: HashMap<String, ResumeDecision>,
+) -> Option<OpenedSession> {
+    let first = match open_session(app, workspace, session_id, HashMap::new()).await {
+        Ok(session) => Ok(session),
+        Err(OpenError::PendingApprovalsRequired(pending)) => Err(pending),
+        Err(err) => {
+            send_open_error(transport, &workspace.id, session_id, err).await;
+            return None;
+        }
+    };
     let pending = match &first {
-        Err(OpenError::PendingApprovalsRequired(p)) => p.clone(),
+        Err(pending) => pending.clone(),
         _ => Vec::new(),
     };
 
-    // 2. Send the snapshot: resumed history plus any pending approvals the
-    //    client must answer before the session can resume.
-    let messages = state
+    let messages = workspace
         .storage
-        .load_checkpoint(&session_id)
+        .session(session_id)
+        .load_checkpoint(session_id)
         .await
         .ok()
         .flatten()
-        .map(|c| c.messages)
+        .map(|checkpoint| checkpoint.messages)
         .unwrap_or_default();
     if !transport
         .send(&ServerMessage::Snapshot {
-            session_id: session_id.clone(),
+            workspace_id: workspace.id.clone(),
+            session_id: session_id.to_string(),
             messages,
             pending_approvals: pending.clone(),
         })
         .await
     {
-        return;
+        return None;
     }
 
-    // 3. Resolve into a live session, collecting `Resume` decisions for any
-    //    pending approvals (re-prompting via events should the runtime suspend
-    //    again before fully resuming).
-    let session = match first {
-        Ok(s) => s,
-        Err(OpenError::PendingApprovalsRequired(_)) => {
-            let Some(mut decisions) = collect_resume_decisions(
-                &transport,
-                state.approval_config.clone(),
-                &pending,
-                &cancel,
+    match first {
+        Ok(session) => Some(OpenedSession::Live(session)),
+        Err(_) if decisions.is_empty() => Some(OpenedSession::Pending(pending)),
+        Err(_) => match open_session(app, workspace, session_id, decisions).await {
+            Ok(session) => Some(OpenedSession::Live(session)),
+            Err(OpenError::PendingApprovalsRequired(more)) => Some(OpenedSession::Pending(more)),
+            Err(err) => {
+                send_open_error(transport, &workspace.id, session_id, err).await;
+                None
+            }
+        },
+    }
+}
+
+fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
+    match event {
+        WireEvent::LlmEnd {
+            agent_name,
+            message,
+            ..
+        } => agent_name == root_name && message.tool_calls.is_empty(),
+        WireEvent::Suspended { .. } => true,
+        WireEvent::Aborted { agent_name, .. } | WireEvent::Error { agent_name, .. } => {
+            agent_name == root_name
+        }
+        _ => false,
+    }
+}
+
+fn make_pending_open(
+    workspace: Arc<WorkspaceState>,
+    session_id: String,
+    approvals: Vec<coda_agent::PendingApproval>,
+) -> PendingOpen {
+    PendingOpen {
+        workspace,
+        session_id,
+        needed: approvals
+            .into_iter()
+            .map(|approval| approval.thread_id)
+            .collect(),
+        decisions: HashMap::new(),
+    }
+}
+
+fn spawn_session_forwarder(
+    workspace_id: String,
+    session_id: String,
+    generation: u64,
+    session: Session,
+    root_name: String,
+    tx: mpsc::UnboundedSender<SessionEnvelope>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = session.recv().await {
+            let event = WireEvent::from_session_event(event, &root_name);
+            if tx
+                .send(SessionEnvelope::Event {
+                    workspace_id: workspace_id.clone(),
+                    session_id: session_id.clone(),
+                    generation,
+                    event,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx.send(SessionEnvelope::Closed {
+            workspace_id,
+            session_id,
+            generation,
+        });
+    });
+}
+
+fn insert_active_session(
+    active: &mut HashMap<(String, String), ActiveSession>,
+    tx: &mpsc::UnboundedSender<SessionEnvelope>,
+    next_generation: &mut u64,
+    workspace: Arc<WorkspaceState>,
+    session_id: String,
+    session: Session,
+) {
+    let generation = *next_generation;
+    *next_generation += 1;
+    let workspace_id = workspace.id.clone();
+    let root_name = session.root_name().to_string();
+    let turn_running = session.has_resuming_agents();
+    spawn_session_forwarder(
+        workspace_id.clone(),
+        session_id.clone(),
+        generation,
+        session.clone(),
+        root_name.clone(),
+        tx.clone(),
+    );
+    active.insert(
+        (workspace_id.clone(), session_id.clone()),
+        ActiveSession {
+            generation,
+            session,
+            root_name,
+            turn_running,
+        },
+    );
+    info!(workspace_id = %workspace_id, session_id = %session_id, "session opened");
+}
+
+async fn send_pending_approval_events<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    workspace_id: &str,
+    session_id: &str,
+    approvals: &[coda_agent::PendingApproval],
+) -> bool {
+    for approval in approvals {
+        let event = WireEvent::Suspended {
+            agent_name: approval.agent_name.clone(),
+            thread_id: approval.thread_id.clone(),
+            approval: approval.clone(),
+        };
+        if !transport
+            .send(&ServerMessage::Event {
+                workspace_id: workspace_id.to_string(),
+                session_id: session_id.to_string(),
+                event,
+            })
+            .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn handle_dashboard_command<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    app: &Arc<AppState>,
+    active: &mut HashMap<(String, String), ActiveSession>,
+    pending: &mut HashMap<(String, String), PendingOpen>,
+    tx: &mpsc::UnboundedSender<SessionEnvelope>,
+    next_generation: &mut u64,
+    command: ClientMessage,
+) -> bool {
+    match command {
+        ClientMessage::ListWorkspaces => send_workspace_catalog(transport, app).await,
+        ClientMessage::OpenSession {
+            workspace_id,
+            session_id,
+        } => {
+            if let Err(err) = validate_session_id(&session_id) {
+                warn!(workspace_id = %workspace_id, "rejecting open: {err}");
+                return true;
+            }
+            let key = (workspace_id.clone(), session_id.clone());
+            if active.contains_key(&key) || pending.contains_key(&key) {
+                return true;
+            }
+            let Some(workspace) = app.workspaces.get(&workspace_id).cloned() else {
+                warn!(workspace_id = %workspace_id, "unknown workspace requested");
+                return true;
+            };
+            match open_session_and_send_snapshot(
+                transport,
+                app,
+                &workspace,
+                &session_id,
+                HashMap::new(),
             )
             .await
-            else {
-                return;
-            };
-            loop {
-                match open_session(&state, &session_id, std::mem::take(&mut decisions)).await {
-                    Ok(s) => break s,
-                    Err(OpenError::PendingApprovalsRequired(more)) => {
-                        for p in &more {
-                            let event = WireEvent::Suspended {
-                                agent_name: p.agent_name.clone(),
-                                thread_id: p.thread_id.clone(),
-                                approval: p.clone(),
-                            };
-                            if !transport.send(&ServerMessage::Event { event }).await {
-                                return;
-                            }
-                        }
-                        match collect_resume_decisions(
-                            &transport,
-                            state.approval_config.clone(),
-                            &more,
-                            &cancel,
-                        )
-                        .await
-                        {
-                            Some(d) => decisions = d,
-                            None => return,
-                        }
-                    }
-                    Err(e) => {
-                        send_open_error(&transport, &session_id, e).await;
-                        return;
-                    }
+            {
+                Some(OpenedSession::Live(session)) => {
+                    insert_active_session(
+                        active,
+                        tx,
+                        next_generation,
+                        workspace,
+                        session_id,
+                        session,
+                    );
+                    send_workspace_catalog(transport, app).await
                 }
+                Some(OpenedSession::Pending(approvals)) => {
+                    pending.insert(key, make_pending_open(workspace, session_id, approvals));
+                    true
+                }
+                None => true,
             }
         }
-        Err(e) => {
-            send_open_error(&transport, &session_id, e).await;
-            return;
+        ClientMessage::Task {
+            workspace_id,
+            session_id,
+            task,
+        } => {
+            if let Some(active_session) =
+                active.get_mut(&(workspace_id.clone(), session_id.clone()))
+            {
+                if let Err(err) = active_session.session.send(task).await {
+                    warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
+                } else {
+                    active_session.turn_running = true;
+                }
+            }
+            true
         }
-    };
-    let root_name = session.root_name().to_string();
-    info!(session_id = %session_id, "session opened");
+        ClientMessage::Resume {
+            workspace_id,
+            session_id,
+            agent_name,
+            thread_id,
+            decision,
+        } => {
+            let key = (workspace_id.clone(), session_id.clone());
+            if let Some(active_session) = active.get_mut(&key) {
+                if let Err(err) = active_session
+                    .session
+                    .resume(&agent_name, &thread_id, decision)
+                    .await
+                {
+                    warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to resume: {err}");
+                } else {
+                    active_session.turn_running = true;
+                }
+                return true;
+            }
 
-    // 4. Pump: client commands in, runtime events out, for the connection's life.
-    //    The cancel token fires when a newer connection evicts us or the process
-    //    is shutting down (it is a child of the global shutdown token).
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            cmd = transport.recv() => {
-                match cmd {
-                    Some(ClientMessage::AddAllowPattern { pattern }) => {
-                        if !send_allow_pattern_result(
-                            &transport,
-                            state.approval_config.clone(),
-                            pattern,
-                        )
+            let Some(pending_open) = pending.get_mut(&key) else {
+                return true;
+            };
+            pending_open.needed.remove(&thread_id);
+            pending_open.decisions.insert(thread_id, decision);
+            if !pending_open.needed.is_empty() {
+                return true;
+            }
+
+            let Some(mut pending_open) = pending.remove(&key) else {
+                return true;
+            };
+            match open_session(
+                app,
+                &pending_open.workspace,
+                &pending_open.session_id,
+                std::mem::take(&mut pending_open.decisions),
+            )
+            .await
+            {
+                Ok(session) => {
+                    insert_active_session(
+                        active,
+                        tx,
+                        next_generation,
+                        pending_open.workspace,
+                        pending_open.session_id,
+                        session,
+                    );
+                }
+                Err(OpenError::PendingApprovalsRequired(more)) => {
+                    if !send_pending_approval_events(transport, &workspace_id, &session_id, &more)
                         .await
-                        {
-                            break;
-                        }
+                    {
+                        return false;
                     }
-                    Some(ClientMessage::Task { task }) => {
-                        if let Err(e) = session.send(task).await {
-                            warn!("failed to send task: {e}");
-                        }
-                    }
-                    Some(ClientMessage::Resume {
-                        agent_name,
-                        thread_id,
-                        decision,
-                    }) => {
-                        if let Err(e) = session.resume(&agent_name, &thread_id, decision).await {
-                            warn!("failed to resume: {e}");
-                        }
-                    }
-                    Some(ClientMessage::Abort) => session.abort().await,
-                    None => break, // client disconnected
+                    pending.insert(
+                        key,
+                        make_pending_open(pending_open.workspace, pending_open.session_id, more),
+                    );
                 }
+                Err(err) => send_open_error(transport, &workspace_id, &session_id, err).await,
             }
-            event = session.recv() => {
-                match event {
-                    Some(ev) => {
-                        let event = WireEvent::from_session_event(ev, &root_name);
-                        if !transport.send(&ServerMessage::Event { event }).await {
-                            break;
-                        }
-                    }
-                    None => break, // runtime shut down
-                }
+            true
+        }
+        ClientMessage::Abort {
+            workspace_id,
+            session_id,
+        } => {
+            if let Some(active_session) = active.get(&(workspace_id, session_id)) {
+                active_session.session.abort().await;
             }
+            true
+        }
+        ClientMessage::DeleteSession {
+            workspace_id,
+            session_id,
+        } => {
+            if let Err(err) = validate_session_id(&session_id) {
+                warn!(workspace_id = %workspace_id, "rejecting delete: {err}");
+                return true;
+            }
+            let key = (workspace_id.clone(), session_id.clone());
+            // Stop a live session before removing its files so no checkpoint is
+            // written back after deletion.
+            if let Some(active_session) = active.remove(&key) {
+                active_session.session.shutdown(Shutdown::Abort).await;
+            }
+            pending.remove(&key);
+            let Some(workspace) = app.workspaces.get(&workspace_id) else {
+                warn!(workspace_id = %workspace_id, "unknown workspace requested");
+                return true;
+            };
+            if let Err(err) = workspace.storage.delete_session(&session_id).await {
+                warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to delete session: {err}");
+            }
+            send_workspace_catalog(transport, app).await
+        }
+        ClientMessage::AddAllowPattern {
+            workspace_id,
+            pattern,
+        } => {
+            let Some(workspace) = app.workspaces.get(&workspace_id) else {
+                warn!(workspace_id = %workspace_id, "unknown workspace requested");
+                return true;
+            };
+            send_allow_pattern_result(
+                transport,
+                workspace_id,
+                workspace.approval_config.clone(),
+                pattern,
+            )
+            .await
         }
     }
-
-    session
-        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
-        .await;
-    info!(session_id = %session_id, "connection closed, session shut down");
 }
 
-async fn wait_for_connection_done(mut done: watch::Receiver<bool>) {
-    if *done.borrow() {
+async fn handle_session_envelope<
+    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
+>(
+    transport: &T,
+    active: &mut HashMap<(String, String), ActiveSession>,
+    envelope: SessionEnvelope,
+    client_connected: bool,
+) -> bool {
+    match envelope {
+        SessionEnvelope::Event {
+            workspace_id,
+            session_id,
+            generation,
+            event,
+        } => {
+            let key = (workspace_id.clone(), session_id.clone());
+            let Some(active_session) = active.get_mut(&key) else {
+                return true;
+            };
+            if active_session.generation != generation {
+                return true;
+            }
+            if event_settles_turn(&event, &active_session.root_name) {
+                active_session.turn_running = false;
+            }
+            if client_connected {
+                return transport
+                    .send(&ServerMessage::Event {
+                        workspace_id,
+                        session_id,
+                        event,
+                    })
+                    .await;
+            }
+            true
+        }
+        SessionEnvelope::Closed {
+            workspace_id,
+            session_id,
+            generation,
+        } => {
+            let key = (workspace_id, session_id);
+            if active
+                .get(&key)
+                .is_some_and(|active_session| active_session.generation == generation)
+            {
+                active.remove(&key);
+            }
+            true
+        }
+    }
+}
+
+fn any_turn_running(active: &HashMap<(String, String), ActiveSession>) -> bool {
+    active.values().any(|session| session.turn_running)
+}
+
+async fn shutdown_active_sessions(active: HashMap<(String, String), ActiveSession>) {
+    for ((workspace_id, session_id), active_session) in active {
+        active_session
+            .session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
+            .await;
+        info!(workspace_id = %workspace_id, session_id = %session_id, "session shut down");
+    }
+}
+
+async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: T,
+    app: Arc<AppState>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut active = HashMap::<(String, String), ActiveSession>::new();
+    let mut pending = HashMap::<(String, String), PendingOpen>::new();
+    let mut next_generation = 1;
+    let mut client_connected = true;
+
+    if !send_workspace_catalog(&transport, &app).await {
         return;
     }
-    while done.changed().await.is_ok() {
-        if *done.borrow() {
-            return;
+
+    loop {
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            command = transport.recv(), if client_connected => {
+                match command {
+                    Some(command) => {
+                        client_connected = handle_dashboard_command(
+                            &transport,
+                            &app,
+                            &mut active,
+                            &mut pending,
+                            &tx,
+                            &mut next_generation,
+                            command,
+                        ).await;
+                    }
+                    None => {
+                        client_connected = false;
+                        pending.clear();
+                        if !any_turn_running(&active) {
+                            break;
+                        }
+                        info!("dashboard disconnected, waiting for active turns to settle");
+                    }
+                }
+            }
+            envelope = rx.recv() => {
+                let Some(envelope) = envelope else {
+                    break;
+                };
+                if !handle_session_envelope(&transport, &mut active, envelope, client_connected).await {
+                    client_connected = false;
+                    pending.clear();
+                }
+                if !client_connected && !any_turn_running(&active) {
+                    break;
+                }
+            }
         }
     }
+
+    shutdown_active_sessions(active).await;
 }
 
-async fn finish_connection(
-    state: &Arc<AppState>,
-    connection_id: u64,
-    done_tx: watch::Sender<bool>,
-) {
-    let mut current = state.current.lock().await;
-    if current.as_ref().is_some_and(|c| c.id == connection_id) {
-        current.take();
-    }
-    drop(current);
-    let _ = done_tx.send(true);
-}
-
-async fn run_upgraded_socket(
-    socket: axum::extract::ws::WebSocket,
-    state: Arc<AppState>,
-    session_id: String,
-) {
-    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
-    let cancel = state.shutdown.child_token();
-    let (done_tx, done_rx) = watch::channel(false);
-
-    let previous = state.current.lock().await.replace(CurrentConnection {
-        id: connection_id,
-        cancel: cancel.clone(),
-        done: done_rx,
-    });
-
-    if let Some(previous) = previous {
-        previous.cancel.cancel();
-        info!("evicting previous client connection");
-        wait_for_connection_done(previous.done).await;
-    }
-
-    if !cancel.is_cancelled() {
-        handle_session(
-            WebSocketTransport::new(socket),
-            state.clone(),
-            session_id,
-            cancel,
-        )
-        .await;
-    }
-
-    finish_connection(&state, connection_id, done_tx).await;
-}
-
-async fn ws_handler(
+async fn dashboard_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    Path(session_id): Path<String>,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
-        info!(session_id = %session_id, "client connected");
-        run_upgraded_socket(socket, state, session_id).await;
+        info!("dashboard connected");
+        run_dashboard(WebSocketTransport::new(socket), state).await;
+        info!("dashboard connection closed");
     })
 }
 
@@ -397,6 +730,7 @@ async fn ws_handler(
 /// keeps this dependency-free and robust to editor atomic-saves; the few-second
 /// latency is immaterial since the prompt is only read at the start of a turn.
 fn spawn_custom_instructions_watcher(
+    workspace_id: String,
     workspace_str: String,
     base_prompt: String,
     system_prompt: SharedSystemPrompt,
@@ -413,12 +747,103 @@ fn spawn_custom_instructions_watcher(
                     if current != last {
                         last = current;
                         system_prompt.set(build_system_prompt(&workspace_str, &base_prompt));
-                        info!("AGENTS.md changed, system prompt reloaded");
+                        info!(workspace_id = %workspace_id, "AGENTS.md changed, system prompt reloaded");
                     }
                 }
             }
         }
     });
+}
+
+fn server_config_path() -> PathBuf {
+    std::env::var("CODA_SERVER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("coda-server.toml"))
+}
+
+fn display_path(path: &FsPath) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+async fn build_workspace(
+    workspace: WorkspaceConfig,
+    shutdown: &CancellationToken,
+) -> Result<WorkspaceState, String> {
+    let workspace_dir = workspace.path.canonicalize().map_err(|e| {
+        format!(
+            "failed to resolve workspace '{}': {e}",
+            workspace.path.display()
+        )
+    })?;
+    let workspace_str = display_path(&workspace_dir);
+
+    let root_agent = load_root_agent_file(&workspace_dir).map_err(|e| e.to_string())?;
+    let base_prompt = root_agent
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
+    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str, &base_prompt));
+
+    let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
+    let storage = WorkspaceStorage::new(checkpoint_dir);
+
+    let mcp_servers = coda_server::mcp::load_mcp_servers(&workspace_dir)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                workspace_id = %workspace.id,
+                "failed to load MCP servers: {e}"
+            );
+            McpServers::empty()
+        });
+
+    let registry_ctx = BuildContext::new(workspace_str.clone());
+    let mut registry = ToolRegistry::new();
+    registry.insert(AskUserToolSpec.build(&registry_ctx));
+    for tool in mcp_servers.tool_objects() {
+        registry.insert(tool);
+    }
+
+    let agent_files = load_agent_files(&workspace_dir).map_err(|e| e.to_string())?;
+    let agent_team = build_agent_team(
+        SystemPrompt::from(system_prompt.clone()),
+        &registry,
+        agent_files,
+        root_agent.tools,
+        root_agent.subagents,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
+        tracing::warn!(
+            workspace_id = %workspace.id,
+            "failed to load approval config: {e}"
+        );
+        ToolApprovalConfig::default_for(&workspace_dir)
+    });
+
+    spawn_custom_instructions_watcher(
+        workspace.id.clone(),
+        workspace_str.clone(),
+        base_prompt,
+        system_prompt.clone(),
+        shutdown.clone(),
+    );
+
+    info!(
+        workspace_id = %workspace.id,
+        path = %workspace_str,
+        "workspace loaded"
+    );
+
+    Ok(WorkspaceState {
+        id: workspace.id,
+        storage,
+        workspace_str,
+        mcp_servers,
+        agent_team,
+        approval_config,
+    })
 }
 
 /// Resolve once the process receives SIGINT (Ctrl+C) or SIGTERM.
@@ -458,92 +883,40 @@ async fn main() {
     let base_url = std::env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
     let model = std::env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
 
-    let workspace_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let workspace_str = workspace_dir.to_string_lossy().into_owned();
-
-    // Load the optional top-level `.coda/agents/AGENT.md` (coda's own config); a
-    // bad parse is fatal at startup. Its body overrides the built-in base prompt;
-    // its tools/subagents overrides are applied when assembling the team below.
-    let root_agent = load_root_agent_file(&workspace_dir).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    });
-    let base_prompt = root_agent
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
-    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str, &base_prompt));
-
     let provider = Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
         base_url,
         stream: true,
     }));
 
-    let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
-    let storage = JsonFileStorage::new(checkpoint_dir);
+    let shutdown = CancellationToken::new();
 
-    let mcp_servers = coda_server::mcp::load_mcp_servers(&workspace_dir)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("failed to load MCP servers: {e}");
-            McpServers::empty()
-        });
-
-    // Build the tool registry: `ask_user` plus every connected MCP tool, each
-    // keyed by name so configured agents can request them individually.
-    let registry_ctx = BuildContext::new(workspace_str.clone());
-    let mut registry = ToolRegistry::new();
-    registry.insert(AskUserToolSpec.build(&registry_ctx));
-    for tool in mcp_servers.tool_objects() {
-        registry.insert(tool);
+    let config_path = server_config_path();
+    let server_config = load_server_config(&config_path).unwrap_or_else(|e| {
+        eprintln!("error loading {}: {e}", config_path.display());
+        eprintln!("example:");
+        eprintln!("[[workspaces]]");
+        eprintln!("id = \"coda\"");
+        eprintln!("path = \"/path/to/workspace\"");
+        std::process::exit(1);
+    });
+    let mut workspaces = HashMap::new();
+    for workspace in server_config.workspaces {
+        let id = workspace.id.clone();
+        let state = build_workspace(workspace, &shutdown)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("error loading workspace '{id}': {e}");
+                std::process::exit(1);
+            });
+        workspaces.insert(id, Arc::new(state));
     }
 
-    // Load file-configured sub-agents and assemble the validated agent team. A
-    // bad configuration (unknown tool, dangling reference, namespace conflict,
-    // parse error) is fatal at startup rather than surfacing per session.
-    // Unreachable agents are ignored with a warning. Holding the resulting
-    // `AgentTeam` proves it is sound, so each session's `build` cannot fail.
-    let agent_files = load_agent_files(&workspace_dir).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    });
-    let agent_team = build_agent_team(
-        SystemPrompt::from(system_prompt.clone()),
-        &registry,
-        agent_files,
-        root_agent.tools,
-        root_agent.subagents,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    });
-
-    let approval_config = ToolApprovalConfig::load(&workspace_dir).unwrap_or_else(|e| {
-        tracing::warn!("failed to load approval config: {e}");
-        ToolApprovalConfig::default_for(&workspace_dir)
-    });
-
-    let shutdown = CancellationToken::new();
-    spawn_custom_instructions_watcher(
-        workspace_str.clone(),
-        base_prompt,
-        system_prompt.clone(),
-        shutdown.clone(),
-    );
-
     let state = Arc::new(AppState {
-        storage,
-        workspace_str,
         provider,
         model,
-        mcp_servers,
-        agent_team,
-        approval_config,
         shutdown: shutdown.clone(),
-        current: Mutex::new(None),
-        next_connection_id: AtomicU64::new(1),
+        workspaces,
     });
 
     // On a shutdown signal, cancel the token: this both ends `axum::serve`'s
@@ -558,20 +931,30 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/ws/{session_id}", get(ws_handler))
+        .route("/ws", get(dashboard_ws_handler))
         .with_state(state.clone());
 
     let listen_addr =
         std::env::var("CODA_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
-    info!("coda_server listening on ws://{listen_addr}/ws/:session_id");
+    info!("coda_server listening on ws://{listen_addr}/ws");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .unwrap();
 
     match Arc::try_unwrap(state) {
-        Ok(app_state) => app_state.mcp_servers.shutdown().await,
+        Ok(app_state) => {
+            for (workspace_id, workspace) in app_state.workspaces {
+                match Arc::try_unwrap(workspace) {
+                    Ok(workspace) => workspace.mcp_servers.shutdown().await,
+                    Err(_) => warn!(
+                        workspace_id = %workspace_id,
+                        "cannot shutdown MCP servers: outstanding references"
+                    ),
+                }
+            }
+        }
         Err(_) => warn!("cannot shutdown MCP servers: outstanding references"),
     }
 

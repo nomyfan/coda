@@ -1,28 +1,150 @@
 use coda_agent::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
+use coda_core::llm::Message;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::UNIX_EPOCH;
 use tokio::fs;
 
+/// Reject session IDs that are unsafe to use as a path component.
+///
+/// `session_id` is client-controlled and gets joined under the workspace's
+/// session root to read, write, and delete files. A value containing path
+/// separators or `..` would escape that root (directory traversal → arbitrary
+/// file overwrite or recursive deletion), so callers must validate before any
+/// filesystem use. A single component that is not `.`/`..` and contains no
+/// separator or NUL byte cannot escape its parent directory.
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    let unsafe_id = session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0');
+    if unsafe_id {
+        return Err(format!("invalid session id: {session_id:?}"));
+    }
+    Ok(())
+}
+
+/// Persistence for all sessions of a single workspace. Each session lives in its
+/// own subdirectory (`<root>/<session_id>/`) holding the runtime snapshot and the
+/// per-thread checkpoints.
 #[derive(Clone, Debug)]
-pub struct JsonFileStorage {
+pub struct WorkspaceStorage {
     root_dir: PathBuf,
 }
 
-impl JsonFileStorage {
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SessionFile {
+    pub session_id: String,
+    pub updated_at_ms: Option<u64>,
+    pub first_user_message: Option<String>,
+}
+
+impl WorkspaceStorage {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
         }
     }
 
-    fn checkpoint_path(&self, thread_id: &str) -> PathBuf {
-        self.root_dir.join(format!("thread_{thread_id}.json"))
+    /// Storage scoped to one session's directory.
+    pub fn session(&self, session_id: &str) -> JsonFileStorage {
+        JsonFileStorage::new(self.root_dir.join(session_id))
     }
 
-    fn snapshot_path(&self, session_id: &str) -> PathBuf {
-        self.root_dir.join(format!("session_{session_id}.json"))
+    /// Remove a session's directory and everything in it.
+    pub async fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        validate_session_id(session_id)?;
+        let dir = self.root_dir.join(session_id);
+        match fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("failed to delete session {}: {err}", dir.display())),
+        }
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<SessionFile>, String> {
+        let mut dir = match fs::read_dir(&self.root_dir).await {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(format!(
+                    "failed to read session directory {}: {err}",
+                    self.root_dir.display()
+                ));
+            }
+        };
+
+        let mut sessions = Vec::new();
+        while let Some(entry) = dir.next_entry().await.map_err(|err| {
+            format!(
+                "failed to read session directory {}: {err}",
+                self.root_dir.display()
+            )
+        })? {
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(session_id) = file_name.to_str() else {
+                continue;
+            };
+            let storage = self.session(session_id);
+            let updated_at_ms = fs::metadata(storage.snapshot_path())
+                .await
+                .or(entry.metadata().await)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .and_then(|duration| duration.as_millis().try_into().ok());
+            let first_user_message = storage.first_user_message(session_id).await;
+            sessions.push(SessionFile {
+                session_id: session_id.to_string(),
+                updated_at_ms,
+                first_user_message,
+            });
+        }
+
+        sessions.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        Ok(sessions)
+    }
+}
+
+/// Persistence scoped to a single session directory.
+#[derive(Clone, Debug)]
+pub struct JsonFileStorage {
+    dir: PathBuf,
+}
+
+impl JsonFileStorage {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn checkpoint_path(&self, thread_id: &str) -> PathBuf {
+        self.dir.join(format!("thread_{thread_id}.json"))
+    }
+
+    fn snapshot_path(&self) -> PathBuf {
+        self.dir.join("snapshot.json")
+    }
+
+    async fn first_user_message(&self, session_id: &str) -> Option<String> {
+        let checkpoint = self.load_checkpoint(session_id).await.ok().flatten()?;
+        checkpoint
+            .messages
+            .into_iter()
+            .find_map(|message| match message {
+                Message::User(message) => Some(message.0),
+                _ => None,
+            })
     }
 }
 
@@ -33,10 +155,10 @@ impl SessionStorage for JsonFileStorage {
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            fs::create_dir_all(&self.root_dir).await.map_err(|err| {
+            fs::create_dir_all(&self.dir).await.map_err(|err| {
                 format!(
                     "failed to create checkpoint directory {}: {err}",
-                    self.root_dir.display()
+                    self.dir.display()
                 )
             })?;
 
@@ -80,16 +202,16 @@ impl SessionStorage for JsonFileStorage {
         snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            fs::create_dir_all(&self.root_dir).await.map_err(|err| {
+            fs::create_dir_all(&self.dir).await.map_err(|err| {
                 format!(
                     "failed to create snapshot directory {}: {err}",
-                    self.root_dir.display()
+                    self.dir.display()
                 )
             })?;
 
             let payload = serde_json::to_vec_pretty(&snapshot)
                 .map_err(|err| format!("failed to serialize snapshot {session_id}: {err}"))?;
-            let path = self.snapshot_path(&session_id);
+            let path = self.snapshot_path();
             fs::write(&path, payload)
                 .await
                 .map_err(|err| format!("failed to write snapshot {}: {err}", path.display()))?;
@@ -100,10 +222,10 @@ impl SessionStorage for JsonFileStorage {
 
     fn load_session_snapshot(
         &self,
-        session_id: &str,
+        _session_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
     {
-        let path = self.snapshot_path(session_id);
+        let path = self.snapshot_path();
         Box::pin(async move {
             let payload = match fs::read(&path).await {
                 Ok(payload) => payload,
@@ -116,5 +238,39 @@ impl SessionStorage for JsonFileStorage {
                 .map(Some)
                 .map_err(|err| format!("failed to parse snapshot {}: {err}", path.display()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_session_id_accepts_uuid_like_ids() {
+        assert!(validate_session_id("3c4e75c-abcd-1234").is_ok());
+        assert!(validate_session_id("session_42").is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_traversal_and_separators() {
+        for bad in ["", ".", "..", "../escape", "a/b", "a\\b", "x\0y"] {
+            assert!(
+                validate_session_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_traversal_without_touching_filesystem() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sentinel = workspace.path().join("keep.txt");
+        std::fs::write(&sentinel, b"important").unwrap();
+
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        // `..` would resolve to the workspace dir; the guard must reject it
+        // before `remove_dir_all` runs.
+        assert!(storage.delete_session("..").await.is_err());
+        assert!(sentinel.exists(), "traversal must not delete outside root");
     }
 }

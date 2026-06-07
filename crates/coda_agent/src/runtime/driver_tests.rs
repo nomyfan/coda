@@ -971,6 +971,8 @@ async fn pending_approval_supports_mixed_resolutions() {
                 ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {
                     assert_eq!(msg.content, "approval-flow-ok");
                     assert!(saw_tool_end_ids.contains("call_exec"));
+                    assert!(saw_tool_end_ids.contains("call_resolved"));
+                    assert!(saw_tool_end_ids.contains("call_rejected"));
                     assert!(saw_tool_end_ids.contains("call_auto"));
                     break;
                 }

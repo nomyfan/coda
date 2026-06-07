@@ -132,30 +132,59 @@ impl WireEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    /// Request the configured workspace/session catalog.
+    ListWorkspaces,
+    /// Open or switch the active session on this connection.
+    OpenSession {
+        workspace_id: String,
+        session_id: String,
+    },
     /// Start a new turn with a user task.
-    Task { task: String },
+    Task {
+        workspace_id: String,
+        session_id: String,
+        task: String,
+    },
     /// Answer a suspended tool call. `agent_name` and `thread_id` come from the
     /// [`PendingApproval`] carried by a [`ServerMessage::Event`] `Suspended`.
     Resume {
+        workspace_id: String,
+        session_id: String,
         agent_name: String,
         thread_id: String,
         decision: ResumeDecision,
     },
     /// Interrupt whatever the session is currently doing.
-    Abort,
+    Abort {
+        workspace_id: String,
+        session_id: String,
+    },
+    /// Delete a session: stop it if live, then remove its persisted directory.
+    DeleteSession {
+        workspace_id: String,
+        session_id: String,
+    },
     /// Append a glob pattern to the shell allow-list. Takes effect immediately
     /// for the live session.
-    AddAllowPattern { pattern: String },
+    AddAllowPattern {
+        workspace_id: String,
+        pattern: String,
+    },
 }
 
 /// A message pushed by the server over the WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Configured workspaces and persisted sessions.
+    WorkspaceCatalog {
+        workspaces: Vec<WorkspaceSummaryWire>,
+    },
     /// Sent once, immediately after connect: the resumed conversation history
     /// plus any approvals left pending from a prior suspension, which the client
     /// must answer with `Resume` before the session resumes.
     Snapshot {
+        workspace_id: String,
         session_id: String,
         messages: Vec<Message>,
         #[serde(default)]
@@ -163,13 +192,34 @@ pub enum ServerMessage {
     },
     /// A live runtime event. Nested under `event` rather than flattened so the
     /// inner `type` tag of [`WireEvent`] does not collide with this enum's tag.
-    Event { event: WireEvent },
+    Event {
+        workspace_id: String,
+        session_id: String,
+        event: WireEvent,
+    },
     /// Result of a requested shell allow-list update.
     AllowPatternResult {
+        workspace_id: String,
         pattern: String,
         #[serde(default)]
         error: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummaryWire {
+    pub id: String,
+    pub path: String,
+    pub sessions: Vec<SessionSummaryWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryWire {
+    pub id: String,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
+    #[serde(default)]
+    pub first_user_message: Option<String>,
 }
 
 #[cfg(test)]
@@ -184,25 +234,62 @@ mod tests {
     #[test]
     fn client_task_roundtrips() {
         let json = serde_json::to_string(&ClientMessage::Task {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
             task: "hello".into(),
         })
         .unwrap();
-        assert_eq!(json, r#"{"type":"task","task":"hello"}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"task","workspace_id":"coda","session_id":"s1","task":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn client_list_workspaces_roundtrips() {
+        let json = serde_json::to_string(&ClientMessage::ListWorkspaces).unwrap();
+        assert_eq!(json, r#"{"type":"list_workspaces"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            ClientMessage::ListWorkspaces
+        ));
+    }
+
+    #[test]
+    fn client_open_session_roundtrips() {
+        let json = serde_json::to_string(&ClientMessage::OpenSession {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"open_session","workspace_id":"coda","session_id":"s1"}"#
+        );
     }
 
     #[test]
     fn client_abort_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::Abort).unwrap();
-        assert_eq!(json, r#"{"type":"abort"}"#);
+        let json = serde_json::to_string(&ClientMessage::Abort {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"abort","workspace_id":"coda","session_id":"s1"}"#
+        );
         assert!(matches!(
             serde_json::from_str::<ClientMessage>(&json).unwrap(),
-            ClientMessage::Abort
+            ClientMessage::Abort { .. }
         ));
     }
 
     #[test]
     fn client_resume_roundtrips() {
         let msg = ClientMessage::Resume {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
             agent_name: "coda".into(),
             thread_id: "t1".into(),
             decision: ResumeDecision {
@@ -211,10 +298,14 @@ mod tests {
         };
         match roundtrip_client(&msg) {
             ClientMessage::Resume {
+                workspace_id,
+                session_id,
                 agent_name,
                 thread_id,
                 decision,
             } => {
+                assert_eq!(workspace_id, "coda");
+                assert_eq!(session_id, "s1");
                 assert_eq!(agent_name, "coda");
                 assert_eq!(thread_id, "t1");
                 assert_eq!(decision.resolutions.len(), 1);
@@ -226,17 +317,19 @@ mod tests {
     #[test]
     fn client_add_allow_pattern_roundtrips() {
         let msg = ClientMessage::AddAllowPattern {
+            workspace_id: "coda".into(),
             pattern: "git *".into(),
         };
         assert!(matches!(
             roundtrip_client(&msg),
-            ClientMessage::AddAllowPattern { pattern } if pattern == "git *"
+            ClientMessage::AddAllowPattern { workspace_id, pattern } if workspace_id == "coda" && pattern == "git *"
         ));
     }
 
     #[test]
     fn server_snapshot_roundtrips() {
         let msg = ServerMessage::Snapshot {
+            workspace_id: "coda".into(),
             session_id: "s1".into(),
             messages: vec![],
             pending_approvals: vec![],
@@ -244,13 +337,38 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"snapshot","session_id":"s1","messages":[],"pending_approvals":[]}"#
+            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[]}"#
         );
+    }
+
+    #[test]
+    fn server_workspace_catalog_roundtrips() {
+        let msg = ServerMessage::WorkspaceCatalog {
+            workspaces: vec![WorkspaceSummaryWire {
+                id: "coda".into(),
+                path: "/work/coda".into(),
+                sessions: vec![SessionSummaryWire {
+                    id: "s1".into(),
+                    updated_at_ms: Some(42),
+                    first_user_message: Some("inspect the repo".into()),
+                }],
+            }],
+        };
+        match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
+        {
+            ServerMessage::WorkspaceCatalog { workspaces } => {
+                assert_eq!(workspaces[0].id, "coda");
+                assert_eq!(workspaces[0].sessions[0].id, "s1");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]
     fn server_event_roundtrips() {
         let msg = ServerMessage::Event {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
             event: WireEvent::LlmContentChunk {
                 agent_name: "coda".into(),
                 thread_id: "t1".into(),
@@ -260,8 +378,12 @@ mod tests {
         match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
         {
             ServerMessage::Event {
+                workspace_id,
+                session_id,
                 event: WireEvent::LlmContentChunk { content, .. },
             } => {
+                assert_eq!(workspace_id, "coda");
+                assert_eq!(session_id, "s1");
                 assert_eq!(content, "hi");
             }
             other => panic!("unexpected variant: {other:?}"),
@@ -271,17 +393,23 @@ mod tests {
     #[test]
     fn server_allow_pattern_result_roundtrips() {
         let ok = ServerMessage::AllowPatternResult {
+            workspace_id: "coda".into(),
             pattern: "git *".into(),
             error: None,
         };
         let json = serde_json::to_string(&ok).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"allow_pattern_result","pattern":"git *","error":null}"#
+            r#"{"type":"allow_pattern_result","workspace_id":"coda","pattern":"git *","error":null}"#
         );
 
         match serde_json::from_str::<ServerMessage>(&json).unwrap() {
-            ServerMessage::AllowPatternResult { pattern, error } => {
+            ServerMessage::AllowPatternResult {
+                workspace_id,
+                pattern,
+                error,
+            } => {
+                assert_eq!(workspace_id, "coda");
                 assert_eq!(pattern, "git *");
                 assert!(error.is_none());
             }

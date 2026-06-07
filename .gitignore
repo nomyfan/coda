@@ -8,3 +8,5 @@
 skills/
 .coda
 .claude/worktrees/
+.claude/launch.json
+coda-server.toml

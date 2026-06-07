@@ -10,13 +10,18 @@ This project is in active development. Breaking changes to APIs, serialization f
 
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `sh`.
 
+## Frontend UI
+
+When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first using `npx` (for example, `npx shadcn@latest add radio-group`) — not `pnpm dlx` — then adapt the generated component to the local UI.
+
 ## Architecture
 
 Cargo workspace implementing an AI Agent:
 
 ```
 app/
-  coda_server (server + client binaries)
+  coda_server (server binary)
+  coda_web    (React/TypeScript web dashboard — the primary UI)
 crates/
   ├── coda_agent   — agent runtime
   ├── coda_tools   — built-in tool implementations & tool spec system
@@ -34,7 +39,7 @@ crates/
 - **`coda_tools`** — Built-in tool implementations and the tool spec system. Provides 9 built-in tools (`shell`, `read_file`, `write_file`, `edit_file`, `ls`, `grep`, `glob`, `read_todos`, `write_todos`), `TodoItem`, the `ToolSpec` factory trait (with `name()` metadata), `BuildContext`, `PrebuiltToolSpec`, and name-based resolution (`builtin_specs()`, `spec_by_name`). Depends on `coda_core`.
 - **`coda_skills`** — Loads skill definitions from `.coda/skills/<name>/SKILL.md` directories. Parses YAML frontmatter (name, description, etc.) and generates XML for system-prompt injection.
 - **`coda_mcp`** — MCP (Model Context Protocol) client integration. Supports stdio and HTTP (streamable-http) transports, adapts MCP server tools into `ToolObject` instances via `McpToolAdapter`, auto-prefixes tool names with `mcp__` and truncates to 64 chars. Configuration is read from the `mcpServers` field in a JSON file.
-- **`coda_server`** — Application layer: WebSocket server (axum) holding one live `Session` per connection (single-client via latest-wins eviction, single-workspace), CLI client, ask_user tool, a `Transport` trait (typed `ClientMessage`/`ServerMessage` in/out, hiding framing & serialization) with a WebSocket implementation, system-prompt construction, file-based agent configuration (loads `.coda/agents/` into a validated `AgentTeam` at startup — see below), tool approval config, MCP server loading, and session persistence (JSON file storage). Located at `app/coda_server`.
+- **`coda_server`** — Application layer: WebSocket server (axum) holding one live `Session` per connection (single-client via latest-wins eviction, single-workspace), ask_user tool, a `Transport` trait (typed `ClientMessage`/`ServerMessage` in/out, hiding framing & serialization) with a WebSocket implementation, system-prompt construction, file-based agent configuration (loads `.coda/agents/` into a validated `AgentTeam` at startup — see below), tool approval config, MCP server loading, and session persistence (JSON file storage). Located at `app/coda_server`. The user-facing client is the `coda_web` dashboard (`app/coda_web`).
 
 ### Key Abstractions
 

@@ -9,25 +9,9 @@ pub mod wire;
 use coda_skills::Skills;
 use std::path::Path;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 pub static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 pub static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
-
-pub const LOGO: &str = r#"
-  ██████╗ ██████╗ ██████╗  █████╗
- ██╔════╝██╔═══██╗██╔══██╗██╔══██╗
- ██║     ██║   ██║██║  ██║███████║
- ██║     ██║   ██║██║  ██║██╔══██║
- ╚██████╗╚██████╔╝██████╔╝██║  ██║
-  ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
-"#;
-
-pub fn print_logo(subtitle: &str) {
-    println!("\x1b[1;38;2;242;123;115m{}\x1b[0m", LOGO);
-    println!("\x1b[2;37m  {subtitle}\x1b[0m");
-    println!();
-}
 
 /// Name of the custom-instructions file read from the workspace root.
 pub const CUSTOM_INSTRUCTIONS_FILE: &str = "AGENTS.md";
@@ -131,32 +115,6 @@ fn get_os_version() -> Option<String> {
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
     }
-}
-
-pub fn parse_session_id_arg(
-    args: impl IntoIterator<Item = String>,
-) -> Result<Option<String>, String> {
-    let mut args = args.into_iter();
-    let mut session_id = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--resume" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "missing value for --resume".to_string())?;
-                Uuid::parse_str(&value)
-                    .map_err(|err| format!("invalid session id '{value}': {err}"))?;
-                if session_id.replace(value).is_some() {
-                    return Err("session id can only be provided once".to_string());
-                }
-            }
-            "-h" | "--help" => return Err(String::new()),
-            other => return Err(format!("unknown argument: {other}")),
-        }
-    }
-
-    Ok(session_id)
 }
 
 #[cfg(test)]

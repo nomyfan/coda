@@ -514,27 +514,43 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     });
                                 }
                                 ToolCallResolution::Resolved(output) => {
+                                    let tool_message = ToolMessage {
+                                        id: tc.id,
+                                        name: tc.name,
+                                        output,
+                                        outcome: ToolCallOutcome::Resolved,
+                                    };
                                     self.agent
-                                        .add_message(Message::Tool(ToolMessage {
-                                            id: tc.id,
-                                            name: tc.name,
-                                            output,
-                                            outcome: ToolCallOutcome::Resolved,
-                                        }))
+                                        .add_message(Message::Tool(tool_message.clone()))
+                                        .await;
+                                    self.runtime
+                                        .emit_event(
+                                            self.agent.name.clone(),
+                                            self.thread_id.clone(),
+                                            AgentEvent::ToolCallEnd(tool_message),
+                                        )
                                         .await;
                                 }
                                 ToolCallResolution::Rejected { reason } => {
+                                    let tool_message = ToolMessage {
+                                        id: tc.id,
+                                        name: tc.name,
+                                        output: ToolOutput::Err(
+                                            reason
+                                                .clone()
+                                                .unwrap_or_else(|| "Rejected by user".to_string()),
+                                        ),
+                                        outcome: ToolCallOutcome::Rejected { reason },
+                                    };
                                     self.agent
-                                        .add_message(Message::Tool(ToolMessage {
-                                            id: tc.id,
-                                            name: tc.name,
-                                            output: ToolOutput::Err(
-                                                reason.clone().unwrap_or_else(|| {
-                                                    "Rejected by user".to_string()
-                                                }),
-                                            ),
-                                            outcome: ToolCallOutcome::Rejected { reason },
-                                        }))
+                                        .add_message(Message::Tool(tool_message.clone()))
+                                        .await;
+                                    self.runtime
+                                        .emit_event(
+                                            self.agent.name.clone(),
+                                            self.thread_id.clone(),
+                                            AgentEvent::ToolCallEnd(tool_message),
+                                        )
                                         .await;
                                 }
                             }
