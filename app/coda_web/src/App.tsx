@@ -213,6 +213,10 @@ function AddServerDialog({
   );
 }
 
+function serverLabel(server: ServerState) {
+  return server.alias || server.url;
+}
+
 function SessionRow({
   serverUrl,
   workspaceId,
@@ -578,6 +582,7 @@ function Sidebar({
   onRemoveServer,
   onRenameServer,
   onOpenSession,
+  onStartNewSession,
   onNewSession,
   onDeleteSession,
 }: {
@@ -593,6 +598,7 @@ function Sidebar({
     workspaceId: string,
     sessionId: string
   ) => void;
+  onStartNewSession: () => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
   onDeleteSession: (
     serverUrl: string,
@@ -624,9 +630,18 @@ function Sidebar({
         ) : (
           <>
             <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Servers
+              Sessions
             </h2>
             <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={onStartNewSession}
+                title="New session"
+              >
+                <MessageSquareText className="size-4" />
+              </Button>
               <Button
                 variant="ghost"
                 size="icon"
@@ -1108,26 +1123,36 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
 function Composer({
   status,
   running,
+  server,
+  servers,
   workspace,
   workspaces,
+  selectingTarget,
+  onChangeServer,
   onChangeWorkspace,
   onSend,
   onAbort,
 }: {
   status: ConnectionStatus;
   running: boolean;
+  server?: string;
+  servers: ServerState[];
   workspace?: string;
   workspaces: string[];
+  selectingTarget: boolean;
+  onChangeServer: (serverUrl: string) => void;
   onChangeWorkspace: (workspaceId: string) => void;
   onSend: (task: string) => void;
   onAbort: () => void;
 }) {
   const [task, setTask] = useState("");
   const connected = status === "connected";
+  const canSend = connected && Boolean(workspace) && !running && Boolean(task.trim());
+  const connectedServers = servers.filter((item) => item.status === "connected");
 
   function submit() {
     const text = task.trim();
-    if (!text || !connected || running) {
+    if (!text || !canSend) {
       return;
     }
     onSend(text);
@@ -1142,7 +1167,44 @@ function Composer({
         submit();
       }}
     >
-      {workspace ? (
+      {selectingTarget ? (
+        <div className="mx-auto mb-2 flex max-w-4xl flex-wrap items-center gap-2">
+          <Select
+            value={server}
+            onValueChange={onChangeServer}
+            disabled={connectedServers.length === 0}
+          >
+            <SelectTrigger size="sm" className="w-44 gap-1.5 rounded-md text-xs">
+              <PlugZap className="size-3.5 text-muted-foreground" />
+              <SelectValue placeholder="Server" />
+            </SelectTrigger>
+            <SelectContent position="popper" side="top">
+              {connectedServers.map((item) => (
+                <SelectItem key={item.url} value={item.url}>
+                  {serverLabel(item)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select
+            value={workspace}
+            onValueChange={onChangeWorkspace}
+            disabled={!connected || workspaces.length === 0}
+          >
+            <SelectTrigger size="sm" className="w-36 gap-1.5 rounded-md text-xs">
+              <Folder className="size-3.5 text-muted-foreground" />
+              <SelectValue placeholder="Workspace" />
+            </SelectTrigger>
+            <SelectContent position="popper" side="top">
+              {workspaces.map((id) => (
+                <SelectItem key={id} value={id}>
+                  {id}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      ) : workspace ? (
         <div className="mx-auto mb-2 flex max-w-4xl items-center gap-2">
           <Select value={workspace} onValueChange={onChangeWorkspace}>
             <SelectTrigger
@@ -1153,7 +1215,7 @@ function Composer({
               <Folder className="size-3.5 text-muted-foreground" />
               <SelectValue />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent position="popper" side="top">
               {workspaces.map((id) => (
                 <SelectItem key={id} value={id}>
                   {id}
@@ -1197,7 +1259,7 @@ function Composer({
             size="icon"
             className="absolute bottom-2 right-2 size-8"
             type="submit"
-            disabled={!connected || !task.trim()}
+            disabled={!canSend}
             title="Send"
           >
             <Send />
@@ -1473,17 +1535,113 @@ function ApprovalCall({
   );
 }
 
+type NewSessionTarget = {
+  serverUrl: string;
+  workspaceId: string;
+};
+
+function defaultNewSessionTarget(
+  servers: ServerState[],
+  activeServer?: string
+): NewSessionTarget {
+  const available = servers.filter(
+    (server) => server.status === "connected" && server.catalog.length > 0
+  );
+  const server =
+    available.find((item) => item.url === activeServer) ?? available[0];
+  return {
+    serverUrl: server?.url ?? "",
+    workspaceId: server?.catalog[0]?.id ?? "",
+  };
+}
+
 export default function App() {
   const session = useCodaSession();
+  const [newSessionTarget, setNewSessionTarget] =
+    useState<NewSessionTarget | null>(null);
 
-  const activeServerState = session.servers.find(
-    (server) => server.url === session.activeServer
+  const selectedServerUrl =
+    newSessionTarget?.serverUrl ?? session.activeServer ?? "";
+  const selectedServerState = session.servers.find(
+    (server) => server.url === selectedServerUrl
   );
-  const workspaceIds = activeServerState?.catalog.map((ws) => ws.id) ?? [];
+  const selectedWorkspace =
+    newSessionTarget?.workspaceId ?? session.activeWorkspace;
+  const workspaceIds = selectedServerState?.catalog.map((ws) => ws.id) ?? [];
+  const showingNewSession = newSessionTarget !== null;
+
+  useEffect(() => {
+    if (!newSessionTarget) {
+      return;
+    }
+    const server = session.servers.find(
+      (item) => item.url === newSessionTarget.serverUrl
+    );
+    const firstWorkspace = server?.catalog[0]?.id ?? "";
+    if (
+      firstWorkspace &&
+      server &&
+      !server.catalog.some(
+        (workspace) => workspace.id === newSessionTarget.workspaceId
+      )
+    ) {
+      setNewSessionTarget({
+        serverUrl: newSessionTarget.serverUrl,
+        workspaceId: firstWorkspace,
+      });
+    }
+  }, [newSessionTarget, session.servers]);
+
+  function startNewSession() {
+    setNewSessionTarget(
+      defaultNewSessionTarget(session.servers, session.activeServer)
+    );
+  }
+
+  function openSession(serverUrl: string, workspaceId: string, sessionId: string) {
+    setNewSessionTarget(null);
+    session.openSession(serverUrl, workspaceId, sessionId);
+  }
+
+  function createWorkspaceSession(serverUrl: string, workspaceId: string) {
+    setNewSessionTarget(null);
+    session.newSession(serverUrl, workspaceId);
+  }
+
+  function changeNewSessionServer(serverUrl: string) {
+    const server = session.servers.find((item) => item.url === serverUrl);
+    setNewSessionTarget({
+      serverUrl,
+      workspaceId: server?.catalog[0]?.id ?? "",
+    });
+  }
+
+  function changeWorkspace(workspaceId: string) {
+    if (newSessionTarget) {
+      setNewSessionTarget({ ...newSessionTarget, workspaceId });
+      return;
+    }
+    if (session.activeServer) {
+      session.newSession(session.activeServer, workspaceId);
+    }
+  }
+
+  function sendTask(task: string) {
+    if (newSessionTarget) {
+      session.sendTaskToNewSession(
+        newSessionTarget.serverUrl,
+        newSessionTarget.workspaceId,
+        task
+      );
+      setNewSessionTarget(null);
+      return;
+    }
+    session.sendTask(task);
+  }
 
   return (
     <div className="flex h-screen min-h-[600px] flex-col overflow-hidden bg-background">
-      <WorkspaceHeader approvals={session.approvals} />
+      <WorkspaceHeader approvals={showingNewSession ? [] : session.approvals} />
       <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[256px_minmax(0,1fr)]">
         <Sidebar
           servers={session.servers}
@@ -1493,35 +1651,42 @@ export default function App() {
           onDisconnectServer={session.disconnectServer}
           onRemoveServer={session.removeServer}
           onRenameServer={session.renameServer}
-          onOpenSession={session.openSession}
-          onNewSession={session.newSession}
+          onOpenSession={openSession}
+          onStartNewSession={startNewSession}
+          onNewSession={createWorkspaceSession}
           onDeleteSession={session.deleteSession}
         />
         <section className="flex min-h-0 flex-col">
           <Transcript
-            entries={session.entries}
-            running={session.running}
-            workspace={session.activeWorkspace}
+            entries={showingNewSession ? [] : session.entries}
+            running={showingNewSession ? false : session.running}
+            workspace={selectedWorkspace}
           />
           <div className="relative z-20 shrink-0">
-            <ApprovalPanel
-              approvals={session.approvals}
-              drafts={session.drafts}
-              onDraft={session.draftCall}
-              onSubmit={session.submitApprovals}
-              onAllowPattern={session.addAllowPattern}
-            />
+            {showingNewSession ? null : (
+              <ApprovalPanel
+                approvals={session.approvals}
+                drafts={session.drafts}
+                onDraft={session.draftCall}
+                onSubmit={session.submitApprovals}
+                onAllowPattern={session.addAllowPattern}
+              />
+            )}
             <Composer
-              status={session.status}
-              running={session.running}
-              workspace={session.activeWorkspace}
+              status={
+                showingNewSession
+                  ? selectedServerState?.status ?? "idle"
+                  : session.status
+              }
+              running={showingNewSession ? false : session.running}
+              server={selectedServerUrl}
+              servers={session.servers}
+              workspace={selectedWorkspace}
               workspaces={workspaceIds}
-              onChangeWorkspace={(workspaceId) => {
-                if (session.activeServer) {
-                  session.newSession(session.activeServer, workspaceId);
-                }
-              }}
-              onSend={session.sendTask}
+              selectingTarget={showingNewSession}
+              onChangeServer={changeNewSessionServer}
+              onChangeWorkspace={changeWorkspace}
+              onSend={sendTask}
               onAbort={session.abort}
             />
           </div>

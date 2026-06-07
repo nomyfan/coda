@@ -1074,6 +1074,30 @@ export function useCodaSession() {
     [send, currentActive],
   );
 
+  const sendTaskToNewSession = useCallback(
+    (server: string, workspaceId: string, task: string) => {
+      const workspace = workspaceId.trim();
+      const text = task.trim();
+      if (!server || !workspace || !text) {
+        return;
+      }
+      const current = stateRef.current.servers[server];
+      const reusable = current
+        ? Object.values(current.sessions).find(
+            (session) => session.draft && session.workspaceId === workspace && session.entries.length === 0,
+          )
+        : undefined;
+      const sessionId = reusable?.sessionId ?? freshSessionId();
+      const key = sessionKey(workspace, sessionId);
+      dispatch({ type: "new_session", server, workspaceId: workspace, sessionId });
+      send(server, { type: "open_session", workspace_id: workspace, session_id: sessionId });
+      if (send(server, { type: "task", workspace_id: workspace, session_id: sessionId, task: text })) {
+        dispatch({ type: "append_user", server, key, content: text });
+      }
+    },
+    [send],
+  );
+
   const abort = useCallback(() => {
     const active = currentActive();
     if (active) {
@@ -1158,6 +1182,7 @@ export function useCodaSession() {
     openSession,
     deleteSession,
     sendTask,
+    sendTaskToNewSession,
     abort,
     addAllowPattern,
     draftCall,
