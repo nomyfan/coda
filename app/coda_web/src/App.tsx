@@ -834,6 +834,17 @@ function EntryIcon({ entry }: { entry: TranscriptEntry }) {
   return <Icon className="size-4 shrink-0 text-muted-foreground" />;
 }
 
+function EntryDetail({ entry }: { entry: TranscriptEntry }) {
+  if (!entry.detail) {
+    return null;
+  }
+  return (
+    <span className="truncate font-mono text-xs text-muted-foreground">
+      {entry.detail}
+    </span>
+  );
+}
+
 function EntryStatus({ entry }: { entry: TranscriptEntry }) {
   return (
     <>
@@ -944,7 +955,8 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
         >
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <EntryIcon entry={entry} />
-            <span className="truncate text-sm">{title}</span>
+            <span className="shrink-0 truncate text-sm">{title}</span>
+            <EntryDetail entry={entry} />
           </div>
           <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
             <div className="flex justify-end">
@@ -1015,7 +1027,8 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
     <div className="mb-2 flex items-center justify-between gap-3">
       <div className="flex min-w-0 items-center gap-2">
         <EntryIcon entry={entry} />
-        <span className="truncate text-sm font-medium">{title}</span>
+        <span className="shrink-0 truncate text-sm font-medium">{title}</span>
+        <EntryDetail entry={entry} />
         {entry.agentName && entry.agentName !== "coda" ? (
           <Badge variant="cyan">sub-agent</Badge>
         ) : null}
@@ -1033,7 +1046,8 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <EntryIcon entry={entry} />
-              <span className="truncate text-sm font-medium">{title}</span>
+              <span className="shrink-0 truncate text-sm font-medium">{title}</span>
+              <EntryDetail entry={entry} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <EntryStatus entry={entry} />

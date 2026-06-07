@@ -187,6 +187,54 @@ export function extractShellCommand(call: ToolCall): string {
   return "";
 }
 
+function basename(p: string): string {
+  const trimmed = p.replace(/[/\\]+$/, "");
+  const segment = trimmed.split(/[/\\]/).pop() ?? "";
+  return segment || trimmed;
+}
+
+/**
+ * A short, human-readable summary of what a built-in tool is acting on — the
+ * file basename for filesystem tools, the command for `shell`, the pattern for
+ * search tools. Returns undefined when there's nothing useful to surface.
+ */
+export function describeTool(
+  name: string,
+  argumentsJson: string | null | undefined
+): string | undefined {
+  let args: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(argumentsJson?.trim() || "{}");
+    if (parsed && typeof parsed === "object") {
+      args = parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  const str = (value: unknown) =>
+    typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+  switch (name) {
+    case "shell":
+      return str(args.command);
+    case "read_file":
+    case "write_file":
+    case "edit_file": {
+      const path = str(args.file_path);
+      return path ? basename(path) : undefined;
+    }
+    case "ls": {
+      const path = str(args.path);
+      return path ? basename(path) : undefined;
+    }
+    case "glob":
+    case "grep":
+      return str(args.pattern);
+    default:
+      return undefined;
+  }
+}
+
 export function deriveAllowPattern(command: string): string {
   const firstToken = command.trim().split(/\s+/)[0] ?? "";
   return /\s/.test(command.trim()) ? `${firstToken} *` : firstToken;

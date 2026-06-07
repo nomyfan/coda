@@ -12,6 +12,7 @@ import {
   type WireEvent,
   type WorkspaceSummary,
   callArguments,
+  describeTool,
   outcomeText,
   outputText,
 } from "./protocol";
@@ -26,6 +27,8 @@ export type TranscriptEntry = {
   agentName?: string;
   threadId?: string;
   title?: string;
+  /** Short summary of what a tool acts on (file basename, shell command, …). */
+  detail?: string;
   content: string;
   status?: string;
   usage?: CompletionUsage | null;
@@ -256,7 +259,26 @@ function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): 
   };
 }
 
-function historyToEntry(message: HistoryMessage, index: number): TranscriptEntry | null {
+/** Tool call arguments keyed by call id, harvested from Assistant messages. */
+function collectToolArgs(
+  messages: HistoryMessage[]
+): Record<string, string | null | undefined> {
+  const map: Record<string, string | null | undefined> = {};
+  for (const message of messages) {
+    if ("Assistant" in message) {
+      for (const call of message.Assistant.tool_calls) {
+        map[call.id] = call.arguments;
+      }
+    }
+  }
+  return map;
+}
+
+function historyToEntry(
+  message: HistoryMessage,
+  index: number,
+  argsById: Record<string, string | null | undefined> = {}
+): TranscriptEntry | null {
   if ("System" in message) {
     return null;
   }
@@ -282,17 +304,26 @@ function historyToEntry(message: HistoryMessage, index: number): TranscriptEntry
     };
   }
   if ("Tool" in message) {
-    return toolMessageToEntry(message.Tool, `history:tool:${index}`);
+    return toolMessageToEntry(
+      message.Tool,
+      `history:tool:${index}`,
+      describeTool(message.Tool.name, argsById[message.Tool.id])
+    );
   }
   return null;
 }
 
-function toolMessageToEntry(message: ToolMessage, id = newId("tool-result")): TranscriptEntry {
+function toolMessageToEntry(
+  message: ToolMessage,
+  id = newId("tool-result"),
+  detail?: string
+): TranscriptEntry {
   return {
     id,
     kind: "tool_result",
     callId: message.id,
     title: message.name,
+    detail,
     content: outputText(message.output),
     status: outcomeText(message.outcome),
   };
@@ -307,8 +338,10 @@ function finishToolEntry(session: OpenedSession, event: Extract<WireEvent, { typ
     };
   }
   const entries = [...session.entries];
+  // Carry over the detail derived from the call arguments at tool_start; the
+  // tool_end message itself doesn't include them.
   entries[index] = {
-    ...toolMessageToEntry(event.message, entries[index].id),
+    ...toolMessageToEntry(event.message, entries[index].id, entries[index].detail),
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
@@ -454,6 +487,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             threadId: event.thread_id,
             callId: event.call.id,
             title: event.call.name,
+            detail: describeTool(event.call.name, event.call.arguments),
             content: callArguments(event.call),
             status: "running",
           },
@@ -691,8 +725,9 @@ function reducer(state: CodaState, action: Action): CodaState {
     }
     case "snapshot": {
       const key = sessionKey(action.workspaceId, action.sessionId);
+      const argsById = collectToolArgs(action.messages);
       const mapped = action.messages
-        .map(historyToEntry)
+        .map((message, index) => historyToEntry(message, index, argsById))
         .filter((entry): entry is TranscriptEntry => Boolean(entry));
       // A brand-new session opened on first send returns an empty history; don't
       // wipe the locally-appended user message / running state in that case.
