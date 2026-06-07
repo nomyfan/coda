@@ -12,7 +12,7 @@ Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (s
 
 ## Frontend UI
 
-When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first (for example, `pnpm dlx shadcn@latest add collapsible`), then adapt the generated component to the local UI.
+When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first using `npx` (for example, `npx shadcn@latest add radio-group`) — not `pnpm dlx` — then adapt the generated component to the local UI.
 
 ## Architecture
 

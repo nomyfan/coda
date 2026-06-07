@@ -2,6 +2,7 @@ import {
   Ban,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleStop,
   Command,
@@ -13,7 +14,6 @@ import {
   MessageSquareText,
   PanelLeft,
   Pencil,
-  Play,
   Plus,
   PlugZap,
   RotateCcw,
@@ -42,6 +42,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -51,6 +53,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  approvalKey,
   callArguments,
   deriveAllowPattern,
   extractShellCommand,
@@ -242,7 +245,10 @@ function SessionRow({
         onClick={() => onOpen(serverUrl, workspaceId, session.id)}
       >
         {awaitingApproval ? (
-          <span className="flex size-4 shrink-0 items-center justify-center" title="Awaiting approval">
+          <span
+            className="flex size-4 shrink-0 items-center justify-center"
+            title="Awaiting approval"
+          >
             <span className="size-2.5 animate-pulse rounded-full bg-amber-500" />
           </span>
         ) : running ? (
@@ -250,7 +256,9 @@ function SessionRow({
         ) : (
           <MessageSquareText className="size-4 shrink-0 text-muted-foreground" />
         )}
-        <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
+        <span className="min-w-0 flex-1 truncate text-sm">
+          {sessionTitle(session)}
+        </span>
       </Button>
       {confirming ? (
         <>
@@ -599,7 +607,7 @@ function Sidebar({
     <aside
       className={cn(
         "flex min-h-0 w-full flex-col gap-2 border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
-        collapsed && "lg:w-12",
+        collapsed && "lg:w-12"
       )}
     >
       <div className="flex items-center justify-between pl-1">
@@ -644,7 +652,7 @@ function Sidebar({
       {collapsed ? (
         <div className="min-h-0 flex-1" />
       ) : (
-        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md border bg-background/70 p-1.5">
+        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5">
           {servers.length === 0 ? (
             <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
               <div className="text-sm font-medium">No servers</div>
@@ -713,7 +721,7 @@ function lastAssistantIndex(entries: TranscriptEntry[]) {
 
 function hasToolWork(entries: TranscriptEntry[]) {
   return entries.some(
-    (entry) => entry.kind === "tool_call" || entry.kind === "tool_result",
+    (entry) => entry.kind === "tool_call" || entry.kind === "tool_result"
   );
 }
 
@@ -725,7 +733,9 @@ function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
   };
 }
 
-function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
+function transcriptRenderItems(
+  entries: TranscriptEntry[]
+): TranscriptRenderItem[] {
   const items: TranscriptRenderItem[] = [];
   let index = 0;
 
@@ -744,7 +754,9 @@ function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem
 
     const segment = entries.slice(start, index);
     if (!hasToolWork(segment)) {
-      items.push(...segment.map((entry) => ({ type: "entry" as const, entry })));
+      items.push(
+        ...segment.map((entry) => ({ type: "entry" as const, entry }))
+      );
       continue;
     }
 
@@ -788,13 +800,13 @@ function Transcript({
             </p>
           </div>
         ) : (
-          renderItems.map((item) => (
+          renderItems.map((item) =>
             item.type === "entry" ? (
               <TranscriptItem key={item.entry.id} entry={item.entry} />
             ) : (
               <AssistantTurnBubble key={item.id} entries={item.entries} />
             )
-          ))
+          )
         )}
         {running ? <WorkingIndicator /> : null}
         <div ref={bottomRef} />
@@ -897,19 +909,20 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
         </div>
       </div>
       <div className="space-y-3">
-        {intermediateEntries.map((entry) => (
+        {intermediateEntries.map((entry) =>
           entry.kind === "assistant" ? (
             <Markdown key={entry.id}>{entry.content}</Markdown>
           ) : (
             <TranscriptDisclosure key={entry.id} entry={entry} />
           )
-        ))}
-        {finalAssistant ? (
-          <Markdown>{finalAssistant.content}</Markdown>
-        ) : null}
+        )}
+        {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
         {finalAssistant ? (
           <div className="flex justify-start">
-            <CopyContentButton content={finalAssistant.content} label="response" />
+            <CopyContentButton
+              content={finalAssistant.content}
+              label="response"
+            />
           </div>
         ) : null}
       </div>
@@ -1107,7 +1120,7 @@ function Composer({
 
   return (
     <form
-      className="border-t bg-background/95 p-3 backdrop-blur"
+      className="bg-background/95 p-3 backdrop-blur"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -1179,44 +1192,134 @@ function Composer({
   );
 }
 
+type ApprovalItem = { approval: PendingApproval; call: ToolCall };
+
+function DecisionRadio({
+  value,
+  selected,
+  label,
+}: {
+  value: string;
+  selected: boolean;
+  label: string;
+}) {
+  return (
+    <Label
+      className={cn(
+        "cursor-pointer rounded-md border px-3 py-2 transition-colors",
+        selected ? "border-primary bg-accent" : "border-input hover:bg-accent"
+      )}
+    >
+      <RadioGroupItem value={value} />
+      {label}
+    </Label>
+  );
+}
+
 function ApprovalPanel({
   approvals,
-  onResolve,
+  drafts,
+  onDraft,
+  onSubmit,
   onAllowPattern,
 }: {
   approvals: PendingApproval[];
-  onResolve: (
+  drafts: Record<string, Record<string, ToolCallResolution>>;
+  onDraft: (
     approval: PendingApproval,
     call: ToolCall,
     resolution: ToolCallResolution
   ) => void;
+  onSubmit: () => void;
   onAllowPattern: (pattern: string) => void;
 }) {
-  if (approvals.length === 0) {
+  const items: ApprovalItem[] = approvals.flatMap((approval) =>
+    approval.calls.map((call) => ({ approval, call }))
+  );
+  const [index, setIndex] = useState(0);
+
+  // Reset to the first item whenever the pending set itself changes (a new
+  // batch arrives) — but keep position while the user works through a batch.
+  const itemsKey = items
+    .map((item) => `${item.approval.thread_id}:${item.call.id}`)
+    .join("|");
+  const prevKey = useRef(itemsKey);
+  useEffect(() => {
+    if (prevKey.current !== itemsKey) {
+      prevKey.current = itemsKey;
+      setIndex(0);
+    }
+  }, [itemsKey]);
+
+  if (items.length === 0) {
     return null;
   }
+
+  const decisionOf = (item: ApprovalItem) =>
+    drafts[approvalKey(item.approval)]?.[item.call.id];
+  const current = items[Math.min(index, items.length - 1)] ?? items[0];
+  const currentIndex = items.indexOf(current);
+  const decidedCount = items.filter((item) => decisionOf(item)).length;
+  const allDecided = decidedCount === items.length;
+
+  const handleDraft = (resolution: ToolCallResolution) => {
+    onDraft(current.approval, current.call, resolution);
+    // Approving needs no follow-up, so jump ahead; rejecting stays put so the
+    // user can fill in a reason.
+    if (resolution === "Execute" && currentIndex < items.length - 1) {
+      setIndex(currentIndex + 1);
+    }
+  };
+
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-full px-4">
       <div className="pointer-events-auto mx-auto w-full max-w-4xl overflow-hidden rounded-t-lg border border-b-0 border-amber-500/50 bg-card shadow-lg ring-1 ring-amber-500/10">
-        <div className="scrollbar-fine max-h-[60vh] space-y-2.5 overflow-y-auto bg-amber-500/5 px-4 py-2.5">
-          <div className="flex items-center justify-between">
+        <div className="flex max-h-[60vh] flex-col bg-amber-500/5">
+          <div className="flex items-center justify-between px-4 pt-2.5">
             <h2 className="flex items-center gap-2 text-sm font-medium">
               <ShieldCheck className="size-4 text-amber-600" />
               Approval required
             </h2>
-            <Badge variant="warning">{approvals.length}</Badge>
+            <Badge variant="warning">
+              {decidedCount}/{items.length} reviewed
+            </Badge>
           </div>
-          {approvals.flatMap((approval) =>
-            approval.calls.map((call) => (
-              <ApprovalCall
-                key={`${approval.thread_id}:${call.id}`}
-                approval={approval}
-                call={call}
-                onResolve={onResolve}
-                onAllowPattern={onAllowPattern}
-              />
-            ))
-          )}
+          <div className="scrollbar-fine overflow-y-auto px-4 py-2.5">
+            <ApprovalCall
+              key={`${current.approval.thread_id}:${current.call.id}`}
+              call={current.call}
+              decision={decisionOf(current)}
+              onDraft={handleDraft}
+              onAllowPattern={onAllowPattern}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-2 border-t border-amber-500/20 px-4 py-2">
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={currentIndex === 0}
+                onClick={() => setIndex(currentIndex - 1)}
+              >
+                <ChevronLeft />
+              </Button>
+              <span className="min-w-12 text-center text-xs tabular-nums text-muted-foreground">
+                {currentIndex + 1} / {items.length}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={currentIndex >= items.length - 1}
+                onClick={() => setIndex(currentIndex + 1)}
+              >
+                <ChevronRight />
+              </Button>
+            </div>
+            <Button disabled={!allDecided} onClick={onSubmit}>
+              <Check />
+              Submit {decidedCount}/{items.length}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -1224,28 +1327,36 @@ function ApprovalPanel({
 }
 
 function ApprovalCall({
-  approval,
   call,
-  onResolve,
+  decision,
+  onDraft,
   onAllowPattern,
 }: {
-  approval: PendingApproval;
   call: ToolCall;
-  onResolve: (
-    approval: PendingApproval,
-    call: ToolCall,
-    resolution: ToolCallResolution
-  ) => void;
+  decision: ToolCallResolution | undefined;
+  onDraft: (resolution: ToolCallResolution) => void;
   onAllowPattern: (pattern: string) => void;
 }) {
-  const [reason, setReason] = useState("");
+  const [reason, setReason] = useState(() =>
+    decision && decision !== "Execute" && "Rejected" in decision
+      ? decision.Rejected.reason ?? ""
+      : ""
+  );
   const [answer, setAnswer] = useState("");
   const [allowPattern, setAllowPattern] = useState(() =>
     deriveAllowPattern(extractShellCommand(call))
   );
   const askUser = call.name === "ask_user" ? parseAskUserParams(call) : null;
+  const approved = decision === "Execute";
+  const rejected = Boolean(decision && decision !== "Execute" && "Rejected" in decision);
 
   if (askUser) {
+    const chosen =
+      decision && decision !== "Execute" && "Resolved" in decision
+        ? "Ok" in decision.Resolved
+          ? decision.Resolved.Ok
+          : null
+        : null;
     return (
       <div className="space-y-3 rounded-md border bg-background p-3">
         <div className="flex items-center gap-2 text-sm font-medium">
@@ -1258,11 +1369,9 @@ function ApprovalCall({
             {askUser.options.map((option) => (
               <Button
                 key={option}
-                variant="outline"
+                variant={chosen === option ? "secondary" : "outline"}
                 className="h-auto justify-start whitespace-normal py-2 text-left"
-                onClick={() =>
-                  onResolve(approval, call, { Resolved: { Ok: option } })
-                }
+                onClick={() => onDraft({ Resolved: { Ok: option } })}
               >
                 {option}
               </Button>
@@ -1279,12 +1388,10 @@ function ApprovalCall({
             variant="secondary"
             className="w-full"
             disabled={!answer.trim()}
-            onClick={() =>
-              onResolve(approval, call, { Resolved: { Ok: answer.trim() } })
-            }
+            onClick={() => onDraft({ Resolved: { Ok: answer.trim() } })}
           >
             <Check />
-            Submit
+            Use this response
           </Button>
         </div>
       </div>
@@ -1293,14 +1400,9 @@ function ApprovalCall({
 
   return (
     <div className="space-y-3 rounded-md border bg-background p-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-          <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
-          <span className="truncate">{call.name}</span>
-        </div>
-        <Badge variant={call.name === "shell" ? "warning" : "outline"}>
-          {call.name === "shell" ? "shell" : "tool"}
-        </Badge>
+      <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+        <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
+        <span className="truncate">{call.name}</span>
       </div>
       <pre className="max-h-44 overflow-auto rounded-md bg-muted p-3 text-xs leading-5 text-muted-foreground">
         {formatArguments(callArguments(call))}
@@ -1315,7 +1417,7 @@ function ApprovalCall({
             variant="outline"
             onClick={() => {
               onAllowPattern(allowPattern);
-              onResolve(approval, call, "Execute");
+              onDraft("Execute");
             }}
           >
             <ShieldCheck />
@@ -1323,30 +1425,29 @@ function ApprovalCall({
           </Button>
         </div>
       ) : null}
-      <div className="grid grid-cols-2 gap-2">
-        <Button
-          variant="secondary"
-          onClick={() => onResolve(approval, call, "Execute")}
-        >
-          <Play />
-          Run
-        </Button>
-        <Button
-          variant="outline"
-          onClick={() =>
-            onResolve(approval, call, {
-              Rejected: { reason: reason.trim() ? reason.trim() : null },
-            })
+      <RadioGroup
+        value={approved ? "run" : rejected ? "reject" : ""}
+        onValueChange={(value) => {
+          if (value === "run") {
+            onDraft("Execute");
+          } else if (value === "reject") {
+            onDraft({ Rejected: { reason: reason.trim() ? reason.trim() : null } });
           }
-        >
-          <X />
-          Reject
-        </Button>
-      </div>
+        }}
+        className="grid grid-cols-2 gap-2"
+      >
+        <DecisionRadio value="run" selected={approved} label="Approve" />
+        <DecisionRadio value="reject" selected={rejected} label="Reject" />
+      </RadioGroup>
       <Input
         value={reason}
-        onChange={(event) => setReason(event.target.value)}
-        placeholder="Rejection reason"
+        disabled={!rejected}
+        onChange={(event) => {
+          const value = event.target.value;
+          setReason(value);
+          onDraft({ Rejected: { reason: value.trim() ? value.trim() : null } });
+        }}
+        placeholder="Rejection reason (optional)"
       />
     </div>
   );
@@ -1385,7 +1486,9 @@ export default function App() {
           <div className="relative z-20 shrink-0">
             <ApprovalPanel
               approvals={session.approvals}
-              onResolve={session.resolveCall}
+              drafts={session.drafts}
+              onDraft={session.draftCall}
+              onSubmit={session.submitApprovals}
               onAllowPattern={session.addAllowPattern}
             />
             <Composer

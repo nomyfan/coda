@@ -1061,22 +1061,28 @@ export function useCodaSession() {
     [send, currentActive],
   );
 
-  const resolveCall = useCallback(
+  const draftCall = useCallback(
     (approval: PendingApproval, call: ToolCall, resolution: ToolCallResolution) => {
       const active = currentActive();
       if (!active) {
         return;
       }
       dispatch({ type: "draft_resolution", server: active.server, key: active.session.key, approval, call, resolution });
+    },
+    [currentActive],
+  );
 
-      const key = approvalKey(approval);
-      const current = active.session.drafts[key] ?? {};
-      const nextDraft = { ...current, [call.id]: resolution };
-      const complete = approval.calls.every((item) => nextDraft[item.id]);
+  const submitApprovals = useCallback(() => {
+    const active = currentActive();
+    if (!active) {
+      return;
+    }
+    for (const approval of active.session.approvals) {
+      const draft = active.session.drafts[approvalKey(approval)] ?? {};
+      const complete = approval.calls.every((item) => draft[item.id]);
       if (!complete) {
-        return;
+        continue;
       }
-
       send(active.server, {
         type: "resume",
         workspace_id: active.session.workspaceId,
@@ -1084,13 +1090,12 @@ export function useCodaSession() {
         agent_name: approval.agent_name,
         thread_id: approval.thread_id,
         decision: {
-          resolutions: approval.calls.map((item) => [item.id, nextDraft[item.id]]),
+          resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
         },
       });
       dispatch({ type: "clear_approval", server: active.server, key: active.session.key, approval });
-    },
-    [send, currentActive],
-  );
+    }
+  }, [send, currentActive]);
 
   const activeServerState = state.activeServer ? state.servers[state.activeServer] : undefined;
   const activeSession = activeServerState && state.activeKey ? activeServerState.sessions[state.activeKey] : undefined;
@@ -1108,6 +1113,7 @@ export function useCodaSession() {
     entries: activeSession?.entries ?? [],
     activity: activeSession?.activity ?? [],
     approvals: activeSession?.approvals ?? [],
+    drafts: activeSession?.drafts ?? {},
     running: activeSession?.running ?? false,
     connectServer,
     disconnectServer,
@@ -1119,6 +1125,7 @@ export function useCodaSession() {
     sendTask,
     abort,
     addAllowPattern,
-    resolveCall,
+    draftCall,
+    submitApprovals,
   };
 }
