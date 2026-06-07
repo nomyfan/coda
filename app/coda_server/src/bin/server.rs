@@ -100,7 +100,9 @@ async fn open_session(
         max_completion_tokens: Some(5000),
         temperature: Some(0.7),
         tool_approval: workspace.approval_config.clone().into_approval_mode(),
-        approval_timeout: Some(Duration::from_secs(300)),
+        // Disabled: approvals never auto-reject; a pending ask_user/tool call
+        // waits indefinitely until the user resolves it.
+        approval_timeout: None,
     };
 
     Session::builder()

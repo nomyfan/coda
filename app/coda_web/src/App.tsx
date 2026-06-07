@@ -5,11 +5,13 @@ import {
   ChevronRight,
   CircleStop,
   Command,
+  Copy,
   Cpu,
   Folder,
   KeyRound,
   Loader2,
   MessageSquareText,
+  PanelLeft,
   Pencil,
   Play,
   Plus,
@@ -20,11 +22,25 @@ import {
   Sparkles,
   TerminalSquare,
   Trash2,
+  Unplug,
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -117,14 +133,17 @@ function StatusDot({ status }: { status: ConnectionStatus }) {
   );
 }
 
-function AddServerRow({
+function AddServerDialog({
+  open,
+  onOpenChange,
   onConnect,
-  onCancel,
 }: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onConnect: (serverUrl: string) => void;
-  onCancel?: () => void;
 }) {
-  const [url, setUrl] = useState("ws://127.0.0.1:3000");
+  const defaultUrl = "ws://127.0.0.1:3000";
+  const [url, setUrl] = useState(defaultUrl);
 
   function commit() {
     const value = url.trim();
@@ -132,47 +151,62 @@ function AddServerRow({
       return;
     }
     onConnect(value);
-    setUrl("ws://127.0.0.1:3000");
+    setUrl(defaultUrl);
+    onOpenChange(false);
   }
 
   return (
-    <div className="flex items-center gap-2 px-1 py-1">
-      <Input
-        autoFocus
-        value={url}
-        onChange={(event) => setUrl(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen);
+        if (!nextOpen) {
+          setUrl(defaultUrl);
+        }
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Add server</DialogTitle>
+          <DialogDescription>
+            Connect to a running Coda server by URL.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
             event.preventDefault();
             commit();
-          } else if (event.key === "Escape") {
-            onCancel?.();
-          }
-        }}
-        placeholder="ws://127.0.0.1:3000"
-        className="h-8"
-      />
-      <Button
-        size="icon"
-        className="size-8 shrink-0"
-        onClick={commit}
-        disabled={!url.trim()}
-        title="Connect"
-      >
-        <PlugZap />
-      </Button>
-      {onCancel ? (
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0"
-          onClick={onCancel}
-          title="Cancel"
+          }}
         >
-          <X />
-        </Button>
-      ) : null}
-    </div>
+          <div className="space-y-2">
+            <label htmlFor="server-url" className="text-sm font-medium">
+              Server URL
+            </label>
+            <Input
+              id="server-url"
+              autoFocus
+              value={url}
+              onChange={(event) => setUrl(event.target.value)}
+              placeholder={defaultUrl}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={!url.trim()}>
+              <PlugZap className="size-4" />
+              Connect
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -359,6 +393,7 @@ function ServerNode({
   activeServer,
   activeKey,
   onReconnect,
+  onDisconnect,
   onRemove,
   onRename,
   onOpenSession,
@@ -369,6 +404,7 @@ function ServerNode({
   activeServer?: string;
   activeKey?: SessionKey;
   onReconnect: (serverUrl: string) => void;
+  onDisconnect: (serverUrl: string) => void;
   onRemove: (serverUrl: string) => void;
   onRename: (serverUrl: string, alias: string) => void;
   onOpenSession: (
@@ -474,7 +510,17 @@ function ServerNode({
             >
               <RotateCcw className="size-4" />
             </Button>
-          ) : null}
+          ) : (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 shrink-0"
+              onClick={() => onDisconnect(server.url)}
+              title="Disconnect"
+            >
+              <Unplug className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -520,6 +566,7 @@ function Sidebar({
   activeServer,
   activeKey,
   onConnectServer,
+  onDisconnectServer,
   onRemoveServer,
   onRenameServer,
   onOpenSession,
@@ -530,6 +577,7 @@ function Sidebar({
   activeServer?: string;
   activeKey?: SessionKey;
   onConnectServer: (serverUrl: string) => void;
+  onDisconnectServer: (serverUrl: string) => void;
   onRemoveServer: (serverUrl: string) => void;
   onRenameServer: (serverUrl: string, alias: string) => void;
   onOpenSession: (
@@ -545,55 +593,95 @@ function Sidebar({
   ) => void;
 }) {
   const [adding, setAdding] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <aside className="flex min-h-0 w-full flex-col gap-2 border-r bg-card/55 p-2.5 lg:w-[256px]">
+    <aside
+      className={cn(
+        "flex min-h-0 w-full flex-col gap-2 border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
+        collapsed && "lg:w-12",
+      )}
+    >
       <div className="flex items-center justify-between pl-1">
-        <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Servers
-        </h2>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          onClick={() => setAdding(true)}
-          disabled={servers.length === 0}
-          title="Add server"
-        >
-          <Plus className="size-4" />
-        </Button>
-      </div>
-      <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md border bg-background/70 p-1.5">
-        {servers.length === 0 ? (
-          <AddServerRow onConnect={onConnectServer} />
+        {collapsed ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7"
+            onClick={() => setCollapsed(false)}
+            title="Expand servers"
+          >
+            <PanelLeft className="size-4" />
+          </Button>
         ) : (
           <>
-            {adding ? (
-              <AddServerRow
-                onConnect={(url) => {
-                  onConnectServer(url);
-                  setAdding(false);
-                }}
-                onCancel={() => setAdding(false)}
-              />
-            ) : null}
-            {servers.map((server) => (
-              <ServerNode
-                key={server.url}
-                server={server}
-                activeServer={activeServer}
-                activeKey={activeKey}
-                onReconnect={onConnectServer}
-                onRemove={onRemoveServer}
-                onRename={onRenameServer}
-                onOpenSession={onOpenSession}
-                onNewSession={onNewSession}
-                onDeleteSession={onDeleteSession}
-              />
-            ))}
+            <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Servers
+            </h2>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => setAdding(true)}
+                title="Add server"
+              >
+                <Plus className="size-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => setCollapsed(true)}
+                title="Collapse servers"
+              >
+                <PanelLeft className="size-4" />
+              </Button>
+            </div>
           </>
         )}
       </div>
+      {collapsed ? (
+        <div className="min-h-0 flex-1" />
+      ) : (
+        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md border bg-background/70 p-1.5">
+          {servers.length === 0 ? (
+            <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
+              <div className="text-sm font-medium">No servers</div>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Connect to a local or remote Coda server.
+              </p>
+              <Button size="sm" onClick={() => setAdding(true)}>
+                <Plus className="size-4" />
+                Add server
+              </Button>
+            </div>
+          ) : (
+            <>
+              {servers.map((server) => (
+                <ServerNode
+                  key={server.url}
+                  server={server}
+                  activeServer={activeServer}
+                  activeKey={activeKey}
+                  onReconnect={onConnectServer}
+                  onDisconnect={onDisconnectServer}
+                  onRemove={onRemoveServer}
+                  onRename={onRenameServer}
+                  onOpenSession={onOpenSession}
+                  onNewSession={onNewSession}
+                  onDeleteSession={onDeleteSession}
+                />
+              ))}
+            </>
+          )}
+        </div>
+      )}
+      <AddServerDialog
+        open={adding}
+        onOpenChange={setAdding}
+        onConnect={onConnectServer}
+      />
     </aside>
   );
 }
@@ -610,6 +698,62 @@ function WorkingIndicator() {
   );
 }
 
+type TranscriptRenderItem =
+  | { type: "entry"; entry: TranscriptEntry }
+  | { type: "turn"; id: string; entries: TranscriptEntry[] };
+
+function lastAssistantIndex(entries: TranscriptEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index].kind === "assistant") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function hasToolWork(entries: TranscriptEntry[]) {
+  return entries.some(
+    (entry) => entry.kind === "tool_call" || entry.kind === "tool_result",
+  );
+}
+
+function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
+  return {
+    type: "turn",
+    id: entries.map((entry) => entry.id).join(":"),
+    entries,
+  };
+}
+
+function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
+  const items: TranscriptRenderItem[] = [];
+  let index = 0;
+
+  while (index < entries.length) {
+    const entry = entries[index];
+    if (entry.kind === "user") {
+      items.push({ type: "entry", entry });
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (index < entries.length && entries[index].kind !== "user") {
+      index += 1;
+    }
+
+    const segment = entries.slice(start, index);
+    if (!hasToolWork(segment)) {
+      items.push(...segment.map((entry) => ({ type: "entry" as const, entry })));
+      continue;
+    }
+
+    items.push(turnGroup(segment));
+  }
+
+  return items;
+}
+
 function Transcript({
   entries,
   running,
@@ -620,6 +764,7 @@ function Transcript({
   workspace?: string;
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const renderItems = transcriptRenderItems(entries);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
@@ -643,8 +788,12 @@ function Transcript({
             </p>
           </div>
         ) : (
-          entries.map((entry) => (
-            <TranscriptItem key={entry.id} entry={entry} />
+          renderItems.map((item) => (
+            item.type === "entry" ? (
+              <TranscriptItem key={item.entry.id} entry={item.entry} />
+            ) : (
+              <AssistantTurnBubble key={item.id} entries={item.entries} />
+            )
           ))
         )}
         {running ? <WorkingIndicator /> : null}
@@ -654,26 +803,11 @@ function Transcript({
   );
 }
 
-function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
-  if (entry.kind === "user") {
-    return (
-      <div className="flex justify-end">
-        <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
-          <Markdown>{entry.content}</Markdown>
-        </div>
-      </div>
-    );
-  }
+function entryTitle(entry: TranscriptEntry) {
+  return entry.title ?? (entry.agentName ? `${entry.agentName}` : entry.kind);
+}
 
-  const tone =
-    entry.kind === "error"
-      ? "border-rose-500/35 bg-rose-500/10"
-      : entry.kind === "tool_call"
-      ? "border-amber-500/35 bg-amber-500/10"
-      : entry.kind === "tool_result"
-      ? "border-emerald-500/30 bg-emerald-500/10"
-      : "border-border bg-card";
-
+function EntryIcon({ entry }: { entry: TranscriptEntry }) {
   const Icon =
     entry.kind === "assistant"
       ? MessageSquareText
@@ -685,36 +819,255 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
       ? Ban
       : Cpu;
 
+  return <Icon className="size-4 shrink-0 text-muted-foreground" />;
+}
+
+function EntryStatus({ entry }: { entry: TranscriptEntry }) {
   return (
-    <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
-      <div className="mb-2 flex items-center justify-between gap-3">
+    <>
+      {entry.status ? (
+        <Badge variant={entry.status === "running" ? "warning" : "secondary"}>
+          {entry.status}
+        </Badge>
+      ) : null}
+      {entry.usage ? (
+        <Badge variant="outline">
+          {entry.usage.prompt_tokens + entry.usage.completion_tokens} tokens
+        </Badge>
+      ) : null}
+    </>
+  );
+}
+
+function CopyContentButton({
+  content,
+  label = "content",
+}: {
+  content: string;
+  label?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyContent() {
+    await navigator.clipboard.writeText(content);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="quiet"
+      size="icon"
+      className="size-7"
+      title={copied ? "Copied" : `Copy ${label}`}
+      onClick={copyContent}
+    >
+      {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+    </Button>
+  );
+}
+
+function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
+  const lastIndex = lastAssistantIndex(entries);
+  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const finalAssistant =
+    finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
+  const intermediateEntries =
+    finalAssistantIndex >= 0
+      ? entries.filter((_, index) => index !== finalAssistantIndex)
+      : entries;
+  const usage = finalAssistant?.usage;
+
+  return (
+    <article className="rounded-md border border-border bg-card p-3 shadow-sm">
+      <div className="mb-3 flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
-          <Icon className="size-4 shrink-0 text-muted-foreground" />
+          <MessageSquareText className="size-4 shrink-0 text-muted-foreground" />
           <span className="truncate text-sm font-medium">
-            {entry.title ??
-              (entry.agentName ? `${entry.agentName}` : entry.kind)}
+            {finalAssistant?.agentName ?? "coda"}
           </span>
-          {entry.agentName && entry.agentName !== "coda" ? (
-            <Badge variant="cyan">sub-agent</Badge>
-          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {entry.status ? (
-            <Badge
-              variant={entry.status === "running" ? "warning" : "secondary"}
-            >
-              {entry.status}
-            </Badge>
-          ) : null}
-          {entry.usage ? (
+          {usage ? (
             <Badge variant="outline">
-              {entry.usage.prompt_tokens + entry.usage.completion_tokens} tokens
+              {usage.prompt_tokens + usage.completion_tokens} tokens
             </Badge>
           ) : null}
         </div>
       </div>
+      <div className="space-y-3">
+        {intermediateEntries.map((entry) => (
+          entry.kind === "assistant" ? (
+            <Markdown key={entry.id}>{entry.content}</Markdown>
+          ) : (
+            <TranscriptDisclosure key={entry.id} entry={entry} />
+          )
+        ))}
+        {finalAssistant ? (
+          <Markdown>{finalAssistant.content}</Markdown>
+        ) : null}
+        {finalAssistant ? (
+          <div className="flex justify-start">
+            <CopyContentButton content={finalAssistant.content} label="response" />
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
+  const [open, setOpen] = useState(false);
+  const title = disclosureTitle(entry);
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-3 rounded-md py-1 text-left text-muted-foreground hover:text-foreground"
+          title={open ? "Collapse" : "Expand"}
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <EntryIcon entry={entry} />
+            <span className="truncate text-sm">{title}</span>
+          </div>
+          <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
+            <div className="flex justify-end">
+              <EntryStatus entry={entry} />
+            </div>
+            <div className="flex size-7 items-center justify-center">
+              {open ? (
+                <ChevronDown className="size-4" />
+              ) : (
+                <ChevronRight className="size-4" />
+              )}
+            </div>
+          </div>
+        </button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="relative mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/20 p-3">
+          {entry.kind === "tool_result" ? (
+            <div className="sticky top-0 z-10 h-0">
+              <div className="flex justify-end">
+                <CopyContentButton content={entry.content} label="result" />
+              </div>
+            </div>
+          ) : null}
+          {entry.kind === "assistant" ? (
+            <Markdown>{entry.content}</Markdown>
+          ) : (
+            <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+              {entry.content}
+            </pre>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function disclosureTitle(entry: TranscriptEntry) {
+  if (entry.kind === "assistant") {
+    return `${entry.agentName ?? "coda"} message`;
+  }
+  return entryTitle(entry);
+}
+
+function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
+  const [toolResultOpen, setToolResultOpen] = useState(false);
+
+  if (entry.kind === "user") {
+    return (
+      <div className="group flex justify-end gap-1">
+        <div className="pt-1 opacity-0 transition-opacity group-hover:opacity-100">
+          <CopyContentButton content={entry.content} label="message" />
+        </div>
+        <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
+          <Markdown>{entry.content}</Markdown>
+        </div>
+      </div>
+    );
+  }
+
+  const tone =
+    entry.kind === "error"
+      ? "border-rose-500/35 bg-rose-500/10"
+      : "border-border bg-card";
+
+  const title = entryTitle(entry);
+  const header = (
+    <div className="mb-2 flex items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-2">
+        <EntryIcon entry={entry} />
+        <span className="truncate text-sm font-medium">{title}</span>
+        {entry.agentName && entry.agentName !== "coda" ? (
+          <Badge variant="cyan">sub-agent</Badge>
+        ) : null}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <EntryStatus entry={entry} />
+      </div>
+    </div>
+  );
+
+  if (entry.kind === "tool_result") {
+    return (
+      <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+        <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <EntryIcon entry={entry} />
+              <span className="truncate text-sm font-medium">{title}</span>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <EntryStatus entry={entry} />
+              <CollapsibleTrigger asChild>
+                <Button
+                  variant="quiet"
+                  size="sm"
+                  className="h-7 px-2"
+                  title={toolResultOpen ? "Collapse result" : "Expand result"}
+                >
+                  {toolResultOpen ? (
+                    <ChevronDown className="size-4" />
+                  ) : (
+                    <ChevronRight className="size-4" />
+                  )}
+                  <span>{toolResultOpen ? "Collapse" : "Expand"}</span>
+                </Button>
+              </CollapsibleTrigger>
+            </div>
+          </div>
+          <CollapsibleContent>
+            <div className="relative max-h-80 overflow-auto rounded-md border border-border/70 bg-background/70 p-3 md:max-h-96">
+              <div className="sticky top-0 z-10 h-0">
+                <div className="flex justify-end">
+                  <CopyContentButton content={entry.content} label="result" />
+                </div>
+              </div>
+              <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+                {entry.content}
+              </pre>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      </article>
+    );
+  }
+
+  return (
+    <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+      {header}
       {entry.kind === "assistant" ? (
-        <Markdown>{entry.content}</Markdown>
+        <div className="space-y-3">
+          <Markdown>{entry.content}</Markdown>
+          <div className="flex justify-start">
+            <CopyContentButton content={entry.content} label="response" />
+          </div>
+        </div>
       ) : (
         <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6">
           {entry.content}
@@ -723,7 +1076,6 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
     </article>
   );
 }
-
 function Composer({
   status,
   running,
@@ -844,44 +1196,30 @@ function ApprovalPanel({
     return null;
   }
   return (
-    <section className="scrollbar-fine max-h-[44vh] shrink-0 overflow-y-auto border-t border-amber-500/50 bg-amber-500/5 px-4 py-2.5">
-      <div className="mx-auto w-full max-w-4xl space-y-2.5">
-        <div className="flex items-center justify-between">
-          <h2 className="flex items-center gap-2 text-sm font-medium">
-            <ShieldCheck className="size-4 text-amber-600" />
-            Approval required
-          </h2>
-          <Badge variant="warning">{approvals.length}</Badge>
-        </div>
-        {approvals.map((approval) => (
-          <div
-            key={`${approval.agent_name}:${approval.thread_id}`}
-            className="space-y-3 rounded-md border bg-card p-3"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">
-                  {approval.agent_name}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {approval.thread_id}
-                </div>
-              </div>
-              <Badge variant="warning">{approval.calls.length} call(s)</Badge>
-            </div>
-            {approval.calls.map((call) => (
+    <div className="pointer-events-none absolute inset-x-0 bottom-full px-4">
+      <div className="pointer-events-auto mx-auto w-full max-w-4xl overflow-hidden rounded-t-lg border border-b-0 border-amber-500/50 bg-card shadow-lg ring-1 ring-amber-500/10">
+        <div className="scrollbar-fine max-h-[60vh] space-y-2.5 overflow-y-auto bg-amber-500/5 px-4 py-2.5">
+          <div className="flex items-center justify-between">
+            <h2 className="flex items-center gap-2 text-sm font-medium">
+              <ShieldCheck className="size-4 text-amber-600" />
+              Approval required
+            </h2>
+            <Badge variant="warning">{approvals.length}</Badge>
+          </div>
+          {approvals.flatMap((approval) =>
+            approval.calls.map((call) => (
               <ApprovalCall
-                key={call.id}
+                key={`${approval.thread_id}:${call.id}`}
                 approval={approval}
                 call={call}
                 onResolve={onResolve}
                 onAllowPattern={onAllowPattern}
               />
-            ))}
-          </div>
-        ))}
+            ))
+          )}
+        </div>
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -916,7 +1254,7 @@ function ApprovalCall({
         </div>
         <p className="text-sm leading-6">{askUser.question}</p>
         {askUser.options.length ? (
-          <div className="grid gap-2">
+          <div className="scrollbar-fine grid max-h-52 gap-2 overflow-y-auto">
             {askUser.options.map((option) => (
               <Button
                 key={option}
@@ -926,13 +1264,12 @@ function ApprovalCall({
                   onResolve(approval, call, { Resolved: { Ok: option } })
                 }
               >
-                <ChevronRight />
                 {option}
               </Button>
             ))}
           </div>
         ) : null}
-        <div className="space-y-2">
+        <div className="space-y-2 border-t pt-3">
           <Textarea
             value={answer}
             onChange={(event) => setAnswer(event.target.value)}
@@ -1032,6 +1369,7 @@ export default function App() {
           activeServer={session.activeServer}
           activeKey={session.activeKey}
           onConnectServer={session.connectServer}
+          onDisconnectServer={session.disconnectServer}
           onRemoveServer={session.removeServer}
           onRenameServer={session.renameServer}
           onOpenSession={session.openSession}
@@ -1044,24 +1382,26 @@ export default function App() {
             running={session.running}
             workspace={session.activeWorkspace}
           />
-          <ApprovalPanel
-            approvals={session.approvals}
-            onResolve={session.resolveCall}
-            onAllowPattern={session.addAllowPattern}
-          />
-          <Composer
-            status={session.status}
-            running={session.running}
-            workspace={session.activeWorkspace}
-            workspaces={workspaceIds}
-            onChangeWorkspace={(workspaceId) => {
-              if (session.activeServer) {
-                session.newSession(session.activeServer, workspaceId);
-              }
-            }}
-            onSend={session.sendTask}
-            onAbort={session.abort}
-          />
+          <div className="relative z-20 shrink-0">
+            <ApprovalPanel
+              approvals={session.approvals}
+              onResolve={session.resolveCall}
+              onAllowPattern={session.addAllowPattern}
+            />
+            <Composer
+              status={session.status}
+              running={session.running}
+              workspace={session.activeWorkspace}
+              workspaces={workspaceIds}
+              onChangeWorkspace={(workspaceId) => {
+                if (session.activeServer) {
+                  session.newSession(session.activeServer, workspaceId);
+                }
+              }}
+              onSend={session.sendTask}
+              onAbort={session.abort}
+            />
+          </div>
         </section>
       </main>
     </div>

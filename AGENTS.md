@@ -10,6 +10,10 @@ This project is in active development. Breaking changes to APIs, serialization f
 
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `sh`.
 
+## Frontend UI
+
+When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first (for example, `pnpm dlx shadcn@latest add collapsible`), then adapt the generated component to the local UI.
+
 ## Architecture
 
 Cargo workspace implementing an AI Agent:

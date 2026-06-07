@@ -30,6 +30,7 @@ export type TranscriptEntry = {
   status?: string;
   usage?: CompletionUsage | null;
   liveKey?: string;
+  callId?: string;
 };
 
 export type ActivityEntry = {
@@ -268,14 +269,14 @@ function historyToEntry(message: HistoryMessage, index: number): TranscriptEntry
   }
   if ("Assistant" in message) {
     const assistant = message.Assistant;
-    if (!assistant.content && assistant.tool_calls.length === 0) {
+    if (!assistant.content) {
       return null;
     }
     return {
       id: `history:assistant:${index}`,
       kind: "assistant",
       agentName: rootName,
-      content: assistant.content || `${assistant.tool_calls.length} tool call(s) requested`,
+      content: assistant.content,
       usage: assistant.usage,
       status: assistant.aborted ? "aborted" : undefined,
     };
@@ -290,10 +291,28 @@ function toolMessageToEntry(message: ToolMessage, id = newId("tool-result")): Tr
   return {
     id,
     kind: "tool_result",
+    callId: message.id,
     title: message.name,
     content: outputText(message.output),
     status: outcomeText(message.outcome),
   };
+}
+
+function finishToolEntry(session: OpenedSession, event: Extract<WireEvent, { type: "tool_end" }>): OpenedSession {
+  const index = session.entries.findIndex((entry) => entry.callId === event.message.id);
+  if (index < 0) {
+    return {
+      ...session,
+      entries: [...session.entries, toolMessageToEntry(event.message)],
+    };
+  }
+  const entries = [...session.entries];
+  entries[index] = {
+    ...toolMessageToEntry(event.message, entries[index].id),
+    agentName: event.agent_name,
+    threadId: event.thread_id,
+  };
+  return { ...session, entries };
 }
 
 function addOrUpdateAssistantChunk(
@@ -433,6 +452,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             kind: "tool_call",
             agentName: event.agent_name,
             threadId: event.thread_id,
+            callId: event.call.id,
             title: event.call.name,
             content: callArguments(event.call),
             status: "running",
@@ -441,12 +461,11 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       };
     case "tool_end":
       return {
-        ...addActivity(session, {
+        ...addActivity(finishToolEntry(session, event), {
           tone: "success",
           label: "tool finished",
           detail: event.message.name,
         }),
-        entries: [...session.entries, toolMessageToEntry(event.message)],
       };
     case "suspended":
       return {
@@ -893,6 +912,16 @@ export function useCodaSession() {
     dispatch({ type: "remove_server", server });
   }, []);
 
+  const disconnectServer = useCallback((rawUrl: string) => {
+    const server = rawUrl.trim();
+    if (!server) {
+      return;
+    }
+    wsMapRef.current[server]?.close();
+    delete wsMapRef.current[server];
+    dispatch({ type: "closed", server });
+  }, []);
+
   const renameServer = useCallback((rawUrl: string, rawAlias: string) => {
     const server = rawUrl.trim();
     if (!server) {
@@ -1081,6 +1110,7 @@ export function useCodaSession() {
     approvals: activeSession?.approvals ?? [],
     running: activeSession?.running ?? false,
     connectServer,
+    disconnectServer,
     removeServer,
     renameServer,
     newSession,
