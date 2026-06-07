@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect } from "react";
+import { createStore, type StoreApi } from "zustand/vanilla";
+import { useStore } from "zustand";
 import {
   approvalKey,
   type ClientMessage,
@@ -16,10 +18,16 @@ import {
   outcomeText,
   outputText,
 } from "./protocol";
+import { useImmutableRef } from "@callcc/toolkit-js/react/useImmutableRef";
 
 export type { WorkspaceSession, WorkspaceSummary } from "./protocol";
 
-export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | "error";
+export type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "closed"
+  | "error";
 
 export type TranscriptEntry = {
   id: string;
@@ -81,46 +89,25 @@ type CodaState = {
   activeKey?: SessionKey;
 };
 
-type Action =
-  | { type: "connecting"; server: string; alias?: string }
-  | { type: "set_alias"; server: string; alias?: string }
-  | { type: "connected"; server: string }
-  | { type: "closed"; server: string }
-  | { type: "error"; server: string; error: string }
-  | { type: "remove_server"; server: string }
-  | { type: "catalog"; server: string; workspaces: WorkspaceSummary[] }
-  | { type: "new_session"; server: string; workspaceId: string; sessionId: string }
-  | { type: "delete_session"; server: string; key: SessionKey }
-  | { type: "select"; server: string; workspaceId: string; sessionId: string }
-  | {
-      type: "snapshot";
-      server: string;
-      workspaceId: string;
-      sessionId: string;
-      messages: HistoryMessage[];
-      approvals: PendingApproval[];
-    }
-  | { type: "event"; server: string; workspaceId: string; sessionId: string; event: WireEvent }
-  | { type: "allow_result"; server: string; workspaceId: string; pattern: string; error?: string | null }
-  | { type: "append_user"; server: string; key: SessionKey; content: string }
-  | {
-      type: "draft_resolution";
-      server: string;
-      key: SessionKey;
-      approval: PendingApproval;
-      call: ToolCall;
-      resolution: ToolCallResolution;
-    }
-  | { type: "clear_approval"; server: string; key: SessionKey; approval: PendingApproval };
+type SessionRuntimeState = {
+  wsMap: Record<string, WebSocket>;
+  autoConnected: boolean;
+};
+
+type CodaStoreState = CodaState & SessionRuntimeState;
 
 const rootName = "coda";
 
 function newId(prefix: string) {
-  return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
+  return `${prefix}:${Date.now().toString(36)}:${Math.random()
+    .toString(36)
+    .slice(2)}`;
 }
 
 function freshSessionId() {
-  return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now().toString(36)}`;
+  return (
+    globalThis.crypto?.randomUUID?.() ?? `session-${Date.now().toString(36)}`
+  );
 }
 
 function sessionKey(workspaceId: string, sessionId: string): SessionKey {
@@ -162,6 +149,12 @@ const initialState: CodaState = {
   order: [],
 };
 
+const initialStoreState: CodaStoreState = {
+  ...initialState,
+  wsMap: {},
+  autoConnected: false,
+};
+
 const serversStorageKey = "coda.servers";
 const legacyServerKey = "coda.serverUrl";
 
@@ -179,8 +172,16 @@ function loadStoredServers(): StoredServer[] {
             if (typeof value === "string" && value.trim()) {
               return { url: value.trim() };
             }
-            if (value && typeof value === "object" && typeof value.url === "string" && value.url.trim()) {
-              const alias = typeof value.alias === "string" && value.alias.trim() ? value.alias.trim() : undefined;
+            if (
+              value &&
+              typeof value === "object" &&
+              typeof value.url === "string" &&
+              value.url.trim()
+            ) {
+              const alias =
+                typeof value.alias === "string" && value.alias.trim()
+                  ? value.alias.trim()
+                  : undefined;
               return { url: value.url.trim(), alias };
             }
             return null;
@@ -219,7 +220,11 @@ function liveKey(agentName: string, threadId: string) {
   return `${agentName}:${threadId}`;
 }
 
-function updateServer(state: CodaState, server: string, updater: (server: ServerState) => ServerState): CodaState {
+function updateServer(
+  state: CodaState,
+  server: string,
+  updater: (server: ServerState) => ServerState
+): CodaState {
   const current = state.servers[server];
   if (!current) {
     return state;
@@ -237,11 +242,12 @@ function updateServerSession(
   state: CodaState,
   server: string,
   key: SessionKey,
-  updater: (session: OpenedSession) => OpenedSession,
+  updater: (session: OpenedSession) => OpenedSession
 ): CodaState {
   return updateServer(state, server, (current) => {
     const { workspaceId, sessionId } = splitKey(key);
-    const session = current.sessions[key] ?? blankSession(workspaceId, sessionId);
+    const session =
+      current.sessions[key] ?? blankSession(workspaceId, sessionId);
     return {
       ...current,
       sessions: {
@@ -252,10 +258,16 @@ function updateServerSession(
   });
 }
 
-function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): OpenedSession {
+function addActivity(
+  session: OpenedSession,
+  entry: Omit<ActivityEntry, "id">
+): OpenedSession {
   return {
     ...session,
-    activity: [{ id: newId("activity"), ...entry }, ...session.activity].slice(0, 80),
+    activity: [{ id: newId("activity"), ...entry }, ...session.activity].slice(
+      0,
+      80
+    ),
   };
 }
 
@@ -329,8 +341,13 @@ function toolMessageToEntry(
   };
 }
 
-function finishToolEntry(session: OpenedSession, event: Extract<WireEvent, { type: "tool_end" }>): OpenedSession {
-  const index = session.entries.findIndex((entry) => entry.callId === event.message.id);
+function finishToolEntry(
+  session: OpenedSession,
+  event: Extract<WireEvent, { type: "tool_end" }>
+): OpenedSession {
+  const index = session.entries.findIndex(
+    (entry) => entry.callId === event.message.id
+  );
   if (index < 0) {
     return {
       ...session,
@@ -341,7 +358,11 @@ function finishToolEntry(session: OpenedSession, event: Extract<WireEvent, { typ
   // Carry over the detail derived from the call arguments at tool_start; the
   // tool_end message itself doesn't include them.
   entries[index] = {
-    ...toolMessageToEntry(event.message, entries[index].id, entries[index].detail),
+    ...toolMessageToEntry(
+      event.message,
+      entries[index].id,
+      entries[index].detail
+    ),
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
@@ -350,7 +371,7 @@ function finishToolEntry(session: OpenedSession, event: Extract<WireEvent, { typ
 
 function addOrUpdateAssistantChunk(
   session: OpenedSession,
-  event: Extract<WireEvent, { type: "llm_chunk" }>,
+  event: Extract<WireEvent, { type: "llm_chunk" }>
 ): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -387,7 +408,7 @@ function finishLiveEntry(
   session: OpenedSession,
   agentName: string,
   threadId: string,
-  updates: Partial<TranscriptEntry> = {},
+  updates: Partial<TranscriptEntry> = {}
 ): OpenedSession {
   const key = liveKey(agentName, threadId);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -403,7 +424,10 @@ function finishLiveEntry(
   return { ...session, entries };
 }
 
-function finishAssistant(session: OpenedSession, event: Extract<WireEvent, { type: "llm_end" }>): OpenedSession {
+function finishAssistant(
+  session: OpenedSession,
+  event: Extract<WireEvent, { type: "llm_end" }>
+): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
@@ -431,7 +455,10 @@ function finishAssistant(session: OpenedSession, event: Extract<WireEvent, { typ
   return session;
 }
 
-function upsertApproval(approvals: PendingApproval[], approval: PendingApproval) {
+function upsertApproval(
+  approvals: PendingApproval[],
+  approval: PendingApproval
+) {
   const key = approvalKey(approval);
   const index = approvals.findIndex((item) => approvalKey(item) === key);
   if (index >= 0) {
@@ -458,13 +485,17 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
-      const turnComplete = event.agent_name === rootName && event.message.tool_calls.length === 0;
+      const turnComplete =
+        event.agent_name === rootName && event.message.tool_calls.length === 0;
       return {
         ...addActivity(finishAssistant(session, event), {
           tone: event.message.aborted ? "warning" : "success",
           label: `${event.agent_name} finished`,
           detail: event.message.usage
-            ? `${event.message.usage.prompt_tokens + event.message.usage.completion_tokens} tokens`
+            ? `${
+                event.message.usage.prompt_tokens +
+                event.message.usage.completion_tokens
+              } tokens`
             : "turn complete",
         }),
         running: turnComplete ? false : session.running,
@@ -512,11 +543,14 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         running: false,
       };
     case "aborted": {
-      const updated = addActivity(finishLiveEntry(session, event.agent_name, event.thread_id), {
-        tone: "warning",
-        label: `${event.agent_name} aborted`,
-        detail: event.target.reason,
-      });
+      const updated = addActivity(
+        finishLiveEntry(session, event.agent_name, event.thread_id),
+        {
+          tone: "warning",
+          label: `${event.agent_name} aborted`,
+          detail: event.target.reason,
+        }
+      );
       return {
         ...updated,
         entries: [
@@ -526,18 +560,24 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             kind: "system",
             agentName: event.agent_name,
             threadId: event.thread_id,
-            content: event.target.reason === "generation" ? "Generation interrupted" : "Tool calls interrupted",
+            content:
+              event.target.reason === "generation"
+                ? "Generation interrupted"
+                : "Tool calls interrupted",
           },
         ],
         running: false,
       };
     }
     case "error": {
-      const updated = addActivity(finishLiveEntry(session, event.agent_name, event.thread_id), {
-        tone: "danger",
-        label: `${event.agent_name || "server"} error`,
-        detail: event.message,
-      });
+      const updated = addActivity(
+        finishLiveEntry(session, event.agent_name, event.thread_id),
+        {
+          tone: "danger",
+          label: `${event.agent_name || "server"} error`,
+          detail: event.message,
+        }
+      );
       return {
         ...updated,
         entries: [
@@ -556,9 +596,16 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
   }
 }
 
-function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, sessionId: string) {
+function upsertCatalogSession(
+  catalog: WorkspaceSummary[],
+  workspaceId: string,
+  sessionId: string
+) {
   return catalog.map((workspace) => {
-    if (workspace.id !== workspaceId || workspace.sessions.some((session) => session.id === sessionId)) {
+    if (
+      workspace.id !== workspaceId ||
+      workspace.sessions.some((session) => session.id === sessionId)
+    ) {
       return workspace;
     }
     return {
@@ -573,13 +620,15 @@ function upsertCatalogTitled(
   catalog: WorkspaceSummary[],
   workspaceId: string,
   sessionId: string,
-  title: string,
+  title: string
 ): WorkspaceSummary[] {
   return catalog.map((workspace) => {
     if (workspace.id !== workspaceId) {
       return workspace;
     }
-    const index = workspace.sessions.findIndex((session) => session.id === sessionId);
+    const index = workspace.sessions.findIndex(
+      (session) => session.id === sessionId
+    );
     if (index >= 0) {
       const sessions = [...workspace.sessions];
       const session = sessions[index];
@@ -592,7 +641,10 @@ function upsertCatalogTitled(
     }
     return {
       ...workspace,
-      sessions: [{ id: sessionId, updated_at_ms: Date.now(), first_user_message: title }, ...workspace.sessions],
+      sessions: [
+        { id: sessionId, updated_at_ms: Date.now(), first_user_message: title },
+        ...workspace.sessions,
+      ],
     };
   });
 }
@@ -604,7 +656,7 @@ function upsertCatalogTitled(
  */
 function mergeCatalog(
   incoming: WorkspaceSummary[],
-  sessions: Record<SessionKey, OpenedSession>,
+  sessions: Record<SessionKey, OpenedSession>
 ): WorkspaceSummary[] {
   return incoming.map((workspace) => {
     const present = new Set(workspace.sessions.map((session) => session.id));
@@ -613,7 +665,9 @@ function mergeCatalog(
         return session;
       }
       const local = sessions[sessionKey(workspace.id, session.id)];
-      return local?.firstUserMessage ? { ...session, first_user_message: local.firstUserMessage } : session;
+      return local?.firstUserMessage
+        ? { ...session, first_user_message: local.firstUserMessage }
+        : session;
     });
     const extras = Object.values(sessions)
       .filter(
@@ -621,7 +675,7 @@ function mergeCatalog(
           !session.draft &&
           session.workspaceId === workspace.id &&
           Boolean(session.firstUserMessage) &&
-          !present.has(session.sessionId),
+          !present.has(session.sessionId)
       )
       .map((session) => ({
         id: session.sessionId,
@@ -632,192 +686,305 @@ function mergeCatalog(
   });
 }
 
-function reducer(state: CodaState, action: Action): CodaState {
-  switch (action.type) {
-    case "connecting": {
-      const existing = state.servers[action.server];
-      return {
-        ...state,
-        order: existing ? state.order : [...state.order, action.server],
-        servers: {
-          ...state.servers,
-          [action.server]: {
-            ...(existing ?? blankServer(action.server)),
-            alias: action.alias ?? existing?.alias,
-            status: "connecting",
-            error: undefined,
-          },
+type CodaStore = StoreApi<CodaStoreState>;
+
+function updateState(store: CodaStore, updater: (state: CodaState) => CodaState) {
+  store.setState((state) => updater(state), false);
+}
+
+function markConnecting(store: CodaStore, server: string, alias?: string) {
+  updateState(store, (state) => {
+    const existing = state.servers[server];
+    return {
+      ...state,
+      order: existing ? state.order : [...state.order, server],
+      servers: {
+        ...state.servers,
+        [server]: {
+          ...(existing ?? blankServer(server)),
+          alias: alias ?? existing?.alias,
+          status: "connecting",
+          error: undefined,
         },
-      };
+      },
+    };
+  });
+}
+
+function setServerAlias(store: CodaStore, server: string, alias?: string) {
+  updateState(store, (state) =>
+    updateServer(state, server, (current) => ({ ...current, alias }))
+  );
+}
+
+function setServerStatus(
+  store: CodaStore,
+  server: string,
+  status: ConnectionStatus,
+  error?: string
+) {
+  updateState(store, (state) =>
+    updateServer(state, server, (current) => ({
+      ...current,
+      status,
+      error: status === "error" ? error : undefined,
+    }))
+  );
+}
+
+function removeServerState(store: CodaStore, server: string) {
+  updateState(store, (state) => {
+    if (!state.servers[server]) {
+      return state;
     }
-    case "set_alias":
-      return updateServer(state, action.server, (server) => ({ ...server, alias: action.alias }));
-    case "connected":
-      return updateServer(state, action.server, (server) => ({ ...server, status: "connected", error: undefined }));
-    case "closed":
-      return updateServer(state, action.server, (server) => ({ ...server, status: "closed" }));
-    case "error":
-      return updateServer(state, action.server, (server) => ({ ...server, status: "error", error: action.error }));
-    case "remove_server": {
-      if (!state.servers[action.server]) {
-        return state;
-      }
-      const { [action.server]: _removed, ...servers } = state.servers;
-      const clearingActive = state.activeServer === action.server;
-      return {
-        ...state,
-        servers,
-        order: state.order.filter((url) => url !== action.server),
-        activeServer: clearingActive ? undefined : state.activeServer,
-        activeKey: clearingActive ? undefined : state.activeKey,
-      };
-    }
-    case "catalog":
-      return updateServer(state, action.server, (server) => ({
-        ...server,
-        catalog: mergeCatalog(action.workspaces, server.sessions),
-      }));
-    case "new_session": {
-      const key = sessionKey(action.workspaceId, action.sessionId);
-      return updateServer(
-        { ...state, activeServer: action.server, activeKey: key },
-        action.server,
-        (server) => {
-          // Drop other empty drafts in this workspace so repeated "+" clicks
-          // don't stack blank sessions.
-          const sessions: Record<SessionKey, OpenedSession> = {};
-          for (const [existingKey, session] of Object.entries(server.sessions) as [SessionKey, OpenedSession][]) {
-            if (
-              existingKey !== key &&
-              session.draft &&
-              session.workspaceId === action.workspaceId &&
-              session.entries.length === 0
-            ) {
-              continue;
-            }
-            sessions[existingKey] = session;
+    const { [server]: _removed, ...servers } = state.servers;
+    const clearingActive = state.activeServer === server;
+    return {
+      ...state,
+      servers,
+      order: state.order.filter((url) => url !== server),
+      activeServer: clearingActive ? undefined : state.activeServer,
+      activeKey: clearingActive ? undefined : state.activeKey,
+    };
+  });
+}
+
+function setCatalog(
+  store: CodaStore,
+  server: string,
+  workspaces: WorkspaceSummary[]
+) {
+  updateState(store, (state) =>
+    updateServer(state, server, (current) => ({
+      ...current,
+      catalog: mergeCatalog(workspaces, current.sessions),
+    }))
+  );
+}
+
+function createDraftSession(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) =>
+    updateServer(
+      { ...state, activeServer: server, activeKey: key },
+      server,
+      (current) => {
+        const sessions: Record<SessionKey, OpenedSession> = {};
+        for (const [existingKey, session] of Object.entries(
+          current.sessions
+        ) as [SessionKey, OpenedSession][]) {
+          if (
+            existingKey !== key &&
+            session.draft &&
+            session.workspaceId === workspaceId &&
+            session.entries.length === 0
+          ) {
+            continue;
           }
-          sessions[key] = { ...blankSession(action.workspaceId, action.sessionId), draft: true };
-          return { ...server, sessions };
-        },
-      );
+          sessions[existingKey] = session;
+        }
+        sessions[key] = { ...blankSession(workspaceId, sessionId), draft: true };
+        return { ...current, sessions };
+      }
+    )
+  );
+}
+
+function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
+  updateState(store, (state) => {
+    const { workspaceId, sessionId } = splitKey(key);
+    const next = updateServer(state, server, (current) => {
+      const { [key]: _removed, ...sessions } = current.sessions;
+      return {
+        ...current,
+        sessions,
+        catalog: current.catalog.map((workspace) =>
+          workspace.id === workspaceId
+            ? {
+                ...workspace,
+                sessions: workspace.sessions.filter(
+                  (session) => session.id !== sessionId
+                ),
+              }
+            : workspace
+        ),
+      };
+    });
+    const clearingActive = state.activeServer === server && state.activeKey === key;
+    return clearingActive ? { ...next, activeKey: undefined } : next;
+  });
+}
+
+function selectSession(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) =>
+    updateServerSession(
+      { ...state, activeServer: server, activeKey: key },
+      server,
+      key,
+      (session) => session
+    )
+  );
+}
+
+function applySnapshot(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  messages: HistoryMessage[],
+  approvals: PendingApproval[]
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  const argsById = collectToolArgs(messages);
+  const mapped = messages
+    .map((message, index) => historyToEntry(message, index, argsById))
+    .filter((entry): entry is TranscriptEntry => Boolean(entry));
+  const hasHistory = messages.length > 0;
+  updateState(store, (state) => {
+    const withCatalog = updateServer(state, server, (current) => ({
+      ...current,
+      status: "connected",
+      catalog: upsertCatalogSession(current.catalog, workspaceId, sessionId),
+    }));
+    return updateServerSession(withCatalog, server, key, (session) => ({
+      ...session,
+      draft: false,
+      entries: hasHistory ? mapped : session.entries,
+      approvals: hasHistory ? approvals : session.approvals,
+      drafts: hasHistory ? {} : session.drafts,
+      running: hasHistory ? false : session.running,
+    }));
+  });
+}
+
+function applyEvent(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  event: WireEvent
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) =>
+    updateServerSession(state, server, key, (session) =>
+      reduceEvent(session, event)
+    )
+  );
+}
+
+function addAllowResultActivity(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  pattern: string,
+  error?: string | null
+) {
+  updateState(store, (state) => {
+    if (state.activeServer !== server || !state.activeKey) {
+      return state;
     }
-    case "delete_session": {
-      const { workspaceId, sessionId } = splitKey(action.key);
-      const next = updateServer(state, action.server, (server) => {
-        const { [action.key]: _removed, ...sessions } = server.sessions;
-        return {
-          ...server,
-          sessions,
-          catalog: server.catalog.map((workspace) =>
-            workspace.id === workspaceId
-              ? { ...workspace, sessions: workspace.sessions.filter((session) => session.id !== sessionId) }
-              : workspace,
-          ),
-        };
-      });
-      const clearingActive = state.activeServer === action.server && state.activeKey === action.key;
-      return clearingActive ? { ...next, activeKey: undefined } : next;
+    if (splitKey(state.activeKey).workspaceId !== workspaceId) {
+      return state;
     }
-    case "select": {
-      const key = sessionKey(action.workspaceId, action.sessionId);
-      return updateServerSession({ ...state, activeServer: action.server, activeKey: key }, action.server, key, (session) => session);
-    }
-    case "snapshot": {
-      const key = sessionKey(action.workspaceId, action.sessionId);
-      const argsById = collectToolArgs(action.messages);
-      const mapped = action.messages
-        .map((message, index) => historyToEntry(message, index, argsById))
-        .filter((entry): entry is TranscriptEntry => Boolean(entry));
-      // A brand-new session opened on first send returns an empty history; don't
-      // wipe the locally-appended user message / running state in that case.
-      const hasHistory = action.messages.length > 0;
-      const withCatalog = updateServer(state, action.server, (server) => ({
-        ...server,
-        status: "connected",
-        catalog: upsertCatalogSession(server.catalog, action.workspaceId, action.sessionId),
-      }));
-      return updateServerSession(withCatalog, action.server, key, (session) => ({
-        ...session,
+    return updateServerSession(state, server, state.activeKey, (session) =>
+      addActivity(session, {
+        tone: error ? "danger" : "success",
+        label: error ? "allow pattern failed" : "allow pattern saved",
+        detail: error || pattern,
+      })
+    );
+  });
+}
+
+function appendUserMessage(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  content: string
+) {
+  updateState(store, (state) =>
+    updateServer(state, server, (current) => {
+      const { workspaceId, sessionId } = splitKey(key);
+      const previous =
+        current.sessions[key] ?? blankSession(workspaceId, sessionId);
+      const firstUserMessage = previous.firstUserMessage ?? content;
+      const session: OpenedSession = {
+        ...previous,
         draft: false,
-        entries: hasHistory ? mapped : session.entries,
-        approvals: hasHistory ? action.approvals : session.approvals,
-        drafts: hasHistory ? {} : session.drafts,
-        running: hasHistory ? false : session.running,
-      }));
-    }
-    case "event": {
-      const key = sessionKey(action.workspaceId, action.sessionId);
-      return updateServerSession(state, action.server, key, (session) => reduceEvent(session, action.event));
-    }
-    case "allow_result": {
-      const server = state.activeServer;
-      const key = state.activeKey;
-      if (!server || server !== action.server || !key) {
-        return state;
-      }
-      if (splitKey(key).workspaceId !== action.workspaceId) {
-        return state;
-      }
-      return updateServerSession(state, server, key, (session) =>
-        addActivity(session, {
-          tone: action.error ? "danger" : "success",
-          label: action.error ? "allow pattern failed" : "allow pattern saved",
-          detail: action.error || action.pattern,
-        }),
-      );
-    }
-    case "append_user":
-      return updateServer(state, action.server, (server) => {
-        const { workspaceId, sessionId } = splitKey(action.key);
-        const previous = server.sessions[action.key] ?? blankSession(workspaceId, sessionId);
-        const firstUserMessage = previous.firstUserMessage ?? action.content;
-        const session: OpenedSession = {
-          ...previous,
-          draft: false,
-          running: true,
-          firstUserMessage,
-          entries: [
-            ...previous.entries,
-            {
-              id: newId("user"),
-              kind: "user",
-              content: action.content,
-            },
-          ],
-        };
-        return {
-          ...server,
-          sessions: { ...server.sessions, [action.key]: session },
-          catalog: upsertCatalogTitled(server.catalog, workspaceId, sessionId, firstUserMessage),
-        };
-      });
-    case "draft_resolution":
-      return updateServerSession(state, action.server, action.key, (session) => {
-        const key = approvalKey(action.approval);
-        const current = session.drafts[key] ?? {};
-        return {
-          ...session,
-          drafts: {
-            ...session.drafts,
-            [key]: {
-              ...current,
-              [action.call.id]: action.resolution,
-            },
-          },
-        };
-      });
-    case "clear_approval":
-      return updateServerSession(state, action.server, action.key, (session) => {
-        const key = approvalKey(action.approval);
-        const { [key]: _removed, ...drafts } = session.drafts;
-        return {
-          ...session,
-          drafts,
-          approvals: session.approvals.filter((approval) => approvalKey(approval) !== key),
-        };
-      });
-  }
+        running: true,
+        firstUserMessage,
+        entries: [
+          ...previous.entries,
+          { id: newId("user"), kind: "user", content },
+        ],
+      };
+      return {
+        ...current,
+        sessions: { ...current.sessions, [key]: session },
+        catalog: upsertCatalogTitled(
+          current.catalog,
+          workspaceId,
+          sessionId,
+          firstUserMessage
+        ),
+      };
+    })
+  );
+}
+
+function setDraftResolution(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  approval: PendingApproval,
+  call: ToolCall,
+  resolution: ToolCallResolution
+) {
+  updateState(store, (state) =>
+    updateServerSession(state, server, key, (session) => {
+      const approvalId = approvalKey(approval);
+      const current = session.drafts[approvalId] ?? {};
+      return {
+        ...session,
+        drafts: {
+          ...session.drafts,
+          [approvalId]: { ...current, [call.id]: resolution },
+        },
+      };
+    })
+  );
+}
+
+function clearApprovalState(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  approval: PendingApproval
+) {
+  updateState(store, (state) =>
+    updateServerSession(state, server, key, (session) => {
+      const approvalId = approvalKey(approval);
+      const { [approvalId]: _removed, ...drafts } = session.drafts;
+      return {
+        ...session,
+        drafts,
+        approvals: session.approvals.filter(
+          (item) => approvalKey(item) !== approvalId
+        ),
+      };
+    })
+  );
 }
 
 function normalizeWsUrl(input: string) {
@@ -827,8 +994,8 @@ function normalizeWsUrl(input: string) {
     const wsBase = base.startsWith("http://")
       ? base.replace(/^http:\/\//, "ws://")
       : base.startsWith("https://")
-        ? base.replace(/^https:\/\//, "wss://")
-        : base;
+      ? base.replace(/^https:\/\//, "wss://")
+      : base;
     // Don't double-append when the user already pasted the `/ws` endpoint.
     return wsBase.endsWith("/ws") ? wsBase : `${wsBase}/ws`;
   }
@@ -841,150 +1008,173 @@ function encode(message: ClientMessage) {
 }
 
 export function useCodaSession() {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const wsMapRef = useRef<Record<string, WebSocket>>({});
-  const stateRef = useRef(state);
-
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  const store = useImmutableRef(() =>
+    createStore<CodaStoreState>(() => initialStoreState)
+  );
+  const state = useStore(store);
 
   useEffect(
     () => () => {
-      for (const socket of Object.values(wsMapRef.current)) {
+      for (const socket of Object.values(store.getState().wsMap)) {
         socket.close();
       }
     },
-    [],
+    [store]
   );
 
-  const send = useCallback((server: string, message: ClientMessage) => {
-    const socket = wsMapRef.current[server];
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(encode(message));
-      return true;
-    }
-    dispatch({ type: "error", server, error: "Connection closed" });
-    return false;
-  }, []);
-
-  const connectServer = useCallback((rawUrl: string) => {
-    const server = rawUrl.trim();
-    if (!server) {
-      return;
-    }
-    wsMapRef.current[server]?.close();
-    const stored = loadStoredServers();
-    storeServers(addStored(stored, server));
-    dispatch({ type: "connecting", server, alias: stored.find((entry) => entry.url === server)?.alias });
-
-    const socket = new WebSocket(normalizeWsUrl(server));
-    wsMapRef.current[server] = socket;
-
-    socket.onopen = () => {
-      dispatch({ type: "connected", server });
-      socket.send(encode({ type: "list_workspaces" }));
-    };
-    socket.onclose = () => {
-      if (wsMapRef.current[server] === socket) {
-        dispatch({ type: "closed", server });
+  const send = useCallback(
+    (server: string, message: ClientMessage) => {
+      const { wsMap } = store.getState();
+      const socket = wsMap[server];
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(encode(message));
+        return true;
       }
-    };
-    socket.onerror = () => dispatch({ type: "error", server, error: "WebSocket connection failed" });
-    socket.onmessage = (event: MessageEvent<string>) => {
-      try {
-        const message = JSON.parse(event.data) as ServerMessage;
-        if (message.type === "workspace_catalog") {
-          dispatch({ type: "catalog", server, workspaces: message.workspaces });
-          return;
-        }
-        if (message.type === "snapshot") {
-          dispatch({
-            type: "snapshot",
-            server,
-            workspaceId: message.workspace_id,
-            sessionId: message.session_id,
-            messages: message.messages,
-            approvals: message.pending_approvals ?? [],
-          });
-          return;
-        }
-        if (message.type === "event") {
-          dispatch({
-            type: "event",
-            server,
-            workspaceId: message.workspace_id,
-            sessionId: message.session_id,
-            event: message.event,
-          });
-          return;
-        }
-        dispatch({
-          type: "allow_result",
-          server,
-          workspaceId: message.workspace_id,
-          pattern: message.pattern,
-          error: message.error,
-        });
-      } catch (error) {
-        dispatch({
-          type: "error",
-          server,
-          error: error instanceof Error ? error.message : "Invalid server message",
-        });
+      setServerStatus(store, server, "error", "Connection closed");
+      return false;
+    },
+    [store]
+  );
+
+  const connectServer = useCallback(
+    (rawUrl: string) => {
+      const server = rawUrl.trim();
+      if (!server) {
+        return;
       }
-    };
-  }, []);
+      const { wsMap } = store.getState();
+      wsMap[server]?.close();
+      const stored = loadStoredServers();
+      storeServers(addStored(stored, server));
+      markConnecting(
+        store,
+        server,
+        stored.find((entry) => entry.url === server)?.alias
+      );
 
-  const removeServer = useCallback((rawUrl: string) => {
-    const server = rawUrl.trim();
-    if (!server) {
-      return;
-    }
-    wsMapRef.current[server]?.close();
-    delete wsMapRef.current[server];
-    storeServers(loadStoredServers().filter((entry) => entry.url !== server));
-    dispatch({ type: "remove_server", server });
-  }, []);
+      const socket = new WebSocket(normalizeWsUrl(server));
+      wsMap[server] = socket;
 
-  const disconnectServer = useCallback((rawUrl: string) => {
-    const server = rawUrl.trim();
-    if (!server) {
-      return;
-    }
-    wsMapRef.current[server]?.close();
-    delete wsMapRef.current[server];
-    dispatch({ type: "closed", server });
-  }, []);
+      socket.onopen = () => {
+        setServerStatus(store, server, "connected");
+        socket.send(encode({ type: "list_workspaces" }));
+      };
+      socket.onclose = () => {
+        if (store.getState().wsMap[server] === socket) {
+          setServerStatus(store, server, "closed");
+        }
+      };
+      socket.onerror = () =>
+        setServerStatus(store, server, "error", "WebSocket connection failed");
+      socket.onmessage = (event: MessageEvent<string>) => {
+        try {
+          const message = JSON.parse(event.data) as ServerMessage;
+          if (message.type === "workspace_catalog") {
+            setCatalog(store, server, message.workspaces);
+            return;
+          }
+          if (message.type === "snapshot") {
+            applySnapshot(
+              store,
+              server,
+              message.workspace_id,
+              message.session_id,
+              message.messages,
+              message.pending_approvals ?? []
+            );
+            return;
+          }
+          if (message.type === "event") {
+            applyEvent(
+              store,
+              server,
+              message.workspace_id,
+              message.session_id,
+              message.event
+            );
+            return;
+          }
+          addAllowResultActivity(
+            store,
+            server,
+            message.workspace_id,
+            message.pattern,
+            message.error
+          );
+        } catch (error) {
+          setServerStatus(
+            store,
+            server,
+            "error",
+            error instanceof Error ? error.message : "Invalid server message"
+          );
+        }
+      };
+    },
+    [store]
+  );
 
-  const renameServer = useCallback((rawUrl: string, rawAlias: string) => {
-    const server = rawUrl.trim();
-    if (!server) {
-      return;
-    }
-    const alias = rawAlias.trim() || undefined;
-    const stored = loadStoredServers();
-    const next = stored.some((entry) => entry.url === server)
-      ? stored.map((entry) => (entry.url === server ? { ...entry, alias } : entry))
-      : [...stored, { url: server, alias }];
-    storeServers(next);
-    dispatch({ type: "set_alias", server, alias });
-  }, []);
+  const removeServer = useCallback(
+    (rawUrl: string) => {
+      const server = rawUrl.trim();
+      if (!server) {
+        return;
+      }
+      const { wsMap } = store.getState();
+      wsMap[server]?.close();
+      delete wsMap[server];
+      storeServers(loadStoredServers().filter((entry) => entry.url !== server));
+      removeServerState(store, server);
+    },
+    [store]
+  );
 
-  // Auto-connect once on load to every server the user has added.
-  const autoConnected = useRef(false);
+  const disconnectServer = useCallback(
+    (rawUrl: string) => {
+      const server = rawUrl.trim();
+      if (!server) {
+        return;
+      }
+      const { wsMap } = store.getState();
+      wsMap[server]?.close();
+      delete wsMap[server];
+      setServerStatus(store, server, "closed");
+    },
+    [store]
+  );
+
+  const renameServer = useCallback(
+    (rawUrl: string, rawAlias: string) => {
+      const server = rawUrl.trim();
+      if (!server) {
+        return;
+      }
+      const alias = rawAlias.trim() || undefined;
+      const stored = loadStoredServers();
+      const next = stored.some((entry) => entry.url === server)
+        ? stored.map((entry) =>
+            entry.url === server ? { ...entry, alias } : entry
+          )
+        : [...stored, { url: server, alias }];
+      storeServers(next);
+      setServerAlias(store, server, alias);
+    },
+    [store]
+  );
+
   useEffect(() => {
-    if (autoConnected.current) {
+    const runtime = store.getState();
+    if (runtime.autoConnected) {
       return;
     }
-    autoConnected.current = true;
+    runtime.autoConnected = true;
     for (const { url } of loadStoredServers()) {
       connectServer(url);
     }
-  }, [connectServer]);
+  }, [connectServer, store]);
 
   const currentActive = useCallback(() => {
-    const snapshot = stateRef.current;
+    const snapshot = store.getState();
     const server = snapshot.activeServer;
     const key = snapshot.activeKey;
     if (!server || !key) {
@@ -992,22 +1182,28 @@ export function useCodaSession() {
     }
     const session = snapshot.servers[server]?.sessions[key];
     return session ? { server, session } : undefined;
-  }, []);
+  }, [store]);
 
-  const newSession = useCallback((server: string, workspaceId: string) => {
-    const workspace = workspaceId.trim();
-    if (!server || !workspace) {
-      return;
-    }
-    const current = stateRef.current.servers[server];
-    const reusable = current
-      ? Object.values(current.sessions).find(
-          (session) => session.draft && session.workspaceId === workspace && session.entries.length === 0,
-        )
-      : undefined;
-    const sessionId = reusable?.sessionId ?? freshSessionId();
-    dispatch({ type: "new_session", server, workspaceId: workspace, sessionId });
-  }, []);
+  const newSession = useCallback(
+    (server: string, workspaceId: string) => {
+      const workspace = workspaceId.trim();
+      if (!server || !workspace) {
+        return;
+      }
+      const current = store.getState().servers[server];
+      const reusable = current
+        ? Object.values(current.sessions).find(
+            (session) =>
+              session.draft &&
+              session.workspaceId === workspace &&
+              session.entries.length === 0
+          )
+        : undefined;
+      const sessionId = reusable?.sessionId ?? freshSessionId();
+      createDraftSession(store, server, workspace, sessionId);
+    },
+    [store]
+  );
 
   const deleteSession = useCallback(
     (server: string, workspaceId: string, sessionId: string) => {
@@ -1017,14 +1213,17 @@ export function useCodaSession() {
         return;
       }
       const key = sessionKey(workspace, session);
-      const local = stateRef.current.servers[server]?.sessions[key];
-      // Drafts only exist locally; nothing to delete on the server.
+      const local = store.getState().servers[server]?.sessions[key];
       if (!local?.draft) {
-        send(server, { type: "delete_session", workspace_id: workspace, session_id: session });
+        send(server, {
+          type: "delete_session",
+          workspace_id: workspace,
+          session_id: session,
+        });
       }
-      dispatch({ type: "delete_session", server, key });
+      deleteSessionState(store, server, key);
     },
-    [send],
+    [send, store]
   );
 
   const openSession = useCallback(
@@ -1034,15 +1233,20 @@ export function useCodaSession() {
       if (!server || !workspace || !session) {
         return;
       }
-      const local = stateRef.current.servers[server]?.sessions[sessionKey(workspace, session)];
-      dispatch({ type: "select", server, workspaceId: workspace, sessionId: session });
-      // Drafts have not been created server-side yet; opening happens lazily on
-      // the first task so repeated clicks don't spawn blank sessions.
+      const local =
+        store.getState().servers[server]?.sessions[
+          sessionKey(workspace, session)
+        ];
+      selectSession(store, server, workspace, session);
       if (!local?.draft) {
-        send(server, { type: "open_session", workspace_id: workspace, session_id: session });
+        send(server, {
+          type: "open_session",
+          workspace_id: workspace,
+          session_id: session,
+        });
       }
     },
-    [send],
+    [send, store]
   );
 
   const sendTask = useCallback(
@@ -1052,7 +1256,6 @@ export function useCodaSession() {
       if (!text || !active) {
         return;
       }
-      // A draft session is created on the server lazily, right before its first task.
       if (active.session.draft) {
         send(active.server, {
           type: "open_session",
@@ -1068,10 +1271,10 @@ export function useCodaSession() {
           task: text,
         })
       ) {
-        dispatch({ type: "append_user", server: active.server, key: active.session.key, content: text });
+        appendUserMessage(store, active.server, active.session.key, text);
       }
     },
-    [send, currentActive],
+    [send, currentActive, store]
   );
 
   const sendTaskToNewSession = useCallback(
@@ -1081,21 +1284,35 @@ export function useCodaSession() {
       if (!server || !workspace || !text) {
         return;
       }
-      const current = stateRef.current.servers[server];
+      const current = store.getState().servers[server];
       const reusable = current
         ? Object.values(current.sessions).find(
-            (session) => session.draft && session.workspaceId === workspace && session.entries.length === 0,
+            (session) =>
+              session.draft &&
+              session.workspaceId === workspace &&
+              session.entries.length === 0
           )
         : undefined;
       const sessionId = reusable?.sessionId ?? freshSessionId();
       const key = sessionKey(workspace, sessionId);
-      dispatch({ type: "new_session", server, workspaceId: workspace, sessionId });
-      send(server, { type: "open_session", workspace_id: workspace, session_id: sessionId });
-      if (send(server, { type: "task", workspace_id: workspace, session_id: sessionId, task: text })) {
-        dispatch({ type: "append_user", server, key, content: text });
+      createDraftSession(store, server, workspace, sessionId);
+      send(server, {
+        type: "open_session",
+        workspace_id: workspace,
+        session_id: sessionId,
+      });
+      if (
+        send(server, {
+          type: "task",
+          workspace_id: workspace,
+          session_id: sessionId,
+          task: text,
+        })
+      ) {
+        appendUserMessage(store, server, key, text);
       }
     },
-    [send],
+    [send, store]
   );
 
   const abort = useCallback(() => {
@@ -1114,21 +1331,36 @@ export function useCodaSession() {
       const active = currentActive();
       const value = pattern.trim();
       if (active && value) {
-        send(active.server, { type: "add_allow_pattern", workspace_id: active.session.workspaceId, pattern: value });
+        send(active.server, {
+          type: "add_allow_pattern",
+          workspace_id: active.session.workspaceId,
+          pattern: value,
+        });
       }
     },
-    [send, currentActive],
+    [send, currentActive]
   );
 
   const draftCall = useCallback(
-    (approval: PendingApproval, call: ToolCall, resolution: ToolCallResolution) => {
+    (
+      approval: PendingApproval,
+      call: ToolCall,
+      resolution: ToolCallResolution
+    ) => {
       const active = currentActive();
       if (!active) {
         return;
       }
-      dispatch({ type: "draft_resolution", server: active.server, key: active.session.key, approval, call, resolution });
+      setDraftResolution(
+        store,
+        active.server,
+        active.session.key,
+        approval,
+        call,
+        resolution
+      );
     },
-    [currentActive],
+    [currentActive, store]
   );
 
   const submitApprovals = useCallback(() => {
@@ -1152,12 +1384,17 @@ export function useCodaSession() {
           resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
         },
       });
-      dispatch({ type: "clear_approval", server: active.server, key: active.session.key, approval });
+      clearApprovalState(store, active.server, active.session.key, approval);
     }
-  }, [send, currentActive]);
+  }, [send, currentActive, store]);
 
-  const activeServerState = state.activeServer ? state.servers[state.activeServer] : undefined;
-  const activeSession = activeServerState && state.activeKey ? activeServerState.sessions[state.activeKey] : undefined;
+  const activeServerState = state.activeServer
+    ? state.servers[state.activeServer]
+    : undefined;
+  const activeSession =
+    activeServerState && state.activeKey
+      ? activeServerState.sessions[state.activeKey]
+      : undefined;
   const servers = state.order
     .map((url) => state.servers[url])
     .filter((server): server is ServerState => Boolean(server));

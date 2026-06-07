@@ -1,0 +1,435 @@
+import {
+  Ban,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Cpu,
+  MessageSquareText,
+  ShieldCheck,
+  Sparkles,
+  TerminalSquare,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Markdown } from "@/components/markdown";
+import type { TranscriptEntry } from "@/lib/session";
+import { cn } from "@/lib/utils";
+
+function WorkingIndicator() {
+  return (
+    <div className="flex items-center gap-2 px-1 py-1 text-sm text-muted-foreground">
+      <span className="flex gap-1">
+        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.3s]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.15s]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
+      </span>
+    </div>
+  );
+}
+
+type TranscriptRenderItem =
+  | { type: "entry"; entry: TranscriptEntry }
+  | { type: "turn"; id: string; entries: TranscriptEntry[] };
+
+function lastAssistantIndex(entries: TranscriptEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index].kind === "assistant") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function hasToolWork(entries: TranscriptEntry[]) {
+  return entries.some(
+    (entry) => entry.kind === "tool_call" || entry.kind === "tool_result"
+  );
+}
+
+function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
+  return {
+    type: "turn",
+    id: entries.map((entry) => entry.id).join(":"),
+    entries,
+  };
+}
+
+function transcriptRenderItems(
+  entries: TranscriptEntry[]
+): TranscriptRenderItem[] {
+  const items: TranscriptRenderItem[] = [];
+  let index = 0;
+
+  while (index < entries.length) {
+    const entry = entries[index];
+    if (entry.kind === "user") {
+      items.push({ type: "entry", entry });
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (index < entries.length && entries[index].kind !== "user") {
+      index += 1;
+    }
+
+    const segment = entries.slice(start, index);
+    if (!hasToolWork(segment)) {
+      items.push(
+        ...segment.map((entry) => ({ type: "entry" as const, entry }))
+      );
+      continue;
+    }
+
+    items.push(turnGroup(segment));
+  }
+
+  return items;
+}
+
+export function Transcript({
+  entries,
+  running,
+  workspace,
+}: {
+  entries: TranscriptEntry[];
+  running: boolean;
+  workspace?: string;
+}) {
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const renderItems = transcriptRenderItems(entries);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [entries.length, entries.at(-1)?.content, running]);
+
+  return (
+    <section className="scrollbar-fine min-h-0 flex-1 overflow-y-auto px-4 py-3">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
+        {entries.length === 0 ? (
+          <div className="flex min-h-[48vh] flex-col items-center justify-center text-center">
+            <div className="mb-3 flex size-10 items-center justify-center rounded-md bg-accent text-accent-foreground">
+              <Sparkles className="size-5" />
+            </div>
+            <div className="text-base font-semibold">
+              {workspace ? "What should we do?" : "No session selected"}
+            </div>
+            <p className="mt-1.5 max-w-md text-sm leading-6 text-muted-foreground">
+              {workspace
+                ? "Send a message to start the session."
+                : "Pick a server and open or create a session to begin."}
+            </p>
+          </div>
+        ) : (
+          renderItems.map((item) =>
+            item.type === "entry" ? (
+              <TranscriptItem key={item.entry.id} entry={item.entry} />
+            ) : (
+              <AssistantTurnBubble key={item.id} entries={item.entries} />
+            )
+          )
+        )}
+        {running ? <WorkingIndicator /> : null}
+        <div ref={bottomRef} />
+      </div>
+    </section>
+  );
+}
+
+function entryTitle(entry: TranscriptEntry) {
+  return entry.title ?? (entry.agentName ? `${entry.agentName}` : entry.kind);
+}
+
+function EntryIcon({ entry }: { entry: TranscriptEntry }) {
+  const Icon =
+    entry.kind === "assistant"
+      ? MessageSquareText
+      : entry.kind === "tool_call"
+      ? TerminalSquare
+      : entry.kind === "tool_result"
+      ? ShieldCheck
+      : entry.kind === "error"
+      ? Ban
+      : Cpu;
+
+  return <Icon className="size-4 shrink-0 text-muted-foreground" />;
+}
+
+function EntryDetail({ entry }: { entry: TranscriptEntry }) {
+  if (!entry.detail) {
+    return null;
+  }
+  return (
+    <span className="truncate font-mono text-xs text-muted-foreground">
+      {entry.detail}
+    </span>
+  );
+}
+
+function EntryStatus({ entry }: { entry: TranscriptEntry }) {
+  return (
+    <>
+      {entry.status ? (
+        <Badge variant={entry.status === "running" ? "warning" : "secondary"}>
+          {entry.status}
+        </Badge>
+      ) : null}
+      {entry.usage ? (
+        <Badge variant="outline">
+          {entry.usage.prompt_tokens + entry.usage.completion_tokens} tokens
+        </Badge>
+      ) : null}
+    </>
+  );
+}
+
+function CopyContentButton({
+  content,
+  label = "content",
+}: {
+  content: string;
+  label?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyContent() {
+    await navigator.clipboard.writeText(content);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="quiet"
+      size="icon"
+      className="size-7"
+      title={copied ? "Copied" : `Copy ${label}`}
+      onClick={copyContent}
+    >
+      {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+    </Button>
+  );
+}
+
+function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
+  const lastIndex = lastAssistantIndex(entries);
+  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const finalAssistant =
+    finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
+  const intermediateEntries =
+    finalAssistantIndex >= 0
+      ? entries.filter((_, index) => index !== finalAssistantIndex)
+      : entries;
+  const usage = finalAssistant?.usage;
+
+  return (
+    <article className="rounded-md border border-border bg-card p-3 shadow-sm">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <MessageSquareText className="size-4 shrink-0 text-muted-foreground" />
+          <span className="truncate text-sm font-medium">
+            {finalAssistant?.agentName ?? "coda"}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {usage ? (
+            <Badge variant="outline">
+              {usage.prompt_tokens + usage.completion_tokens} tokens
+            </Badge>
+          ) : null}
+        </div>
+      </div>
+      <div className="space-y-3">
+        {intermediateEntries.map((entry) =>
+          entry.kind === "assistant" ? (
+            <Markdown key={entry.id}>{entry.content}</Markdown>
+          ) : (
+            <TranscriptDisclosure key={entry.id} entry={entry} />
+          )
+        )}
+        {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
+        {finalAssistant ? (
+          <div className="flex justify-start">
+            <CopyContentButton
+              content={finalAssistant.content}
+              label="response"
+            />
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
+  const [open, setOpen] = useState(false);
+  const title = disclosureTitle(entry);
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-3 rounded-md py-1 text-left text-muted-foreground hover:text-foreground"
+          title={open ? "Collapse" : "Expand"}
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <EntryIcon entry={entry} />
+            <span className="shrink-0 truncate text-sm">{title}</span>
+            <EntryDetail entry={entry} />
+          </div>
+          <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
+            <div className="flex justify-end">
+              <EntryStatus entry={entry} />
+            </div>
+            <div className="flex size-7 items-center justify-center">
+              {open ? (
+                <ChevronDown className="size-4" />
+              ) : (
+                <ChevronRight className="size-4" />
+              )}
+            </div>
+          </div>
+        </button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="relative mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/20 p-3">
+          {entry.kind === "tool_result" ? (
+            <div className="sticky top-0 z-10 h-0">
+              <div className="flex justify-end">
+                <CopyContentButton content={entry.content} label="result" />
+              </div>
+            </div>
+          ) : null}
+          {entry.kind === "assistant" ? (
+            <Markdown>{entry.content}</Markdown>
+          ) : (
+            <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+              {entry.content}
+            </pre>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function disclosureTitle(entry: TranscriptEntry) {
+  if (entry.kind === "assistant") {
+    return `${entry.agentName ?? "coda"} message`;
+  }
+  return entryTitle(entry);
+}
+
+function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
+  const [toolResultOpen, setToolResultOpen] = useState(false);
+
+  if (entry.kind === "user") {
+    return (
+      <div className="group flex justify-end gap-1">
+        <div className="pt-1 opacity-0 transition-opacity group-hover:opacity-100">
+          <CopyContentButton content={entry.content} label="message" />
+        </div>
+        <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
+          <Markdown>{entry.content}</Markdown>
+        </div>
+      </div>
+    );
+  }
+
+  const tone =
+    entry.kind === "error"
+      ? "border-rose-500/35 bg-rose-500/10"
+      : "border-border bg-card";
+
+  const title = entryTitle(entry);
+  const header = (
+    <div className="mb-2 flex items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-2">
+        <EntryIcon entry={entry} />
+        <span className="shrink-0 truncate text-sm font-medium">{title}</span>
+        <EntryDetail entry={entry} />
+        {entry.agentName && entry.agentName !== "coda" ? (
+          <Badge variant="cyan">sub-agent</Badge>
+        ) : null}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <EntryStatus entry={entry} />
+      </div>
+    </div>
+  );
+
+  if (entry.kind === "tool_result") {
+    return (
+      <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+        <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <EntryIcon entry={entry} />
+              <span className="shrink-0 truncate text-sm font-medium">
+                {title}
+              </span>
+              <EntryDetail entry={entry} />
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <EntryStatus entry={entry} />
+              <CollapsibleTrigger asChild>
+                <Button
+                  variant="quiet"
+                  size="sm"
+                  className="h-7 px-2"
+                  title={toolResultOpen ? "Collapse result" : "Expand result"}
+                >
+                  {toolResultOpen ? (
+                    <ChevronDown className="size-4" />
+                  ) : (
+                    <ChevronRight className="size-4" />
+                  )}
+                  <span>{toolResultOpen ? "Collapse" : "Expand"}</span>
+                </Button>
+              </CollapsibleTrigger>
+            </div>
+          </div>
+          <CollapsibleContent>
+            <div className="relative max-h-80 overflow-auto rounded-md border border-border/70 bg-background/70 p-3 md:max-h-96">
+              <div className="sticky top-0 z-10 h-0">
+                <div className="flex justify-end">
+                  <CopyContentButton content={entry.content} label="result" />
+                </div>
+              </div>
+              <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+                {entry.content}
+              </pre>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      </article>
+    );
+  }
+
+  return (
+    <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+      {header}
+      {entry.kind === "assistant" ? (
+        <div className="space-y-3">
+          <Markdown>{entry.content}</Markdown>
+          <div className="flex justify-start">
+            <CopyContentButton content={entry.content} label="response" />
+          </div>
+        </div>
+      ) : (
+        <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6">
+          {entry.content}
+        </pre>
+      )}
+    </article>
+  );
+}
