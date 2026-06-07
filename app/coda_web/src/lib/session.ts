@@ -331,18 +331,33 @@ function addOrUpdateAssistantChunk(
   };
 }
 
+function finishLiveEntry(
+  session: OpenedSession,
+  agentName: string,
+  threadId: string,
+  updates: Partial<TranscriptEntry> = {},
+): OpenedSession {
+  const key = liveKey(agentName, threadId);
+  const index = session.entries.findIndex((entry) => entry.liveKey === key);
+  if (index < 0) {
+    return session;
+  }
+  const entries = [...session.entries];
+  entries[index] = {
+    ...entries[index],
+    ...updates,
+    liveKey: undefined,
+  };
+  return { ...session, entries };
+}
+
 function finishAssistant(session: OpenedSession, event: Extract<WireEvent, { type: "llm_end" }>): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
-  const index = session.entries.findIndex((entry) => entry.liveKey === key);
-  if (index >= 0) {
-    const entries = [...session.entries];
-    entries[index] = {
-      ...entries[index],
-      liveKey: undefined,
+  if (session.entries.some((entry) => entry.liveKey === key)) {
+    return finishLiveEntry(session, event.agent_name, event.thread_id, {
       usage: event.message.usage,
       status: event.message.aborted ? "aborted" : undefined,
-    };
-    return { ...session, entries };
+    });
   }
   if (event.message.content) {
     return {
@@ -443,15 +458,16 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         approvals: upsertApproval(session.approvals, event.approval),
         running: false,
       };
-    case "aborted":
+    case "aborted": {
+      const updated = addActivity(finishLiveEntry(session, event.agent_name, event.thread_id), {
+        tone: "warning",
+        label: `${event.agent_name} aborted`,
+        detail: event.target.reason,
+      });
       return {
-        ...addActivity(session, {
-          tone: "warning",
-          label: `${event.agent_name} aborted`,
-          detail: event.target.reason,
-        }),
+        ...updated,
         entries: [
-          ...session.entries,
+          ...updated.entries,
           {
             id: newId("aborted"),
             kind: "system",
@@ -462,15 +478,17 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         ],
         running: false,
       };
-    case "error":
+    }
+    case "error": {
+      const updated = addActivity(finishLiveEntry(session, event.agent_name, event.thread_id), {
+        tone: "danger",
+        label: `${event.agent_name || "server"} error`,
+        detail: event.message,
+      });
       return {
-        ...addActivity(session, {
-          tone: "danger",
-          label: `${event.agent_name || "server"} error`,
-          detail: event.message,
-        }),
+        ...updated,
         entries: [
-          ...session.entries,
+          ...updated.entries,
           {
             id: newId("error"),
             kind: "error",
@@ -481,6 +499,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         ],
         running: false,
       };
+    }
   }
 }
 
@@ -509,11 +528,13 @@ function upsertCatalogTitled(
     }
     const index = workspace.sessions.findIndex((session) => session.id === sessionId);
     if (index >= 0) {
-      if (workspace.sessions[index].first_user_message) {
-        return workspace;
-      }
       const sessions = [...workspace.sessions];
-      sessions[index] = { ...sessions[index], first_user_message: title };
+      const session = sessions[index];
+      sessions[index] = {
+        ...session,
+        updated_at_ms: Date.now(),
+        first_user_message: session.first_user_message ?? title,
+      };
       return { ...workspace, sessions };
     }
     return {
