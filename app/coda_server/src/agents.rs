@@ -14,9 +14,10 @@
 //!
 //! A [`ToolRegistry`] resolves the `tools` list: built-in tools by name, plus
 //! any prebuilt tools (MCP, `ask_user`) registered at startup. A name ending in
-//! `*` is a prefix pattern (e.g. `mcp__example__*` enables every tool that
-//! server exposes). An unknown plain name is a hard error, surfaced at startup;
-//! a pattern that matches nothing only warns.
+//! `*` over a non-empty prefix is a pattern (e.g. `mcp__example__*` enables
+//! every tool that server exposes); to get every tool, omit `tools` entirely
+//! rather than writing a bare `*`. An unknown plain name is a hard error,
+//! surfaced at startup; a pattern that matches nothing only warns.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -119,7 +120,8 @@ impl ToolRegistry {
 
     /// Expand a trailing-`*` prefix pattern (e.g. `mcp__example__*`) to every tool
     /// — built-in or prebuilt — whose name starts with `prefix`, as fresh specs
-    /// sorted by name. An empty `prefix` (the bare `*`) matches every tool.
+    /// sorted by name. `prefix` is always non-empty (the caller rejects a bare
+    /// `*`).
     fn expand_pattern(&self, prefix: &str) -> Vec<Box<dyn ToolSpec>> {
         let mut names: Vec<&str> = BUILTIN_TOOL_NAMES
             .iter()
@@ -338,12 +340,15 @@ pub fn load_root_agent_file(workspace_dir: &Path) -> Result<RootAgentFile, LoadE
 
 /// Resolve a list of tool names to [`ToolSpec`] factories via `registry`.
 ///
-/// A name ending in `*` is a prefix pattern (e.g. `mcp__example__*`), expanded to
-/// every matching tool; a pattern that matches nothing is warned about, not an
-/// error, since which MCP tools exist can legitimately vary. A plain name that
-/// resolves to nothing is a hard [`LoadError::UnknownTool`] (attributed to
-/// `agent`). The result is deduplicated by name so a pattern overlapping a
-/// literal entry doesn't trip the tool-namespace conflict check downstream.
+/// A name ending in `*` with a non-empty prefix is a pattern (e.g.
+/// `mcp__example__*`), expanded to every matching tool; a pattern that matches
+/// nothing is warned about, not an error, since which MCP tools exist can
+/// legitimately vary. A bare `*` is not a pattern (omit `tools` to get every
+/// tool) — it falls through and resolves to nothing, a hard error. A plain name
+/// that resolves to nothing is likewise a hard [`LoadError::UnknownTool`]
+/// (attributed to `agent`). The result is deduplicated by name so a pattern
+/// overlapping a literal entry doesn't trip the tool-namespace conflict check
+/// downstream.
 fn resolve_tools(
     registry: &ToolRegistry,
     agent: &str,
@@ -358,7 +363,10 @@ fn resolve_tools(
     };
 
     for name in names {
-        if let Some(prefix) = name.strip_suffix('*') {
+        // A trailing `*` over a non-empty prefix is a pattern; a bare `*` is
+        // not (drop the whole `tools` field to get every tool) and falls
+        // through to the literal path, where it resolves to nothing.
+        if let Some(prefix) = name.strip_suffix('*').filter(|p| !p.is_empty()) {
             let matches = registry.expand_pattern(prefix);
             if matches.is_empty() {
                 warn!(agent, pattern = name, "tool pattern matched no tools");
@@ -826,11 +834,15 @@ mod tests {
     }
 
     #[test]
-    fn bare_star_pattern_matches_every_tool() {
+    fn bare_star_is_not_a_wildcard() {
+        // A bare `*` is not a pattern (omit `tools` to get everything); it has
+        // no non-empty prefix, so it resolves like a literal and is unknown.
         let registry = registry_with_mcp();
-        let tools = resolve_tools(&registry, "explore", &["*".to_string()]).unwrap();
-        // All nine built-ins plus the three prebuilt tools.
-        assert_eq!(tools.len(), BUILTIN_TOOL_NAMES.len() + 3);
+        let result = resolve_tools(&registry, "explore", &["*".to_string()]);
+        assert!(matches!(
+            result,
+            Err(LoadError::UnknownTool { tool, .. }) if tool == "*"
+        ));
     }
 
     #[test]
