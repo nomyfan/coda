@@ -15,9 +15,10 @@
 //! A [`ToolRegistry`] resolves the `tools` list: built-in tools by name, plus
 //! any prebuilt tools (MCP, `ask_user`) registered at startup. A name ending in
 //! `*` over a non-empty prefix is a pattern (e.g. `mcp__example__*` enables
-//! every tool that server exposes); to get every tool, omit `tools` entirely
-//! rather than writing a bare `*`. An unknown plain name is a hard error,
-//! surfaced at startup; a pattern that matches nothing only warns.
+//! every tool that server exposes); a bare `*` is *not* a wildcard. To grant
+//! every tool, omit `tools` on the root `coda` agent (its default is all tools)
+//! — a sub-agent that omits `tools` gets none. An unknown plain name is a hard
+//! error, surfaced at startup; a pattern that matches nothing only warns.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -343,12 +344,12 @@ pub fn load_root_agent_file(workspace_dir: &Path) -> Result<RootAgentFile, LoadE
 /// A name ending in `*` with a non-empty prefix is a pattern (e.g.
 /// `mcp__example__*`), expanded to every matching tool; a pattern that matches
 /// nothing is warned about, not an error, since which MCP tools exist can
-/// legitimately vary. A bare `*` is not a pattern (omit `tools` to get every
-/// tool) — it falls through and resolves to nothing, a hard error. A plain name
-/// that resolves to nothing is likewise a hard [`LoadError::UnknownTool`]
-/// (attributed to `agent`). The result is deduplicated by name so a pattern
-/// overlapping a literal entry doesn't trip the tool-namespace conflict check
-/// downstream.
+/// legitimately vary. A bare `*` is not a pattern (to grant every tool, omit
+/// `tools` on the root agent) — it falls through and resolves to nothing, a hard
+/// error. A plain name that resolves to nothing is likewise a hard
+/// [`LoadError::UnknownTool`] (attributed to `agent`). The result is
+/// deduplicated by name so a pattern overlapping a literal entry doesn't trip
+/// the tool-namespace conflict check downstream.
 fn resolve_tools(
     registry: &ToolRegistry,
     agent: &str,
