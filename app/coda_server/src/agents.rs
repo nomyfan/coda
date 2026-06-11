@@ -128,8 +128,14 @@ impl ToolRegistry {
             .filter(|name| name.starts_with(prefix))
             .collect();
         names.sort_unstable();
-        // `resolve` never misses here: every name came from a known source.
-        names.iter().filter_map(|name| self.resolve(name)).collect()
+        names
+            .iter()
+            .map(|name| {
+                // Every name came straight from a known source, so a miss is a
+                // broken internal invariant — surface it rather than dropping it.
+                self.resolve(name).expect("enumerated tool name resolves")
+            })
+            .collect()
     }
 
     /// Every registered prebuilt tool, for handing to the top-level agent.
