@@ -115,21 +115,19 @@ impl<T: Tool> From<T> for ToolWrapper<T> {
 }
 
 #[derive(Clone, Default)]
-pub struct ToolSet {
-    tools: BTreeMap<String, Arc<dyn ToolObject>>,
-}
+pub struct Tools(BTreeMap<String, Arc<dyn ToolObject>>);
 
-impl ToolSet {
+impl Tools {
     pub fn register(&mut self, tool: Box<dyn ToolObject>) {
-        self.tools.insert(tool.name().to_string(), Arc::from(tool));
+        self.0.insert(tool.name().to_string(), Arc::from(tool));
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn ToolObject>> {
-        self.tools.get(name).cloned()
+        self.0.get(name).cloned()
     }
 
     pub fn descriptors(&self) -> Vec<ToolDefinition> {
-        self.tools
+        self.0
             .values()
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),

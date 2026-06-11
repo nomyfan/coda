@@ -9,7 +9,7 @@ use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, Message, SystemMessage, ToolCall,
     ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
 };
-use coda_core::tool::ToolSet;
+use coda_core::tool::Tools;
 use coda_tools::TodoItem;
 use tracing::debug;
 
@@ -270,7 +270,7 @@ pub struct Agent {
     pub system_prompt: SystemPrompt,
     pub state: Arc<Mutex<AgentState>>,
     pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
-    pub tools: ToolSet,
+    pub tools: Tools,
     pub subagents: SubAgents,
 }
 

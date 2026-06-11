@@ -33,7 +33,7 @@ crates/
 
 ### Crate Responsibilities
 
-- **`coda_core`** — Core abstractions for LLM interaction: `LLMProvider` trait (streaming completions), `Message` type hierarchy (System/User/Assistant/Tool), `Tool`/`ToolObject` traits (tool definition & execution), and `ToolSet` (tool registry). All other crates depend on this one.
+- **`coda_core`** — Core abstractions for LLM interaction: `LLMProvider` trait (streaming completions), `Message` type hierarchy (System/User/Assistant/Tool), `Tool`/`ToolObject` traits (tool definition & execution), and `Tools` (tool registry). All other crates depend on this one.
 - **`coda_openai`** — OpenAI-compatible `LLMProvider` implementation. Converts `coda_core` message types to `async_openai` SDK types, handles streaming SSE responses, and reassembles tool-call chunks.
 - **`coda_agent`** — Agent runtime. Key components: `Agent` (per-agent state & tool set), `AgentSpec` (plain per-agent data; sub-agents referenced by name), `AgentTeam` (a validated, rooted set of specs — its `new` is the single validation gate, `build(workspace_dir)` mints fresh agents per session), `Session` (high-level session facade wrapping agent lifecycle & event dispatch), `AgentRuntime` (low-level multi-agent scheduler). Supports tool approval (auto/manual/conditional) and sub-agents (stateful/stateless modes).
 - **`coda_tools`** — Built-in tool implementations and the tool spec system. Provides 9 built-in tools (`shell`, `read_file`, `write_file`, `edit_file`, `ls`, `grep`, `glob`, `read_todos`, `write_todos`), `TodoItem`, the `ToolSpec` factory trait (with `name()` metadata), `BuildContext`, `PrebuiltToolSpec`, and name-based resolution (`builtin_specs()`, `spec_by_name`). Depends on `coda_core`.
