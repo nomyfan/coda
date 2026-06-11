@@ -32,7 +32,14 @@ export type ConnectionStatus =
 
 export type TranscriptEntry = {
   id: string;
-  kind: "user" | "assistant" | "tool_call" | "tool_result" | "system" | "error";
+  kind:
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "system"
+    | "error";
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -223,6 +230,11 @@ function liveKey(agentName: string, threadId: string) {
   return `${agentName}:${threadId}`;
 }
 
+/** Reasoning streams under its own live key so it never merges with the answer entry. */
+function reasoningLiveKey(agentName: string, threadId: string) {
+  return `reasoning:${liveKey(agentName, threadId)}`;
+}
+
 function addActivity(
   session: OpenedSession,
   entry: Omit<ActivityEntry, "id">
@@ -369,6 +381,60 @@ function addOrUpdateAssistantChunk(
   };
 }
 
+function addOrUpdateReasoningChunk(
+  session: OpenedSession,
+  event: Extract<WireEvent, { type: "llm_reasoning_chunk" }>
+): OpenedSession {
+  const key = reasoningLiveKey(event.agent_name, event.thread_id);
+  const index = session.entries.findIndex((entry) => entry.liveKey === key);
+  if (index >= 0) {
+    const entries = [...session.entries];
+    entries[index] = {
+      ...entries[index],
+      content: entries[index].content + event.content,
+    };
+    return { ...session, entries };
+  }
+  if (!event.content) {
+    return session;
+  }
+  return {
+    ...session,
+    entries: [
+      ...session.entries,
+      {
+        id: newId("reasoning"),
+        kind: "reasoning",
+        agentName: event.agent_name,
+        threadId: event.thread_id,
+        title: "thinking",
+        content: event.content,
+        status: "thinking",
+        liveKey: key,
+      },
+    ],
+  };
+}
+
+/**
+ * Settle the live reasoning entry, if any. Called when answer content starts
+ * or the turn ends, so a later turn on the same thread starts a fresh entry.
+ */
+function finishReasoning(
+  session: OpenedSession,
+  agentName: string,
+  threadId: string
+): OpenedSession {
+  const key = reasoningLiveKey(agentName, threadId);
+  const index = session.entries.findIndex((entry) => entry.liveKey === key);
+  if (index < 0) {
+    return session;
+  }
+  const entries = [...session.entries];
+  entries[index] = { ...entries[index], status: undefined, liveKey: undefined };
+  return { ...session, entries };
+}
+
 function finishLiveEntry(
   session: OpenedSession,
   agentName: string,
@@ -446,23 +512,35 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         running: true,
       };
     case "llm_chunk":
-      return addOrUpdateAssistantChunk(session, event);
+      // Answer content marks the end of the reasoning phase.
+      return addOrUpdateAssistantChunk(
+        finishReasoning(session, event.agent_name, event.thread_id),
+        event
+      );
+    case "llm_reasoning_chunk":
+      return addOrUpdateReasoningChunk(session, event);
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
       const turnComplete =
         event.agent_name === rootName && event.message.tool_calls.length === 0;
       return {
-        ...addActivity(finishAssistant(session, event), {
-          tone: event.message.aborted ? "warning" : "success",
-          label: `${event.agent_name} finished`,
-          detail: event.message.usage
-            ? `${
-                event.message.usage.prompt_tokens +
-                event.message.usage.completion_tokens
-              } tokens`
-            : "turn complete",
-        }),
+        ...addActivity(
+          finishAssistant(
+            finishReasoning(session, event.agent_name, event.thread_id),
+            event
+          ),
+          {
+            tone: event.message.aborted ? "warning" : "success",
+            label: `${event.agent_name} finished`,
+            detail: event.message.usage
+              ? `${
+                  event.message.usage.prompt_tokens +
+                  event.message.usage.completion_tokens
+                } tokens`
+              : "turn complete",
+          }
+        ),
         running: turnComplete ? false : session.running,
       };
     }
@@ -509,7 +587,11 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       };
     case "aborted": {
       const updated = addActivity(
-        finishLiveEntry(session, event.agent_name, event.thread_id),
+        finishLiveEntry(
+          finishReasoning(session, event.agent_name, event.thread_id),
+          event.agent_name,
+          event.thread_id
+        ),
         {
           tone: "warning",
           label: `${event.agent_name} aborted`,
@@ -536,7 +618,11 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
     }
     case "error": {
       const updated = addActivity(
-        finishLiveEntry(session, event.agent_name, event.thread_id),
+        finishLiveEntry(
+          finishReasoning(session, event.agent_name, event.thread_id),
+          event.agent_name,
+          event.thread_id
+        ),
         {
           tone: "danger",
           label: `${event.agent_name || "server"} error`,

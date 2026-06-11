@@ -96,6 +96,12 @@ export type WireEvent =
       content: string;
     }
   | {
+      type: "llm_reasoning_chunk";
+      agent_name: string;
+      thread_id: string;
+      content: string;
+    }
+  | {
       type: "llm_end";
       agent_name: string;
       thread_id: string;
