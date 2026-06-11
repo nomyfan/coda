@@ -13,17 +13,21 @@
 //! agents, and the built-in base prompt respectively). `coda` is always present.
 //!
 //! A [`ToolRegistry`] resolves the `tools` list: built-in tools by name, plus
-//! any prebuilt tools (MCP, `ask_user`) registered at startup. An unknown tool
-//! name is a hard error, surfaced at startup.
+//! any prebuilt tools (MCP, `ask_user`) registered at startup. A name ending in
+//! `*` over a non-empty prefix is a pattern (e.g. `mcp__example__*` enables
+//! every tool that server exposes); a bare `*` is *not* a wildcard. To grant
+//! every tool, omit `tools` on the root `coda` agent (its default is all tools)
+//! — a sub-agent that omits `tools` gets none. An unknown plain name is a hard
+//! error, surfaced at startup; a pattern that matches nothing only warns.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use coda_agent::{AgentSpec, AgentTeam, BuildError, SubAgentMode, SystemPrompt};
 use coda_core::tool::ToolObject;
-use coda_tools::{PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
+use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The top-level agent's name. Reserved: configured agents may neither use it
 /// nor reference it as a sub-agent.
@@ -113,6 +117,28 @@ impl ToolRegistry {
         self.prebuilt
             .get(name)
             .map(|p| Box::new(p.clone()) as Box<dyn ToolSpec>)
+    }
+
+    /// Expand a trailing-`*` prefix pattern (e.g. `mcp__example__*`) to every tool
+    /// — built-in or prebuilt — whose name starts with `prefix`, as fresh specs
+    /// sorted by name. `prefix` is always non-empty (the caller rejects a bare
+    /// `*`).
+    fn expand_pattern(&self, prefix: &str) -> Vec<Box<dyn ToolSpec>> {
+        let mut names: Vec<&str> = BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(self.prebuilt.keys().map(String::as_str))
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        names.sort_unstable();
+        names
+            .iter()
+            .map(|name| {
+                // Every name came straight from a known source, so a miss is a
+                // broken internal invariant — surface it rather than dropping it.
+                self.resolve(name).expect("enumerated tool name resolves")
+            })
+            .collect()
     }
 
     /// Every registered prebuilt tool, for handing to the top-level agent.
@@ -313,22 +339,51 @@ pub fn load_root_agent_file(workspace_dir: &Path) -> Result<RootAgentFile, LoadE
     parse_root_agent_file(&content)
 }
 
-/// Resolve a list of tool names to [`ToolSpec`] factories via `registry`, failing
-/// with [`LoadError::UnknownTool`] (attributed to `agent`) on the first miss.
+/// Resolve a list of tool names to [`ToolSpec`] factories via `registry`.
+///
+/// A name ending in `*` with a non-empty prefix is a pattern (e.g.
+/// `mcp__example__*`), expanded to every matching tool; a pattern that matches
+/// nothing is warned about, not an error, since which MCP tools exist can
+/// legitimately vary. A bare `*` is not a pattern (to grant every tool, omit
+/// `tools` on the root agent) — it falls through and resolves to nothing, a hard
+/// error. A plain name that resolves to nothing is likewise a hard
+/// [`LoadError::UnknownTool`] (attributed to `agent`). The result is
+/// deduplicated by name so a pattern overlapping a literal entry doesn't trip
+/// the tool-namespace conflict check downstream.
 fn resolve_tools(
     registry: &ToolRegistry,
     agent: &str,
     names: &[String],
 ) -> Result<Vec<Box<dyn ToolSpec>>, LoadError> {
-    let mut tools = Vec::with_capacity(names.len());
+    let mut tools: Vec<Box<dyn ToolSpec>> = Vec::with_capacity(names.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |tools: &mut Vec<Box<dyn ToolSpec>>, spec: Box<dyn ToolSpec>| {
+        if seen.insert(spec.name().to_string()) {
+            tools.push(spec);
+        }
+    };
+
     for name in names {
-        match registry.resolve(name) {
-            Some(spec) => tools.push(spec),
-            None => {
-                return Err(LoadError::UnknownTool {
-                    agent: agent.to_string(),
-                    tool: name.clone(),
-                });
+        // A trailing `*` over a non-empty prefix is a pattern; a bare `*` is
+        // not (drop the whole `tools` field to get every tool) and falls
+        // through to the literal path, where it resolves to nothing.
+        if let Some(prefix) = name.strip_suffix('*').filter(|p| !p.is_empty()) {
+            let matches = registry.expand_pattern(prefix);
+            if matches.is_empty() {
+                warn!(agent, pattern = name, "tool pattern matched no tools");
+            }
+            for spec in matches {
+                push(&mut tools, spec);
+            }
+        } else {
+            match registry.resolve(name) {
+                Some(spec) => push(&mut tools, spec),
+                None => {
+                    return Err(LoadError::UnknownTool {
+                        agent: agent.to_string(),
+                        tool: name.clone(),
+                    });
+                }
             }
         }
     }
@@ -410,7 +465,54 @@ pub fn build_agent_team(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use coda_core::tool::ToolResult;
+
     use super::*;
+
+    /// A bare prebuilt tool with a fixed name, standing in for an MCP tool.
+    struct FakeTool {
+        name: String,
+        schema: serde_json::Value,
+    }
+
+    impl FakeTool {
+        fn boxed(name: &str) -> Box<dyn ToolObject> {
+            Box::new(FakeTool {
+                name: name.to_string(),
+                schema: serde_json::json!({}),
+            })
+        }
+    }
+
+    impl ToolObject for FakeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "fake"
+        }
+        fn parameter_schema(&self) -> &serde_json::Value {
+            &self.schema
+        }
+        fn execute(
+            self: Arc<Self>,
+            _params: String,
+        ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// A registry preloaded with two `mcp__example__*` tools and one other.
+    fn registry_with_mcp() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.insert(FakeTool::boxed("mcp__example__search"));
+        registry.insert(FakeTool::boxed("mcp__example__extract"));
+        registry.insert(FakeTool::boxed("mcp__other__list"));
+        registry
+    }
 
     fn write_agent(dir: &Path, name: &str, content: &str) {
         let agent_dir = dir.join(".coda").join("agents").join(name);
@@ -687,6 +789,60 @@ mod tests {
         assert!(matches!(
             result,
             Err(LoadError::UnknownTool { agent, .. }) if agent == ROOT_AGENT_NAME
+        ));
+    }
+
+    #[test]
+    fn tool_pattern_expands_to_matching_prebuilt_tools() {
+        let registry = registry_with_mcp();
+        let tools = resolve_tools(
+            &registry,
+            "explore",
+            &["read_file".to_string(), "mcp__example__*".to_string()],
+        )
+        .unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        // Literal first, then the two example tools (sorted); other excluded.
+        assert_eq!(
+            names,
+            vec!["read_file", "mcp__example__extract", "mcp__example__search"]
+        );
+    }
+
+    #[test]
+    fn tool_pattern_dedups_against_literal_overlap() {
+        let registry = registry_with_mcp();
+        // `mcp__example__search` named both explicitly and via the pattern must
+        // appear once, or the downstream namespace check would reject it.
+        let tools = resolve_tools(
+            &registry,
+            "explore",
+            &[
+                "mcp__example__search".to_string(),
+                "mcp__example__*".to_string(),
+            ],
+        )
+        .unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["mcp__example__search", "mcp__example__extract"]);
+    }
+
+    #[test]
+    fn tool_pattern_matching_nothing_is_not_an_error() {
+        let registry = registry_with_mcp();
+        let tools = resolve_tools(&registry, "explore", &["mcp__nope__*".to_string()]).unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn bare_star_is_not_a_wildcard() {
+        // A bare `*` is not a pattern (omit `tools` to get everything); it has
+        // no non-empty prefix, so it resolves like a literal and is unknown.
+        let registry = registry_with_mcp();
+        let result = resolve_tools(&registry, "explore", &["*".to_string()]);
+        assert!(matches!(
+            result,
+            Err(LoadError::UnknownTool { tool, .. }) if tool == "*"
         ));
     }
 
