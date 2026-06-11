@@ -322,6 +322,7 @@ dependencies = [
  "async-stream",
  "coda_core",
  "futures",
+ "serde",
 ]
 
 [[package]]

@@ -9,8 +9,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionTool,
-    ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionCall, FunctionCallStream,
-    FunctionObject,
+    ChatCompletionTools, CompletionUsage as OpenAICompletionUsage, CreateChatCompletionRequestArgs,
+    FunctionCall, FunctionCallStream, FunctionObject,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMProviderConfig,
@@ -127,11 +127,33 @@ impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
     }
 }
 
+/// `CreateChatCompletionStreamResponse` minus the fields we don't consume, plus
+/// `reasoning_content` — a non-standard field from OpenAI-compatible reasoning models
+/// (e.g. DeepSeek) that async-openai's built-in types drop.
+#[derive(Debug, serde::Deserialize)]
+struct ReasoningStreamResponse {
+    #[serde(default)]
+    choices: Vec<ReasoningStreamChoice>,
+    usage: Option<OpenAICompletionUsage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReasoningStreamChoice {
+    delta: ReasoningStreamDelta,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReasoningStreamDelta {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAI {
     client: Client<OpenAIConfig>,
     /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
-    stream: bool,
+    include_usage: bool,
 }
 
 impl LLMProvider for OpenAI {
@@ -158,14 +180,20 @@ impl LLMProvider for OpenAI {
             if let Some(max_completion_tokens) = request.max_completion_tokens {
                 req.max_completion_tokens(max_completion_tokens);
             }
-            let req = req.build().unwrap();
+            let mut req = req.build().unwrap();
+            // The `byot` feature disables async-openai's automatic `stream: true`
+            // injection, so set it explicitly here.
+            req.stream = Some(true);
             let mut chat = self.client.chat();
-            if self.stream {
+            if self.include_usage {
                 chat = chat
                     .header("stream_options", r#"{"include_usage": true}"#)
                     .unwrap();
             }
-            let mut stream = chat.create_stream(req).await.unwrap();
+            let mut stream = chat
+                .create_stream_byot::<_, ReasoningStreamResponse>(req)
+                .await
+                .unwrap();
             let mut chat_completion = ReducedChatCompletion::new();
             while let Some(response) = stream.next().await {
                 match response {
@@ -177,6 +205,11 @@ impl LLMProvider for OpenAI {
                             });
                         }
                         if let Some(choice) = stream_response.choices.pop() {
+                            // Reasoning must not enter the assistant message: DeepSeek
+                            // rejects requests that send reasoning back on later turns.
+                            if let Some(reasoning) = &choice.delta.reasoning_content {
+                                yield Ok(LLMStreamEvent::ReasoningChunk(reasoning.clone()));
+                            }
                             if let Some(content) = &choice.delta.content {
                                 chat_completion.reduce_content(content);
                                 yield Ok(LLMStreamEvent::ContentChunk(content.clone()));
@@ -209,7 +242,7 @@ impl OpenAI {
             .with_api_key(config.api_key);
         Self {
             client: Client::with_config(client_config),
-            stream: config.stream,
+            include_usage: config.include_usage,
         }
     }
 }

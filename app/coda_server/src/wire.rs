@@ -19,6 +19,12 @@ pub enum WireEvent {
         thread_id: String,
         content: String,
     },
+    #[serde(rename = "llm_reasoning_chunk")]
+    LlmReasoningChunk {
+        agent_name: String,
+        thread_id: String,
+        content: String,
+    },
     #[serde(rename = "llm_end")]
     LlmEnd {
         agent_name: String,
@@ -90,6 +96,11 @@ impl WireEvent {
                 model: request.model,
             },
             AgentEvent::LLMContentChunk(content) => WireEvent::LlmContentChunk {
+                agent_name,
+                thread_id,
+                content,
+            },
+            AgentEvent::LLMReasoningChunk(content) => WireEvent::LlmReasoningChunk {
                 agent_name,
                 thread_id,
                 content,

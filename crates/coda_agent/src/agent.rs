@@ -193,6 +193,9 @@ impl Envelope {
 pub enum AgentEvent {
     LLMStart(ChatCompletionRequest),
     LLMContentChunk(String),
+    /// A chunk of the model's reasoning / chain-of-thought text (reasoning
+    /// models only, e.g. DeepSeek).
+    LLMReasoningChunk(String),
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),

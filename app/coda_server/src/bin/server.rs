@@ -886,7 +886,7 @@ async fn main() {
     let provider = Arc::new(OpenAI::new(LLMProviderConfig {
         api_key,
         base_url,
-        stream: true,
+        include_usage: true,
     }));
 
     let shutdown = CancellationToken::new();

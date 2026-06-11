@@ -92,7 +92,8 @@ pub enum Message {
 pub struct LLMProviderConfig {
     pub api_key: String,
     pub base_url: String,
-    pub stream: bool,
+    /// Request token-usage statistics in the streaming response.
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +127,9 @@ impl std::error::Error for StreamError {}
 /// Events produced by `LLMProvider::stream`.
 pub enum LLMStreamEvent {
     ContentChunk(String),
+    /// A chunk of the model's reasoning / chain-of-thought text, from providers
+    /// that expose a separate reasoning stream (e.g. DeepSeek).
+    ReasoningChunk(String),
     Completed(AssistantMessage),
 }
 
