@@ -41,6 +41,15 @@ crates/
 - **`coda_mcp`** — MCP (Model Context Protocol) client integration. Supports stdio and HTTP (streamable-http) transports, adapts MCP server tools into `ToolObject` instances via `McpToolAdapter`, auto-prefixes tool names with `mcp__` and truncates to 64 chars. Configuration is read from the `mcpServers` field in a JSON file.
 - **`coda_server`** — Application layer: WebSocket server (axum) holding one live `Session` per connection (single-client via latest-wins eviction, single-workspace), ask_user tool, a `Transport` trait (typed `ClientMessage`/`ServerMessage` in/out, hiding framing & serialization) with a WebSocket implementation, system-prompt construction, file-based agent configuration (loads `.coda/agents/` into a validated `AgentTeam` at startup — see below), tool approval config, MCP server loading, and session persistence (JSON file storage). Located at `app/coda_server`. The user-facing client is the `coda_web` dashboard (`app/coda_web`).
 
+### Server Configuration
+
+The server reads `coda-server.toml` (overridable via `CODA_SERVER_CONFIG` env var). It declares providers and workspaces:
+
+- **Providers** — `[[providers]]` array-of-tables. Each is an OpenAI-compatible endpoint with `id`, `kind` (`"generic"` or `"deepseek"`), `api_key` / `base_url` (both support `${VAR}` env expansion), and an inline `models` array. Each model has a required `id` (the API model name sent in requests), an optional `name` (human-readable dashboard label; defaults to `id`), and optional `reasoning_efforts` (omit for non-reasoning models). Models under the same provider share one `Arc<OpenAI>` instance. The dashboard shows a grouped dropdown (provider → model) and a reasoning-effort selector when the selected model has reasoning levels.
+- **Workspaces** — `[[workspaces]]` array-of-tables with `id` and `path`. Sessions are scoped to a workspace and persisted under `.coda/sessions/`.
+
+Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first model of the first provider is the default.
+
 ### Key Abstractions
 
 - **`LLMProvider`** (`coda_core::llm`) — Model provider trait; core method `stream()` returns `Stream<LLMStreamEvent>`.
