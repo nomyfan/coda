@@ -21,6 +21,10 @@ pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<CompletionUsage>,
+    /// Provider-specific reasoning that must accompany tool calls on subsequent
+    /// requests. It stays separate from visible assistant content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Whether LLM generation for this assistant message was interrupted by user abort
     /// before a normal completion was produced.
     #[serde(default)]
@@ -164,5 +168,32 @@ impl<P: LLMProvider> LLMProvider for std::sync::Arc<P> {
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
         (**self).stream(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_reasoning_roundtrips_and_defaults_when_absent() {
+        let message = AssistantMessage {
+            reasoning_content: Some("tool reasoning".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value["reasoning_content"],
+            serde_json::json!("tool reasoning")
+        );
+
+        let legacy: AssistantMessage = serde_json::from_value(serde_json::json!({
+            "content": "",
+            "tool_calls": [],
+            "usage": null,
+            "aborted": false
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_content.is_none());
     }
 }

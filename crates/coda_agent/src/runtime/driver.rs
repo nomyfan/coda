@@ -621,8 +621,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::ReasoningChunk(chunk))) => {
-                            // Reasoning must stay out of `partial_content`: it must not
-                            // become part of the assistant message history.
+                            // Assistant content and reasoning remain separate.
+                            // The provider retains reasoning needed for later tool turns.
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(message),
