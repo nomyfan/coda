@@ -1,7 +1,10 @@
 import { Command } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { PendingApproval } from "@/lib/protocol";
-import { useCodaSession } from "@/lib/session";
+import {
+  type ReasoningEffort,
+  useCodaSession,
+} from "@/lib/session";
 import { Sidebar } from "@/components/sidebar";
 import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
@@ -35,6 +38,11 @@ function WorkspaceHeader({ approvals }: { approvals: PendingApproval[] }) {
 export default function App() {
   const session = useCodaSession();
   const newSessionTarget = useNewSessionStore((state) => state.target);
+  const [newSessionModel, setNewSessionModel] = useState<{
+    serverUrl: string;
+    providerId: string;
+    reasoningEffort: ReasoningEffort | null;
+  } | null>(null);
 
   const selectedServerUrl =
     newSessionTarget?.serverUrl ?? session.activeServer ?? "";
@@ -48,6 +56,9 @@ export default function App() {
 
   useEffect(() => {
     if (!newSessionTarget) {
+      if (newSessionModel) {
+        setNewSessionModel(null);
+      }
       return;
     }
     const resolved = resolveNewSessionTarget(
@@ -62,6 +73,36 @@ export default function App() {
       setNewSessionTarget(resolved);
     }
   }, [newSessionTarget, session.servers]);
+
+  useEffect(() => {
+    if (!newSessionTarget) {
+      return;
+    }
+    const server = session.servers.find(
+      (item) => item.url === newSessionTarget.serverUrl
+    );
+    const currentProvider = server?.providers.find(
+      (provider) =>
+        provider.id === newSessionModel?.providerId &&
+        newSessionModel.serverUrl === newSessionTarget.serverUrl
+    );
+    if (currentProvider) {
+      return;
+    }
+    const provider =
+      server?.providers.find(
+        (item) => item.id === server.defaultProvider
+      ) ?? server?.providers[0];
+    setNewSessionModel(
+      provider
+        ? {
+            serverUrl: newSessionTarget.serverUrl,
+            providerId: provider.id,
+            reasoningEffort: provider.reasoning_efforts[0] ?? null,
+          }
+        : null
+    );
+  }, [newSessionModel, newSessionTarget, session.servers]);
 
   function startNewSession() {
     beginNewSession(session.servers, session.activeServer);
@@ -109,7 +150,9 @@ export default function App() {
       session.sendTaskToNewSession(
         newSessionTarget.serverUrl,
         newSessionTarget.workspaceId,
-        task
+        task,
+        newSessionModel?.providerId,
+        newSessionModel?.reasoningEffort ?? null
       );
       clearNewSessionTarget();
       return;
@@ -162,6 +205,31 @@ export default function App() {
               workspace={selectedWorkspace}
               workspaces={workspaceIds}
               selectingTarget={showingNewSession}
+              providers={
+                showingNewSession
+                  ? selectedServerState?.providers ?? []
+                  : session.providers
+              }
+              providerId={
+                showingNewSession
+                  ? newSessionModel?.providerId
+                  : session.activeProviderId
+              }
+              reasoningEffort={
+                showingNewSession
+                  ? newSessionModel?.reasoningEffort ?? null
+                  : session.activeReasoningEffort
+              }
+              onSetModel={
+                showingNewSession
+                  ? (providerId, reasoningEffort) =>
+                      setNewSessionModel({
+                        serverUrl: selectedServerUrl,
+                        providerId,
+                        reasoningEffort,
+                      })
+                  : session.setModel
+              }
               onChangeServer={changeNewSessionServer}
               onChangeWorkspace={changeWorkspace}
               onSend={sendTask}

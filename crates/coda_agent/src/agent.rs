@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMProvider, Message, SystemMessage, ToolCall,
-    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, LLMProvider, Message, ReasoningEffort, SystemMessage,
+    ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
@@ -282,6 +282,9 @@ pub struct RunConfig<P: LLMProvider> {
     pub model: String,
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
+    /// Reasoning effort sent on each generation request. Outer `None` leaves the
+    /// provider default untouched; `Some(ReasoningEffort::None)` turns thinking off.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_approval: ToolApprovalMode,
     /// If set, pending approvals older than this duration are auto-rejected
     /// when opening a session.
@@ -295,6 +298,7 @@ impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
             model: self.model.clone(),
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
+            reasoning_effort: self.reasoning_effort,
             tool_approval: self.tool_approval.clone(),
             approval_timeout: self.approval_timeout,
         }

@@ -9,8 +9,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ConnectionStatus, ServerState } from "@/lib/session";
+import type {
+  ConnectionStatus,
+  ProviderInfo,
+  ReasoningEffort,
+  ServerState,
+} from "@/lib/session";
 import { serverLabel } from "@/components/session-utils";
+import { ModelSelector } from "@/components/model-selector";
 
 export function Composer({
   status,
@@ -20,6 +26,10 @@ export function Composer({
   workspace,
   workspaces,
   selectingTarget,
+  providers,
+  providerId,
+  reasoningEffort,
+  onSetModel,
   onChangeServer,
   onChangeWorkspace,
   onSend,
@@ -32,6 +42,13 @@ export function Composer({
   workspace?: string;
   workspaces: string[];
   selectingTarget: boolean;
+  providers: ProviderInfo[];
+  providerId?: string;
+  reasoningEffort: ReasoningEffort | null;
+  onSetModel: (
+    providerId: string,
+    reasoningEffort: ReasoningEffort | null
+  ) => void;
   onChangeServer: (serverUrl: string) => void;
   onChangeWorkspace: (workspaceId: string) => void;
   onSend: (task: string) => void;
@@ -102,9 +119,16 @@ export function Composer({
               ))}
             </SelectContent>
           </Select>
+          <ModelSelector
+            providers={providers}
+            providerId={providerId}
+            reasoningEffort={reasoningEffort}
+            disabled={!connected || running}
+            onSetModel={onSetModel}
+          />
         </div>
       ) : workspace ? (
-        <div className="mx-auto mb-2 flex max-w-4xl items-center gap-2">
+        <div className="mx-auto mb-2 flex max-w-4xl flex-wrap items-center gap-2">
           <Select value={workspace} onValueChange={onChangeWorkspace}>
             <SelectTrigger
               size="sm"
@@ -122,6 +146,13 @@ export function Composer({
               ))}
             </SelectContent>
           </Select>
+          <ModelSelector
+            providers={providers}
+            providerId={providerId}
+            reasoningEffort={reasoningEffort}
+            disabled={!connected || running}
+            onSetModel={onSetModel}
+          />
         </div>
       ) : null}
       <div className="relative mx-auto max-w-4xl">

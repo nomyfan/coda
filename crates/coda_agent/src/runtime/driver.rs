@@ -581,6 +581,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             model: self.config.model.clone(),
             max_completion_tokens: self.config.max_completion_tokens,
             temperature: self.config.temperature,
+            reasoning_effort: self.config.reasoning_effort,
             messages: self.agent.messages().await,
             tools: {
                 let mut tools = self.agent.tools.descriptors();

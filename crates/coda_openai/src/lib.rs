@@ -10,11 +10,12 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionTool,
     ChatCompletionTools, CompletionUsage as OpenAICompletionUsage, CreateChatCompletionRequestArgs,
-    FunctionCall, FunctionCallStream, FunctionObject,
+    FunctionCall, FunctionCallStream, FunctionObject, ReasoningEffort as OpenAIReasoningEffort,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMProviderConfig,
-    LLMStreamEvent, Message, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    LLMStreamEvent, Message, ReasoningEffort, StreamError, ToolCall, ToolCallOutcome,
+    ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -149,9 +150,32 @@ struct ReasoningStreamDelta {
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
 }
 
+/// Which OpenAI-compatible API the provider talks to. Most knobs are shared,
+/// but the way thinking is toggled differs: DeepSeek takes a top-level
+/// `thinking` object, while standard OpenAI-compatible endpoints rely on
+/// `reasoning_effort` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderKind {
+    #[default]
+    Generic,
+    Deepseek,
+}
+
+fn map_effort(effort: ReasoningEffort) -> OpenAIReasoningEffort {
+    match effort {
+        ReasoningEffort::None => OpenAIReasoningEffort::None,
+        ReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
+        ReasoningEffort::Low => OpenAIReasoningEffort::Low,
+        ReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
+        ReasoningEffort::High => OpenAIReasoningEffort::High,
+        ReasoningEffort::Xhigh => OpenAIReasoningEffort::Xhigh,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAI {
     client: Client<OpenAIConfig>,
+    kind: ProviderKind,
     /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
     include_usage: bool,
 }
@@ -161,6 +185,8 @@ impl LLMProvider for OpenAI {
         &self,
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
+        let kind = self.kind;
+        let reasoning_effort = request.reasoning_effort;
         async_stream::stream! {
             let messages: Vec<ChatCompletionRequestMessage> = request
                 .messages
@@ -180,10 +206,32 @@ impl LLMProvider for OpenAI {
             if let Some(max_completion_tokens) = request.max_completion_tokens {
                 req.max_completion_tokens(max_completion_tokens);
             }
+            // The effort level maps onto the standard `reasoning_effort` field.
+            // DeepSeek toggles thinking off via its own `thinking` object instead,
+            // so the field is omitted there when reasoning is turned off.
+            if let Some(effort) = reasoning_effort {
+                let set_effort = match kind {
+                    ProviderKind::Generic => true,
+                    ProviderKind::Deepseek => effort != ReasoningEffort::None,
+                };
+                if set_effort {
+                    req.reasoning_effort(map_effort(effort));
+                }
+            }
             let mut req = req.build().unwrap();
             // The `byot` feature disables async-openai's automatic `stream: true`
             // injection, so set it explicitly here.
             req.stream = Some(true);
+            // Serialize to a JSON body so provider-specific fields (e.g. DeepSeek's
+            // `thinking`) can be injected before the request is sent.
+            let mut body = serde_json::to_value(&req).unwrap();
+            if kind == ProviderKind::Deepseek
+                && let Some(effort) = reasoning_effort
+                && let Some(obj) = body.as_object_mut()
+            {
+                let state = if effort == ReasoningEffort::None { "disabled" } else { "enabled" };
+                obj.insert("thinking".to_string(), serde_json::json!({ "type": state }));
+            }
             let mut chat = self.client.chat();
             if self.include_usage {
                 chat = chat
@@ -191,7 +239,7 @@ impl LLMProvider for OpenAI {
                     .unwrap();
             }
             let mut stream = chat
-                .create_stream_byot::<_, ReasoningStreamResponse>(req)
+                .create_stream_byot::<_, ReasoningStreamResponse>(body)
                 .await
                 .unwrap();
             let mut chat_completion = ReducedChatCompletion::new();
@@ -236,12 +284,13 @@ impl LLMProvider for OpenAI {
 }
 
 impl OpenAI {
-    pub fn new(config: LLMProviderConfig) -> Self {
+    pub fn new(config: LLMProviderConfig, kind: ProviderKind) -> Self {
         let client_config = OpenAIConfig::new()
             .with_api_base(config.base_url)
             .with_api_key(config.api_key);
         Self {
             client: Client::with_config(client_config),
+            kind,
             include_usage: config.include_usage,
         }
     }

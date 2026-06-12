@@ -8,7 +8,7 @@ use coda_agent::{
     AgentTeam, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt, Shutdown,
     SystemPrompt, runtime::SessionStorage,
 };
-use coda_core::llm::LLMProviderConfig;
+use coda_core::llm::{LLMProviderConfig, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
     agents::{ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
@@ -18,7 +18,10 @@ use coda_server::{
     mcp::McpServers,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
-    wire::{ClientMessage, ServerMessage, SessionSummaryWire, WireEvent, WorkspaceSummaryWire},
+    wire::{
+        ClientMessage, ProviderInfoWire, ServerMessage, SessionSummaryWire, WireEvent,
+        WorkspaceSummaryWire,
+    },
 };
 use coda_tools::{BuildContext, ToolSpec};
 use std::collections::{HashMap, HashSet};
@@ -30,10 +33,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 struct AppState {
-    provider: Arc<OpenAI>,
-    model: String,
+    /// All configured providers, keyed by id. The dashboard chooses which one a
+    /// session uses; `default_provider` is the fallback until it selects.
+    providers: HashMap<String, Arc<ProviderHandle>>,
+    default_provider: String,
     shutdown: CancellationToken,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
+}
+
+/// A constructed provider plus the per-provider settings the agent needs at
+/// request time. `reasoning_efforts` is the list the UI offers; empty means the
+/// model has no reasoning controls.
+struct ProviderHandle {
+    provider: Arc<OpenAI>,
+    model: String,
+    /// Effort levels surfaced to the dashboard so it can render reasoning controls.
+    reasoning_efforts: Vec<ReasoningEffort>,
 }
 
 struct WorkspaceState {
@@ -57,11 +72,17 @@ struct ActiveSession {
     session: Session,
     root_name: String,
     turn_running: bool,
+    /// The provider/model and reasoning setting this session was opened with.
+    /// Switching them reopens the session (see `SetModel`).
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 struct PendingOpen {
     workspace: Arc<WorkspaceState>,
     session_id: String,
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
     needed: HashSet<String>,
     decisions: HashMap<String, ResumeDecision>,
 }
@@ -92,13 +113,20 @@ async fn open_session(
     app: &AppState,
     workspace: &WorkspaceState,
     session_id: &str,
+    provider_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Result<Session, OpenError> {
+    let provider = app
+        .providers
+        .get(provider_id)
+        .expect("caller passes a validated provider id");
     let config = RunConfig {
-        provider: app.provider.clone(),
-        model: app.model.clone(),
+        provider: provider.provider.clone(),
+        model: provider.model.clone(),
         max_completion_tokens: Some(5000),
         temperature: Some(0.7),
+        reasoning_effort,
         tool_approval: workspace.approval_config.clone().into_approval_mode(),
         // Disabled: approvals never auto-reject; a pending ask_user/tool call
         // waits indefinitely until the user resolves it.
@@ -206,6 +234,65 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
     workspaces
 }
 
+/// A session's initial reasoning effort: the provider's first declared level, or
+/// `None` when the model has no reasoning controls. The dashboard switches it
+/// afterward with `SetModel`.
+fn initial_reasoning_effort(provider: &ProviderHandle) -> Option<ReasoningEffort> {
+    provider.reasoning_efforts.first().copied()
+}
+
+fn selection_is_valid(
+    app: &AppState,
+    provider_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> bool {
+    let Some(provider) = app.providers.get(provider_id) else {
+        return false;
+    };
+    match reasoning_effort {
+        None => true,
+        Some(ReasoningEffort::None) => !provider.reasoning_efforts.is_empty(),
+        Some(effort) => provider.reasoning_efforts.contains(&effort),
+    }
+}
+
+/// Resolve a client-supplied model selection. A valid `provider_id` is taken
+/// together with its `reasoning_effort`; anything else falls back to the default
+/// provider at its initial effort.
+fn resolve_selection(
+    app: &AppState,
+    provider_id: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> (String, Option<ReasoningEffort>) {
+    match provider_id {
+        Some(id) if selection_is_valid(app, &id, reasoning_effort) => (id, reasoning_effort),
+        _ => {
+            let id = app.default_provider.clone();
+            let effort = initial_reasoning_effort(
+                app.providers
+                    .get(&id)
+                    .expect("default provider always present"),
+            );
+            (id, effort)
+        }
+    }
+}
+
+/// The selectable providers, sorted by id for a stable dashboard ordering.
+fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
+    let mut infos: Vec<ProviderInfoWire> = app
+        .providers
+        .iter()
+        .map(|(id, handle)| ProviderInfoWire {
+            id: id.clone(),
+            model: handle.model.clone(),
+            reasoning_efforts: handle.reasoning_efforts.clone(),
+        })
+        .collect();
+    infos.sort_by(|a, b| a.id.cmp(&b.id));
+    infos
+}
+
 async fn send_workspace_catalog<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
@@ -219,6 +306,18 @@ async fn send_workspace_catalog<
         .await
 }
 
+async fn send_provider_catalog<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: &T,
+    app: &AppState,
+) -> bool {
+    transport
+        .send(&ServerMessage::ProviderCatalog {
+            providers: provider_infos(app),
+            default_provider: app.default_provider.clone(),
+        })
+        .await
+}
+
 async fn open_session_and_send_snapshot<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
@@ -226,9 +325,20 @@ async fn open_session_and_send_snapshot<
     app: &AppState,
     workspace: &WorkspaceState,
     session_id: &str,
+    provider_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Option<OpenedSession> {
-    let first = match open_session(app, workspace, session_id, HashMap::new()).await {
+    let first = match open_session(
+        app,
+        workspace,
+        session_id,
+        provider_id,
+        reasoning_effort,
+        HashMap::new(),
+    )
+    .await
+    {
         Ok(session) => Ok(session),
         Err(OpenError::PendingApprovalsRequired(pending)) => Err(pending),
         Err(err) => {
@@ -256,6 +366,8 @@ async fn open_session_and_send_snapshot<
             session_id: session_id.to_string(),
             messages,
             pending_approvals: pending.clone(),
+            provider_id: provider_id.to_string(),
+            reasoning_effort,
         })
         .await
     {
@@ -265,7 +377,16 @@ async fn open_session_and_send_snapshot<
     match first {
         Ok(session) => Some(OpenedSession::Live(session)),
         Err(_) if decisions.is_empty() => Some(OpenedSession::Pending(pending)),
-        Err(_) => match open_session(app, workspace, session_id, decisions).await {
+        Err(_) => match open_session(
+            app,
+            workspace,
+            session_id,
+            provider_id,
+            reasoning_effort,
+            decisions,
+        )
+        .await
+        {
             Ok(session) => Some(OpenedSession::Live(session)),
             Err(OpenError::PendingApprovalsRequired(more)) => Some(OpenedSession::Pending(more)),
             Err(err) => {
@@ -294,11 +415,15 @@ fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
 fn make_pending_open(
     workspace: Arc<WorkspaceState>,
     session_id: String,
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
     approvals: Vec<coda_agent::PendingApproval>,
 ) -> PendingOpen {
     PendingOpen {
         workspace,
         session_id,
+        provider_id,
+        reasoning_effort,
         needed: approvals
             .into_iter()
             .map(|approval| approval.thread_id)
@@ -338,6 +463,7 @@ fn spawn_session_forwarder(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_active_session(
     active: &mut HashMap<(String, String), ActiveSession>,
     tx: &mpsc::UnboundedSender<SessionEnvelope>,
@@ -345,6 +471,8 @@ fn insert_active_session(
     workspace: Arc<WorkspaceState>,
     session_id: String,
     session: Session,
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
 ) {
     let generation = *next_generation;
     *next_generation += 1;
@@ -366,6 +494,8 @@ fn insert_active_session(
             session,
             root_name,
             turn_running,
+            provider_id,
+            reasoning_effort,
         },
     );
     info!(workspace_id = %workspace_id, session_id = %session_id, "session opened");
@@ -412,9 +542,12 @@ async fn handle_dashboard_command<
 ) -> bool {
     match command {
         ClientMessage::ListWorkspaces => send_workspace_catalog(transport, app).await,
+        ClientMessage::ListProviders => send_provider_catalog(transport, app).await,
         ClientMessage::OpenSession {
             workspace_id,
             session_id,
+            provider_id,
+            reasoning_effort,
         } => {
             if let Err(err) = validate_session_id(&session_id) {
                 warn!(workspace_id = %workspace_id, "rejecting open: {err}");
@@ -428,11 +561,17 @@ async fn handle_dashboard_command<
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
                 return true;
             };
+            // Honor the client's chosen model (e.g. picked on a new session),
+            // otherwise fall back to the default provider.
+            let (provider_id, reasoning_effort) =
+                resolve_selection(app, provider_id, reasoning_effort);
             match open_session_and_send_snapshot(
                 transport,
                 app,
                 &workspace,
                 &session_id,
+                &provider_id,
+                reasoning_effort,
                 HashMap::new(),
             )
             .await
@@ -445,11 +584,22 @@ async fn handle_dashboard_command<
                         workspace,
                         session_id,
                         session,
+                        provider_id,
+                        reasoning_effort,
                     );
                     send_workspace_catalog(transport, app).await
                 }
                 Some(OpenedSession::Pending(approvals)) => {
-                    pending.insert(key, make_pending_open(workspace, session_id, approvals));
+                    pending.insert(
+                        key,
+                        make_pending_open(
+                            workspace,
+                            session_id,
+                            provider_id,
+                            reasoning_effort,
+                            approvals,
+                        ),
+                    );
                     true
                 }
                 None => true,
@@ -504,10 +654,14 @@ async fn handle_dashboard_command<
             let Some(mut pending_open) = pending.remove(&key) else {
                 return true;
             };
+            let provider_id = pending_open.provider_id.clone();
+            let reasoning_effort = pending_open.reasoning_effort;
             match open_session(
                 app,
                 &pending_open.workspace,
                 &pending_open.session_id,
+                &provider_id,
+                reasoning_effort,
                 std::mem::take(&mut pending_open.decisions),
             )
             .await
@@ -520,6 +674,8 @@ async fn handle_dashboard_command<
                         pending_open.workspace,
                         pending_open.session_id,
                         session,
+                        provider_id,
+                        reasoning_effort,
                     );
                 }
                 Err(OpenError::PendingApprovalsRequired(more)) => {
@@ -530,7 +686,13 @@ async fn handle_dashboard_command<
                     }
                     pending.insert(
                         key,
-                        make_pending_open(pending_open.workspace, pending_open.session_id, more),
+                        make_pending_open(
+                            pending_open.workspace,
+                            pending_open.session_id,
+                            provider_id,
+                            reasoning_effort,
+                            more,
+                        ),
                     );
                 }
                 Err(err) => send_open_error(transport, &workspace_id, &session_id, err).await,
@@ -585,6 +747,77 @@ async fn handle_dashboard_command<
                 pattern,
             )
             .await
+        }
+        ClientMessage::SetModel {
+            workspace_id,
+            session_id,
+            provider_id,
+            reasoning_effort,
+        } => {
+            let key = (workspace_id.clone(), session_id.clone());
+            if !selection_is_valid(app, &provider_id, reasoning_effort) {
+                warn!(workspace_id = %workspace_id, %provider_id, "set_model has an invalid selection");
+                return true;
+            }
+            let Some(active_session) = active.get(&key) else {
+                return true;
+            };
+            // Nothing to do if the selection is unchanged.
+            if active_session.provider_id == provider_id
+                && active_session.reasoning_effort == reasoning_effort
+            {
+                return true;
+            }
+            // The session is rebuilt with a new RunConfig; only safe while idle.
+            if active_session.turn_running {
+                warn!(workspace_id = %workspace_id, session_id = %session_id, "ignoring set_model while a turn is running");
+                return true;
+            }
+            let Some(workspace) = app.workspaces.get(&workspace_id).cloned() else {
+                warn!(workspace_id = %workspace_id, "unknown workspace requested");
+                return true;
+            };
+            // Open the replacement before tearing down the current session, so a
+            // failed open leaves the existing one intact.
+            match open_session(
+                app,
+                &workspace,
+                &session_id,
+                &provider_id,
+                reasoning_effort,
+                HashMap::new(),
+            )
+            .await
+            {
+                Ok(session) => {
+                    if let Some(old) = active.remove(&key) {
+                        old.session.shutdown(Shutdown::Abort).await;
+                    }
+                    insert_active_session(
+                        active,
+                        tx,
+                        next_generation,
+                        workspace,
+                        session_id.clone(),
+                        session,
+                        provider_id.clone(),
+                        reasoning_effort,
+                    );
+                    return transport
+                        .send(&ServerMessage::ModelChanged {
+                            workspace_id,
+                            session_id,
+                            provider_id,
+                            reasoning_effort,
+                        })
+                        .await;
+                }
+                Err(OpenError::PendingApprovalsRequired(_)) => {
+                    warn!(workspace_id = %workspace_id, session_id = %session_id, "cannot switch model while approvals are pending");
+                }
+                Err(err) => send_open_error(transport, &workspace_id, &session_id, err).await,
+            }
+            true
         }
     }
 }
@@ -667,6 +900,9 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
     let mut client_connected = true;
 
     if !send_workspace_catalog(&transport, &app).await {
+        return;
+    }
+    if !send_provider_catalog(&transport, &app).await {
         return;
     }
 
@@ -879,27 +1115,49 @@ async fn main() {
         )
         .init();
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
-    let base_url = std::env::var("OPENAI_BASE_URL").expect("OPENAI_BASE_URL must be set");
-    let model = std::env::var("OPENAI_MODEL").expect("OPENAI_MODEL must be set");
-
-    let provider = Arc::new(OpenAI::new(LLMProviderConfig {
-        api_key,
-        base_url,
-        include_usage: true,
-    }));
-
     let shutdown = CancellationToken::new();
 
     let config_path = server_config_path();
     let server_config = load_server_config(&config_path).unwrap_or_else(|e| {
         eprintln!("error loading {}: {e}", config_path.display());
         eprintln!("example:");
+        eprintln!("[[providers]]");
+        eprintln!("id = \"deepseek\"");
+        eprintln!("kind = \"deepseek\"");
+        eprintln!("api_key = \"${{DEEPSEEK_API_KEY}}\"");
+        eprintln!("base_url = \"https://api.deepseek.com/v1\"");
+        eprintln!("model = \"deepseek-reasoner\"");
+        eprintln!("reasoning_efforts = [\"low\", \"medium\", \"high\"]");
+        eprintln!();
         eprintln!("[[workspaces]]");
         eprintln!("id = \"coda\"");
         eprintln!("path = \"/path/to/workspace\"");
+        eprintln!("provider = \"deepseek\"");
         std::process::exit(1);
     });
+
+    // Config guarantees at least one provider; the first is the session default.
+    let default_provider = server_config.providers[0].id.clone();
+    let providers: HashMap<String, Arc<ProviderHandle>> = server_config
+        .providers
+        .into_iter()
+        .map(|p| {
+            let handle = ProviderHandle {
+                provider: Arc::new(OpenAI::new(
+                    LLMProviderConfig {
+                        api_key: p.api_key,
+                        base_url: p.base_url,
+                        include_usage: p.include_usage,
+                    },
+                    p.kind,
+                )),
+                model: p.model,
+                reasoning_efforts: p.reasoning_efforts,
+            };
+            (p.id, Arc::new(handle))
+        })
+        .collect();
+
     let mut workspaces = HashMap::new();
     for workspace in server_config.workspaces {
         let id = workspace.id.clone();
@@ -913,8 +1171,8 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        provider,
-        model,
+        providers,
+        default_provider,
         shutdown: shutdown.clone(),
         workspaces,
     });

@@ -66,9 +66,35 @@ export type WorkspaceSummary = {
   sessions: WorkspaceSession[];
 };
 
+/** Reasoning effort levels, mirroring the server enum. */
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
+
+/**
+ * A provider the dashboard can select. Empty `reasoning_efforts` means the
+ * model has no reasoning controls.
+ */
+export type ProviderInfo = {
+  id: string;
+  model: string;
+  reasoning_efforts: ReasoningEffort[];
+};
+
 export type ClientMessage =
   | { type: "list_workspaces" }
-  | { type: "open_session"; workspace_id: string; session_id: string }
+  | { type: "list_providers" }
+  | {
+      type: "open_session";
+      workspace_id: string;
+      session_id: string;
+      provider_id?: string;
+      reasoning_effort?: ReasoningEffort | null;
+    }
   | { type: "task"; workspace_id: string; session_id: string; task: string }
   | {
       type: "resume";
@@ -80,7 +106,14 @@ export type ClientMessage =
     }
   | { type: "abort"; workspace_id: string; session_id: string }
   | { type: "delete_session"; workspace_id: string; session_id: string }
-  | { type: "add_allow_pattern"; workspace_id: string; pattern: string };
+  | { type: "add_allow_pattern"; workspace_id: string; pattern: string }
+  | {
+      type: "set_model";
+      workspace_id: string;
+      session_id: string;
+      provider_id: string;
+      reasoning_effort: ReasoningEffort | null;
+    };
 
 export type WireEvent =
   | {
@@ -144,11 +177,25 @@ export type ServerMessage =
       workspaces: WorkspaceSummary[];
     }
   | {
+      type: "provider_catalog";
+      providers: ProviderInfo[];
+      default_provider: string;
+    }
+  | {
+      type: "model_changed";
+      workspace_id: string;
+      session_id: string;
+      provider_id: string;
+      reasoning_effort?: ReasoningEffort | null;
+    }
+  | {
       type: "snapshot";
       workspace_id: string;
       session_id: string;
       messages: HistoryMessage[];
       pending_approvals?: PendingApproval[];
+      provider_id: string;
+      reasoning_effort?: ReasoningEffort | null;
     }
   | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
   | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null };

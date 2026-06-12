@@ -96,6 +96,21 @@ pub struct LLMProviderConfig {
     pub include_usage: bool,
 }
 
+/// How hard a reasoning model should think. Provider-agnostic; the provider
+/// maps it to its own wire representation. `None` is the "thinking off" state —
+/// distinct from `reasoning_effort` being absent, which leaves the provider's
+/// own default untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -103,6 +118,9 @@ pub struct ChatCompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Reasoning effort for this request. Outer `None` leaves the provider
+    /// default; `Some(ReasoningEffort::None)` explicitly turns thinking off.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]

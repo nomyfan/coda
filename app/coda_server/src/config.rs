@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use coda_agent::ToolApprovalMode;
-use coda_core::llm::ToolCall;
+use coda_core::llm::{ReasoningEffort, ToolCall};
+use coda_openai::ProviderKind;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -28,6 +29,20 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+/// A configured LLM provider. `reasoning_efforts` declares which effort levels
+/// the model accepts; an empty list means the model is not a reasoning model,
+/// so the UI shows no reasoning controls for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub kind: ProviderKind,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub include_usage: bool,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub id: String,
@@ -36,6 +51,7 @@ pub struct WorkspaceConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
 }
 
@@ -48,6 +64,106 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let doc = content
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
+
+    let providers = parse_providers(&doc)?;
+    let workspaces = parse_workspaces(&doc, base_dir)?;
+
+    Ok(ServerConfig {
+        providers,
+        workspaces,
+    })
+}
+
+fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, ConfigError> {
+    let providers = doc
+        .get("providers")
+        .and_then(|item| item.as_array_of_tables())
+        .ok_or_else(|| ConfigError::Parse("missing [[providers]] table".to_string()))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut parsed = Vec::new();
+    for provider in providers {
+        let id = require_str(provider, "id", "provider")?;
+        if !seen.insert(id.clone()) {
+            return Err(ConfigError::Parse(format!("duplicate provider id '{id}'")));
+        }
+        let kind = match provider.get("kind").and_then(|v| v.as_str()) {
+            None | Some("generic") => ProviderKind::Generic,
+            Some("deepseek") => ProviderKind::Deepseek,
+            Some(other) => {
+                return Err(ConfigError::Parse(format!(
+                    "provider '{id}' has unknown kind '{other}' (expected 'generic' or 'deepseek')"
+                )));
+            }
+        };
+        let api_key = expand_env(&require_str(provider, "api_key", "provider")?)?;
+        let base_url = expand_env(&require_str(provider, "base_url", "provider")?)?;
+        let model = require_str(provider, "model", "provider")?;
+        let include_usage = provider
+            .get("include_usage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let reasoning_efforts = parse_reasoning_efforts(provider, &id)?;
+
+        parsed.push(ProviderConfig {
+            id,
+            kind,
+            api_key,
+            base_url,
+            model,
+            include_usage,
+            reasoning_efforts,
+        });
+    }
+
+    if parsed.is_empty() {
+        return Err(ConfigError::Parse(
+            "server config must define at least one provider".to_string(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_reasoning_efforts(
+    provider: &toml_edit::Table,
+    provider_id: &str,
+) -> Result<Vec<ReasoningEffort>, ConfigError> {
+    let Some(array) = provider.get("reasoning_efforts") else {
+        return Ok(Vec::new());
+    };
+    let array = array.as_array().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "provider '{provider_id}' reasoning_efforts must be an array"
+        ))
+    })?;
+    array
+        .iter()
+        .map(|value| {
+            let raw = value.as_str().ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "provider '{provider_id}' reasoning_efforts must be strings"
+                ))
+            })?;
+            match raw {
+                "minimal" => Ok(ReasoningEffort::Minimal),
+                "low" => Ok(ReasoningEffort::Low),
+                "medium" => Ok(ReasoningEffort::Medium),
+                "high" => Ok(ReasoningEffort::High),
+                "xhigh" => Ok(ReasoningEffort::Xhigh),
+                // `none` is the thinking-off state, not an offered level.
+                other => Err(ConfigError::Parse(format!(
+                    "provider '{provider_id}' has unknown reasoning effort '{other}' (expected 'minimal', 'low', 'medium', 'high', or 'xhigh')"
+                ))),
+            }
+        })
+        .collect()
+}
+
+fn parse_workspaces(
+    doc: &toml_edit::DocumentMut,
+    base_dir: &Path,
+) -> Result<Vec<WorkspaceConfig>, ConfigError> {
     let workspaces = doc
         .get("workspaces")
         .and_then(|item| item.as_array_of_tables())
@@ -56,11 +172,7 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let mut seen = std::collections::HashSet::new();
     let mut parsed = Vec::new();
     for workspace in workspaces {
-        let id = workspace
-            .get("id")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| ConfigError::Parse("workspace id must be a string".to_string()))?
-            .to_string();
+        let id = require_str(workspace, "id", "workspace")?;
         if !is_workspace_id(&id) {
             return Err(ConfigError::Parse(format!(
                 "workspace id '{id}' may only contain letters, digits, '.', '_', and '-'"
@@ -70,11 +182,8 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
             return Err(ConfigError::Parse(format!("duplicate workspace id '{id}'")));
         }
 
-        let raw_path = workspace
-            .get("path")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| ConfigError::Parse(format!("workspace '{id}' path must be a string")))?;
-        let path = resolve_workspace_path(base_dir, raw_path);
+        let raw_path = require_str(workspace, "path", "workspace")?;
+        let path = resolve_workspace_path(base_dir, &raw_path);
         parsed.push(WorkspaceConfig { id, path });
     }
 
@@ -84,7 +193,28 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
         ));
     }
 
-    Ok(ServerConfig { workspaces: parsed })
+    Ok(parsed)
+}
+
+/// Read a required string field, producing a `{kind} '{field}' must be a string`
+/// style error when it is missing or not a string.
+fn require_str(table: &toml_edit::Table, field: &str, kind: &str) -> Result<String, ConfigError> {
+    table
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| ConfigError::Parse(format!("{kind} {field} must be a string")))
+}
+
+/// Expand a single leading `${VAR}` reference from the environment so secrets
+/// (API keys) can stay out of the config file. A value without the `${...}`
+/// wrapper is returned unchanged.
+fn expand_env(value: &str) -> Result<String, ConfigError> {
+    let Some(var) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        return Ok(value.to_string());
+    };
+    std::env::var(var)
+        .map_err(|_| ConfigError::Parse(format!("environment variable '{var}' is not set")))
 }
 
 fn is_workspace_id(value: &str) -> bool {
@@ -371,10 +501,21 @@ mod tests {
         assert!(deny.is_empty());
     }
 
+    const PROVIDERS: &str = r#"
+[[providers]]
+id = "deepseek"
+kind = "deepseek"
+api_key = "sk-test"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-reasoner"
+reasoning_efforts = ["low", "medium", "high"]
+"#;
+
     #[test]
     fn parse_server_config_resolves_workspaces() {
         let config = parse_server_config(
-            r#"
+            &format!(
+                r#"{PROVIDERS}
 [[workspaces]]
 id = "coda"
 path = "projects/coda"
@@ -382,7 +523,8 @@ path = "projects/coda"
 [[workspaces]]
 id = "scratch"
 path = "/tmp/scratch"
-"#,
+"#
+            ),
             Path::new("/srv"),
         )
         .unwrap();
@@ -400,12 +542,74 @@ path = "/tmp/scratch"
                 },
             ]
         );
+        assert_eq!(
+            config.providers,
+            vec![ProviderConfig {
+                id: "deepseek".to_string(),
+                kind: ProviderKind::Deepseek,
+                api_key: "sk-test".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                model: "deepseek-reasoner".to_string(),
+                include_usage: true,
+                reasoning_efforts: vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_server_config_expands_env_api_key() {
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::set_var("CODA_TEST_KEY", "secret-from-env") };
+        let config = parse_server_config(
+            r#"
+[[providers]]
+id = "deepseek"
+api_key = "${CODA_TEST_KEY}"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-reasoner"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap();
+        assert_eq!(config.providers[0].api_key, "secret-from-env");
+        assert_eq!(config.providers[0].kind, ProviderKind::Generic);
+        assert!(config.providers[0].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn parse_server_config_rejects_unknown_reasoning_effort() {
+        let err = parse_server_config(
+            r#"
+[[providers]]
+id = "deepseek"
+api_key = "sk-test"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-reasoner"
+reasoning_efforts = ["ultra"]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown reasoning effort 'ultra'"));
     }
 
     #[test]
     fn parse_server_config_rejects_duplicate_ids() {
         let err = parse_server_config(
-            r#"
+            &format!(
+                r#"{PROVIDERS}
 [[workspaces]]
 id = "coda"
 path = "/tmp/a"
@@ -413,7 +617,8 @@ path = "/tmp/a"
 [[workspaces]]
 id = "coda"
 path = "/tmp/b"
-"#,
+"#
+            ),
             Path::new("/srv"),
         )
         .unwrap_err();
