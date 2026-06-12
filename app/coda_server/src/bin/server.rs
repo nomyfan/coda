@@ -1125,7 +1125,7 @@ async fn main() {
         eprintln!("id = \"deepseek\"");
         eprintln!("kind = \"deepseek\"");
         eprintln!("api_key = \"${{DEEPSEEK_API_KEY}}\"");
-        eprintln!("base_url = \"https://api.deepseek.com/v1\"");
+        eprintln!("base_url = \"https://api.deepseek.com\"");
         eprintln!("model = \"deepseek-reasoner\"");
         eprintln!("reasoning_efforts = [\"low\", \"medium\", \"high\"]");
         eprintln!();

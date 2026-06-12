@@ -8,14 +8,16 @@ import {
 } from "@/components/ui/select";
 import type { ProviderInfo, ReasoningEffort } from "@/lib/session";
 
+const defaultReasoning = "__default__";
+
 function effortLabel(effort: ReasoningEffort) {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
 /**
  * Pick the reasoning value to carry over when switching provider: a model with
- * no reasoning controls gets `null`; "off" stays off; an effort the new
- * provider still accepts is kept, otherwise its first declared level.
+ * no reasoning controls gets `null`; provider default and "off" carry over; an
+ * effort the new provider still accepts is kept, otherwise its first level.
  */
 function carryReasoning(
   provider: ProviderInfo,
@@ -24,10 +26,10 @@ function carryReasoning(
   if (provider.reasoning_efforts.length === 0) {
     return null;
   }
-  if (current === "none") {
+  if (current === null || current === "none") {
     return current;
   }
-  if (current !== null && provider.reasoning_efforts.includes(current)) {
+  if (provider.reasoning_efforts.includes(current)) {
     return current;
   }
   return provider.reasoning_efforts[0];
@@ -81,9 +83,12 @@ export function ModelSelector({
       </Select>
       {efforts.length > 0 ? (
         <Select
-          value={reasoningEffort ?? undefined}
+          value={reasoningEffort ?? defaultReasoning}
           onValueChange={(value) =>
-            onSetModel(providerId, value as ReasoningEffort)
+            onSetModel(
+              providerId,
+              value === defaultReasoning ? null : (value as ReasoningEffort)
+            )
           }
           disabled={disabled}
         >
@@ -92,6 +97,7 @@ export function ModelSelector({
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>
           <SelectContent position="popper" side="top">
+            <SelectItem value={defaultReasoning}>Default</SelectItem>
             <SelectItem value="none">Off</SelectItem>
             {efforts.map((effort) => (
               <SelectItem key={effort} value={effort}>
