@@ -202,7 +202,7 @@ fn inject_deepseek_reasoning(body: &mut serde_json::Value, messages: &[Message])
 pub struct OpenAI {
     client: Client<OpenAIConfig>,
     kind: ProviderKind,
-    /// Add "stream_options" header with `{"include_usage": true}` to include usage in streaming response.
+    /// Add `stream_options.include_usage` to the request body.
     include_usage: bool,
 }
 

@@ -1437,11 +1437,14 @@ export function useCodaSession() {
         ];
       selectSession(store, server, workspace, session);
       if (!local?.draft) {
-        send(server, {
-          type: "open_session",
-          workspace_id: workspace,
-          session_id: session,
-        });
+        const opened =
+          local ??
+          store.getState().servers[server]?.sessions[
+            sessionKey(workspace, session)
+          ];
+        if (opened) {
+          send(server, openMessage(opened));
+        }
       }
     },
     [send, store]

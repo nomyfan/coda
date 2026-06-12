@@ -462,7 +462,35 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test owns its unique environment variable name.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard restores the unique variable it owns.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn wildcard_basics() {
@@ -562,8 +590,7 @@ path = "/tmp/scratch"
 
     #[test]
     fn parse_server_config_expands_env_api_key() {
-        // SAFETY: single-threaded test, no concurrent env access.
-        unsafe { std::env::set_var("CODA_TEST_KEY", "secret-from-env") };
+        let _env = EnvVarGuard::set("CODA_TEST_KEY", "secret-from-env");
         let config = parse_server_config(
             r#"
 [[providers]]

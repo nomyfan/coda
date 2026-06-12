@@ -1132,7 +1132,6 @@ async fn main() {
         eprintln!("[[workspaces]]");
         eprintln!("id = \"coda\"");
         eprintln!("path = \"/path/to/workspace\"");
-        eprintln!("provider = \"deepseek\"");
         std::process::exit(1);
     });
 
