@@ -147,7 +147,7 @@ fn parse_models(
     };
     let array = array.as_array().ok_or_else(|| {
         ConfigError::Parse(format!(
-            "provider '{provider_id}' 'models' must be an array of tables"
+            "provider '{provider_id}' 'models' must be an array of inline tables"
         ))
     })?;
 

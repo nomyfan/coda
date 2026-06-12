@@ -18,7 +18,7 @@ function effortLabel(effort: ReasoningEffort) {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
-/** Map of provider name → list of its models, in config order. */
+/** Map of provider name → list of its models, as received from the server. */
 type ProviderGroups = Record<string, ProviderInfo[]>;
 
 function groupProviders(providers: ProviderInfo[]): ProviderGroups {

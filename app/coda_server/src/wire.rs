@@ -479,13 +479,13 @@ mod tests {
         let msg = ServerMessage::ModelChanged {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
-            provider_id: "openai".into(),
+            provider_id: "openai:gpt-4o".into(),
             reasoning_effort: None,
         };
         assert!(matches!(
             serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap(),
             ServerMessage::ModelChanged { provider_id, reasoning_effort, .. }
-                if provider_id == "openai" && reasoning_effort.is_none()
+                if provider_id == "openai:gpt-4o" && reasoning_effort.is_none()
         ));
     }
 
