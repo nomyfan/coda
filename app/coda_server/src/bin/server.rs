@@ -128,7 +128,7 @@ async fn open_session(
     let config = RunConfig {
         provider: provider.provider.clone(),
         model: provider.model_id.clone(),
-        max_completion_tokens: None,
+        max_completion_tokens: Some(10_000),
         temperature: Some(0.7),
         reasoning_effort,
         tool_approval: workspace.approval_config.clone().into_approval_mode(),
