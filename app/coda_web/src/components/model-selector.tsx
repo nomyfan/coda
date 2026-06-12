@@ -1,8 +1,12 @@
 import { Brain, Cpu } from "lucide-react";
+import { useMemo } from "react";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -14,25 +18,36 @@ function effortLabel(effort: ReasoningEffort) {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
+/** Map of provider name → list of its models, in config order. */
+type ProviderGroups = Record<string, ProviderInfo[]>;
+
+function groupProviders(providers: ProviderInfo[]): ProviderGroups {
+  const groups: ProviderGroups = {};
+  for (const info of providers) {
+    (groups[info.provider] ??= []).push(info);
+  }
+  return groups;
+}
+
 /**
- * Pick the reasoning value to carry over when switching provider: a model with
+ * Pick the reasoning value to carry over when switching model: a model with
  * no reasoning controls gets `null`; provider default and "off" carry over; an
- * effort the new provider still accepts is kept, otherwise its first level.
+ * effort the new model still accepts is kept, otherwise its first level.
  */
 function carryReasoning(
-  provider: ProviderInfo,
+  model: ProviderInfo | undefined,
   current: ReasoningEffort | null
 ): ReasoningEffort | null {
-  if (provider.reasoning_efforts.length === 0) {
+  if (!model || model.reasoning_efforts.length === 0) {
     return null;
   }
   if (current === null || current === "none") {
     return current;
   }
-  if (provider.reasoning_efforts.includes(current)) {
+  if (model.reasoning_efforts.includes(current)) {
     return current;
   }
-  return provider.reasoning_efforts[0];
+  return model.reasoning_efforts[0];
 }
 
 export function ModelSelector({
@@ -51,21 +66,43 @@ export function ModelSelector({
     reasoningEffort: ReasoningEffort | null
   ) => void;
 }) {
+  const groups = useMemo(() => groupProviders(providers), [providers]);
+  const providerNames = useMemo(
+    () => Object.keys(groups).sort(),
+    [groups]
+  );
+  const selected = providers.find((info) => info.id === providerId);
+  const efforts = selected?.reasoning_efforts ?? [];
+
   if (providers.length === 0 || !providerId) {
     return null;
   }
-  const selected = providers.find((provider) => provider.id === providerId);
-  const efforts = selected?.reasoning_efforts ?? [];
+
+  // Build a flat list of elements so Radix viewport receives only valid children.
+  const dropdownItems = providerNames.flatMap((providerName, groupIndex) => {
+    const models = groups[providerName];
+    return [
+      ...(groupIndex > 0
+        ? [<SelectSeparator key={`sep-${providerName}`} />]
+        : []),
+      <SelectGroup key={providerName}>
+        <SelectLabel>{providerName}</SelectLabel>
+        {models.map((info) => (
+          <SelectItem key={info.id} value={info.id}>
+            {info.model}
+          </SelectItem>
+        ))}
+      </SelectGroup>,
+    ];
+  });
 
   return (
     <>
       <Select
         value={providerId}
         onValueChange={(id) => {
-          const next = providers.find((provider) => provider.id === id);
-          if (next) {
-            onSetModel(id, carryReasoning(next, reasoningEffort));
-          }
+          const next = providers.find((info) => info.id === id);
+          onSetModel(id, carryReasoning(next, reasoningEffort));
         }}
         disabled={disabled}
       >
@@ -74,11 +111,7 @@ export function ModelSelector({
           <SelectValue placeholder="Model" />
         </SelectTrigger>
         <SelectContent position="popper" side="top">
-          {providers.map((provider) => (
-            <SelectItem key={provider.id} value={provider.id}>
-              {provider.model}
-            </SelectItem>
-          ))}
+          {dropdownItems}
         </SelectContent>
       </Select>
       {efforts.length > 0 ? (

@@ -255,11 +255,14 @@ pub enum ServerMessage {
     },
 }
 
-/// A provider the dashboard can pick. `reasoning_efforts` lists the effort
-/// levels the model offers; empty means it has no reasoning controls.
+/// A model the dashboard can pick, grouped under a provider. `reasoning_efforts`
+/// lists the effort levels the model offers; empty means it has no reasoning
+/// controls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfoWire {
     pub id: String,
+    /// The id of the provider this model belongs to (e.g. "deepseek").
+    pub provider: String,
     pub model: String,
     pub reasoning_efforts: Vec<ReasoningEffort>,
 }
@@ -449,11 +452,12 @@ mod tests {
     fn server_provider_catalog_roundtrips() {
         let msg = ServerMessage::ProviderCatalog {
             providers: vec![ProviderInfoWire {
-                id: "deepseek".into(),
+                id: "deepseek:deepseek-reasoner".into(),
+                provider: "deepseek".into(),
                 model: "deepseek-reasoner".into(),
                 reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
             }],
-            default_provider: "deepseek".into(),
+            default_provider: "deepseek:deepseek-reasoner".into(),
         };
         match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
         {
@@ -461,9 +465,10 @@ mod tests {
                 providers,
                 default_provider,
             } => {
-                assert_eq!(providers[0].id, "deepseek");
+                assert_eq!(providers[0].id, "deepseek:deepseek-reasoner");
+                assert_eq!(providers[0].provider, "deepseek");
                 assert_eq!(providers[0].reasoning_efforts.len(), 2);
-                assert_eq!(default_provider, "deepseek");
+                assert_eq!(default_provider, "deepseek:deepseek-reasoner");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

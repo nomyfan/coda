@@ -41,12 +41,16 @@ struct AppState {
     workspaces: HashMap<String, Arc<WorkspaceState>>,
 }
 
-/// A constructed provider plus the per-provider settings the agent needs at
-/// request time. `reasoning_efforts` is the list the UI offers; empty means the
-/// model has no reasoning controls.
+/// A constructed provider model entry. `model_id` is the API model name sent in
+/// requests; `model_name` is the human-readable label shown in the dashboard.
+/// Several entries can share the same `provider` when the config declares
+/// multiple models under one provider. `reasoning_efforts` is the list the UI
+/// offers; empty means the model has no reasoning controls.
 struct ProviderHandle {
     provider: Arc<OpenAI>,
-    model: String,
+    model_id: String,
+    model_name: String,
+    provider_name: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
 }
@@ -123,8 +127,8 @@ async fn open_session(
         .expect("caller passes a validated provider id");
     let config = RunConfig {
         provider: provider.provider.clone(),
-        model: provider.model.clone(),
-        max_completion_tokens: Some(5000),
+        model: provider.model_id.clone(),
+        max_completion_tokens: None,
         temperature: Some(0.7),
         reasoning_effort,
         tool_approval: workspace.approval_config.clone().into_approval_mode(),
@@ -278,14 +282,16 @@ fn resolve_selection(
     }
 }
 
-/// The selectable providers, sorted by id for a stable dashboard ordering.
+/// The selectable models, sorted by id for a stable dashboard ordering. Each
+/// entry's `id` is `{provider_id}:{model_id}`; `model` is the display name.
 fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
     let mut infos: Vec<ProviderInfoWire> = app
         .providers
         .iter()
         .map(|(id, handle)| ProviderInfoWire {
             id: id.clone(),
-            model: handle.model.clone(),
+            provider: handle.provider_name.clone(),
+            model: handle.model_name.clone(),
             reasoning_efforts: handle.reasoning_efforts.clone(),
         })
         .collect();
@@ -1126,8 +1132,9 @@ async fn main() {
         eprintln!("kind = \"deepseek\"");
         eprintln!("api_key = \"${{DEEPSEEK_API_KEY}}\"");
         eprintln!("base_url = \"https://api.deepseek.com\"");
-        eprintln!("model = \"deepseek-reasoner\"");
-        eprintln!("reasoning_efforts = [\"low\", \"medium\", \"high\"]");
+        eprintln!("models = [");
+        eprintln!("  {{ id = \"deepseek-reasoner\", name = \"DeepSeek R1\", reasoning_efforts = [\"low\", \"medium\", \"high\"] }},");
+        eprintln!("]");
         eprintln!();
         eprintln!("[[workspaces]]");
         eprintln!("id = \"coda\"");
@@ -1135,25 +1142,35 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // Config guarantees at least one provider; the first is the session default.
-    let default_provider = server_config.providers[0].id.clone();
+    // Config guarantees at least one provider with at least one model;
+    // the first model is the session default.
+    let default_provider = {
+        let first = &server_config.providers[0];
+        format!("{}:{}", first.id, first.models[0].id)
+    };
     let providers: HashMap<String, Arc<ProviderHandle>> = server_config
         .providers
         .into_iter()
-        .map(|p| {
-            let handle = ProviderHandle {
-                provider: Arc::new(OpenAI::new(
-                    LLMProviderConfig {
-                        api_key: p.api_key,
-                        base_url: p.base_url,
-                        include_usage: p.include_usage,
-                    },
-                    p.kind,
-                )),
-                model: p.model,
-                reasoning_efforts: p.reasoning_efforts,
-            };
-            (p.id, Arc::new(handle))
+        .flat_map(|p| {
+            let shared_provider = Arc::new(OpenAI::new(
+                LLMProviderConfig {
+                    api_key: p.api_key,
+                    base_url: p.base_url,
+                    include_usage: p.include_usage,
+                },
+                p.kind,
+            ));
+            p.models.into_iter().map(move |m| {
+                let id = format!("{}:{}", p.id, m.id);
+                let handle = ProviderHandle {
+                    provider: shared_provider.clone(),
+                    model_id: m.id,
+                    model_name: m.name,
+                    provider_name: p.id.clone(),
+                    reasoning_efforts: m.reasoning_efforts,
+                };
+                (id, Arc::new(handle))
+            })
         })
         .collect();
 

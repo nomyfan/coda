@@ -76,11 +76,12 @@ export type ReasoningEffort =
   | "xhigh";
 
 /**
- * A provider the dashboard can select. Empty `reasoning_efforts` means the
- * model has no reasoning controls.
+ * A model the dashboard can select, grouped under a provider.
+ * Empty `reasoning_efforts` means the model has no reasoning controls.
  */
 export type ProviderInfo = {
   id: string;
+  provider: string;
   model: string;
   reasoning_efforts: ReasoningEffort[];
 };

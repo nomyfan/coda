@@ -29,18 +29,28 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
-/// A configured LLM provider. `reasoning_efforts` declares which effort levels
+/// A model configured under a provider. `id` is the API model name sent in
+/// requests; `name` is an optional human-readable label for the dashboard (falls
+/// back to `id` when absent). `reasoning_efforts` declares which effort levels
 /// the model accepts; an empty list means the model is not a reasoning model,
 /// so the UI shows no reasoning controls for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelConfig {
+    pub id: String,
+    pub name: String,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+}
+
+/// A configured LLM provider with one or more models. `api_key`, `base_url`,
+/// `kind`, and `include_usage` are shared across all models.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub id: String,
     pub kind: ProviderKind,
     pub api_key: String,
     pub base_url: String,
-    pub model: String,
     pub include_usage: bool,
-    pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub models: Vec<ModelConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,21 +108,19 @@ fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, 
         };
         let api_key = expand_env(&require_str(provider, "api_key", "provider")?)?;
         let base_url = expand_env(&require_str(provider, "base_url", "provider")?)?;
-        let model = require_str(provider, "model", "provider")?;
         let include_usage = provider
             .get("include_usage")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let reasoning_efforts = parse_reasoning_efforts(provider, &id)?;
+        let models = parse_models(provider, &id)?;
 
         parsed.push(ProviderConfig {
             id,
             kind,
             api_key,
             base_url,
-            model,
             include_usage,
-            reasoning_efforts,
+            models,
         });
     }
 
@@ -125,16 +133,80 @@ fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, 
     Ok(parsed)
 }
 
-fn parse_reasoning_efforts(
+/// Parse the per-provider `models` inline array. Each model requires an `id`
+/// (the API model name) and optionally a `name` (display label, defaults to
+/// `id`). Model ids must be unique within a provider.
+fn parse_models(
     provider: &toml_edit::Table,
     provider_id: &str,
+) -> Result<Vec<ModelConfig>, ConfigError> {
+    let Some(array) = provider.get("models") else {
+        return Err(ConfigError::Parse(format!(
+            "provider '{provider_id}' must have a 'models' array"
+        )));
+    };
+    let array = array.as_array().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "provider '{provider_id}' 'models' must be an array of tables"
+        ))
+    })?;
+
+    if array.is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "provider '{provider_id}' must define at least one model"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for (index, item) in array.iter().enumerate() {
+        let table = item.as_inline_table().ok_or_else(|| {
+            ConfigError::Parse(format!(
+                "provider '{provider_id}' model at index {index} must be an inline table"
+            ))
+        })?;
+        let id = table
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "provider '{provider_id}' model at index {index} id must be a string"
+                ))
+            })?;
+        if !seen.insert(id.clone()) {
+            return Err(ConfigError::Parse(format!(
+                "provider '{provider_id}' has duplicate model id '{id}'"
+            )));
+        }
+        // `name` is optional: when absent, the dashboard shows `id`.
+        let name = table
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id.clone());
+        let reasoning_efforts = parse_model_reasoning_efforts(table, provider_id, &id)?;
+        models.push(ModelConfig {
+            id,
+            name,
+            reasoning_efforts,
+        });
+    }
+
+    Ok(models)
+}
+
+fn parse_model_reasoning_efforts(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
 ) -> Result<Vec<ReasoningEffort>, ConfigError> {
-    let Some(array) = provider.get("reasoning_efforts") else {
+    let Some(array) = model.get("reasoning_efforts") else {
         return Ok(Vec::new());
     };
     let array = array.as_array().ok_or_else(|| {
         ConfigError::Parse(format!(
-            "provider '{provider_id}' reasoning_efforts must be an array"
+            "provider '{provider_id}' model '{model_name}' reasoning_efforts must be an array"
         ))
     })?;
     array
@@ -142,7 +214,7 @@ fn parse_reasoning_efforts(
         .map(|value| {
             let raw = value.as_str().ok_or_else(|| {
                 ConfigError::Parse(format!(
-                    "provider '{provider_id}' reasoning_efforts must be strings"
+                    "provider '{provider_id}' model '{model_name}' reasoning_efforts must be strings"
                 ))
             })?;
             match raw {
@@ -153,7 +225,7 @@ fn parse_reasoning_efforts(
                 "xhigh" => Ok(ReasoningEffort::Xhigh),
                 // `none` is the thinking-off state, not an offered level.
                 other => Err(ConfigError::Parse(format!(
-                    "provider '{provider_id}' has unknown reasoning effort '{other}' (expected 'minimal', 'low', 'medium', 'high', or 'xhigh')"
+                    "provider '{provider_id}' model '{model_name}' has unknown reasoning effort '{other}' (expected 'minimal', 'low', 'medium', 'high', or 'xhigh')"
                 ))),
             }
         })
@@ -535,8 +607,9 @@ id = "deepseek"
 kind = "deepseek"
 api_key = "sk-test"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-reasoner"
-reasoning_efforts = ["low", "medium", "high"]
+models = [
+  { id = "deepseek-reasoner", name = "DeepSeek R1", reasoning_efforts = ["low", "medium", "high"] },
+]
 "#;
 
     #[test]
@@ -577,13 +650,16 @@ path = "/tmp/scratch"
                 kind: ProviderKind::Deepseek,
                 api_key: "sk-test".to_string(),
                 base_url: "https://api.deepseek.com/v1".to_string(),
-                model: "deepseek-reasoner".to_string(),
                 include_usage: true,
-                reasoning_efforts: vec![
-                    ReasoningEffort::Low,
-                    ReasoningEffort::Medium,
-                    ReasoningEffort::High,
-                ],
+                models: vec![ModelConfig {
+                    id: "deepseek-reasoner".to_string(),
+                    name: "DeepSeek R1".to_string(),
+                    reasoning_efforts: vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                    ],
+                }],
             }]
         );
     }
@@ -597,7 +673,9 @@ path = "/tmp/scratch"
 id = "deepseek"
 api_key = "${CODA_TEST_KEY}"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-reasoner"
+models = [
+  { id = "deepseek-reasoner" },
+]
 
 [[workspaces]]
 id = "coda"
@@ -608,7 +686,10 @@ path = "/tmp/coda"
         .unwrap();
         assert_eq!(config.providers[0].api_key, "secret-from-env");
         assert_eq!(config.providers[0].kind, ProviderKind::Generic);
-        assert!(config.providers[0].reasoning_efforts.is_empty());
+        assert_eq!(config.providers[0].models.len(), 1);
+        assert_eq!(config.providers[0].models[0].id, "deepseek-reasoner");
+        assert_eq!(config.providers[0].models[0].name, "deepseek-reasoner");
+        assert!(config.providers[0].models[0].reasoning_efforts.is_empty());
     }
 
     #[test]
@@ -619,8 +700,9 @@ path = "/tmp/coda"
 id = "deepseek"
 api_key = "sk-test"
 base_url = "https://api.deepseek.com/v1"
-model = "deepseek-reasoner"
-reasoning_efforts = ["ultra"]
+models = [
+  { id = "deepseek-reasoner", reasoning_efforts = ["ultra"] },
+]
 
 [[workspaces]]
 id = "coda"
