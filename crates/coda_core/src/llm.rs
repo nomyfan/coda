@@ -21,6 +21,10 @@ pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<CompletionUsage>,
+    /// Provider-specific reasoning that must accompany tool calls on subsequent
+    /// requests. It stays separate from visible assistant content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Whether LLM generation for this assistant message was interrupted by user abort
     /// before a normal completion was produced.
     #[serde(default)]
@@ -92,7 +96,23 @@ pub enum Message {
 pub struct LLMProviderConfig {
     pub api_key: String,
     pub base_url: String,
-    pub stream: bool,
+    /// Request token-usage statistics in the streaming response.
+    pub include_usage: bool,
+}
+
+/// How hard a reasoning model should think. Provider-agnostic; the provider
+/// maps it to its own wire representation. `None` is the "thinking off" state —
+/// distinct from `reasoning_effort` being absent, which leaves the provider's
+/// own default untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,6 +122,9 @@ pub struct ChatCompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Reasoning effort for this request. Outer `None` leaves the provider
+    /// default; `Some(ReasoningEffort::None)` explicitly turns thinking off.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +149,9 @@ impl std::error::Error for StreamError {}
 /// Events produced by `LLMProvider::stream`.
 pub enum LLMStreamEvent {
     ContentChunk(String),
+    /// A chunk of the model's reasoning / chain-of-thought text, from providers
+    /// that expose a separate reasoning stream (e.g. DeepSeek).
+    ReasoningChunk(String),
     Completed(AssistantMessage),
 }
 
@@ -142,5 +168,32 @@ impl<P: LLMProvider> LLMProvider for std::sync::Arc<P> {
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
         (**self).stream(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_reasoning_roundtrips_and_defaults_when_absent() {
+        let message = AssistantMessage {
+            reasoning_content: Some("tool reasoning".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value["reasoning_content"],
+            serde_json::json!("tool reasoning")
+        );
+
+        let legacy: AssistantMessage = serde_json::from_value(serde_json::json!({
+            "content": "",
+            "tool_calls": [],
+            "usage": null,
+            "aborted": false
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_content.is_none());
     }
 }

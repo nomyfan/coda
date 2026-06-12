@@ -7,6 +7,8 @@ import {
   type CompletionUsage,
   type HistoryMessage,
   type PendingApproval,
+  type ProviderInfo,
+  type ReasoningEffort,
   type ServerMessage,
   type ToolCall,
   type ToolCallResolution,
@@ -21,7 +23,12 @@ import {
 import { useImmutableRef } from "@callcc/toolkit-js/react/useImmutableRef";
 import { create, type Store } from "@/store/utils";
 
-export type { WorkspaceSession, WorkspaceSummary } from "./protocol";
+export type {
+  ProviderInfo,
+  ReasoningEffort,
+  WorkspaceSession,
+  WorkspaceSummary,
+} from "./protocol";
 
 export type ConnectionStatus =
   | "idle"
@@ -32,7 +39,14 @@ export type ConnectionStatus =
 
 export type TranscriptEntry = {
   id: string;
-  kind: "user" | "assistant" | "tool_call" | "tool_result" | "system" | "error";
+  kind:
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "system"
+    | "error";
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -67,6 +81,10 @@ export type OpenedSession = {
   draft?: boolean;
   /** First user task, used as the session list title before the server persists it. */
   firstUserMessage?: string;
+  /** Provider this session currently uses; set from the server snapshot. */
+  providerId?: string;
+  /** Reasoning selection: `undefined`/`null` = provider default, `"none"` = thinking off. */
+  reasoningEffort?: ReasoningEffort | null;
 };
 
 /** One connected (or attempted) server, holding its own catalog and sessions. */
@@ -77,6 +95,10 @@ export type ServerState = {
   status: ConnectionStatus;
   error?: string;
   catalog: WorkspaceSummary[];
+  /** Providers this server offers, for the model selector. */
+  providers: ProviderInfo[];
+  /** Provider new sessions default to (from the provider catalog). */
+  defaultProvider?: string;
   sessions: Record<SessionKey, OpenedSession>;
 };
 
@@ -141,6 +163,7 @@ function blankServer(url: string): ServerState {
     url,
     status: "idle",
     catalog: [],
+    providers: [],
     sessions: {},
   };
 }
@@ -221,6 +244,11 @@ function addStored(list: StoredServer[], url: string): StoredServer[] {
 
 function liveKey(agentName: string, threadId: string) {
   return `${agentName}:${threadId}`;
+}
+
+/** Reasoning streams under its own live key so it never merges with the answer entry. */
+function reasoningLiveKey(agentName: string, threadId: string) {
+  return `reasoning:${liveKey(agentName, threadId)}`;
 }
 
 function addActivity(
@@ -369,6 +397,60 @@ function addOrUpdateAssistantChunk(
   };
 }
 
+function addOrUpdateReasoningChunk(
+  session: OpenedSession,
+  event: Extract<WireEvent, { type: "llm_reasoning_chunk" }>
+): OpenedSession {
+  const key = reasoningLiveKey(event.agent_name, event.thread_id);
+  const index = session.entries.findIndex((entry) => entry.liveKey === key);
+  if (index >= 0) {
+    const entries = [...session.entries];
+    entries[index] = {
+      ...entries[index],
+      content: entries[index].content + event.content,
+    };
+    return { ...session, entries };
+  }
+  if (!event.content) {
+    return session;
+  }
+  return {
+    ...session,
+    entries: [
+      ...session.entries,
+      {
+        id: newId("reasoning"),
+        kind: "reasoning",
+        agentName: event.agent_name,
+        threadId: event.thread_id,
+        title: "thinking",
+        content: event.content,
+        status: "thinking",
+        liveKey: key,
+      },
+    ],
+  };
+}
+
+/**
+ * Settle the live reasoning entry, if any. Called when answer content starts
+ * or the turn ends, so a later turn on the same thread starts a fresh entry.
+ */
+function finishReasoning(
+  session: OpenedSession,
+  agentName: string,
+  threadId: string
+): OpenedSession {
+  const key = reasoningLiveKey(agentName, threadId);
+  const index = session.entries.findIndex((entry) => entry.liveKey === key);
+  if (index < 0) {
+    return session;
+  }
+  const entries = [...session.entries];
+  entries[index] = { ...entries[index], status: undefined, liveKey: undefined };
+  return { ...session, entries };
+}
+
 function finishLiveEntry(
   session: OpenedSession,
   agentName: string,
@@ -446,23 +528,35 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         running: true,
       };
     case "llm_chunk":
-      return addOrUpdateAssistantChunk(session, event);
+      // Answer content marks the end of the reasoning phase.
+      return addOrUpdateAssistantChunk(
+        finishReasoning(session, event.agent_name, event.thread_id),
+        event
+      );
+    case "llm_reasoning_chunk":
+      return addOrUpdateReasoningChunk(session, event);
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
       const turnComplete =
         event.agent_name === rootName && event.message.tool_calls.length === 0;
       return {
-        ...addActivity(finishAssistant(session, event), {
-          tone: event.message.aborted ? "warning" : "success",
-          label: `${event.agent_name} finished`,
-          detail: event.message.usage
-            ? `${
-                event.message.usage.prompt_tokens +
-                event.message.usage.completion_tokens
-              } tokens`
-            : "turn complete",
-        }),
+        ...addActivity(
+          finishAssistant(
+            finishReasoning(session, event.agent_name, event.thread_id),
+            event
+          ),
+          {
+            tone: event.message.aborted ? "warning" : "success",
+            label: `${event.agent_name} finished`,
+            detail: event.message.usage
+              ? `${
+                  event.message.usage.prompt_tokens +
+                  event.message.usage.completion_tokens
+                } tokens`
+              : "turn complete",
+          }
+        ),
         running: turnComplete ? false : session.running,
       };
     }
@@ -509,7 +603,11 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       };
     case "aborted": {
       const updated = addActivity(
-        finishLiveEntry(session, event.agent_name, event.thread_id),
+        finishLiveEntry(
+          finishReasoning(session, event.agent_name, event.thread_id),
+          event.agent_name,
+          event.thread_id
+        ),
         {
           tone: "warning",
           label: `${event.agent_name} aborted`,
@@ -536,7 +634,11 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
     }
     case "error": {
       const updated = addActivity(
-        finishLiveEntry(session, event.agent_name, event.thread_id),
+        finishLiveEntry(
+          finishReasoning(session, event.agent_name, event.thread_id),
+          event.agent_name,
+          event.thread_id
+        ),
         {
           tone: "danger",
           label: `${event.agent_name || "server"} error`,
@@ -766,6 +868,28 @@ function setCatalog(
   });
 }
 
+function setProviderCatalog(
+  store: CodaStore,
+  server: string,
+  providers: ProviderInfo[],
+  defaultProvider: string
+) {
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (current) {
+      current.providers = providers;
+      current.defaultProvider = defaultProvider;
+      for (const session of Object.values(current.sessions)) {
+        if (session.draft && !session.providerId) {
+          const seed = seedSelection(current);
+          session.providerId = seed.providerId;
+          session.reasoningEffort = seed.reasoningEffort;
+        }
+      }
+    }
+  });
+}
+
 function createDraftSession(
   store: CodaStore,
   server: string,
@@ -793,11 +917,32 @@ function createDraftSession(
         delete current.sessions[existingKey];
       }
     }
+    const seed = seedSelection(current);
     current.sessions[key] = {
       ...blankSession(workspaceId, sessionId),
       draft: true,
+      providerId: seed.providerId,
+      reasoningEffort: seed.reasoningEffort,
     };
   });
+}
+
+/**
+ * Initial model selection for a freshly created (draft) session: the server's
+ * default provider at its first declared effort. Empty when the provider
+ * catalog hasn't arrived yet, leaving the selector hidden until it has.
+ */
+function seedSelection(server: ServerState): {
+  providerId?: string;
+  reasoningEffort: ReasoningEffort | null;
+} {
+  const provider =
+    server.providers.find((item) => item.id === server.defaultProvider) ??
+    server.providers[0];
+  return {
+    providerId: provider?.id,
+    reasoningEffort: provider?.reasoning_efforts[0] ?? null,
+  };
 }
 
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
@@ -844,7 +989,9 @@ function applySnapshot(
   workspaceId: string,
   sessionId: string,
   messages: HistoryMessage[],
-  approvals: PendingApproval[]
+  approvals: PendingApproval[],
+  providerId: string,
+  reasoningEffort: ReasoningEffort | null
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
@@ -868,11 +1015,29 @@ function applySnapshot(
       return;
     }
     session.draft = false;
+    session.providerId = providerId;
+    session.reasoningEffort = reasoningEffort;
     if (hasHistory) {
       session.entries = mapped;
       session.approvals = approvals;
       session.drafts = {};
       session.running = false;
+    }
+  });
+}
+
+function setSessionModel(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  providerId: string,
+  reasoningEffort: ReasoningEffort | null
+) {
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      session.providerId = providerId;
+      session.reasoningEffort = reasoningEffort;
     }
   });
 }
@@ -1003,6 +1168,25 @@ function encode(message: ClientMessage) {
   return JSON.stringify(message);
 }
 
+/**
+ * Build an `open_session` command, carrying the session's chosen model when it
+ * has one (a draft seeds it locally) so the server opens on that provider rather
+ * than the default.
+ */
+function openMessage(session: OpenedSession): ClientMessage {
+  return {
+    type: "open_session",
+    workspace_id: session.workspaceId,
+    session_id: session.sessionId,
+    ...(session.providerId
+      ? {
+          provider_id: session.providerId,
+          reasoning_effort: session.reasoningEffort ?? null,
+        }
+      : {}),
+  };
+}
+
 export function useCodaSession() {
   const store = useImmutableRef(() =>
     create<CodaStoreState>(initialStoreState)
@@ -1052,6 +1236,7 @@ export function useCodaSession() {
       socket.onopen = () => {
         setServerStatus(store, server, "connected");
         socket.send(encode({ type: "list_workspaces" }));
+        socket.send(encode({ type: "list_providers" }));
       };
       socket.onclose = () => {
         if (currentSocket(store, server) === socket) {
@@ -1067,6 +1252,15 @@ export function useCodaSession() {
             setCatalog(store, server, message.workspaces);
             return;
           }
+          if (message.type === "provider_catalog") {
+            setProviderCatalog(
+              store,
+              server,
+              message.providers,
+              message.default_provider
+            );
+            return;
+          }
           if (message.type === "snapshot") {
             applySnapshot(
               store,
@@ -1074,7 +1268,19 @@ export function useCodaSession() {
               message.workspace_id,
               message.session_id,
               message.messages,
-              message.pending_approvals ?? []
+              message.pending_approvals ?? [],
+              message.provider_id,
+              message.reasoning_effort ?? null
+            );
+            return;
+          }
+          if (message.type === "model_changed") {
+            setSessionModel(
+              store,
+              server,
+              sessionKey(message.workspace_id, message.session_id),
+              message.provider_id,
+              message.reasoning_effort ?? null
             );
             return;
           }
@@ -1231,11 +1437,14 @@ export function useCodaSession() {
         ];
       selectSession(store, server, workspace, session);
       if (!local?.draft) {
-        send(server, {
-          type: "open_session",
-          workspace_id: workspace,
-          session_id: session,
-        });
+        const opened =
+          local ??
+          store.getState().servers[server]?.sessions[
+            sessionKey(workspace, session)
+          ];
+        if (opened) {
+          send(server, openMessage(opened));
+        }
       }
     },
     [send, store]
@@ -1249,11 +1458,7 @@ export function useCodaSession() {
         return;
       }
       if (active.session.draft) {
-        send(active.server, {
-          type: "open_session",
-          workspace_id: active.session.workspaceId,
-          session_id: active.session.sessionId,
-        });
+        send(active.server, openMessage(active.session));
       }
       if (
         send(active.server, {
@@ -1270,7 +1475,13 @@ export function useCodaSession() {
   );
 
   const sendTaskToNewSession = useCallback(
-    (server: string, workspaceId: string, task: string) => {
+    (
+      server: string,
+      workspaceId: string,
+      task: string,
+      providerId?: string,
+      reasoningEffort: ReasoningEffort | null = null
+    ) => {
       const workspace = workspaceId.trim();
       const text = task.trim();
       if (!server || !workspace || !text) {
@@ -1288,11 +1499,14 @@ export function useCodaSession() {
       const sessionId = reusable?.sessionId ?? freshSessionId();
       const key = sessionKey(workspace, sessionId);
       createDraftSession(store, server, workspace, sessionId);
-      send(server, {
-        type: "open_session",
-        workspace_id: workspace,
-        session_id: sessionId,
-      });
+      if (providerId) {
+        setSessionModel(store, server, key, providerId, reasoningEffort);
+      }
+      const session = store.getState().servers[server]?.sessions[key];
+      if (!session) {
+        return;
+      }
+      send(server, openMessage(session));
       if (
         send(server, {
           type: "task",
@@ -1331,6 +1545,33 @@ export function useCodaSession() {
       }
     },
     [send, currentActive]
+  );
+
+  const setModel = useCallback(
+    (providerId: string, reasoningEffort: ReasoningEffort | null) => {
+      const active = currentActive();
+      if (!active) {
+        return;
+      }
+      if (active.session.draft) {
+        setSessionModel(
+          store,
+          active.server,
+          active.session.key,
+          providerId,
+          reasoningEffort
+        );
+        return;
+      }
+      send(active.server, {
+        type: "set_model",
+        workspace_id: active.session.workspaceId,
+        session_id: active.session.sessionId,
+        provider_id: providerId,
+        reasoning_effort: reasoningEffort,
+      });
+    },
+    [send, currentActive, store]
   );
 
   const draftCall = useCallback(
@@ -1403,6 +1644,10 @@ export function useCodaSession() {
     approvals: activeSession?.approvals ?? [],
     drafts: activeSession?.drafts ?? {},
     running: activeSession?.running ?? false,
+    providers: activeServerState?.providers ?? [],
+    activeProviderId: activeSession?.providerId,
+    activeReasoningEffort: activeSession?.reasoningEffort ?? null,
+    setModel,
     connectServer,
     disconnectServer,
     removeServer,

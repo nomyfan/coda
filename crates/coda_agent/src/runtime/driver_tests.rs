@@ -561,6 +561,7 @@ where
             model: "fake".into(),
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
             tool_approval: approval,
             approval_timeout: None,
         };
@@ -624,6 +625,7 @@ where
             model: "fake".into(),
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
             tool_approval: approval,
             approval_timeout: None,
         };
@@ -689,6 +691,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         model: "fake".into(),
         temperature: None,
         max_completion_tokens: None,
+        reasoning_effort: None,
         tool_approval: ToolApprovalMode::Auto,
         approval_timeout: None,
     };

@@ -1,7 +1,7 @@
 use coda_agent::{
     AbortedTarget, AgentEvent, EventOrigin, PendingApproval, ResumeDecision, SessionEvent,
 };
-use coda_core::llm::{AssistantMessage, Message, ToolCall, ToolMessage};
+use coda_core::llm::{AssistantMessage, Message, ReasoningEffort, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +15,12 @@ pub enum WireEvent {
     },
     #[serde(rename = "llm_chunk")]
     LlmContentChunk {
+        agent_name: String,
+        thread_id: String,
+        content: String,
+    },
+    #[serde(rename = "llm_reasoning_chunk")]
+    LlmReasoningChunk {
         agent_name: String,
         thread_id: String,
         content: String,
@@ -94,6 +100,11 @@ impl WireEvent {
                 thread_id,
                 content,
             },
+            AgentEvent::LLMReasoningChunk(content) => WireEvent::LlmReasoningChunk {
+                agent_name,
+                thread_id,
+                content,
+            },
             AgentEvent::LLMEnd(message) => WireEvent::LlmEnd {
                 agent_name,
                 thread_id,
@@ -134,10 +145,19 @@ impl WireEvent {
 pub enum ClientMessage {
     /// Request the configured workspace/session catalog.
     ListWorkspaces,
-    /// Open or switch the active session on this connection.
+    /// Request the selectable providers (static for the server's lifetime).
+    ListProviders,
+    /// Open or switch the active session on this connection. `provider_id` and
+    /// `reasoning_effort` carry a client-chosen selection (e.g. picked on a new
+    /// session before the first message); both default to the server's defaults
+    /// when omitted.
     OpenSession {
         workspace_id: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     /// Start a new turn with a user task.
     Task {
@@ -170,6 +190,17 @@ pub enum ClientMessage {
         workspace_id: String,
         pattern: String,
     },
+    /// Switch the provider/model and reasoning setting a session uses. Applies
+    /// from the next turn (the server reopens the session). `reasoning_effort`
+    /// is three-state: `null` leaves the provider default, `none` turns thinking
+    /// off, and any level turns it on at that level.
+    SetModel {
+        workspace_id: String,
+        session_id: String,
+        provider_id: String,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
 }
 
 /// A message pushed by the server over the WebSocket.
@@ -180,15 +211,33 @@ pub enum ServerMessage {
     WorkspaceCatalog {
         workspaces: Vec<WorkspaceSummaryWire>,
     },
+    /// The providers the dashboard can choose between and the one new sessions
+    /// default to. Static for the server's lifetime; fetched once per connection.
+    ProviderCatalog {
+        providers: Vec<ProviderInfoWire>,
+        default_provider: String,
+    },
+    /// Confirms a successful provider/reasoning switch for a live session.
+    ModelChanged {
+        workspace_id: String,
+        session_id: String,
+        provider_id: String,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     /// Sent once, immediately after connect: the resumed conversation history
     /// plus any approvals left pending from a prior suspension, which the client
-    /// must answer with `Resume` before the session resumes.
+    /// must answer with `Resume` before the session resumes. `provider_id` and
+    /// `reasoning_effort` are the session's current model selection.
     Snapshot {
         workspace_id: String,
         session_id: String,
         messages: Vec<Message>,
         #[serde(default)]
         pending_approvals: Vec<PendingApproval>,
+        provider_id: String,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     /// A live runtime event. Nested under `event` rather than flattened so the
     /// inner `type` tag of [`WireEvent`] does not collide with this enum's tag.
@@ -204,6 +253,15 @@ pub enum ServerMessage {
         #[serde(default)]
         error: Option<String>,
     },
+}
+
+/// A provider the dashboard can pick. `reasoning_efforts` lists the effort
+/// levels the model offers; empty means it has no reasoning controls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderInfoWire {
+    pub id: String,
+    pub model: String,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +318,8 @@ mod tests {
         let json = serde_json::to_string(&ClientMessage::OpenSession {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
+            provider_id: None,
+            reasoning_effort: None,
         })
         .unwrap();
         assert_eq!(
@@ -333,12 +393,33 @@ mod tests {
             session_id: "s1".into(),
             messages: vec![],
             pending_approvals: vec![],
+            provider_id: "deepseek".into(),
+            reasoning_effort: Some(ReasoningEffort::High),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[]}"#
+            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high"}"#
         );
+    }
+
+    #[test]
+    fn client_set_model_roundtrips() {
+        let msg = ClientMessage::SetModel {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+            provider_id: "deepseek".into(),
+            reasoning_effort: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"set_model","workspace_id":"coda","session_id":"s1","provider_id":"deepseek","reasoning_effort":null}"#
+        );
+        assert!(matches!(
+            roundtrip_client(&msg),
+            ClientMessage::SetModel { provider_id, reasoning_effort, .. }
+                if provider_id == "deepseek" && reasoning_effort.is_none()
+        ));
     }
 
     #[test]
@@ -362,6 +443,45 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_provider_catalog_roundtrips() {
+        let msg = ServerMessage::ProviderCatalog {
+            providers: vec![ProviderInfoWire {
+                id: "deepseek".into(),
+                model: "deepseek-reasoner".into(),
+                reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+            }],
+            default_provider: "deepseek".into(),
+        };
+        match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
+        {
+            ServerMessage::ProviderCatalog {
+                providers,
+                default_provider,
+            } => {
+                assert_eq!(providers[0].id, "deepseek");
+                assert_eq!(providers[0].reasoning_efforts.len(), 2);
+                assert_eq!(default_provider, "deepseek");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_model_changed_roundtrips() {
+        let msg = ServerMessage::ModelChanged {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+            provider_id: "openai".into(),
+            reasoning_effort: None,
+        };
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap(),
+            ServerMessage::ModelChanged { provider_id, reasoning_effort, .. }
+                if provider_id == "openai" && reasoning_effort.is_none()
+        ));
     }
 
     #[test]

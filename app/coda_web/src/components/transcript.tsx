@@ -1,5 +1,6 @@
 import {
   Ban,
+  Brain,
   Check,
   ChevronDown,
   ChevronRight,
@@ -47,9 +48,13 @@ function lastAssistantIndex(entries: TranscriptEntry[]) {
   return -1;
 }
 
-function hasToolWork(entries: TranscriptEntry[]) {
+/** Entries rendered as collapsed disclosure rows inside an assistant turn. */
+function hasDisclosureWork(entries: TranscriptEntry[]) {
   return entries.some(
-    (entry) => entry.kind === "tool_call" || entry.kind === "tool_result"
+    (entry) =>
+      entry.kind === "tool_call" ||
+      entry.kind === "tool_result" ||
+      entry.kind === "reasoning"
   );
 }
 
@@ -81,7 +86,7 @@ function transcriptRenderItems(
     }
 
     const segment = entries.slice(start, index);
-    if (!hasToolWork(segment)) {
+    if (!hasDisclosureWork(segment)) {
       items.push(
         ...segment.map((entry) => ({ type: "entry" as const, entry }))
       );
@@ -151,6 +156,8 @@ function EntryIcon({ entry }: { entry: TranscriptEntry }) {
   const Icon =
     entry.kind === "assistant"
       ? MessageSquareText
+      : entry.kind === "reasoning"
+      ? Brain
       : entry.kind === "tool_call"
       ? TerminalSquare
       : entry.kind === "tool_result"
@@ -311,6 +318,10 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
           ) : null}
           {entry.kind === "assistant" ? (
             <Markdown>{entry.content}</Markdown>
+          ) : entry.kind === "reasoning" ? (
+            <div className="text-muted-foreground">
+              <Markdown>{entry.content}</Markdown>
+            </div>
           ) : (
             <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
               {entry.content}

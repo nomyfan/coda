@@ -1,3 +1,25 @@
+# Each provider is an OpenAI-compatible endpoint. `kind` selects request quirks:
+#   "generic"  — standard OpenAI-compatible API (default)
+#   "deepseek" — toggles thinking via DeepSeek's `thinking` field
+# `api_key` and `base_url` may reference an environment variable as `${VAR}`.
+# `reasoning_efforts` declares the levels the model offers; the dashboard shows
+# reasoning controls only when this list is non-empty. Omit it for plain models.
+# The dashboard picks which provider a session uses; the first listed is the default.
+
+[[providers]]
+id = "deepseek"
+kind = "deepseek"
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com"
+model = "deepseek-reasoner"
+reasoning_efforts = ["low", "medium", "high"]
+
+[[providers]]
+id = "openai"
+api_key = "${OPENAI_API_KEY}"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o"
+
 [[workspaces]]
 id = "coda"
 path = "/path/to/coda"

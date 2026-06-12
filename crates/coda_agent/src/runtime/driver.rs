@@ -581,6 +581,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             model: self.config.model.clone(),
             max_completion_tokens: self.config.max_completion_tokens,
             temperature: self.config.temperature,
+            reasoning_effort: self.config.reasoning_effort,
             messages: self.agent.messages().await,
             tools: {
                 let mut tools = self.agent.tools.descriptors();
@@ -618,6 +619,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         Some(Ok(LLMStreamEvent::ContentChunk(chunk))) => {
                             partial_content.push_str(&chunk);
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
+                        }
+                        Some(Ok(LLMStreamEvent::ReasoningChunk(chunk))) => {
+                            // Assistant content and reasoning remain separate.
+                            // The provider retains reasoning needed for later tool turns.
+                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(message),
                         Some(Err(err)) => break Err(err.to_string()),

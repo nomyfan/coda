@@ -326,6 +326,7 @@ fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
         model: "fake".into(),
         temperature: None,
         max_completion_tokens: None,
+        reasoning_effort: None,
         tool_approval: approval,
         approval_timeout: None,
     }
@@ -645,6 +646,7 @@ async fn should_execute_tool_after_approval_resume() {
             model: "fake".into(),
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
             tool_approval: approval,
             approval_timeout: None,
         })
@@ -695,6 +697,7 @@ async fn should_auto_reject_when_approval_times_out() {
             model: "fake".into(),
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
             tool_approval: approval.clone(),
             approval_timeout: None,
         })
@@ -727,6 +730,7 @@ async fn should_auto_reject_when_approval_times_out() {
             model: "fake".into(),
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: None,
             tool_approval: approval,
             approval_timeout: Some(Duration::ZERO),
         })
