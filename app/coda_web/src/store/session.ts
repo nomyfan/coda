@@ -1622,19 +1622,10 @@ export function useCodaShallow<T>(selector: (state: CodaStoreState) => T): T {
 
 /**
  * Auto-connect stored servers once, and close sockets on teardown. Mount once,
- * at the app root. The `autoConnected` guard (in the module-global store) keeps
- * it idempotent across React StrictMode's mount/unmount/mount cycle.
+ * at the app root. Resets `autoConnected` on cleanup so React StrictMode's
+ * mount→unmount→mount cycle correctly reconnects.
  */
 export function useCodaBootstrap() {
-  useEffect(
-    () => () => {
-      for (const socket of Object.values(codaStore.getState().wsMap)) {
-        socket.close();
-      }
-    },
-    []
-  );
-
   useEffect(() => {
     if (codaStore.getState().autoConnected) {
       return;
@@ -1644,4 +1635,16 @@ export function useCodaBootstrap() {
       connectServer(url);
     }
   }, []);
+
+  useEffect(
+    () => () => {
+      updateState(codaStore, (state) => {
+        state.autoConnected = false;
+      });
+      for (const socket of Object.values(codaStore.getState().wsMap)) {
+        socket.close();
+      }
+    },
+    []
+  );
 }
