@@ -20,6 +20,7 @@ import {
   deriveAllowPattern,
   extractShellCommand,
   parseAskUserParams,
+  subAgentDisplayName,
   type PendingApproval,
   type ToolCall,
   type ToolCallResolution,
@@ -240,7 +241,7 @@ function ApprovalCall({
     <div className="space-y-3 rounded-md border bg-background p-3">
       <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
         <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
-        <span className="truncate">{call.name}</span>
+        <span className="truncate">{subAgentDisplayName(call.name)}</span>
       </div>
       <pre className="max-h-44 overflow-auto rounded-md bg-muted p-3 text-xs leading-5 text-muted-foreground">
         {formatArguments(callArguments(call))}

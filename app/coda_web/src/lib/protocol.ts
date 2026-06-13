@@ -221,6 +221,26 @@ export function approvalKey(approval: PendingApproval): string {
   return `${approval.agent_name}:${approval.thread_id}`;
 }
 
+/**
+ * Prefix the runtime applies to sub-agent names when exposing them to the LLM as
+ * tools (mirrors MCP's `mcp__`). Keep in sync with `SUBAGENT_TOOL_PREFIX` in
+ * `crates/coda_agent/src/agent.rs`. The prefix self-identifies a sub-agent
+ * invocation wherever its tool name surfaces — live events and history alike.
+ */
+export const SUBAGENT_TOOL_PREFIX = "agent__";
+
+export function isSubAgentToolName(
+  name: string | undefined | null
+): name is string {
+  return Boolean(name && name.startsWith(SUBAGENT_TOOL_PREFIX));
+}
+
+export function subAgentDisplayName(name: string): string {
+  return name.startsWith(SUBAGENT_TOOL_PREFIX)
+    ? name.slice(SUBAGENT_TOOL_PREFIX.length)
+    : name;
+}
+
 export function callArguments(call: ToolCall): string {
   return call.arguments?.trim() || "{}";
 }

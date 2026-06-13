@@ -576,7 +576,7 @@ export function Sidebar({
                 onClick={onStartNewSession}
                 title="New session"
               >
-                <MessageSquarePlus className="size-4" />
+                <Plus className="size-4" />
               </Button>
               <Button
                 variant="ghost"

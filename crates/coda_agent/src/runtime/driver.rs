@@ -793,7 +793,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 } else {
                     // Stateful: stable thread id derived from the parent thread so the
                     // sub-agent session persists across calls within the same conversation.
-                    ThreadId::from_uuid5(&self.thread_id, &tc.tool_call.name)
+                    ThreadId::from_uuid5(&self.thread_id, &subagent.name)
                 };
                 let subagent_tool_call_envelope = Envelope::with_id(|id| Envelope {
                     id,
@@ -802,7 +802,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         thread_id: self.thread_id.clone(),
                     },
                     to: Receiver {
-                        name: tc.tool_call.name.clone(),
+                        // The tool name is prefixed (`agent__foo`); route by the
+                        // bare agent name the runtime registered.
+                        name: subagent.name.clone(),
                         thread_id: subagent_thread_id,
                     },
                     reply_to: None,
