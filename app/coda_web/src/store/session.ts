@@ -632,6 +632,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             kind: "system",
             agentName: event.agent_name,
             threadId: event.thread_id,
+            status: "aborted",
             content:
               event.target.reason === "generation"
                 ? "Generation interrupted"
