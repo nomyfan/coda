@@ -50,7 +50,8 @@ struct ProviderHandle {
     provider: Arc<OpenAI>,
     model_id: String,
     model_name: String,
-    provider_name: String,
+    /// The configured provider's id.
+    provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
 }
@@ -384,7 +385,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
         .iter()
         .map(|(id, handle)| ProviderInfoWire {
             id: id.clone(),
-            provider: handle.provider_name.clone(),
+            provider: handle.provider_id.clone(),
             model: handle.model_name.clone(),
             reasoning_efforts: handle.reasoning_efforts.clone(),
         })
@@ -1308,7 +1309,7 @@ async fn main() {
                     provider: shared_provider.clone(),
                     model_id: m.id,
                     model_name: m.name,
-                    provider_name: p.id.clone(),
+                    provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                 };
                 (id, Arc::new(handle))
