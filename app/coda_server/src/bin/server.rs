@@ -50,6 +50,7 @@ struct ProviderHandle {
     provider: Arc<OpenAI>,
     model_id: String,
     model_name: String,
+    context_window: u32,
     /// The configured provider's id.
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
@@ -387,6 +388,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
             id: id.clone(),
             provider: handle.provider_id.clone(),
             model: handle.model_name.clone(),
+            context_window: handle.context_window,
             reasoning_efforts: handle.reasoning_efforts.clone(),
         })
         .collect();
@@ -1276,7 +1278,7 @@ async fn main() {
         eprintln!("api_key = \"${{DEEPSEEK_API_KEY}}\"");
         eprintln!("base_url = \"https://api.deepseek.com\"");
         eprintln!("models = [");
-        eprintln!("  {{ id = \"deepseek-reasoner\", name = \"DeepSeek R1\", reasoning_efforts = [\"low\", \"medium\", \"high\"] }},");
+        eprintln!("  {{ id = \"deepseek-reasoner\", name = \"DeepSeek R1\", context_window = 128000, reasoning_efforts = [\"low\", \"medium\", \"high\"] }},");
         eprintln!("]");
         eprintln!();
         eprintln!("[[workspaces]]");
@@ -1309,6 +1311,7 @@ async fn main() {
                     provider: shared_provider.clone(),
                     model_id: m.id,
                     model_name: m.name,
+                    context_window: m.context_window,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                 };

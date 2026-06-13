@@ -25,6 +25,7 @@ import { useShallow } from "zustand/react/shallow";
 import { create, type Store } from "@/store/utils";
 
 export type {
+  CompletionUsage,
   ProviderInfo,
   ReasoningEffort,
   WorkspaceSession,
@@ -70,6 +71,11 @@ export type ActivityEntry = {
 
 export type SessionKey = `${string}/${string}`;
 
+export type UsageRecord = {
+  agentName: string;
+  usage: CompletionUsage;
+};
+
 export type OpenedSession = {
   key: SessionKey;
   workspaceId: string;
@@ -87,6 +93,7 @@ export type OpenedSession = {
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
   reasoningEffort?: ReasoningEffort | null;
+  usage: UsageRecord[];
 };
 
 /** One connected (or attempted) server, holding its own catalog and sessions. */
@@ -159,6 +166,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     approvals: [],
     drafts: {},
     running: false,
+    usage: [],
   };
 }
 
@@ -321,6 +329,15 @@ function historyToEntries(
     ];
   }
   return [];
+}
+
+function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
+  return messages.flatMap((message) => {
+    if ("Assistant" in message && message.Assistant.usage) {
+      return [{ agentName: rootName, usage: message.Assistant.usage }];
+    }
+    return [];
+  });
 }
 
 function toolMessageToEntry(
@@ -550,7 +567,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       // more tools; otherwise more work (tools / sub-agents) is still pending.
       const turnComplete =
         event.agent_name === rootName && event.message.tool_calls.length === 0;
-      return {
+      const finished = {
         ...addActivity(
           finishAssistant(
             finishReasoning(session, event.agent_name, event.thread_id),
@@ -569,6 +586,15 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         ),
         running: turnComplete ? false : session.running,
       };
+      return event.message.usage
+        ? {
+            ...finished,
+            usage: [
+              ...finished.usage,
+              { agentName: event.agent_name, usage: event.message.usage },
+            ],
+          }
+        : finished;
     }
     case "tool_start":
       return {
@@ -1009,6 +1035,7 @@ function applySnapshot(
   const mapped = messages.flatMap((message, index) =>
     historyToEntries(message, index, argsById)
   );
+  const usage = historyUsage(messages);
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -1028,6 +1055,7 @@ function applySnapshot(
     session.draft = false;
     session.providerId = providerId;
     session.reasoningEffort = reasoningEffort;
+    session.usage = usage;
     if (hasHistory) {
       session.entries = mapped;
       session.approvals = approvals;
@@ -1694,6 +1722,9 @@ export const selectActiveProviderId = (state: CodaStoreState) =>
   activeSessionOf(state)?.providerId;
 export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
+const EMPTY_USAGE: UsageRecord[] = [];
+export const selectActiveUsage = (state: CodaStoreState) =>
+  activeSessionOf(state)?.usage ?? EMPTY_USAGE;
 
 /** Subscribe to a slice of the store; re-renders only when that slice changes. */
 export function useCodaStore<T>(selector: (state: CodaStoreState) => T): T {

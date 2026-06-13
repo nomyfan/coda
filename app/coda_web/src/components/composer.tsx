@@ -14,9 +14,11 @@ import type {
   ProviderInfo,
   ReasoningEffort,
   ServerSummary,
+  UsageRecord,
 } from "@/store/session";
 import { serverLabel } from "@/components/session-utils";
 import { ModelSelector } from "@/components/model-selector";
+import { ContextUsage } from "@/components/context-usage";
 
 export const Composer = memo(function Composer({
   status,
@@ -29,6 +31,7 @@ export const Composer = memo(function Composer({
   providers,
   providerId,
   reasoningEffort,
+  usage,
   onSetModel,
   onChangeServer,
   onChangeWorkspace,
@@ -45,6 +48,7 @@ export const Composer = memo(function Composer({
   providers: ProviderInfo[];
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
+  usage: UsageRecord[];
   onSetModel: (
     providerId: string,
     reasoningEffort: ReasoningEffort | null
@@ -59,6 +63,10 @@ export const Composer = memo(function Composer({
   const canSend =
     connected && Boolean(workspace) && !running && Boolean(task.trim());
   const selectableServers = servers.filter((item) => item.catalog.length > 0);
+  const showControls = selectingTarget || Boolean(workspace);
+  const contextWindow = providers.find(
+    (provider) => provider.id === providerId
+  )?.context_window;
 
   function submit() {
     const text = task.trim();
@@ -77,84 +85,6 @@ export const Composer = memo(function Composer({
         submit();
       }}
     >
-      {selectingTarget ? (
-        <div className="mx-auto mb-2 flex max-w-4xl flex-wrap items-center gap-2">
-          <Select
-            value={server}
-            onValueChange={onChangeServer}
-            disabled={selectableServers.length === 0}
-          >
-            <SelectTrigger
-              size="sm"
-              className="w-44 gap-1.5 rounded-md text-xs"
-            >
-              <PlugZap className="size-3.5 text-muted-foreground" />
-              <SelectValue placeholder="Server" />
-            </SelectTrigger>
-            <SelectContent position="popper" side="top">
-              {selectableServers.map((item) => (
-                <SelectItem key={item.url} value={item.url}>
-                  {serverLabel(item)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select
-            value={workspace}
-            onValueChange={onChangeWorkspace}
-            disabled={!connected || workspaces.length === 0}
-          >
-            <SelectTrigger
-              size="sm"
-              className="w-36 gap-1.5 rounded-md text-xs"
-            >
-              <Folder className="size-3.5 text-muted-foreground" />
-              <SelectValue placeholder="Workspace" />
-            </SelectTrigger>
-            <SelectContent position="popper" side="top">
-              {workspaces.map((id) => (
-                <SelectItem key={id} value={id}>
-                  {id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <ModelSelector
-            providers={providers}
-            providerId={providerId}
-            reasoningEffort={reasoningEffort}
-            disabled={!connected || running}
-            onSetModel={onSetModel}
-          />
-        </div>
-      ) : workspace ? (
-        <div className="mx-auto mb-2 flex max-w-4xl flex-wrap items-center gap-2">
-          <Select value={workspace} onValueChange={onChangeWorkspace}>
-            <SelectTrigger
-              size="sm"
-              className="w-auto gap-1.5 rounded-md text-xs"
-              disabled={!connected || workspaces.length === 0}
-            >
-              <Folder className="size-3.5 text-muted-foreground" />
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent position="popper" side="top">
-              {workspaces.map((id) => (
-                <SelectItem key={id} value={id}>
-                  {id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <ModelSelector
-            providers={providers}
-            providerId={providerId}
-            reasoningEffort={reasoningEffort}
-            disabled={!connected || running}
-            onSetModel={onSetModel}
-          />
-        </div>
-      ) : null}
       <div className="relative mx-auto max-w-4xl">
         <Textarea
           value={task}
@@ -196,6 +126,70 @@ export const Composer = memo(function Composer({
           </Button>
         )}
       </div>
+      {showControls ? (
+        <div className="mx-auto mt-2 flex max-w-4xl flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {selectingTarget ? (
+              <Select
+                value={server}
+                onValueChange={onChangeServer}
+                disabled={selectableServers.length === 0}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="w-44 gap-1.5 rounded-md text-xs"
+                >
+                  <PlugZap className="size-3.5 text-muted-foreground" />
+                  <SelectValue placeholder="Server" />
+                </SelectTrigger>
+                <SelectContent position="popper" side="top">
+                  {selectableServers.map((item) => (
+                    <SelectItem key={item.url} value={item.url}>
+                      {serverLabel(item)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : null}
+            <Select
+              value={workspace}
+              onValueChange={onChangeWorkspace}
+              disabled={!connected || workspaces.length === 0}
+            >
+              <SelectTrigger
+                size="sm"
+                className={
+                  selectingTarget
+                    ? "w-36 gap-1.5 rounded-md text-xs"
+                    : "w-auto gap-1.5 rounded-md text-xs"
+                }
+              >
+                <Folder className="size-3.5 text-muted-foreground" />
+                <SelectValue placeholder="Workspace" />
+              </SelectTrigger>
+              <SelectContent position="popper" side="top">
+                {workspaces.map((id) => (
+                  <SelectItem key={id} value={id}>
+                    {id}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+            <ModelSelector
+              providers={providers}
+              providerId={providerId}
+              reasoningEffort={reasoningEffort}
+              disabled={!connected || running}
+              onSetModel={onSetModel}
+            />
+            {contextWindow ? (
+              <ContextUsage contextWindow={contextWindow} records={usage} />
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </form>
   );
 });

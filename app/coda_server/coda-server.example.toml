@@ -4,7 +4,8 @@
 # `api_key` and `base_url` may reference an environment variable as `${VAR}`.
 # `models` lists the models under this provider; each model has a required `id`
 # (the API model name sent in requests), an optional `name` (human-readable
-# dashboard label, defaults to `id`), and optional `reasoning_efforts`.
+# dashboard label, defaults to `id`), a required `context_window`, and optional
+# `reasoning_efforts`.
 # The dashboard picks which model a session uses; the first listed is the default.
 
 [[providers]]
@@ -13,8 +14,8 @@ kind = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com"
 models = [
-  { id = "deepseek-reasoner", name = "DeepSeek R1", reasoning_efforts = ["low", "medium", "high"] },
-  { id = "deepseek-chat", name = "DeepSeek V3" },
+  { id = "deepseek-reasoner", name = "DeepSeek R1", context_window = 128000, reasoning_efforts = ["low", "medium", "high"] },
+  { id = "deepseek-chat", name = "DeepSeek V3", context_window = 128000 },
 ]
 
 [[providers]]
@@ -22,7 +23,7 @@ id = "openai"
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"
 models = [
-  { id = "gpt-4o", name = "GPT-4o" },
+  { id = "gpt-4o", name = "GPT-4o", context_window = 128000 },
 ]
 
 [[workspaces]]

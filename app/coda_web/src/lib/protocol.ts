@@ -7,6 +7,19 @@ export type ToolCall = {
 export type CompletionUsage = {
   prompt_tokens: number;
   completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: {
+    audio_tokens?: number | null;
+    cached_tokens?: number | null;
+    cache_hit_tokens?: number | null;
+    cache_miss_tokens?: number | null;
+  } | null;
+  completion_tokens_details?: {
+    accepted_prediction_tokens?: number | null;
+    audio_tokens?: number | null;
+    reasoning_tokens?: number | null;
+    rejected_prediction_tokens?: number | null;
+  } | null;
 };
 
 export type AssistantMessage = {
@@ -84,6 +97,7 @@ export type ProviderInfo = {
   id: string;
   provider: string;
   model: string;
+  context_window: number;
   reasoning_efforts: ReasoningEffort[];
 };
 
