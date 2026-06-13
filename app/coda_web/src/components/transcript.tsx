@@ -309,59 +309,66 @@ type ProcessItem =
       entries: TranscriptEntry[];
     };
 
+type SubAgentItem = Extract<ProcessItem, { type: "subagent" }>;
+
 /**
  * Fold a flat process timeline into items, collapsing each sub-agent run into a
  * single group. The anchor is the `coda` tool entry whose name carries the
  * sub-agent prefix — a `tool_call` while it runs, an in-place `tool_result` once
- * it replies. Any consecutive sub-agent events that follow are its process.
- * This works identically for live turns and for resumed history (where only the
- * anchor survives, with no inner process), since the prefix self-identifies it.
+ * it replies. A sub-agent's own events attach to the open group with the
+ * matching agent name, *not* merely the ones that happen to follow — so several
+ * sub-agents invoked in one batch (whose events interleave) each land under
+ * their own invocation. Sequential runs of the same agent split correctly too;
+ * only truly concurrent same-name runs degrade (events fold into the latest).
+ *
+ * Works identically for live turns and resumed history (where only the anchor
+ * survives, with no inner process), since the prefix self-identifies it.
  */
 function groupProcessItems(entries: TranscriptEntry[]): ProcessItem[] {
   const items: ProcessItem[] = [];
-  let index = 0;
+  // Open sub-agent groups keyed by agent display name.
+  const openByName = new Map<string, SubAgentItem>();
 
-  while (index < entries.length) {
-    const entry = entries[index];
-
-    if (
+  for (const entry of entries) {
+    const isAnchor =
       (entry.kind === "tool_call" || entry.kind === "tool_result") &&
-      isSubAgentToolName(entry.title)
-    ) {
-      index += 1;
-      const start = index;
-      while (index < entries.length && isSubAgentEntry(entries[index])) {
-        index += 1;
-      }
-      items.push({
+      isSubAgentToolName(entry.title);
+
+    // A `coda`-issued prefixed tool entry opens a top-level sub-agent group.
+    if (isAnchor && !isSubAgentEntry(entry)) {
+      const agentName = subAgentDisplayName(entry.title as string);
+      const group: SubAgentItem = {
         type: "subagent",
         key: entry.id,
-        agentName: subAgentDisplayName(entry.title),
+        agentName,
         callEntry: entry,
-        entries: entries.slice(start, index),
-      });
+        entries: [],
+      };
+      items.push(group);
+      openByName.set(agentName, group);
       continue;
     }
 
-    // Fallback: sub-agent events without a surviving anchor (shouldn't normally
-    // happen, but keeps an orphaned run grouped rather than flattened).
+    // A sub-agent's own event attaches to its matching open group (opening a
+    // fallback group if no anchor survived, e.g. an orphaned resumed run).
     if (isSubAgentEntry(entry)) {
-      const start = index;
-      while (index < entries.length && isSubAgentEntry(entries[index])) {
-        index += 1;
+      const name = entry.agentName ?? "sub-agent";
+      let group = openByName.get(name);
+      if (!group) {
+        group = { type: "subagent", key: entry.id, agentName: name, entries: [] };
+        items.push(group);
+        openByName.set(name, group);
       }
-      const block = entries.slice(start, index);
-      items.push({
-        type: "subagent",
-        key: block[0].id,
-        agentName: block[0].agentName ?? "sub-agent",
-        entries: block,
-      });
+      group.entries.push(entry);
+      // A nested sub-agent invocation: route the nested agent's own events into
+      // this same group rather than letting them surface at the top level.
+      if (isAnchor) {
+        openByName.set(subAgentDisplayName(entry.title as string), group);
+      }
       continue;
     }
 
     items.push({ type: "entry", entry });
-    index += 1;
   }
 
   return items;

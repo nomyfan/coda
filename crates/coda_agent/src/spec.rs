@@ -5,7 +5,14 @@ use tokio::sync::Mutex;
 
 use coda_tools::{BuildContext, TodoItem, ToolSpec};
 
-use crate::agent::{Agent, AgentState, SubAgentMode, SubAgentTool, SystemPrompt};
+use crate::agent::{
+    Agent, AgentState, SUBAGENT_TOOL_PREFIX, SubAgentMode, SubAgentTool, SystemPrompt,
+};
+
+/// OpenAI-compatible function names are capped at 64 characters; a sub-agent's
+/// name plus the `agent__` prefix must fit, or the provider rejects every
+/// request that exposes it.
+const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// Errors that can occur while validating an [`AgentTeam`].
 #[derive(Debug)]
@@ -18,6 +25,9 @@ pub enum BuildError {
     /// a name. Tools and sub-agents occupy the same LLM tool namespace, so the
     /// name would be ambiguous at dispatch.
     NameConflict { agent: String, name: String },
+    /// A sub-agent's name, once prefixed for the LLM tool namespace, exceeds the
+    /// provider's function-name length limit.
+    SubagentNameTooLong { name: String, max: usize },
 }
 
 impl std::fmt::Display for BuildError {
@@ -43,6 +53,14 @@ impl std::fmt::Display for BuildError {
                     "Agent '{}' has two entries named '{}' (tools and sub-agents \
                      share one namespace)",
                     agent, name
+                )
+            }
+            BuildError::SubagentNameTooLong { name, max } => {
+                write!(
+                    f,
+                    "Sub-agent name '{}' is too long: prefixed with '{}' the tool \
+                     name must be at most {} characters",
+                    name, SUBAGENT_TOOL_PREFIX, max
                 )
             }
         }
@@ -90,6 +108,17 @@ impl AgentTeam {
         for spec in std::iter::once(&root).chain(&subagents) {
             if by_name.insert(spec.name.as_str(), spec).is_some() {
                 return Err(BuildError::DuplicateAgentName(spec.name.clone()));
+            }
+        }
+
+        // Sub-agents are exposed to the LLM as `agent__<name>` tools; reject any
+        // whose prefixed name would overflow the provider's function-name limit.
+        for spec in &subagents {
+            if SUBAGENT_TOOL_PREFIX.len() + spec.name.len() > MAX_TOOL_NAME_LEN {
+                return Err(BuildError::SubagentNameTooLong {
+                    name: spec.name.clone(),
+                    max: MAX_TOOL_NAME_LEN,
+                });
             }
         }
 
@@ -200,5 +229,41 @@ impl AgentTeam {
         }
 
         agents
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str) -> AgentSpec {
+        AgentSpec {
+            name: name.into(),
+            description: String::new(),
+            system_prompt: "".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }
+    }
+
+    #[test]
+    fn rejects_subagent_name_overflowing_prefixed_tool_limit() {
+        let too_long = "a".repeat(MAX_TOOL_NAME_LEN - SUBAGENT_TOOL_PREFIX.len() + 1);
+        let result = AgentTeam::new(spec("coda"), vec![spec(&too_long)]);
+        assert!(matches!(
+            result,
+            Err(BuildError::SubagentNameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_subagent_name_at_the_prefixed_tool_limit() {
+        let max = "a".repeat(MAX_TOOL_NAME_LEN - SUBAGENT_TOOL_PREFIX.len());
+        let root = AgentSpec {
+            subagents: vec![max.clone()],
+            ..spec("coda")
+        };
+        assert!(AgentTeam::new(root, vec![spec(&max)]).is_ok());
     }
 }

@@ -772,7 +772,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         for tc in &tool_execution.tool_calls {
             if let Some(subagent) = self.agent.subagents.get(&tc.tool_call.name) {
                 if subagent.mode == SubAgentMode::Stateful
-                    && concurrent_stateful.contains(&tc.tool_call.name)
+                    && concurrent_stateful.contains(&subagent.name)
                 {
                     // reject concurrent calls to stateful subagent
                     self.agent
@@ -984,10 +984,12 @@ fn concurrent_stateful_subagents(
 ) -> HashSet<String> {
     let mut counts = std::collections::HashMap::new();
     for tc in tool_calls {
+        // Key by the resolved (bare) agent name so prefixed and bare tool-name
+        // forms that point at the same stateful sub-agent are counted together.
         if let Some(subagent) = agent.subagents.get(&tc.tool_call.name)
             && subagent.mode == crate::SubAgentMode::Stateful
         {
-            *counts.entry(tc.tool_call.name.clone()).or_insert(0usize) += 1;
+            *counts.entry(subagent.name.clone()).or_insert(0usize) += 1;
         }
     }
     counts
