@@ -362,7 +362,10 @@ impl ToolApprovalConfig {
         ToolApprovalMode::RequireWhen(Arc::new(move |call| {
             // `ask_user` has no real execution — it must always suspend so the
             // caller can interactively answer and resolve it.
-            call.name == "ask_user" || self.requires_approval(call)
+            call.name == "ask_user"
+                || call.name == "edit_file"
+                || call.name == "write_file"
+                || self.requires_approval(call)
         }))
     }
 
