@@ -5,13 +5,13 @@ use axum::{
     routing::get,
 };
 use coda_agent::{
-    AgentTeam, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt, Shutdown,
-    SystemPrompt, runtime::SessionStorage,
+    AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
+    Shutdown, SystemPrompt, runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProviderConfig, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
-    agents::{ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
+    agents::{AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
     ask_user::AskUserToolSpec,
     build_system_prompt,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
@@ -50,7 +50,8 @@ struct ProviderHandle {
     provider: Arc<OpenAI>,
     model_id: String,
     model_name: String,
-    provider_name: String,
+    /// The configured provider's id.
+    provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
 }
@@ -68,7 +69,19 @@ struct WorkspaceState {
     /// watcher updates, so live and newly opened sessions both pick up changes on
     /// their next turn.
     agent_team: AgentTeam,
+    /// Static per-agent model overrides parsed from each agent's `AGENT.md`,
+    /// keyed by agent name and validated against the provider catalog at startup.
+    /// Agents absent here inherit the session's default (root) model.
+    agent_models: HashMap<String, ModelSelection>,
     approval_config: ToolApprovalConfig,
+}
+
+/// A validated per-agent model override: a provider selection key plus the
+/// normalized reasoning effort. Resolved to a `ModelProfile` at session open.
+#[derive(Clone)]
+struct ModelSelection {
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 struct ActiveSession {
@@ -125,12 +138,41 @@ async fn open_session(
         .providers
         .get(provider_id)
         .expect("caller passes a validated provider id");
-    let config = RunConfig {
+    // The root agent (and any agent without an override) runs on the session's
+    // selected model.
+    let default_model = ModelProfile {
         provider: provider.provider.clone(),
         model: provider.model_id.clone(),
-        max_completion_tokens: Some(10_000),
+        label: provider_id.to_string(),
         temperature: Some(0.7),
+        max_completion_tokens: Some(10_000),
         reasoning_effort,
+    };
+    // Sub-agents with a configured `model` run on their own provider/model. The
+    // selections were validated against the catalog at startup, so every lookup
+    // resolves.
+    let agent_models = workspace
+        .agent_models
+        .iter()
+        .map(|(name, selection)| {
+            let handle = app
+                .providers
+                .get(&selection.provider_id)
+                .expect("agent model selections are validated at startup");
+            let profile = ModelProfile {
+                provider: handle.provider.clone(),
+                model: handle.model_id.clone(),
+                label: selection.provider_id.clone(),
+                temperature: Some(0.7),
+                max_completion_tokens: Some(10_000),
+                reasoning_effort: selection.reasoning_effort,
+            };
+            (name.clone(), profile)
+        })
+        .collect();
+    let config = RunConfig {
+        default_model,
+        agent_models,
         tool_approval: workspace.approval_config.clone().into_approval_mode(),
         // Disabled: approvals never auto-reject; a pending ask_user/tool call
         // waits indefinitely until the user resolves it.
@@ -343,7 +385,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
         .iter()
         .map(|(id, handle)| ProviderInfoWire {
             id: id.clone(),
-            provider: handle.provider_name.clone(),
+            provider: handle.provider_id.clone(),
             model: handle.model_name.clone(),
             reasoning_efforts: handle.reasoning_efforts.clone(),
         })
@@ -1062,8 +1104,52 @@ fn display_path(path: &FsPath) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Validate each agent file's optional `model` override against the provider
+/// catalog, returning a map of agent name → resolved selection. A reference to
+/// an unknown model, or a reasoning effort the model doesn't offer, is a hard
+/// startup error — so a misconfigured agent can never silently fall back to the
+/// default model. Reasoning effort is normalized exactly like a dashboard
+/// selection (omitted → the model's first configured level).
+fn resolve_agent_model_selections(
+    files: &[AgentFile],
+    providers: &HashMap<String, Arc<ProviderHandle>>,
+) -> Result<HashMap<String, ModelSelection>, String> {
+    let mut selections = HashMap::new();
+    for file in files {
+        let Some(model_key) = file.model() else {
+            continue;
+        };
+        let Some(handle) = providers.get(model_key) else {
+            return Err(format!(
+                "agent '{}' references unknown model '{}'",
+                file.name(),
+                model_key
+            ));
+        };
+        let Some(reasoning_effort) =
+            normalize_reasoning_effort(&handle.reasoning_efforts, file.reasoning_effort())
+        else {
+            return Err(format!(
+                "agent '{}' model '{}' does not support reasoning effort {:?}",
+                file.name(),
+                model_key,
+                file.reasoning_effort()
+            ));
+        };
+        selections.insert(
+            file.name().to_string(),
+            ModelSelection {
+                provider_id: model_key.to_string(),
+                reasoning_effort,
+            },
+        );
+    }
+    Ok(selections)
+}
+
 async fn build_workspace(
     workspace: WorkspaceConfig,
+    providers: &HashMap<String, Arc<ProviderHandle>>,
     shutdown: &CancellationToken,
 ) -> Result<WorkspaceState, String> {
     let workspace_dir = workspace.path.canonicalize().map_err(|e| {
@@ -1102,6 +1188,7 @@ async fn build_workspace(
     }
 
     let agent_files = load_agent_files(&workspace_dir).map_err(|e| e.to_string())?;
+    let agent_models = resolve_agent_model_selections(&agent_files, providers)?;
     let agent_team = build_agent_team(
         SystemPrompt::from(system_prompt.clone()),
         &registry,
@@ -1139,6 +1226,7 @@ async fn build_workspace(
         workspace_str,
         mcp_servers,
         agent_team,
+        agent_models,
         approval_config,
     })
 }
@@ -1221,7 +1309,7 @@ async fn main() {
                     provider: shared_provider.clone(),
                     model_id: m.id,
                     model_name: m.name,
-                    provider_name: p.id.clone(),
+                    provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                 };
                 (id, Arc::new(handle))
@@ -1232,7 +1320,7 @@ async fn main() {
     let mut workspaces = HashMap::new();
     for workspace in server_config.workspaces {
         let id = workspace.id.clone();
-        let state = build_workspace(workspace, &shutdown)
+        let state = build_workspace(workspace, &providers, &shutdown)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("error loading workspace '{id}': {e}");

@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use coda_agent::{AgentSpec, AgentTeam, BuildError, SubAgentMode, SystemPrompt};
+use coda_core::llm::ReasoningEffort;
 use coda_core::tool::ToolObject;
 use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
 use serde::Deserialize;
@@ -174,6 +175,14 @@ struct Frontmatter {
     tools: Vec<String>,
     #[serde(default)]
     subagents: Vec<String>,
+    /// Optional model override, as a `{provider_id}:{model_id}` selection key.
+    /// Absent means the agent inherits the session's default (root) model.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional reasoning effort for the overridden model. Validated against the
+    /// model's configured levels at startup.
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A parsed agent file (before tool resolution).
@@ -184,6 +193,25 @@ pub struct AgentFile {
     tools: Vec<String>,
     subagents: Vec<String>,
     system_prompt: String,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl AgentFile {
+    /// The agent's name (its directory name under `.coda/agents/`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The configured model selection key (`{provider_id}:{model_id}`), if any.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The configured reasoning effort for the overridden model, if any.
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
 }
 
 /// Frontmatter of the optional top-level `.coda/agents/AGENT.md`. Both fields are
@@ -256,6 +284,8 @@ fn parse_agent_file(name: &str, content: &str) -> Result<AgentFile, LoadError> {
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: body.to_string(),
+        model: fm.model,
+        reasoning_effort: fm.reasoning_effort,
     })
 }
 
@@ -546,6 +576,32 @@ mod tests {
         assert_eq!(files[0].mode, SubAgentMode::Stateless);
         assert_eq!(files[0].tools, vec!["read_file", "grep"]);
         assert_eq!(files[0].system_prompt, "You explore.");
+    }
+
+    #[test]
+    fn parses_model_override() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "deep",
+            "---\ndescription: reasons hard\nmode: stateless\nmodel: \"deepseek:deepseek-reasoner\"\nreasoning_effort: high\n---\nYou reason.",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        assert_eq!(files[0].model(), Some("deepseek:deepseek-reasoner"));
+        assert_eq!(files[0].reasoning_effort(), Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn model_override_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "plain",
+            "---\ndescription: x\nmode: stateless\n---\nbody",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        assert_eq!(files[0].model(), None);
+        assert_eq!(files[0].reasoning_effort(), None);
     }
 
     #[test]

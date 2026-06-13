@@ -14,11 +14,11 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender,
+    AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, Sender,
     SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
-        EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget, ResumePoint,
-        ToolExecutionState,
+        AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget,
+        ResumePoint, ToolExecutionState,
     },
     persist::StoredCheckpoint,
     runtime::AgentRuntime,
@@ -31,9 +31,12 @@ pub(crate) async fn run_agent(
     mut agent: Agent,
     mut control_rx: mpsc::Receiver<AgentControl>,
     mut envelope_rx: mpsc::Receiver<Envelope>,
-    config: RunConfig<impl LLMProvider + Clone>,
+    config: AgentRunConfig<impl LLMProvider + Clone>,
 ) {
-    info!("Agent {} is running", agent.name);
+    info!(
+        "Agent {} is running (model: {})",
+        agent.name, config.profile.label
+    );
     let (mut active_thread, resume_decision) = active;
     // When a resume decision is provided alongside the active thread, turn it into
     // a Resume envelope for the first iteration so the agent drops straight from
@@ -216,7 +219,7 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
     runtime: AgentRuntime,
     agent: &'a mut Agent,
     cancel: CancellationToken,
-    config: RunConfig<C>,
+    config: AgentRunConfig<C>,
     thread_id: ThreadId,
     reply_target: Option<ReplyTarget>,
 }
@@ -578,10 +581,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     async fn handle_generation(&mut self) -> AgentLoopState {
         let thread_id = self.thread_id.clone();
         let request = ChatCompletionRequest {
-            model: self.config.model.clone(),
-            max_completion_tokens: self.config.max_completion_tokens,
-            temperature: self.config.temperature,
-            reasoning_effort: self.config.reasoning_effort,
+            model: self.config.profile.model.clone(),
+            max_completion_tokens: self.config.profile.max_completion_tokens,
+            temperature: self.config.profile.temperature,
+            reasoning_effort: self.config.profile.reasoning_effort,
             messages: self.agent.messages().await,
             tools: {
                 let mut tools = self.agent.tools.descriptors();
@@ -597,7 +600,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             )
             .await;
 
-        let mut llm_stream = std::pin::pin!(self.config.provider.stream(request));
+        let mut llm_stream = std::pin::pin!(self.config.profile.provider.stream(request));
         let mut partial_content = String::new();
         let mut partial_reasoning = String::new();
         let llm_result = loop {
