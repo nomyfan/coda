@@ -212,26 +212,14 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
-function EntryStatus({
-  entry,
-  showUsage = true,
-}: {
-  entry: TranscriptEntry;
-  showUsage?: boolean;
-}) {
+function EntryStatus({ entry }: { entry: TranscriptEntry }) {
+  if (!entry.status) {
+    return null;
+  }
   return (
-    <>
-      {entry.status ? (
-        <Badge variant={entry.status === "running" ? "warning" : "secondary"}>
-          {entry.status}
-        </Badge>
-      ) : null}
-      {showUsage && entry.usage ? (
-        <Badge variant="outline">
-          {entry.usage.prompt_tokens + entry.usage.completion_tokens} tokens
-        </Badge>
-      ) : null}
-    </>
+    <Badge variant={entry.status === "running" ? "warning" : "secondary"}>
+      {entry.status}
+    </Badge>
   );
 }
 
@@ -267,12 +255,10 @@ function CopyContentButton({
 function MessageActions({
   content,
   label,
-  usage,
   align,
 }: {
   content: string;
   label: string;
-  usage?: TranscriptEntry["usage"];
   align: "start" | "end";
 }) {
   return (
@@ -283,11 +269,6 @@ function MessageActions({
       )}
     >
       <CopyContentButton content={content} label={label} />
-      {usage ? (
-        <Badge variant="outline">
-          {usage.prompt_tokens + usage.completion_tokens} tokens
-        </Badge>
-      ) : null}
     </div>
   );
 }
@@ -480,7 +461,6 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
       ? entries.filter((_, index) => index !== finalAssistantIndex)
       : entries;
   const processItems = groupProcessItems(intermediateEntries);
-  const usage = finalAssistant?.usage;
   const [processOpen, setProcessOpen] = useState(!processComplete);
   const previousProcessComplete = useRef(processComplete);
 
@@ -539,7 +519,6 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
         <MessageActions
           content={finalAssistant.content}
           label="response"
-          usage={usage}
           align="start"
         />
       ) : null}
@@ -646,10 +625,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <EntryStatus
-          entry={entry}
-          showUsage={entry.kind !== "assistant"}
-        />
+        <EntryStatus entry={entry} />
       </div>
     </div>
   );
@@ -712,7 +688,6 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <MessageActions
           content={entry.content}
           label="response"
-          usage={entry.usage}
           align="start"
         />
       </div>

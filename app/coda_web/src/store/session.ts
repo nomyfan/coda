@@ -56,7 +56,6 @@ export type TranscriptEntry = {
   detail?: string;
   content: string;
   status?: string;
-  usage?: CompletionUsage | null;
   liveKey?: string;
   callId?: string;
   isFinalResponse?: boolean;
@@ -312,7 +311,6 @@ function historyToEntries(
         kind: "assistant",
         agentName: rootName,
         content: assistant.content,
-        usage: assistant.usage,
         status: assistant.aborted ? "aborted" : undefined,
         isFinalResponse: assistant.tool_calls.length === 0,
       });
@@ -503,7 +501,6 @@ function finishAssistant(
     event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
-      usage: event.message.usage,
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
     });
@@ -519,7 +516,6 @@ function finishAssistant(
           agentName: event.agent_name,
           threadId: event.thread_id,
           content: event.message.content,
-          usage: event.message.usage,
           status: event.message.aborted ? "aborted" : undefined,
           isFinalResponse,
         },
