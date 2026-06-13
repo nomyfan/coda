@@ -10,9 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ProviderInfo, ReasoningEffort } from "@/lib/session";
-
-const defaultReasoning = "__default__";
+import type { ProviderInfo, ReasoningEffort } from "@/store/session";
 
 function effortLabel(effort: ReasoningEffort) {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
@@ -31,8 +29,8 @@ function groupProviders(providers: ProviderInfo[]): ProviderGroups {
 
 /**
  * Pick the reasoning value to carry over when switching model: a model with
- * no reasoning controls gets `null`; provider default and "off" carry over; an
- * effort the new model still accepts is kept, otherwise its first level.
+ * no reasoning controls gets `null`; "off" and supported efforts carry over;
+ * every other value becomes the model's first configured effort.
  */
 function carryReasoning(
   model: ProviderInfo | undefined,
@@ -41,10 +39,10 @@ function carryReasoning(
   if (!model || model.reasoning_efforts.length === 0) {
     return null;
   }
-  if (current === null || current === "none") {
+  if (current === "none") {
     return current;
   }
-  if (model.reasoning_efforts.includes(current)) {
+  if (current && model.reasoning_efforts.includes(current)) {
     return current;
   }
   return model.reasoning_efforts[0];
@@ -116,12 +114,9 @@ export function ModelSelector({
       </Select>
       {efforts.length > 0 ? (
         <Select
-          value={reasoningEffort ?? defaultReasoning}
+          value={reasoningEffort ?? efforts[0]}
           onValueChange={(value) =>
-            onSetModel(
-              providerId,
-              value === defaultReasoning ? null : (value as ReasoningEffort)
-            )
+            onSetModel(providerId, value as ReasoningEffort)
           }
           disabled={disabled}
         >
@@ -130,7 +125,6 @@ export function ModelSelector({
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>
           <SelectContent position="popper" side="top">
-            <SelectItem value={defaultReasoning}>Default</SelectItem>
             <SelectItem value="none">Off</SelectItem>
             {efforts.map((effort) => (
               <SelectItem key={effort} value={effort}>

@@ -4,9 +4,11 @@ import {
   ChevronRight,
   Folder,
   Loader2,
-  MessageSquareText,
+  MessageSquarePlus,
+  MessageSquareQuote,
   PanelLeft,
   Pencil,
+  Plug,
   Plus,
   PlugZap,
   RotateCcw,
@@ -14,7 +16,7 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,15 +28,27 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
 import {
+  connectServer,
+  deleteSession,
+  disconnectServer,
+  removeServer,
+  renameServer,
+  selectActiveKey,
+  selectActiveServer,
+  useCodaStore,
   type ConnectionStatus,
   type OpenedSession,
-  type ServerState,
   type SessionKey,
   type WorkspaceSummary,
-} from "@/lib/session";
+} from "@/store/session";
 import { cn } from "@/lib/utils";
-import { serverLabel, sessionTitle, statusCopy } from "@/components/session-utils";
+import {
+  serverLabel,
+  sessionTitle,
+  statusCopy,
+} from "@/components/session-utils";
 
 function StatusDot({ status }: { status: ConnectionStatus }) {
   const tone =
@@ -54,6 +68,34 @@ function StatusDot({ status }: { status: ConnectionStatus }) {
     />
   );
 }
+
+/** Compact server entry shown in the collapsed rail: click starts a new session
+ * under that server (in its first workspace). */
+const CollapsedServerButton = memo(function CollapsedServerButton({
+  url,
+  onNewSession,
+}: {
+  url: string;
+  onNewSession: (serverUrl: string, workspaceId: string) => void;
+}) {
+  const server = useCodaStore((state) => state.servers[url]);
+  if (!server) {
+    return null;
+  }
+  const firstWorkspace = server.catalog[0]?.id;
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      className="size-6"
+      disabled={server.status !== "connected" || !firstWorkspace}
+      onClick={() => firstWorkspace && onNewSession(url, firstWorkspace)}
+      title={`New session · ${serverLabel(server)}`}
+    >
+      <StatusDot status={server.status} />
+    </Button>
+  );
+});
 
 function AddServerDialog({
   open,
@@ -173,7 +215,7 @@ function SessionRow({
         ) : running ? (
           <Loader2 className="size-4 shrink-0 animate-spin text-amber-500" />
         ) : (
-          <MessageSquareText className="size-4 shrink-0 text-muted-foreground" />
+          <MessageSquareQuote className="size-4 shrink-0 text-muted-foreground" />
         )}
         <span className="min-w-0 flex-1 truncate text-sm">
           {sessionTitle(session)}
@@ -315,40 +357,31 @@ function WorkspaceNode({
   );
 }
 
-function ServerNode({
-  server,
-  activeServer,
-  activeKey,
-  onReconnect,
-  onDisconnect,
-  onRemove,
-  onRename,
+const ServerNode = memo(function ServerNode({
+  url,
   onOpenSession,
   onNewSession,
-  onDeleteSession,
 }: {
-  server: ServerState;
-  activeServer?: string;
-  activeKey?: SessionKey;
-  onReconnect: (serverUrl: string) => void;
-  onDisconnect: (serverUrl: string) => void;
-  onRemove: (serverUrl: string) => void;
-  onRename: (serverUrl: string, alias: string) => void;
+  url: string;
   onOpenSession: (
     serverUrl: string,
     workspaceId: string,
     sessionId: string
   ) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
-  onDeleteSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
 }) {
+  // Subscribe to just this server, so streaming on one session only re-renders
+  // its own node — not every server in the sidebar.
+  const server = useCodaStore((state) => state.servers[url]);
+  const activeServer = useCodaStore(selectActiveServer);
+  const activeKey = useCodaStore(selectActiveKey);
   const [collapsed, setCollapsed] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [aliasDraft, setAliasDraft] = useState(server.alias ?? "");
+  const [aliasDraft, setAliasDraft] = useState(server?.alias ?? "");
+
+  if (!server) {
+    return null;
+  }
 
   function startEditing() {
     setAliasDraft(server.alias ?? "");
@@ -356,7 +389,7 @@ function ServerNode({
   }
 
   function commitAlias() {
-    onRename(server.url, aliasDraft);
+    renameServer(server.url, aliasDraft);
     setEditing(false);
   }
 
@@ -432,7 +465,7 @@ function ServerNode({
               variant="ghost"
               size="icon"
               className="size-6 shrink-0"
-              onClick={() => onReconnect(server.url)}
+              onClick={() => connectServer(server.url)}
               title="Reconnect"
             >
               <RotateCcw className="size-4" />
@@ -442,7 +475,7 @@ function ServerNode({
               variant="ghost"
               size="icon"
               className="size-6 shrink-0"
-              onClick={() => onDisconnect(server.url)}
+              onClick={() => disconnectServer(server.url)}
               title="Disconnect"
             >
               <Unplug className="size-4" />
@@ -452,7 +485,7 @@ function ServerNode({
             variant="ghost"
             size="icon"
             className="size-6 shrink-0"
-            onClick={() => onRemove(server.url)}
+            onClick={() => removeServer(server.url)}
             title="Remove server"
           >
             <X className="size-4" />
@@ -472,7 +505,7 @@ function ServerNode({
               sessions={server.sessions}
               onOpenSession={onOpenSession}
               onNewSession={onNewSession}
-              onDeleteSession={onDeleteSession}
+              onDeleteSession={deleteSession}
             />
           ))}
           {server.catalog.length === 0 ? (
@@ -486,28 +519,13 @@ function ServerNode({
       ) : null}
     </div>
   );
-}
+});
 
 export function Sidebar({
-  servers,
-  activeServer,
-  activeKey,
-  onConnectServer,
-  onDisconnectServer,
-  onRemoveServer,
-  onRenameServer,
   onOpenSession,
   onStartNewSession,
   onNewSession,
-  onDeleteSession,
 }: {
-  servers: ServerState[];
-  activeServer?: string;
-  activeKey?: SessionKey;
-  onConnectServer: (serverUrl: string) => void;
-  onDisconnectServer: (serverUrl: string) => void;
-  onRemoveServer: (serverUrl: string) => void;
-  onRenameServer: (serverUrl: string, alias: string) => void;
   onOpenSession: (
     serverUrl: string,
     workspaceId: string,
@@ -515,12 +533,10 @@ export function Sidebar({
   ) => void;
   onStartNewSession: () => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
-  onDeleteSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
 }) {
+  // `order` is stable while sessions stream (only changes when servers are
+  // added/removed), so the sidebar shell doesn't re-render on every token.
+  const order = useCodaStore((state) => state.order);
   const [adding, setAdding] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
@@ -531,12 +547,17 @@ export function Sidebar({
         collapsed && "lg:w-12"
       )}
     >
-      <div className="flex items-center justify-between pl-1">
+      <div
+        className={cn(
+          "flex items-center",
+          collapsed ? "justify-center" : "justify-between pl-1"
+        )}
+      >
         {collapsed ? (
           <Button
             variant="ghost"
             size="icon"
-            className="size-7"
+            className="size-6"
             onClick={() => setCollapsed(false)}
             title="Expand servers"
           >
@@ -555,7 +576,7 @@ export function Sidebar({
                 onClick={onStartNewSession}
                 title="New session"
               >
-                <MessageSquareText className="size-4" />
+                <MessageSquarePlus className="size-4" />
               </Button>
               <Button
                 variant="ghost"
@@ -564,7 +585,7 @@ export function Sidebar({
                 onClick={() => setAdding(true)}
                 title="Add server"
               >
-                <Plus className="size-4" />
+                <Plug className="size-4" />
               </Button>
               <Button
                 variant="ghost"
@@ -580,35 +601,55 @@ export function Sidebar({
         )}
       </div>
       {collapsed ? (
-        <div className="min-h-0 flex-1" />
+        <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            onClick={onStartNewSession}
+            title="New session"
+          >
+            <MessageSquarePlus className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            onClick={() => setAdding(true)}
+            title="Add server"
+          >
+            <Plug className="size-4" />
+          </Button>
+          {order.length > 0 ? <Separator className="my-1 w-6" /> : null}
+          {order.map((url) => (
+            <CollapsedServerButton
+              key={url}
+              url={url}
+              onNewSession={onNewSession}
+            />
+          ))}
+        </div>
       ) : (
         <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5">
-          {servers.length === 0 ? (
+          {order.length === 0 ? (
             <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
               <div className="text-sm font-medium">No servers</div>
               <p className="text-xs leading-5 text-muted-foreground">
                 Connect to a local or remote Coda server.
               </p>
               <Button size="sm" onClick={() => setAdding(true)}>
-                <Plus className="size-4" />
+                <Plug className="size-4" />
                 Add server
               </Button>
             </div>
           ) : (
             <>
-              {servers.map((server) => (
+              {order.map((url) => (
                 <ServerNode
-                  key={server.url}
-                  server={server}
-                  activeServer={activeServer}
-                  activeKey={activeKey}
-                  onReconnect={onConnectServer}
-                  onDisconnect={onDisconnectServer}
-                  onRemove={onRemoveServer}
-                  onRename={onRenameServer}
+                  key={url}
+                  url={url}
                   onOpenSession={onOpenSession}
                   onNewSession={onNewSession}
-                  onDeleteSession={onDeleteSession}
                 />
               ))}
             </>
@@ -618,7 +659,7 @@ export function Sidebar({
       <AddServerDialog
         open={adding}
         onOpenChange={setAdding}
-        onConnect={onConnectServer}
+        onConnect={connectServer}
       />
     </aside>
   );

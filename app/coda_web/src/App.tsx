@@ -1,10 +1,27 @@
 import { Command } from "lucide-react";
-import { useEffect, useState } from "react";
-import type { PendingApproval } from "@/lib/protocol";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  abort,
+  codaStore,
+  newSession,
+  openSession,
+  selectActiveApprovalCount,
+  selectActiveProviderId,
+  selectActiveProviders,
+  selectActiveReasoningEffort,
+  selectActiveRunning,
+  selectActiveServer,
+  selectActiveStatus,
+  selectActiveWorkspace,
+  selectServerSummaries,
+  sendTask,
+  sendTaskToNewSession,
+  setModel,
+  useCodaBootstrap,
+  useCodaStore,
   type ReasoningEffort,
-  useCodaSession,
-} from "@/lib/session";
+  type ServerSummary,
+} from "@/store/session";
 import { Sidebar } from "@/components/sidebar";
 import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
@@ -12,13 +29,18 @@ import { ApprovalPanel } from "@/components/approval-panel";
 import {
   beginNewSession,
   clearNewSessionTarget,
+  newSessionStore,
   rememberNewSessionTarget,
   resolveNewSessionTarget,
   setNewSessionTarget,
   useNewSessionStore,
 } from "@/store/new-session";
 
-function WorkspaceHeader({ approvals }: { approvals: PendingApproval[] }) {
+/** Stable empty list so the composer's `servers` prop is referentially stable
+ * in the active-session view (the list is only used while picking a target). */
+const NO_SERVERS: ServerSummary[] = [];
+
+function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
   return (
     <header className="flex h-11 shrink-0 items-center justify-between border-b bg-background/90 px-4 backdrop-blur">
       <div className="flex min-w-0 items-center gap-2">
@@ -28,7 +50,7 @@ function WorkspaceHeader({ approvals }: { approvals: PendingApproval[] }) {
         <h1 className="truncate text-sm font-semibold tracking-normal">Coda</h1>
         <span className="size-1 rounded-full bg-muted-foreground/45" />
         <span className="text-xs text-muted-foreground">
-          {approvals.length} pending approval(s)
+          {approvalCount} pending approval(s)
         </span>
       </div>
     </header>
@@ -36,7 +58,20 @@ function WorkspaceHeader({ approvals }: { approvals: PendingApproval[] }) {
 }
 
 export default function App() {
-  const session = useCodaSession();
+  useCodaBootstrap();
+
+  // Server summaries exclude session state, so streaming entries leave this
+  // subscription stable.
+  const servers = useCodaStore(selectServerSummaries);
+  const activeServer = useCodaStore(selectActiveServer);
+  const activeWorkspace = useCodaStore(selectActiveWorkspace);
+  const activeStatus = useCodaStore(selectActiveStatus);
+  const activeRunning = useCodaStore(selectActiveRunning);
+  const activeProviders = useCodaStore(selectActiveProviders);
+  const activeProviderId = useCodaStore(selectActiveProviderId);
+  const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
+  const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
+
   const newSessionTarget = useNewSessionStore((state) => state.target);
   const [newSessionModel, setNewSessionModel] = useState<{
     serverUrl: string;
@@ -44,14 +79,15 @@ export default function App() {
     reasoningEffort: ReasoningEffort | null;
   } | null>(null);
 
-  const selectedServerUrl =
-    newSessionTarget?.serverUrl ?? session.activeServer ?? "";
-  const selectedServerState = session.servers.find(
+  const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
+  const selectedServerState = servers.find(
     (server) => server.url === selectedServerUrl
   );
-  const selectedWorkspace =
-    newSessionTarget?.workspaceId ?? session.activeWorkspace;
-  const workspaceIds = selectedServerState?.catalog.map((ws) => ws.id) ?? [];
+  const selectedWorkspace = newSessionTarget?.workspaceId ?? activeWorkspace;
+  const workspaceIds = useMemo(
+    () => selectedServerState?.catalog.map((ws) => ws.id) ?? [],
+    [selectedServerState?.catalog]
+  );
   const showingNewSession = newSessionTarget !== null;
 
   useEffect(() => {
@@ -62,9 +98,9 @@ export default function App() {
       return;
     }
     const resolved = resolveNewSessionTarget(
-      session.servers,
+      servers,
       newSessionTarget,
-      session.activeServer
+      activeServer
     );
     if (
       resolved.serverUrl !== newSessionTarget.serverUrl ||
@@ -72,13 +108,13 @@ export default function App() {
     ) {
       setNewSessionTarget(resolved);
     }
-  }, [newSessionTarget, session.servers]);
+  }, [newSessionTarget, servers, activeServer]);
 
   useEffect(() => {
     if (!newSessionTarget) {
       return;
     }
-    const server = session.servers.find(
+    const server = servers.find(
       (item) => item.url === newSessionTarget.serverUrl
     );
     const currentProvider = server?.providers.find(
@@ -102,138 +138,128 @@ export default function App() {
           }
         : null
     );
-  }, [newSessionModel, newSessionTarget, session.servers]);
+  }, [newSessionModel, newSessionTarget, servers]);
 
-  function startNewSession() {
-    beginNewSession(session.servers, session.activeServer);
-  }
+  // Handlers read the latest store state at call time rather than closing over
+  // the subscribed values, so they keep a stable identity across renders and
+  // don't defeat the memoized children.
+  const startNewSession = useCallback(() => {
+    const state = codaStore.getState();
+    beginNewSession(selectServerSummaries(state), state.activeServer);
+  }, []);
 
-  function openSession(serverUrl: string, workspaceId: string, sessionId: string) {
-    rememberNewSessionTarget({ serverUrl, workspaceId });
-    clearNewSessionTarget();
-    session.openSession(serverUrl, workspaceId, sessionId);
-  }
+  const handleOpenSession = useCallback(
+    (serverUrl: string, workspaceId: string, sessionId: string) => {
+      rememberNewSessionTarget({ serverUrl, workspaceId });
+      clearNewSessionTarget();
+      openSession(serverUrl, workspaceId, sessionId);
+    },
+    []
+  );
 
-  function createWorkspaceSession(serverUrl: string, workspaceId: string) {
-    rememberNewSessionTarget({ serverUrl, workspaceId });
-    clearNewSessionTarget();
-    session.newSession(serverUrl, workspaceId);
-  }
+  const createWorkspaceSession = useCallback(
+    (serverUrl: string, workspaceId: string) => {
+      rememberNewSessionTarget({ serverUrl, workspaceId });
+      clearNewSessionTarget();
+      newSession(serverUrl, workspaceId);
+    },
+    []
+  );
 
-  function changeNewSessionServer(serverUrl: string) {
-    const server = session.servers.find((item) => item.url === serverUrl);
-    const target = {
+  const changeNewSessionServer = useCallback((serverUrl: string) => {
+    const server = selectServerSummaries(codaStore.getState()).find(
+      (item) => item.url === serverUrl
+    );
+    setNewSessionTarget({
       serverUrl,
       workspaceId: server?.catalog[0]?.id ?? "",
-    };
-    setNewSessionTarget(target);
-  }
+    });
+  }, []);
 
-  function changeWorkspace(workspaceId: string) {
-    if (newSessionTarget) {
-      const target = { ...newSessionTarget, workspaceId };
-      setNewSessionTarget(target);
+  const changeWorkspace = useCallback((workspaceId: string) => {
+    const target = newSessionStore.getState().target;
+    if (target) {
+      setNewSessionTarget({ ...target, workspaceId });
       return;
     }
-    if (session.activeServer) {
-      rememberNewSessionTarget({
-        serverUrl: session.activeServer,
-        workspaceId,
-      });
-      session.newSession(session.activeServer, workspaceId);
+    const server = codaStore.getState().activeServer;
+    if (server) {
+      rememberNewSessionTarget({ serverUrl: server, workspaceId });
+      newSession(server, workspaceId);
     }
-  }
+  }, []);
 
-  function sendTask(task: string) {
-    if (newSessionTarget) {
-      rememberNewSessionTarget(newSessionTarget);
-      session.sendTaskToNewSession(
-        newSessionTarget.serverUrl,
-        newSessionTarget.workspaceId,
-        task,
-        newSessionModel?.providerId,
-        newSessionModel?.reasoningEffort ?? null
-      );
-      clearNewSessionTarget();
-      return;
-    }
-    session.sendTask(task);
-  }
+  const handleSend = useCallback(
+    (task: string) => {
+      const target = newSessionStore.getState().target;
+      if (target) {
+        rememberNewSessionTarget(target);
+        sendTaskToNewSession(
+          target.serverUrl,
+          target.workspaceId,
+          task,
+          newSessionModel?.providerId,
+          newSessionModel?.reasoningEffort ?? null
+        );
+        clearNewSessionTarget();
+        return;
+      }
+      sendTask(task);
+    },
+    [newSessionModel]
+  );
+
+  const handleSetNewSessionModel = useCallback(
+    (providerId: string, reasoningEffort: ReasoningEffort | null) => {
+      const serverUrl = newSessionStore.getState().target?.serverUrl ?? "";
+      setNewSessionModel({ serverUrl, providerId, reasoningEffort });
+    },
+    []
+  );
 
   return (
     <div className="flex h-screen min-h-[600px] flex-col overflow-hidden bg-background">
-      <WorkspaceHeader approvals={showingNewSession ? [] : session.approvals} />
-      <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[256px_minmax(0,1fr)]">
+      <WorkspaceHeader approvalCount={showingNewSession ? 0 : activeApprovalCount} />
+      <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[auto_minmax(0,1fr)]">
         <Sidebar
-          servers={session.servers}
-          activeServer={session.activeServer}
-          activeKey={session.activeKey}
-          onConnectServer={session.connectServer}
-          onDisconnectServer={session.disconnectServer}
-          onRemoveServer={session.removeServer}
-          onRenameServer={session.renameServer}
-          onOpenSession={openSession}
+          onOpenSession={handleOpenSession}
           onStartNewSession={startNewSession}
           onNewSession={createWorkspaceSession}
-          onDeleteSession={session.deleteSession}
         />
         <section className="flex min-h-0 flex-col">
-          <Transcript
-            entries={showingNewSession ? [] : session.entries}
-            running={showingNewSession ? false : session.running}
-            workspace={selectedWorkspace}
-          />
+          <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
           <div className="relative z-20 shrink-0">
-            {showingNewSession ? null : (
-              <ApprovalPanel
-                approvals={session.approvals}
-                drafts={session.drafts}
-                onDraft={session.draftCall}
-                onSubmit={session.submitApprovals}
-                onAllowPattern={session.addAllowPattern}
-              />
-            )}
+            {showingNewSession ? null : <ApprovalPanel />}
             <Composer
               status={
                 showingNewSession
                   ? selectedServerState?.status ?? "idle"
-                  : session.status
+                  : activeStatus
               }
-              running={showingNewSession ? false : session.running}
+              running={showingNewSession ? false : activeRunning}
               server={selectedServerUrl}
-              servers={session.servers}
+              servers={showingNewSession ? servers : NO_SERVERS}
               workspace={selectedWorkspace}
               workspaces={workspaceIds}
               selectingTarget={showingNewSession}
               providers={
                 showingNewSession
                   ? selectedServerState?.providers ?? []
-                  : session.providers
+                  : activeProviders
               }
               providerId={
-                showingNewSession
-                  ? newSessionModel?.providerId
-                  : session.activeProviderId
+                showingNewSession ? newSessionModel?.providerId : activeProviderId
               }
               reasoningEffort={
                 showingNewSession
                   ? newSessionModel?.reasoningEffort ?? null
-                  : session.activeReasoningEffort
+                  : activeReasoningEffort
               }
-              onSetModel={
-                showingNewSession
-                  ? (providerId, reasoningEffort) =>
-                      setNewSessionModel({
-                        serverUrl: selectedServerUrl,
-                        providerId,
-                        reasoningEffort,
-                      })
-                  : session.setModel
-              }
+              onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
               onChangeServer={changeNewSessionServer}
               onChangeWorkspace={changeWorkspace}
-              onSend={sendTask}
-              onAbort={session.abort}
+              onSend={handleSend}
+              onAbort={abort}
             />
           </div>
         </section>

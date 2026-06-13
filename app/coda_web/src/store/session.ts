@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useEffect } from "react";
 import { useStore } from "zustand";
 import type { Draft } from "immer";
 import {
@@ -19,8 +19,8 @@ import {
   describeTool,
   outcomeText,
   outputText,
-} from "./protocol";
-import { useImmutableRef } from "@callcc/toolkit-js/react/useImmutableRef";
+} from "@/lib/protocol";
+import { useShallow } from "zustand/react/shallow";
 import { create, type Store } from "@/store/utils";
 
 export type {
@@ -28,7 +28,7 @@ export type {
   ReasoningEffort,
   WorkspaceSession,
   WorkspaceSummary,
-} from "./protocol";
+} from "@/lib/protocol";
 
 export type ConnectionStatus =
   | "idle"
@@ -83,7 +83,7 @@ export type OpenedSession = {
   firstUserMessage?: string;
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
-  /** Reasoning selection: `undefined`/`null` = provider default, `"none"` = thinking off. */
+  /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
   reasoningEffort?: ReasoningEffort | null;
 };
 
@@ -101,6 +101,8 @@ export type ServerState = {
   defaultProvider?: string;
   sessions: Record<SessionKey, OpenedSession>;
 };
+
+export type ServerSummary = Omit<ServerState, "sessions">;
 
 type CodaState = {
   servers: Record<string, ServerState>;
@@ -182,7 +184,6 @@ function initialStoreState(): CodaStoreState {
 }
 
 const serversStorageKey = "coda.servers";
-const legacyServerKey = "coda.serverUrl";
 
 export type StoredServer = { url: string; alias?: string };
 
@@ -194,10 +195,6 @@ function loadStoredServers(): StoredServer[] {
       if (Array.isArray(parsed)) {
         return parsed
           .map((value): StoredServer | null => {
-            // Current format: { url, alias? }. Legacy format: bare URL string.
-            if (typeof value === "string" && value.trim()) {
-              return { url: value.trim() };
-            }
             if (
               value &&
               typeof value === "object" &&
@@ -218,21 +215,12 @@ function loadStoredServers(): StoredServer[] {
   } catch {
     // ignore malformed/blocked storage
   }
-  try {
-    const legacy = window.localStorage.getItem(legacyServerKey);
-    if (legacy && legacy.trim()) {
-      return [{ url: legacy.trim() }];
-    }
-  } catch {
-    // ignore
-  }
   return [];
 }
 
 function storeServers(servers: StoredServer[]) {
   try {
     window.localStorage.setItem(serversStorageKey, JSON.stringify(servers));
-    window.localStorage.removeItem(legacyServerKey);
   } catch {
     // ignore storage failures (private mode, disabled storage)
   }
@@ -1187,479 +1175,538 @@ function openMessage(session: OpenedSession): ClientMessage {
   };
 }
 
-export function useCodaSession() {
-  const store = useImmutableRef(() =>
-    create<CodaStoreState>(initialStoreState)
-  );
-  const state = useStore(store);
+/**
+ * The single, app-wide store. Lives at module scope (not per-component) so any
+ * component can subscribe to just the slice it needs via `useCodaStore`, and
+ * actions are plain functions that close over it — no hook, no prop drilling.
+ */
+export const codaStore = create<CodaStoreState>(initialStoreState);
 
-  useEffect(
-    () => () => {
-      for (const socket of Object.values(store.getState().wsMap)) {
-        socket.close();
-      }
-    },
-    [store]
-  );
+// --- Actions (plain functions, stable identity) ------------------------------
 
-  const send = useCallback(
-    (server: string, message: ClientMessage) => {
-      const socket = currentSocket(store, server);
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(encode(message));
-        return true;
-      }
-      setServerStatus(store, server, "error", "Connection closed");
-      return false;
-    },
-    [store]
-  );
+function send(server: string, message: ClientMessage) {
+  const socket = currentSocket(codaStore, server);
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(encode(message));
+    return true;
+  }
+  setServerStatus(codaStore, server, "error", "Connection closed");
+  return false;
+}
 
-  const connectServer = useCallback(
-    (rawUrl: string) => {
-      const server = rawUrl.trim();
-      if (!server) {
-        return;
-      }
-      closeSocket(store, server);
-      const stored = loadStoredServers();
-      storeServers(addStored(stored, server));
-      markConnecting(
-        store,
-        server,
-        stored.find((entry) => entry.url === server)?.alias
-      );
+function currentActive() {
+  const snapshot = codaStore.getState();
+  const server = snapshot.activeServer;
+  const key = snapshot.activeKey;
+  if (!server || !key) {
+    return undefined;
+  }
+  const session = snapshot.servers[server]?.sessions[key];
+  return session ? { server, session } : undefined;
+}
 
-      const socket = new WebSocket(normalizeWsUrl(server));
-      setSocket(store, server, socket);
-
-      socket.onopen = () => {
-        setServerStatus(store, server, "connected");
-        socket.send(encode({ type: "list_workspaces" }));
-        socket.send(encode({ type: "list_providers" }));
-      };
-      socket.onclose = () => {
-        if (currentSocket(store, server) === socket) {
-          setServerStatus(store, server, "closed");
-        }
-      };
-      socket.onerror = () =>
-        setServerStatus(store, server, "error", "WebSocket connection failed");
-      socket.onmessage = (event: MessageEvent<string>) => {
-        try {
-          const message = JSON.parse(event.data) as ServerMessage;
-          if (message.type === "workspace_catalog") {
-            setCatalog(store, server, message.workspaces);
-            return;
-          }
-          if (message.type === "provider_catalog") {
-            setProviderCatalog(
-              store,
-              server,
-              message.providers,
-              message.default_provider
-            );
-            return;
-          }
-          if (message.type === "snapshot") {
-            applySnapshot(
-              store,
-              server,
-              message.workspace_id,
-              message.session_id,
-              message.messages,
-              message.pending_approvals ?? [],
-              message.provider_id,
-              message.reasoning_effort ?? null
-            );
-            return;
-          }
-          if (message.type === "model_changed") {
-            setSessionModel(
-              store,
-              server,
-              sessionKey(message.workspace_id, message.session_id),
-              message.provider_id,
-              message.reasoning_effort ?? null
-            );
-            return;
-          }
-          if (message.type === "event") {
-            applyEvent(
-              store,
-              server,
-              message.workspace_id,
-              message.session_id,
-              message.event
-            );
-            return;
-          }
-          addAllowResultActivity(
-            store,
-            server,
-            message.workspace_id,
-            message.pattern,
-            message.error
-          );
-        } catch (error) {
-          setServerStatus(
-            store,
-            server,
-            "error",
-            error instanceof Error ? error.message : "Invalid server message"
-          );
-        }
-      };
-    },
-    [store]
+export function connectServer(rawUrl: string) {
+  const server = rawUrl.trim();
+  if (!server) {
+    return;
+  }
+  closeSocket(codaStore, server);
+  const stored = loadStoredServers();
+  storeServers(addStored(stored, server));
+  markConnecting(
+    codaStore,
+    server,
+    stored.find((entry) => entry.url === server)?.alias
   );
 
-  const removeServer = useCallback(
-    (rawUrl: string) => {
-      const server = rawUrl.trim();
-      if (!server) {
-        return;
-      }
-      closeSocket(store, server);
-      removeSocket(store, server);
-      storeServers(loadStoredServers().filter((entry) => entry.url !== server));
-      removeServerState(store, server);
-    },
-    [store]
-  );
+  const socket = new WebSocket(normalizeWsUrl(server));
+  setSocket(codaStore, server, socket);
 
-  const disconnectServer = useCallback(
-    (rawUrl: string) => {
-      const server = rawUrl.trim();
-      if (!server) {
-        return;
-      }
-      closeSocket(store, server);
-      removeSocket(store, server);
-      setServerStatus(store, server, "closed");
-    },
-    [store]
-  );
-
-  const renameServer = useCallback(
-    (rawUrl: string, rawAlias: string) => {
-      const server = rawUrl.trim();
-      if (!server) {
-        return;
-      }
-      const alias = rawAlias.trim() || undefined;
-      const stored = loadStoredServers();
-      const next = stored.some((entry) => entry.url === server)
-        ? stored.map((entry) =>
-            entry.url === server ? { ...entry, alias } : entry
-          )
-        : [...stored, { url: server, alias }];
-      storeServers(next);
-      setServerAlias(store, server, alias);
-    },
-    [store]
-  );
-
-  useEffect(() => {
-    const runtime = store.getState();
-    if (runtime.autoConnected) {
-      return;
+  socket.onopen = () => {
+    setServerStatus(codaStore, server, "connected");
+    socket.send(encode({ type: "list_workspaces" }));
+    socket.send(encode({ type: "list_providers" }));
+  };
+  socket.onclose = () => {
+    if (currentSocket(codaStore, server) === socket) {
+      setServerStatus(codaStore, server, "closed");
     }
-    markAutoConnected(store);
-    for (const { url } of loadStoredServers()) {
-      connectServer(url);
-    }
-  }, [connectServer, store]);
-
-  const currentActive = useCallback(() => {
-    const snapshot = store.getState();
-    const server = snapshot.activeServer;
-    const key = snapshot.activeKey;
-    if (!server || !key) {
-      return undefined;
-    }
-    const session = snapshot.servers[server]?.sessions[key];
-    return session ? { server, session } : undefined;
-  }, [store]);
-
-  const newSession = useCallback(
-    (server: string, workspaceId: string) => {
-      const workspace = workspaceId.trim();
-      if (!server || !workspace) {
+  };
+  socket.onerror = () =>
+    setServerStatus(codaStore, server, "error", "WebSocket connection failed");
+  socket.onmessage = (event: MessageEvent<string>) => {
+    try {
+      const message = JSON.parse(event.data) as ServerMessage;
+      if (message.type === "workspace_catalog") {
+        setCatalog(codaStore, server, message.workspaces);
         return;
       }
-      const current = store.getState().servers[server];
-      const reusable = current
-        ? Object.values(current.sessions).find(
-            (session) =>
-              session.draft &&
-              session.workspaceId === workspace &&
-              session.entries.length === 0
-          )
-        : undefined;
-      const sessionId = reusable?.sessionId ?? freshSessionId();
-      createDraftSession(store, server, workspace, sessionId);
-    },
-    [store]
-  );
-
-  const deleteSession = useCallback(
-    (server: string, workspaceId: string, sessionId: string) => {
-      const workspace = workspaceId.trim();
-      const session = sessionId.trim();
-      if (!server || !workspace || !session) {
-        return;
-      }
-      const key = sessionKey(workspace, session);
-      const local = store.getState().servers[server]?.sessions[key];
-      if (!local?.draft) {
-        send(server, {
-          type: "delete_session",
-          workspace_id: workspace,
-          session_id: session,
-        });
-      }
-      deleteSessionState(store, server, key);
-    },
-    [send, store]
-  );
-
-  const openSession = useCallback(
-    (server: string, workspaceId: string, sessionId: string) => {
-      const workspace = workspaceId.trim();
-      const session = sessionId.trim();
-      if (!server || !workspace || !session) {
-        return;
-      }
-      const local =
-        store.getState().servers[server]?.sessions[
-          sessionKey(workspace, session)
-        ];
-      selectSession(store, server, workspace, session);
-      if (!local?.draft) {
-        const opened =
-          local ??
-          store.getState().servers[server]?.sessions[
-            sessionKey(workspace, session)
-          ];
-        if (opened) {
-          send(server, openMessage(opened));
-        }
-      }
-    },
-    [send, store]
-  );
-
-  const sendTask = useCallback(
-    (task: string) => {
-      const text = task.trim();
-      const active = currentActive();
-      if (!text || !active) {
-        return;
-      }
-      if (active.session.draft) {
-        send(active.server, openMessage(active.session));
-      }
-      if (
-        send(active.server, {
-          type: "task",
-          workspace_id: active.session.workspaceId,
-          session_id: active.session.sessionId,
-          task: text,
-        })
-      ) {
-        appendUserMessage(store, active.server, active.session.key, text);
-      }
-    },
-    [send, currentActive, store]
-  );
-
-  const sendTaskToNewSession = useCallback(
-    (
-      server: string,
-      workspaceId: string,
-      task: string,
-      providerId?: string,
-      reasoningEffort: ReasoningEffort | null = null
-    ) => {
-      const workspace = workspaceId.trim();
-      const text = task.trim();
-      if (!server || !workspace || !text) {
-        return;
-      }
-      const current = store.getState().servers[server];
-      const reusable = current
-        ? Object.values(current.sessions).find(
-            (session) =>
-              session.draft &&
-              session.workspaceId === workspace &&
-              session.entries.length === 0
-          )
-        : undefined;
-      const sessionId = reusable?.sessionId ?? freshSessionId();
-      const key = sessionKey(workspace, sessionId);
-      createDraftSession(store, server, workspace, sessionId);
-      if (providerId) {
-        setSessionModel(store, server, key, providerId, reasoningEffort);
-      }
-      const session = store.getState().servers[server]?.sessions[key];
-      if (!session) {
-        return;
-      }
-      send(server, openMessage(session));
-      if (
-        send(server, {
-          type: "task",
-          workspace_id: workspace,
-          session_id: sessionId,
-          task: text,
-        })
-      ) {
-        appendUserMessage(store, server, key, text);
-      }
-    },
-    [send, store]
-  );
-
-  const abort = useCallback(() => {
-    const active = currentActive();
-    if (active) {
-      send(active.server, {
-        type: "abort",
-        workspace_id: active.session.workspaceId,
-        session_id: active.session.sessionId,
-      });
-    }
-  }, [send, currentActive]);
-
-  const addAllowPattern = useCallback(
-    (pattern: string) => {
-      const active = currentActive();
-      const value = pattern.trim();
-      if (active && value) {
-        send(active.server, {
-          type: "add_allow_pattern",
-          workspace_id: active.session.workspaceId,
-          pattern: value,
-        });
-      }
-    },
-    [send, currentActive]
-  );
-
-  const setModel = useCallback(
-    (providerId: string, reasoningEffort: ReasoningEffort | null) => {
-      const active = currentActive();
-      if (!active) {
-        return;
-      }
-      if (active.session.draft) {
-        setSessionModel(
-          store,
-          active.server,
-          active.session.key,
-          providerId,
-          reasoningEffort
+      if (message.type === "provider_catalog") {
+        setProviderCatalog(
+          codaStore,
+          server,
+          message.providers,
+          message.default_provider
         );
         return;
       }
-      send(active.server, {
-        type: "set_model",
-        workspace_id: active.session.workspaceId,
-        session_id: active.session.sessionId,
-        provider_id: providerId,
-        reasoning_effort: reasoningEffort,
-      });
-    },
-    [send, currentActive, store]
-  );
-
-  const draftCall = useCallback(
-    (
-      approval: PendingApproval,
-      call: ToolCall,
-      resolution: ToolCallResolution
-    ) => {
-      const active = currentActive();
-      if (!active) {
+      if (message.type === "snapshot") {
+        applySnapshot(
+          codaStore,
+          server,
+          message.workspace_id,
+          message.session_id,
+          message.messages,
+          message.pending_approvals ?? [],
+          message.provider_id,
+          message.reasoning_effort ?? null
+        );
         return;
       }
-      setDraftResolution(
-        store,
-        active.server,
-        active.session.key,
-        approval,
-        call,
-        resolution
-      );
-    },
-    [currentActive, store]
-  );
-
-  const submitApprovals = useCallback(() => {
-    const active = currentActive();
-    if (!active) {
-      return;
-    }
-    for (const approval of active.session.approvals) {
-      const draft = active.session.drafts[approvalKey(approval)] ?? {};
-      const complete = approval.calls.every((item) => draft[item.id]);
-      if (!complete) {
-        continue;
+      if (message.type === "model_changed") {
+        setSessionModel(
+          codaStore,
+          server,
+          sessionKey(message.workspace_id, message.session_id),
+          message.provider_id,
+          message.reasoning_effort ?? null
+        );
+        return;
       }
-      send(active.server, {
-        type: "resume",
-        workspace_id: active.session.workspaceId,
-        session_id: active.session.sessionId,
-        agent_name: approval.agent_name,
-        thread_id: approval.thread_id,
-        decision: {
-          resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
-        },
-      });
-      clearApprovalState(store, active.server, active.session.key, approval);
+      if (message.type === "event") {
+        applyEvent(
+          codaStore,
+          server,
+          message.workspace_id,
+          message.session_id,
+          message.event
+        );
+        return;
+      }
+      addAllowResultActivity(
+        codaStore,
+        server,
+        message.workspace_id,
+        message.pattern,
+        message.error
+      );
+    } catch (error) {
+      setServerStatus(
+        codaStore,
+        server,
+        "error",
+        error instanceof Error ? error.message : "Invalid server message"
+      );
     }
-  }, [send, currentActive, store]);
+  };
+}
 
-  const activeServerState = state.activeServer
-    ? state.servers[state.activeServer]
+export function removeServer(rawUrl: string) {
+  const server = rawUrl.trim();
+  if (!server) {
+    return;
+  }
+  closeSocket(codaStore, server);
+  removeSocket(codaStore, server);
+  storeServers(loadStoredServers().filter((entry) => entry.url !== server));
+  removeServerState(codaStore, server);
+}
+
+export function disconnectServer(rawUrl: string) {
+  const server = rawUrl.trim();
+  if (!server) {
+    return;
+  }
+  closeSocket(codaStore, server);
+  removeSocket(codaStore, server);
+  setServerStatus(codaStore, server, "closed");
+}
+
+export function renameServer(rawUrl: string, rawAlias: string) {
+  const server = rawUrl.trim();
+  if (!server) {
+    return;
+  }
+  const alias = rawAlias.trim() || undefined;
+  const stored = loadStoredServers();
+  const next = stored.some((entry) => entry.url === server)
+    ? stored.map((entry) =>
+        entry.url === server ? { ...entry, alias } : entry
+      )
+    : [...stored, { url: server, alias }];
+  storeServers(next);
+  setServerAlias(codaStore, server, alias);
+}
+
+export function newSession(server: string, workspaceId: string) {
+  const workspace = workspaceId.trim();
+  if (!server || !workspace) {
+    return;
+  }
+  const current = codaStore.getState().servers[server];
+  const reusable = current
+    ? Object.values(current.sessions).find(
+        (session) =>
+          session.draft &&
+          session.workspaceId === workspace &&
+          session.entries.length === 0
+      )
     : undefined;
-  const activeSession =
-    activeServerState && state.activeKey
-      ? activeServerState.sessions[state.activeKey]
-      : undefined;
-  const servers = state.order
+  const sessionId = reusable?.sessionId ?? freshSessionId();
+  createDraftSession(codaStore, server, workspace, sessionId);
+}
+
+export function deleteSession(
+  server: string,
+  workspaceId: string,
+  sessionId: string
+) {
+  const workspace = workspaceId.trim();
+  const session = sessionId.trim();
+  if (!server || !workspace || !session) {
+    return;
+  }
+  const key = sessionKey(workspace, session);
+  const local = codaStore.getState().servers[server]?.sessions[key];
+  if (!local?.draft) {
+    send(server, {
+      type: "delete_session",
+      workspace_id: workspace,
+      session_id: session,
+    });
+  }
+  deleteSessionState(codaStore, server, key);
+}
+
+export function openSession(
+  server: string,
+  workspaceId: string,
+  sessionId: string
+) {
+  const workspace = workspaceId.trim();
+  const session = sessionId.trim();
+  if (!server || !workspace || !session) {
+    return;
+  }
+  const local =
+    codaStore.getState().servers[server]?.sessions[
+      sessionKey(workspace, session)
+    ];
+  selectSession(codaStore, server, workspace, session);
+  if (!local?.draft) {
+    const opened =
+      local ??
+      codaStore.getState().servers[server]?.sessions[
+        sessionKey(workspace, session)
+      ];
+    if (opened) {
+      send(server, openMessage(opened));
+    }
+  }
+}
+
+export function sendTask(task: string) {
+  const text = task.trim();
+  const active = currentActive();
+  if (!text || !active) {
+    return;
+  }
+  if (active.session.draft) {
+    send(active.server, openMessage(active.session));
+  }
+  if (
+    send(active.server, {
+      type: "task",
+      workspace_id: active.session.workspaceId,
+      session_id: active.session.sessionId,
+      task: text,
+    })
+  ) {
+    appendUserMessage(codaStore, active.server, active.session.key, text);
+  }
+}
+
+export function sendTaskToNewSession(
+  server: string,
+  workspaceId: string,
+  task: string,
+  providerId?: string,
+  reasoningEffort: ReasoningEffort | null = null
+) {
+  const workspace = workspaceId.trim();
+  const text = task.trim();
+  if (!server || !workspace || !text) {
+    return;
+  }
+  const current = codaStore.getState().servers[server];
+  const reusable = current
+    ? Object.values(current.sessions).find(
+        (session) =>
+          session.draft &&
+          session.workspaceId === workspace &&
+          session.entries.length === 0
+      )
+    : undefined;
+  const sessionId = reusable?.sessionId ?? freshSessionId();
+  const key = sessionKey(workspace, sessionId);
+  createDraftSession(codaStore, server, workspace, sessionId);
+  if (providerId) {
+    setSessionModel(codaStore, server, key, providerId, reasoningEffort);
+  }
+  const session = codaStore.getState().servers[server]?.sessions[key];
+  if (!session) {
+    return;
+  }
+  send(server, openMessage(session));
+  if (
+    send(server, {
+      type: "task",
+      workspace_id: workspace,
+      session_id: sessionId,
+      task: text,
+    })
+  ) {
+    appendUserMessage(codaStore, server, key, text);
+  }
+}
+
+export function abort() {
+  const active = currentActive();
+  if (active) {
+    send(active.server, {
+      type: "abort",
+      workspace_id: active.session.workspaceId,
+      session_id: active.session.sessionId,
+    });
+  }
+}
+
+export function addAllowPattern(pattern: string) {
+  const active = currentActive();
+  const value = pattern.trim();
+  if (active && value) {
+    send(active.server, {
+      type: "add_allow_pattern",
+      workspace_id: active.session.workspaceId,
+      pattern: value,
+    });
+  }
+}
+
+export function setModel(
+  providerId: string,
+  reasoningEffort: ReasoningEffort | null
+) {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  if (active.session.draft) {
+    setSessionModel(
+      codaStore,
+      active.server,
+      active.session.key,
+      providerId,
+      reasoningEffort
+    );
+    return;
+  }
+  send(active.server, {
+    type: "set_model",
+    workspace_id: active.session.workspaceId,
+    session_id: active.session.sessionId,
+    provider_id: providerId,
+    reasoning_effort: reasoningEffort,
+  });
+}
+
+export function draftCall(
+  approval: PendingApproval,
+  call: ToolCall,
+  resolution: ToolCallResolution
+) {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  setDraftResolution(
+    codaStore,
+    active.server,
+    active.session.key,
+    approval,
+    call,
+    resolution
+  );
+}
+
+export function submitApprovals() {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  for (const approval of active.session.approvals) {
+    const draft = active.session.drafts[approvalKey(approval)] ?? {};
+    const complete = approval.calls.every((item) => draft[item.id]);
+    if (!complete) {
+      continue;
+    }
+    send(active.server, {
+      type: "resume",
+      workspace_id: active.session.workspaceId,
+      session_id: active.session.sessionId,
+      agent_name: approval.agent_name,
+      thread_id: approval.thread_id,
+      decision: {
+        resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
+      },
+    });
+    clearApprovalState(codaStore, active.server, active.session.key, approval);
+  }
+}
+
+// --- Selectors ---------------------------------------------------------------
+// Stable empties so default-valued selectors keep referential identity and
+// don't force re-renders under `useSyncExternalStore`.
+
+const EMPTY_ENTRIES: TranscriptEntry[] = [];
+const EMPTY_APPROVALS: PendingApproval[] = [];
+const EMPTY_DRAFTS: Record<string, Record<string, ToolCallResolution>> = {};
+const EMPTY_PROVIDERS: ProviderInfo[] = [];
+
+function activeServerOf(state: CodaStoreState): ServerState | undefined {
+  return state.activeServer ? state.servers[state.activeServer] : undefined;
+}
+
+function activeSessionOf(state: CodaStoreState): OpenedSession | undefined {
+  const server = activeServerOf(state);
+  return server && state.activeKey ? server.sessions[state.activeKey] : undefined;
+}
+
+export const selectServers = (state: CodaStoreState): ServerState[] =>
+  state.order
     .map((url) => state.servers[url])
     .filter((server): server is ServerState => Boolean(server));
 
-  return {
-    servers,
-    activeServer: state.activeServer,
-    activeKey: state.activeKey,
-    activeWorkspace: activeSession?.workspaceId,
-    activeDraft: activeSession?.draft ?? false,
-    status: activeServerState?.status ?? "idle",
-    entries: activeSession?.entries ?? [],
-    activity: activeSession?.activity ?? [],
-    approvals: activeSession?.approvals ?? [],
-    drafts: activeSession?.drafts ?? {},
-    running: activeSession?.running ?? false,
-    providers: activeServerState?.providers ?? [],
-    activeProviderId: activeSession?.providerId,
-    activeReasoningEffort: activeSession?.reasoningEffort ?? null,
-    setModel,
-    connectServer,
-    disconnectServer,
-    removeServer,
-    renameServer,
-    newSession,
-    openSession,
-    deleteSession,
-    sendTask,
-    sendTaskToNewSession,
-    abort,
-    addAllowPattern,
-    draftCall,
-    submitApprovals,
-  };
+let cachedServerSummaries: ServerSummary[] = [];
+
+function summaryMatchesServer(
+  summary: ServerSummary,
+  server: ServerState
+): boolean {
+  return (
+    summary.url === server.url &&
+    summary.alias === server.alias &&
+    summary.status === server.status &&
+    summary.error === server.error &&
+    summary.catalog === server.catalog &&
+    summary.providers === server.providers &&
+    summary.defaultProvider === server.defaultProvider
+  );
+}
+
+export const selectServerSummaries = (
+  state: CodaStoreState
+): ServerSummary[] => {
+  if (
+    state.order.length === cachedServerSummaries.length &&
+    state.order.every((url, index) => {
+      const server = state.servers[url];
+      return (
+        Boolean(server) &&
+        summaryMatchesServer(cachedServerSummaries[index], server)
+      );
+    })
+  ) {
+    return cachedServerSummaries;
+  }
+  const previousByUrl = new Map(
+    cachedServerSummaries.map((server) => [server.url, server])
+  );
+  const next = state.order.flatMap((url) => {
+    const server = state.servers[url];
+    if (!server) {
+      return [];
+    }
+    const previous = previousByUrl.get(url);
+    if (previous && summaryMatchesServer(previous, server)) {
+      return [previous];
+    }
+    return [
+      {
+        url: server.url,
+        alias: server.alias,
+        status: server.status,
+        error: server.error,
+        catalog: server.catalog,
+        providers: server.providers,
+        defaultProvider: server.defaultProvider,
+      },
+    ];
+  });
+  cachedServerSummaries = next;
+  return next;
+};
+
+export const selectActiveServer = (state: CodaStoreState) => state.activeServer;
+export const selectActiveKey = (state: CodaStoreState) => state.activeKey;
+export const selectActiveEntries = (state: CodaStoreState) =>
+  activeSessionOf(state)?.entries ?? EMPTY_ENTRIES;
+export const selectActiveRunning = (state: CodaStoreState) =>
+  activeSessionOf(state)?.running ?? false;
+export const selectActiveApprovals = (state: CodaStoreState) =>
+  activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
+export const selectActiveDrafts = (state: CodaStoreState) =>
+  activeSessionOf(state)?.drafts ?? EMPTY_DRAFTS;
+export const selectActiveApprovalCount = (state: CodaStoreState) =>
+  activeSessionOf(state)?.approvals.length ?? 0;
+export const selectActiveWorkspace = (state: CodaStoreState) =>
+  activeSessionOf(state)?.workspaceId;
+export const selectActiveDraftFlag = (state: CodaStoreState) =>
+  activeSessionOf(state)?.draft ?? false;
+export const selectActiveStatus = (state: CodaStoreState): ConnectionStatus =>
+  activeServerOf(state)?.status ?? "idle";
+export const selectActiveProviders = (state: CodaStoreState): ProviderInfo[] =>
+  activeServerOf(state)?.providers ?? EMPTY_PROVIDERS;
+export const selectActiveProviderId = (state: CodaStoreState) =>
+  activeSessionOf(state)?.providerId;
+export const selectActiveReasoningEffort = (state: CodaStoreState) =>
+  activeSessionOf(state)?.reasoningEffort ?? null;
+
+/** Subscribe to a slice of the store; re-renders only when that slice changes. */
+export function useCodaStore<T>(selector: (state: CodaStoreState) => T): T {
+  return useStore(codaStore, selector);
+}
+
+/** Subscribe to a computed slice with shallow equality (for arrays/objects). */
+export function useCodaShallow<T>(selector: (state: CodaStoreState) => T): T {
+  return useStore(codaStore, useShallow(selector));
+}
+
+/**
+ * Auto-connect stored servers once, and close sockets on teardown. Mount once,
+ * at the app root. Resets `autoConnected` on cleanup so React StrictMode's
+ * mount→unmount→mount cycle correctly reconnects.
+ */
+export function useCodaBootstrap() {
+  useEffect(() => {
+    if (codaStore.getState().autoConnected) {
+      return;
+    }
+    markAutoConnected(codaStore);
+    for (const { url } of loadStoredServers()) {
+      connectServer(url);
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      updateState(codaStore, (state) => {
+        state.autoConnected = false;
+      });
+      for (const socket of Object.values(codaStore.getState().wsMap)) {
+        socket.close();
+      }
+    },
+    []
+  );
 }

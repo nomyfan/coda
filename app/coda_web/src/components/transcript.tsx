@@ -11,7 +11,7 @@ import {
   Sparkles,
   TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,8 +20,15 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { Markdown } from "@/components/markdown";
-import type { TranscriptEntry } from "@/lib/session";
+import {
+  selectActiveEntries,
+  selectActiveRunning,
+  type TranscriptEntry,
+  useCodaStore,
+} from "@/store/session";
 import { cn } from "@/lib/utils";
+
+const NO_ENTRIES: TranscriptEntry[] = [];
 
 function WorkingIndicator() {
   return (
@@ -99,15 +106,21 @@ function transcriptRenderItems(
   return items;
 }
 
-export function Transcript({
-  entries,
-  running,
+/**
+ * `suppressed` blanks the transcript while the new-session composer is open
+ * (no session is active yet), without unsubscribing from the store.
+ */
+export const Transcript = memo(function Transcript({
   workspace,
+  suppressed,
 }: {
-  entries: TranscriptEntry[];
-  running: boolean;
   workspace?: string;
+  suppressed: boolean;
 }) {
+  const liveEntries = useCodaStore(selectActiveEntries);
+  const liveRunning = useCodaStore(selectActiveRunning);
+  const entries = suppressed ? NO_ENTRIES : liveEntries;
+  const running = suppressed ? false : liveRunning;
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const renderItems = transcriptRenderItems(entries);
 
@@ -146,7 +159,7 @@ export function Transcript({
       </div>
     </section>
   );
-}
+});
 
 function entryTitle(entry: TranscriptEntry) {
   return entry.title ?? (entry.agentName ? `${entry.agentName}` : entry.kind);
