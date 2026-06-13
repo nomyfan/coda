@@ -1,5 +1,6 @@
 import {
   Ban,
+  Bot,
   Brain,
   Check,
   ChevronDown,
@@ -26,9 +27,20 @@ import {
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
+import {
+  isSubAgentToolName,
+  subAgentDisplayName,
+} from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
+
+const ROOT_AGENT = "coda";
+
+/** A sub-agent's own events (its inner LLM turns, reasoning, tool calls). */
+function isSubAgentEntry(entry: TranscriptEntry) {
+  return Boolean(entry.agentName && entry.agentName !== ROOT_AGENT);
+}
 
 function WorkingIndicator() {
   return (
@@ -166,7 +178,10 @@ export const Transcript = memo(function Transcript({
 });
 
 function entryTitle(entry: TranscriptEntry) {
-  return entry.title ?? (entry.agentName ? `${entry.agentName}` : entry.kind);
+  if (entry.title) {
+    return subAgentDisplayName(entry.title);
+  }
+  return entry.agentName ? `${entry.agentName}` : entry.kind;
 }
 
 function EntryIcon({ entry }: { entry: TranscriptEntry }) {
@@ -277,6 +292,180 @@ function MessageActions({
   );
 }
 
+/** A process step: either a plain entry or a grouped sub-agent invocation. */
+type ProcessItem =
+  | { type: "entry"; entry: TranscriptEntry }
+  | {
+      type: "subagent";
+      key: string;
+      agentName: string;
+      /**
+       * The parent `coda` entry for this invocation. It starts as a `tool_call`
+       * while the sub-agent runs and is converted in place to a `tool_result`
+       * once the reply lands — so its kind tells us whether the run is done.
+       */
+      callEntry?: TranscriptEntry;
+      entries: TranscriptEntry[];
+    };
+
+type SubAgentItem = Extract<ProcessItem, { type: "subagent" }>;
+
+/**
+ * Fold a flat process timeline into items, collapsing each sub-agent run into a
+ * single group. The anchor is the `coda` tool entry whose name carries the
+ * sub-agent prefix — a `tool_call` while it runs, an in-place `tool_result` once
+ * it replies. A sub-agent's own events attach to the open group with the
+ * matching agent name, *not* merely the ones that happen to follow — so several
+ * sub-agents invoked in one batch (whose events interleave) each land under
+ * their own invocation. Sequential runs of the same agent split correctly too;
+ * only truly concurrent same-name runs degrade (events fold into the latest).
+ *
+ * Works identically for live turns and resumed history (where only the anchor
+ * survives, with no inner process), since the prefix self-identifies it.
+ */
+function groupProcessItems(entries: TranscriptEntry[]): ProcessItem[] {
+  const items: ProcessItem[] = [];
+  // Open sub-agent groups keyed by agent display name.
+  const openByName = new Map<string, SubAgentItem>();
+
+  for (const entry of entries) {
+    const isAnchor =
+      (entry.kind === "tool_call" || entry.kind === "tool_result") &&
+      isSubAgentToolName(entry.title);
+
+    // A `coda`-issued prefixed tool entry opens a top-level sub-agent group.
+    if (isAnchor && !isSubAgentEntry(entry)) {
+      const agentName = subAgentDisplayName(entry.title as string);
+      const group: SubAgentItem = {
+        type: "subagent",
+        key: entry.id,
+        agentName,
+        callEntry: entry,
+        entries: [],
+      };
+      items.push(group);
+      openByName.set(agentName, group);
+      continue;
+    }
+
+    // A sub-agent's own event attaches to its matching open group (opening a
+    // fallback group if no anchor survived, e.g. an orphaned resumed run).
+    if (isSubAgentEntry(entry)) {
+      const name = entry.agentName ?? "sub-agent";
+      let group = openByName.get(name);
+      if (!group) {
+        group = { type: "subagent", key: entry.id, agentName: name, entries: [] };
+        items.push(group);
+        openByName.set(name, group);
+      }
+      group.entries.push(entry);
+      // A nested sub-agent invocation: route the nested agent's own events into
+      // this same group rather than letting them surface at the top level.
+      if (isAnchor) {
+        openByName.set(subAgentDisplayName(entry.title as string), group);
+      }
+      continue;
+    }
+
+    items.push({ type: "entry", entry });
+  }
+
+  return items;
+}
+
+/** One step inside a process disclosure (assistant prose inline, rest collapsed). */
+function ProcessEntry({ entry }: { entry: TranscriptEntry }) {
+  if (entry.kind === "assistant") {
+    return <Markdown>{entry.content}</Markdown>;
+  }
+  return <TranscriptDisclosure entry={entry} />;
+}
+
+/** A collapsed disclosure gathering an entire sub-agent run under its name. */
+function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent" }> }) {
+  // The invocation entry flips from `tool_call` to `tool_result` when the
+  // sub-agent replies; until then it's still working, so open it while it runs.
+  // Orphaned runs (no anchor) fall back to whether any inner step is still live.
+  const complete = item.callEntry
+    ? item.callEntry.kind === "tool_result"
+    : !item.entries.some(
+        (entry) => entry.status === "running" || entry.status === "thinking"
+      );
+  const [open, setOpen] = useState(!complete);
+  const previousComplete = useRef(complete);
+
+  useEffect(() => {
+    if (previousComplete.current === complete) {
+      return;
+    }
+    previousComplete.current = complete;
+    setOpen(!complete);
+  }, [complete]);
+
+  const task = item.callEntry?.detail;
+  const stepCount = item.entries.length;
+  // Resumed history keeps no inner process — surface the reply that survived so
+  // the group isn't empty when expanded.
+  const showResultOnly =
+    stepCount === 0 && item.callEntry?.kind === "tool_result";
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <article className="rounded-md border border-border bg-card">
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left text-muted-foreground hover:text-foreground"
+            title={open ? "Collapse sub-agent" : "Expand sub-agent"}
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <Bot className="size-4 shrink-0" />
+              <span className="shrink-0 truncate text-sm font-medium">
+                {item.agentName}
+              </span>
+              <Badge variant="cyan" className="shrink-0 whitespace-nowrap">
+                agent
+              </Badge>
+              {task ? (
+                <span className="truncate text-xs text-muted-foreground">
+                  {task}
+                </span>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Badge variant={complete ? "secondary" : "warning"}>
+                {!complete
+                  ? "running"
+                  : stepCount > 0
+                  ? `${stepCount} ${stepCount === 1 ? "step" : "steps"}`
+                  : "done"}
+              </Badge>
+              {open ? (
+                <ChevronDown className="size-4" />
+              ) : (
+                <ChevronRight className="size-4" />
+              )}
+            </div>
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="space-y-2 px-2 pb-2">
+            {showResultOnly && item.callEntry ? (
+              // Resumed history keeps no inner process, only the reply the
+              // sub-agent returned — render it as prose, not a nested tool row.
+              <Markdown>{item.callEntry.content}</Markdown>
+            ) : (
+              item.entries.map((entry) => (
+                <ProcessEntry key={entry.id} entry={entry} />
+              ))
+            )}
+          </div>
+        </CollapsibleContent>
+      </article>
+    </Collapsible>
+  );
+}
+
 function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
   const lastIndex = findFinalAssistantIndex(entries);
   const finalAssistantIndex =
@@ -290,6 +479,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
       : entries;
+  const processItems = groupProcessItems(intermediateEntries);
   const usage = finalAssistant?.usage;
   const [processOpen, setProcessOpen] = useState(!processComplete);
   const previousProcessComplete = useRef(processComplete);
@@ -317,8 +507,8 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                   <Brain className="size-4 shrink-0" />
                   <span className="text-sm font-medium">Process</span>
                   <Badge variant="secondary">
-                    {intermediateEntries.length}{" "}
-                    {intermediateEntries.length === 1 ? "step" : "steps"}
+                    {processItems.length}{" "}
+                    {processItems.length === 1 ? "step" : "steps"}
                   </Badge>
                 </div>
                 {processOpen ? (
@@ -330,11 +520,11 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
             </CollapsibleTrigger>
             <CollapsibleContent>
               <div className="mt-2 space-y-2 px-1">
-                {intermediateEntries.map((entry) =>
-                  entry.kind === "assistant" ? (
-                    <Markdown key={entry.id}>{entry.content}</Markdown>
+                {processItems.map((item) =>
+                  item.type === "subagent" ? (
+                    <SubAgentGroup key={item.key} item={item} />
                   ) : (
-                    <TranscriptDisclosure key={entry.id} entry={entry} />
+                    <ProcessEntry key={item.entry.id} entry={item.entry} />
                   )
                 )}
               </div>
@@ -452,7 +642,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <span className="shrink-0 truncate text-sm font-medium">{title}</span>
         <EntryDetail entry={entry} />
         {entry.agentName && entry.agentName !== "coda" ? (
-          <Badge variant="cyan">sub-agent</Badge>
+          <Badge variant="cyan">agent</Badge>
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">

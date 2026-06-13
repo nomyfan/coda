@@ -55,12 +55,14 @@ Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first
 - **`LLMProvider`** (`coda_core::llm`) — Model provider trait; core method `stream()` returns `Stream<LLMStreamEvent>`.
 - **`Tool` / `ToolObject`** (`coda_core::tool`) — `Tool` is a generic trait (associated types Parameters/Output); `ToolObject` is the object-safe, dynamically-dispatched counterpart. `ToolWrapper` bridges the two.
 - **`ToolSpec` / `BuildContext`** (`coda_tools::spec`) — `ToolSpec` is a factory trait for creating tool instances; `BuildContext` carries workspace directory and optional todo store during tool construction.
-- **`AgentSpec` / `AgentTeam`** (`coda_agent::spec`) — `AgentSpec` is plain per-agent data (sub-agents referenced by name). `AgentTeam::new(root, subagents)` validates the whole set once (unique names, resolvable references, tool/sub-agent namespace conflicts; sub-agents unreachable from the root are dropped) so holding one proves it sound; `AgentTeam::build(workspace_dir)` then constructs fresh `Agent`s per session (infallibly).
+- **`AgentSpec` / `AgentTeam`** (`coda_agent::spec`) — `AgentSpec` is plain per-agent data (sub-agents referenced by name). `AgentTeam::new(root, subagents)` validates the whole set once (unique names, resolvable references, tool/sub-agent namespace conflicts; sub-agents unreachable from the root are dropped; each retained sub-agent's `agent__`-prefixed tool name must fit the 64-character provider limit) so holding one proves it sound; `AgentTeam::build(workspace_dir)` then constructs fresh `Agent`s per session (infallibly).
 - **`Session`** (`coda_agent::session`) — High-level API for callers: send tasks, consume events, resume from suspension, and shut down sessions. `SessionBuilder::team(&AgentTeam, workspace_dir)` borrows the team and builds the agents at `open()`.
 
 ### Agent Configuration (file-based)
 
 Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`: YAML frontmatter (`description`, `mode` = stateful/stateless, `tools`, `subagents`, `model`, `reasoning_effort`) plus a markdown body used as the system prompt. They become sub-agents of the top-level `coda` agent and may reference one another by name to form deeper graphs (sharing allowed).
+
+The runtime exposes sub-agents to the LLM as `agent__<name>` tools and strips the prefix for routing. The prefixed name is preserved in live events and session history so clients can identify sub-agent invocations directly. Each reachable file-based agent name may contain up to 57 characters, leaving room for the `agent__` prefix within the 64-character provider limit.
 
 Agents may optionally override the session’s model via the `model` frontmatter field, a `{provider_id}:{model_id}` selection key (optionally paired with `reasoning_effort`). Overrides are validated against the provider catalog at startup — an unknown model or unsupported reasoning effort is a hard error. When a sub-agent omits `model`, it inherits the session’s default (root) model.
 

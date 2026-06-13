@@ -19,6 +19,7 @@ import {
   describeTool,
   outcomeText,
   outputText,
+  subAgentDisplayName,
 } from "@/lib/protocol";
 import { useShallow } from "zustand/react/shallow";
 import { create, type Store } from "@/store/utils";
@@ -574,7 +575,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         ...addActivity(session, {
           tone: event.agent_name === rootName ? "warning" : "cyan",
           label: `${event.agent_name} tool`,
-          detail: event.call.name,
+          detail: subAgentDisplayName(event.call.name),
         }),
         running: true,
         entries: [
@@ -597,7 +598,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         ...addActivity(finishToolEntry(session, event), {
           tone: "success",
           label: "tool finished",
-          detail: event.message.name,
+          detail: subAgentDisplayName(event.message.name),
         }),
       };
     case "suspended":

@@ -13,6 +13,14 @@ use coda_core::tool::Tools;
 use coda_tools::TodoItem;
 use tracing::debug;
 
+/// Prefix applied to sub-agent names when they are exposed to the LLM as tools,
+/// mirroring how MCP tools are prefixed with `mcp__`. It makes a sub-agent
+/// invocation self-identifying wherever its tool name appears — live events and
+/// persisted history alike — so the UI can distinguish it from a built-in tool
+/// without any side channel. The runtime strips it back to the bare agent name
+/// for routing.
+pub const SUBAGENT_TOOL_PREFIX: &str = "agent__";
+
 #[derive(Clone, Default)]
 pub enum ToolApprovalMode {
     #[default]
@@ -423,15 +431,18 @@ impl SubAgents {
         self.0.push(Arc::new(subagent));
     }
 
+    /// Resolve a sub-agent by its tool name. Accepts both the prefixed name the
+    /// LLM sees (`agent__foo`) and the bare agent name (`foo`).
     pub fn get(&self, name: &str) -> Option<Arc<SubAgentTool>> {
-        self.0.iter().find(|agent| agent.name == name).cloned()
+        let bare = name.strip_prefix(SUBAGENT_TOOL_PREFIX).unwrap_or(name);
+        self.0.iter().find(|agent| agent.name == bare).cloned()
     }
 
     pub fn descriptors(&self) -> Vec<ToolDefinition> {
         self.0
             .iter()
             .map(|subagent| ToolDefinition {
-                name: subagent.name.to_string(),
+                name: format!("{SUBAGENT_TOOL_PREFIX}{}", subagent.name),
                 description: if subagent.mode == SubAgentMode::Stateful {
                     format!(
                         "{}\n\nIMPORTANT: This sub-agent does NOT support concurrent invocation. Do NOT call this tool more than once in the same tool-call batch. If you need to invoke it multiple times, call it sequentially — one at a time.",

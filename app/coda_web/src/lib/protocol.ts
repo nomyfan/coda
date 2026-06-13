@@ -221,6 +221,26 @@ export function approvalKey(approval: PendingApproval): string {
   return `${approval.agent_name}:${approval.thread_id}`;
 }
 
+/**
+ * Prefix the runtime applies to sub-agent names when exposing them to the LLM as
+ * tools (mirrors MCP's `mcp__`). Keep in sync with `SUBAGENT_TOOL_PREFIX` in
+ * `crates/coda_agent/src/agent.rs`. The prefix self-identifies a sub-agent
+ * invocation wherever its tool name surfaces — live events and history alike.
+ */
+export const SUBAGENT_TOOL_PREFIX = "agent__";
+
+export function isSubAgentToolName(
+  name: string | undefined | null
+): name is string {
+  return Boolean(name && name.startsWith(SUBAGENT_TOOL_PREFIX));
+}
+
+export function subAgentDisplayName(name: string): string {
+  return name.startsWith(SUBAGENT_TOOL_PREFIX)
+    ? name.slice(SUBAGENT_TOOL_PREFIX.length)
+    : name;
+}
+
 export function callArguments(call: ToolCall): string {
   return call.arguments?.trim() || "{}";
 }
@@ -249,9 +269,8 @@ function basename(p: string): string {
 }
 
 /**
- * A short, human-readable summary of what a built-in tool is acting on — the
- * file basename for filesystem tools, the command for `shell`, the pattern for
- * search tools. Returns undefined when there's nothing useful to surface.
+ * A short, human-readable summary of what a tool is acting on: the sub-agent
+ * task, file basename, shell command, or search pattern.
  */
 export function describeTool(
   name: string,
@@ -268,6 +287,10 @@ export function describeTool(
   }
   const str = (value: unknown) =>
     typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+  if (isSubAgentToolName(name)) {
+    return str(args.task);
+  }
 
   switch (name) {
     case "shell":
