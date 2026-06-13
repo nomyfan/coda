@@ -191,9 +191,10 @@ pub enum ClientMessage {
         pattern: String,
     },
     /// Switch the provider/model and reasoning setting a session uses. Applies
-    /// from the next turn (the server reopens the session). `reasoning_effort`
-    /// is three-state: `null` leaves the provider default, `none` turns thinking
-    /// off, and any level turns it on at that level.
+    /// from the next turn (the server reopens the session). For reasoning models,
+    /// `null` selects the first configured effort, `none` turns thinking off, and
+    /// any configured level turns it on at that level. Models without reasoning
+    /// controls keep `null`.
     SetModel {
         workspace_id: String,
         session_id: String,

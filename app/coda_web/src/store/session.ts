@@ -83,7 +83,7 @@ export type OpenedSession = {
   firstUserMessage?: string;
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
-  /** Reasoning selection: `undefined`/`null` = provider default, `"none"` = thinking off. */
+  /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
   reasoningEffort?: ReasoningEffort | null;
 };
 

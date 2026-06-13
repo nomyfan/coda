@@ -245,40 +245,93 @@ fn initial_reasoning_effort(provider: &ProviderHandle) -> Option<ReasoningEffort
     provider.reasoning_efforts.first().copied()
 }
 
-fn selection_is_valid(
-    app: &AppState,
-    provider_id: &str,
+/// Normalize a client selection to the values exposed by the provider catalog.
+/// Reasoning models use their first configured effort when the client omits one;
+/// models without reasoning controls keep `None`.
+fn normalize_reasoning_effort(
+    configured: &[ReasoningEffort],
     reasoning_effort: Option<ReasoningEffort>,
-) -> bool {
-    let Some(provider) = app.providers.get(provider_id) else {
-        return false;
-    };
+) -> Option<Option<ReasoningEffort>> {
     match reasoning_effort {
-        None => true,
-        Some(ReasoningEffort::None) => !provider.reasoning_efforts.is_empty(),
-        Some(effort) => provider.reasoning_efforts.contains(&effort),
+        None => Some(configured.first().copied()),
+        Some(ReasoningEffort::None) if !configured.is_empty() => Some(Some(ReasoningEffort::None)),
+        Some(effort) if configured.contains(&effort) => Some(Some(effort)),
+        Some(_) => None,
     }
 }
 
-/// Resolve a client-supplied model selection. A valid `provider_id` is taken
-/// together with its `reasoning_effort`; anything else falls back to the default
-/// provider at its initial effort.
+/// Resolve and normalize a client-supplied model selection. Invalid selections
+/// fall back to the default provider at its initial effort.
 fn resolve_selection(
     app: &AppState,
     provider_id: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> (String, Option<ReasoningEffort>) {
-    match provider_id {
-        Some(id) if selection_is_valid(app, &id, reasoning_effort) => (id, reasoning_effort),
-        _ => {
-            let id = app.default_provider.clone();
-            let effort = initial_reasoning_effort(
-                app.providers
-                    .get(&id)
-                    .expect("default provider always present"),
-            );
-            (id, effort)
-        }
+    if let Some(id) = provider_id
+        && let Some(provider) = app.providers.get(&id)
+        && let Some(reasoning_effort) =
+            normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
+    {
+        return (id, reasoning_effort);
+    }
+    let id = app.default_provider.clone();
+    let effort = initial_reasoning_effort(
+        app.providers
+            .get(&id)
+            .expect("default provider always present"),
+    );
+    (id, effort)
+}
+
+fn normalize_provider_selection(
+    app: &AppState,
+    provider_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<Option<ReasoningEffort>> {
+    let provider = app.providers.get(provider_id)?;
+    normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn no_reasoning_controls_keep_none() {
+        assert_eq!(normalize_reasoning_effort(&[], None), Some(None));
+    }
+
+    #[test]
+    fn omitted_effort_uses_first_configured_level() {
+        assert_eq!(
+            normalize_reasoning_effort(&[ReasoningEffort::Low, ReasoningEffort::High], None),
+            Some(Some(ReasoningEffort::Low))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_accepts_off_and_configured_levels() {
+        let configured = [ReasoningEffort::Low, ReasoningEffort::High];
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some(ReasoningEffort::None)),
+            Some(Some(ReasoningEffort::None))
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some(ReasoningEffort::High)),
+            Some(Some(ReasoningEffort::High))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_rejects_unconfigured_levels() {
+        assert_eq!(
+            normalize_reasoning_effort(&[ReasoningEffort::Low], Some(ReasoningEffort::High)),
+            None
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&[], Some(ReasoningEffort::None)),
+            None
+        );
     }
 }
 
@@ -761,10 +814,12 @@ async fn handle_dashboard_command<
             reasoning_effort,
         } => {
             let key = (workspace_id.clone(), session_id.clone());
-            if !selection_is_valid(app, &provider_id, reasoning_effort) {
+            let Some(reasoning_effort) =
+                normalize_provider_selection(app, &provider_id, reasoning_effort)
+            else {
                 warn!(workspace_id = %workspace_id, %provider_id, "set_model has an invalid selection");
                 return true;
-            }
+            };
             let Some(active_session) = active.get(&key) else {
                 return true;
             };
