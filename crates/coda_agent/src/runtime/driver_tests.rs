@@ -518,6 +518,23 @@ fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
     })
 }
 
+/// A `RunConfig` where every agent runs on the fake test model.
+fn test_config(provider: TestProvider, approval: ToolApprovalMode) -> RunConfig<TestProvider> {
+    RunConfig {
+        default_model: ModelProfile {
+            provider,
+            model: "fake".into(),
+            label: "fake".into(),
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+        },
+        agent_models: HashMap::new(),
+        tool_approval: approval,
+        approval_timeout: None,
+    }
+}
+
 struct Harness<S> {
     runtime: AgentRuntime,
     events: tokio::sync::broadcast::Receiver<(String, ThreadId, AgentEvent)>,
@@ -560,17 +577,7 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let config = RunConfig::uniform(
-            ModelProfile {
-                provider,
-                model: "fake".into(),
-                label: "fake".into(),
-                temperature: None,
-                max_completion_tokens: None,
-                reasoning_effort: None,
-            },
-            approval,
-        );
+        let config = test_config(provider, approval);
 
         let thread_id = ThreadId::new();
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
@@ -626,17 +633,7 @@ where
         approval: ToolApprovalMode,
         resume_decisions: HashMap<String, ResumeDecision>,
     ) -> Self {
-        let config = RunConfig::uniform(
-            ModelProfile {
-                provider,
-                model: "fake".into(),
-                label: "fake".into(),
-                temperature: None,
-                max_completion_tokens: None,
-                reasoning_effort: None,
-            },
-            approval,
-        );
+        let config = test_config(provider, approval);
 
         let session_id = self.thread_id.as_ref().to_string();
         let snapshot: Option<AgentRuntimeSnapshot> = self
@@ -694,17 +691,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     .expect("valid team")
     .build(".");
 
-    let config = RunConfig::uniform(
-        ModelProfile {
-            provider: TestProvider::default(),
-            model: "fake".into(),
-            label: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-        },
-        ToolApprovalMode::Auto,
-    );
+    let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
     let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
     runtime

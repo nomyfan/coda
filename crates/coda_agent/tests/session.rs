@@ -4,6 +4,7 @@
 //! with a fake LLM provider, covering real built-in tools, multi-turn
 //! conversations, sub-agent delegation, session resume, and approval flows.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -332,7 +333,12 @@ fn fake_profile() -> ModelProfile<FakeProvider> {
 }
 
 fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
-    RunConfig::uniform(fake_profile(), approval)
+    RunConfig {
+        default_model: fake_profile(),
+        agent_models: HashMap::new(),
+        tool_approval: approval,
+        approval_timeout: None,
+    }
 }
 
 /// Collect events until the root agent produces a final `LLMEnd` with no tool
@@ -644,7 +650,7 @@ async fn should_execute_tool_after_approval_resume() {
     let session = Session::builder()
         .storage(MemoryStorage::default())
         .team(&solo_team(spec), ".")
-        .run_config(RunConfig::uniform(fake_profile(), approval))
+        .run_config(run_config(approval))
         .open()
         .await
         .expect("open session");
@@ -687,7 +693,7 @@ async fn should_auto_reject_when_approval_times_out() {
     let session1 = Session::builder()
         .storage(storage.clone())
         .team(&solo_team(spec), ".")
-        .run_config(RunConfig::uniform(fake_profile(), approval.clone()))
+        .run_config(run_config(approval.clone()))
         .session_id(session_id)
         .open()
         .await
@@ -714,7 +720,7 @@ async fn should_auto_reject_when_approval_times_out() {
         .team(&solo_team(spec2), ".")
         .run_config(RunConfig {
             approval_timeout: Some(Duration::ZERO),
-            ..RunConfig::uniform(fake_profile(), approval)
+            ..run_config(approval)
         })
         .session_id(session_id)
         .open()

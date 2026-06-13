@@ -322,16 +322,6 @@ pub struct RunConfig<P> {
 }
 
 impl<P: Clone> RunConfig<P> {
-    /// Build a config where every agent runs on `model` (no per-agent overrides).
-    pub fn uniform(model: ModelProfile<P>, tool_approval: ToolApprovalMode) -> Self {
-        RunConfig {
-            default_model: model,
-            agent_models: HashMap::new(),
-            tool_approval,
-            approval_timeout: None,
-        }
-    }
-
     /// Resolve the configuration for a single agent: its model override if one is
     /// registered, otherwise `default_model`, paired with the shared approval mode.
     pub(crate) fn resolve(&self, agent_name: &str) -> AgentRunConfig<P> {
