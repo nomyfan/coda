@@ -6,6 +6,11 @@ After modifying Rust code, always run `cargo clippy` and `cargo test` as a final
 
 This project is in active development. Breaking changes to APIs, serialization formats, and persisted data are acceptable — no backward-compatibility shims needed.
 
+## Git Workflow
+
+- Use Conventional Commits format for commit messages and pull request titles.
+- Commits must include a `Co-authored-by` trailer.
+
 ## Runtime Config
 
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `sh`.
