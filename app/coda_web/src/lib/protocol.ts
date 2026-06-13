@@ -269,9 +269,8 @@ function basename(p: string): string {
 }
 
 /**
- * A short, human-readable summary of what a built-in tool is acting on — the
- * file basename for filesystem tools, the command for `shell`, the pattern for
- * search tools. Returns undefined when there's nothing useful to surface.
+ * A short, human-readable summary of what a tool is acting on: the sub-agent
+ * task, file basename, shell command, or search pattern.
  */
 export function describeTool(
   name: string,
@@ -288,6 +287,10 @@ export function describeTool(
   }
   const str = (value: unknown) =>
     typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+  if (isSubAgentToolName(name)) {
+    return str(args.task);
+  }
 
   switch (name) {
     case "shell":

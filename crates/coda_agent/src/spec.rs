@@ -111,17 +111,6 @@ impl AgentTeam {
             }
         }
 
-        // Sub-agents are exposed to the LLM as `agent__<name>` tools; reject any
-        // whose prefixed name would overflow the provider's function-name limit.
-        for spec in &subagents {
-            if SUBAGENT_TOOL_PREFIX.len() + spec.name.len() > MAX_TOOL_NAME_LEN {
-                return Err(BuildError::SubagentNameTooLong {
-                    name: spec.name.clone(),
-                    max: MAX_TOOL_NAME_LEN,
-                });
-            }
-        }
-
         for spec in std::iter::once(&root).chain(&subagents) {
             for child in &spec.subagents {
                 if !by_name.contains_key(child.as_str()) {
@@ -174,6 +163,16 @@ impl AgentTeam {
             }
             keep
         });
+
+        // Retained sub-agents are exposed to the LLM as `agent__<name>` tools.
+        for spec in &subagents {
+            if SUBAGENT_TOOL_PREFIX.len() + spec.name.len() > MAX_TOOL_NAME_LEN {
+                return Err(BuildError::SubagentNameTooLong {
+                    name: spec.name.clone(),
+                    max: MAX_TOOL_NAME_LEN,
+                });
+            }
+        }
 
         Ok(AgentTeam { root, subagents })
     }
@@ -250,11 +249,21 @@ mod tests {
     #[test]
     fn rejects_subagent_name_overflowing_prefixed_tool_limit() {
         let too_long = "a".repeat(MAX_TOOL_NAME_LEN - SUBAGENT_TOOL_PREFIX.len() + 1);
-        let result = AgentTeam::new(spec("coda"), vec![spec(&too_long)]);
+        let root = AgentSpec {
+            subagents: vec![too_long.clone()],
+            ..spec("coda")
+        };
+        let result = AgentTeam::new(root, vec![spec(&too_long)]);
         assert!(matches!(
             result,
             Err(BuildError::SubagentNameTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn ignores_unreachable_subagent_name_overflowing_prefixed_tool_limit() {
+        let too_long = "a".repeat(MAX_TOOL_NAME_LEN - SUBAGENT_TOOL_PREFIX.len() + 1);
+        assert!(AgentTeam::new(spec("coda"), vec![spec(&too_long)]).is_ok());
     }
 
     #[test]

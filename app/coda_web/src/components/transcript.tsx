@@ -29,7 +29,6 @@ import {
 } from "@/store/session";
 import {
   isSubAgentToolName,
-  parseCallArguments,
   subAgentDisplayName,
 } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
@@ -382,22 +381,6 @@ function ProcessEntry({ entry }: { entry: TranscriptEntry }) {
   return <TranscriptDisclosure entry={entry} />;
 }
 
-function subAgentTask(callEntry?: TranscriptEntry): string | undefined {
-  if (!callEntry) {
-    return undefined;
-  }
-  const args = parseCallArguments({
-    id: callEntry.callId ?? "",
-    name: callEntry.title ?? "",
-    arguments: callEntry.content,
-  });
-  if (args && typeof args === "object" && "task" in args) {
-    const task = (args as { task?: unknown }).task;
-    return typeof task === "string" && task.trim() ? task.trim() : undefined;
-  }
-  return undefined;
-}
-
 /** A collapsed disclosure gathering an entire sub-agent run under its name. */
 function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent" }> }) {
   // The invocation entry flips from `tool_call` to `tool_result` when the
@@ -419,7 +402,7 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
     setOpen(!complete);
   }, [complete]);
 
-  const task = subAgentTask(item.callEntry);
+  const task = item.callEntry?.detail;
   const stepCount = item.entries.length;
   // Resumed history keeps no inner process — surface the reply that survived so
   // the group isn't empty when expanded.
