@@ -57,6 +57,7 @@ export type TranscriptEntry = {
   usage?: CompletionUsage | null;
   liveKey?: string;
   callId?: string;
+  isFinalResponse?: boolean;
 };
 
 export type ActivityEntry = {
@@ -267,43 +268,58 @@ function collectToolArgs(
   return map;
 }
 
-function historyToEntry(
+function historyToEntries(
   message: HistoryMessage,
   index: number,
   argsById: Record<string, string | null | undefined> = {}
-): TranscriptEntry | null {
+): TranscriptEntry[] {
   if ("System" in message) {
-    return null;
+    return [];
   }
   if ("User" in message) {
-    return {
-      id: `history:user:${index}`,
-      kind: "user",
-      content: message.User,
-    };
+    return [
+      {
+        id: `history:user:${index}`,
+        kind: "user",
+        content: message.User,
+      },
+    ];
   }
   if ("Assistant" in message) {
     const assistant = message.Assistant;
-    if (!assistant.content) {
-      return null;
+    const entries: TranscriptEntry[] = [];
+    if (assistant.reasoning_content) {
+      entries.push({
+        id: `history:reasoning:${index}`,
+        kind: "reasoning",
+        agentName: rootName,
+        title: "thinking",
+        content: assistant.reasoning_content,
+      });
     }
-    return {
-      id: `history:assistant:${index}`,
-      kind: "assistant",
-      agentName: rootName,
-      content: assistant.content,
-      usage: assistant.usage,
-      status: assistant.aborted ? "aborted" : undefined,
-    };
+    if (assistant.content) {
+      entries.push({
+        id: `history:assistant:${index}`,
+        kind: "assistant",
+        agentName: rootName,
+        content: assistant.content,
+        usage: assistant.usage,
+        status: assistant.aborted ? "aborted" : undefined,
+        isFinalResponse: assistant.tool_calls.length === 0,
+      });
+    }
+    return entries;
   }
   if ("Tool" in message) {
-    return toolMessageToEntry(
-      message.Tool,
-      `history:tool:${index}`,
-      describeTool(message.Tool.name, argsById[message.Tool.id])
-    );
+    return [
+      toolMessageToEntry(
+        message.Tool,
+        `history:tool:${index}`,
+        describeTool(message.Tool.name, argsById[message.Tool.id])
+      ),
+    ];
   }
-  return null;
+  return [];
 }
 
 function toolMessageToEntry(
@@ -380,6 +396,7 @@ function addOrUpdateAssistantChunk(
         threadId: event.thread_id,
         content: event.content,
         liveKey: key,
+        isFinalResponse: false,
       },
     ],
   };
@@ -464,10 +481,13 @@ function finishAssistant(
   event: Extract<WireEvent, { type: "llm_end" }>
 ): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
+  const isFinalResponse =
+    event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
       usage: event.message.usage,
       status: event.message.aborted ? "aborted" : undefined,
+      isFinalResponse,
     });
   }
   if (event.message.content) {
@@ -483,6 +503,7 @@ function finishAssistant(
           content: event.message.content,
           usage: event.message.usage,
           status: event.message.aborted ? "aborted" : undefined,
+          isFinalResponse,
         },
       ],
     };
@@ -611,6 +632,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             kind: "system",
             agentName: event.agent_name,
             threadId: event.thread_id,
+            status: "aborted",
             content:
               event.target.reason === "generation"
                 ? "Generation interrupted"
@@ -983,9 +1005,9 @@ function applySnapshot(
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
-  const mapped = messages
-    .map((message, index) => historyToEntry(message, index, argsById))
-    .filter((entry): entry is TranscriptEntry => Boolean(entry));
+  const mapped = messages.flatMap((message, index) =>
+    historyToEntries(message, index, argsById)
+  );
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
     const current = state.servers[server];

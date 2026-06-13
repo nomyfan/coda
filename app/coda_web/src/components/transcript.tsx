@@ -46,9 +46,12 @@ type TranscriptRenderItem =
   | { type: "entry"; entry: TranscriptEntry }
   | { type: "turn"; id: string; entries: TranscriptEntry[] };
 
-function lastAssistantIndex(entries: TranscriptEntry[]) {
+function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (entries[index].kind === "assistant") {
+    if (
+      entries[index].kind === "assistant" &&
+      entries[index].isFinalResponse
+    ) {
       return index;
     }
   }
@@ -61,14 +64,15 @@ function hasDisclosureWork(entries: TranscriptEntry[]) {
     (entry) =>
       entry.kind === "tool_call" ||
       entry.kind === "tool_result" ||
-      entry.kind === "reasoning"
+      entry.kind === "reasoning" ||
+      (entry.kind === "assistant" && entry.isFinalResponse === false)
   );
 }
 
 function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
   return {
     type: "turn",
-    id: entries.map((entry) => entry.id).join(":"),
+    id: `turn:${entries[0]?.id ?? "empty"}`,
     entries,
   };
 }
@@ -193,7 +197,13 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
-function EntryStatus({ entry }: { entry: TranscriptEntry }) {
+function EntryStatus({
+  entry,
+  showUsage = true,
+}: {
+  entry: TranscriptEntry;
+  showUsage?: boolean;
+}) {
   return (
     <>
       {entry.status ? (
@@ -201,7 +211,7 @@ function EntryStatus({ entry }: { entry: TranscriptEntry }) {
           {entry.status}
         </Badge>
       ) : null}
-      {entry.usage ? (
+      {showUsage && entry.usage ? (
         <Badge variant="outline">
           {entry.usage.prompt_tokens + entry.usage.completion_tokens} tokens
         </Badge>
@@ -239,53 +249,111 @@ function CopyContentButton({
   );
 }
 
+function MessageActions({
+  content,
+  label,
+  usage,
+  align,
+}: {
+  content: string;
+  label: string;
+  usage?: TranscriptEntry["usage"];
+  align: "start" | "end";
+}) {
+  return (
+    <div
+      className={cn(
+        "flex h-8 items-center gap-1 px-1 opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100",
+        align === "end" ? "justify-end" : "justify-start"
+      )}
+    >
+      <CopyContentButton content={content} label={label} />
+      {usage ? (
+        <Badge variant="outline">
+          {usage.prompt_tokens + usage.completion_tokens} tokens
+        </Badge>
+      ) : null}
+    </div>
+  );
+}
+
 function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
-  const lastIndex = lastAssistantIndex(entries);
-  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const lastIndex = findFinalAssistantIndex(entries);
+  const finalAssistantIndex =
+    lastIndex === entries.length - 1 ? lastIndex : -1;
   const finalAssistant =
     finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
+  const hasFinalAssistant = finalAssistant !== undefined;
+  const processComplete =
+    hasFinalAssistant || entries.some((entry) => entry.status === "aborted");
   const intermediateEntries =
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
       : entries;
   const usage = finalAssistant?.usage;
+  const [processOpen, setProcessOpen] = useState(!processComplete);
+  const previousProcessComplete = useRef(processComplete);
+
+  useEffect(() => {
+    if (previousProcessComplete.current === processComplete) {
+      return;
+    }
+    previousProcessComplete.current = processComplete;
+    setProcessOpen(!processComplete);
+  }, [processComplete]);
 
   return (
-    <article className="rounded-md border border-border bg-card p-3 shadow-sm">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <MessageSquareText className="size-4 shrink-0 text-muted-foreground" />
-          <span className="truncate text-sm font-medium">
-            {finalAssistant?.agentName ?? "coda"}
-          </span>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {usage ? (
-            <Badge variant="outline">
-              {usage.prompt_tokens + usage.completion_tokens} tokens
-            </Badge>
+    <div className="group/message">
+      <article className="rounded-md border border-border bg-card p-3 shadow-sm">
+        <div className="space-y-3">
+          <Collapsible open={processOpen} onOpenChange={setProcessOpen}>
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-3 rounded-md py-1 text-left text-muted-foreground hover:text-foreground"
+                title={processOpen ? "Collapse process" : "Expand process"}
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <Brain className="size-4 shrink-0" />
+                  <span className="text-sm font-medium">Process</span>
+                  <Badge variant="secondary">
+                    {intermediateEntries.length}{" "}
+                    {intermediateEntries.length === 1 ? "step" : "steps"}
+                  </Badge>
+                </div>
+                {processOpen ? (
+                  <ChevronDown className="size-4 shrink-0" />
+                ) : (
+                  <ChevronRight className="size-4 shrink-0" />
+                )}
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="mt-2 space-y-2 px-1">
+                {intermediateEntries.map((entry) =>
+                  entry.kind === "assistant" ? (
+                    <Markdown key={entry.id}>{entry.content}</Markdown>
+                  ) : (
+                    <TranscriptDisclosure key={entry.id} entry={entry} />
+                  )
+                )}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+          {finalAssistant ? (
+            <Markdown>{finalAssistant.content}</Markdown>
           ) : null}
         </div>
-      </div>
-      <div className="space-y-3">
-        {intermediateEntries.map((entry) =>
-          entry.kind === "assistant" ? (
-            <Markdown key={entry.id}>{entry.content}</Markdown>
-          ) : (
-            <TranscriptDisclosure key={entry.id} entry={entry} />
-          )
-        )}
-        {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
-        {finalAssistant ? (
-          <div className="flex justify-start">
-            <CopyContentButton
-              content={finalAssistant.content}
-              label="response"
-            />
-          </div>
-        ) : null}
-      </div>
-    </article>
+      </article>
+      {finalAssistant ? (
+        <MessageActions
+          content={finalAssistant.content}
+          label="response"
+          usage={usage}
+          align="start"
+        />
+      ) : null}
+    </div>
   );
 }
 
@@ -358,13 +426,15 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
 
   if (entry.kind === "user") {
     return (
-      <div className="group flex justify-end gap-1">
-        <div className="pt-1 opacity-0 transition-opacity group-hover:opacity-100">
-          <CopyContentButton content={entry.content} label="message" />
-        </div>
+      <div className="group/message flex flex-col items-end">
         <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
           <Markdown>{entry.content}</Markdown>
         </div>
+        <MessageActions
+          content={entry.content}
+          label="message"
+          align="end"
+        />
       </div>
     );
   }
@@ -386,7 +456,10 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <EntryStatus entry={entry} />
+        <EntryStatus
+          entry={entry}
+          showUsage={entry.kind !== "assistant"}
+        />
       </div>
     </div>
   );
@@ -439,21 +512,29 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
     );
   }
 
+  if (entry.kind === "assistant") {
+    return (
+      <div className="group/message">
+        <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+          {header}
+          <Markdown>{entry.content}</Markdown>
+        </article>
+        <MessageActions
+          content={entry.content}
+          label="response"
+          usage={entry.usage}
+          align="start"
+        />
+      </div>
+    );
+  }
+
   return (
     <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
       {header}
-      {entry.kind === "assistant" ? (
-        <div className="space-y-3">
-          <Markdown>{entry.content}</Markdown>
-          <div className="flex justify-start">
-            <CopyContentButton content={entry.content} label="response" />
-          </div>
-        </div>
-      ) : (
-        <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6">
-          {entry.content}
-        </pre>
-      )}
+      <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6">
+        {entry.content}
+      </pre>
     </article>
   );
 }

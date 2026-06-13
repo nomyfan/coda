@@ -93,8 +93,9 @@ impl WorkspaceStorage {
                 continue;
             };
             let storage = self.session(session_id);
-            let updated_at_ms = fs::metadata(storage.snapshot_path())
+            let updated_at_ms = fs::metadata(storage.checkpoint_path(session_id))
                 .await
+                .or(fs::metadata(storage.snapshot_path()).await)
                 .or(entry.metadata().await)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
@@ -244,6 +245,8 @@ impl SessionStorage for JsonFileStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coda_agent::persist::StoredResumePoint;
+    use coda_core::llm::UserMessage;
 
     #[test]
     fn validate_session_id_accepts_uuid_like_ids() {
@@ -272,5 +275,45 @@ mod tests {
         // before `remove_dir_all` runs.
         assert!(storage.delete_session("..").await.is_err());
         assert!(sentinel.exists(), "traversal must not delete outside root");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_uses_root_checkpoint_for_recent_activity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions_dir = workspace.path().join("sessions");
+        let storage = WorkspaceStorage::new(&sessions_dir);
+        let active = storage.session("active");
+        let other = storage.session("other");
+
+        fs::create_dir_all(&active.dir).await.unwrap();
+        fs::write(active.snapshot_path(), b"{}").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        fs::create_dir_all(&other.dir).await.unwrap();
+        fs::write(other.snapshot_path(), b"{}").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        active
+            .save_checkpoint(
+                "active".into(),
+                StoredCheckpoint {
+                    thread_id: "active".into(),
+                    agent_name: "coda".into(),
+                    reply_target: None,
+                    messages: vec![Message::User(UserMessage("recent session".into()))],
+                    todos: vec![],
+                    resume_point: StoredResumePoint::Generation,
+                    suspended_at: jiff::Timestamp::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sessions = storage.list_sessions().await.unwrap();
+
+        assert_eq!(sessions[0].session_id, "active");
+        assert!(sessions[0].updated_at_ms > sessions[1].updated_at_ms);
+        assert_eq!(
+            sessions[0].first_user_message.as_deref(),
+            Some("recent session")
+        );
     }
 }

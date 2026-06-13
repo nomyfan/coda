@@ -13,6 +13,7 @@ export type AssistantMessage = {
   content: string;
   tool_calls: ToolCall[];
   usage?: CompletionUsage | null;
+  reasoning_content?: string | null;
   aborted?: boolean;
 };
 
