@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, RunConfig, Sender, StoredCheckpoint, StoredRuntimeSnapshot,
-    SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
+    StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::{AgentRuntime, AgentRuntimeSnapshot, MemoryStorage, SessionStorage},
 };
 use coda_core::{
@@ -560,15 +560,17 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let config = RunConfig {
-            provider,
-            model: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-            tool_approval: approval,
-            approval_timeout: None,
-        };
+        let config = RunConfig::uniform(
+            ModelProfile {
+                provider,
+                model: "fake".into(),
+                label: "fake".into(),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning_effort: None,
+            },
+            approval,
+        );
 
         let thread_id = ThreadId::new();
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
@@ -624,15 +626,17 @@ where
         approval: ToolApprovalMode,
         resume_decisions: HashMap<String, ResumeDecision>,
     ) -> Self {
-        let config = RunConfig {
-            provider,
-            model: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-            tool_approval: approval,
-            approval_timeout: None,
-        };
+        let config = RunConfig::uniform(
+            ModelProfile {
+                provider,
+                model: "fake".into(),
+                label: "fake".into(),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning_effort: None,
+            },
+            approval,
+        );
 
         let session_id = self.thread_id.as_ref().to_string();
         let snapshot: Option<AgentRuntimeSnapshot> = self
@@ -690,15 +694,17 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     .expect("valid team")
     .build(".");
 
-    let config = RunConfig {
-        provider: TestProvider::default(),
-        model: "fake".into(),
-        temperature: None,
-        max_completion_tokens: None,
-        reasoning_effort: None,
-        tool_approval: ToolApprovalMode::Auto,
-        approval_timeout: None,
-    };
+    let config = RunConfig::uniform(
+        ModelProfile {
+            provider: TestProvider::default(),
+            model: "fake".into(),
+            label: "fake".into(),
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+        },
+        ToolApprovalMode::Auto,
+    );
 
     let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
     runtime

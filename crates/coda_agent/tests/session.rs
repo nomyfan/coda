@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use coda_agent::runtime::MemoryStorage;
 use coda_agent::{
-    AgentEvent, AgentSpec, AgentTeam, ResumeDecision, RunConfig, Session, SessionEvent, Shutdown,
-    SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    AgentEvent, AgentSpec, AgentTeam, ModelProfile, ResumeDecision, RunConfig, Session,
+    SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, StreamError, ToolCall,
@@ -320,16 +320,19 @@ fn solo_team(spec: AgentSpec) -> AgentTeam {
     AgentTeam::new(spec, vec![]).expect("valid team")
 }
 
-fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
-    RunConfig {
+fn fake_profile() -> ModelProfile<FakeProvider> {
+    ModelProfile {
         provider: FakeProvider,
         model: "fake".into(),
+        label: "fake".into(),
         temperature: None,
         max_completion_tokens: None,
         reasoning_effort: None,
-        tool_approval: approval,
-        approval_timeout: None,
     }
+}
+
+fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
+    RunConfig::uniform(fake_profile(), approval)
 }
 
 /// Collect events until the root agent produces a final `LLMEnd` with no tool
@@ -641,15 +644,7 @@ async fn should_execute_tool_after_approval_resume() {
     let session = Session::builder()
         .storage(MemoryStorage::default())
         .team(&solo_team(spec), ".")
-        .run_config(RunConfig {
-            provider: FakeProvider,
-            model: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-            tool_approval: approval,
-            approval_timeout: None,
-        })
+        .run_config(RunConfig::uniform(fake_profile(), approval))
         .open()
         .await
         .expect("open session");
@@ -692,15 +687,7 @@ async fn should_auto_reject_when_approval_times_out() {
     let session1 = Session::builder()
         .storage(storage.clone())
         .team(&solo_team(spec), ".")
-        .run_config(RunConfig {
-            provider: FakeProvider,
-            model: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-            tool_approval: approval.clone(),
-            approval_timeout: None,
-        })
+        .run_config(RunConfig::uniform(fake_profile(), approval.clone()))
         .session_id(session_id)
         .open()
         .await
@@ -726,13 +713,8 @@ async fn should_auto_reject_when_approval_times_out() {
         .storage(storage.clone())
         .team(&solo_team(spec2), ".")
         .run_config(RunConfig {
-            provider: FakeProvider,
-            model: "fake".into(),
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: None,
-            tool_approval: approval,
             approval_timeout: Some(Duration::ZERO),
+            ..RunConfig::uniform(fake_profile(), approval)
         })
         .session_id(session_id)
         .open()

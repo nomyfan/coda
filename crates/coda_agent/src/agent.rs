@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMProvider, Message, ReasoningEffort, SystemMessage,
-    ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, Message, ReasoningEffort, SystemMessage, ToolCall,
+    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
@@ -277,32 +277,92 @@ pub struct Agent {
     pub subagents: SubAgents,
 }
 
-pub struct RunConfig<P: LLMProvider> {
+/// A model and its sampling parameters. One agent runs on exactly one profile
+/// per turn; a session can map different agents to different profiles through
+/// [`RunConfig::agent_models`].
+pub struct ModelProfile<P> {
     pub provider: P,
     pub model: String,
+    /// Human-readable identifier for logging (the `provider_id:model_id`
+    /// selection key). Distinct from `model`, which is the bare API model name.
+    pub label: String,
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
     /// Reasoning effort sent on each generation request. Outer `None` leaves the
     /// provider default untouched; `Some(ReasoningEffort::None)` turns thinking off.
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl<P: Clone> Clone for ModelProfile<P> {
+    fn clone(&self) -> Self {
+        ModelProfile {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            label: self.label.clone(),
+            temperature: self.temperature,
+            max_completion_tokens: self.max_completion_tokens,
+            reasoning_effort: self.reasoning_effort,
+        }
+    }
+}
+
+/// Per-session run configuration. Every agent shares the same tool-approval
+/// policy, but each can run on its own [`ModelProfile`]: the root agent — and
+/// any agent without an entry in `agent_models` — uses `default_model`, while
+/// `agent_models` overrides specific agents by name.
+pub struct RunConfig<P> {
+    pub default_model: ModelProfile<P>,
+    /// Per-agent model overrides, keyed by agent name. Agents absent here fall
+    /// back to `default_model`.
+    pub agent_models: HashMap<String, ModelProfile<P>>,
     pub tool_approval: ToolApprovalMode,
     /// If set, pending approvals older than this duration are auto-rejected
     /// when opening a session.
     pub approval_timeout: Option<std::time::Duration>,
 }
 
-impl<P: LLMProvider + Clone> Clone for RunConfig<P> {
+impl<P: Clone> RunConfig<P> {
+    /// Build a config where every agent runs on `model` (no per-agent overrides).
+    pub fn uniform(model: ModelProfile<P>, tool_approval: ToolApprovalMode) -> Self {
+        RunConfig {
+            default_model: model,
+            agent_models: HashMap::new(),
+            tool_approval,
+            approval_timeout: None,
+        }
+    }
+
+    /// Resolve the configuration for a single agent: its model override if one is
+    /// registered, otherwise `default_model`, paired with the shared approval mode.
+    pub(crate) fn resolve(&self, agent_name: &str) -> AgentRunConfig<P> {
+        let profile = self
+            .agent_models
+            .get(agent_name)
+            .cloned()
+            .unwrap_or_else(|| self.default_model.clone());
+        AgentRunConfig {
+            profile,
+            tool_approval: self.tool_approval.clone(),
+        }
+    }
+}
+
+impl<P: Clone> Clone for RunConfig<P> {
     fn clone(&self) -> Self {
         RunConfig {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            temperature: self.temperature,
-            max_completion_tokens: self.max_completion_tokens,
-            reasoning_effort: self.reasoning_effort,
+            default_model: self.default_model.clone(),
+            agent_models: self.agent_models.clone(),
             tool_approval: self.tool_approval.clone(),
             approval_timeout: self.approval_timeout,
         }
     }
+}
+
+/// The resolved configuration handed to a single agent's run loop.
+#[derive(Clone)]
+pub(crate) struct AgentRunConfig<P> {
+    pub profile: ModelProfile<P>,
+    pub tool_approval: ToolApprovalMode,
 }
 
 impl Agent {

@@ -237,11 +237,11 @@ impl AgentRuntime {
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
         for (name, agent) in agents {
-            info!("Bootstrapping agent: {}", name);
+            info!("Bootstrap agent: {}", name);
             let runtime = self.clone();
 
             let task_name = name.clone();
-            let config = config.clone();
+            let agent_config = config.resolve(&name);
             let active_thread = snapshot
                 .as_ref()
                 .and_then(|s| s.active_threads.get(&name))
@@ -272,7 +272,7 @@ impl AgentRuntime {
                     agent,
                     control_rx,
                     envelope_rx,
-                    config,
+                    agent_config,
                 )
                 .await;
                 task_name
