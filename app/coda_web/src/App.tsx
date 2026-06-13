@@ -13,15 +13,14 @@ import {
   selectActiveServer,
   selectActiveStatus,
   selectActiveWorkspace,
-  selectServers,
+  selectServerSummaries,
   sendTask,
   sendTaskToNewSession,
   setModel,
   useCodaBootstrap,
-  useCodaShallow,
   useCodaStore,
   type ReasoningEffort,
-  type ServerState,
+  type ServerSummary,
 } from "@/store/session";
 import { Sidebar } from "@/components/sidebar";
 import { Composer } from "@/components/composer";
@@ -39,7 +38,7 @@ import {
 
 /** Stable empty list so the composer's `servers` prop is referentially stable
  * in the active-session view (the list is only used while picking a target). */
-const NO_SERVERS: ServerState[] = [];
+const NO_SERVERS: ServerSummary[] = [];
 
 function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
   return (
@@ -61,10 +60,9 @@ function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
 export default function App() {
   useCodaBootstrap();
 
-  // Each value is its own narrow subscription: streaming tokens mutate only the
-  // active session's `entries`, leaving these scalar selectors referentially
-  // stable, so the heavy children (Transcript/Sidebar/Composer) don't churn.
-  const servers = useCodaShallow(selectServers);
+  // Server summaries exclude session state, so streaming entries leave this
+  // subscription stable.
+  const servers = useCodaStore(selectServerSummaries);
   const activeServer = useCodaStore(selectActiveServer);
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
@@ -147,7 +145,7 @@ export default function App() {
   // don't defeat the memoized children.
   const startNewSession = useCallback(() => {
     const state = codaStore.getState();
-    beginNewSession(selectServers(state), state.activeServer);
+    beginNewSession(selectServerSummaries(state), state.activeServer);
   }, []);
 
   const handleOpenSession = useCallback(
@@ -169,7 +167,7 @@ export default function App() {
   );
 
   const changeNewSessionServer = useCallback((serverUrl: string) => {
-    const server = selectServers(codaStore.getState()).find(
+    const server = selectServerSummaries(codaStore.getState()).find(
       (item) => item.url === serverUrl
     );
     setNewSessionTarget({

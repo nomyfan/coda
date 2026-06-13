@@ -1,4 +1,4 @@
-import type { ConnectionStatus, ServerState } from "@/store/session";
+import type { ConnectionStatus } from "@/store/session";
 
 export const statusCopy: Record<
   ConnectionStatus,
@@ -18,6 +18,6 @@ export function sessionTitle(session: {
   return session.first_user_message?.trim() || session.id;
 }
 
-export function serverLabel(server: ServerState) {
+export function serverLabel(server: { alias?: string; url: string }) {
   return server.alias || server.url;
 }

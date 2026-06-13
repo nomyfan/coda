@@ -102,6 +102,8 @@ export type ServerState = {
   sessions: Record<SessionKey, OpenedSession>;
 };
 
+export type ServerSummary = Omit<ServerState, "sessions">;
+
 type CodaState = {
   servers: Record<string, ServerState>;
   /** Stable ordering of `servers` for rendering. */
@@ -1584,6 +1586,66 @@ export const selectServers = (state: CodaStoreState): ServerState[] =>
   state.order
     .map((url) => state.servers[url])
     .filter((server): server is ServerState => Boolean(server));
+
+let cachedServerSummaries: ServerSummary[] = [];
+
+function summaryMatchesServer(
+  summary: ServerSummary,
+  server: ServerState
+): boolean {
+  return (
+    summary.url === server.url &&
+    summary.alias === server.alias &&
+    summary.status === server.status &&
+    summary.error === server.error &&
+    summary.catalog === server.catalog &&
+    summary.providers === server.providers &&
+    summary.defaultProvider === server.defaultProvider
+  );
+}
+
+export const selectServerSummaries = (
+  state: CodaStoreState
+): ServerSummary[] => {
+  if (
+    state.order.length === cachedServerSummaries.length &&
+    state.order.every((url, index) => {
+      const server = state.servers[url];
+      return (
+        Boolean(server) &&
+        summaryMatchesServer(cachedServerSummaries[index], server)
+      );
+    })
+  ) {
+    return cachedServerSummaries;
+  }
+  const previousByUrl = new Map(
+    cachedServerSummaries.map((server) => [server.url, server])
+  );
+  const next = state.order.flatMap((url) => {
+    const server = state.servers[url];
+    if (!server) {
+      return [];
+    }
+    const previous = previousByUrl.get(url);
+    if (previous && summaryMatchesServer(previous, server)) {
+      return [previous];
+    }
+    return [
+      {
+        url: server.url,
+        alias: server.alias,
+        status: server.status,
+        error: server.error,
+        catalog: server.catalog,
+        providers: server.providers,
+        defaultProvider: server.defaultProvider,
+      },
+    ];
+  });
+  cachedServerSummaries = next;
+  return next;
+};
 
 export const selectActiveServer = (state: CodaStoreState) => state.activeServer;
 export const selectActiveKey = (state: CodaStoreState) => state.activeKey;

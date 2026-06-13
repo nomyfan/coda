@@ -1,5 +1,5 @@
 import { useStore } from "zustand";
-import type { ServerState } from "./session";
+import type { ServerSummary } from "./session";
 import { create } from "@/store/utils";
 
 export type NewSessionTarget = {
@@ -61,7 +61,7 @@ export function useNewSessionStore<T>(
 }
 
 export function resolveNewSessionTarget(
-  servers: ServerState[],
+  servers: ServerSummary[],
   preferred?: NewSessionTarget | null,
   fallbackServer?: string
 ): NewSessionTarget {
@@ -98,7 +98,7 @@ export function rememberNewSessionTarget(target: NewSessionTarget) {
 }
 
 export function beginNewSession(
-  servers: ServerState[],
+  servers: ServerSummary[],
   fallbackServer?: string
 ) {
   const target = resolveNewSessionTarget(

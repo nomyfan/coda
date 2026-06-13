@@ -13,7 +13,7 @@ import type {
   ConnectionStatus,
   ProviderInfo,
   ReasoningEffort,
-  ServerState,
+  ServerSummary,
 } from "@/store/session";
 import { serverLabel } from "@/components/session-utils";
 import { ModelSelector } from "@/components/model-selector";
@@ -38,7 +38,7 @@ export const Composer = memo(function Composer({
   status: ConnectionStatus;
   running: boolean;
   server?: string;
-  servers: ServerState[];
+  servers: ServerSummary[];
   workspace?: string;
   workspaces: string[];
   selectingTarget: boolean;
