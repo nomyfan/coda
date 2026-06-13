@@ -238,17 +238,20 @@ impl TestProvider {
     }
 
     fn chunk_then_wait(
+        reasoning: &str,
         chunk: &str,
         gate: Arc<Notify>,
         final_message: AssistantMessage,
     ) -> Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
         Box::pin(
-            stream::iter(vec![Ok(LLMStreamEvent::ContentChunk(chunk.into()))]).chain(stream::once(
-                async move {
-                    gate.notified().await;
-                    Ok(LLMStreamEvent::Completed(final_message))
-                },
-            )),
+            stream::iter(vec![
+                Ok(LLMStreamEvent::ReasoningChunk(reasoning.into())),
+                Ok(LLMStreamEvent::ContentChunk(chunk.into())),
+            ])
+            .chain(stream::once(async move {
+                gate.notified().await;
+                Ok(LLMStreamEvent::Completed(final_message))
+            })),
         )
     }
 }
@@ -436,6 +439,7 @@ impl LLMProvider for TestProvider {
                     .clone()
                     .expect("abort-generation-main prompt requires a notify");
                 Self::chunk_then_wait(
+                    "partial reasoning",
                     "partial",
                     hold_generation,
                     AssistantMessage {
@@ -1239,10 +1243,15 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 
     let result = timeout(Duration::from_secs(2), async {
         let mut saw_chunk = false;
+        let mut saw_reasoning = false;
 
         loop {
             let (agent_name, _, event) = harness.next_event().await;
             match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::LLMReasoningChunk(chunk)) => {
+                    assert_eq!(chunk, "partial reasoning");
+                    saw_reasoning = true;
+                }
                 ("coda", AgentEvent::LLMContentChunk(chunk)) => {
                     assert_eq!(chunk, "partial");
                     saw_chunk = true;
@@ -1252,6 +1261,10 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                     assert!(
                         saw_chunk,
                         "generation was aborted before any partial content"
+                    );
+                    assert!(
+                        saw_reasoning,
+                        "generation was aborted before any partial reasoning"
                     );
                     break;
                 }
@@ -1287,6 +1300,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
             if message.aborted
                 && message.content.contains("partial")
                 && message.content.contains("interrupted by the user")
+                && message.reasoning_content.as_deref() == Some("partial reasoning")
     ));
 }
 

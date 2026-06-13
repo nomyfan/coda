@@ -419,8 +419,8 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
                 arguments,
             });
         }
-        let reasoning_content = (!tool_calls.is_empty() && !value.reasoning_content.is_empty())
-            .then_some(value.reasoning_content);
+        let reasoning_content =
+            (!value.reasoning_content.is_empty()).then_some(value.reasoning_content);
         Ok(AssistantMessage {
             content: value.content,
             tool_calls,
@@ -491,13 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn reduced_completion_discards_reasoning_without_tool_calls() {
+    fn reduced_completion_keeps_reasoning_without_tool_calls() {
         let mut completion = ReducedChatCompletion::new();
         completion.reduce_reasoning("final reasoning");
 
         let message = AssistantMessage::try_from(completion).unwrap();
 
-        assert!(message.reasoning_content.is_none());
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("final reasoning")
+        );
     }
 
     #[test]

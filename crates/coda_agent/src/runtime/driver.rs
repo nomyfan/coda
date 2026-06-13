@@ -599,14 +599,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 
         let mut llm_stream = std::pin::pin!(self.config.provider.stream(request));
         let mut partial_content = String::new();
+        let mut partial_reasoning = String::new();
         let llm_result = loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
                     self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::Aborted(AbortedTarget::Generation)).await;
-                    if !partial_content.is_empty() {
+                    if !partial_content.is_empty() || !partial_reasoning.is_empty() {
+                        let content = if partial_content.is_empty() {
+                            "[Generation was interrupted by the user]".to_string()
+                        } else {
+                            partial_content + "\n[Generation was interrupted by the user]"
+                        };
                         self.agent.add_message(Message::Assistant(coda_core::llm::AssistantMessage {
-                            content: partial_content + "\n[Generation was interrupted by the user]",
+                            content,
+                            reasoning_content: (!partial_reasoning.is_empty()).then_some(partial_reasoning),
                             aborted: true,
                             ..Default::default()
                         })).await;
@@ -621,8 +628,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::ReasoningChunk(chunk))) => {
-                            // Assistant content and reasoning remain separate.
-                            // The provider retains reasoning needed for later tool turns.
+                            partial_reasoning.push_str(&chunk);
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(message),

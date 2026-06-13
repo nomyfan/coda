@@ -21,8 +21,8 @@ pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<CompletionUsage>,
-    /// Provider-specific reasoning that must accompany tool calls on subsequent
-    /// requests. It stays separate from visible assistant content.
+    /// Provider-specific reasoning captured separately from assistant content.
+    /// Request adapters decide when the provider needs it on later turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// Whether LLM generation for this assistant message was interrupted by user abort
