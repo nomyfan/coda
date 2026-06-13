@@ -31,13 +31,14 @@ impl From<std::io::Error> for ConfigError {
 
 /// A model configured under a provider. `id` is the API model name sent in
 /// requests; `name` is an optional human-readable label for the dashboard (falls
-/// back to `id` when absent). `reasoning_efforts` declares which effort levels
-/// the model accepts; an empty list means the model is not a reasoning model,
-/// so the UI shows no reasoning controls for it.
+/// back to `id` when absent). `context_window` is the model's total token
+/// capacity. `reasoning_efforts` declares which effort levels the model accepts;
+/// an empty list means the UI shows no reasoning controls for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
+    pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
 }
 
@@ -185,10 +186,21 @@ fn parse_models(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| id.clone());
+        let context_window = table
+            .get("context_window")
+            .and_then(|value| value.as_integer())
+            .filter(|value| *value > 0)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "provider '{provider_id}' model '{id}' context_window must be a positive integer"
+                ))
+            })?;
         let reasoning_efforts = parse_model_reasoning_efforts(table, provider_id, &id)?;
         models.push(ModelConfig {
             id,
             name,
+            context_window,
             reasoning_efforts,
         });
     }
@@ -611,7 +623,7 @@ kind = "deepseek"
 api_key = "sk-test"
 base_url = "https://api.deepseek.com/v1"
 models = [
-  { id = "deepseek-reasoner", name = "DeepSeek R1", reasoning_efforts = ["low", "medium", "high"] },
+  { id = "deepseek-reasoner", name = "DeepSeek R1", context_window = 128000, reasoning_efforts = ["low", "medium", "high"] },
 ]
 "#;
 
@@ -657,6 +669,7 @@ path = "/tmp/scratch"
                 models: vec![ModelConfig {
                     id: "deepseek-reasoner".to_string(),
                     name: "DeepSeek R1".to_string(),
+                    context_window: 128_000,
                     reasoning_efforts: vec![
                         ReasoningEffort::Low,
                         ReasoningEffort::Medium,
@@ -677,7 +690,7 @@ id = "deepseek"
 api_key = "${CODA_TEST_KEY}"
 base_url = "https://api.deepseek.com/v1"
 models = [
-  { id = "deepseek-reasoner" },
+  { id = "deepseek-reasoner", context_window = 128000 },
 ]
 
 [[workspaces]]
@@ -704,7 +717,7 @@ id = "deepseek"
 api_key = "sk-test"
 base_url = "https://api.deepseek.com/v1"
 models = [
-  { id = "deepseek-reasoner", reasoning_efforts = ["ultra"] },
+  { id = "deepseek-reasoner", context_window = 128000, reasoning_efforts = ["ultra"] },
 ]
 
 [[workspaces]]
@@ -715,6 +728,32 @@ path = "/tmp/coda"
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown reasoning effort 'ultra'"));
+    }
+
+    #[test]
+    fn parse_server_config_requires_context_window() {
+        let err = parse_server_config(
+            r#"
+[[providers]]
+id = "deepseek"
+api_key = "sk-test"
+base_url = "https://api.deepseek.com/v1"
+models = [
+  { id = "deepseek-reasoner" },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("context_window must be a positive integer")
+        );
     }
 
     #[test]

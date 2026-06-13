@@ -6,6 +6,11 @@ After modifying Rust code, always run `cargo clippy` and `cargo test` as a final
 
 This project is in active development. Breaking changes to APIs, serialization formats, and persisted data are acceptable — no backward-compatibility shims needed.
 
+## Git Workflow
+
+- Use Conventional Commits format for commit messages and pull request titles.
+- Commits must include a `Co-authored-by` trailer.
+
 ## Runtime Config
 
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `sh`.
@@ -45,7 +50,7 @@ crates/
 
 The server reads `coda-server.toml` (overridable via `CODA_SERVER_CONFIG` env var). It declares providers and workspaces:
 
-- **Providers** — `[[providers]]` array-of-tables. Each is an OpenAI-compatible endpoint with `id`, `kind` (`"generic"` or `"deepseek"`), `api_key` / `base_url` (both support `${VAR}` env expansion), and an inline `models` array. Each model has a required `id` (the API model name sent in requests), an optional `name` (human-readable dashboard label; defaults to `id`), and optional `reasoning_efforts` (omit for non-reasoning models). Models under the same provider share one `Arc<OpenAI>` instance. The dashboard shows a grouped dropdown (provider → model) and a reasoning-effort selector when the selected model has reasoning levels.
+- **Providers** — `[[providers]]` array-of-tables. Each is an OpenAI-compatible endpoint with `id`, `kind` (`"generic"` or `"deepseek"`), `api_key` / `base_url` (both support `${VAR}` env expansion), and an inline `models` array. Each model has a required `id` (the API model name sent in requests), an optional `name` (human-readable dashboard label; defaults to `id`), a required positive `context_window` token count, and optional `reasoning_efforts` (omit for non-reasoning models). Models under the same provider share one `Arc<OpenAI>` instance. The dashboard shows a grouped dropdown (provider → model) and a reasoning-effort selector when the selected model has reasoning levels.
 - **Workspaces** — `[[workspaces]]` array-of-tables with `id` and `path`. Sessions are scoped to a workspace and persisted under `.coda/sessions/`.
 
 Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first model of the first provider is the default.

@@ -12,6 +12,7 @@ import {
   selectActiveRunning,
   selectActiveServer,
   selectActiveStatus,
+  selectActiveUsage,
   selectActiveWorkspace,
   selectServerSummaries,
   sendTask,
@@ -21,6 +22,7 @@ import {
   useCodaStore,
   type ReasoningEffort,
   type ServerSummary,
+  type UsageRecord,
 } from "@/store/session";
 import { Sidebar } from "@/components/sidebar";
 import { Composer } from "@/components/composer";
@@ -39,6 +41,7 @@ import {
 /** Stable empty list so the composer's `servers` prop is referentially stable
  * in the active-session view (the list is only used while picking a target). */
 const NO_SERVERS: ServerSummary[] = [];
+const NO_USAGE: UsageRecord[] = [];
 
 function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
   return (
@@ -71,6 +74,7 @@ export default function App() {
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
   const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
+  const activeUsage = useCodaStore(selectActiveUsage);
 
   const newSessionTarget = useNewSessionStore((state) => state.target);
   const [newSessionModel, setNewSessionModel] = useState<{
@@ -255,6 +259,7 @@ export default function App() {
                   ? newSessionModel?.reasoningEffort ?? null
                   : activeReasoningEffort
               }
+              usage={showingNewSession ? NO_USAGE : activeUsage}
               onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
               onChangeServer={changeNewSessionServer}
               onChangeWorkspace={changeWorkspace}

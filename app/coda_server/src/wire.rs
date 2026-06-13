@@ -265,6 +265,7 @@ pub struct ProviderInfoWire {
     /// The id of the provider this model belongs to (e.g. "deepseek").
     pub provider: String,
     pub model: String,
+    pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
 }
 
@@ -456,6 +457,7 @@ mod tests {
                 id: "deepseek:deepseek-reasoner".into(),
                 provider: "deepseek".into(),
                 model: "deepseek-reasoner".into(),
+                context_window: 128_000,
                 reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),
@@ -468,6 +470,7 @@ mod tests {
             } => {
                 assert_eq!(providers[0].id, "deepseek:deepseek-reasoner");
                 assert_eq!(providers[0].provider, "deepseek");
+                assert_eq!(providers[0].context_window, 128_000);
                 assert_eq!(providers[0].reasoning_efforts.len(), 2);
                 assert_eq!(default_provider, "deepseek:deepseek-reasoner");
             }
