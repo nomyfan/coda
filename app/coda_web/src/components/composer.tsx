@@ -1,5 +1,5 @@
 import { CircleStop, Folder, PlugZap, Send } from "lucide-react";
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -14,11 +14,11 @@ import type {
   ProviderInfo,
   ReasoningEffort,
   ServerState,
-} from "@/lib/session";
+} from "@/store/session";
 import { serverLabel } from "@/components/session-utils";
 import { ModelSelector } from "@/components/model-selector";
 
-export function Composer({
+export const Composer = memo(function Composer({
   status,
   running,
   server,
@@ -198,4 +198,4 @@ export function Composer({
       </div>
     </form>
   );
-}
+});

@@ -184,12 +184,6 @@
   * {
     @apply border-border outline-ring/50;
   }
-  /* Base font size one notch below the 16px browser default. Tailwind's font
-     and spacing scales are rem-based, so this tightens text and spacing
-     together for a denser UI. */
-  html {
-    font-size: 14px;
-  }
   body {
     @apply bg-background text-foreground;
     letter-spacing: var(--tracking-normal);

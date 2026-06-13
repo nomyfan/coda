@@ -10,7 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ProviderInfo, ReasoningEffort } from "@/lib/session";
+import type { ProviderInfo, ReasoningEffort } from "@/store/session";
 
 const defaultReasoning = "__default__";
 

@@ -1,4 +1,4 @@
-import type { ConnectionStatus, ServerState } from "@/lib/session";
+import type { ConnectionStatus, ServerState } from "@/store/session";
 
 export const statusCopy: Record<
   ConnectionStatus,

@@ -7,7 +7,7 @@ import {
   ShieldCheck,
   TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,6 +24,14 @@ import {
   type ToolCall,
   type ToolCallResolution,
 } from "@/lib/protocol";
+import {
+  addAllowPattern,
+  draftCall,
+  selectActiveApprovals,
+  selectActiveDrafts,
+  submitApprovals,
+  useCodaStore,
+} from "@/store/session";
 import { cn } from "@/lib/utils";
 
 function formatArguments(value: string) {
@@ -58,23 +66,9 @@ function DecisionRadio({
   );
 }
 
-export function ApprovalPanel({
-  approvals,
-  drafts,
-  onDraft,
-  onSubmit,
-  onAllowPattern,
-}: {
-  approvals: PendingApproval[];
-  drafts: Record<string, Record<string, ToolCallResolution>>;
-  onDraft: (
-    approval: PendingApproval,
-    call: ToolCall,
-    resolution: ToolCallResolution
-  ) => void;
-  onSubmit: () => void;
-  onAllowPattern: (pattern: string) => void;
-}) {
+export const ApprovalPanel = memo(function ApprovalPanel() {
+  const approvals = useCodaStore(selectActiveApprovals);
+  const drafts = useCodaStore(selectActiveDrafts);
   const items: ApprovalItem[] = approvals.flatMap((approval) =>
     approval.calls.map((call) => ({ approval, call }))
   );
@@ -105,7 +99,7 @@ export function ApprovalPanel({
   const allDecided = decidedCount === items.length;
 
   const handleDraft = (resolution: ToolCallResolution) => {
-    onDraft(current.approval, current.call, resolution);
+    draftCall(current.approval, current.call, resolution);
     // Approving needs no follow-up, so jump ahead; rejecting stays put so the
     // user can fill in a reason.
     if (resolution === "Execute" && currentIndex < items.length - 1) {
@@ -132,7 +126,7 @@ export function ApprovalPanel({
               call={current.call}
               decision={decisionOf(current)}
               onDraft={handleDraft}
-              onAllowPattern={onAllowPattern}
+              onAllowPattern={addAllowPattern}
             />
           </div>
           <div className="flex items-center justify-between gap-2 px-4 py-2">
@@ -157,7 +151,7 @@ export function ApprovalPanel({
                 <ChevronRight />
               </Button>
             </div>
-            <Button disabled={!allDecided} onClick={onSubmit}>
+            <Button disabled={!allDecided} onClick={submitApprovals}>
               <Check />
               Submit {decidedCount}/{items.length}
             </Button>
@@ -166,7 +160,7 @@ export function ApprovalPanel({
       </div>
     </div>
   );
-}
+});
 
 function ApprovalCall({
   call,

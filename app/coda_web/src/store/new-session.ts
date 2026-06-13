@@ -1,5 +1,5 @@
 import { useStore } from "zustand";
-import type { ServerState } from "@/lib/session";
+import type { ServerState } from "./session";
 import { create } from "@/store/utils";
 
 export type NewSessionTarget = {
