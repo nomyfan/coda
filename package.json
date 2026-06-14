@@ -3,16 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@11.5.0",
   "scripts": {
+    "prepare": "node -e \"if(!process.env.CI)require('child_process').execSync('pnpm exec prek install',{stdio:'inherit'})\"",
     "build:rpi": "node scripts/build-rpi.mts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt --check ."
   },
   "dependencies": {
     "commander": "^14.0.2"
   },
   "devDependencies": {
-    "@types/node": "^22.19.19",
-    "typescript": "^6.0.3"
-  }
+    "@j178/prek": "^0.4.4",
+    "@types/node": "catalog:",
+    "oxfmt": "^0.54.0",
+    "typescript": "catalog:"
+  },
+  "packageManager": "pnpm@11.5.0"
 }

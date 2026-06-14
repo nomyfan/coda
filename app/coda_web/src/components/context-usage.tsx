@@ -1,8 +1,4 @@
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { CompletionUsage, UsageRecord } from "@/store/session";
 
 const rootAgent = "coda";
@@ -93,15 +89,10 @@ export function ContextUsage({
           <section>
             <div className="mb-2 flex items-baseline justify-between gap-4">
               <span className="text-muted-foreground">Current context</span>
-              <span className="font-mono font-semibold">
-                {percentage.toFixed(1)}%
-              </span>
+              <span className="font-mono font-semibold">{percentage.toFixed(1)}%</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted">
-              <div
-                className="h-full rounded-full bg-primary"
-                style={{ width: `${percentage}%` }}
-              />
+              <div className="h-full rounded-full bg-primary" style={{ width: `${percentage}%` }} />
             </div>
             <dl className="mt-2 space-y-1">
               <UsageRow label="Used" value={contextTokens} />
@@ -114,10 +105,7 @@ export function ContextUsage({
               <h3 className="mb-2 font-medium">Latest request</h3>
               <dl className="space-y-1">
                 <UsageRow label="Input tokens" value={latestRootUsage.prompt_tokens} />
-                <UsageRow
-                  label="Output tokens"
-                  value={latestRootUsage.completion_tokens}
-                />
+                <UsageRow label="Output tokens" value={latestRootUsage.completion_tokens} />
                 <UsageRow label="Total tokens" value={tokenCount(latestRootUsage)} />
                 <UsageRow
                   label="Cached input"
@@ -137,30 +125,24 @@ export function ContextUsage({
                 />
                 <UsageRow
                   label="Reasoning tokens"
-                  value={
-                    latestRootUsage.completion_tokens_details?.reasoning_tokens ??
-                    undefined
-                  }
+                  value={latestRootUsage.completion_tokens_details?.reasoning_tokens ?? undefined}
                 />
                 <UsageRow
                   label="Output audio"
-                  value={
-                    latestRootUsage.completion_tokens_details?.audio_tokens ??
-                    undefined
-                  }
+                  value={latestRootUsage.completion_tokens_details?.audio_tokens ?? undefined}
                 />
                 <UsageRow
                   label="Accepted prediction"
                   value={
-                    latestRootUsage.completion_tokens_details
-                      ?.accepted_prediction_tokens ?? undefined
+                    latestRootUsage.completion_tokens_details?.accepted_prediction_tokens ??
+                    undefined
                   }
                 />
                 <UsageRow
                   label="Rejected prediction"
                   value={
-                    latestRootUsage.completion_tokens_details
-                      ?.rejected_prediction_tokens ?? undefined
+                    latestRootUsage.completion_tokens_details?.rejected_prediction_tokens ??
+                    undefined
                   }
                 />
               </dl>

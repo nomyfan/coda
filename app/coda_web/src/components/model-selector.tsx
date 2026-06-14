@@ -34,7 +34,7 @@ function groupProviders(providers: ProviderInfo[]): ProviderGroups {
  */
 function carryReasoning(
   model: ProviderInfo | undefined,
-  current: ReasoningEffort | null
+  current: ReasoningEffort | null,
 ): ReasoningEffort | null {
   if (!model || model.reasoning_efforts.length === 0) {
     return null;
@@ -59,16 +59,10 @@ export function ModelSelector({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   disabled: boolean;
-  onSetModel: (
-    providerId: string,
-    reasoningEffort: ReasoningEffort | null
-  ) => void;
+  onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
 }) {
   const groups = useMemo(() => groupProviders(providers), [providers]);
-  const providerNames = useMemo(
-    () => Object.keys(groups).sort(),
-    [groups]
-  );
+  const providerNames = useMemo(() => Object.keys(groups).sort(), [groups]);
   const selected = providers.find((info) => info.id === providerId);
   const efforts = selected?.reasoning_efforts ?? [];
 
@@ -80,9 +74,7 @@ export function ModelSelector({
   const dropdownItems = providerNames.flatMap((providerName, groupIndex) => {
     const models = groups[providerName];
     return [
-      ...(groupIndex > 0
-        ? [<SelectSeparator key={`sep-${providerName}`} />]
-        : []),
+      ...(groupIndex > 0 ? [<SelectSeparator key={`sep-${providerName}`} />] : []),
       <SelectGroup key={providerName}>
         <SelectLabel>{providerName}</SelectLabel>
         {models.map((info) => (
@@ -115,9 +107,7 @@ export function ModelSelector({
       {efforts.length > 0 ? (
         <Select
           value={reasoningEffort ?? efforts[0]}
-          onValueChange={(value) =>
-            onSetModel(providerId, value as ReasoningEffort)
-          }
+          onValueChange={(value) => onSetModel(providerId, value as ReasoningEffort)}
           disabled={disabled}
         >
           <SelectTrigger size="sm" className="w-auto gap-1.5 rounded-md text-xs">

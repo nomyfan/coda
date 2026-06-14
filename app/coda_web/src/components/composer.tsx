@@ -49,10 +49,7 @@ export const Composer = memo(function Composer({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   usage: UsageRecord[];
-  onSetModel: (
-    providerId: string,
-    reasoningEffort: ReasoningEffort | null
-  ) => void;
+  onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onChangeServer: (serverUrl: string) => void;
   onChangeWorkspace: (workspaceId: string) => void;
   onSend: (task: string) => void;
@@ -60,13 +57,10 @@ export const Composer = memo(function Composer({
 }) {
   const [task, setTask] = useState("");
   const connected = status === "connected";
-  const canSend =
-    connected && Boolean(workspace) && !running && Boolean(task.trim());
+  const canSend = connected && Boolean(workspace) && !running && Boolean(task.trim());
   const selectableServers = servers.filter((item) => item.catalog.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
-  const contextWindow = providers.find(
-    (provider) => provider.id === providerId
-  )?.context_window;
+  const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
 
   function submit() {
     const text = task.trim();
@@ -90,11 +84,7 @@ export const Composer = memo(function Composer({
           value={task}
           onChange={(event) => setTask(event.target.value)}
           onKeyDown={(event) => {
-            if (
-              event.key === "Enter" &&
-              !event.shiftKey &&
-              !event.nativeEvent.isComposing
-            ) {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
               submit();
             }
@@ -135,10 +125,7 @@ export const Composer = memo(function Composer({
                 onValueChange={onChangeServer}
                 disabled={selectableServers.length === 0}
               >
-                <SelectTrigger
-                  size="sm"
-                  className="w-44 gap-1.5 rounded-md text-xs"
-                >
+                <SelectTrigger size="sm" className="w-44 gap-1.5 rounded-md text-xs">
                   <PlugZap className="size-3.5 text-muted-foreground" />
                   <SelectValue placeholder="Server" />
                 </SelectTrigger>
@@ -184,9 +171,7 @@ export const Composer = memo(function Composer({
               disabled={!connected || running}
               onSetModel={onSetModel}
             />
-            {contextWindow ? (
-              <ContextUsage contextWindow={contextWindow} records={usage} />
-            ) : null}
+            {contextWindow ? <ContextUsage contextWindow={contextWindow} records={usage} /> : null}
           </div>
         </div>
       ) : null}

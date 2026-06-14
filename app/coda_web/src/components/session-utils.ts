@@ -11,10 +11,7 @@ export const statusCopy: Record<
   error: { label: "Error", tone: "danger" },
 };
 
-export function sessionTitle(session: {
-  id: string;
-  first_user_message?: string | null;
-}) {
+export function sessionTitle(session: { id: string; first_user_message?: string | null }) {
   return session.first_user_message?.trim() || session.id;
 }
 

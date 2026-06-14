@@ -1,9 +1,4 @@
-import {
-  createStore,
-  type Mutate,
-  type StateCreator,
-  type StoreApi,
-} from "zustand/vanilla";
+import { createStore, type Mutate, type StateCreator, type StoreApi } from "zustand/vanilla";
 import { subscribeWithSelector } from "zustand/middleware";
 import { immer } from "zustand/middleware/immer";
 
@@ -13,11 +8,6 @@ export type Store<T> = Mutate<
 >;
 
 export function create<T>(initializer: () => T): Store<T> {
-  const stateCreator: StateCreator<
-    T,
-    [["zustand/immer", never]],
-    [],
-    T
-  > = () => initializer();
+  const stateCreator: StateCreator<T, [["zustand/immer", never]], [], T> = () => initializer();
   return createStore<T>()(subscribeWithSelector(immer(stateCreator)));
 }

@@ -52,9 +52,7 @@ function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
         </div>
         <h1 className="truncate text-sm font-semibold tracking-normal">Coda</h1>
         <span className="size-1 rounded-full bg-muted-foreground/45" />
-        <span className="text-xs text-muted-foreground">
-          {approvalCount} pending approval(s)
-        </span>
+        <span className="text-xs text-muted-foreground">{approvalCount} pending approval(s)</span>
       </div>
     </header>
   );
@@ -84,28 +82,20 @@ export default function App() {
   } | null>(null);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
-  const selectedServerState = servers.find(
-    (server) => server.url === selectedServerUrl
-  );
+  const selectedServerState = servers.find((server) => server.url === selectedServerUrl);
   const selectedWorkspace = newSessionTarget?.workspaceId ?? activeWorkspace;
   const workspaceIds = useMemo(
     () => selectedServerState?.catalog.map((ws) => ws.id) ?? [],
-    [selectedServerState?.catalog]
+    [selectedServerState?.catalog],
   );
   const showingNewSession = newSessionTarget !== null;
 
   useEffect(() => {
     if (!newSessionTarget) {
-      if (newSessionModel) {
-        setNewSessionModel(null);
-      }
+      setNewSessionModel(null);
       return;
     }
-    const resolved = resolveNewSessionTarget(
-      servers,
-      newSessionTarget,
-      activeServer
-    );
+    const resolved = resolveNewSessionTarget(servers, newSessionTarget, activeServer);
     if (
       resolved.serverUrl !== newSessionTarget.serverUrl ||
       resolved.workspaceId !== newSessionTarget.workspaceId
@@ -118,21 +108,17 @@ export default function App() {
     if (!newSessionTarget) {
       return;
     }
-    const server = servers.find(
-      (item) => item.url === newSessionTarget.serverUrl
-    );
+    const server = servers.find((item) => item.url === newSessionTarget.serverUrl);
     const currentProvider = server?.providers.find(
       (provider) =>
         provider.id === newSessionModel?.providerId &&
-        newSessionModel.serverUrl === newSessionTarget.serverUrl
+        newSessionModel.serverUrl === newSessionTarget.serverUrl,
     );
     if (currentProvider) {
       return;
     }
     const provider =
-      server?.providers.find(
-        (item) => item.id === server.defaultProvider
-      ) ?? server?.providers[0];
+      server?.providers.find((item) => item.id === server.defaultProvider) ?? server?.providers[0];
     setNewSessionModel(
       provider
         ? {
@@ -140,7 +126,7 @@ export default function App() {
             providerId: provider.id,
             reasoningEffort: provider.reasoning_efforts[0] ?? null,
           }
-        : null
+        : null,
     );
   }, [newSessionModel, newSessionTarget, servers]);
 
@@ -158,21 +144,18 @@ export default function App() {
       clearNewSessionTarget();
       openSession(serverUrl, workspaceId, sessionId);
     },
-    []
+    [],
   );
 
-  const createWorkspaceSession = useCallback(
-    (serverUrl: string, workspaceId: string) => {
-      rememberNewSessionTarget({ serverUrl, workspaceId });
-      clearNewSessionTarget();
-      newSession(serverUrl, workspaceId);
-    },
-    []
-  );
+  const createWorkspaceSession = useCallback((serverUrl: string, workspaceId: string) => {
+    rememberNewSessionTarget({ serverUrl, workspaceId });
+    clearNewSessionTarget();
+    newSession(serverUrl, workspaceId);
+  }, []);
 
   const changeNewSessionServer = useCallback((serverUrl: string) => {
     const server = selectServerSummaries(codaStore.getState()).find(
-      (item) => item.url === serverUrl
+      (item) => item.url === serverUrl,
     );
     setNewSessionTarget({
       serverUrl,
@@ -203,14 +186,14 @@ export default function App() {
           target.workspaceId,
           task,
           newSessionModel?.providerId,
-          newSessionModel?.reasoningEffort ?? null
+          newSessionModel?.reasoningEffort ?? null,
         );
         clearNewSessionTarget();
         return;
       }
       sendTask(task);
     },
-    [newSessionModel]
+    [newSessionModel],
   );
 
   const handleSetNewSessionModel = useCallback(
@@ -218,7 +201,7 @@ export default function App() {
       const serverUrl = newSessionStore.getState().target?.serverUrl ?? "";
       setNewSessionModel({ serverUrl, providerId, reasoningEffort });
     },
-    []
+    [],
   );
 
   return (
@@ -235,11 +218,7 @@ export default function App() {
           <div className="relative z-20 shrink-0">
             {showingNewSession ? null : <ApprovalPanel />}
             <Composer
-              status={
-                showingNewSession
-                  ? selectedServerState?.status ?? "idle"
-                  : activeStatus
-              }
+              status={showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus}
               running={showingNewSession ? false : activeRunning}
               server={selectedServerUrl}
               servers={showingNewSession ? servers : NO_SERVERS}
@@ -247,16 +226,12 @@ export default function App() {
               workspaces={workspaceIds}
               selectingTarget={showingNewSession}
               providers={
-                showingNewSession
-                  ? selectedServerState?.providers ?? []
-                  : activeProviders
+                showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
               }
-              providerId={
-                showingNewSession ? newSessionModel?.providerId : activeProviderId
-              }
+              providerId={showingNewSession ? newSessionModel?.providerId : activeProviderId}
               reasoningEffort={
                 showingNewSession
-                  ? newSessionModel?.reasoningEffort ?? null
+                  ? (newSessionModel?.reasoningEffort ?? null)
                   : activeReasoningEffort
               }
               usage={showingNewSession ? NO_USAGE : activeUsage}

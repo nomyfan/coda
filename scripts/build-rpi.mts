@@ -197,7 +197,9 @@ async function findBuiltBinary(options: Options, zigTarget: string): Promise<str
     }
   }
 
-  throw new Error(`Built binary was not found. Checked:\n${candidates.map((path) => `  ${path}`).join("\n")}`);
+  throw new Error(
+    `Built binary was not found. Checked:\n${candidates.map((path) => `  ${path}`).join("\n")}`,
+  );
 }
 
 async function sha256(path: string): Promise<string> {

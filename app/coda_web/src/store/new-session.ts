@@ -25,11 +25,7 @@ function loadRecentTarget(): NewSessionTarget | null {
       return null;
     }
     const parsed = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed.serverUrl === "string" &&
-      typeof parsed.workspaceId === "string"
-    ) {
+    if (parsed && typeof parsed.serverUrl === "string" && typeof parsed.workspaceId === "string") {
       return {
         serverUrl: parsed.serverUrl,
         workspaceId: parsed.workspaceId,
@@ -54,33 +50,27 @@ export const newSessionStore = create<NewSessionState>(() => ({
   recentTarget: loadRecentTarget(),
 }));
 
-export function useNewSessionStore<T>(
-  selector: (state: NewSessionState) => T
-) {
+export function useNewSessionStore<T>(selector: (state: NewSessionState) => T) {
   return useStore(newSessionStore, selector);
 }
 
 export function resolveNewSessionTarget(
   servers: ServerSummary[],
   preferred?: NewSessionTarget | null,
-  fallbackServer?: string
+  fallbackServer?: string,
 ): NewSessionTarget {
   const available = servers.filter((server) => server.catalog.length > 0);
-  const preferredServer = available.find(
-    (server) => server.url === preferred?.serverUrl
-  );
+  const preferredServer = available.find((server) => server.url === preferred?.serverUrl);
   if (preferredServer) {
     const preferredWorkspace = preferredServer.catalog.find(
-      (workspace) => workspace.id === preferred?.workspaceId
+      (workspace) => workspace.id === preferred?.workspaceId,
     );
     return {
       serverUrl: preferredServer.url,
-      workspaceId:
-        preferredWorkspace?.id ?? preferredServer.catalog[0]?.id ?? "",
+      workspaceId: preferredWorkspace?.id ?? preferredServer.catalog[0]?.id ?? "",
     };
   }
-  const fallback =
-    available.find((server) => server.url === fallbackServer) ?? available[0];
+  const fallback = available.find((server) => server.url === fallbackServer) ?? available[0];
   return {
     serverUrl: fallback?.url ?? "",
     workspaceId: fallback?.catalog[0]?.id ?? "",
@@ -97,14 +87,11 @@ export function rememberNewSessionTarget(target: NewSessionTarget) {
   writeRecentTarget(target);
 }
 
-export function beginNewSession(
-  servers: ServerSummary[],
-  fallbackServer?: string
-) {
+export function beginNewSession(servers: ServerSummary[], fallbackServer?: string) {
   const target = resolveNewSessionTarget(
     servers,
     newSessionStore.getState().recentTarget,
-    fallbackServer
+    fallbackServer,
   );
   newSessionStore.setState((state) => {
     state.target = target;
