@@ -47,8 +47,8 @@ impl ToolSpec for ShellToolSpec {
     fn name(&self) -> &str {
         "shell"
     }
-    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ShellTool::new()))
+    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(ShellTool::new(ctx.workspace_dir.clone())))
     }
 }
 

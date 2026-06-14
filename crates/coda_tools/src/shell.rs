@@ -12,11 +12,11 @@ pub struct ShellToolParams {
 pub struct ShellTool {
     schema: Schema,
     description: String,
+    cwd: String,
 }
 
 impl ShellTool {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(cwd: String) -> Self {
         let description =
             "Execute shell commands and return stdout and stderr. Your are in a Unix environment."
                 .to_string();
@@ -26,6 +26,7 @@ impl ShellTool {
         ShellTool {
             schema,
             description,
+            cwd,
         }
     }
 }
@@ -51,10 +52,12 @@ impl Tool for ShellTool {
         &self,
         params: Self::Parameters,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
+        let cwd = self.cwd.clone();
         async move {
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(&params.command)
+                .current_dir(&cwd)
                 .output()
                 .await
                 .map_err(|e| {
