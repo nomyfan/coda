@@ -71,6 +71,9 @@ export type OpenedSession = {
   activity: ActivityEntry[];
   approvals: PendingApproval[];
   drafts: Record<string, Record<string, ToolCallResolution>>;
+  /** Per-call "always allow" patterns staged for an approval; sent to the
+   * server only on submit, so the intent stays cancelable until then. */
+  allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
   /** Created locally via "new session" but not yet opened on the server. */
   draft?: boolean;
@@ -148,6 +151,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     activity: [],
     approvals: [],
     drafts: {},
+    allowDrafts: {},
     running: false,
     usage: [],
   };
@@ -983,6 +987,7 @@ function applySnapshot(
       session.entries = mapped;
       session.approvals = approvals;
       session.drafts = {};
+      session.allowDrafts = {};
       session.running = false;
     }
   });
@@ -1086,6 +1091,30 @@ function setDraftResolution(
   });
 }
 
+function setAllowDraftPattern(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  approval: PendingApproval,
+  call: ToolCall,
+  pattern: string | null,
+) {
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const approvalId = approvalKey(approval);
+    const value = pattern?.trim();
+    if (value) {
+      session.allowDrafts[approvalId] ??= {};
+      session.allowDrafts[approvalId][call.id] = value;
+    } else if (session.allowDrafts[approvalId]) {
+      delete session.allowDrafts[approvalId][call.id];
+    }
+  });
+}
+
 function clearApprovalState(
   store: CodaStore,
   server: string,
@@ -1099,6 +1128,7 @@ function clearApprovalState(
     }
     const approvalId = approvalKey(approval);
     delete session.drafts[approvalId];
+    delete session.allowDrafts[approvalId];
     session.approvals = session.approvals.filter((item) => approvalKey(item) !== approvalId);
   });
 }
@@ -1412,16 +1442,14 @@ export function abort() {
   }
 }
 
-export function addAllowPattern(pattern: string) {
+/** Stage (or clear, with `null`) an "always allow" pattern for a call. The
+ * pattern is only sent to the server on submit, so the choice is cancelable. */
+export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern: string | null) {
   const active = currentActive();
-  const value = pattern.trim();
-  if (active && value) {
-    send(active.server, {
-      type: "add_allow_pattern",
-      workspace_id: active.session.workspaceId,
-      pattern: value,
-    });
+  if (!active) {
+    return;
   }
+  setAllowDraftPattern(codaStore, active.server, active.session.key, approval, call, pattern);
 }
 
 export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
@@ -1460,10 +1488,23 @@ export function submitApprovals() {
     return;
   }
   for (const approval of active.session.approvals) {
-    const draft = active.session.drafts[approvalKey(approval)] ?? {};
+    const approvalId = approvalKey(approval);
+    const draft = active.session.drafts[approvalId] ?? {};
     const complete = approval.calls.every((item) => draft[item.id]);
     if (!complete) {
       continue;
+    }
+    // Persist staged "always allow" patterns for approved calls only.
+    const allow = active.session.allowDrafts[approvalId] ?? {};
+    for (const item of approval.calls) {
+      const pattern = allow[item.id];
+      if (pattern && draft[item.id] === "Execute") {
+        send(active.server, {
+          type: "add_allow_pattern",
+          workspace_id: active.session.workspaceId,
+          pattern,
+        });
+      }
     }
     send(active.server, {
       type: "resume",
@@ -1486,6 +1527,7 @@ export function submitApprovals() {
 const EMPTY_ENTRIES: TranscriptEntry[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_DRAFTS: Record<string, Record<string, ToolCallResolution>> = {};
+const EMPTY_ALLOW_DRAFTS: Record<string, Record<string, string>> = {};
 const EMPTY_PROVIDERS: ProviderInfo[] = [];
 
 function activeServerOf(state: CodaStoreState): ServerState | undefined {
@@ -1562,6 +1604,8 @@ export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
 export const selectActiveDrafts = (state: CodaStoreState) =>
   activeSessionOf(state)?.drafts ?? EMPTY_DRAFTS;
+export const selectActiveAllowDrafts = (state: CodaStoreState) =>
+  activeSessionOf(state)?.allowDrafts ?? EMPTY_ALLOW_DRAFTS;
 export const selectActiveApprovalCount = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals.length ?? 0;
 export const selectActiveWorkspace = (state: CodaStoreState) => activeSessionOf(state)?.workspaceId;

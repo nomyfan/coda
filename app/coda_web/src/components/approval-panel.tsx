@@ -25,10 +25,11 @@ import {
   type ToolCallResolution,
 } from "@/lib/protocol";
 import {
-  addAllowPattern,
   draftCall,
+  selectActiveAllowDrafts,
   selectActiveApprovals,
   selectActiveDrafts,
+  setAllowDraft,
   submitApprovals,
   useCodaStore,
 } from "@/store/session";
@@ -69,6 +70,7 @@ function DecisionRadio({
 export const ApprovalPanel = memo(function ApprovalPanel() {
   const approvals = useCodaStore(selectActiveApprovals);
   const drafts = useCodaStore(selectActiveDrafts);
+  const allowDrafts = useCodaStore(selectActiveAllowDrafts);
   const items: ApprovalItem[] = approvals.flatMap((approval) =>
     approval.calls.map((call) => ({ approval, call })),
   );
@@ -90,6 +92,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
   }
 
   const decisionOf = (item: ApprovalItem) => drafts[approvalKey(item.approval)]?.[item.call.id];
+  const allowOf = (item: ApprovalItem) => allowDrafts[approvalKey(item.approval)]?.[item.call.id];
   const current = items[Math.min(index, items.length - 1)] ?? items[0];
   const currentIndex = items.indexOf(current);
   const decidedCount = items.filter((item) => decisionOf(item)).length;
@@ -105,9 +108,9 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
   };
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-full px-4">
-      <div className="pointer-events-auto mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-amber-500/50 bg-card shadow-lg ring-1 ring-amber-500/10">
-        <div className="flex max-h-[60vh] flex-col bg-amber-500/5">
+    <div className="px-4 pt-2">
+      <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-amber-500/40 bg-amber-500/5">
+        <div className="flex max-h-[55vh] flex-col">
           <div className="flex items-center justify-between px-4 pt-2.5">
             <h2 className="flex items-center gap-2 text-sm font-medium">
               <ShieldCheck className="size-4 text-amber-600" />
@@ -122,8 +125,9 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               key={`${current.approval.thread_id}:${current.call.id}`}
               call={current.call}
               decision={decisionOf(current)}
+              allowPattern={allowOf(current)}
               onDraft={handleDraft}
-              onAllowPattern={addAllowPattern}
+              onSetAllow={(pattern) => setAllowDraft(current.approval, current.call, pattern)}
             />
           </div>
           <div className="flex items-center justify-between gap-2 px-4 py-2">
@@ -162,13 +166,16 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
 function ApprovalCall({
   call,
   decision,
+  allowPattern: stagedAllow,
   onDraft,
-  onAllowPattern,
+  onSetAllow,
 }: {
   call: ToolCall;
   decision: ToolCallResolution | undefined;
+  /** The "always allow" pattern staged for this call, if any. */
+  allowPattern: string | undefined;
   onDraft: (resolution: ToolCallResolution) => void;
-  onAllowPattern: (pattern: string) => void;
+  onSetAllow: (pattern: string | null) => void;
 }) {
   const [reason, setReason] = useState(() =>
     decision && decision !== "Execute" && "Rejected" in decision
@@ -176,12 +183,13 @@ function ApprovalCall({
       : "",
   );
   const [answer, setAnswer] = useState("");
-  const [allowPattern, setAllowPattern] = useState(() =>
-    deriveAllowPattern(extractShellCommand(call)),
+  const [allowPattern, setAllowPattern] = useState(
+    () => stagedAllow ?? deriveAllowPattern(extractShellCommand(call)),
   );
   const askUser = call.name === "ask_user" ? parseAskUserParams(call) : null;
   const approved = decision === "Execute";
   const rejected = Boolean(decision && decision !== "Execute" && "Rejected" in decision);
+  const remembering = Boolean(stagedAllow);
 
   if (askUser) {
     const chosen =
@@ -191,7 +199,7 @@ function ApprovalCall({
           : null
         : null;
     return (
-      <div className="space-y-3 rounded-md border bg-background p-3">
+      <div className="space-y-3">
         <div className="flex items-center gap-2 text-sm font-medium">
           <KeyRound className="size-4 text-muted-foreground" />
           ask_user
@@ -232,7 +240,7 @@ function ApprovalCall({
   }
 
   return (
-    <div className="space-y-3 rounded-md border bg-background p-3">
+    <div className="space-y-3">
       <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
         <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
         <span className="truncate">{subAgentDisplayName(call.name)}</span>
@@ -242,12 +250,28 @@ function ApprovalCall({
       </pre>
       {call.name === "shell" ? (
         <div className="flex gap-2">
-          <Input value={allowPattern} onChange={(event) => setAllowPattern(event.target.value)} />
+          <Input
+            value={allowPattern}
+            onChange={(event) => {
+              const value = event.target.value;
+              setAllowPattern(value);
+              if (remembering) {
+                onSetAllow(value);
+              }
+            }}
+          />
           <Button
-            variant="outline"
+            type="button"
+            variant={remembering ? "secondary" : "outline"}
+            aria-pressed={remembering}
+            className={cn(remembering && "border-amber-500/70 text-amber-700")}
             onClick={() => {
-              onAllowPattern(allowPattern);
-              onDraft("Execute");
+              if (remembering) {
+                onSetAllow(null);
+              } else {
+                onDraft("Execute");
+                onSetAllow(allowPattern);
+              }
             }}
           >
             <ShieldCheck />
@@ -261,6 +285,7 @@ function ApprovalCall({
           if (value === "run") {
             onDraft("Execute");
           } else if (value === "reject") {
+            onSetAllow(null);
             onDraft({
               Rejected: { reason: reason.trim() ? reason.trim() : null },
             });
