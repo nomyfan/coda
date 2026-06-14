@@ -1,0 +1,4 @@
+packages:
+  - app/coda_web
+allowBuilds:
+  esbuild: true

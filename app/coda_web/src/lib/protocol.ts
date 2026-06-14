@@ -81,13 +81,7 @@ export type WorkspaceSummary = {
 };
 
 /** Reasoning effort levels, mirroring the server enum. */
-export type ReasoningEffort =
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 /**
  * A model the dashboard can select, grouped under a provider.
@@ -243,16 +237,12 @@ export function approvalKey(approval: PendingApproval): string {
  */
 export const SUBAGENT_TOOL_PREFIX = "agent__";
 
-export function isSubAgentToolName(
-  name: string | undefined | null
-): name is string {
+export function isSubAgentToolName(name: string | undefined | null): name is string {
   return Boolean(name && name.startsWith(SUBAGENT_TOOL_PREFIX));
 }
 
 export function subAgentDisplayName(name: string): string {
-  return name.startsWith(SUBAGENT_TOOL_PREFIX)
-    ? name.slice(SUBAGENT_TOOL_PREFIX.length)
-    : name;
+  return name.startsWith(SUBAGENT_TOOL_PREFIX) ? name.slice(SUBAGENT_TOOL_PREFIX.length) : name;
 }
 
 export function callArguments(call: ToolCall): string {
@@ -288,7 +278,7 @@ function basename(p: string): string {
  */
 export function describeTool(
   name: string,
-  argumentsJson: string | null | undefined
+  argumentsJson: string | null | undefined,
 ): string | undefined {
   let args: Record<string, unknown> = {};
   try {
@@ -344,7 +334,9 @@ export function parseAskUserParams(call: ToolCall): AskUserParams {
     const options = (args as { options?: unknown }).options;
     return {
       question: typeof question === "string" ? question : "Input required",
-      options: Array.isArray(options) ? options.filter((item): item is string => typeof item === "string") : [],
+      options: Array.isArray(options)
+        ? options.filter((item): item is string => typeof item === "string")
+        : [],
     };
   }
   return { question: "Input required", options: [] };

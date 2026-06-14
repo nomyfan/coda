@@ -14,7 +14,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  rust:
     strategy:
       fail-fast: false
       matrix:
@@ -30,12 +30,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ matrix.os }}-cargo
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
 
       - name: Build
         run: cargo build
@@ -45,3 +48,33 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -D warnings
+
+  web:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm --filter coda-web lint
+
+      - name: Format check
+        run: pnpm fmt:check
+
+      - name: Typecheck
+        run: |
+          pnpm typecheck
+          pnpm --filter coda-web typecheck

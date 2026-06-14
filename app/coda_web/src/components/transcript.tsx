@@ -15,11 +15,7 @@ import {
 import { memo, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Markdown } from "@/components/markdown";
 import {
   selectActiveEntries,
@@ -27,10 +23,7 @@ import {
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
-import {
-  isSubAgentToolName,
-  subAgentDisplayName,
-} from "@/lib/protocol";
+import { isSubAgentToolName, subAgentDisplayName } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
@@ -60,10 +53,7 @@ type TranscriptRenderItem =
 
 function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (
-      entries[index].kind === "assistant" &&
-      entries[index].isFinalResponse
-    ) {
+    if (entries[index].kind === "assistant" && entries[index].isFinalResponse) {
       return index;
     }
   }
@@ -77,7 +67,7 @@ function hasDisclosureWork(entries: TranscriptEntry[]) {
       entry.kind === "tool_call" ||
       entry.kind === "tool_result" ||
       entry.kind === "reasoning" ||
-      (entry.kind === "assistant" && entry.isFinalResponse === false)
+      (entry.kind === "assistant" && entry.isFinalResponse === false),
   );
 }
 
@@ -89,9 +79,7 @@ function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
   };
 }
 
-function transcriptRenderItems(
-  entries: TranscriptEntry[]
-): TranscriptRenderItem[] {
+function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
   const items: TranscriptRenderItem[] = [];
   let index = 0;
 
@@ -110,9 +98,7 @@ function transcriptRenderItems(
 
     const segment = entries.slice(start, index);
     if (!hasDisclosureWork(segment)) {
-      items.push(
-        ...segment.map((entry) => ({ type: "entry" as const, entry }))
-      );
+      items.push(...segment.map((entry) => ({ type: "entry" as const, entry })));
       continue;
     }
 
@@ -139,10 +125,11 @@ export const Transcript = memo(function Transcript({
   const running = suppressed ? false : liveRunning;
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const renderItems = transcriptRenderItems(entries);
+  const lastEntryContent = entries.at(-1)?.content;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [entries.length, entries.at(-1)?.content, running]);
+  }, [entries.length, lastEntryContent, running]);
 
   return (
     <section className="scrollbar-fine min-h-0 flex-1 overflow-y-auto px-4 py-3">
@@ -167,7 +154,7 @@ export const Transcript = memo(function Transcript({
               <TranscriptItem key={item.entry.id} entry={item.entry} />
             ) : (
               <AssistantTurnBubble key={item.id} entries={item.entries} />
-            )
+            ),
           )
         )}
         {running ? <WorkingIndicator /> : null}
@@ -189,14 +176,14 @@ function EntryIcon({ entry }: { entry: TranscriptEntry }) {
     entry.kind === "assistant"
       ? MessageSquareText
       : entry.kind === "reasoning"
-      ? Brain
-      : entry.kind === "tool_call"
-      ? TerminalSquare
-      : entry.kind === "tool_result"
-      ? ShieldCheck
-      : entry.kind === "error"
-      ? Ban
-      : Cpu;
+        ? Brain
+        : entry.kind === "tool_call"
+          ? TerminalSquare
+          : entry.kind === "tool_result"
+            ? ShieldCheck
+            : entry.kind === "error"
+              ? Ban
+              : Cpu;
 
   return <Icon className="size-4 shrink-0 text-muted-foreground" />;
 }
@@ -205,11 +192,7 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
   if (!entry.detail) {
     return null;
   }
-  return (
-    <span className="truncate font-mono text-xs text-muted-foreground">
-      {entry.detail}
-    </span>
-  );
+  return <span className="truncate font-mono text-xs text-muted-foreground">{entry.detail}</span>;
 }
 
 function EntryStatus({ entry }: { entry: TranscriptEntry }) {
@@ -217,19 +200,11 @@ function EntryStatus({ entry }: { entry: TranscriptEntry }) {
     return null;
   }
   return (
-    <Badge variant={entry.status === "running" ? "warning" : "secondary"}>
-      {entry.status}
-    </Badge>
+    <Badge variant={entry.status === "running" ? "warning" : "secondary"}>{entry.status}</Badge>
   );
 }
 
-function CopyContentButton({
-  content,
-  label = "content",
-}: {
-  content: string;
-  label?: string;
-}) {
+function CopyContentButton({ content, label = "content" }: { content: string; label?: string }) {
   const [copied, setCopied] = useState(false);
 
   async function copyContent() {
@@ -265,7 +240,7 @@ function MessageActions({
     <div
       className={cn(
         "flex h-8 items-center gap-1 px-1 opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100",
-        align === "end" ? "justify-end" : "justify-start"
+        align === "end" ? "justify-end" : "justify-start",
       )}
     >
       <CopyContentButton content={content} label={label} />
@@ -369,9 +344,7 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
   // Orphaned runs (no anchor) fall back to whether any inner step is still live.
   const complete = item.callEntry
     ? item.callEntry.kind === "tool_result"
-    : !item.entries.some(
-        (entry) => entry.status === "running" || entry.status === "thinking"
-      );
+    : !item.entries.some((entry) => entry.status === "running" || entry.status === "thinking");
   const [open, setOpen] = useState(!complete);
   const previousComplete = useRef(complete);
 
@@ -387,8 +360,7 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
   const stepCount = item.entries.length;
   // Resumed history keeps no inner process — surface the reply that survived so
   // the group isn't empty when expanded.
-  const showResultOnly =
-    stepCount === 0 && item.callEntry?.kind === "tool_result";
+  const showResultOnly = stepCount === 0 && item.callEntry?.kind === "tool_result";
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -401,31 +373,21 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
           >
             <div className="flex min-w-0 items-center gap-2">
               <Bot className="size-4 shrink-0" />
-              <span className="shrink-0 truncate text-sm font-medium">
-                {item.agentName}
-              </span>
+              <span className="shrink-0 truncate text-sm font-medium">{item.agentName}</span>
               <Badge variant="cyan" className="shrink-0 whitespace-nowrap">
                 agent
               </Badge>
-              {task ? (
-                <span className="truncate text-xs text-muted-foreground">
-                  {task}
-                </span>
-              ) : null}
+              {task ? <span className="truncate text-xs text-muted-foreground">{task}</span> : null}
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <Badge variant={complete ? "secondary" : "warning"}>
                 {!complete
                   ? "running"
                   : stepCount > 0
-                  ? `${stepCount} ${stepCount === 1 ? "step" : "steps"}`
-                  : "done"}
+                    ? `${stepCount} ${stepCount === 1 ? "step" : "steps"}`
+                    : "done"}
               </Badge>
-              {open ? (
-                <ChevronDown className="size-4" />
-              ) : (
-                <ChevronRight className="size-4" />
-              )}
+              {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
             </div>
           </button>
         </CollapsibleTrigger>
@@ -436,9 +398,7 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
               // sub-agent returned — render it as prose, not a nested tool row.
               <Markdown>{item.callEntry.content}</Markdown>
             ) : (
-              item.entries.map((entry) => (
-                <ProcessEntry key={entry.id} entry={entry} />
-              ))
+              item.entries.map((entry) => <ProcessEntry key={entry.id} entry={entry} />)
             )}
           </div>
         </CollapsibleContent>
@@ -449,13 +409,10 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
 
 function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
   const lastIndex = findFinalAssistantIndex(entries);
-  const finalAssistantIndex =
-    lastIndex === entries.length - 1 ? lastIndex : -1;
-  const finalAssistant =
-    finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
+  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
   const hasFinalAssistant = finalAssistant !== undefined;
-  const processComplete =
-    hasFinalAssistant || entries.some((entry) => entry.status === "aborted");
+  const processComplete = hasFinalAssistant || entries.some((entry) => entry.status === "aborted");
   const intermediateEntries =
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
@@ -487,8 +444,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                   <Brain className="size-4 shrink-0" />
                   <span className="text-sm font-medium">Process</span>
                   <Badge variant="secondary">
-                    {processItems.length}{" "}
-                    {processItems.length === 1 ? "step" : "steps"}
+                    {processItems.length} {processItems.length === 1 ? "step" : "steps"}
                   </Badge>
                 </div>
                 {processOpen ? (
@@ -505,22 +461,16 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                     <SubAgentGroup key={item.key} item={item} />
                   ) : (
                     <ProcessEntry key={item.entry.id} entry={item.entry} />
-                  )
+                  ),
                 )}
               </div>
             </CollapsibleContent>
           </Collapsible>
-          {finalAssistant ? (
-            <Markdown>{finalAssistant.content}</Markdown>
-          ) : null}
+          {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
         </div>
       </article>
       {finalAssistant ? (
-        <MessageActions
-          content={finalAssistant.content}
-          label="response"
-          align="start"
-        />
+        <MessageActions content={finalAssistant.content} label="response" align="start" />
       ) : null}
     </div>
   );
@@ -548,11 +498,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
               <EntryStatus entry={entry} />
             </div>
             <div className="flex size-7 items-center justify-center">
-              {open ? (
-                <ChevronDown className="size-4" />
-              ) : (
-                <ChevronRight className="size-4" />
-              )}
+              {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
             </div>
           </div>
         </button>
@@ -599,19 +545,13 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
           <Markdown>{entry.content}</Markdown>
         </div>
-        <MessageActions
-          content={entry.content}
-          label="message"
-          align="end"
-        />
+        <MessageActions content={entry.content} label="message" align="end" />
       </div>
     );
   }
 
   const tone =
-    entry.kind === "error"
-      ? "border-rose-500/35 bg-rose-500/10"
-      : "border-border bg-card";
+    entry.kind === "error" ? "border-rose-500/35 bg-rose-500/10" : "border-border bg-card";
 
   const title = entryTitle(entry);
   const header = (
@@ -620,9 +560,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <EntryIcon entry={entry} />
         <span className="shrink-0 truncate text-sm font-medium">{title}</span>
         <EntryDetail entry={entry} />
-        {entry.agentName && entry.agentName !== "coda" ? (
-          <Badge variant="cyan">agent</Badge>
-        ) : null}
+        {entry.agentName && entry.agentName !== "coda" ? <Badge variant="cyan">agent</Badge> : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <EntryStatus entry={entry} />
@@ -637,9 +575,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <EntryIcon entry={entry} />
-              <span className="shrink-0 truncate text-sm font-medium">
-                {title}
-              </span>
+              <span className="shrink-0 truncate text-sm font-medium">{title}</span>
               <EntryDetail entry={entry} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -685,11 +621,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
           {header}
           <Markdown>{entry.content}</Markdown>
         </article>
-        <MessageActions
-          content={entry.content}
-          label="response"
-          align="start"
-        />
+        <MessageActions content={entry.content} label="response" align="start" />
       </div>
     );
   }

@@ -3,9 +3,12 @@
 [[repos]]
 repo = "local"
 hooks = [
-    { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --", types = [
-        "rust",
-    ], stages = [
-        "pre-commit",
-    ] },
+  { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --", types = [
+    "rust",
+  ], stages = [
+    "pre-commit",
+  ] },
+  { id = "oxfmt", name = "oxfmt", language = "system", entry = "node_modules/.bin/oxfmt", files = "\\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|css|json)$", stages = [
+    "pre-commit",
+  ] },
 ]

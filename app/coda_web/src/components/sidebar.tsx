@@ -43,25 +43,21 @@ import {
   type WorkspaceSummary,
 } from "@/store/session";
 import { cn } from "@/lib/utils";
-import {
-  serverLabel,
-  sessionTitle,
-  statusCopy,
-} from "@/components/session-utils";
+import { serverLabel, sessionTitle, statusCopy } from "@/components/session-utils";
 
 function StatusDot({ status }: { status: ConnectionStatus }) {
   const tone =
     status === "connected"
       ? "bg-emerald-500"
       : status === "connecting"
-      ? "bg-amber-500"
-      : "bg-rose-500";
+        ? "bg-amber-500"
+        : "bg-rose-500";
   return (
     <span
       className={cn(
         "size-2.5 shrink-0 rounded-full",
         tone,
-        status === "connecting" && "animate-pulse"
+        status === "connecting" && "animate-pulse",
       )}
       title={statusCopy[status].label}
     />
@@ -131,9 +127,7 @@ function AddServerDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Add server</DialogTitle>
-          <DialogDescription>
-            Connect to a running Coda server by URL.
-          </DialogDescription>
+          <DialogDescription>Connect to a running Coda server by URL.</DialogDescription>
         </DialogHeader>
         <form
           className="space-y-4"
@@ -155,11 +149,7 @@ function AddServerDialog({
             />
           </div>
           <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button type="submit" disabled={!url.trim()}>
@@ -216,9 +206,7 @@ function SessionRow({
         ) : (
           <MessageSquareQuote className="size-4 shrink-0 text-muted-foreground" />
         )}
-        <span className="min-w-0 flex-1 truncate text-sm">
-          {sessionTitle(session)}
-        </span>
+        <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
       </Button>
       {confirming ? (
         <>
@@ -276,23 +264,14 @@ function WorkspaceNode({
   activeServer?: string;
   activeKey?: SessionKey;
   sessions: Record<SessionKey, OpenedSession>;
-  onOpenSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
+  onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
-  onDeleteSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
+  onDeleteSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const sessions = [...workspace.sessions].sort(
     (a, b) =>
-      (b.updated_at_ms ?? Number.POSITIVE_INFINITY) -
-      (a.updated_at_ms ?? Number.POSITIVE_INFINITY)
+      (b.updated_at_ms ?? Number.POSITIVE_INFINITY) - (a.updated_at_ms ?? Number.POSITIVE_INFINITY),
   );
 
   return (
@@ -309,9 +288,7 @@ function WorkspaceNode({
             <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
           )}
           <Folder className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1 truncate font-medium">
-            {workspace.id}
-          </span>
+          <span className="min-w-0 flex-1 truncate font-medium">{workspace.id}</span>
           <Badge variant="outline">{sessions.length}</Badge>
         </button>
         <Button
@@ -346,9 +323,7 @@ function WorkspaceNode({
             );
           })}
           {sessions.length === 0 ? (
-            <div className="px-2 py-1 text-xs text-muted-foreground">
-              No sessions yet
-            </div>
+            <div className="px-2 py-1 text-xs text-muted-foreground">No sessions yet</div>
           ) : null}
         </div>
       ) : null}
@@ -362,11 +337,7 @@ const ServerNode = memo(function ServerNode({
   onNewSession,
 }: {
   url: string;
-  onOpenSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
+  onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
 }) {
   // Subscribe to just this server, so streaming on one session only re-renders
@@ -443,10 +414,7 @@ const ServerNode = memo(function ServerNode({
               <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
             )}
             <StatusDot status={server.status} />
-            <span
-              className="min-w-0 flex-1 truncate text-sm font-medium"
-              title={server.url}
-            >
+            <span className="min-w-0 flex-1 truncate text-sm font-medium" title={server.url}>
               {serverLabel(server)}
             </span>
           </button>
@@ -509,9 +477,7 @@ const ServerNode = memo(function ServerNode({
           ))}
           {server.catalog.length === 0 ? (
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {server.status === "connected"
-                ? "No workspaces"
-                : statusCopy[server.status].label}
+              {server.status === "connected" ? "No workspaces" : statusCopy[server.status].label}
             </div>
           ) : null}
         </div>
@@ -525,11 +491,7 @@ export function Sidebar({
   onStartNewSession,
   onNewSession,
 }: {
-  onOpenSession: (
-    serverUrl: string,
-    workspaceId: string,
-    sessionId: string
-  ) => void;
+  onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onStartNewSession: () => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
 }) {
@@ -543,14 +505,11 @@ export function Sidebar({
     <aside
       className={cn(
         "flex min-h-0 w-full flex-col gap-2 border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
-        collapsed && "lg:w-12"
+        collapsed && "lg:w-12",
       )}
     >
       <div
-        className={cn(
-          "flex items-center",
-          collapsed ? "justify-center" : "justify-between pl-1"
-        )}
+        className={cn("flex items-center", collapsed ? "justify-center" : "justify-between pl-1")}
       >
         {collapsed ? (
           <Button
@@ -621,11 +580,7 @@ export function Sidebar({
           </Button>
           {order.length > 0 ? <Separator className="my-1 w-6" /> : null}
           {order.map((url) => (
-            <CollapsedServerButton
-              key={url}
-              url={url}
-              onNewSession={onNewSession}
-            />
+            <CollapsedServerButton key={url} url={url} onNewSession={onNewSession} />
           ))}
         </div>
       ) : (
@@ -655,11 +610,7 @@ export function Sidebar({
           )}
         </div>
       )}
-      <AddServerDialog
-        open={adding}
-        onOpenChange={setAdding}
-        onConnect={connectServer}
-      />
+      <AddServerDialog open={adding} onOpenChange={setAdding} onConnect={connectServer} />
     </aside>
   );
 }

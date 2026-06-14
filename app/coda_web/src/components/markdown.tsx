@@ -16,14 +16,10 @@ const components: Components = {
     </a>
   ),
   ul: ({ children }) => (
-    <ul className="my-2 ml-5 list-disc space-y-1 first:mt-0 last:mb-0">
-      {children}
-    </ul>
+    <ul className="my-2 ml-5 list-disc space-y-1 first:mt-0 last:mb-0">{children}</ul>
   ),
   ol: ({ children }) => (
-    <ol className="my-2 ml-5 list-decimal space-y-1 first:mt-0 last:mb-0">
-      {children}
-    </ol>
+    <ol className="my-2 ml-5 list-decimal space-y-1 first:mt-0 last:mb-0">{children}</ol>
   ),
   li: ({ children }) => <li className="leading-6">{children}</li>,
   h1: ({ children }) => (
@@ -63,13 +59,9 @@ const components: Components = {
     </div>
   ),
   th: ({ children }) => (
-    <th className="border border-border px-2 py-1 text-left font-medium">
-      {children}
-    </th>
+    <th className="border border-border px-2 py-1 text-left font-medium">{children}</th>
   ),
-  td: ({ children }) => (
-    <td className="border border-border px-2 py-1">{children}</td>
-  ),
+  td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
 };
 
 export const Markdown = memo(function Markdown({

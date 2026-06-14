@@ -32,23 +32,11 @@ export type {
   WorkspaceSummary,
 } from "@/lib/protocol";
 
-export type ConnectionStatus =
-  | "idle"
-  | "connecting"
-  | "connected"
-  | "closed"
-  | "error";
+export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | "error";
 
 export type TranscriptEntry = {
   id: string;
-  kind:
-    | "user"
-    | "assistant"
-    | "reasoning"
-    | "tool_call"
-    | "tool_result"
-    | "system"
-    | "error";
+  kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -132,15 +120,11 @@ type CodaStoreState = CodaState & SessionRuntimeState;
 const rootName = "coda";
 
 function newId(prefix: string) {
-  return `${prefix}:${Date.now().toString(36)}:${Math.random()
-    .toString(36)
-    .slice(2)}`;
+  return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
 }
 
 function freshSessionId() {
-  return (
-    globalThis.crypto?.randomUUID?.() ?? `session-${Date.now().toString(36)}`
-  );
+  return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now().toString(36)}`;
 }
 
 function sessionKey(workspaceId: string, sessionId: string): SessionKey {
@@ -248,23 +232,15 @@ function reasoningLiveKey(agentName: string, threadId: string) {
   return `reasoning:${liveKey(agentName, threadId)}`;
 }
 
-function addActivity(
-  session: OpenedSession,
-  entry: Omit<ActivityEntry, "id">
-): OpenedSession {
+function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): OpenedSession {
   return {
     ...session,
-    activity: [{ id: newId("activity"), ...entry }, ...session.activity].slice(
-      0,
-      80
-    ),
+    activity: [{ id: newId("activity"), ...entry }, ...session.activity].slice(0, 80),
   };
 }
 
 /** Tool call arguments keyed by call id, harvested from Assistant messages. */
-function collectToolArgs(
-  messages: HistoryMessage[]
-): Record<string, string | null | undefined> {
+function collectToolArgs(messages: HistoryMessage[]): Record<string, string | null | undefined> {
   const map: Record<string, string | null | undefined> = {};
   for (const message of messages) {
     if ("Assistant" in message) {
@@ -279,7 +255,7 @@ function collectToolArgs(
 function historyToEntries(
   message: HistoryMessage,
   index: number,
-  argsById: Record<string, string | null | undefined> = {}
+  argsById: Record<string, string | null | undefined> = {},
 ): TranscriptEntry[] {
   if ("System" in message) {
     return [];
@@ -322,7 +298,7 @@ function historyToEntries(
       toolMessageToEntry(
         message.Tool,
         `history:tool:${index}`,
-        describeTool(message.Tool.name, argsById[message.Tool.id])
+        describeTool(message.Tool.name, argsById[message.Tool.id]),
       ),
     ];
   }
@@ -341,7 +317,7 @@ function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
 function toolMessageToEntry(
   message: ToolMessage,
   id = newId("tool-result"),
-  detail?: string
+  detail?: string,
 ): TranscriptEntry {
   return {
     id,
@@ -356,11 +332,9 @@ function toolMessageToEntry(
 
 function finishToolEntry(
   session: OpenedSession,
-  event: Extract<WireEvent, { type: "tool_end" }>
+  event: Extract<WireEvent, { type: "tool_end" }>,
 ): OpenedSession {
-  const index = session.entries.findIndex(
-    (entry) => entry.callId === event.message.id
-  );
+  const index = session.entries.findIndex((entry) => entry.callId === event.message.id);
   if (index < 0) {
     return {
       ...session,
@@ -371,11 +345,7 @@ function finishToolEntry(
   // Carry over the detail derived from the call arguments at tool_start; the
   // tool_end message itself doesn't include them.
   entries[index] = {
-    ...toolMessageToEntry(
-      event.message,
-      entries[index].id,
-      entries[index].detail
-    ),
+    ...toolMessageToEntry(event.message, entries[index].id, entries[index].detail),
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
@@ -384,7 +354,7 @@ function finishToolEntry(
 
 function addOrUpdateAssistantChunk(
   session: OpenedSession,
-  event: Extract<WireEvent, { type: "llm_chunk" }>
+  event: Extract<WireEvent, { type: "llm_chunk" }>,
 ): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -420,7 +390,7 @@ function addOrUpdateAssistantChunk(
 
 function addOrUpdateReasoningChunk(
   session: OpenedSession,
-  event: Extract<WireEvent, { type: "llm_reasoning_chunk" }>
+  event: Extract<WireEvent, { type: "llm_reasoning_chunk" }>,
 ): OpenedSession {
   const key = reasoningLiveKey(event.agent_name, event.thread_id);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -460,7 +430,7 @@ function addOrUpdateReasoningChunk(
 function finishReasoning(
   session: OpenedSession,
   agentName: string,
-  threadId: string
+  threadId: string,
 ): OpenedSession {
   const key = reasoningLiveKey(agentName, threadId);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -476,7 +446,7 @@ function finishLiveEntry(
   session: OpenedSession,
   agentName: string,
   threadId: string,
-  updates: Partial<TranscriptEntry> = {}
+  updates: Partial<TranscriptEntry> = {},
 ): OpenedSession {
   const key = liveKey(agentName, threadId);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -494,11 +464,10 @@ function finishLiveEntry(
 
 function finishAssistant(
   session: OpenedSession,
-  event: Extract<WireEvent, { type: "llm_end" }>
+  event: Extract<WireEvent, { type: "llm_end" }>,
 ): OpenedSession {
   const key = liveKey(event.agent_name, event.thread_id);
-  const isFinalResponse =
-    event.agent_name === rootName && event.message.tool_calls.length === 0;
+  const isFinalResponse = event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
       status: event.message.aborted ? "aborted" : undefined,
@@ -525,10 +494,7 @@ function finishAssistant(
   return session;
 }
 
-function upsertApproval(
-  approvals: PendingApproval[],
-  approval: PendingApproval
-) {
+function upsertApproval(approvals: PendingApproval[], approval: PendingApproval) {
   const key = approvalKey(approval);
   const index = approvals.findIndex((item) => approvalKey(item) === key);
   if (index >= 0) {
@@ -554,41 +520,33 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       // Answer content marks the end of the reasoning phase.
       return addOrUpdateAssistantChunk(
         finishReasoning(session, event.agent_name, event.thread_id),
-        event
+        event,
       );
     case "llm_reasoning_chunk":
       return addOrUpdateReasoningChunk(session, event);
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
-      const turnComplete =
-        event.agent_name === rootName && event.message.tool_calls.length === 0;
+      const turnComplete = event.agent_name === rootName && event.message.tool_calls.length === 0;
       const finished = {
         ...addActivity(
-          finishAssistant(
-            finishReasoning(session, event.agent_name, event.thread_id),
-            event
-          ),
+          finishAssistant(finishReasoning(session, event.agent_name, event.thread_id), event),
           {
             tone: event.message.aborted ? "warning" : "success",
             label: `${event.agent_name} finished`,
             detail: event.message.usage
               ? `${
-                  event.message.usage.prompt_tokens +
-                  event.message.usage.completion_tokens
+                  event.message.usage.prompt_tokens + event.message.usage.completion_tokens
                 } tokens`
               : "turn complete",
-          }
+          },
         ),
         running: turnComplete ? false : session.running,
       };
       return event.message.usage
         ? {
             ...finished,
-            usage: [
-              ...finished.usage,
-              { agentName: event.agent_name, usage: event.message.usage },
-            ],
+            usage: [...finished.usage, { agentName: event.agent_name, usage: event.message.usage }],
           }
         : finished;
     }
@@ -638,13 +596,13 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         finishLiveEntry(
           finishReasoning(session, event.agent_name, event.thread_id),
           event.agent_name,
-          event.thread_id
+          event.thread_id,
         ),
         {
           tone: "warning",
           label: `${event.agent_name} aborted`,
           detail: event.target.reason,
-        }
+        },
       );
       return {
         ...updated,
@@ -670,13 +628,13 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
         finishLiveEntry(
           finishReasoning(session, event.agent_name, event.thread_id),
           event.agent_name,
-          event.thread_id
+          event.thread_id,
         ),
         {
           tone: "danger",
           label: `${event.agent_name || "server"} error`,
           detail: event.message,
-        }
+        },
       );
       return {
         ...updated,
@@ -696,11 +654,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
   }
 }
 
-function upsertCatalogSession(
-  catalog: WorkspaceSummary[],
-  workspaceId: string,
-  sessionId: string
-) {
+function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, sessionId: string) {
   return catalog.map((workspace) => {
     if (
       workspace.id !== workspaceId ||
@@ -720,15 +674,13 @@ function upsertCatalogTitled(
   catalog: WorkspaceSummary[],
   workspaceId: string,
   sessionId: string,
-  title: string
+  title: string,
 ): WorkspaceSummary[] {
   return catalog.map((workspace) => {
     if (workspace.id !== workspaceId) {
       return workspace;
     }
-    const index = workspace.sessions.findIndex(
-      (session) => session.id === sessionId
-    );
+    const index = workspace.sessions.findIndex((session) => session.id === sessionId);
     if (index >= 0) {
       const sessions = [...workspace.sessions];
       const session = sessions[index];
@@ -756,7 +708,7 @@ function upsertCatalogTitled(
  */
 function mergeCatalog(
   incoming: WorkspaceSummary[],
-  sessions: Record<SessionKey, OpenedSession>
+  sessions: Record<SessionKey, OpenedSession>,
 ): WorkspaceSummary[] {
   return incoming.map((workspace) => {
     const present = new Set(workspace.sessions.map((session) => session.id));
@@ -775,7 +727,7 @@ function mergeCatalog(
           !session.draft &&
           session.workspaceId === workspace.id &&
           Boolean(session.firstUserMessage) &&
-          !present.has(session.sessionId)
+          !present.has(session.sessionId),
       )
       .map((session) => ({
         id: session.sessionId,
@@ -789,10 +741,7 @@ function mergeCatalog(
 type CodaStore = Store<CodaStoreState>;
 type CodaDraft = Draft<CodaStoreState>;
 
-function updateState(
-  store: CodaStore,
-  updater: (state: CodaDraft) => void
-) {
+function updateState(store: CodaStore, updater: (state: CodaDraft) => void) {
   store.setState(updater);
 }
 
@@ -822,11 +771,7 @@ function markAutoConnected(store: CodaStore) {
   });
 }
 
-function draftSession(
-  state: CodaDraft,
-  server: string,
-  key: SessionKey
-) {
+function draftSession(state: CodaDraft, server: string, key: SessionKey) {
   const current = state.servers[server];
   if (!current) {
     return undefined;
@@ -862,7 +807,7 @@ function setServerStatus(
   store: CodaStore,
   server: string,
   status: ConnectionStatus,
-  error?: string
+  error?: string,
 ) {
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -888,11 +833,7 @@ function removeServerState(store: CodaStore, server: string) {
   });
 }
 
-function setCatalog(
-  store: CodaStore,
-  server: string,
-  workspaces: WorkspaceSummary[]
-) {
+function setCatalog(store: CodaStore, server: string, workspaces: WorkspaceSummary[]) {
   updateState(store, (state) => {
     const current = state.servers[server];
     if (current) {
@@ -905,7 +846,7 @@ function setProviderCatalog(
   store: CodaStore,
   server: string,
   providers: ProviderInfo[],
-  defaultProvider: string
+  defaultProvider: string,
 ) {
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -927,7 +868,7 @@ function createDraftSession(
   store: CodaStore,
   server: string,
   workspaceId: string,
-  sessionId: string
+  sessionId: string,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
@@ -970,8 +911,7 @@ function seedSelection(server: ServerState): {
   reasoningEffort: ReasoningEffort | null;
 } {
   const provider =
-    server.providers.find((item) => item.id === server.defaultProvider) ??
-    server.providers[0];
+    server.providers.find((item) => item.id === server.defaultProvider) ?? server.providers[0];
   return {
     providerId: provider?.id,
     reasoningEffort: provider?.reasoning_efforts[0] ?? null,
@@ -988,9 +928,7 @@ function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
     delete current.sessions[key];
     for (const workspace of current.catalog) {
       if (workspace.id === workspaceId) {
-        workspace.sessions = workspace.sessions.filter(
-          (session) => session.id !== sessionId
-        );
+        workspace.sessions = workspace.sessions.filter((session) => session.id !== sessionId);
       }
     }
     const clearingActive = state.activeServer === server && state.activeKey === key;
@@ -1000,12 +938,7 @@ function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
   });
 }
 
-function selectSession(
-  store: CodaStore,
-  server: string,
-  workspaceId: string,
-  sessionId: string
-) {
+function selectSession(store: CodaStore, server: string, workspaceId: string, sessionId: string) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
     if (state.servers[server]) {
@@ -1024,13 +957,11 @@ function applySnapshot(
   messages: HistoryMessage[],
   approvals: PendingApproval[],
   providerId: string,
-  reasoningEffort: ReasoningEffort | null
+  reasoningEffort: ReasoningEffort | null,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
-  const mapped = messages.flatMap((message, index) =>
-    historyToEntries(message, index, argsById)
-  );
+  const mapped = messages.flatMap((message, index) => historyToEntries(message, index, argsById));
   const usage = historyUsage(messages);
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
@@ -1039,11 +970,7 @@ function applySnapshot(
       return;
     }
     current.status = "connected";
-    current.catalog = upsertCatalogSession(
-      current.catalog,
-      workspaceId,
-      sessionId
-    );
+    current.catalog = upsertCatalogSession(current.catalog, workspaceId, sessionId);
     const session = draftSession(state, server, key);
     if (!session) {
       return;
@@ -1066,7 +993,7 @@ function setSessionModel(
   server: string,
   key: SessionKey,
   providerId: string,
-  reasoningEffort: ReasoningEffort | null
+  reasoningEffort: ReasoningEffort | null,
 ) {
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1082,7 +1009,7 @@ function applyEvent(
   server: string,
   workspaceId: string,
   sessionId: string,
-  event: WireEvent
+  event: WireEvent,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
@@ -1098,7 +1025,7 @@ function addAllowResultActivity(
   server: string,
   workspaceId: string,
   pattern: string,
-  error?: string | null
+  error?: string | null,
 ) {
   updateState(store, (state) => {
     if (state.activeServer !== server || !state.activeKey) {
@@ -1118,12 +1045,7 @@ function addAllowResultActivity(
   });
 }
 
-function appendUserMessage(
-  store: CodaStore,
-  server: string,
-  key: SessionKey,
-  content: string
-) {
+function appendUserMessage(store: CodaStore, server: string, key: SessionKey, content: string) {
   updateState(store, (state) => {
     const current = state.servers[server];
     const session = draftSession(state, server, key);
@@ -1140,7 +1062,7 @@ function appendUserMessage(
       current.catalog,
       workspaceId,
       sessionId,
-      firstUserMessage
+      firstUserMessage,
     );
   });
 }
@@ -1151,7 +1073,7 @@ function setDraftResolution(
   key: SessionKey,
   approval: PendingApproval,
   call: ToolCall,
-  resolution: ToolCallResolution
+  resolution: ToolCallResolution,
 ) {
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1168,7 +1090,7 @@ function clearApprovalState(
   store: CodaStore,
   server: string,
   key: SessionKey,
-  approval: PendingApproval
+  approval: PendingApproval,
 ) {
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1177,9 +1099,7 @@ function clearApprovalState(
     }
     const approvalId = approvalKey(approval);
     delete session.drafts[approvalId];
-    session.approvals = session.approvals.filter(
-      (item) => approvalKey(item) !== approvalId
-    );
+    session.approvals = session.approvals.filter((item) => approvalKey(item) !== approvalId);
   });
 }
 
@@ -1190,8 +1110,8 @@ function normalizeWsUrl(input: string) {
     const wsBase = base.startsWith("http://")
       ? base.replace(/^http:\/\//, "ws://")
       : base.startsWith("https://")
-      ? base.replace(/^https:\/\//, "wss://")
-      : base;
+        ? base.replace(/^https:\/\//, "wss://")
+        : base;
     // Don't double-append when the user already pasted the `/ws` endpoint.
     return wsBase.endsWith("/ws") ? wsBase : `${wsBase}/ws`;
   }
@@ -1260,11 +1180,7 @@ export function connectServer(rawUrl: string) {
   closeSocket(codaStore, server);
   const stored = loadStoredServers();
   storeServers(addStored(stored, server));
-  markConnecting(
-    codaStore,
-    server,
-    stored.find((entry) => entry.url === server)?.alias
-  );
+  markConnecting(codaStore, server, stored.find((entry) => entry.url === server)?.alias);
 
   const socket = new WebSocket(normalizeWsUrl(server));
   setSocket(codaStore, server, socket);
@@ -1279,8 +1195,7 @@ export function connectServer(rawUrl: string) {
       setServerStatus(codaStore, server, "closed");
     }
   };
-  socket.onerror = () =>
-    setServerStatus(codaStore, server, "error", "WebSocket connection failed");
+  socket.onerror = () => setServerStatus(codaStore, server, "error", "WebSocket connection failed");
   socket.onmessage = (event: MessageEvent<string>) => {
     try {
       const message = JSON.parse(event.data) as ServerMessage;
@@ -1289,12 +1204,7 @@ export function connectServer(rawUrl: string) {
         return;
       }
       if (message.type === "provider_catalog") {
-        setProviderCatalog(
-          codaStore,
-          server,
-          message.providers,
-          message.default_provider
-        );
+        setProviderCatalog(codaStore, server, message.providers, message.default_provider);
         return;
       }
       if (message.type === "snapshot") {
@@ -1306,7 +1216,7 @@ export function connectServer(rawUrl: string) {
           message.messages,
           message.pending_approvals ?? [],
           message.provider_id,
-          message.reasoning_effort ?? null
+          message.reasoning_effort ?? null,
         );
         return;
       }
@@ -1316,18 +1226,12 @@ export function connectServer(rawUrl: string) {
           server,
           sessionKey(message.workspace_id, message.session_id),
           message.provider_id,
-          message.reasoning_effort ?? null
+          message.reasoning_effort ?? null,
         );
         return;
       }
       if (message.type === "event") {
-        applyEvent(
-          codaStore,
-          server,
-          message.workspace_id,
-          message.session_id,
-          message.event
-        );
+        applyEvent(codaStore, server, message.workspace_id, message.session_id, message.event);
         return;
       }
       addAllowResultActivity(
@@ -1335,14 +1239,14 @@ export function connectServer(rawUrl: string) {
         server,
         message.workspace_id,
         message.pattern,
-        message.error
+        message.error,
       );
     } catch (error) {
       setServerStatus(
         codaStore,
         server,
         "error",
-        error instanceof Error ? error.message : "Invalid server message"
+        error instanceof Error ? error.message : "Invalid server message",
       );
     }
   };
@@ -1377,9 +1281,7 @@ export function renameServer(rawUrl: string, rawAlias: string) {
   const alias = rawAlias.trim() || undefined;
   const stored = loadStoredServers();
   const next = stored.some((entry) => entry.url === server)
-    ? stored.map((entry) =>
-        entry.url === server ? { ...entry, alias } : entry
-      )
+    ? stored.map((entry) => (entry.url === server ? { ...entry, alias } : entry))
     : [...stored, { url: server, alias }];
   storeServers(next);
   setServerAlias(codaStore, server, alias);
@@ -1394,20 +1296,14 @@ export function newSession(server: string, workspaceId: string) {
   const reusable = current
     ? Object.values(current.sessions).find(
         (session) =>
-          session.draft &&
-          session.workspaceId === workspace &&
-          session.entries.length === 0
+          session.draft && session.workspaceId === workspace && session.entries.length === 0,
       )
     : undefined;
   const sessionId = reusable?.sessionId ?? freshSessionId();
   createDraftSession(codaStore, server, workspace, sessionId);
 }
 
-export function deleteSession(
-  server: string,
-  workspaceId: string,
-  sessionId: string
-) {
+export function deleteSession(server: string, workspaceId: string, sessionId: string) {
   const workspace = workspaceId.trim();
   const session = sessionId.trim();
   if (!server || !workspace || !session) {
@@ -1425,27 +1321,17 @@ export function deleteSession(
   deleteSessionState(codaStore, server, key);
 }
 
-export function openSession(
-  server: string,
-  workspaceId: string,
-  sessionId: string
-) {
+export function openSession(server: string, workspaceId: string, sessionId: string) {
   const workspace = workspaceId.trim();
   const session = sessionId.trim();
   if (!server || !workspace || !session) {
     return;
   }
-  const local =
-    codaStore.getState().servers[server]?.sessions[
-      sessionKey(workspace, session)
-    ];
+  const local = codaStore.getState().servers[server]?.sessions[sessionKey(workspace, session)];
   selectSession(codaStore, server, workspace, session);
   if (!local?.draft) {
     const opened =
-      local ??
-      codaStore.getState().servers[server]?.sessions[
-        sessionKey(workspace, session)
-      ];
+      local ?? codaStore.getState().servers[server]?.sessions[sessionKey(workspace, session)];
     if (opened) {
       send(server, openMessage(opened));
     }
@@ -1478,7 +1364,7 @@ export function sendTaskToNewSession(
   workspaceId: string,
   task: string,
   providerId?: string,
-  reasoningEffort: ReasoningEffort | null = null
+  reasoningEffort: ReasoningEffort | null = null,
 ) {
   const workspace = workspaceId.trim();
   const text = task.trim();
@@ -1489,9 +1375,7 @@ export function sendTaskToNewSession(
   const reusable = current
     ? Object.values(current.sessions).find(
         (session) =>
-          session.draft &&
-          session.workspaceId === workspace &&
-          session.entries.length === 0
+          session.draft && session.workspaceId === workspace && session.entries.length === 0,
       )
     : undefined;
   const sessionId = reusable?.sessionId ?? freshSessionId();
@@ -1540,22 +1424,13 @@ export function addAllowPattern(pattern: string) {
   }
 }
 
-export function setModel(
-  providerId: string,
-  reasoningEffort: ReasoningEffort | null
-) {
+export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
   const active = currentActive();
   if (!active) {
     return;
   }
   if (active.session.draft) {
-    setSessionModel(
-      codaStore,
-      active.server,
-      active.session.key,
-      providerId,
-      reasoningEffort
-    );
+    setSessionModel(codaStore, active.server, active.session.key, providerId, reasoningEffort);
     return;
   }
   send(active.server, {
@@ -1570,20 +1445,13 @@ export function setModel(
 export function draftCall(
   approval: PendingApproval,
   call: ToolCall,
-  resolution: ToolCallResolution
+  resolution: ToolCallResolution,
 ) {
   const active = currentActive();
   if (!active) {
     return;
   }
-  setDraftResolution(
-    codaStore,
-    active.server,
-    active.session.key,
-    approval,
-    call,
-    resolution
-  );
+  setDraftResolution(codaStore, active.server, active.session.key, approval, call, resolution);
 }
 
 export function submitApprovals() {
@@ -1636,10 +1504,7 @@ export const selectServers = (state: CodaStoreState): ServerState[] =>
 
 let cachedServerSummaries: ServerSummary[] = [];
 
-function summaryMatchesServer(
-  summary: ServerSummary,
-  server: ServerState
-): boolean {
+function summaryMatchesServer(summary: ServerSummary, server: ServerState): boolean {
   return (
     summary.url === server.url &&
     summary.alias === server.alias &&
@@ -1651,24 +1516,17 @@ function summaryMatchesServer(
   );
 }
 
-export const selectServerSummaries = (
-  state: CodaStoreState
-): ServerSummary[] => {
+export const selectServerSummaries = (state: CodaStoreState): ServerSummary[] => {
   if (
     state.order.length === cachedServerSummaries.length &&
     state.order.every((url, index) => {
       const server = state.servers[url];
-      return (
-        Boolean(server) &&
-        summaryMatchesServer(cachedServerSummaries[index], server)
-      );
+      return Boolean(server) && summaryMatchesServer(cachedServerSummaries[index], server);
     })
   ) {
     return cachedServerSummaries;
   }
-  const previousByUrl = new Map(
-    cachedServerSummaries.map((server) => [server.url, server])
-  );
+  const previousByUrl = new Map(cachedServerSummaries.map((server) => [server.url, server]));
   const next = state.order.flatMap((url) => {
     const server = state.servers[url];
     if (!server) {
@@ -1706,16 +1564,14 @@ export const selectActiveDrafts = (state: CodaStoreState) =>
   activeSessionOf(state)?.drafts ?? EMPTY_DRAFTS;
 export const selectActiveApprovalCount = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals.length ?? 0;
-export const selectActiveWorkspace = (state: CodaStoreState) =>
-  activeSessionOf(state)?.workspaceId;
+export const selectActiveWorkspace = (state: CodaStoreState) => activeSessionOf(state)?.workspaceId;
 export const selectActiveDraftFlag = (state: CodaStoreState) =>
   activeSessionOf(state)?.draft ?? false;
 export const selectActiveStatus = (state: CodaStoreState): ConnectionStatus =>
   activeServerOf(state)?.status ?? "idle";
 export const selectActiveProviders = (state: CodaStoreState): ProviderInfo[] =>
   activeServerOf(state)?.providers ?? EMPTY_PROVIDERS;
-export const selectActiveProviderId = (state: CodaStoreState) =>
-  activeSessionOf(state)?.providerId;
+export const selectActiveProviderId = (state: CodaStoreState) => activeSessionOf(state)?.providerId;
 export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
 const EMPTY_USAGE: UsageRecord[] = [];
@@ -1757,6 +1613,6 @@ export function useCodaBootstrap() {
         socket.close();
       }
     },
-    []
+    [],
   );
 }

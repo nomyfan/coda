@@ -1,6 +1,5 @@
 import {
   Check,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   KeyRound,
@@ -58,7 +57,7 @@ function DecisionRadio({
     <Label
       className={cn(
         "cursor-pointer rounded-md border px-3 py-2 transition-colors",
-        selected ? "border-primary bg-accent" : "border-input hover:bg-accent"
+        selected ? "border-primary bg-accent" : "border-input hover:bg-accent",
       )}
     >
       <RadioGroupItem value={value} />
@@ -71,15 +70,13 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
   const approvals = useCodaStore(selectActiveApprovals);
   const drafts = useCodaStore(selectActiveDrafts);
   const items: ApprovalItem[] = approvals.flatMap((approval) =>
-    approval.calls.map((call) => ({ approval, call }))
+    approval.calls.map((call) => ({ approval, call })),
   );
   const [index, setIndex] = useState(0);
 
   // Reset to the first item whenever the pending set itself changes (a new
   // batch arrives) — but keep position while the user works through a batch.
-  const itemsKey = items
-    .map((item) => `${item.approval.thread_id}:${item.call.id}`)
-    .join("|");
+  const itemsKey = items.map((item) => `${item.approval.thread_id}:${item.call.id}`).join("|");
   const prevKey = useRef(itemsKey);
   useEffect(() => {
     if (prevKey.current !== itemsKey) {
@@ -92,8 +89,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
     return null;
   }
 
-  const decisionOf = (item: ApprovalItem) =>
-    drafts[approvalKey(item.approval)]?.[item.call.id];
+  const decisionOf = (item: ApprovalItem) => drafts[approvalKey(item.approval)]?.[item.call.id];
   const current = items[Math.min(index, items.length - 1)] ?? items[0];
   const currentIndex = items.indexOf(current);
   const decidedCount = items.filter((item) => decisionOf(item)).length;
@@ -176,18 +172,16 @@ function ApprovalCall({
 }) {
   const [reason, setReason] = useState(() =>
     decision && decision !== "Execute" && "Rejected" in decision
-      ? decision.Rejected.reason ?? ""
-      : ""
+      ? (decision.Rejected.reason ?? "")
+      : "",
   );
   const [answer, setAnswer] = useState("");
   const [allowPattern, setAllowPattern] = useState(() =>
-    deriveAllowPattern(extractShellCommand(call))
+    deriveAllowPattern(extractShellCommand(call)),
   );
   const askUser = call.name === "ask_user" ? parseAskUserParams(call) : null;
   const approved = decision === "Execute";
-  const rejected = Boolean(
-    decision && decision !== "Execute" && "Rejected" in decision
-  );
+  const rejected = Boolean(decision && decision !== "Execute" && "Rejected" in decision);
 
   if (askUser) {
     const chosen =
@@ -248,10 +242,7 @@ function ApprovalCall({
       </pre>
       {call.name === "shell" ? (
         <div className="flex gap-2">
-          <Input
-            value={allowPattern}
-            onChange={(event) => setAllowPattern(event.target.value)}
-          />
+          <Input value={allowPattern} onChange={(event) => setAllowPattern(event.target.value)} />
           <Button
             variant="outline"
             onClick={() => {
@@ -293,4 +284,3 @@ function ApprovalCall({
     </div>
   );
 }
-
