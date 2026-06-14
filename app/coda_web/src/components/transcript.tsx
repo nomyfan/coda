@@ -618,7 +618,6 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
     return (
       <div className="group/message">
         <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
-          {header}
           <Markdown>{entry.content}</Markdown>
         </article>
         <MessageActions content={entry.content} label="response" align="start" />
