@@ -4,6 +4,15 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+catalogs:
+  default:
+    '@types/node':
+      specifier: ^22.19.19
+      version: 22.19.19
+    typescript:
+      specifier: ^6.0.3
+      version: 6.0.3
+
 importers:
 
   .:
@@ -16,13 +25,13 @@ importers:
         specifier: ^0.4.4
         version: 0.4.4
       '@types/node':
-        specifier: ^22.19.19
+        specifier: 'catalog:'
         version: 22.19.19
       oxfmt:
         specifier: ^0.54.0
         version: 0.54.0
       typescript:
-        specifier: ^6.0.3
+        specifier: 'catalog:'
         version: 6.0.3
 
   app/coda_web:
@@ -74,7 +83,7 @@ importers:
         specifier: ^4.3.0
         version: 4.3.1(vite@7.3.5(@types/node@22.19.19)(jiti@2.7.0)(lightningcss@1.32.0))
       '@types/node':
-        specifier: ^22.19.19
+        specifier: 'catalog:'
         version: 22.19.19
       '@types/react':
         specifier: ^19.2.7
@@ -92,7 +101,7 @@ importers:
         specifier: ^4.3.0
         version: 4.3.1
       typescript:
-        specifier: ^6.0.3
+        specifier: 'catalog:'
         version: 6.0.3
       vite:
         specifier: ^7.2.7
