@@ -3,8 +3,7 @@ import {
   ChevronDown,
   ChevronRight,
   Folder,
-  Loader2,
-  MessageSquareQuote,
+  CircleSmall,
   PanelLeft,
   Pencil,
   Plug,
@@ -28,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { StatusDot, type DotTone } from "@/components/status-dot";
 import {
   connectServer,
   deleteSession,
@@ -45,20 +45,13 @@ import {
 import { cn } from "@/lib/utils";
 import { serverLabel, sessionTitle, statusCopy } from "@/components/session-utils";
 
-function StatusDot({ status }: { status: ConnectionStatus }) {
-  const tone =
-    status === "connected"
-      ? "bg-emerald-500"
-      : status === "connecting"
-        ? "bg-amber-500"
-        : "bg-rose-500";
+function ServerStatusDot({ status }: { status: ConnectionStatus }) {
+  const tone: DotTone =
+    status === "connected" ? "online" : status === "connecting" ? "busy" : "offline";
   return (
-    <span
-      className={cn(
-        "size-2.5 shrink-0 rounded-full",
-        tone,
-        status === "connecting" && "animate-pulse",
-      )}
+    <StatusDot
+      tone={tone}
+      motion={status === "connecting" ? "breathe" : "static"}
       title={statusCopy[status].label}
     />
   );
@@ -87,7 +80,7 @@ const CollapsedServerButton = memo(function CollapsedServerButton({
       onClick={() => firstWorkspace && onNewSession(url, firstWorkspace)}
       title={`New session · ${serverLabel(server)}`}
     >
-      <StatusDot status={server.status} />
+      <ServerStatusDot status={server.status} />
     </Button>
   );
 });
@@ -199,12 +192,14 @@ function SessionRow({
             className="flex size-4 shrink-0 items-center justify-center"
             title="Awaiting approval"
           >
-            <span className="size-2.5 animate-pulse rounded-full bg-amber-500" />
+            <StatusDot tone="busy" motion="ping" />
           </span>
         ) : running ? (
-          <Loader2 className="size-4 shrink-0 animate-spin text-amber-500" />
+          <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
+            <StatusDot tone="busy" motion="breathe" />
+          </span>
         ) : (
-          <MessageSquareQuote className="size-4 shrink-0 text-muted-foreground" />
+          <CircleSmall className="size-4 shrink-0 text-muted-foreground" />
         )}
         <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
       </Button>
@@ -413,7 +408,7 @@ const ServerNode = memo(function ServerNode({
             ) : (
               <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
             )}
-            <StatusDot status={server.status} />
+            <ServerStatusDot status={server.status} />
             <span className="min-w-0 flex-1 truncate text-sm font-medium" title={server.url}>
               {serverLabel(server)}
             </span>

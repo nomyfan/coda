@@ -3,3 +3,4 @@ dist/
 *.tsbuildinfo
 vite.config.js
 src/**/*.js
+.claude/launch.json
