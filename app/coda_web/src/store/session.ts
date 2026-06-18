@@ -233,18 +233,21 @@ type ModelPref = { providerId: string; reasoningEffort: ReasoningEffort | null }
 
 /** Last model the user picked, keyed by server URL, so new sessions reuse it. */
 function loadModelPrefs(): Record<string, ModelPref> {
+  // Null-prototype record: server URLs are user-provided, so a key like
+  // "__proto__" must not pollute the prototype when written back.
+  const prefs: Record<string, ModelPref> = Object.create(null);
   try {
     const raw = window.localStorage.getItem(modelPrefsStorageKey);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        return parsed as Record<string, ModelPref>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        Object.assign(prefs, parsed);
       }
     }
   } catch {
     // ignore malformed/blocked storage
   }
-  return {};
+  return prefs;
 }
 
 function rememberModelPref(server: string, pref: ModelPref) {
