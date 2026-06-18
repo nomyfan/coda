@@ -145,7 +145,7 @@ async fn open_session(
         provider: provider.provider.clone(),
         model: provider.model_id.clone(),
         label: provider_id.to_string(),
-        temperature: Some(0.7),
+        temperature: None,
         max_completion_tokens: Some(10_000),
         reasoning_effort,
     };
@@ -164,7 +164,7 @@ async fn open_session(
                 provider: handle.provider.clone(),
                 model: handle.model_id.clone(),
                 label: selection.provider_id.clone(),
-                temperature: Some(0.7),
+                temperature: None,
                 max_completion_tokens: Some(10_000),
                 reasoning_effort: selection.reasoning_effort,
             };

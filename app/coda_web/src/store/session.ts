@@ -227,6 +227,39 @@ function addStored(list: StoredServer[], url: string): StoredServer[] {
   return list.some((server) => server.url === url) ? list : [...list, { url }];
 }
 
+const modelPrefsStorageKey = "coda.modelPrefs";
+
+type ModelPref = { providerId: string; reasoningEffort: ReasoningEffort | null };
+
+/** Last model the user picked, keyed by server URL, so new sessions reuse it. */
+function loadModelPrefs(): Record<string, ModelPref> {
+  // Null-prototype record: server URLs are user-provided, so a key like
+  // "__proto__" must not pollute the prototype when written back.
+  const prefs: Record<string, ModelPref> = Object.create(null);
+  try {
+    const raw = window.localStorage.getItem(modelPrefsStorageKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        Object.assign(prefs, parsed);
+      }
+    }
+  } catch {
+    // ignore malformed/blocked storage
+  }
+  return prefs;
+}
+
+function rememberModelPref(server: string, pref: ModelPref) {
+  try {
+    const prefs = loadModelPrefs();
+    prefs[server] = pref;
+    window.localStorage.setItem(modelPrefsStorageKey, JSON.stringify(prefs));
+  } catch {
+    // ignore storage failures (private mode, disabled storage)
+  }
+}
+
 function liveKey(agentName: string, threadId: string) {
   return `${agentName}:${threadId}`;
 }
@@ -906,20 +939,45 @@ function createDraftSession(
 }
 
 /**
- * Initial model selection for a freshly created (draft) session: the server's
- * default provider at its first declared effort. Empty when the provider
- * catalog hasn't arrived yet, leaving the selector hidden until it has.
+ * Initial model selection for a freshly created (draft) session: the model the
+ * user last used on this server (remembered per server URL), falling back to the
+ * server's default provider at its first declared effort. Empty when the
+ * provider catalog hasn't arrived yet, leaving the selector hidden until it has.
  */
 function seedSelection(server: ServerState): {
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
 } {
+  const remembered = loadModelPrefs()[server.url];
+  const rememberedProvider = remembered
+    ? server.providers.find((item) => item.id === remembered.providerId)
+    : undefined;
   const provider =
-    server.providers.find((item) => item.id === server.defaultProvider) ?? server.providers[0];
-  return {
-    providerId: provider?.id,
-    reasoningEffort: provider?.reasoning_efforts[0] ?? null,
-  };
+    rememberedProvider ??
+    server.providers.find((item) => item.id === server.defaultProvider) ??
+    server.providers[0];
+  if (!provider) {
+    return { providerId: undefined, reasoningEffort: null };
+  }
+  const reasoningEffort =
+    rememberedProvider && remembered
+      ? validEffort(provider, remembered.reasoningEffort)
+      : (provider.reasoning_efforts[0] ?? null);
+  return { providerId: provider.id, reasoningEffort };
+}
+
+/** Keep a remembered reasoning effort only when it still applies to the model. */
+function validEffort(
+  provider: ProviderInfo,
+  effort: ReasoningEffort | null,
+): ReasoningEffort | null {
+  if (provider.reasoning_efforts.length === 0) {
+    return null;
+  }
+  if (effort === "none" || (effort && provider.reasoning_efforts.includes(effort))) {
+    return effort;
+  }
+  return provider.reasoning_efforts[0];
 }
 
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
@@ -945,10 +1003,20 @@ function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
 function selectSession(store: CodaStore, server: string, workspaceId: string, sessionId: string) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
-    if (state.servers[server]) {
-      state.activeServer = server;
-      state.activeKey = key;
-      draftSession(state, server, key);
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    state.activeServer = server;
+    state.activeKey = key;
+    const session = draftSession(state, server, key);
+    // A history session opened this browser-session for the first time has no
+    // model yet; the server doesn't persist one, so seed the remembered model
+    // (or the default) and let `open_session` carry it instead of resetting.
+    if (session && !session.providerId) {
+      const seed = seedSelection(current);
+      session.providerId = seed.providerId;
+      session.reasoningEffort = seed.reasoningEffort;
     }
   });
 }
@@ -1457,6 +1525,7 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
   if (!active) {
     return;
   }
+  rememberModelPref(active.server, { providerId, reasoningEffort });
   if (active.session.draft) {
     setSessionModel(codaStore, active.server, active.session.key, providerId, reasoningEffort);
     return;
