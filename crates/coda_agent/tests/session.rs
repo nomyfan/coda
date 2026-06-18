@@ -522,7 +522,10 @@ async fn should_delegate_to_explore_subagent() {
         .await
         .expect("open session");
 
-    session.send("delegate to explore", vec![]).await.expect("send");
+    session
+        .send("delegate to explore", vec![])
+        .await
+        .expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -548,7 +551,10 @@ async fn should_maintain_history_across_turns() {
         .expect("open session");
 
     // Turn 1
-    session.send("multi turn start", vec![]).await.expect("send turn 1");
+    session
+        .send("multi turn start", vec![])
+        .await
+        .expect("send turn 1");
     let reply1 = collect_until_done(&session).await;
     assert_eq!(reply1, "turn-1-reply");
 
@@ -585,7 +591,10 @@ async fn should_resume_from_prior_checkpoint() {
         .await
         .expect("open session 1");
 
-    session1.send("resume test start", vec![]).await.expect("send");
+    session1
+        .send("resume test start", vec![])
+        .await
+        .expect("send");
     let reply1 = collect_until_done(&session1).await;
     assert_eq!(reply1, "session-1-reply");
 
@@ -625,7 +634,10 @@ async fn should_resume_from_prior_checkpoint() {
         "resumed history should contain the first assistant reply, got: {resumed_text}"
     );
 
-    session2.send("resume test follow", vec![]).await.expect("send");
+    session2
+        .send("resume test follow", vec![])
+        .await
+        .expect("send");
     let reply2 = collect_until_done(&session2).await;
     assert!(
         reply2.contains("session-2-reply"),
@@ -655,7 +667,10 @@ async fn should_execute_tool_after_approval_resume() {
         .await
         .expect("open session");
 
-    session.send("approve read_todos", vec![]).await.expect("send");
+    session
+        .send("approve read_todos", vec![])
+        .await
+        .expect("send");
 
     let pending = collect_until_suspended(&session).await;
     assert_eq!(pending.calls.len(), 1);
@@ -699,7 +714,10 @@ async fn should_auto_reject_when_approval_times_out() {
         .await
         .expect("open session 1");
 
-    session1.send("timeout approval", vec![]).await.expect("send");
+    session1
+        .send("timeout approval", vec![])
+        .await
+        .expect("send");
 
     let pending = collect_until_suspended(&session1).await;
     assert_eq!(pending.calls[0].name, "read_todos");

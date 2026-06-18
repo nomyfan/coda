@@ -41,7 +41,11 @@ impl UserMessage {
     /// Construct a message with text followed by zero or more image data-URIs.
     pub fn with_images(text: impl Into<String>, images: &[String]) -> Self {
         let mut parts = vec![ContentPart::Text { text: text.into() }];
-        parts.extend(images.iter().map(|url| ContentPart::Image { url: url.clone() }));
+        parts.extend(
+            images
+                .iter()
+                .map(|url| ContentPart::Image { url: url.clone() }),
+        );
         Self { parts }
     }
 

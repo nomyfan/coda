@@ -514,7 +514,10 @@ fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
             thread_id: thread_id.clone(),
         },
         reply_to: None,
-        body: EnvelopeBody::Task { task: task.into(), images: vec![] },
+        body: EnvelopeBody::Task {
+            task: task.into(),
+            images: vec![],
+        },
     })
 }
 

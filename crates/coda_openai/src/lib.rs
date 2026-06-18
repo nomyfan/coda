@@ -5,20 +5,19 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
     CompletionTokensDetails as OpenAICompletionTokensDetails, CreateChatCompletionRequestArgs,
     FunctionCall, FunctionCallStream, FunctionObject, ImageUrl,
     PromptTokensDetails as OpenAIPromptTokensDetails, ReasoningEffort as OpenAIReasoningEffort,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage,
-    ContentPart, LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails,
-    ReasoningEffort, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, ContentPart,
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ReasoningEffort,
+    StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 

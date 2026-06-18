@@ -419,7 +419,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         Envelope {
-                            body: EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. },
+                            body:
+                                EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. },
                             ..
                         } => {
                             // A new task/tool-call arrived while waiting for subagent replies
