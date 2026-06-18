@@ -34,12 +34,14 @@ impl From<std::io::Error> for ConfigError {
 /// back to `id` when absent). `context_window` is the model's total token
 /// capacity. `reasoning_efforts` declares which effort levels the model accepts;
 /// an empty list means the UI shows no reasoning controls for it.
+/// `supports_vision` indicates whether the model accepts image content parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
     pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub supports_vision: bool,
 }
 
 /// A configured LLM provider with one or more models. `api_key`, `base_url`,
@@ -197,11 +199,16 @@ fn parse_models(
                 ))
             })?;
         let reasoning_efforts = parse_model_reasoning_efforts(table, provider_id, &id)?;
+        let supports_vision = table
+            .get("supports_vision")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         models.push(ModelConfig {
             id,
             name,
             context_window,
             reasoning_efforts,
+            supports_vision,
         });
     }
 
@@ -675,6 +682,7 @@ path = "/tmp/scratch"
                         ReasoningEffort::Medium,
                         ReasoningEffort::High,
                     ],
+                    supports_vision: false,
                 }],
             }]
         );

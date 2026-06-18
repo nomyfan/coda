@@ -55,6 +55,8 @@ struct ProviderHandle {
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
+    /// Whether this model accepts image content parts.
+    supports_vision: bool,
 }
 
 struct WorkspaceState {
@@ -390,6 +392,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
             model: handle.model_name.clone(),
             context_window: handle.context_window,
             reasoning_efforts: handle.reasoning_efforts.clone(),
+            supports_vision: handle.supports_vision,
         })
         .collect();
     infos.sort_by(|a, b| a.id.cmp(&b.id));
@@ -712,11 +715,12 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
             task,
+            images,
         } => {
             if let Some(active_session) =
                 active.get_mut(&(workspace_id.clone(), session_id.clone()))
             {
-                if let Err(err) = active_session.session.send(task).await {
+                if let Err(err) = active_session.session.send(task, images).await {
                     warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
                 } else {
                     active_session.turn_running = true;
@@ -1314,6 +1318,7 @@ async fn main() {
                     context_window: m.context_window,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
+                    supports_vision: m.supports_vision,
                 };
                 (id, Arc::new(handle))
             })

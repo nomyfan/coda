@@ -4,19 +4,21 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
     CompletionTokensDetails as OpenAICompletionTokensDetails, CreateChatCompletionRequestArgs,
-    FunctionCall, FunctionCallStream, FunctionObject,
+    FunctionCall, FunctionCallStream, FunctionObject, ImageUrl,
     PromptTokensDetails as OpenAIPromptTokensDetails, ReasoningEffort as OpenAIReasoningEffort,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, LLMProvider,
-    LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ReasoningEffort, StreamError,
-    ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage,
+    ContentPart, LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails,
+    ReasoningEffort, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -36,9 +38,44 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 .into()
             }
             Message::User(user_message) => {
-                //
+                let has_images = user_message
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Image { .. }));
+                let content = if has_images {
+                    let parts = user_message
+                        .parts
+                        .into_iter()
+                        .map(|p| match p {
+                            ContentPart::Text { text } => {
+                                ChatCompletionRequestUserMessageContentPart::Text(
+                                    ChatCompletionRequestMessageContentPartText { text },
+                                )
+                            }
+                            ContentPart::Image { url } => {
+                                ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                                    ChatCompletionRequestMessageContentPartImage {
+                                        image_url: ImageUrl { url, detail: None },
+                                    },
+                                )
+                            }
+                        })
+                        .collect();
+                    ChatCompletionRequestUserMessageContent::Array(parts)
+                } else {
+                    let text = user_message
+                        .parts
+                        .into_iter()
+                        .filter_map(|p| match p {
+                            ContentPart::Text { text } => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    ChatCompletionRequestUserMessageContent::Text(text)
+                };
                 ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(user_message.0),
+                    content,
                     ..Default::default()
                 }
                 .into()

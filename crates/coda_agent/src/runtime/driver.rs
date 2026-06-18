@@ -365,16 +365,19 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         match resume_point {
             ResumePoint::Generation => {
                 match &envelope.body {
-                    EnvelopeBody::Task(task) => {
+                    EnvelopeBody::Task { task, images } => {
                         self.reply_target = None;
                         self.agent
-                            .add_message(Message::User(UserMessage(task.clone())))
+                            .add_message(Message::User(UserMessage::with_images(
+                                task.clone(),
+                                images,
+                            )))
                             .await
                     }
                     EnvelopeBody::ToolCall { task, .. } => {
                         self.reply_target = reply_target_from_envelope(&envelope);
                         self.agent
-                            .add_message(Message::User(UserMessage(task.clone())))
+                            .add_message(Message::User(UserMessage::text(task.clone())))
                             .await
                     }
                     _ => {
@@ -416,7 +419,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         Envelope {
-                            body: EnvelopeBody::Task(task) | EnvelopeBody::ToolCall { task, .. },
+                            body: EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. },
                             ..
                         } => {
                             // A new task/tool-call arrived while waiting for subagent replies
@@ -441,7 +444,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
                             self.agent
-                                .add_message(Message::User(UserMessage(task.clone())))
+                                .add_message(Message::User(UserMessage::text(task.clone())))
                                 .await;
                             return AgentLoopState::Next(ResumePoint::Generation);
                         }
@@ -463,7 +466,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 mut pending_calls,
             } => {
                 match &envelope.body {
-                    EnvelopeBody::Task(task) | EnvelopeBody::ToolCall { task, .. } => {
+                    EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. } => {
                         // Stale PendingApproval state: new task or sub-agent re-invocation
                         // arrived (e.g. after abort). Write aborted ToolMessages for all
                         // pending calls so the history stays valid, then start fresh.
@@ -497,7 +500,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
                         self.agent
-                            .add_message(Message::User(UserMessage(task.clone())))
+                            .add_message(Message::User(UserMessage::text(task.clone())))
                             .await;
                         AgentLoopState::Next(ResumePoint::Generation)
                     }

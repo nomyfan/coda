@@ -390,8 +390,15 @@ impl Session {
         self.inner.resumed_messages.as_deref()
     }
 
-    /// Send a user task to the root agent.
-    pub async fn send(&self, task: impl Into<String>) -> Result<(), SendCommandError> {
+    /// Send a user task to the root agent, optionally with image attachments.
+    ///
+    /// `images` is a list of base64 data-URIs (`data:image/<fmt>;base64,<b64>`)
+    /// or HTTPS URLs. Pass an empty slice for text-only turns.
+    pub async fn send(
+        &self,
+        task: impl Into<String>,
+        images: Vec<String>,
+    ) -> Result<(), SendCommandError> {
         let task = task.into();
         let thread_id = ThreadId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
@@ -405,7 +412,7 @@ impl Session {
                     thread_id,
                 },
                 reply_to: None,
-                body: EnvelopeBody::Task(task),
+                body: EnvelopeBody::Task { task, images },
             }))
             .await
     }

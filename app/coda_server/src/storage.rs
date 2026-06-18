@@ -143,7 +143,7 @@ impl JsonFileStorage {
             .messages
             .into_iter()
             .find_map(|message| match message {
-                Message::User(message) => Some(message.0),
+                Message::User(msg) => msg.first_text().map(|s| s.to_string()),
                 _ => None,
             })
     }
@@ -298,7 +298,7 @@ mod tests {
                     thread_id: "active".into(),
                     agent_name: "coda".into(),
                     reply_target: None,
-                    messages: vec![Message::User(UserMessage("recent session".into()))],
+                    messages: vec![Message::User(UserMessage::text("recent session"))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),

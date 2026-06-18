@@ -161,7 +161,12 @@ pub struct Receiver {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnvelopeBody {
-    Task(String),
+    Task {
+        task: String,
+        /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// Call agent as a tool
     ToolCall {
         call_id: String,

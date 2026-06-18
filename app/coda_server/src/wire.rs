@@ -159,11 +159,14 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<ReasoningEffort>,
     },
-    /// Start a new turn with a user task.
+    /// Start a new turn with a user task, optionally with image attachments.
     Task {
         workspace_id: String,
         session_id: String,
         task: String,
+        /// Base64 data-URIs (`data:image/<fmt>;base64,<b64>`) or HTTPS URLs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     /// Answer a suspended tool call. `agent_name` and `thread_id` come from the
     /// [`PendingApproval`] carried by a [`ServerMessage::Event`] `Suspended`.
@@ -258,7 +261,7 @@ pub enum ServerMessage {
 
 /// A model the dashboard can pick, grouped under a provider. `reasoning_efforts`
 /// lists the effort levels the model offers; empty means it has no reasoning
-/// controls.
+/// controls. `supports_vision` indicates whether image attachments are accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfoWire {
     pub id: String,
@@ -267,6 +270,8 @@ pub struct ProviderInfoWire {
     pub model: String,
     pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +305,7 @@ mod tests {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             task: "hello".into(),
+            images: vec![],
         })
         .unwrap();
         assert_eq!(
@@ -459,6 +465,7 @@ mod tests {
                 model: "deepseek-reasoner".into(),
                 context_window: 128_000,
                 reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                supports_vision: false,
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),
         };

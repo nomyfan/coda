@@ -12,8 +12,47 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMessage(pub String);
 
+/// A single piece of multimodal user content: plain text or an image.
+///
+/// Images are passed as data URIs (`data:image/<fmt>;base64,<b64>`) or HTTPS
+/// URLs. The provider receives them without a `detail` hint so it applies its
+/// own default (equivalent to `"auto"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserMessage(pub String);
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    Image { url: String },
+}
+
+/// A user-turn message whose content may include text and/or images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessage {
+    pub parts: Vec<ContentPart>,
+}
+
+impl UserMessage {
+    /// Construct a text-only message.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            parts: vec![ContentPart::Text { text: text.into() }],
+        }
+    }
+
+    /// Construct a message with text followed by zero or more image data-URIs.
+    pub fn with_images(text: impl Into<String>, images: &[String]) -> Self {
+        let mut parts = vec![ContentPart::Text { text: text.into() }];
+        parts.extend(images.iter().map(|url| ContentPart::Image { url: url.clone() }));
+        Self { parts }
+    }
+
+    /// Return the first text part, used for session-list previews.
+    pub fn first_text(&self) -> Option<&str> {
+        self.parts.iter().find_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+    }
+}
 
 /// A message representing a response from the AI, which may include tool calls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -479,7 +479,7 @@ impl LLMProvider for TestProvider {
 
 fn last_user(messages: &[Message]) -> Option<&str> {
     messages.iter().rev().find_map(|message| match message {
-        Message::User(user) => Some(user.0.as_str()),
+        Message::User(user) => user.first_text(),
         _ => None,
     })
 }
@@ -514,7 +514,7 @@ fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
             thread_id: thread_id.clone(),
         },
         reply_to: None,
-        body: EnvelopeBody::Task(task.into()),
+        body: EnvelopeBody::Task { task: task.into(), images: vec![] },
     })
 }
 
