@@ -199,7 +199,7 @@ function SessionRow({
             <StatusDot tone="busy" motion="breathe" />
           </span>
         ) : (
-          <CircleSmall className="size-4 shrink-0 text-muted-foreground" />
+          <CircleSmall className="size-4 shrink-0 text-muted-foreground scale-75" />
         )}
         <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
       </Button>
