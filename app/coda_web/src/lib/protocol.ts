@@ -46,9 +46,13 @@ export type ToolMessage = {
   outcome: ToolCallOutcome;
 };
 
+export type ContentPart = { type: "text"; text: string } | { type: "image"; url: string };
+
+export type UserMessage = { parts: ContentPart[] };
+
 export type HistoryMessage =
   | { System: string }
-  | { User: string }
+  | { User: UserMessage }
   | { Assistant: AssistantMessage }
   | { Tool: ToolMessage };
 
@@ -93,6 +97,7 @@ export type ProviderInfo = {
   model: string;
   context_window: number;
   reasoning_efforts: ReasoningEffort[];
+  supports_vision: boolean;
 };
 
 export type ClientMessage =
@@ -105,7 +110,7 @@ export type ClientMessage =
       provider_id?: string;
       reasoning_effort?: ReasoningEffort | null;
     }
-  | { type: "task"; workspace_id: string; session_id: string; task: string }
+  | { type: "task"; workspace_id: string; session_id: string; task: string; images?: string[] }
   | {
       type: "resume";
       workspace_id: string;

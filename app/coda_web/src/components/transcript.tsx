@@ -13,6 +13,7 @@ import {
   TerminalSquare,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
+import { ImageLightbox } from "@/components/image-lightbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -536,18 +537,50 @@ function disclosureTitle(entry: TranscriptEntry) {
   return entryTitle(entry);
 }
 
+function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+
+  return (
+    <div className="group/message flex flex-col items-end">
+      <div className="max-w-[82%] space-y-2">
+        {entry.images && entry.images.length > 0 && (
+          <div className="flex flex-wrap justify-end gap-2">
+            {entry.images.map((src, index) => (
+              <button
+                key={index}
+                type="button"
+                title="View full size"
+                onClick={() => setLightboxSrc(src)}
+                className="block"
+              >
+                <img
+                  src={src}
+                  alt={`Image ${index + 1}`}
+                  className="h-20 w-20 rounded-md border border-border/40 object-cover shadow-sm"
+                />
+              </button>
+            ))}
+          </div>
+        )}
+        {entry.content && (
+          <div className="rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
+            <Markdown>{entry.content}</Markdown>
+          </div>
+        )}
+      </div>
+      <MessageActions content={entry.content} label="message" align="end" />
+      {lightboxSrc && (
+        <ImageLightbox src={lightboxSrc} open={true} onClose={() => setLightboxSrc(null)} />
+      )}
+    </div>
+  );
+}
+
 function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
   if (entry.kind === "user") {
-    return (
-      <div className="group/message flex flex-col items-end">
-        <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
-          <Markdown>{entry.content}</Markdown>
-        </div>
-        <MessageActions content={entry.content} label="message" align="end" />
-      </div>
-    );
+    return <UserMessageBubble entry={entry} />;
   }
 
   const tone =
