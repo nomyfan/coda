@@ -19,7 +19,10 @@ export function formatClockTime(iso: string | null | undefined): string | undefi
   if (ms === undefined) {
     return undefined;
   }
-  return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const date = new Date(ms);
+  const hour = date.getHours().toString().padStart(2, "0");
+  const minute = date.getMinutes().toString().padStart(2, "0");
+  return `${hour}:${minute}`;
 }
 
 /**
@@ -39,11 +42,12 @@ export function formatDuration(
   if (ms < 1000) {
     return `${Math.round(ms)}ms`;
   }
-  const seconds = ms / 1000;
-  if (seconds < 60) {
-    return `${seconds.toFixed(1)}s`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds >= 60) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainder = totalSeconds % 60;
+    return `${minutes}m ${remainder}s`;
   }
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.round(seconds - minutes * 60);
-  return `${minutes}m ${remainder}s`;
+  const seconds = ms / 1000;
+  return `${seconds.toFixed(1)}s`;
 }
