@@ -30,11 +30,15 @@ import {
   useCodaStore,
 } from "@/store/session";
 import { isSubAgentToolName, subAgentDisplayName } from "@/lib/protocol";
-import { cn } from "@/lib/utils";
+import { cn, formatClockTime, formatDuration } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
 
 const ROOT_AGENT = "coda";
+
+/** Reveal-on-hover, matching the message action buttons' fade-in behavior. */
+const HOVER_REVEAL =
+  "opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100";
 
 /** A sub-agent's own events (its inner LLM turns, reasoning, tool calls). */
 function isSubAgentEntry(entry: TranscriptEntry) {
@@ -199,6 +203,30 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
     return null;
   }
   return <span className="truncate font-mono text-xs text-muted-foreground">{entry.detail}</span>;
+}
+
+/** Wall-clock time and/or elapsed duration for a message, e.g. `14:03 · 3.2s`. */
+function EntryTiming({
+  entry,
+  showTime = true,
+  className,
+}: {
+  entry: TranscriptEntry;
+  showTime?: boolean;
+  className?: string;
+}) {
+  const time = showTime ? formatClockTime(entry.startedAt) : undefined;
+  const duration = formatDuration(entry.startedAt, entry.endedAt);
+  if (!time && !duration) {
+    return null;
+  }
+  return (
+    <span className={cn("shrink-0 text-xs text-muted-foreground tabular-nums", className)}>
+      {time}
+      {time && duration ? " · " : null}
+      {duration}
+    </span>
+  );
 }
 
 function EntryStatus({ entry }: { entry: TranscriptEntry }) {
@@ -476,7 +504,10 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
         </div>
       </article>
       {finalAssistant ? (
-        <MessageActions content={finalAssistant.content} label="response" align="start" />
+        <div className="flex items-center gap-1">
+          <MessageActions content={finalAssistant.content} label="response" align="start" />
+          <EntryTiming entry={finalAssistant} className={cn("px-1", HOVER_REVEAL)} />
+        </div>
       ) : null}
     </div>
   );
@@ -499,6 +530,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
             <span className="shrink-0 truncate text-sm">{title}</span>
             <EntryDetail entry={entry} />
           </div>
+          <EntryTiming entry={entry} showTime={false} />
           <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
             <div className="flex justify-end">
               <EntryStatus entry={entry} />
@@ -578,7 +610,10 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
             </div>
           )}
         </div>
-        <MessageActions content={entry.content} label="message" align="end" />
+        <div className="flex items-center justify-end gap-1">
+          <EntryTiming entry={entry} className={cn("px-1", HOVER_REVEAL)} />
+          <MessageActions content={entry.content} label="message" align="end" />
+        </div>
         {lightboxIndex !== null && entry.images && (
           <ImageLightbox
             images={entry.images}
@@ -628,6 +663,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
               <EntryDetail entry={entry} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
+              <EntryTiming entry={entry} showTime={false} />
               <EntryStatus entry={entry} />
               <CollapsibleTrigger asChild>
                 <Button
@@ -669,7 +705,10 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
           <Markdown>{entry.content}</Markdown>
         </article>
-        <MessageActions content={entry.content} label="response" align="start" />
+        <div className="flex items-center gap-1">
+          <MessageActions content={entry.content} label="response" align="start" />
+          <EntryTiming entry={entry} className={cn("px-1", HOVER_REVEAL)} />
+        </div>
       </div>
     );
   }

@@ -296,6 +296,7 @@ name = "coda_core"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "jiff",
  "serde",
  "serde_json",
  "tracing",

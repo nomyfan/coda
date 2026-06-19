@@ -400,12 +400,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .position(|call| &call.call_id == call_id)
                             {
                                 let tc = tool_execution.pending_replies.remove(pos);
-                                let tool_message = ToolMessage {
-                                    id: tc.call_id,
-                                    name: tc.tool_name,
-                                    output: output.clone(),
-                                    outcome: tc.outcome,
-                                };
+                                let tool_message = ToolMessage::new(
+                                    tc.call_id,
+                                    tc.tool_name,
+                                    output.clone(),
+                                    tc.outcome,
+                                    tc.started_at,
+                                );
                                 self.agent
                                     .add_message(Message::Tool(tool_message.clone()))
                                     .await;
@@ -432,15 +433,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             );
                             for pending in tool_execution.pending_replies.drain(..) {
                                 self.agent
-                                    .add_message(Message::Tool(ToolMessage {
-                                        id: pending.call_id,
-                                        name: pending.tool_name,
-                                        output: ToolOutput::Err(
+                                    .add_message(Message::Tool(ToolMessage::new(
+                                        pending.call_id,
+                                        pending.tool_name,
+                                        ToolOutput::Err(
                                             "Tool execution was interrupted by the user"
                                                 .to_string(),
                                         ),
-                                        outcome: ToolCallOutcome::Aborted,
-                                    }))
+                                        ToolCallOutcome::Aborted,
+                                        pending.started_at,
+                                    )))
                                     .await;
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
@@ -477,26 +479,28 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         );
                         for tc in pending_approval_calls.drain(..) {
                             self.agent
-                                .add_message(Message::Tool(ToolMessage {
-                                    id: tc.id,
-                                    name: tc.name,
-                                    output: ToolOutput::Err(
+                                .add_message(Message::Tool(ToolMessage::new(
+                                    tc.id,
+                                    tc.name,
+                                    ToolOutput::Err(
                                         "Tool execution was interrupted by the user".to_string(),
                                     ),
-                                    outcome: ToolCallOutcome::Aborted,
-                                }))
+                                    ToolCallOutcome::Aborted,
+                                    None,
+                                )))
                                 .await;
                         }
                         for tc in pending_calls.drain(..) {
                             self.agent
-                                .add_message(Message::Tool(ToolMessage {
-                                    id: tc.tool_call.id,
-                                    name: tc.tool_call.name,
-                                    output: ToolOutput::Err(
+                                .add_message(Message::Tool(ToolMessage::new(
+                                    tc.tool_call.id,
+                                    tc.tool_call.name,
+                                    ToolOutput::Err(
                                         "Tool execution was interrupted by the user".to_string(),
                                     ),
-                                    outcome: ToolCallOutcome::Aborted,
-                                }))
+                                    ToolCallOutcome::Aborted,
+                                    None,
+                                )))
                                 .await;
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
@@ -521,12 +525,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     });
                                 }
                                 ToolCallResolution::Resolved(output) => {
-                                    let tool_message = ToolMessage {
-                                        id: tc.id,
-                                        name: tc.name,
+                                    let tool_message = ToolMessage::new(
+                                        tc.id,
+                                        tc.name,
                                         output,
-                                        outcome: ToolCallOutcome::Resolved,
-                                    };
+                                        ToolCallOutcome::Resolved,
+                                        None,
+                                    );
                                     self.agent
                                         .add_message(Message::Tool(tool_message.clone()))
                                         .await;
@@ -539,16 +544,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                         .await;
                                 }
                                 ToolCallResolution::Rejected { reason } => {
-                                    let tool_message = ToolMessage {
-                                        id: tc.id,
-                                        name: tc.name,
-                                        output: ToolOutput::Err(
+                                    let tool_message = ToolMessage::new(
+                                        tc.id,
+                                        tc.name,
+                                        ToolOutput::Err(
                                             reason
                                                 .clone()
                                                 .unwrap_or_else(|| "Rejected by user".to_string()),
                                         ),
-                                        outcome: ToolCallOutcome::Rejected { reason },
-                                    };
+                                        ToolCallOutcome::Rejected { reason },
+                                        None,
+                                    );
                                     self.agent
                                         .add_message(Message::Tool(tool_message.clone()))
                                         .await;
@@ -596,6 +602,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 tools
             },
         };
+        let started_at = jiff::Timestamp::now();
         self.runtime
             .emit_event(
                 self.agent.name.clone(),
@@ -607,12 +614,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let mut llm_stream = std::pin::pin!(self.config.profile.provider.stream(request));
         let mut partial_content = String::new();
         let mut partial_reasoning = String::new();
+        let mut reasoning_ended_at: Option<jiff::Timestamp> = None;
         let llm_result = loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
                     self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::Aborted(AbortedTarget::Generation)).await;
                     if !partial_content.is_empty() || !partial_reasoning.is_empty() {
+                        let ended_at = jiff::Timestamp::now();
+                        let has_reasoning = !partial_reasoning.is_empty();
                         let content = if partial_content.is_empty() {
                             "[Generation was interrupted by the user]".to_string()
                         } else {
@@ -620,8 +630,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         };
                         self.agent.add_message(Message::Assistant(coda_core::llm::AssistantMessage {
                             content,
-                            reasoning_content: (!partial_reasoning.is_empty()).then_some(partial_reasoning),
+                            reasoning_content: has_reasoning.then_some(partial_reasoning),
+                            reasoning_ended_at: has_reasoning.then_some(reasoning_ended_at.unwrap_or(ended_at)),
                             aborted: true,
+                            started_at: Some(started_at),
+                            ended_at: Some(ended_at),
                             ..Default::default()
                         })).await;
                     }
@@ -631,6 +644,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 event = llm_stream.next() => {
                     match event {
                         Some(Ok(LLMStreamEvent::ContentChunk(chunk))) => {
+                            if !partial_reasoning.is_empty() && reasoning_ended_at.is_none() {
+                                reasoning_ended_at = Some(jiff::Timestamp::now());
+                            }
                             partial_content.push_str(&chunk);
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
                         }
@@ -649,7 +665,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
         };
         match llm_result {
-            Ok(assistant_message) => {
+            Ok(mut assistant_message) => {
+                let ended_at = jiff::Timestamp::now();
+                if assistant_message.reasoning_content.is_some() {
+                    assistant_message.reasoning_ended_at =
+                        Some(reasoning_ended_at.unwrap_or(ended_at));
+                }
+                assistant_message.started_at = Some(started_at);
+                assistant_message.ended_at = Some(ended_at);
                 self.agent
                     .add_message(Message::Assistant(assistant_message.clone()))
                     .await;
@@ -771,7 +794,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let concurrent_stateful =
             concurrent_stateful_subagents(self.agent, &tool_execution.tool_calls);
         // Tracks local tool calls that have not yet completed, keyed by tool call id.
-        let mut pending_local: HashMap<String, PendingToolCall> = HashMap::new();
+        // The timestamp records when execution began, for the result's duration.
+        let mut pending_local: HashMap<String, (PendingToolCall, jiff::Timestamp)> = HashMap::new();
         let mut futures = futures::stream::FuturesUnordered::new();
         for tc in &tool_execution.tool_calls {
             if let Some(subagent) = self.agent.subagents.get(&tc.tool_call.name) {
@@ -780,12 +804,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 {
                     // reject concurrent calls to stateful subagent
                     self.agent
-                    .add_message(Message::Tool(ToolMessage {
-                        id: tc.tool_call.id.clone(),
-                        name: tc.tool_call.name.clone(),
-                        output: ToolOutput::Err(format!("Concurrent invocation of sub-agent '{}' is not allowed. Call it sequentially.", tc.tool_call.name)),
-                        outcome: tc.outcome.clone()
-                    })).await;
+                    .add_message(Message::Tool(ToolMessage::new(
+                        tc.tool_call.id.clone(),
+                        tc.tool_call.name.clone(),
+                        ToolOutput::Err(format!("Concurrent invocation of sub-agent '{}' is not allowed. Call it sequentially.", tc.tool_call.name)),
+                        tc.outcome.clone(),
+                        None,
+                    ))).await;
                     continue;
                 }
 
@@ -830,15 +855,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         tc.tool_call.name, err
                     );
                     self.agent
-                        .add_message(Message::Tool(ToolMessage {
-                            id: tc.tool_call.id.clone(),
-                            name: tc.tool_call.name.clone(),
-                            output: ToolOutput::Err(format!(
+                        .add_message(Message::Tool(ToolMessage::new(
+                            tc.tool_call.id.clone(),
+                            tc.tool_call.name.clone(),
+                            ToolOutput::Err(format!(
                                 "Failed to dispatch to subagent '{}': {}",
                                 tc.tool_call.name, err
                             )),
-                            outcome: tc.outcome.clone(),
-                        }))
+                            tc.outcome.clone(),
+                            None,
+                        )))
                         .await;
                 } else {
                     self.runtime
@@ -852,9 +878,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         call_id: tc.tool_call.id.clone(),
                         tool_name: tc.tool_call.name.clone(),
                         outcome: tc.outcome.clone(),
+                        started_at: Some(jiff::Timestamp::now()),
                     });
                 }
             } else if let Some(tool) = self.agent.tools.get(&tc.tool_call.name) {
+                let started_at = jiff::Timestamp::now();
                 self.runtime
                     .emit_event(
                         self.agent.name.clone(),
@@ -862,24 +890,25 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         AgentEvent::ToolCallStart(tc.tool_call.clone()),
                     )
                     .await;
-                pending_local.insert(tc.tool_call.id.clone(), tc.clone());
+                pending_local.insert(tc.tool_call.id.clone(), (tc.clone(), started_at));
                 let tc = tc.clone();
                 let future = async move {
                     let output = tool
                         .execute(tc.tool_call.arguments.clone().unwrap_or_default())
                         .await;
-                    (tc, output)
+                    (tc, started_at, output)
                 };
                 futures.push(future);
             } else {
                 // No such tool
                 self.agent
-                    .add_message(Message::Tool(ToolMessage {
-                        id: tc.tool_call.id.clone(),
-                        name: tc.tool_call.name.clone(),
-                        output: ToolOutput::Err(format!("No such tool: {}", tc.tool_call.name)),
-                        outcome: tc.outcome.clone(),
-                    }))
+                    .add_message(Message::Tool(ToolMessage::new(
+                        tc.tool_call.id.clone(),
+                        tc.tool_call.name.clone(),
+                        ToolOutput::Err(format!("No such tool: {}", tc.tool_call.name)),
+                        tc.outcome.clone(),
+                        None,
+                    )))
                     .await;
             }
         }
@@ -900,17 +929,18 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break true,
-                Some((tc, result)) = futures.next() => {
+                Some((tc, started_at, result)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    let message = ToolMessage {
-                        id: tc.tool_call.id,
-                        name: tc.tool_call.name,
-                        output: match result {
+                    let message = ToolMessage::new(
+                        tc.tool_call.id,
+                        tc.tool_call.name,
+                        match result {
                             Ok(output) => ToolOutput::Ok(output),
                             Err(err) => ToolOutput::Err(format!("Tool execution error: {}", err)),
                         },
-                        outcome: tc.outcome,
-                    };
+                        tc.outcome,
+                        Some(started_at),
+                    );
                     self.agent.add_message(Message::Tool(message.clone())).await;
                     self.runtime.emit_event(
                         self.agent.name.clone(),
@@ -924,30 +954,28 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 
         if aborted {
             let mut aborted_ids: Vec<String> = pending_local.keys().cloned().collect();
-            for (id, tc) in pending_local {
+            for (id, (tc, started_at)) in pending_local {
                 self.agent
-                    .add_message(Message::Tool(ToolMessage {
+                    .add_message(Message::Tool(ToolMessage::new(
                         id,
-                        name: tc.tool_call.name,
-                        output: ToolOutput::Err(
-                            "Tool execution was interrupted by the user".to_string(),
-                        ),
-                        outcome: ToolCallOutcome::Aborted,
-                    }))
+                        tc.tool_call.name,
+                        ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
+                        ToolCallOutcome::Aborted,
+                        Some(started_at),
+                    )))
                     .await;
             }
             // Also write aborted ToolMessages for any pending subagent replies.
             for pending in tool_execution.pending_replies.drain(..) {
                 aborted_ids.push(pending.call_id.clone());
                 self.agent
-                    .add_message(Message::Tool(ToolMessage {
-                        id: pending.call_id,
-                        name: pending.tool_name,
-                        output: ToolOutput::Err(
-                            "Tool execution was interrupted by the user".to_string(),
-                        ),
-                        outcome: ToolCallOutcome::Aborted,
-                    }))
+                    .add_message(Message::Tool(ToolMessage::new(
+                        pending.call_id,
+                        pending.tool_name,
+                        ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
+                        ToolCallOutcome::Aborted,
+                        pending.started_at,
+                    )))
                     .await;
             }
             self.runtime

@@ -535,6 +535,9 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
             usage: value.usage,
             reasoning_content,
             aborted: false,
+            // Timestamps are stamped by the agent runtime, which knows when the
+            // request was dispatched and when the stream completed.
+            ..Default::default()
         })
     }
 }
