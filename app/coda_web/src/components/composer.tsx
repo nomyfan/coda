@@ -71,7 +71,8 @@ export const Composer = memo(function Composer({
 }) {
   const [task, setTask] = useState("");
   const [images, setImages] = useState<string[]>([]);
-  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const thumbRefs = useRef(new Map<number, HTMLButtonElement>());
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -167,11 +168,15 @@ export const Composer = memo(function Composer({
             {images.map((src, index) => (
               <div key={index} className="group relative">
                 <button
+                  ref={(el) => {
+                    if (el) thumbRefs.current.set(index, el);
+                    else thumbRefs.current.delete(index);
+                  }}
                   type="button"
                   className="block"
                   title="View full size"
                   aria-label={`View attachment ${index + 1} full size`}
-                  onClick={() => setLightboxSrc(src)}
+                  onClick={() => setLightboxIndex(index)}
                 >
                   <img
                     src={src}
@@ -328,8 +333,13 @@ export const Composer = memo(function Composer({
           </div>
         </div>
       ) : null}
-      {lightboxSrc && (
-        <ImageLightbox src={lightboxSrc} open={true} onClose={() => setLightboxSrc(null)} />
+      {lightboxIndex !== null && (
+        <ImageLightbox
+          images={images}
+          initialIndex={lightboxIndex}
+          getThumbRect={(i) => thumbRefs.current.get(i)?.getBoundingClientRect() ?? null}
+          onClose={() => setLightboxIndex(null)}
+        />
       )}
     </form>
   );

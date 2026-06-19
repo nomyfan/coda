@@ -538,7 +538,8 @@ function disclosureTitle(entry: TranscriptEntry) {
 }
 
 function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
-  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const thumbRefs = useRef(new Map<number, HTMLButtonElement>());
 
   return (
     <div className="group/message flex flex-col items-end">
@@ -548,10 +549,14 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
             {entry.images.map((src, index) => (
               <button
                 key={index}
+                ref={(el) => {
+                  if (el) thumbRefs.current.set(index, el);
+                  else thumbRefs.current.delete(index);
+                }}
                 type="button"
                 title="View full size"
                 aria-label={`View image ${index + 1} full size`}
-                onClick={() => setLightboxSrc(src)}
+                onClick={() => setLightboxIndex(index)}
                 className="block"
               >
                 <img
@@ -570,8 +575,13 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
         )}
       </div>
       <MessageActions content={entry.content} label="message" align="end" />
-      {lightboxSrc && (
-        <ImageLightbox src={lightboxSrc} open={true} onClose={() => setLightboxSrc(null)} />
+      {lightboxIndex !== null && entry.images && (
+        <ImageLightbox
+          images={entry.images}
+          initialIndex={lightboxIndex}
+          getThumbRect={(i) => thumbRefs.current.get(i)?.getBoundingClientRect() ?? null}
+          onClose={() => setLightboxIndex(null)}
+        />
       )}
     </div>
   );
