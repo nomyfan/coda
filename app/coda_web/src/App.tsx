@@ -177,7 +177,7 @@ export default function App() {
   }, []);
 
   const handleSend = useCallback(
-    (task: string) => {
+    (task: string, images: string[] = []) => {
       const target = newSessionStore.getState().target;
       if (target) {
         rememberNewSessionTarget(target);
@@ -187,11 +187,12 @@ export default function App() {
           task,
           newSessionModel?.providerId,
           newSessionModel?.reasoningEffort ?? null,
+          images,
         );
         clearNewSessionTarget();
         return;
       }
-      sendTask(task);
+      sendTask(task, images);
     },
     [newSessionModel],
   );

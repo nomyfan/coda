@@ -12,8 +12,65 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMessage(pub String);
 
+/// A single piece of multimodal user content: plain text or an image.
+///
+/// Images are passed as data URIs (`data:image/<fmt>;base64,<b64>`) or HTTPS
+/// URLs. The provider receives them without a `detail` hint so it applies its
+/// own default (equivalent to `"auto"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserMessage(pub String);
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    Image { url: String },
+}
+
+/// A user-turn message whose content may include text and/or images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessage {
+    pub parts: Vec<ContentPart>,
+}
+
+impl UserMessage {
+    /// Construct a text-only message.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            parts: vec![ContentPart::Text { text: text.into() }],
+        }
+    }
+
+    /// Construct a message with optional text and zero or more image URLs
+    /// (data-URIs or HTTPS URLs). An empty `text` produces a pure-image
+    /// message with no text part, since some providers reject empty text parts.
+    pub fn with_images(text: impl Into<String>, images: &[String]) -> Self {
+        let text = text.into();
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        parts.extend(
+            images
+                .iter()
+                .map(|url| ContentPart::Image { url: url.clone() }),
+        );
+        Self { parts }
+    }
+
+    /// Return the first text part, used for session-list previews.
+    pub fn first_text(&self) -> Option<&str> {
+        self.parts.iter().find_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+    }
+
+    /// Whether the message carries at least one image part. Used to render a
+    /// list preview for image-only turns that have no text.
+    pub fn has_image(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. }))
+    }
+}
 
 /// A message representing a response from the AI, which may include tool calls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -167,6 +224,16 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+}
+
+/// An input modality a model can accept. Provider-agnostic. Every model accepts
+/// `Text`; richer modalities (e.g. `Image`) are opt-in per model and gate the
+/// corresponding UI affordances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modality {
+    Text,
+    Image,
 }
 
 #[derive(Debug, Clone, Default)]

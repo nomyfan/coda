@@ -8,7 +8,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     Shutdown, SystemPrompt, runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, ReasoningEffort};
+use coda_core::llm::{LLMProviderConfig, Modality, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
     agents::{AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
@@ -55,6 +55,8 @@ struct ProviderHandle {
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
+    /// Input kinds this model accepts (always includes text; image enables attachments).
+    input_modalities: Vec<Modality>,
 }
 
 struct WorkspaceState {
@@ -110,6 +112,12 @@ enum OpenedSession {
     Pending(Vec<coda_agent::PendingApproval>),
 }
 
+const MAX_TASK_IMAGES: usize = 5;
+const MAX_TASK_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TASK_IMAGE_URL_BYTES: usize = 2048;
+const ACCEPTED_TASK_IMAGE_MIME_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
 enum SessionEnvelope {
     Event {
         workspace_id: String,
@@ -122,6 +130,63 @@ enum SessionEnvelope {
         session_id: String,
         generation: u64,
     },
+}
+
+fn sanitize_task_images(images: Vec<String>) -> Vec<String> {
+    images
+        .into_iter()
+        .filter(|image| task_image_is_allowed(image))
+        .take(MAX_TASK_IMAGES)
+        .collect()
+}
+
+fn task_image_is_allowed(image: &str) -> bool {
+    if image.starts_with("https://") {
+        return image.len() <= MAX_TASK_IMAGE_URL_BYTES;
+    }
+
+    task_image_data_uri_decoded_len(image).is_some_and(|len| len <= MAX_TASK_IMAGE_BYTES)
+}
+
+fn task_image_data_uri_decoded_len(image: &str) -> Option<usize> {
+    let (metadata, payload) = image.split_once(',')?;
+    let mime_type = metadata.strip_prefix("data:")?.strip_suffix(";base64")?;
+
+    if !ACCEPTED_TASK_IMAGE_MIME_TYPES.contains(&mime_type) || payload.is_empty() {
+        return None;
+    }
+
+    if payload.len() % 4 != 0 {
+        return None;
+    }
+
+    let padding = payload
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'=')
+        .count();
+    if padding > 2 {
+        return None;
+    }
+
+    let unpadded = payload.len() - padding;
+    if payload.as_bytes()[..unpadded].contains(&b'=') {
+        return None;
+    }
+
+    if !payload
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
+
+    payload
+        .len()
+        .checked_mul(3)?
+        .checked_div(4)?
+        .checked_sub(padding)
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -376,6 +441,50 @@ mod selection_tests {
             None
         );
     }
+
+    #[test]
+    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
+        let images = (0..(MAX_TASK_IMAGES + 1))
+            .map(|index| format!("https://example.com/{index}.png"))
+            .collect();
+
+        let sanitized = sanitize_task_images(images);
+
+        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
+        assert_eq!(sanitized[0], "https://example.com/0.png");
+        assert_eq!(sanitized[4], "https://example.com/4.png");
+    }
+
+    #[test]
+    fn task_image_sanitizer_accepts_supported_data_uri_images() {
+        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
+
+        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
+    }
+
+    #[test]
+    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
+        let oversized_url = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
+        );
+        let oversized_data = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
+        );
+        let images = vec![
+            "http://example.com/image.png".to_string(),
+            "data:text/plain;base64,AAAA".to_string(),
+            "data:image/png;base64,AAA".to_string(),
+            "data:image/png;base64,AA=A".to_string(),
+            oversized_url,
+            oversized_data,
+        ];
+
+        let sanitized = sanitize_task_images(images);
+
+        assert!(sanitized.is_empty());
+    }
 }
 
 /// The selectable models, sorted by id for a stable dashboard ordering. Each
@@ -390,6 +499,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
             model: handle.model_name.clone(),
             context_window: handle.context_window,
             reasoning_efforts: handle.reasoning_efforts.clone(),
+            input_modalities: handle.input_modalities.clone(),
         })
         .collect();
     infos.sort_by(|a, b| a.id.cmp(&b.id));
@@ -712,15 +822,43 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
             task,
+            images,
         } => {
-            if let Some(active_session) =
-                active.get_mut(&(workspace_id.clone(), session_id.clone()))
-            {
-                if let Err(err) = active_session.session.send(task).await {
-                    warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
-                } else {
-                    active_session.turn_running = true;
-                }
+            let Some(active_session) = active.get_mut(&(workspace_id.clone(), session_id.clone()))
+            else {
+                return true;
+            };
+            // Reject image input when the active model does not accept it. The
+            // frontend already disables image sends for such models, so reaching
+            // here means a UI bypass — surface an error rather than silently
+            // dropping the attachments.
+            let accepts_images = app
+                .providers
+                .get(&active_session.provider_id)
+                .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
+            if !accepts_images && !images.is_empty() {
+                let event = WireEvent::Error {
+                    agent_name: String::new(),
+                    thread_id: session_id.clone(),
+                    message: "the selected model does not accept image input".to_string(),
+                };
+                return transport
+                    .send(&ServerMessage::Event {
+                        workspace_id,
+                        session_id,
+                        event,
+                    })
+                    .await;
+            }
+            let images = sanitize_task_images(images);
+            let task = task.trim().to_string();
+            if task.is_empty() && images.is_empty() {
+                return true;
+            }
+            if let Err(err) = active_session.session.send(task, images).await {
+                warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
+            } else {
+                active_session.turn_running = true;
             }
             true
         }
@@ -1314,6 +1452,7 @@ async fn main() {
                     context_window: m.context_window,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
+                    input_modalities: m.input_modalities,
                 };
                 (id, Arc::new(handle))
             })

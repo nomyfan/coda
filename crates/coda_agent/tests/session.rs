@@ -31,7 +31,7 @@ fn last_user_text(messages: &[Message]) -> &str {
         .iter()
         .rev()
         .find_map(|m| match m {
-            Message::User(u) => Some(u.0.as_str()),
+            Message::User(u) => u.first_text(),
             _ => None,
         })
         .unwrap_or("")
@@ -407,7 +407,7 @@ async fn should_reply_with_text_when_no_tools_needed() {
         .await
         .expect("open session");
 
-    session.send("simple hello").await.expect("send");
+    session.send("simple hello", vec![]).await.expect("send");
 
     let reply = collect_until_done(&session).await;
     assert_eq!(reply, "Hello from the agent!");
@@ -441,7 +441,7 @@ async fn should_read_file_via_tool_call() {
         .expect("open session");
 
     let task = format!("read file at {}", file_path.display());
-    session.send(task).await.expect("send");
+    session.send(task, vec![]).await.expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -477,7 +477,7 @@ async fn should_write_and_read_back_file() {
         .expect("open session");
 
     let task = format!("write then read {}", file_path.display());
-    session.send(task).await.expect("send");
+    session.send(task, vec![]).await.expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -522,7 +522,10 @@ async fn should_delegate_to_explore_subagent() {
         .await
         .expect("open session");
 
-    session.send("delegate to explore").await.expect("send");
+    session
+        .send("delegate to explore", vec![])
+        .await
+        .expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -548,13 +551,16 @@ async fn should_maintain_history_across_turns() {
         .expect("open session");
 
     // Turn 1
-    session.send("multi turn start").await.expect("send turn 1");
+    session
+        .send("multi turn start", vec![])
+        .await
+        .expect("send turn 1");
     let reply1 = collect_until_done(&session).await;
     assert_eq!(reply1, "turn-1-reply");
 
     // Turn 2
     session
-        .send("multi turn follow")
+        .send("multi turn follow", vec![])
         .await
         .expect("send turn 2");
     let reply2 = collect_until_done(&session).await;
@@ -585,7 +591,10 @@ async fn should_resume_from_prior_checkpoint() {
         .await
         .expect("open session 1");
 
-    session1.send("resume test start").await.expect("send");
+    session1
+        .send("resume test start", vec![])
+        .await
+        .expect("send");
     let reply1 = collect_until_done(&session1).await;
     assert_eq!(reply1, "session-1-reply");
 
@@ -610,7 +619,7 @@ async fn should_resume_from_prior_checkpoint() {
     let resumed_text: String = resumed
         .iter()
         .filter_map(|m| match m {
-            Message::User(u) => Some(u.0.as_str()),
+            Message::User(u) => u.first_text(),
             Message::Assistant(a) => Some(a.content.as_str()),
             _ => None,
         })
@@ -625,7 +634,10 @@ async fn should_resume_from_prior_checkpoint() {
         "resumed history should contain the first assistant reply, got: {resumed_text}"
     );
 
-    session2.send("resume test follow").await.expect("send");
+    session2
+        .send("resume test follow", vec![])
+        .await
+        .expect("send");
     let reply2 = collect_until_done(&session2).await;
     assert!(
         reply2.contains("session-2-reply"),
@@ -655,7 +667,10 @@ async fn should_execute_tool_after_approval_resume() {
         .await
         .expect("open session");
 
-    session.send("approve read_todos").await.expect("send");
+    session
+        .send("approve read_todos", vec![])
+        .await
+        .expect("send");
 
     let pending = collect_until_suspended(&session).await;
     assert_eq!(pending.calls.len(), 1);
@@ -699,7 +714,10 @@ async fn should_auto_reject_when_approval_times_out() {
         .await
         .expect("open session 1");
 
-    session1.send("timeout approval").await.expect("send");
+    session1
+        .send("timeout approval", vec![])
+        .await
+        .expect("send");
 
     let pending = collect_until_suspended(&session1).await;
     assert_eq!(pending.calls[0].name, "read_todos");

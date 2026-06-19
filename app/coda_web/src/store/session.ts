@@ -43,6 +43,8 @@ export type TranscriptEntry = {
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
   content: string;
+  /** Image URLs attached to a user message (base64 data-URIs or HTTPS URLs). */
+  images?: string[];
   status?: string;
   liveKey?: string;
   callId?: string;
@@ -121,6 +123,11 @@ type SessionRuntimeState = {
 type CodaStoreState = CodaState & SessionRuntimeState;
 
 const rootName = "coda";
+
+/** Session-list title for a turn that carried only images (no text). Kept in
+ * sync with `IMAGE_ONLY_PREVIEW` in the server's `storage.rs` so the optimistic
+ * title matches the one the server persists. */
+const IMAGE_ONLY_TITLE = "[image]";
 
 function newId(prefix: string) {
   return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
@@ -298,11 +305,19 @@ function historyToEntries(
     return [];
   }
   if ("User" in message) {
+    const textContent = message.User.parts
+      .filter((p) => p.type === "text")
+      .map((p) => (p as { type: "text"; text: string }).text)
+      .join("");
+    const images = message.User.parts
+      .filter((p) => p.type === "image")
+      .map((p) => (p as { type: "image"; url: string }).url);
     return [
       {
         id: `history:user:${index}`,
         kind: "user",
-        content: message.User,
+        content: textContent,
+        images: images.length > 0 ? images : undefined,
       },
     ];
   }
@@ -1118,7 +1133,13 @@ function addAllowResultActivity(
   });
 }
 
-function appendUserMessage(store: CodaStore, server: string, key: SessionKey, content: string) {
+function appendUserMessage(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  content: string,
+  images?: string[],
+) {
   updateState(store, (state) => {
     const current = state.servers[server];
     const session = draftSession(state, server, key);
@@ -1126,11 +1147,21 @@ function appendUserMessage(store: CodaStore, server: string, key: SessionKey, co
       return;
     }
     const { workspaceId, sessionId } = splitKey(key);
-    const firstUserMessage = session.firstUserMessage ?? content;
+    // Fall back to an image placeholder when the turn has no text, so the session
+    // shows a title in the list (instead of the raw id) and isn't dropped from
+    // the optimistic catalog, which keys on a non-empty title.
+    const firstUserMessage =
+      session.firstUserMessage ??
+      (content || (images && images.length > 0 ? IMAGE_ONLY_TITLE : ""));
     session.draft = false;
     session.running = true;
     session.firstUserMessage = firstUserMessage;
-    session.entries.push({ id: newId("user"), kind: "user", content });
+    session.entries.push({
+      id: newId("user"),
+      kind: "user",
+      content,
+      images: images && images.length > 0 ? images : undefined,
+    });
     current.catalog = upsertCatalogTitled(
       current.catalog,
       workspaceId,
@@ -1436,10 +1467,13 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
 }
 
-export function sendTask(task: string) {
+export function sendTask(task: string, images: string[] = []) {
   const text = task.trim();
   const active = currentActive();
-  if (!text || !active) {
+  if (!text && images.length === 0) {
+    return;
+  }
+  if (!active) {
     return;
   }
   if (active.session.draft) {
@@ -1451,9 +1485,10 @@ export function sendTask(task: string) {
       workspace_id: active.session.workspaceId,
       session_id: active.session.sessionId,
       task: text,
+      images: images.length > 0 ? images : undefined,
     })
   ) {
-    appendUserMessage(codaStore, active.server, active.session.key, text);
+    appendUserMessage(codaStore, active.server, active.session.key, text, images);
   }
 }
 
@@ -1463,10 +1498,11 @@ export function sendTaskToNewSession(
   task: string,
   providerId?: string,
   reasoningEffort: ReasoningEffort | null = null,
+  images: string[] = [],
 ) {
   const workspace = workspaceId.trim();
   const text = task.trim();
-  if (!server || !workspace || !text) {
+  if (!server || !workspace || (!text && images.length === 0)) {
     return;
   }
   const current = codaStore.getState().servers[server];
@@ -1493,9 +1529,10 @@ export function sendTaskToNewSession(
       workspace_id: workspace,
       session_id: sessionId,
       task: text,
+      images: images.length > 0 ? images : undefined,
     })
   ) {
-    appendUserMessage(codaStore, server, key, text);
+    appendUserMessage(codaStore, server, key, text, images);
   }
 }
 

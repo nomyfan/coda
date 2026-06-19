@@ -7,6 +7,11 @@ use std::pin::Pin;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 
+/// Session-list preview shown for a session whose first user turn carried only
+/// images (no text). Kept in sync with `IMAGE_ONLY_TITLE` in the web store so the
+/// optimistic title and the persisted one match.
+const IMAGE_ONLY_PREVIEW: &str = "[image]";
+
 /// Reject session IDs that are unsafe to use as a path component.
 ///
 /// `session_id` is client-controlled and gets joined under the workspace's
@@ -143,8 +148,16 @@ impl JsonFileStorage {
             .messages
             .into_iter()
             .find_map(|message| match message {
-                Message::User(message) => Some(message.0),
+                Message::User(msg) => Some(msg),
                 _ => None,
+            })
+            .and_then(|msg| match msg.first_text() {
+                Some(text) => Some(text.to_string()),
+                // An image-only first turn has no text; show a placeholder so the
+                // session list doesn't fall back to the raw session id. Keep this
+                // string in sync with `IMAGE_ONLY_TITLE` in the web store.
+                None if msg.has_image() => Some(IMAGE_ONLY_PREVIEW.to_string()),
+                None => None,
             })
     }
 }
@@ -298,7 +311,7 @@ mod tests {
                     thread_id: "active".into(),
                     agent_name: "coda".into(),
                     reply_target: None,
-                    messages: vec![Message::User(UserMessage("recent session".into()))],
+                    messages: vec![Message::User(UserMessage::text("recent session"))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),
@@ -314,6 +327,38 @@ mod tests {
         assert_eq!(
             sessions[0].first_user_message.as_deref(),
             Some("recent session")
+        );
+    }
+
+    #[tokio::test]
+    async fn first_user_message_previews_image_only_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        let session = storage.session("images");
+        fs::create_dir_all(&session.dir).await.unwrap();
+
+        session
+            .save_checkpoint(
+                "images".into(),
+                StoredCheckpoint {
+                    thread_id: "images".into(),
+                    agent_name: "coda".into(),
+                    reply_target: None,
+                    messages: vec![Message::User(UserMessage::with_images(
+                        "",
+                        &["data:image/png;base64,AAAA".to_string()],
+                    ))],
+                    todos: vec![],
+                    resume_point: StoredResumePoint::Generation,
+                    suspended_at: jiff::Timestamp::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.first_user_message("images").await.as_deref(),
+            Some(IMAGE_ONLY_PREVIEW)
         );
     }
 }

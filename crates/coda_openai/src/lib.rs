@@ -4,19 +4,20 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
     CompletionTokensDetails as OpenAICompletionTokensDetails, CreateChatCompletionRequestArgs,
-    FunctionCall, FunctionCallStream, FunctionObject,
+    FunctionCall, FunctionCallStream, FunctionObject, ImageUrl,
     PromptTokensDetails as OpenAIPromptTokensDetails, ReasoningEffort as OpenAIReasoningEffort,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, LLMProvider,
-    LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ReasoningEffort, StreamError,
-    ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, ContentPart,
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ReasoningEffort,
+    StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -36,9 +37,44 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 .into()
             }
             Message::User(user_message) => {
-                //
+                let has_images = user_message
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Image { .. }));
+                let content = if has_images {
+                    let parts = user_message
+                        .parts
+                        .into_iter()
+                        .map(|p| match p {
+                            ContentPart::Text { text } => {
+                                ChatCompletionRequestUserMessageContentPart::Text(
+                                    ChatCompletionRequestMessageContentPartText { text },
+                                )
+                            }
+                            ContentPart::Image { url } => {
+                                ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                                    ChatCompletionRequestMessageContentPartImage {
+                                        image_url: ImageUrl { url, detail: None },
+                                    },
+                                )
+                            }
+                        })
+                        .collect();
+                    ChatCompletionRequestUserMessageContent::Array(parts)
+                } else {
+                    let text = user_message
+                        .parts
+                        .into_iter()
+                        .filter_map(|p| match p {
+                            ContentPart::Text { text } => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    ChatCompletionRequestUserMessageContent::Text(text)
+                };
                 ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(user_message.0),
+                    content,
                     ..Default::default()
                 }
                 .into()
@@ -123,7 +159,10 @@ impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
                 name: self.name,
                 description: Some(self.description),
                 parameters: Some(self.parameter_schema),
-                strict: Some(true),
+                // Strict mode requires every property to be listed in `required` and
+                // `additionalProperties: false`. Arbitrary tool schemas (notably MCP
+                // tools) routinely violate this, so leave it off rather than reject them.
+                strict: None,
             },
         })
     }
@@ -330,10 +369,20 @@ impl LLMProvider for OpenAI {
                     obj.insert("thinking".to_string(), serde_json::json!({ "type": state }));
                 }
             }
-            let mut stream = self.client.chat()
+            let mut stream = match self.client.chat()
                 .create_stream_byot::<_, ReasoningStreamResponse>(body)
                 .await
-                .unwrap();
+            {
+                Ok(stream) => stream,
+                // A non-2xx response (e.g. a 400 over an invalid tool schema) surfaces
+                // here. Some providers return an error body async-openai can't
+                // deserialize (e.g. a numeric `code`), so use the Debug form to keep the
+                // raw provider message instead of the opaque deserialization error.
+                Err(e) => {
+                    yield Err(StreamError::StreamingError(format!("{e:?}")));
+                    return;
+                }
+            };
             let mut chat_completion = ReducedChatCompletion::new();
             while let Some(response) = stream.next().await {
                 match response {
@@ -493,6 +542,47 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_text_message_uses_text_content_form() {
+        let message: ChatCompletionRequestMessage =
+            Message::User(coda_core::llm::UserMessage::text("hello")).into_openai_type();
+
+        let ChatCompletionRequestMessage::User(user) = message else {
+            panic!("expected user message");
+        };
+        assert!(matches!(
+            user.content,
+            ChatCompletionRequestUserMessageContent::Text(text) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn user_image_message_uses_array_content_form() {
+        let image_url = "data:image/png;base64,abc123".to_string();
+        let message: ChatCompletionRequestMessage = Message::User(
+            coda_core::llm::UserMessage::with_images("look", std::slice::from_ref(&image_url)),
+        )
+        .into_openai_type();
+
+        let ChatCompletionRequestMessage::User(user) = message else {
+            panic!("expected user message");
+        };
+        let ChatCompletionRequestUserMessageContent::Array(parts) = user.content else {
+            panic!("expected array content");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            ChatCompletionRequestUserMessageContentPart::Text(text) if text.text == "look"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(image)
+                if image.image_url.url == image_url && image.image_url.detail.is_none()
+        ));
+    }
 
     #[test]
     fn injects_reasoning_only_for_assistant_tool_calls() {

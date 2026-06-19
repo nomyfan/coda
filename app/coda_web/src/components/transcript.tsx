@@ -12,7 +12,13 @@ import {
   Sparkles,
   TerminalSquare,
 } from "lucide-react";
+import { LayoutGroup, motion } from "motion/react";
 import { memo, useEffect, useRef, useState } from "react";
+import {
+  ImageLightbox,
+  IMAGE_LIGHTBOX_TRANSITION,
+  imageLightboxLayoutId,
+} from "@/components/image-lightbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -536,18 +542,61 @@ function disclosureTitle(entry: TranscriptEntry) {
   return entryTitle(entry);
 }
 
+function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const getImageLayoutId = (index: number) => imageLightboxLayoutId(index, entry.images?.[index]);
+
+  return (
+    <LayoutGroup id={`message-${entry.id}`}>
+      <div className="group/message flex flex-col items-end">
+        <div className="max-w-[82%] space-y-2">
+          {entry.images && entry.images.length > 0 && (
+            <div className="flex flex-wrap justify-end gap-2">
+              {entry.images.map((src, index) => (
+                <button
+                  key={index}
+                  type="button"
+                  title="View full size"
+                  aria-label={`View image ${index + 1} full size`}
+                  onClick={() => setLightboxIndex(index)}
+                  className="block"
+                >
+                  <motion.img
+                    layoutId={getImageLayoutId(index)}
+                    transition={IMAGE_LIGHTBOX_TRANSITION}
+                    src={src}
+                    alt={`Image ${index + 1}`}
+                    className="h-20 w-20 rounded-md border border-border/40 object-cover shadow-sm"
+                  />
+                </button>
+              ))}
+            </div>
+          )}
+          {entry.content && (
+            <div className="rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
+              <Markdown>{entry.content}</Markdown>
+            </div>
+          )}
+        </div>
+        <MessageActions content={entry.content} label="message" align="end" />
+        {lightboxIndex !== null && entry.images && (
+          <ImageLightbox
+            images={entry.images}
+            initialIndex={lightboxIndex}
+            getLayoutId={getImageLayoutId}
+            onClose={() => setLightboxIndex(null)}
+          />
+        )}
+      </div>
+    </LayoutGroup>
+  );
+}
+
 function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
   if (entry.kind === "user") {
-    return (
-      <div className="group/message flex flex-col items-end">
-        <div className="max-w-[82%] rounded-md bg-primary px-3.5 py-2 text-primary-foreground shadow-sm">
-          <Markdown>{entry.content}</Markdown>
-        </div>
-        <MessageActions content={entry.content} label="message" align="end" />
-      </div>
-    );
+    return <UserMessageBubble entry={entry} />;
   }
 
   const tone =

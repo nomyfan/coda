@@ -46,9 +46,13 @@ export type ToolMessage = {
   outcome: ToolCallOutcome;
 };
 
+export type ContentPart = { type: "text"; text: string } | { type: "image"; url: string };
+
+export type UserMessage = { parts: ContentPart[] };
+
 export type HistoryMessage =
   | { System: string }
-  | { User: string }
+  | { User: UserMessage }
   | { Assistant: AssistantMessage }
   | { Tool: ToolMessage };
 
@@ -83,6 +87,8 @@ export type WorkspaceSummary = {
 /** Reasoning effort levels, mirroring the server enum. */
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export type Modality = "text" | "image";
+
 /**
  * A model the dashboard can select, grouped under a provider.
  * Empty `reasoning_efforts` means the model has no reasoning controls.
@@ -93,6 +99,7 @@ export type ProviderInfo = {
   model: string;
   context_window: number;
   reasoning_efforts: ReasoningEffort[];
+  input_modalities: Modality[];
 };
 
 export type ClientMessage =
@@ -105,7 +112,7 @@ export type ClientMessage =
       provider_id?: string;
       reasoning_effort?: ReasoningEffort | null;
     }
-  | { type: "task"; workspace_id: string; session_id: string; task: string }
+  | { type: "task"; workspace_id: string; session_id: string; task: string; images?: string[] }
   | {
       type: "resume";
       workspace_id: string;
