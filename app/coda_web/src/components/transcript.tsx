@@ -63,7 +63,11 @@ type TranscriptRenderItem =
 
 function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (entries[index].kind === "assistant" && entries[index].isFinalResponse) {
+    const entry = entries[index];
+    if (
+      entry.kind === "assistant" &&
+      (entry.isFinalResponse || (entry.agentName === ROOT_AGENT && entry.liveKey))
+    ) {
       return index;
     }
   }
@@ -205,18 +209,28 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
   return <span className="truncate font-mono text-xs text-muted-foreground">{entry.detail}</span>;
 }
 
+type EntryTimingMode = "start-and-duration" | "duration" | "end";
+
 /** Wall-clock time and/or elapsed duration for a message, e.g. `14:03 · 3.2s`. */
 function EntryTiming({
   entry,
-  showTime = true,
+  mode = "start-and-duration",
   className,
 }: {
   entry: TranscriptEntry;
-  showTime?: boolean;
+  mode?: EntryTimingMode;
   className?: string;
 }) {
-  const time = showTime ? formatClockTime(entry.startedAt) : undefined;
-  const duration = formatDuration(entry.startedAt, entry.endedAt);
+  const time =
+    mode === "start-and-duration"
+      ? formatClockTime(entry.startedAt)
+      : mode === "end"
+        ? formatClockTime(entry.endedAt)
+        : undefined;
+  const duration =
+    mode === "start-and-duration" || mode === "duration"
+      ? formatDuration(entry.startedAt, entry.endedAt)
+      : undefined;
   if (!time && !duration) {
     return null;
   }
@@ -371,6 +385,62 @@ function ProcessEntry({ entry }: { entry: TranscriptEntry }) {
   return <TranscriptDisclosure entry={entry} />;
 }
 
+function latestActiveProcessEntry(entries: TranscriptEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.status === "thinking" || entry.status === "running") {
+      return entry;
+    }
+  }
+  return entries.at(-1);
+}
+
+function processStepText(stepCount: number) {
+  return `${stepCount} ${stepCount === 1 ? "step" : "steps"}`;
+}
+
+function processDuration(entries: TranscriptEntry[], finalAssistant?: TranscriptEntry) {
+  let startedAt: string | undefined;
+  let startedMs: number | undefined;
+  let endedAt: string | undefined;
+  let endedMs: number | undefined;
+
+  for (const entry of finalAssistant ? [...entries, finalAssistant] : entries) {
+    const entryStartedMs = entry.startedAt ? Date.parse(entry.startedAt) : NaN;
+    if (!Number.isNaN(entryStartedMs) && (startedMs === undefined || entryStartedMs < startedMs)) {
+      startedMs = entryStartedMs;
+      startedAt = entry.startedAt;
+    }
+
+    const entryEndedMs = entry.endedAt ? Date.parse(entry.endedAt) : NaN;
+    if (!Number.isNaN(entryEndedMs) && (endedMs === undefined || entryEndedMs > endedMs)) {
+      endedMs = entryEndedMs;
+      endedAt = entry.endedAt;
+    }
+  }
+
+  return formatDuration(startedAt, endedAt);
+}
+
+function processEntrySummary(entry: TranscriptEntry | undefined) {
+  if (!entry) {
+    return { title: "Working" };
+  }
+  if (entry.kind === "reasoning") {
+    return { title: "Thinking" };
+  }
+  if (entry.kind === "tool_call") {
+    return { title: `Running ${entryTitle(entry)}`, detail: entry.detail };
+  }
+  if (entry.kind === "tool_result") {
+    return { title: `Finished ${entryTitle(entry)}`, detail: entry.detail };
+  }
+  if (entry.kind === "assistant") {
+    return { title: "Responding" };
+  }
+  return { title: entryTitle(entry), detail: entry.detail };
+}
+
 /** A collapsed disclosure gathering an entire sub-agent run under its name. */
 function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent" }> }) {
   // The invocation entry flips from `tool_call` to `tool_result` when the
@@ -452,16 +522,16 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
       ? entries.filter((_, index) => index !== finalAssistantIndex)
       : entries;
   const processItems = groupProcessItems(intermediateEntries);
-  const [processOpen, setProcessOpen] = useState(!processComplete);
-  const previousProcessComplete = useRef(processComplete);
-
-  useEffect(() => {
-    if (previousProcessComplete.current === processComplete) {
-      return;
-    }
-    previousProcessComplete.current = processComplete;
-    setProcessOpen(!processComplete);
-  }, [processComplete]);
+  const [processOpen, setProcessOpen] = useState(false);
+  const activeProcessEntry = latestActiveProcessEntry(intermediateEntries);
+  const activeSummary = processEntrySummary(activeProcessEntry);
+  const stepText = processStepText(processItems.length);
+  const duration = processDuration(intermediateEntries, finalAssistant);
+  const processTitle = processComplete
+    ? duration
+      ? `Worked over ${duration} with ${stepText}`
+      : `Worked with ${stepText}`
+    : activeSummary.title;
 
   return (
     <div className="group/message">
@@ -476,10 +546,12 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <Brain className="size-4 shrink-0" />
-                  <span className="text-sm font-medium">Process</span>
-                  <Badge variant="secondary">
-                    {processItems.length} {processItems.length === 1 ? "step" : "steps"}
-                  </Badge>
+                  <span className="truncate text-sm font-medium">{processTitle}</span>
+                  {activeSummary.detail && !processComplete ? (
+                    <span className="truncate font-mono text-xs text-muted-foreground">
+                      {activeSummary.detail}
+                    </span>
+                  ) : null}
                 </div>
                 {processOpen ? (
                   <ChevronDown className="size-4 shrink-0" />
@@ -506,7 +578,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
       {finalAssistant ? (
         <div className="flex items-center gap-1">
           <MessageActions content={finalAssistant.content} label="response" align="start" />
-          <EntryTiming entry={finalAssistant} className={cn("px-1", HOVER_REVEAL)} />
+          <EntryTiming entry={finalAssistant} mode="end" className={cn("px-1", HOVER_REVEAL)} />
         </div>
       ) : null}
     </div>
@@ -530,7 +602,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
             <span className="shrink-0 truncate text-sm">{title}</span>
             <EntryDetail entry={entry} />
           </div>
-          <EntryTiming entry={entry} showTime={false} />
+          <EntryTiming entry={entry} mode="duration" />
           <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
             <div className="flex justify-end">
               <EntryStatus entry={entry} />
@@ -663,7 +735,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
               <EntryDetail entry={entry} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              <EntryTiming entry={entry} showTime={false} />
+              <EntryTiming entry={entry} mode="duration" />
               <EntryStatus entry={entry} />
               <CollapsibleTrigger asChild>
                 <Button
@@ -707,7 +779,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         </article>
         <div className="flex items-center gap-1">
           <MessageActions content={entry.content} label="response" align="start" />
-          <EntryTiming entry={entry} className={cn("px-1", HOVER_REVEAL)} />
+          <EntryTiming entry={entry} mode="end" className={cn("px-1", HOVER_REVEAL)} />
         </div>
       </div>
     );
