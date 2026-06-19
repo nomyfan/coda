@@ -525,8 +525,9 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
   const lastIndex = findFinalAssistantIndex(entries);
   const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
   const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
-  const hasFinalAssistant = finalAssistant !== undefined;
-  const processComplete = hasFinalAssistant || entries.some((entry) => entry.status === "aborted");
+  const completedFinalAssistant = finalAssistant?.isFinalResponse ? finalAssistant : undefined;
+  const processComplete =
+    completedFinalAssistant !== undefined || entries.some((entry) => entry.status === "aborted");
   const intermediateEntries =
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
@@ -536,7 +537,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
   const activeProcessEntry = latestActiveProcessEntry(intermediateEntries);
   const activeSummary = processEntrySummary(activeProcessEntry);
   const stepText = processStepText(processItems.length);
-  const duration = processDuration(intermediateEntries, finalAssistant);
+  const duration = processDuration(intermediateEntries, completedFinalAssistant);
   const processTitle = processComplete
     ? duration
       ? `Worked over ${duration} with ${stepText}`
