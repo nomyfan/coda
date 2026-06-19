@@ -405,7 +405,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     tc.tool_name,
                                     output.clone(),
                                     tc.outcome,
-                                    tc.started_at,
+                                    Some(tc.started_at),
                                 );
                                 self.agent
                                     .add_message(Message::Tool(tool_message.clone()))
@@ -441,7 +441,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                                 .to_string(),
                                         ),
                                         ToolCallOutcome::Aborted,
-                                        pending.started_at,
+                                        Some(pending.started_at),
                                     )))
                                     .await;
                             }
@@ -630,12 +630,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         };
                         self.agent.add_message(Message::Assistant(coda_core::llm::AssistantMessage {
                             content,
+                            tool_calls: Vec::new(),
+                            usage: None,
                             reasoning_content: has_reasoning.then_some(partial_reasoning),
                             reasoning_ended_at: has_reasoning.then_some(reasoning_ended_at.unwrap_or(ended_at)),
                             aborted: true,
-                            started_at: Some(started_at),
-                            ended_at: Some(ended_at),
-                            ..Default::default()
+                            started_at,
+                            ended_at,
                         })).await;
                     }
                     // TODO: returning Err here may cause a downstream Error event in addition to Aborted(Generation). Consider a distinct abort result.
@@ -671,8 +672,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     assistant_message.reasoning_ended_at =
                         Some(reasoning_ended_at.unwrap_or(ended_at));
                 }
-                assistant_message.started_at = Some(started_at);
-                assistant_message.ended_at = Some(ended_at);
+                assistant_message.started_at = started_at;
+                assistant_message.ended_at = ended_at;
                 self.agent
                     .add_message(Message::Assistant(assistant_message.clone()))
                     .await;
@@ -878,7 +879,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         call_id: tc.tool_call.id.clone(),
                         tool_name: tc.tool_call.name.clone(),
                         outcome: tc.outcome.clone(),
-                        started_at: Some(jiff::Timestamp::now()),
+                        started_at: jiff::Timestamp::now(),
                     });
                 }
             } else if let Some(tool) = self.agent.tools.get(&tc.tool_call.name) {
@@ -974,7 +975,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         pending.tool_name,
                         ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
                         ToolCallOutcome::Aborted,
-                        pending.started_at,
+                        Some(pending.started_at),
                     )))
                     .await;
             }

@@ -8,5 +8,6 @@ async-openai = { version = "0.40.2", features = ["chat-completion", "byot"] }
 async-stream = { workspace = true }
 coda_core = { workspace = true }
 futures = { workspace = true }
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

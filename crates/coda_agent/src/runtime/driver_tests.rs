@@ -27,6 +27,22 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+/// Base assistant message for tests; callers override the fields they care
+/// about with struct-update syntax (`..assistant()`).
+fn assistant() -> AssistantMessage {
+    let now = jiff::Timestamp::now();
+    AssistantMessage {
+        content: String::new(),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
+        reasoning_ended_at: None,
+        aborted: false,
+        started_at: now,
+        ended_at: now,
+    }
+}
+
 #[derive(Clone, Default)]
 struct TestStorage {
     checkpoints: Arc<Mutex<HashMap<String, StoredCheckpoint>>>,
@@ -214,14 +230,14 @@ impl TestProvider {
     fn with_hold_subagent(hold_subagent: Arc<Notify>) -> Self {
         Self {
             hold_subagent: Some(hold_subagent),
-            ..Default::default()
+            hold_generation: None,
         }
     }
 
     fn with_hold_generation(hold_generation: Arc<Notify>) -> Self {
         Self {
             hold_generation: Some(hold_generation),
-            ..Default::default()
+            hold_subagent: None,
         }
     }
 
@@ -279,7 +295,7 @@ impl LLMProvider for TestProvider {
                 if has_explore_result {
                     Self::completed(AssistantMessage {
                         content: "main done".into(),
-                        ..Default::default()
+                        ..assistant()
                     })
                 } else {
                     Self::completed(AssistantMessage {
@@ -288,7 +304,7 @@ impl LLMProvider for TestProvider {
                             name: "explore".into(),
                             arguments: Some(r#"{"task":"inspect the crate"}"#.into()),
                         }],
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
             }
@@ -300,7 +316,7 @@ impl LLMProvider for TestProvider {
                 if has_read_todos_result {
                     Self::completed(AssistantMessage {
                         content: "explore done".into(),
-                        ..Default::default()
+                        ..assistant()
                     })
                 } else {
                     Self::completed(AssistantMessage {
@@ -309,7 +325,7 @@ impl LLMProvider for TestProvider {
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
                         }],
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
             }
@@ -343,7 +359,7 @@ impl LLMProvider for TestProvider {
                                 arguments: Some(r#"{"text":"auto"}"#.into()),
                             },
                         ],
-                        ..Default::default()
+                        ..assistant()
                     })
                 } else {
                     let ok = matches!(
@@ -379,7 +395,7 @@ impl LLMProvider for TestProvider {
                         } else {
                             format!("approval-flow-bad: {}", describe_tools(&request.messages))
                         },
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
             }
@@ -391,18 +407,18 @@ impl LLMProvider for TestProvider {
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
                         }],
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
                 Some("phase1") if tool_message(&request.messages, "call_approve").is_some() => {
                     Self::completed(AssistantMessage {
                         content: "interrupt-flow-ok".into(),
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
                 other => Self::completed(AssistantMessage {
                     content: format!("unexpected-user-state: {other:?}"),
-                    ..Default::default()
+                    ..assistant()
                 }),
             },
             "abort-main" => Self::completed(AssistantMessage {
@@ -418,7 +434,7 @@ impl LLMProvider for TestProvider {
                         arguments: Some(r#"{"task":"hold"}"#.into()),
                     },
                 ],
-                ..Default::default()
+                ..assistant()
             }),
             "hold-subagent" => {
                 let hold_subagent = self
@@ -429,7 +445,7 @@ impl LLMProvider for TestProvider {
                     hold_subagent.notified().await;
                     Ok(LLMStreamEvent::Completed(AssistantMessage {
                         content: "subagent done".into(),
-                        ..Default::default()
+                        ..assistant()
                     }))
                 }))
             }
@@ -444,7 +460,7 @@ impl LLMProvider for TestProvider {
                     hold_generation,
                     AssistantMessage {
                         content: "should not complete".into(),
-                        ..Default::default()
+                        ..assistant()
                     },
                 )
             }
@@ -458,7 +474,7 @@ impl LLMProvider for TestProvider {
                 if subagent_failed {
                     Self::completed(AssistantMessage {
                         content: "subagent-error-ok".into(),
-                        ..Default::default()
+                        ..assistant()
                     })
                 } else {
                     Self::completed(AssistantMessage {
@@ -467,7 +483,7 @@ impl LLMProvider for TestProvider {
                             name: "explore".into(),
                             arguments: Some(r#"{"task":"inspect failure"}"#.into()),
                         }],
-                        ..Default::default()
+                        ..assistant()
                     })
                 }
             }

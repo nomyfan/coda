@@ -29,9 +29,8 @@ pub enum ContentPart {
 pub struct UserMessage {
     pub parts: Vec<ContentPart>,
     /// When the user turn was created. Stamped by the constructors so every
-    /// message carries a timestamp for the UI. Absent on legacy checkpoints.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<jiff::Timestamp>,
+    /// message carries a timestamp for the UI.
+    pub created_at: jiff::Timestamp,
 }
 
 impl UserMessage {
@@ -39,7 +38,7 @@ impl UserMessage {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             parts: vec![ContentPart::Text { text: text.into() }],
-            created_at: Some(jiff::Timestamp::now()),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -59,7 +58,7 @@ impl UserMessage {
         );
         Self {
             parts,
-            created_at: Some(jiff::Timestamp::now()),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -81,7 +80,7 @@ impl UserMessage {
 }
 
 /// A message representing a response from the AI, which may include tool calls.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
@@ -100,13 +99,11 @@ pub struct AssistantMessage {
     #[serde(default)]
     pub aborted: bool,
     /// When generation started (the moment the request was dispatched). Set by
-    /// the agent runtime, not the provider. Absent on legacy checkpoints.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<jiff::Timestamp>,
+    /// the agent runtime, not the provider.
+    pub started_at: jiff::Timestamp,
     /// When generation finished. Paired with `started_at`, it yields the
     /// model's generation duration for the UI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<jiff::Timestamp>,
+    pub ended_at: jiff::Timestamp,
 }
 
 /// A message representing a tool call from the AI.
@@ -215,8 +212,7 @@ pub struct ToolMessage {
     pub started_at: Option<jiff::Timestamp>,
     /// When the tool call produced this result. Paired with `started_at`, it
     /// yields the execution duration for the UI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<jiff::Timestamp>,
+    pub ended_at: jiff::Timestamp,
 }
 
 impl ToolMessage {
@@ -236,7 +232,7 @@ impl ToolMessage {
             output,
             outcome,
             started_at,
-            ended_at: Some(jiff::Timestamp::now()),
+            ended_at: jiff::Timestamp::now(),
         }
     }
 }
@@ -349,9 +345,16 @@ mod tests {
 
     #[test]
     fn assistant_reasoning_roundtrips_and_defaults_when_absent() {
+        let now = jiff::Timestamp::now();
         let message = AssistantMessage {
+            content: String::new(),
+            tool_calls: vec![],
+            usage: None,
             reasoning_content: Some("tool reasoning".into()),
-            ..Default::default()
+            reasoning_ended_at: None,
+            aborted: false,
+            started_at: now,
+            ended_at: now,
         };
         let value = serde_json::to_value(&message).unwrap();
         assert_eq!(
@@ -359,13 +362,16 @@ mod tests {
             serde_json::json!("tool reasoning")
         );
 
-        let legacy: AssistantMessage = serde_json::from_value(serde_json::json!({
+        let now = jiff::Timestamp::now();
+        let without_reasoning: AssistantMessage = serde_json::from_value(serde_json::json!({
             "content": "",
             "tool_calls": [],
             "usage": null,
-            "aborted": false
+            "aborted": false,
+            "started_at": now,
+            "ended_at": now,
         }))
         .unwrap();
-        assert!(legacy.reasoning_content.is_none());
+        assert!(without_reasoning.reasoning_content.is_none());
     }
 }

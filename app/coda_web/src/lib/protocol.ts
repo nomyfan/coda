@@ -29,8 +29,8 @@ export type AssistantMessage = {
   reasoning_content?: string | null;
   aborted?: boolean;
   /** RFC 3339 timestamps; the gap between them is the generation duration. */
-  started_at?: string | null;
-  ended_at?: string | null;
+  started_at: string;
+  ended_at: string;
   /** RFC 3339 timestamp for the end of streamed reasoning, before answer content. */
   reasoning_ended_at?: string | null;
 };
@@ -49,14 +49,15 @@ export type ToolMessage = {
   name: string;
   output: ToolOutput;
   outcome: ToolCallOutcome;
-  /** RFC 3339 timestamps; the gap between them is the execution duration. */
+  /** RFC 3339 timestamps; the gap between them is the execution duration.
+   * `started_at` is absent for instantly-resolved calls (rejections, dispatch errors). */
   started_at?: string | null;
-  ended_at?: string | null;
+  ended_at: string;
 };
 
 export type ContentPart = { type: "text"; text: string } | { type: "image"; url: string };
 
-export type UserMessage = { parts: ContentPart[]; created_at?: string | null };
+export type UserMessage = { parts: ContentPart[]; created_at: string };
 
 export type HistoryMessage =
   | { System: string }
