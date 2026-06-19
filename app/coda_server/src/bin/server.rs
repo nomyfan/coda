@@ -727,6 +727,10 @@ async fn handle_dashboard_command<
                     .get(&active_session.provider_id)
                     .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
                 let images = if accepts_images { images } else { vec![] };
+                let task = task.trim().to_string();
+                if task.is_empty() && images.is_empty() {
+                    return true;
+                }
                 if let Err(err) = active_session.session.send(task, images).await {
                     warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
                 } else {

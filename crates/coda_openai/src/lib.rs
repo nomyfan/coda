@@ -544,6 +544,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_text_message_uses_text_content_form() {
+        let message: ChatCompletionRequestMessage =
+            Message::User(coda_core::llm::UserMessage::text("hello")).into_openai_type();
+
+        let ChatCompletionRequestMessage::User(user) = message else {
+            panic!("expected user message");
+        };
+        assert!(matches!(
+            user.content,
+            ChatCompletionRequestUserMessageContent::Text(text) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn user_image_message_uses_array_content_form() {
+        let image_url = "data:image/png;base64,abc123".to_string();
+        let message: ChatCompletionRequestMessage = Message::User(
+            coda_core::llm::UserMessage::with_images("look", std::slice::from_ref(&image_url)),
+        )
+        .into_openai_type();
+
+        let ChatCompletionRequestMessage::User(user) = message else {
+            panic!("expected user message");
+        };
+        let ChatCompletionRequestUserMessageContent::Array(parts) = user.content else {
+            panic!("expected array content");
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            ChatCompletionRequestUserMessageContentPart::Text(text) if text.text == "look"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(image)
+                if image.image_url.url == image_url && image.image_url.detail.is_none()
+        ));
+    }
+
+    #[test]
     fn injects_reasoning_only_for_assistant_tool_calls() {
         let messages = vec![
             Message::Assistant(AssistantMessage {

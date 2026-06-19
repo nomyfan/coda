@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { ChevronLeft, ChevronRight, XIcon } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
@@ -36,8 +36,11 @@ export function ImageLightbox({
   const count = images.length;
   const [current, setCurrent] = useState(initialIndex);
   const [closing, setClosing] = useState(false);
+  const closingRef = useRef(false);
 
   const requestClose = () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
     setClosing(true);
   };
 

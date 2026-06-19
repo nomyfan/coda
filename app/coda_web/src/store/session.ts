@@ -43,7 +43,7 @@ export type TranscriptEntry = {
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
   content: string;
-  /** Base64 data-URI images attached to a user message. */
+  /** Image URLs attached to a user message (base64 data-URIs or HTTPS URLs). */
   images?: string[];
   status?: string;
   liveKey?: string;
