@@ -12,8 +12,8 @@ This project is in active development. Breaking changes to APIs, serialization f
 - Every commit must include a `Co-authored-by` trailer that names the **AI agent** which made the change — not the human. The human is already the commit author, so listing them as co-author is redundant and wrong. Use the agent's own identity, e.g.:
 
   ```
-  Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
-  Co-authored-by: Codex <codex@openai.com>
+  Co-authored-by: Claude [optional-model-slug] <noreply@anthropic.com>
+  Co-authored-by: Codex [optional-model-slug] <codex@openai.com>
   ```
 
 ## Runtime Config
