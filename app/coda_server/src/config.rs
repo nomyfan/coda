@@ -263,7 +263,7 @@ fn parse_model_input_modalities(
             "provider '{provider_id}' model '{model_name}' input_modalities must be an array"
         ))
     })?;
-    array
+    let parsed = array
         .iter()
         .map(|value| {
             let raw = value.as_str().ok_or_else(|| {
@@ -279,7 +279,15 @@ fn parse_model_input_modalities(
                 ))),
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    // Normalize: text is always supported, and order/duplicates carry no meaning.
+    let mut modalities = vec![Modality::Text];
+    for modality in parsed {
+        if !modalities.contains(&modality) {
+            modalities.push(modality);
+        }
+    }
+    Ok(modalities)
 }
 
 fn parse_workspaces(
@@ -780,6 +788,7 @@ base_url = "https://api.openai.com/v1"
 models = [
   { id = "gpt-4o", context_window = 128000, input_modalities = ["text", "image"] },
   { id = "o1", context_window = 128000 },
+  { id = "img-only", context_window = 128000, input_modalities = ["image", "image"] },
 ]
 
 [[workspaces]]
@@ -796,6 +805,11 @@ path = "/tmp/coda"
         );
         // Absent key defaults to text-only.
         assert_eq!(models[1].input_modalities, vec![Modality::Text]);
+        // Normalized: text is always present and duplicates are dropped.
+        assert_eq!(
+            models[2].input_modalities,
+            vec![Modality::Text, Modality::Image]
+        );
     }
 
     #[test]

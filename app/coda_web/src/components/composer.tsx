@@ -103,7 +103,13 @@ export const Composer = memo(function Composer({
         .filter((f) => f.size <= MAX_IMAGE_BYTES)
         .slice(0, available);
 
-      const dataUris = await Promise.all(accepted.map(toDataUri));
+      // allSettled so one unreadable file doesn't drop the rest or surface as
+      // an unhandled rejection (callers fire this without awaiting).
+      const results = await Promise.allSettled(accepted.map(toDataUri));
+      const dataUris = results
+        .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled")
+        .map((r) => r.value);
+      if (dataUris.length === 0) return;
       setImages((prev) => [...prev, ...dataUris].slice(0, MAX_IMAGES));
     },
     [images.length],
