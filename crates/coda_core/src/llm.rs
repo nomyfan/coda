@@ -28,6 +28,10 @@ pub enum ContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
     pub parts: Vec<ContentPart>,
+    /// When the user turn was created. Stamped by the constructors so every
+    /// message carries a timestamp for the UI. Absent on legacy checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<jiff::Timestamp>,
 }
 
 impl UserMessage {
@@ -35,6 +39,7 @@ impl UserMessage {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             parts: vec![ContentPart::Text { text: text.into() }],
+            created_at: Some(jiff::Timestamp::now()),
         }
     }
 
@@ -52,7 +57,10 @@ impl UserMessage {
                 .iter()
                 .map(|url| ContentPart::Image { url: url.clone() }),
         );
-        Self { parts }
+        Self {
+            parts,
+            created_at: Some(jiff::Timestamp::now()),
+        }
     }
 
     /// Return the first text part, used for session-list previews.
@@ -82,10 +90,23 @@ pub struct AssistantMessage {
     /// Request adapters decide when the provider needs it on later turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// When the reasoning phase ended, when the provider streamed reasoning
+    /// separately from answer content. This is distinct from `ended_at`, which
+    /// covers the whole generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_ended_at: Option<jiff::Timestamp>,
     /// Whether LLM generation for this assistant message was interrupted by user abort
     /// before a normal completion was produced.
     #[serde(default)]
     pub aborted: bool,
+    /// When generation started (the moment the request was dispatched). Set by
+    /// the agent runtime, not the provider. Absent on legacy checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<jiff::Timestamp>,
+    /// When generation finished. Paired with `started_at`, it yields the
+    /// model's generation duration for the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<jiff::Timestamp>,
 }
 
 /// A message representing a tool call from the AI.
@@ -188,6 +209,36 @@ pub struct ToolMessage {
     pub name: String,
     pub output: ToolOutput,
     pub outcome: ToolCallOutcome,
+    /// When the tool call began executing, when known. Calls that resolve
+    /// instantly (rejections, dispatch errors) leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<jiff::Timestamp>,
+    /// When the tool call produced this result. Paired with `started_at`, it
+    /// yields the execution duration for the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<jiff::Timestamp>,
+}
+
+impl ToolMessage {
+    /// Construct a tool result, stamping `ended_at` at the current instant.
+    /// Pass `started_at` when execution timing is known; instantaneous results
+    /// (rejections, dispatch failures) pass `None`.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        output: ToolOutput,
+        outcome: ToolCallOutcome,
+        started_at: Option<jiff::Timestamp>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            output,
+            outcome,
+            started_at,
+            ended_at: Some(jiff::Timestamp::now()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -123,7 +123,9 @@ enum SessionEnvelope {
         workspace_id: String,
         session_id: String,
         generation: u64,
-        event: WireEvent,
+        // Boxed: `WireEvent` is far larger than the other variant, so keeping it
+        // inline would bloat every `SessionEnvelope` (clippy large_enum_variant).
+        event: Box<WireEvent>,
     },
     Closed {
         workspace_id: String,
@@ -661,7 +663,7 @@ fn spawn_session_forwarder(
                     workspace_id: workspace_id.clone(),
                     session_id: session_id.clone(),
                     generation,
-                    event,
+                    event: Box::new(event),
                 })
                 .is_err()
             {
@@ -1095,7 +1097,7 @@ async fn handle_session_envelope<
                     .send(&ServerMessage::Event {
                         workspace_id,
                         session_id,
-                        event,
+                        event: *event,
                     })
                     .await;
             }

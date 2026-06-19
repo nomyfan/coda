@@ -71,6 +71,10 @@ pub struct PendingReply {
     /// Also the name of the peer agent
     pub tool_name: String,
     pub outcome: ToolCallOutcome,
+    /// When the sub-agent call was dispatched, carried so the eventual reply's
+    /// `ToolMessage` records the full execution duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Clone)]

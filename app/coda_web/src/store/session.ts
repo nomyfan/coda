@@ -49,6 +49,9 @@ export type TranscriptEntry = {
   liveKey?: string;
   callId?: string;
   isFinalResponse?: boolean;
+  /** RFC 3339 timestamps for display: message time and elapsed duration. */
+  startedAt?: string | null;
+  endedAt?: string | null;
 };
 
 export type ActivityEntry = {
@@ -318,6 +321,7 @@ function historyToEntries(
         kind: "user",
         content: textContent,
         images: images.length > 0 ? images : undefined,
+        startedAt: message.User.created_at,
       },
     ];
   }
@@ -331,6 +335,8 @@ function historyToEntries(
         agentName: rootName,
         title: "thinking",
         content: assistant.reasoning_content,
+        startedAt: assistant.started_at,
+        endedAt: assistant.reasoning_ended_at,
       });
     }
     if (assistant.content) {
@@ -341,6 +347,8 @@ function historyToEntries(
         content: assistant.content,
         status: assistant.aborted ? "aborted" : undefined,
         isFinalResponse: assistant.tool_calls.length === 0,
+        startedAt: assistant.started_at,
+        endedAt: assistant.ended_at,
       });
     }
     return entries;
@@ -379,6 +387,8 @@ function toolMessageToEntry(
     detail,
     content: outputText(message.output),
     status: outcomeText(message.outcome),
+    startedAt: message.started_at,
+    endedAt: message.ended_at,
   };
 }
 
@@ -470,6 +480,7 @@ function addOrUpdateReasoningChunk(
         content: event.content,
         status: "thinking",
         liveKey: key,
+        startedAt: new Date().toISOString(),
       },
     ],
   };
@@ -483,6 +494,7 @@ function finishReasoning(
   session: OpenedSession,
   agentName: string,
   threadId: string,
+  updates: Partial<TranscriptEntry> = {},
 ): OpenedSession {
   const key = reasoningLiveKey(agentName, threadId);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
@@ -490,7 +502,12 @@ function finishReasoning(
     return session;
   }
   const entries = [...session.entries];
-  entries[index] = { ...entries[index], status: undefined, liveKey: undefined };
+  entries[index] = {
+    ...entries[index],
+    ...updates,
+    status: undefined,
+    liveKey: undefined,
+  };
   return { ...session, entries };
 }
 
@@ -524,6 +541,8 @@ function finishAssistant(
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
+      startedAt: event.message.started_at,
+      endedAt: event.message.ended_at,
     });
   }
   if (event.message.content) {
@@ -539,6 +558,8 @@ function finishAssistant(
           content: event.message.content,
           status: event.message.aborted ? "aborted" : undefined,
           isFinalResponse,
+          startedAt: event.message.started_at,
+          endedAt: event.message.ended_at,
         },
       ],
     };
@@ -571,7 +592,9 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
     case "llm_chunk":
       // Answer content marks the end of the reasoning phase.
       return addOrUpdateAssistantChunk(
-        finishReasoning(session, event.agent_name, event.thread_id),
+        finishReasoning(session, event.agent_name, event.thread_id, {
+          endedAt: new Date().toISOString(),
+        }),
         event,
       );
     case "llm_reasoning_chunk":
@@ -582,7 +605,13 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
       const turnComplete = event.agent_name === rootName && event.message.tool_calls.length === 0;
       const finished = {
         ...addActivity(
-          finishAssistant(finishReasoning(session, event.agent_name, event.thread_id), event),
+          finishAssistant(
+            finishReasoning(session, event.agent_name, event.thread_id, {
+              startedAt: event.message.started_at,
+              endedAt: event.message.reasoning_ended_at,
+            }),
+            event,
+          ),
           {
             tone: event.message.aborted ? "warning" : "success",
             label: `${event.agent_name} finished`,
@@ -1161,6 +1190,7 @@ function appendUserMessage(
       kind: "user",
       content,
       images: images && images.length > 0 ? images : undefined,
+      startedAt: new Date().toISOString(),
     });
     current.catalog = upsertCatalogTitled(
       current.catalog,
