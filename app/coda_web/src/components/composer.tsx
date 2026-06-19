@@ -170,6 +170,7 @@ export const Composer = memo(function Composer({
                   type="button"
                   className="block"
                   title="View full size"
+                  aria-label={`View attachment ${index + 1} full size`}
                   onClick={() => setLightboxSrc(src)}
                 >
                   <img
@@ -182,6 +183,7 @@ export const Composer = memo(function Composer({
                   type="button"
                   className="absolute -right-1.5 -top-1.5 flex size-4 items-center justify-center rounded-full bg-muted text-muted-foreground opacity-0 transition-opacity hover:bg-foreground hover:text-background group-hover:opacity-100"
                   title="Remove image"
+                  aria-label={`Remove attachment ${index + 1}`}
                   onClick={() => removeImage(index)}
                 >
                   <X className="size-2.5" />

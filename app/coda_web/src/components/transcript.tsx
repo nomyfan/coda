@@ -550,6 +550,7 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
                 key={index}
                 type="button"
                 title="View full size"
+                aria-label={`View image ${index + 1} full size`}
                 onClick={() => setLightboxSrc(src)}
                 className="block"
               >

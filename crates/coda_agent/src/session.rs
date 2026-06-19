@@ -393,7 +393,7 @@ impl Session {
     /// Send a user task to the root agent, optionally with image attachments.
     ///
     /// `images` is a list of base64 data-URIs (`data:image/<fmt>;base64,<b64>`)
-    /// or HTTPS URLs. Pass an empty slice for text-only turns.
+    /// or HTTPS URLs. Pass an empty `Vec` for text-only turns.
     pub async fn send(
         &self,
         task: impl Into<String>,

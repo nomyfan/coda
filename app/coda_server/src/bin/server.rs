@@ -720,6 +720,14 @@ async fn handle_dashboard_command<
             if let Some(active_session) =
                 active.get_mut(&(workspace_id.clone(), session_id.clone()))
             {
+                // Strip images when the active provider does not support vision;
+                // this guards against UI bypasses and avoids provider-side errors.
+                let supports_vision = app
+                    .providers
+                    .get(&active_session.provider_id)
+                    .map(|h| h.supports_vision)
+                    .unwrap_or(false);
+                let images = if supports_vision { images } else { vec![] };
                 if let Err(err) = active_session.session.send(task, images).await {
                     warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
                 } else {

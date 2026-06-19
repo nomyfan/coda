@@ -38,9 +38,15 @@ impl UserMessage {
         }
     }
 
-    /// Construct a message with text followed by zero or more image data-URIs.
+    /// Construct a message with optional text and zero or more image URLs
+    /// (data-URIs or HTTPS URLs). An empty `text` produces a pure-image
+    /// message with no text part, since some providers reject empty text parts.
     pub fn with_images(text: impl Into<String>, images: &[String]) -> Self {
-        let mut parts = vec![ContentPart::Text { text: text.into() }];
+        let text = text.into();
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
         parts.extend(
             images
                 .iter()
