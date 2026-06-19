@@ -218,6 +218,16 @@ pub enum ReasoningEffort {
     Xhigh,
 }
 
+/// An input modality a model can accept. Provider-agnostic. Every model accepts
+/// `Text`; richer modalities (e.g. `Image`) are opt-in per model and gate the
+/// corresponding UI affordances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modality {
+    Text,
+    Image,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatCompletionRequest {
     pub model: String,

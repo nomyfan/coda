@@ -1,7 +1,7 @@
 use coda_agent::{
     AbortedTarget, AgentEvent, EventOrigin, PendingApproval, ResumeDecision, SessionEvent,
 };
-use coda_core::llm::{AssistantMessage, Message, ReasoningEffort, ToolCall, ToolMessage};
+use coda_core::llm::{AssistantMessage, Message, Modality, ReasoningEffort, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +261,8 @@ pub enum ServerMessage {
 
 /// A model the dashboard can pick, grouped under a provider. `reasoning_efforts`
 /// lists the effort levels the model offers; empty means it has no reasoning
-/// controls. `supports_vision` indicates whether image attachments are accepted.
+/// controls. `input_modalities` lists the input kinds the model accepts (always
+/// includes `text`; `image` enables image attachments).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfoWire {
     pub id: String,
@@ -271,7 +272,7 @@ pub struct ProviderInfoWire {
     pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
     #[serde(default)]
-    pub supports_vision: bool,
+    pub input_modalities: Vec<Modality>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,7 +466,7 @@ mod tests {
                 model: "deepseek-reasoner".into(),
                 context_window: 128_000,
                 reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
-                supports_vision: false,
+                input_modalities: vec![Modality::Text, Modality::Image],
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),
         };

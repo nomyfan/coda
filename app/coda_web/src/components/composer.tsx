@@ -77,10 +77,11 @@ export const Composer = memo(function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const connected = status === "connected";
-  const supportsVision =
-    Boolean(providerId) && (providers.find((p) => p.id === providerId)?.supports_vision ?? false);
-  const canAddImages = supportsVision && images.length < MAX_IMAGES;
-  const imagesBlockSend = !supportsVision && images.length > 0;
+  const acceptsImages =
+    Boolean(providerId) &&
+    (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
+  const canAddImages = acceptsImages && images.length < MAX_IMAGES;
+  const imagesBlockSend = !acceptsImages && images.length > 0;
   const canSend =
     connected &&
     Boolean(workspace) &&
@@ -114,7 +115,7 @@ export const Composer = memo(function Composer({
 
   const handlePaste = useCallback(
     (event: React.ClipboardEvent) => {
-      if (!supportsVision) return;
+      if (!acceptsImages) return;
       const files = Array.from(event.clipboardData.items)
         .filter((item) => item.kind === "file" && ACCEPTED_TYPES.has(item.type))
         .map((item) => item.getAsFile())
@@ -124,17 +125,17 @@ export const Composer = memo(function Composer({
         void addFiles(files);
       }
     },
-    [supportsVision, addFiles],
+    [acceptsImages, addFiles],
   );
 
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
       setDragOver(false);
-      if (!supportsVision) return;
+      if (!acceptsImages) return;
       void addFiles(event.dataTransfer.files);
     },
-    [supportsVision, addFiles],
+    [acceptsImages, addFiles],
   );
 
   function submit() {
@@ -155,7 +156,7 @@ export const Composer = memo(function Composer({
       <div
         className="relative mx-auto max-w-4xl"
         onDragOver={(e) => {
-          if (supportsVision) {
+          if (acceptsImages) {
             e.preventDefault();
             setDragOver(true);
           }
@@ -210,7 +211,7 @@ export const Composer = memo(function Composer({
           placeholder="Ask Coda to edit, inspect, test, or explain...  (Enter to send, Shift+Enter for newline)"
           className={[
             "min-h-[52px]",
-            supportsVision ? "pr-20" : "pr-12",
+            acceptsImages ? "pr-20" : "pr-12",
             dragOver ? "border-primary ring-1 ring-primary" : "",
           ]
             .filter(Boolean)
@@ -230,7 +231,7 @@ export const Composer = memo(function Composer({
           }}
         />
         <div className="absolute bottom-2 right-2 flex items-center gap-1">
-          {supportsVision && (
+          {acceptsImages && (
             <Button
               size="icon"
               variant="ghost"

@@ -87,6 +87,8 @@ export type WorkspaceSummary = {
 /** Reasoning effort levels, mirroring the server enum. */
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export type Modality = "text" | "image";
+
 /**
  * A model the dashboard can select, grouped under a provider.
  * Empty `reasoning_efforts` means the model has no reasoning controls.
@@ -97,7 +99,7 @@ export type ProviderInfo = {
   model: string;
   context_window: number;
   reasoning_efforts: ReasoningEffort[];
-  supports_vision: boolean;
+  input_modalities: Modality[];
 };
 
 export type ClientMessage =

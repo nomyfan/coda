@@ -8,7 +8,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     Shutdown, SystemPrompt, runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, ReasoningEffort};
+use coda_core::llm::{LLMProviderConfig, Modality, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
     agents::{AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
@@ -55,8 +55,8 @@ struct ProviderHandle {
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<ReasoningEffort>,
-    /// Whether this model accepts image content parts.
-    supports_vision: bool,
+    /// Input kinds this model accepts (always includes text; image enables attachments).
+    input_modalities: Vec<Modality>,
 }
 
 struct WorkspaceState {
@@ -392,7 +392,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
             model: handle.model_name.clone(),
             context_window: handle.context_window,
             reasoning_efforts: handle.reasoning_efforts.clone(),
-            supports_vision: handle.supports_vision,
+            input_modalities: handle.input_modalities.clone(),
         })
         .collect();
     infos.sort_by(|a, b| a.id.cmp(&b.id));
@@ -720,14 +720,13 @@ async fn handle_dashboard_command<
             if let Some(active_session) =
                 active.get_mut(&(workspace_id.clone(), session_id.clone()))
             {
-                // Strip images when the active provider does not support vision;
+                // Strip images when the active model does not accept image input;
                 // this guards against UI bypasses and avoids provider-side errors.
-                let supports_vision = app
+                let accepts_images = app
                     .providers
                     .get(&active_session.provider_id)
-                    .map(|h| h.supports_vision)
-                    .unwrap_or(false);
-                let images = if supports_vision { images } else { vec![] };
+                    .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
+                let images = if accepts_images { images } else { vec![] };
                 if let Err(err) = active_session.session.send(task, images).await {
                     warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
                 } else {
@@ -1326,7 +1325,7 @@ async fn main() {
                     context_window: m.context_window,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
-                    supports_vision: m.supports_vision,
+                    input_modalities: m.input_modalities,
                 };
                 (id, Arc::new(handle))
             })

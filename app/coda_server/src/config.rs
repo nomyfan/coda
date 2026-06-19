@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use coda_agent::ToolApprovalMode;
-use coda_core::llm::{ReasoningEffort, ToolCall};
+use coda_core::llm::{Modality, ReasoningEffort, ToolCall};
 use coda_openai::ProviderKind;
 
 #[derive(Debug)]
@@ -34,14 +34,15 @@ impl From<std::io::Error> for ConfigError {
 /// back to `id` when absent). `context_window` is the model's total token
 /// capacity. `reasoning_efforts` declares which effort levels the model accepts;
 /// an empty list means the UI shows no reasoning controls for it.
-/// `supports_vision` indicates whether the model accepts image content parts.
+/// `input_modalities` lists the input kinds the model accepts; every model
+/// accepts text, and `image` additionally enables image attachments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
     pub context_window: u32,
     pub reasoning_efforts: Vec<ReasoningEffort>,
-    pub supports_vision: bool,
+    pub input_modalities: Vec<Modality>,
 }
 
 /// A configured LLM provider with one or more models. `api_key`, `base_url`,
@@ -199,16 +200,13 @@ fn parse_models(
                 ))
             })?;
         let reasoning_efforts = parse_model_reasoning_efforts(table, provider_id, &id)?;
-        let supports_vision = table
-            .get("supports_vision")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let input_modalities = parse_model_input_modalities(table, provider_id, &id)?;
         models.push(ModelConfig {
             id,
             name,
             context_window,
             reasoning_efforts,
-            supports_vision,
+            input_modalities,
         });
     }
 
@@ -245,6 +243,39 @@ fn parse_model_reasoning_efforts(
                 // `none` is the thinking-off state, not an offered level.
                 other => Err(ConfigError::Parse(format!(
                     "provider '{provider_id}' model '{model_name}' has unknown reasoning effort '{other}' (expected 'minimal', 'low', 'medium', 'high', or 'xhigh')"
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// Parses `input_modalities`. Absent means text-only (`[text]`).
+fn parse_model_input_modalities(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+) -> Result<Vec<Modality>, ConfigError> {
+    let Some(array) = model.get("input_modalities") else {
+        return Ok(vec![Modality::Text]);
+    };
+    let array = array.as_array().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "provider '{provider_id}' model '{model_name}' input_modalities must be an array"
+        ))
+    })?;
+    array
+        .iter()
+        .map(|value| {
+            let raw = value.as_str().ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "provider '{provider_id}' model '{model_name}' input_modalities must be strings"
+                ))
+            })?;
+            match raw {
+                "text" => Ok(Modality::Text),
+                "image" => Ok(Modality::Image),
+                other => Err(ConfigError::Parse(format!(
+                    "provider '{provider_id}' model '{model_name}' has unknown input modality '{other}' (expected 'text' or 'image')"
                 ))),
             }
         })
@@ -682,7 +713,7 @@ path = "/tmp/scratch"
                         ReasoningEffort::Medium,
                         ReasoningEffort::High,
                     ],
-                    supports_vision: false,
+                    input_modalities: vec![Modality::Text],
                 }],
             }]
         );
@@ -736,6 +767,57 @@ path = "/tmp/coda"
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown reasoning effort 'ultra'"));
+    }
+
+    #[test]
+    fn parse_server_config_parses_input_modalities() {
+        let config = parse_server_config(
+            r#"
+[[providers]]
+id = "openai"
+api_key = "sk-test"
+base_url = "https://api.openai.com/v1"
+models = [
+  { id = "gpt-4o", context_window = 128000, input_modalities = ["text", "image"] },
+  { id = "o1", context_window = 128000 },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap();
+        let models = &config.providers[0].models;
+        assert_eq!(
+            models[0].input_modalities,
+            vec![Modality::Text, Modality::Image]
+        );
+        // Absent key defaults to text-only.
+        assert_eq!(models[1].input_modalities, vec![Modality::Text]);
+    }
+
+    #[test]
+    fn parse_server_config_rejects_unknown_input_modality() {
+        let err = parse_server_config(
+            r#"
+[[providers]]
+id = "openai"
+api_key = "sk-test"
+base_url = "https://api.openai.com/v1"
+models = [
+  { id = "gpt-4o", context_window = 128000, input_modalities = ["audio"] },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown input modality 'audio'"));
     }
 
     #[test]

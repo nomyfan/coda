@@ -4,8 +4,9 @@
 # `api_key` and `base_url` may reference an environment variable as `${VAR}`.
 # `models` lists the models under this provider; each model has a required `id`
 # (the API model name sent in requests), an optional `name` (human-readable
-# dashboard label, defaults to `id`), a required `context_window`, and optional
-# `reasoning_efforts`.
+# dashboard label, defaults to `id`), a required `context_window`, optional
+# `reasoning_efforts`, and optional `input_modalities` (defaults to ["text"];
+# add "image" to allow image attachments).
 # The dashboard picks which model a session uses; the first listed is the default.
 
 [[providers]]
@@ -23,7 +24,7 @@ id = "openai"
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"
 models = [
-  { id = "gpt-4o", name = "GPT-4o", context_window = 128000 },
+  { id = "gpt-4o", name = "GPT-4o", context_window = 128000, input_modalities = ["text", "image"] },
 ]
 
 [[workspaces]]
