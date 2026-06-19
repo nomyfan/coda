@@ -406,16 +406,26 @@ function processDuration(entries: TranscriptEntry[], finalAssistant?: Transcript
   let endedMs: number | undefined;
 
   for (const entry of finalAssistant ? [...entries, finalAssistant] : entries) {
-    const entryStartedMs = entry.startedAt ? Date.parse(entry.startedAt) : NaN;
-    if (!Number.isNaN(entryStartedMs) && (startedMs === undefined || entryStartedMs < startedMs)) {
+    const entryStartedAt = entry.startedAt;
+    const entryStartedMs = entryStartedAt ? Date.parse(entryStartedAt) : NaN;
+    if (
+      entryStartedAt &&
+      !Number.isNaN(entryStartedMs) &&
+      (startedMs === undefined || entryStartedMs < startedMs)
+    ) {
       startedMs = entryStartedMs;
-      startedAt = entry.startedAt;
+      startedAt = entryStartedAt;
     }
 
-    const entryEndedMs = entry.endedAt ? Date.parse(entry.endedAt) : NaN;
-    if (!Number.isNaN(entryEndedMs) && (endedMs === undefined || entryEndedMs > endedMs)) {
+    const entryEndedAt = entry.endedAt;
+    const entryEndedMs = entryEndedAt ? Date.parse(entryEndedAt) : NaN;
+    if (
+      entryEndedAt &&
+      !Number.isNaN(entryEndedMs) &&
+      (endedMs === undefined || entryEndedMs > endedMs)
+    ) {
       endedMs = entryEndedMs;
-      endedAt = entry.endedAt;
+      endedAt = entryEndedAt;
     }
   }
 
