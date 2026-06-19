@@ -73,6 +73,7 @@ export const Composer = memo(function Composer({
   const [images, setImages] = useState<string[]>([]);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const thumbRefs = useRef(new Map<number, HTMLButtonElement>());
+  const getThumbEl = useCallback((index: number) => thumbRefs.current.get(index) ?? null, []);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -344,7 +345,7 @@ export const Composer = memo(function Composer({
         <ImageLightbox
           images={images}
           initialIndex={lightboxIndex}
-          getThumbRect={(i) => thumbRefs.current.get(i)?.getBoundingClientRect() ?? null}
+          getThumbEl={getThumbEl}
           onClose={() => setLightboxIndex(null)}
         />
       )}

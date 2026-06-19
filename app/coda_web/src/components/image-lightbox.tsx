@@ -3,65 +3,208 @@ import { ChevronLeft, ChevronRight, XIcon } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 
 const OPEN_EASING = "cubic-bezier(0.22, 1, 0.36, 1)";
+const OVERLAY_OPEN_DURATION = 300;
+const OVERLAY_CLOSE_DURATION = 380;
+const OPEN_DURATION = 520;
+const CLOSE_DURATION = 440;
 
-// Transform that maps an element currently laid out at `to` so it visually
-// covers `from` (FLIP). transform-origin is the element center.
-function flipTransform(from: DOMRect, to: DOMRect): string {
-  const sx = from.width / to.width;
-  const sy = from.height / to.height;
-  const tx = from.left + from.width / 2 - (to.left + to.width / 2);
-  const ty = from.top + from.height / 2 - (to.top + to.height / 2);
-  return `translate(${tx}px, ${ty}px) scale(${sx}, ${sy})`;
+function rectKeyframe(rect: DOMRect): Keyframe {
+  return {
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  };
+}
+
+function thumbRadius(el: HTMLElement): string {
+  const image = el.querySelector("img");
+  return getComputedStyle(image ?? el).borderRadius;
+}
+
+function createTransitionImage(src: string, rect: DOMRect, radius: string): HTMLImageElement {
+  const image = document.createElement("img");
+  image.src = src;
+  Object.assign(image.style, {
+    ...rectKeyframe(rect),
+    borderRadius: radius,
+    margin: "0",
+    maxHeight: "none",
+    maxWidth: "none",
+    objectFit: "cover",
+    pointerEvents: "none",
+    position: "fixed",
+    zIndex: "60",
+  });
+  document.body.appendChild(image);
+  return image;
+}
+
+class LightboxAnimator {
+  private openAnim: Animation | null = null;
+  private transitionImage: HTMLImageElement | null = null;
+  private opened = false;
+
+  cleanup() {
+    this.cancelOpenAnimation();
+    this.removeTransitionImage();
+  }
+
+  openOverlay(overlay: HTMLElement | null) {
+    overlay?.animate([{ opacity: 0 }, { opacity: 1 }], {
+      duration: OVERLAY_OPEN_DURATION,
+      easing: "ease-out",
+    });
+  }
+
+  open(image: HTMLImageElement, src: string, thumb: HTMLElement | null) {
+    if (this.opened || this.openAnim) return;
+    this.opened = true;
+
+    const to = image.getBoundingClientRect();
+    const from = thumb?.getBoundingClientRect();
+
+    if (!from || !thumb) {
+      image.style.opacity = "1";
+      this.openAnim = image.animate(
+        [
+          { transform: "scale(0.96)", opacity: 0 },
+          { transform: "none", opacity: 1 },
+        ],
+        { duration: 240, easing: "ease-out", fill: "both" },
+      );
+      return;
+    }
+
+    this.removeTransitionImage();
+    const transitionImage = createTransitionImage(src, from, thumbRadius(thumb));
+    this.transitionImage = transitionImage;
+    this.openAnim = transitionImage.animate(
+      [
+        { ...rectKeyframe(from), opacity: 1, borderRadius: thumbRadius(thumb), offset: 0 },
+        {
+          ...rectKeyframe(to),
+          opacity: 1,
+          borderRadius: getComputedStyle(image).borderRadius,
+          offset: 1,
+        },
+      ],
+      { duration: OPEN_DURATION, easing: OPEN_EASING, fill: "forwards" },
+    );
+    this.openAnim.onfinish = () => {
+      image.style.opacity = "1";
+      requestAnimationFrame(() => this.removeTransitionImageIfCurrent(transitionImage));
+      this.openAnim = null;
+    };
+    this.openAnim.oncancel = () => {
+      this.removeTransitionImage();
+      this.openAnim = null;
+    };
+  }
+
+  close(image: HTMLImageElement, src: string, thumb: HTMLElement | null, onFinish: () => void) {
+    this.cancelOpenAnimation();
+
+    const from = image.getBoundingClientRect();
+    const dest = thumb?.getBoundingClientRect();
+
+    if (!dest || !thumb) {
+      const anim = image.animate(
+        [
+          { transform: "none", opacity: 1 },
+          { transform: "scale(0.96)", opacity: 0 },
+        ],
+        { duration: 240, easing: "ease-in", fill: "forwards" },
+      );
+      anim.onfinish = onFinish;
+      anim.oncancel = onFinish;
+      return;
+    }
+
+    image.style.opacity = "0";
+    this.removeTransitionImage();
+    const transitionImage = createTransitionImage(src, from, getComputedStyle(image).borderRadius);
+    this.transitionImage = transitionImage;
+    const anim = transitionImage.animate(
+      [
+        {
+          ...rectKeyframe(from),
+          opacity: 1,
+          borderRadius: getComputedStyle(image).borderRadius,
+          offset: 0,
+        },
+        { ...rectKeyframe(dest), opacity: 1, borderRadius: thumbRadius(thumb), offset: 1 },
+      ],
+      { duration: CLOSE_DURATION, easing: OPEN_EASING, fill: "forwards" },
+    );
+    const finish = () => {
+      this.removeTransitionImage();
+      onFinish();
+    };
+    anim.onfinish = finish;
+    anim.oncancel = finish;
+  }
+
+  closeOverlay(overlay: HTMLElement | null) {
+    overlay?.animate([{ opacity: 1 }, { opacity: 0 }], {
+      duration: OVERLAY_CLOSE_DURATION,
+      easing: "ease-in",
+      fill: "forwards",
+    });
+  }
+
+  private cancelOpenAnimation() {
+    if (!this.openAnim) return;
+    this.openAnim.oncancel = null;
+    this.openAnim.onfinish = null;
+    this.openAnim.cancel();
+    this.openAnim = null;
+  }
+
+  private removeTransitionImage() {
+    this.transitionImage?.remove();
+    this.transitionImage = null;
+  }
+
+  private removeTransitionImageIfCurrent(image: HTMLImageElement) {
+    if (this.transitionImage === image) {
+      this.removeTransitionImage();
+    } else {
+      image.remove();
+    }
+  }
 }
 
 export function ImageLightbox({
   images,
   initialIndex,
   onClose,
-  getThumbRect,
+  getThumbEl,
 }: {
   images: string[];
   /** Index to open at. Seeds the initial view; navigation is self-managed. */
   initialIndex: number;
   onClose: () => void;
-  /** Screen rect of the thumbnail at `i`, used as the zoom origin/target. */
-  getThumbRect?: (i: number) => DOMRect | null;
+  /** The thumbnail element at `i`, used as the zoom origin/target. */
+  getThumbEl?: (i: number) => HTMLElement | null;
 }) {
   const count = images.length;
   const [current, setCurrent] = useState(initialIndex);
   const [closing, setClosing] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
-  const openAnimRef = useRef<Animation | null>(null);
+  const animatorRef = useRef(new LightboxAnimator());
 
-  // Zoom the image up from the clicked thumbnail. Deferred until the image has
-  // loaded — before that the element has no layout size to measure against, and
-  // the image is kept transparent so no full-size frame flashes first. `fill`
-  // holds the keyframes outside the active phase to drive that reveal.
+  // Zoom a temporary image from the clicked thumbnail into the measured lightbox
+  // image slot. The real image appears after the transition image lands.
   const playOpen = () => {
     const img = imgRef.current;
-    if (openAnimRef.current || !img) return;
-    const to = img.getBoundingClientRect();
-    const from = getThumbRect?.(initialIndex);
-    openAnimRef.current = img.animate(
-      from
-        ? [
-            { transform: flipTransform(from, to), opacity: 0.5 },
-            { transform: "none", opacity: 1 },
-          ]
-        : [
-            { transform: "scale(0.9)", opacity: 0 },
-            { transform: "none", opacity: 1 },
-          ],
-      { duration: 520, easing: OPEN_EASING, fill: "both" },
-    );
+    if (img)
+      animatorRef.current.open(img, images[initialIndex], getThumbEl?.(initialIndex) ?? null);
   };
 
   useLayoutEffect(() => {
-    overlayRef.current?.animate([{ opacity: 0 }, { opacity: 1 }], {
-      duration: 300,
-      easing: "ease-out",
-    });
+    animatorRef.current.openOverlay(overlayRef.current);
     // Cached images are already complete and won't fire `onLoad`.
     const img = imgRef.current;
     if (img?.complete && img.naturalWidth > 0) playOpen();
@@ -69,39 +212,23 @@ export function ImageLightbox({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const animator = animatorRef.current;
+    return () => {
+      animator.cleanup();
+    };
+  }, []);
+
   const requestClose = () => {
     if (closing) return;
     setClosing(true);
-    overlayRef.current?.animate([{ opacity: 1 }, { opacity: 0 }], {
-      duration: 300,
-      easing: "ease-in",
-      fill: "forwards",
-    });
+    animatorRef.current.closeOverlay(overlayRef.current);
     const img = imgRef.current;
     if (!img) {
       onClose();
       return;
     }
-    // Drop the held open animation so it doesn't fight the closing one.
-    openAnimRef.current?.cancel();
-    openAnimRef.current = null;
-    // Zoom back to the thumbnail of the image currently being viewed.
-    const to = img.getBoundingClientRect();
-    const dest = getThumbRect?.(current);
-    const anim = img.animate(
-      dest
-        ? [
-            { transform: "none", opacity: 1 },
-            { transform: flipTransform(dest, to), opacity: 0.5 },
-          ]
-        : [
-            { transform: "none", opacity: 1 },
-            { transform: "scale(0.9)", opacity: 0 },
-          ],
-      { duration: 340, easing: OPEN_EASING, fill: "forwards" },
-    );
-    anim.onfinish = onClose;
-    anim.oncancel = onClose;
+    animatorRef.current.close(img, src, getThumbEl?.(current) ?? null, onClose);
   };
 
   const goPrev = () => setCurrent((c) => (c - 1 + count) % count);
@@ -137,10 +264,7 @@ export function ImageLightbox({
             src={src}
             alt={`Image ${current + 1} of ${count}`}
             draggable={false}
-            className="max-h-[60vh] max-w-[60vw] rounded-md object-contain"
-            // Hidden until the open animation reveals it (see playOpen), so no
-            // full-size frame flashes before the zoom-from-thumbnail begins.
-            style={{ opacity: 0 }}
+            className="max-h-[60vh] max-w-[60vw] rounded-md object-contain opacity-0"
             onLoad={playOpen}
             onClick={(e) => e.stopPropagation()}
           />

@@ -12,7 +12,7 @@ import {
   Sparkles,
   TerminalSquare,
 } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -540,6 +540,7 @@ function disclosureTitle(entry: TranscriptEntry) {
 function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const thumbRefs = useRef(new Map<number, HTMLButtonElement>());
+  const getThumbEl = useCallback((index: number) => thumbRefs.current.get(index) ?? null, []);
 
   return (
     <div className="group/message flex flex-col items-end">
@@ -579,7 +580,7 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
         <ImageLightbox
           images={entry.images}
           initialIndex={lightboxIndex}
-          getThumbRect={(i) => thumbRefs.current.get(i)?.getBoundingClientRect() ?? null}
+          getThumbEl={getThumbEl}
           onClose={() => setLightboxIndex(null)}
         />
       )}
