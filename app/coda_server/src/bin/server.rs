@@ -824,29 +824,41 @@ async fn handle_dashboard_command<
             task,
             images,
         } => {
-            if let Some(active_session) =
-                active.get_mut(&(workspace_id.clone(), session_id.clone()))
-            {
-                // Strip images when the active model does not accept image input;
-                // this guards against UI bypasses and avoids provider-side errors.
-                let accepts_images = app
-                    .providers
-                    .get(&active_session.provider_id)
-                    .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
-                let images = if accepts_images {
-                    sanitize_task_images(images)
-                } else {
-                    vec![]
+            let Some(active_session) = active.get_mut(&(workspace_id.clone(), session_id.clone()))
+            else {
+                return true;
+            };
+            // Reject image input when the active model does not accept it. The
+            // frontend already disables image sends for such models, so reaching
+            // here means a UI bypass — surface an error rather than silently
+            // dropping the attachments.
+            let accepts_images = app
+                .providers
+                .get(&active_session.provider_id)
+                .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
+            if !accepts_images && !images.is_empty() {
+                let event = WireEvent::Error {
+                    agent_name: String::new(),
+                    thread_id: session_id.clone(),
+                    message: "the selected model does not accept image input".to_string(),
                 };
-                let task = task.trim().to_string();
-                if task.is_empty() && images.is_empty() {
-                    return true;
-                }
-                if let Err(err) = active_session.session.send(task, images).await {
-                    warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
-                } else {
-                    active_session.turn_running = true;
-                }
+                return transport
+                    .send(&ServerMessage::Event {
+                        workspace_id,
+                        session_id,
+                        event,
+                    })
+                    .await;
+            }
+            let images = sanitize_task_images(images);
+            let task = task.trim().to_string();
+            if task.is_empty() && images.is_empty() {
+                return true;
+            }
+            if let Err(err) = active_session.session.send(task, images).await {
+                warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
+            } else {
+                active_session.turn_running = true;
             }
             true
         }

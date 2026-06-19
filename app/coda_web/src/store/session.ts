@@ -124,6 +124,11 @@ type CodaStoreState = CodaState & SessionRuntimeState;
 
 const rootName = "coda";
 
+/** Session-list title for a turn that carried only images (no text). Kept in
+ * sync with `IMAGE_ONLY_PREVIEW` in the server's `storage.rs` so the optimistic
+ * title matches the one the server persists. */
+const IMAGE_ONLY_TITLE = "[image]";
+
 function newId(prefix: string) {
   return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
 }
@@ -1142,7 +1147,12 @@ function appendUserMessage(
       return;
     }
     const { workspaceId, sessionId } = splitKey(key);
-    const firstUserMessage = session.firstUserMessage ?? content;
+    // Fall back to an image placeholder when the turn has no text, so the session
+    // shows a title in the list (instead of the raw id) and isn't dropped from
+    // the optimistic catalog, which keys on a non-empty title.
+    const firstUserMessage =
+      session.firstUserMessage ??
+      (content || (images && images.length > 0 ? IMAGE_ONLY_TITLE : ""));
     session.draft = false;
     session.running = true;
     session.firstUserMessage = firstUserMessage;

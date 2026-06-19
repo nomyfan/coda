@@ -62,6 +62,14 @@ impl UserMessage {
             ContentPart::Image { .. } => None,
         })
     }
+
+    /// Whether the message carries at least one image part. Used to render a
+    /// list preview for image-only turns that have no text.
+    pub fn has_image(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. }))
+    }
 }
 
 /// A message representing a response from the AI, which may include tool calls.
