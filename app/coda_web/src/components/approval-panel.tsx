@@ -17,9 +17,10 @@ import {
   approvalKey,
   callArguments,
   deriveAllowPattern,
+  describeTool,
   extractShellCommand,
   parseAskUserParams,
-  subAgentDisplayName,
+  toolDisplayName,
   type PendingApproval,
   type ToolCall,
   type ToolCallResolution,
@@ -243,7 +244,12 @@ function ApprovalCall({
     <div className="space-y-3">
       <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
         <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
-        <span className="truncate">{subAgentDisplayName(call.name)}</span>
+        <span className="shrink-0">{toolDisplayName(call.name)}</span>
+        {describeTool(call.name, callArguments(call)) ? (
+          <span className="truncate font-mono text-xs font-normal text-muted-foreground">
+            {describeTool(call.name, callArguments(call))}
+          </span>
+        ) : null}
       </div>
       <pre className="max-h-44 overflow-auto rounded-md bg-muted p-3 text-xs leading-5 text-muted-foreground">
         {formatArguments(callArguments(call))}

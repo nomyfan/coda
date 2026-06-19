@@ -6,7 +6,11 @@ use tracing::debug;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ShellToolParams {
+    /// The shell command to execute.
     command: String,
+    /// A short (5-10 word) description of what this command does, in active
+    /// voice. For example: "List files in the current directory".
+    description: String,
 }
 
 pub struct ShellTool {
@@ -54,6 +58,7 @@ impl Tool for ShellTool {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
         async move {
+            debug!(description = %params.description, command = %params.command, "Executing shell command");
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(&params.command)

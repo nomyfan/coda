@@ -261,6 +261,54 @@ export function subAgentDisplayName(name: string): string {
   return name.startsWith(SUBAGENT_TOOL_PREFIX) ? name.slice(SUBAGENT_TOOL_PREFIX.length) : name;
 }
 
+/** Friendly action verbs for the built-in tools, e.g. `read_file` → `Read`. */
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Edit",
+  ls: "List",
+  glob: "Find",
+  grep: "Search",
+  shell: "Run",
+  read_todos: "Read todos",
+  write_todos: "Update todos",
+};
+
+/**
+ * A human-readable label for a tool invocation. Built-ins map to a verb,
+ * sub-agents drop the `agent__` prefix, and MCP tools keep their final segment.
+ */
+export function toolDisplayName(name: string): string {
+  if (name.startsWith(SUBAGENT_TOOL_PREFIX)) {
+    return subAgentDisplayName(name);
+  }
+  if (name in TOOL_DISPLAY_NAMES) {
+    return TOOL_DISPLAY_NAMES[name];
+  }
+  if (name.startsWith("mcp__")) {
+    const rest = name.slice("mcp__".length);
+    const sep = rest.indexOf("__");
+    if (sep === -1) {
+      return rest || name;
+    }
+    const server = rest.slice(0, sep);
+    const tool = rest.slice(sep + 2);
+    return tool ? `MCP(${server}): ${tool}` : server;
+  }
+  return name;
+}
+
+/** Format a `read_file` offset/limit pair as a `(from-to)` line range. */
+function formatLineRange(offset: unknown, limit: unknown): string | undefined {
+  const start = typeof offset === "number" && offset >= 1 ? Math.floor(offset) : undefined;
+  const count = typeof limit === "number" && limit >= 1 ? Math.floor(limit) : undefined;
+  if (start === undefined && count === undefined) {
+    return undefined;
+  }
+  const from = start ?? 1;
+  return count === undefined ? `(${from}-)` : `(${from}-${from + count - 1})`;
+}
+
 export function callArguments(call: ToolCall): string {
   return call.arguments?.trim() || "{}";
 }
@@ -314,8 +362,15 @@ export function describeTool(
 
   switch (name) {
     case "shell":
-      return str(args.command);
-    case "read_file":
+      return str(args.description) ?? str(args.command);
+    case "read_file": {
+      const path = str(args.file_path);
+      if (!path) {
+        return undefined;
+      }
+      const range = formatLineRange(args.offset, args.limit);
+      return range ? `${basename(path)} ${range}` : basename(path);
+    }
     case "write_file":
     case "edit_file": {
       const path = str(args.file_path);
@@ -325,9 +380,32 @@ export function describeTool(
       const path = str(args.path);
       return path ? basename(path) : undefined;
     }
-    case "glob":
-    case "grep":
-      return str(args.pattern);
+    case "glob": {
+      const pattern = str(args.pattern);
+      if (!pattern) {
+        return undefined;
+      }
+      const dir = str(args.path);
+      return dir ? `${pattern} in ${basename(dir)}` : pattern;
+    }
+    case "grep": {
+      const pattern = str(args.pattern);
+      if (!pattern) {
+        return undefined;
+      }
+      const scope = str(args.glob) ?? (str(args.path) ? basename(str(args.path)!) : undefined);
+      return scope ? `${pattern} in ${scope}` : pattern;
+    }
+    case "write_todos": {
+      if (!Array.isArray(args.todos)) {
+        return undefined;
+      }
+      const todos = args.todos;
+      const done = todos.filter(
+        (item) => item && typeof item === "object" && (item as { done?: unknown }).done,
+      ).length;
+      return `${done}/${todos.length} done`;
+    }
     default:
       return undefined;
   }

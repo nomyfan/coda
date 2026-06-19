@@ -29,7 +29,7 @@ import {
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
-import { isSubAgentToolName, subAgentDisplayName } from "@/lib/protocol";
+import { isSubAgentToolName, subAgentDisplayName, toolDisplayName } from "@/lib/protocol";
 import { cn, formatClockTime, formatDuration } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
@@ -180,7 +180,7 @@ export const Transcript = memo(function Transcript({
 
 function entryTitle(entry: TranscriptEntry) {
   if (entry.title) {
-    return subAgentDisplayName(entry.title);
+    return toolDisplayName(entry.title);
   }
   return entry.agentName ? `${entry.agentName}` : entry.kind;
 }
@@ -439,11 +439,8 @@ function processEntrySummary(entry: TranscriptEntry | undefined) {
   if (entry.kind === "reasoning") {
     return { title: "Thinking" };
   }
-  if (entry.kind === "tool_call") {
-    return { title: `Running ${entryTitle(entry)}`, detail: entry.detail };
-  }
-  if (entry.kind === "tool_result") {
-    return { title: `Finished ${entryTitle(entry)}`, detail: entry.detail };
+  if (entry.kind === "tool_call" || entry.kind === "tool_result") {
+    return { title: entryTitle(entry), detail: entry.detail };
   }
   if (entry.kind === "assistant") {
     return { title: "Responding" };
@@ -612,8 +609,8 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
             <EntryIcon entry={entry} />
             <span className="shrink-0 truncate text-sm">{title}</span>
             <EntryDetail entry={entry} />
+            <EntryTiming entry={entry} mode="duration" />
           </div>
-          <EntryTiming entry={entry} mode="duration" />
           <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
             <div className="flex justify-end">
               <EntryStatus entry={entry} />
