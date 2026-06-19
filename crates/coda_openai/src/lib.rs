@@ -159,7 +159,10 @@ impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
                 name: self.name,
                 description: Some(self.description),
                 parameters: Some(self.parameter_schema),
-                strict: Some(true),
+                // Strict mode requires every property to be listed in `required` and
+                // `additionalProperties: false`. Arbitrary tool schemas (notably MCP
+                // tools) routinely violate this, so leave it off rather than reject them.
+                strict: None,
             },
         })
     }
@@ -366,10 +369,20 @@ impl LLMProvider for OpenAI {
                     obj.insert("thinking".to_string(), serde_json::json!({ "type": state }));
                 }
             }
-            let mut stream = self.client.chat()
+            let mut stream = match self.client.chat()
                 .create_stream_byot::<_, ReasoningStreamResponse>(body)
                 .await
-                .unwrap();
+            {
+                Ok(stream) => stream,
+                // A non-2xx response (e.g. a 400 over an invalid tool schema) surfaces
+                // here. Some providers return an error body async-openai can't
+                // deserialize (e.g. a numeric `code`), so use the Debug form to keep the
+                // raw provider message instead of the opaque deserialization error.
+                Err(e) => {
+                    yield Err(StreamError::StreamingError(format!("{e:?}")));
+                    return;
+                }
+            };
             let mut chat_completion = ReducedChatCompletion::new();
             while let Some(response) = stream.next().await {
                 match response {
