@@ -439,6 +439,10 @@ struct ReducedChatCompletion {
     reasoning_content: String,
     chunks: Vec<ChatCompletionMessageToolCallChunk>,
     usage: Option<CompletionUsage>,
+    /// When this completion began streaming. Stamped at construction so the
+    /// assembled `AssistantMessage` carries a real start time even before the
+    /// agent runtime overlays its own dispatch/completion timing.
+    started_at: jiff::Timestamp,
 }
 
 impl ReducedChatCompletion {
@@ -448,6 +452,7 @@ impl ReducedChatCompletion {
             reasoning_content: String::new(),
             chunks: vec![],
             usage: None,
+            started_at: jiff::Timestamp::now(),
         }
     }
 
@@ -534,10 +539,12 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
             tool_calls,
             usage: value.usage,
             reasoning_content,
+            reasoning_ended_at: None,
             aborted: false,
-            // Timestamps are stamped by the agent runtime, which knows when the
-            // request was dispatched and when the stream completed.
-            ..Default::default()
+            // Real stream timing; the agent runtime later overlays its own
+            // dispatch/completion timestamps, which bracket the whole request.
+            started_at: value.started_at,
+            ended_at: jiff::Timestamp::now(),
         })
     }
 }
@@ -545,6 +552,22 @@ impl TryFrom<ReducedChatCompletion> for AssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Base assistant message for tests; callers override the fields they care
+    /// about with struct-update syntax (`..assistant()`).
+    fn assistant() -> AssistantMessage {
+        let now = jiff::Timestamp::now();
+        AssistantMessage {
+            content: String::new(),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+            reasoning_ended_at: None,
+            aborted: false,
+            started_at: now,
+            ended_at: now,
+        }
+    }
 
     #[test]
     fn user_text_message_uses_text_content_form() {
@@ -598,12 +621,12 @@ mod tests {
                     arguments: Some("{}".into()),
                 }],
                 reasoning_content: Some("need a tool".into()),
-                ..Default::default()
+                ..assistant()
             }),
             Message::Assistant(AssistantMessage {
                 content: "done".into(),
                 reasoning_content: Some("final reasoning".into()),
-                ..Default::default()
+                ..assistant()
             }),
         ];
         let mut body = serde_json::json!({

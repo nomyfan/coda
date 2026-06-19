@@ -56,6 +56,22 @@ fn completed(
     Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(msg))]))
 }
 
+/// Base assistant message for tests; callers override the fields they care
+/// about with struct-update syntax (`..assistant()`).
+fn assistant() -> AssistantMessage {
+    let now = jiff::Timestamp::now();
+    AssistantMessage {
+        content: String::new(),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
+        reasoning_ended_at: None,
+        aborted: false,
+        started_at: now,
+        ended_at: now,
+    }
+}
+
 /// A fake LLM provider that returns pre-scripted responses based on message
 /// content.
 ///
@@ -78,7 +94,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("simple hello") {
             return completed(AssistantMessage {
                 content: "Hello from the agent!".into(),
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -103,7 +119,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .unwrap_or_default();
                 return completed(AssistantMessage {
                     content: format!("file-content: {tool_output}"),
-                    ..Default::default()
+                    ..assistant()
                 });
             }
             return completed(AssistantMessage {
@@ -112,7 +128,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     name: "read_file".into(),
                     arguments: Some(json!({"file_path": path}).to_string()),
                 }],
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -147,7 +163,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .unwrap_or_default();
                 return completed(AssistantMessage {
                     content: format!("round-trip: {read_output}"),
-                    ..Default::default()
+                    ..assistant()
                 });
             } else if has_write {
                 return completed(AssistantMessage {
@@ -156,7 +172,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                         name: "read_file".into(),
                         arguments: Some(json!({"file_path": path}).to_string()),
                     }],
-                    ..Default::default()
+                    ..assistant()
                 });
             } else {
                 return completed(AssistantMessage {
@@ -167,7 +183,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                             json!({"file_path": path, "content": "session-test-data"}).to_string(),
                         ),
                     }],
-                    ..Default::default()
+                    ..assistant()
                 });
             }
         }
@@ -192,7 +208,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .unwrap_or_default();
                 return completed(AssistantMessage {
                     content: format!("explore-result: {explore_output}"),
-                    ..Default::default()
+                    ..assistant()
                 });
             }
             return completed(AssistantMessage {
@@ -201,7 +217,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     name: "explore".into(),
                     arguments: Some(r#"{"task":"session probe"}"#.into()),
                 }],
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -209,7 +225,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("session probe") {
             return completed(AssistantMessage {
                 content: "explore-done".into(),
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -217,14 +233,14 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("multi turn start") {
             return completed(AssistantMessage {
                 content: "turn-1-reply".into(),
-                ..Default::default()
+                ..assistant()
             });
         }
         if user_text.contains("multi turn follow") {
             let count = user_message_count(&request.messages);
             return completed(AssistantMessage {
                 content: format!("turn-2-reply (saw {count} user messages)"),
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -232,14 +248,14 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("resume test start") {
             return completed(AssistantMessage {
                 content: "session-1-reply".into(),
-                ..Default::default()
+                ..assistant()
             });
         }
         if user_text.contains("resume test follow") {
             let total = request.messages.len();
             return completed(AssistantMessage {
                 content: format!("session-2-reply (history-len: {total})"),
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -248,7 +264,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             if has_results {
                 return completed(AssistantMessage {
                     content: "approval-done".into(),
-                    ..Default::default()
+                    ..assistant()
                 });
             }
             return completed(AssistantMessage {
@@ -257,7 +273,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
                 }],
-                ..Default::default()
+                ..assistant()
             });
         }
 
@@ -277,7 +293,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .unwrap_or_default();
                 return completed(AssistantMessage {
                     content: format!("timeout-result: {outcome}"),
-                    ..Default::default()
+                    ..assistant()
                 });
             }
             return completed(AssistantMessage {
@@ -286,14 +302,14 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
                 }],
-                ..Default::default()
+                ..assistant()
             });
         }
 
         // Default fallback
         completed(AssistantMessage {
             content: format!("echo: {user_text}"),
-            ..Default::default()
+            ..assistant()
         })
     }
 }
