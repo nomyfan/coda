@@ -50,8 +50,13 @@ export function ImageLightbox({
   useEffect(() => {
     if (count <= 1) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "ArrowLeft") setCurrent((c) => (c - 1 + count) % count);
-      else if (e.key === "ArrowRight") setCurrent((c) => (c + 1) % count);
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setCurrent((c) => (c - 1 + count) % count);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setCurrent((c) => (c + 1) % count);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

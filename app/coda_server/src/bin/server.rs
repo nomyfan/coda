@@ -112,6 +112,12 @@ enum OpenedSession {
     Pending(Vec<coda_agent::PendingApproval>),
 }
 
+const MAX_TASK_IMAGES: usize = 5;
+const MAX_TASK_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TASK_IMAGE_URL_BYTES: usize = 2048;
+const ACCEPTED_TASK_IMAGE_MIME_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
 enum SessionEnvelope {
     Event {
         workspace_id: String,
@@ -124,6 +130,63 @@ enum SessionEnvelope {
         session_id: String,
         generation: u64,
     },
+}
+
+fn sanitize_task_images(images: Vec<String>) -> Vec<String> {
+    images
+        .into_iter()
+        .filter(|image| task_image_is_allowed(image))
+        .take(MAX_TASK_IMAGES)
+        .collect()
+}
+
+fn task_image_is_allowed(image: &str) -> bool {
+    if image.starts_with("https://") {
+        return image.len() <= MAX_TASK_IMAGE_URL_BYTES;
+    }
+
+    task_image_data_uri_decoded_len(image).is_some_and(|len| len <= MAX_TASK_IMAGE_BYTES)
+}
+
+fn task_image_data_uri_decoded_len(image: &str) -> Option<usize> {
+    let (metadata, payload) = image.split_once(',')?;
+    let mime_type = metadata.strip_prefix("data:")?.strip_suffix(";base64")?;
+
+    if !ACCEPTED_TASK_IMAGE_MIME_TYPES.contains(&mime_type) || payload.is_empty() {
+        return None;
+    }
+
+    if payload.len() % 4 != 0 {
+        return None;
+    }
+
+    let padding = payload
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'=')
+        .count();
+    if padding > 2 {
+        return None;
+    }
+
+    let unpadded = payload.len() - padding;
+    if payload.as_bytes()[..unpadded].contains(&b'=') {
+        return None;
+    }
+
+    if !payload
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
+
+    payload
+        .len()
+        .checked_mul(3)?
+        .checked_div(4)?
+        .checked_sub(padding)
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -377,6 +440,50 @@ mod selection_tests {
             normalize_reasoning_effort(&[], Some(ReasoningEffort::None)),
             None
         );
+    }
+
+    #[test]
+    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
+        let images = (0..(MAX_TASK_IMAGES + 1))
+            .map(|index| format!("https://example.com/{index}.png"))
+            .collect();
+
+        let sanitized = sanitize_task_images(images);
+
+        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
+        assert_eq!(sanitized[0], "https://example.com/0.png");
+        assert_eq!(sanitized[4], "https://example.com/4.png");
+    }
+
+    #[test]
+    fn task_image_sanitizer_accepts_supported_data_uri_images() {
+        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
+
+        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
+    }
+
+    #[test]
+    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
+        let oversized_url = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
+        );
+        let oversized_data = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
+        );
+        let images = vec![
+            "http://example.com/image.png".to_string(),
+            "data:text/plain;base64,AAAA".to_string(),
+            "data:image/png;base64,AAA".to_string(),
+            "data:image/png;base64,AA=A".to_string(),
+            oversized_url,
+            oversized_data,
+        ];
+
+        let sanitized = sanitize_task_images(images);
+
+        assert!(sanitized.is_empty());
     }
 }
 
@@ -726,7 +833,11 @@ async fn handle_dashboard_command<
                     .providers
                     .get(&active_session.provider_id)
                     .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
-                let images = if accepts_images { images } else { vec![] };
+                let images = if accepts_images {
+                    sanitize_task_images(images)
+                } else {
+                    vec![]
+                };
                 let task = task.trim().to_string();
                 if task.is_empty() && images.is_empty() {
                     return true;
