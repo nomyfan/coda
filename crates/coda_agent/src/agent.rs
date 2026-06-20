@@ -235,11 +235,11 @@ pub type EnvRenderer = Arc<dyn Fn() -> String + Send + Sync>;
 /// turn, assembled from three independently-lived segments:
 ///
 /// - `base` — the agent's own body (built-in default or `AGENT.md` body). Held
-///   behind a handle so its text can be hot-reloaded without rebuilding the
-///   agent.
-/// - `workspace_knowledge` — the workspace's `AGENTS.md` and skills. Also a
-///   handle (a watcher refreshes it). `None` for an agent not bound to a
-///   workspace (every sub-agent in Phase 1; they gain one in Phase 2).
+///   behind a handle so it *can* be updated in place without rebuilding the
+///   agent, though the server currently sets it once at load.
+/// - `workspace_knowledge` — the workspace's `AGENTS.md` and skills. A handle a
+///   per-workspace watcher refreshes in place. `None` only for an agent not
+///   bound to a workspace (e.g. a bare prompt built via `From<&str>`).
 /// - `env` — the environment context, rendered fresh every turn so the date and
 ///   other volatile values stay current.
 ///

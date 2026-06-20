@@ -592,8 +592,11 @@ pub fn resolve_agent_workspace(
     root_workspace: &str,
     raw: Option<&str>,
 ) -> Result<String, LoadError> {
-    let Some(raw) = raw else {
-        return Ok(root_workspace.to_string());
+    let raw = match raw.map(str::trim) {
+        // Trim incidental YAML whitespace so `workspace: "./sub "` resolves like
+        // `./sub` instead of failing with a confusing "missing dir".
+        Some(raw) if !raw.is_empty() => raw,
+        _ => return Ok(root_workspace.to_string()),
     };
 
     let path = Path::new(raw);
@@ -738,6 +741,26 @@ mod tests {
         let root_str = root.path().to_string_lossy();
         let resolved = resolve_agent_workspace("a", &root_str, Some("sub")).unwrap();
         assert_eq!(resolved, sub.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_workspace_trims_incidental_whitespace() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let root_str = root.path().to_string_lossy();
+        let resolved = resolve_agent_workspace("a", &root_str, Some("  sub  ")).unwrap();
+        assert_eq!(resolved, sub.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_workspace_blank_inherits_root() {
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy();
+        assert_eq!(
+            resolve_agent_workspace("a", &root_str, Some("   ")).unwrap(),
+            *root_str
+        );
     }
 
     #[test]
