@@ -94,6 +94,11 @@ pub struct AgentSpec {
 pub struct AgentTeam {
     root: AgentSpec,
     subagents: Vec<AgentSpec>,
+    /// Per-agent tool-root override, keyed by agent name. An agent absent here
+    /// roots its tools at the default workspace passed to [`build`](Self::build).
+    /// This is the lookup a per-agent workspace flows through — the root is just
+    /// another entry, not a special case.
+    agent_workspaces: HashMap<String, String>,
 }
 
 impl AgentTeam {
@@ -174,7 +179,20 @@ impl AgentTeam {
             }
         }
 
-        Ok(AgentTeam { root, subagents })
+        Ok(AgentTeam {
+            root,
+            subagents,
+            agent_workspaces: HashMap::new(),
+        })
+    }
+
+    /// Override per-agent tool roots by name. Names not present fall back to the
+    /// default workspace passed to [`build`](Self::build); names that don't match
+    /// any agent are simply never looked up. Returns `self` for chaining off
+    /// [`new`](Self::new).
+    pub fn with_agent_workspaces(mut self, workspaces: HashMap<String, String>) -> Self {
+        self.agent_workspaces = workspaces;
+        self
     }
 
     /// The root agent's spec — the team's entry point.
@@ -182,13 +200,15 @@ impl AgentTeam {
         &self.root
     }
 
-    /// Build every spec into a fresh [`Agent`], keyed by name, with tools rooted
-    /// at `workspace_dir`. Each spec is built exactly once, so the same agent may
-    /// be a sub-agent of several parents. Cycles are fine: sub-agents are
-    /// addressed by name through the resulting flat map, so building never
-    /// recurses. Infallible — the team was validated at construction. Call once
-    /// per session: the returned agents carry independent state.
-    pub fn build(&self, workspace_dir: &str) -> HashMap<String, Agent> {
+    /// Build every spec into a fresh [`Agent`], keyed by name. Tools are rooted
+    /// at the agent's own workspace ([`with_agent_workspaces`](Self::with_agent_workspaces)),
+    /// falling back to `default_workspace` for any agent without an override.
+    /// Each spec is built exactly once, so the same agent may be a sub-agent of
+    /// several parents. Cycles are fine: sub-agents are addressed by name through
+    /// the resulting flat map, so building never recurses. Infallible — the team
+    /// was validated at construction. Call once per session: the returned agents
+    /// carry independent state.
+    pub fn build(&self, default_workspace: &str) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
 
@@ -197,6 +217,11 @@ impl AgentTeam {
             let todo_store = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             let state = Arc::new(Mutex::new(AgentState { messages: vec![] }));
 
+            let workspace_dir = self
+                .agent_workspaces
+                .get(&spec.name)
+                .map(String::as_str)
+                .unwrap_or(default_workspace);
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 todo_store: todo_store.clone(),
@@ -233,6 +258,11 @@ impl AgentTeam {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+
+    use coda_core::tool::{ToolObject, ToolResult};
+
     use super::*;
 
     fn spec(name: &str) -> AgentSpec {
@@ -244,6 +274,66 @@ mod tests {
             tools: vec![],
             subagents: vec![],
         }
+    }
+
+    /// A tool that records the workspace it was built with, for asserting that
+    /// each agent's tools are rooted at its own workspace.
+    struct RecordingTool;
+    impl ToolObject for RecordingTool {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        fn description(&self) -> &str {
+            "records"
+        }
+        fn parameter_schema(&self) -> &serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| serde_json::json!({}))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _params: String,
+        ) -> Pin<Box<dyn std::future::Future<Output = ToolResult<String>> + Send>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    struct RecordingToolSpec {
+        seen: Arc<StdMutex<Vec<String>>>,
+    }
+    impl ToolSpec for RecordingToolSpec {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+            self.seen.lock().unwrap().push(ctx.workspace_dir.clone());
+            Box::new(RecordingTool)
+        }
+    }
+
+    #[test]
+    fn build_roots_tools_at_per_agent_workspace() {
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let mk = || Box::new(RecordingToolSpec { seen: seen.clone() }) as Box<dyn ToolSpec>;
+        let root = AgentSpec {
+            tools: vec![mk()],
+            subagents: vec!["sub".into()],
+            ..spec("coda")
+        };
+        let sub = AgentSpec {
+            tools: vec![mk()],
+            ..spec("sub")
+        };
+        let team = AgentTeam::new(root, vec![sub])
+            .unwrap()
+            .with_agent_workspaces(HashMap::from([("sub".to_string(), "/sub".to_string())]));
+
+        team.build("/root");
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        // Root falls back to the default workspace; `sub` uses its override.
+        assert_eq!(got, vec!["/root".to_string(), "/sub".to_string()]);
     }
 
     #[test]
