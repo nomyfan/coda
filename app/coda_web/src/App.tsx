@@ -6,6 +6,7 @@ import {
   newSession,
   openSession,
   selectActiveApprovalCount,
+  selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
   selectActiveReasoningEffort,
@@ -73,6 +74,7 @@ export default function App() {
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
   const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeUsage = useCodaStore(selectActiveUsage);
+  const activeHasImages = useCodaStore(selectActiveHasImages);
 
   const newSessionTarget = useNewSessionStore((state) => state.target);
   const [newSessionModel, setNewSessionModel] = useState<{
@@ -236,6 +238,7 @@ export default function App() {
                   : activeReasoningEffort
               }
               usage={showingNewSession ? NO_USAGE : activeUsage}
+              sessionHasImages={showingNewSession ? false : activeHasImages}
               onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
               onChangeServer={changeNewSessionServer}
               onChangeWorkspace={changeWorkspace}

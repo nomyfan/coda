@@ -1734,6 +1734,12 @@ export const selectActiveServer = (state: CodaStoreState) => state.activeServer;
 export const selectActiveKey = (state: CodaStoreState) => state.activeKey;
 export const selectActiveEntries = (state: CodaStoreState) =>
   activeSessionOf(state)?.entries ?? EMPTY_ENTRIES;
+/** Whether the active session's history carries any image attachment, so the
+ * model selection must stay on a vision-capable model. */
+export const selectActiveHasImages = (state: CodaStoreState): boolean =>
+  (activeSessionOf(state)?.entries ?? EMPTY_ENTRIES).some(
+    (entry) => (entry.images?.length ?? 0) > 0,
+  );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>

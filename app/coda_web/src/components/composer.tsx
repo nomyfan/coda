@@ -51,6 +51,7 @@ export const Composer = memo(function Composer({
   providerId,
   reasoningEffort,
   usage,
+  sessionHasImages,
   onSetModel,
   onChangeServer,
   onChangeWorkspace,
@@ -68,6 +69,9 @@ export const Composer = memo(function Composer({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   usage: UsageRecord[];
+  /** The active session's history already carries image attachments, so a
+   * text-only model can no longer serve this conversation. */
+  sessionHasImages: boolean;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onChangeServer: (serverUrl: string) => void;
   onChangeWorkspace: (workspaceId: string) => void;
@@ -91,6 +95,9 @@ export const Composer = memo(function Composer({
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
   const canAddImages = acceptsImages && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
+  // Once images are in play — staged in the draft or already in history — only a
+  // vision-capable model can serve the turn, so text-only models are locked out.
+  const requireImageModel = images.length > 0 || sessionHasImages;
   const canSend =
     connected &&
     Boolean(workspace) &&
@@ -344,6 +351,7 @@ export const Composer = memo(function Composer({
                 providerId={providerId}
                 reasoningEffort={reasoningEffort}
                 disabled={!connected || running}
+                requireImageModel={requireImageModel}
                 onSetModel={onSetModel}
               />
               {contextWindow ? (

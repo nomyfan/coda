@@ -146,7 +146,13 @@ export const Transcript = memo(function Transcript({
   }, [entries.length, lastEntryContent, running]);
 
   return (
-    <section className="scrollbar-fine min-h-0 flex-1 overflow-y-auto px-4 py-3">
+    // `layoutScroll` lets motion account for this container's scroll offset when
+    // measuring layout, so scrolling to the bottom on a new message doesn't make
+    // the layoutId image thumbnails spuriously animate from their old position.
+    <motion.section
+      layoutScroll
+      className="scrollbar-fine min-h-0 flex-1 overflow-y-auto px-4 py-3"
+    >
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (
           <div className="flex min-h-[48vh] flex-col items-center justify-center text-center">
@@ -174,7 +180,7 @@ export const Transcript = memo(function Transcript({
         {running ? <WorkingIndicator /> : null}
         <div ref={bottomRef} />
       </div>
-    </section>
+    </motion.section>
   );
 });
 

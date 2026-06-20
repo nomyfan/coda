@@ -53,12 +53,16 @@ export function ModelSelector({
   providerId,
   reasoningEffort,
   disabled,
+  requireImageModel,
   onSetModel,
 }: {
   providers: ProviderInfo[];
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   disabled: boolean;
+  /** Restrict selectable models to vision-capable ones (the conversation
+   * already involves images). */
+  requireImageModel: boolean;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
 }) {
   const groups = useMemo(() => groupProviders(providers), [providers]);
@@ -78,7 +82,11 @@ export function ModelSelector({
       <SelectGroup key={providerName}>
         <SelectLabel>{providerName}</SelectLabel>
         {models.map((info) => (
-          <SelectItem key={info.id} value={info.id}>
+          <SelectItem
+            key={info.id}
+            value={info.id}
+            disabled={requireImageModel && !info.input_modalities.includes("image")}
+          >
             {info.model}
           </SelectItem>
         ))}
