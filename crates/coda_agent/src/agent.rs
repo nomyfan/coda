@@ -224,43 +224,92 @@ pub enum AgentEvent {
     Error(String), // TODO: make this more structured
 }
 
+/// Renders the per-turn environment context block (date, system, shell,
+/// workspace). Invoked fresh at the start of every turn so volatile values —
+/// the date above all — are never stale. The closure captures the agent's
+/// workspace directory and the selected fields; only truly volatile values are
+/// recomputed per call (see the renderer constructed in `coda_server`).
+pub type EnvRenderer = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// The system prompt an agent prepends to its messages at the start of every
-/// turn.
+/// turn, assembled from three independently-lived segments:
 ///
-/// `Static` is fixed for the agent's lifetime. `Shared` reads through a handle
-/// an outside owner can update (e.g. when `AGENTS.md` changes), so the next
-/// turn picks up the new text without rebuilding the agent.
+/// - `base` — the agent's own body (built-in default or `AGENT.md` body). Held
+///   behind a handle so its text can be hot-reloaded without rebuilding the
+///   agent.
+/// - `workspace_knowledge` — the workspace's `AGENTS.md` and skills. Also a
+///   handle (a watcher refreshes it). `None` for an agent not bound to a
+///   workspace (every sub-agent in Phase 1; they gain one in Phase 2).
+/// - `env` — the environment context, rendered fresh every turn so the date and
+///   other volatile values stay current.
+///
+/// [`resolve`](Self::resolve) concatenates the three each turn.
 #[derive(Clone)]
-pub enum SystemPrompt {
-    Static(String),
-    Shared(SharedSystemPrompt),
+pub struct SystemPrompt {
+    base: SharedSystemPrompt,
+    workspace_knowledge: Option<SharedSystemPrompt>,
+    env: Option<EnvRenderer>,
 }
 
 impl SystemPrompt {
-    /// The current prompt text.
-    pub fn resolve(&self) -> String {
-        match self {
-            SystemPrompt::Static(s) => s.clone(),
-            SystemPrompt::Shared(s) => s.get(),
+    /// A prompt with only a base body — no workspace knowledge, no env block.
+    pub fn new(base: SharedSystemPrompt) -> Self {
+        SystemPrompt {
+            base,
+            workspace_knowledge: None,
+            env: None,
         }
+    }
+
+    /// Attach the workspace-knowledge handle (`AGENTS.md` + skills).
+    pub fn with_workspace_knowledge(mut self, knowledge: SharedSystemPrompt) -> Self {
+        self.workspace_knowledge = Some(knowledge);
+        self
+    }
+
+    /// Attach the per-turn environment renderer.
+    pub fn with_env(mut self, env: EnvRenderer) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    /// The current prompt text: base, then workspace knowledge, then a freshly
+    /// rendered environment block. Empty segments are skipped.
+    pub fn resolve(&self) -> String {
+        let mut out = self.base.get();
+        if let Some(knowledge) = &self.workspace_knowledge {
+            let text = knowledge.get();
+            if !text.is_empty() {
+                out.push_str("\n---\n");
+                out.push_str(&text);
+            }
+        }
+        if let Some(env) = &self.env {
+            let text = env();
+            if !text.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&text);
+            }
+        }
+        out
     }
 }
 
 impl From<&str> for SystemPrompt {
     fn from(s: &str) -> Self {
-        SystemPrompt::Static(s.to_string())
+        SystemPrompt::new(SharedSystemPrompt::new(s))
     }
 }
 
 impl From<String> for SystemPrompt {
     fn from(s: String) -> Self {
-        SystemPrompt::Static(s)
+        SystemPrompt::new(SharedSystemPrompt::new(s))
     }
 }
 
 impl From<SharedSystemPrompt> for SystemPrompt {
     fn from(s: SharedSystemPrompt) -> Self {
-        SystemPrompt::Shared(s)
+        SystemPrompt::new(s)
     }
 }
 
@@ -471,5 +520,44 @@ impl SubAgents {
                 }),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_base_only() {
+        let sp = SystemPrompt::from("base body");
+        assert_eq!(sp.resolve(), "base body");
+    }
+
+    #[test]
+    fn resolve_concatenates_all_three_segments_in_order() {
+        let env: EnvRenderer = Arc::new(|| "<env/>".to_string());
+        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
+            .with_workspace_knowledge(SharedSystemPrompt::new("knowledge"))
+            .with_env(env);
+        assert_eq!(sp.resolve(), "base\n---\nknowledge\n\n<env/>");
+    }
+
+    #[test]
+    fn resolve_skips_empty_segments() {
+        let env: EnvRenderer = Arc::new(String::new);
+        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
+            .with_workspace_knowledge(SharedSystemPrompt::new(""))
+            .with_env(env);
+        assert_eq!(sp.resolve(), "base");
+    }
+
+    #[test]
+    fn resolve_reflects_workspace_knowledge_updates_in_place() {
+        let knowledge = SharedSystemPrompt::new("old");
+        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
+            .with_workspace_knowledge(knowledge.clone());
+        assert_eq!(sp.resolve(), "base\n---\nold");
+        knowledge.set("new");
+        assert_eq!(sp.resolve(), "base\n---\nnew");
     }
 }

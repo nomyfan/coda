@@ -23,8 +23,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use coda_agent::{AgentSpec, AgentTeam, BuildError, SubAgentMode, SystemPrompt};
+use coda_agent::{
+    AgentSpec, AgentTeam, BuildError, SharedSystemPrompt, SubAgentMode, SystemPrompt,
+};
 use coda_core::llm::ReasoningEffort;
+
+use crate::{EnvField, default_env_fields, make_env_renderer};
 use coda_core::tool::ToolObject;
 use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
 use serde::Deserialize;
@@ -175,6 +179,9 @@ struct Frontmatter {
     tools: Vec<String>,
     #[serde(default)]
     subagents: Vec<String>,
+    /// Optional environment-context fields. Absent means the default ([`date`]).
+    #[serde(default)]
+    env: Option<Vec<EnvField>>,
     /// Optional model override, as a `{provider_id}:{model_id}` selection key.
     /// Absent means the agent inherits the session's default (root) model.
     #[serde(default)]
@@ -193,6 +200,7 @@ pub struct AgentFile {
     tools: Vec<String>,
     subagents: Vec<String>,
     system_prompt: String,
+    env: Vec<EnvField>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -223,18 +231,33 @@ struct RootFrontmatter {
     tools: Option<Vec<String>>,
     #[serde(default)]
     subagents: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<Vec<EnvField>>,
 }
 
 /// Parsed top-level `coda` configuration. Each field is an explicit override of a
 /// default when `Some`/non-empty; otherwise the built-in behavior applies. See
 /// [`build_agent_team`] (tools, sub-agents) and the system-prompt assembly (body).
-#[derive(Default)]
 pub struct RootAgentFile {
     pub tools: Option<Vec<String>>,
     pub subagents: Option<Vec<String>>,
     /// The body, used as the root agent's base system prompt; `None` when the
     /// file is absent or its body is empty (fall back to the built-in default).
     pub system_prompt: Option<String>,
+    /// Environment-context fields for the root agent. Defaults to [`date`] when
+    /// the file is absent or omits `env:`.
+    pub env: Vec<EnvField>,
+}
+
+impl Default for RootAgentFile {
+    fn default() -> Self {
+        RootAgentFile {
+            tools: None,
+            subagents: None,
+            system_prompt: None,
+            env: default_env_fields(),
+        }
+    }
 }
 
 /// True if `name` is a syntactically valid agent name (lowercase alphanumerics
@@ -284,6 +307,7 @@ fn parse_agent_file(name: &str, content: &str) -> Result<AgentFile, LoadError> {
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: body.to_string(),
+        env: fm.env.unwrap_or_else(default_env_fields),
         model: fm.model,
         reasoning_effort: fm.reasoning_effort,
     })
@@ -351,6 +375,7 @@ fn parse_root_agent_file(content: &str) -> Result<RootAgentFile, LoadError> {
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: (!body.is_empty()).then(|| body.to_string()),
+        env: fm.env.unwrap_or_else(default_env_fields),
     })
 }
 
@@ -432,7 +457,14 @@ fn resolve_tools(
 /// structural problem [`AgentTeam::new`] rejects — duplicate names, dangling
 /// references, or tool/sub-agent conflicts ([`LoadError::Build`]).
 /// Agents unreachable from `coda` are ignored with a warning.
+///
+/// The caller assembles `root_system_prompt` (it owns the base and
+/// workspace-knowledge handles a watcher refreshes). Sub-agent prompts are built
+/// here: a static base body plus a per-turn env block rendered against
+/// `workspace_dir` — the single workspace in Phase 1; per-agent in Phase 2.
+/// Sub-agents have no workspace knowledge yet (they gain it in Phase 2).
 pub fn build_agent_team(
+    workspace_dir: &str,
     root_system_prompt: SystemPrompt,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
@@ -480,10 +512,14 @@ pub fn build_agent_team(
     let mut subagents = Vec::with_capacity(files.len());
     for file in files {
         let tools = resolve_tools(registry, &file.name, &file.tools)?;
+        let mut system_prompt = SystemPrompt::new(SharedSystemPrompt::new(file.system_prompt));
+        if let Some(env) = make_env_renderer(workspace_dir.to_string(), file.env) {
+            system_prompt = system_prompt.with_env(env);
+        }
         subagents.push(AgentSpec {
             name: file.name,
             description: file.description,
-            system_prompt: SystemPrompt::Static(file.system_prompt),
+            system_prompt,
             mode: file.mode,
             tools,
             subagents: file.subagents,
@@ -576,6 +612,40 @@ mod tests {
         assert_eq!(files[0].mode, SubAgentMode::Stateless);
         assert_eq!(files[0].tools, vec!["read_file", "grep"]);
         assert_eq!(files[0].system_prompt, "You explore.");
+        // Omitting `env:` defaults to date only.
+        assert_eq!(files[0].env, vec![EnvField::Date]);
+    }
+
+    #[test]
+    fn parses_explicit_env_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "coder",
+            "---\ndescription: codes\nmode: stateful\nenv: [date, system, shell, workspace]\n---\nYou code.",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        assert_eq!(
+            files[0].env,
+            vec![
+                EnvField::Date,
+                EnvField::System,
+                EnvField::Shell,
+                EnvField::Workspace
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_empty_env_to_no_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "quiet",
+            "---\ndescription: quiet\nmode: stateless\nenv: []\n---\nYou are quiet.",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        assert!(files[0].env.is_empty());
     }
 
     #[test]
@@ -656,7 +726,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let result = build_agent_team("root".into(), &registry, files, None, None);
+        let result = build_agent_team("/ws", "root".into(), &registry, files, None, None);
         assert!(matches!(result, Err(LoadError::UnknownTool { .. })));
     }
 
@@ -675,7 +745,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let team = build_agent_team("root".into(), &registry, files, None, None).unwrap();
+        let team = build_agent_team("/ws", "root".into(), &registry, files, None, None).unwrap();
 
         // Only `boss` is a direct sub-agent of coda; `worker` hangs under boss.
         assert_eq!(team.root().subagents, vec!["boss".to_string()]);
@@ -690,8 +760,15 @@ mod tests {
             "---\ndescription: x\nmode: stateful\nsubagents: [loop]\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team =
-            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
+        let team = build_agent_team(
+            "/ws",
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            None,
+            None,
+        )
+        .unwrap();
         // A self-loop doesn't count as "referenced by another agent", so `loop`
         // is still a root under coda (and thus reachable), not orphaned.
         assert_eq!(team.root().subagents, vec!["loop".to_string()]);
@@ -713,8 +790,15 @@ mod tests {
         let files = load_agent_files(dir.path()).unwrap();
         // `a` and `b` reference each other but neither is reachable from the
         // root, so both are dropped (with a warning) and the team still builds.
-        let team =
-            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
+        let team = build_agent_team(
+            "/ws",
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(team.root().subagents.is_empty());
     }
 
@@ -731,7 +815,14 @@ mod tests {
         let files = load_agent_files(dir.path()).unwrap();
         // Team construction catches the conflict from spec metadata alone — no
         // build.
-        let result = build_agent_team("root".into(), &ToolRegistry::new(), files, None, None);
+        let result = build_agent_team(
+            "/ws",
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            None,
+            None,
+        );
         assert!(matches!(
             result,
             Err(LoadError::Build(BuildError::NameConflict { .. }))
@@ -757,8 +848,15 @@ mod tests {
             "---\ndescription: x\nmode: stateless\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team =
-            build_agent_team("root".into(), &ToolRegistry::new(), files, None, None).unwrap();
+        let team = build_agent_team(
+            "/ws",
+            "root".into(),
+            &ToolRegistry::new(),
+            files,
+            None,
+            None,
+        )
+        .unwrap();
         let agents = team.build(".");
         assert!(agents.contains_key("shared"));
         assert!(agents.contains_key("a"));
@@ -818,6 +916,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let team = build_agent_team(
+            "/ws",
             "root".into(),
             &ToolRegistry::new(),
             files,
@@ -836,6 +935,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = load_agent_files(dir.path()).unwrap();
         let result = build_agent_team(
+            "/ws",
             "root".into(),
             &ToolRegistry::new(),
             files,

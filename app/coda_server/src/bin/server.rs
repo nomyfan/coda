@@ -13,8 +13,9 @@ use coda_openai::OpenAI;
 use coda_server::{
     agents::{AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
     ask_user::AskUserToolSpec,
-    build_system_prompt,
+    build_workspace_knowledge,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
+    make_env_renderer,
     mcp::McpServers,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
@@ -1206,29 +1207,29 @@ async fn dashboard_ws_handler(
     })
 }
 
-/// Poll the workspace's `AGENTS.md` for content changes and refresh the shared
-/// system prompt in place whenever it changes. Polling (over an OS watcher)
-/// keeps this dependency-free and robust to editor atomic-saves; the few-second
-/// latency is immaterial since the prompt is only read at the start of a turn.
-fn spawn_custom_instructions_watcher(
+/// Poll the workspace's knowledge sources — `AGENTS.md` and the skills directory
+/// — and refresh the shared workspace-knowledge handle in place whenever the
+/// rendered text changes. Polling (over an OS watcher) keeps this
+/// dependency-free and robust to editor atomic-saves; the few-second latency is
+/// immaterial since the prompt is only read at the start of a turn.
+fn spawn_workspace_knowledge_watcher(
     workspace_id: String,
     workspace_str: String,
-    base_prompt: String,
-    system_prompt: SharedSystemPrompt,
+    workspace_knowledge: SharedSystemPrompt,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut last = coda_server::read_custom_instructions(&workspace_str);
+        let mut last = workspace_knowledge.get();
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let current = coda_server::read_custom_instructions(&workspace_str);
+                    let current = build_workspace_knowledge(&workspace_str);
                     if current != last {
-                        last = current;
-                        system_prompt.set(build_system_prompt(&workspace_str, &base_prompt));
-                        info!(workspace_id = %workspace_id, "AGENTS.md changed, system prompt reloaded");
+                        last = current.clone();
+                        workspace_knowledge.set(current);
+                        info!(workspace_id = %workspace_id, "workspace knowledge changed, reloaded");
                     }
                 }
             }
@@ -1307,7 +1308,17 @@ async fn build_workspace(
         .system_prompt
         .clone()
         .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
-    let system_prompt = SharedSystemPrompt::new(build_system_prompt(&workspace_str, &base_prompt));
+
+    // Three independently-lived segments. `base` is fixed for the session; the
+    // workspace-knowledge handle is refreshed in place by the watcher; the env
+    // block is rendered fresh every turn (so the date never goes stale).
+    let base = SharedSystemPrompt::new(base_prompt);
+    let workspace_knowledge = SharedSystemPrompt::new(build_workspace_knowledge(&workspace_str));
+    let mut root_system_prompt =
+        SystemPrompt::new(base).with_workspace_knowledge(workspace_knowledge.clone());
+    if let Some(env) = make_env_renderer(workspace_str.clone(), root_agent.env.clone()) {
+        root_system_prompt = root_system_prompt.with_env(env);
+    }
 
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = WorkspaceStorage::new(checkpoint_dir);
@@ -1332,7 +1343,8 @@ async fn build_workspace(
     let agent_files = load_agent_files(&workspace_dir).map_err(|e| e.to_string())?;
     let agent_models = resolve_agent_model_selections(&agent_files, providers)?;
     let agent_team = build_agent_team(
-        SystemPrompt::from(system_prompt.clone()),
+        &workspace_str,
+        root_system_prompt,
         &registry,
         agent_files,
         root_agent.tools,
@@ -1348,11 +1360,10 @@ async fn build_workspace(
         ToolApprovalConfig::default_for(&workspace_dir)
     });
 
-    spawn_custom_instructions_watcher(
+    spawn_workspace_knowledge_watcher(
         workspace.id.clone(),
         workspace_str.clone(),
-        base_prompt,
-        system_prompt.clone(),
+        workspace_knowledge,
         shutdown.clone(),
     );
 
