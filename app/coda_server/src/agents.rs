@@ -1,8 +1,9 @@
 //! File-based agent definitions.
 //!
 //! Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`:
-//! YAML frontmatter (description, mode, tools, subagents, env, workspace, model)
-//! followed by a markdown body used as the agent's system prompt. They become
+//! YAML frontmatter (description, mode, tools, subagents, env, workspace, model,
+//! reasoning_effort) followed by a markdown body used as the agent's system
+//! prompt. They become
 //! sub-agents of the top-level `coda` agent and may reference one another by name
 //! to form deeper graphs.
 //!
