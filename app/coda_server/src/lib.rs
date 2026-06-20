@@ -6,8 +6,10 @@ pub mod storage;
 pub mod transport;
 pub mod wire;
 
+use coda_agent::EnvRenderer;
 use coda_skills::Skills;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 pub static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
@@ -34,20 +36,39 @@ pub fn read_custom_instructions(workspace_dir: &str) -> Option<String> {
     }
 }
 
-/// Compose the root agent's full system prompt: `base` (the root agent's base
-/// instructions — either the configured `.coda/agents/AGENT.md` body or the
-/// built-in [`SYSTEM_PROMPT`]) followed by skills, workspace custom
-/// instructions (`AGENTS.md`), and environment context.
-pub fn build_system_prompt(workspace_dir: &str, base: &str) -> String {
-    let mut prompt = base.to_string();
+/// A selectable field of the per-turn environment context block. Agents declare
+/// the set they want via the `env:` frontmatter list; omitting it defaults to
+/// just [`EnvField::Date`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvField {
+    /// Today's date — the one truly volatile field, recomputed every turn.
+    Date,
+    /// OS, architecture, and (best-effort) OS version.
+    System,
+    /// The current shell.
+    Shell,
+    /// The agent's workspace directory.
+    Workspace,
+}
+
+/// The default env field set when an agent omits `env:` — date only.
+pub fn default_env_fields() -> Vec<EnvField> {
+    vec![EnvField::Date]
+}
+
+/// Build the workspace-knowledge segment: the workspace's skills followed by its
+/// custom instructions (`AGENTS.md`). Returns an empty string when neither is
+/// present, so callers can treat "no knowledge" uniformly.
+pub fn build_workspace_knowledge(workspace_dir: &str) -> String {
+    let mut out = String::new();
 
     match Skills::from_dir(&Path::new(workspace_dir).join(".coda").join("skills")) {
         Ok(skills) => {
             info!("loaded {} skills", skills.0.len());
-            prompt.push_str("\n---\n");
-            prompt.push_str(AGENT_SKILLS_PROMPT);
-            prompt.push('\n');
-            prompt.push_str(&skills.to_xml());
+            out.push_str(AGENT_SKILLS_PROMPT);
+            out.push('\n');
+            out.push_str(&skills.to_xml());
         }
         Err(err) => {
             warn!("failed to load skills, proceeding without them: {err}");
@@ -56,35 +77,59 @@ pub fn build_system_prompt(workspace_dir: &str, base: &str) -> String {
 
     if let Some(instructions) = read_custom_instructions(workspace_dir) {
         info!("loaded custom instructions from {CUSTOM_INSTRUCTIONS_FILE}");
-        prompt.push_str("\n\n<custom_instructions>\n");
-        prompt.push_str(&instructions);
-        prompt.push_str("\n</custom_instructions>");
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("<custom_instructions>\n");
+        out.push_str(&instructions);
+        out.push_str("\n</custom_instructions>");
     }
 
-    prompt.push_str("\n\n");
-    prompt.push_str(&build_environment_context(workspace_dir));
-
-    prompt
+    out
 }
 
-fn build_environment_context(workspace_dir: &str) -> String {
+/// Build a per-turn environment-context renderer for an agent rooted at
+/// `workspace_dir` and wanting `fields`. The static values (OS, shell, workspace
+/// path) are computed once, here; only the date is recomputed on each call, so
+/// it never goes stale in a long session without paying to re-probe the shell or
+/// OS version every turn. Returns `None` when `fields` is empty (no env block).
+///
+/// The renderer captures its `workspace_dir`, so a per-agent workspace in Phase
+/// 2 only changes the captured value — not the shape of this seam.
+pub fn make_env_renderer(workspace_dir: String, fields: Vec<EnvField>) -> Option<EnvRenderer> {
+    if fields.is_empty() {
+        return None;
+    }
+
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let os_version = get_os_version()
-        .map(|v| format!("\n  <os_version>{v}</os_version>"))
-        .unwrap_or_default();
-    let today = jiff::Zoned::now().date();
-    let shell = get_current_shell();
+    let system = format!(
+        "  <os>{os}({arch})</os>{}",
+        get_os_version()
+            .map(|v| format!("\n  <os_version>{v}</os_version>"))
+            .unwrap_or_default()
+    );
+    let shell = format!("  <shell>{}</shell>", get_current_shell());
+    let workspace = format!("  <workspace>{workspace_dir}</workspace>");
 
-    format!(
-        "\
-<environment_context>
-  <workspace>{workspace_dir}</workspace>
-  <os>{os}({arch})</os>{os_version}
-  <date>{today}</date>
-  <shell>{shell}</shell>
-</environment_context>"
-    )
+    Some(Arc::new(move || {
+        let mut lines = Vec::with_capacity(fields.len());
+        for field in &fields {
+            match field {
+                EnvField::Date => {
+                    let today = jiff::Zoned::now().date();
+                    lines.push(format!("  <date>{today}</date>"));
+                }
+                EnvField::System => lines.push(system.clone()),
+                EnvField::Shell => lines.push(shell.clone()),
+                EnvField::Workspace => lines.push(workspace.clone()),
+            }
+        }
+        format!(
+            "<environment_context>\n{}\n</environment_context>",
+            lines.join("\n")
+        )
+    }))
 }
 
 #[cfg(unix)]
@@ -147,15 +192,38 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_includes_custom_instructions() {
+    fn build_workspace_knowledge_includes_custom_instructions() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CUSTOM_INSTRUCTIONS_FILE),
             "always write tests.",
         )
         .unwrap();
-        let prompt = build_system_prompt(&dir.path().to_string_lossy(), SYSTEM_PROMPT);
-        assert!(prompt.contains("<custom_instructions>"));
-        assert!(prompt.contains("always write tests."));
+        let knowledge = build_workspace_knowledge(&dir.path().to_string_lossy());
+        assert!(knowledge.contains("<custom_instructions>"));
+        assert!(knowledge.contains("always write tests."));
+    }
+
+    #[test]
+    fn build_workspace_knowledge_empty_without_skills_or_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_workspace_knowledge(&dir.path().to_string_lossy()).is_empty());
+    }
+
+    #[test]
+    fn env_renderer_recomputes_date_and_honors_fields() {
+        let renderer =
+            make_env_renderer("/ws".to_string(), vec![EnvField::Date, EnvField::Workspace])
+                .expect("non-empty fields yield a renderer");
+        let rendered = renderer();
+        assert!(rendered.contains("<date>"));
+        assert!(rendered.contains("<workspace>/ws</workspace>"));
+        assert!(!rendered.contains("<shell>"));
+        assert!(!rendered.contains("<os>"));
+    }
+
+    #[test]
+    fn env_renderer_none_for_empty_fields() {
+        assert!(make_env_renderer("/ws".to_string(), vec![]).is_none());
     }
 }
