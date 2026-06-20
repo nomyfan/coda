@@ -603,10 +603,12 @@ pub fn resolve_agent_workspace(
         Path::new(root_workspace).join(path)
     };
 
+    // Report the joined path (what was actually looked up), noting the raw value
+    // a relative `./sub` is otherwise ambiguous without its resolution base.
     let invalid = |reason: String| LoadError::InvalidWorkspace {
         agent: agent.to_string(),
-        path: raw.to_string(),
-        reason,
+        path: joined.to_string_lossy().into_owned(),
+        reason: format!("{reason} (from workspace: '{raw}')"),
     };
 
     let canonical = joined.canonicalize().map_err(|e| invalid(e.to_string()))?;
