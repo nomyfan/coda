@@ -1,0 +1,43 @@
+# Example server config. Run the server against it with:
+#
+#   CODA_SERVER_CONFIG=examples/coda-server.toml cargo run -p coda_server --bin coda-server
+#
+# It declares the LLM providers the dashboard can choose from, and the
+# workspaces sessions are scoped to. See `examples/README.md` for a tour of the
+# `.coda/` configuration inside the workspace.
+
+# --- Providers ---------------------------------------------------------------
+# Each provider is an OpenAI-compatible endpoint. `kind` selects request quirks:
+#   "generic"  — standard OpenAI-compatible API (default)
+#   "deepseek" — toggles thinking via DeepSeek's `thinking` field
+# `api_key` / `base_url` may reference an environment variable as `${VAR}`.
+# Each model needs an `id` (the API model name) and a `context_window`; `name`,
+# `reasoning_efforts`, and `input_modalities` are optional.
+
+[[providers]]
+id = "deepseek"
+kind = "deepseek"
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com"
+models = [
+  { id = "deepseek-v4-pro", name = "DeepSeek V4 Pro", context_window = 1000000, reasoning_efforts = ["xhigh", "high"] },
+  { id = "deepseek-v4-flash", name = "DeepSeek V4 Flash", context_window = 1000000, reasoning_efforts = ["xhigh", "high"] },
+]
+
+[[providers]]
+id = "openrouter"
+api_key = "${OPENROUTER_API_KEY}"
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  { id = "openai/gpt-5.1-codex-mini", name = "GPT-5.1-Codex-Mini", context_window = 400000, input_modalities = ["text", "image"] },
+  { id = "openai/gpt-5.4-nano", name = "GPT-5.4 Nano", context_window = 400000, input_modalities = ["text", "image"] },
+]
+
+# --- Workspaces --------------------------------------------------------------
+# Sessions are scoped to a workspace. `path` is resolved (and canonicalized) at
+# startup, relative to *this config file's directory* (so `workspace` points at
+# examples/workspace). Point it at an absolute path in real use.
+
+[[workspaces]]
+id = "demo"
+path = "workspace"

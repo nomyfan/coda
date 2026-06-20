@@ -10,3 +10,11 @@ skills/
 .claude/worktrees/
 .claude/launch.json
 coda-server.toml
+
+# examples/ ships curated reference config; keep its whole tree tracked despite
+# the skills/, .coda, and coda-server.toml rules above. Re-include directories
+# first (so git descends into them), then their files.
+!examples/**/
+!examples/**
+# ...but never the per-run session checkpoints the server writes there.
+examples/**/.coda/sessions/
