@@ -363,11 +363,23 @@ fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
-/// Pattern-based permission rules for shell commands.
+/// Pattern-based permission rules for `shell` commands.
 ///
-/// Evaluation order: deny match → require approval, shell operators
-/// (`;`, `&`, `|`, `>`, `<`, backticks, `$()`, newlines) → require approval,
-/// allow match → auto-approve, no match → require approval (default).
+/// A command is parsed into its constituent simple commands (splitting on `;`,
+/// `&&`, `||`, and `|`) and each is evaluated independently against the rules.
+/// The whole call auto-approves only when **every** simple command is allowed
+/// and **none** is denied. A command auto-approves iff:
+///
+/// - it parses as a valid shell program, and
+/// - it uses only sequencing/and-or/pipe operators — no backgrounding (`&`),
+///   redirections (`>`, `<`), command substitution (`$(...)`, backticks),
+///   process substitution, compound commands (subshells, loops, `if`/`case`),
+///   or function definitions, and
+/// - every simple command matches an `allow` pattern, and
+/// - no simple command matches a `deny` pattern.
+///
+/// Anything that can't be statically reduced this way falls back to requiring
+/// human approval (the safe default).
 #[derive(Clone)]
 pub struct ToolApprovalConfig {
     inner: Arc<Mutex<Inner>>,
@@ -434,17 +446,7 @@ impl ToolApprovalConfig {
         }
         let command = extract_shell_command(call);
         let inner = self.inner.lock().unwrap();
-
-        if inner.deny.iter().any(|p| wildcard_match(p, &command)) {
-            return true;
-        }
-        if has_shell_operators(&command) {
-            return true;
-        }
-        if inner.allow.iter().any(|p| wildcard_match(p, &command)) {
-            return false;
-        }
-        true
+        !is_auto_approved(&command, &inner.allow, &inner.deny)
     }
 
     /// Append a glob pattern to the allow-list, updating both in-memory state
@@ -474,15 +476,93 @@ impl ToolApprovalConfig {
     }
 }
 
-fn has_shell_operators(command: &str) -> bool {
-    command.contains(';')
-        || command.contains('&')
-        || command.contains('|')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains('`')
-        || command.contains("$(")
-        || command.contains('\n')
+/// Whether `command` can be auto-approved against the given rules.
+///
+/// Parses the command and reduces it to a flat list of plain simple commands.
+/// Returns `true` only when every simple command matches `allow` and none
+/// matches `deny`. Any construct that can't be statically reduced — a parse
+/// error, backgrounding, redirections, substitutions, compound commands, etc.
+/// — yields `false` (require approval).
+fn is_auto_approved(command: &str, allow: &[String], deny: &[String]) -> bool {
+    let Some(simple_commands) = decompose(command) else {
+        return false;
+    };
+    if simple_commands.is_empty() {
+        return false;
+    }
+    simple_commands.iter().all(|cmd| {
+        !deny.iter().any(|p| wildcard_match(p, cmd)) && allow.iter().any(|p| wildcard_match(p, cmd))
+    })
+}
+
+/// Parse `command` and reduce it to the textual form of each simple command it
+/// runs, e.g. `cd app && cargo test` → `["cd app", "cargo test"]`.
+///
+/// Returns `None` when the command can't be statically reduced to plain simple
+/// commands joined by `;`/`&&`/`||`/`|`: a parse error, an async (`&`)
+/// separator, a redirection, a command/process substitution, or any compound
+/// command (subshell, loop, conditional) or function definition.
+fn decompose(command: &str) -> Option<Vec<String>> {
+    use brush_parser::ast;
+
+    let tokens = brush_parser::tokenize_str(command).ok()?;
+    let program =
+        brush_parser::parse_tokens(&tokens, &brush_parser::ParserOptions::default()).ok()?;
+
+    let mut out = Vec::new();
+    for ast::CompoundList(items) in &program.complete_commands {
+        for ast::CompoundListItem(and_or, separator) in items {
+            if !matches!(separator, ast::SeparatorOperator::Sequence) {
+                return None; // backgrounding with `&`
+            }
+            collect_pipeline(&and_or.first, &mut out)?;
+            for tail in &and_or.additional {
+                let (ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline)) = tail;
+                collect_pipeline(pipeline, &mut out)?;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn collect_pipeline(pipeline: &brush_parser::ast::Pipeline, out: &mut Vec<String>) -> Option<()> {
+    use brush_parser::ast::Command;
+    for command in &pipeline.seq {
+        let Command::Simple(simple) = command else {
+            return None; // compound command, function, or extended test
+        };
+        out.push(simple_command_text(simple)?);
+    }
+    Some(())
+}
+
+/// The textual form of a plain simple command, or `None` if it carries anything
+/// we can't statically vet: a missing command name, a redirection, a process
+/// substitution, or a command substitution.
+fn simple_command_text(simple: &brush_parser::ast::SimpleCommand) -> Option<String> {
+    use brush_parser::ast::CommandPrefixOrSuffixItem as Item;
+
+    simple.word_or_name.as_ref()?;
+
+    let has_risky_item = |items: &[Item]| {
+        items
+            .iter()
+            .any(|i| matches!(i, Item::IoRedirect(_) | Item::ProcessSubstitution(..)))
+    };
+    if simple.prefix.as_ref().is_some_and(|p| has_risky_item(&p.0)) {
+        return None;
+    }
+    if simple.suffix.as_ref().is_some_and(|s| has_risky_item(&s.0)) {
+        return None;
+    }
+
+    let text = simple.to_string();
+    // brush keeps command/arithmetic substitution as a flat word string; reject
+    // anything we can't resolve to a fixed command.
+    if text.contains("$(") || text.contains('`') {
+        return None;
+    }
+    Some(text)
 }
 
 fn extract_shell_command(call: &ToolCall) -> String {
@@ -1024,22 +1104,57 @@ deny = ["rm -rf *"]
     }
 
     #[test]
-    fn compound_commands_require_approval() {
+    fn compound_of_allowed_commands_auto_approves() {
+        let config = ToolApprovalConfig::default_for(Path::new("/tmp"));
+        {
+            let mut inner = config.inner.lock().unwrap();
+            inner.allow.push("git *".to_string());
+            inner.allow.push("cargo *".to_string());
+            inner.allow.push("cd *".to_string());
+        }
+        // Sequencing, and-or, and pipes auto-approve when every constituent
+        // simple command is allowed.
+        assert!(!config.requires_approval(&shell_call("git status")));
+        assert!(!config.requires_approval(&shell_call("cd app && cargo test")));
+        assert!(!config.requires_approval(&shell_call("git fetch; git status")));
+        assert!(!config.requires_approval(&shell_call("git log | cargo run")));
+        assert!(!config.requires_approval(&shell_call("git status || git fetch")));
+        assert!(!config.requires_approval(&shell_call("git status\ncargo test")));
+    }
+
+    #[test]
+    fn compound_with_disallowed_command_requires_approval() {
         let config = ToolApprovalConfig::default_for(Path::new("/tmp"));
         {
             let mut inner = config.inner.lock().unwrap();
             inner.allow.push("git *".to_string());
         }
-        assert!(!config.requires_approval(&shell_call("git status")));
+        // A single disallowed simple command anywhere in the compound gates it.
         assert!(config.requires_approval(&shell_call("git status; rm -rf /")));
         assert!(config.requires_approval(&shell_call("git status && echo done")));
-        assert!(config.requires_approval(&shell_call("git status & rm -rf /")));
-        assert!(config.requires_approval(&shell_call("git status\nrm -rf /")));
         assert!(config.requires_approval(&shell_call("git log | head")));
+    }
+
+    #[test]
+    fn unresolvable_constructs_require_approval() {
+        let config = ToolApprovalConfig::default_for(Path::new("/tmp"));
+        {
+            let mut inner = config.inner.lock().unwrap();
+            inner.allow.push("git *".to_string());
+            inner.allow.push("echo *".to_string());
+        }
+        // Backgrounding, redirections, and substitutions can't be statically
+        // vetted even when the visible command is allowed.
+        assert!(config.requires_approval(&shell_call("git status & echo done")));
         assert!(config.requires_approval(&shell_call("git status > /tmp/out")));
         assert!(config.requires_approval(&shell_call("git status < /dev/null")));
         assert!(config.requires_approval(&shell_call("echo `whoami`")));
         assert!(config.requires_approval(&shell_call("echo $(whoami)")));
+        // Compound commands (subshells, loops) fall back to approval.
+        assert!(config.requires_approval(&shell_call("(git status)")));
+        assert!(config.requires_approval(&shell_call("for f in *; do echo $f; done")));
+        // A syntactically invalid command is never auto-approved.
+        assert!(config.requires_approval(&shell_call("git status &&")));
     }
 
     #[test]

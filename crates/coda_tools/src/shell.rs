@@ -22,7 +22,7 @@ pub struct ShellTool {
 impl ShellTool {
     pub fn new(cwd: String) -> Self {
         let description =
-            "Execute shell commands and return stdout and stderr. Your are in a Unix environment."
+            "Execute shell commands and return stdout and stderr. You are in a Unix environment."
                 .to_string();
         let schema = schemars::schema_for!(ShellToolParams);
         debug!("ShellTool schema: {:?}", schema);
@@ -59,7 +59,8 @@ impl Tool for ShellTool {
         let cwd = self.cwd.clone();
         async move {
             debug!(description = %params.description, command = %params.command, "Executing shell command");
-            let output = Command::new("sh")
+            // `shell` is the platform-agnostic tool name; `bash` is the current backend.
+            let output = Command::new("bash")
                 .arg("-c")
                 .arg(&params.command)
                 .current_dir(&cwd)
