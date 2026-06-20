@@ -98,7 +98,7 @@ pub fn build_workspace_knowledge(workspace_dir: &str) -> String {
 /// Build a per-turn environment-context renderer for an agent rooted at
 /// `workspace_dir` and wanting `fields`. The static values (OS, shell, workspace
 /// path) are computed once, here, and only for the fields actually requested —
-/// so a `[date]`-only agent never spawns the shell/OS-version probes. Only the
+/// so a `[date]`-only agent never spawns the OS-version probe. Only the
 /// date is recomputed on each call, so it never goes stale in a long session.
 /// Returns `None` when `fields` is empty (no env block).
 ///
@@ -119,9 +119,11 @@ pub fn make_env_renderer(workspace_dir: String, fields: Vec<EnvField>) -> Option
                 .unwrap_or_default()
         )
     });
+    // The `shell` tool always executes via `bash -c`, regardless of the host's
+    // login shell, so the advertised shell is fixed to its concrete backend.
     let shell = fields
         .contains(&EnvField::Shell)
-        .then(|| format!("  <shell>{}</shell>", get_current_shell()));
+        .then(|| "  <shell>bash</shell>".to_string());
     let workspace = fields
         .contains(&EnvField::Workspace)
         .then(|| format!("  <workspace>{workspace_dir}</workspace>"));
@@ -146,18 +148,6 @@ pub fn make_env_renderer(workspace_dir: String, fields: Vec<EnvField>) -> Option
             lines.join("\n")
         )
     }))
-}
-
-#[cfg(unix)]
-fn get_current_shell() -> String {
-    let ppid = std::os::unix::process::parent_id();
-    std::process::Command::new("ps")
-        .args(["-p", &ppid.to_string(), "-o", "comm="])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().rsplit('/').next().unwrap_or("unknown").to_string())
-        .unwrap_or_else(|| "unknown".into())
 }
 
 fn get_os_version() -> Option<String> {

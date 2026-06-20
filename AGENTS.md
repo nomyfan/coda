@@ -18,7 +18,9 @@ This project is in active development. Breaking changes to APIs, serialization f
 
 ## Runtime Config
 
-Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `sh`.
+**Unix-only for now.** The runtime targets Unix (Linux/macOS): the `shell` tool runs every command through `bash -c` (`bash` is the current concrete backend behind the platform-agnostic `shell` tool name), and the env probes use Unix utilities (`uname`/`sw_vers`). Windows is not supported at this stage.
+
+Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `bash`.
 
 ## Frontend UI
 
@@ -78,7 +80,7 @@ The runtime exposes sub-agents to the LLM as `agent__<name>` tools and strips th
 
 Agents may optionally override the session’s model via the `model` frontmatter field, a `{provider_id}:{model_id}` selection key (optionally paired with `reasoning_effort`). Overrides are validated against the provider catalog at startup — an unknown model or unsupported reasoning effort is a hard error. When a sub-agent omits `model`, it inherits the session’s default (root) model.
 
-Each agent's system prompt is assembled per turn from three independently-lived segments: a **base** body (the `AGENT.md` body / built-in prompt; read once at workspace load), the **workspace knowledge** (`AGENTS.md` + skills for that agent's workspace; refreshed in place by a per-workspace watcher), and a per-turn **env** block. The `env:` frontmatter list selects env fields (`date`, `system`, `shell`, `workspace`); omitting it defaults to `[date]`. Only the date is recomputed each turn (so it never goes stale); shell/OS are probed once and only when requested.
+Each agent's system prompt is assembled per turn from three independently-lived segments: a **base** body (the `AGENT.md` body / built-in prompt; read once at workspace load), the **workspace knowledge** (`AGENTS.md` + skills for that agent's workspace; refreshed in place by a per-workspace watcher), and a per-turn **env** block. The `env:` frontmatter list selects env fields (`date`, `system`, `shell`, `workspace`); omitting it defaults to `[date]`. Only the date is recomputed each turn (so it never goes stale); the OS is probed once and only when requested, and the shell is fixed to `bash` (the interpreter the `shell` tool always runs commands through).
 
 The `workspace:` frontmatter roots an agent at its own directory (its tool root and knowledge source) — absolute, or relative to the root workspace; absent inherits the root (session) workspace. A `workspace:` that doesn't resolve to an existing directory is a hard startup error. Agents sharing a workspace share one knowledge handle + watcher. This is a default cwd/relative-root, **not** a sandbox — tools can still reach outside it. A per-agent workspace does **not** load its own `.coda/agents` (agent topology is defined only in the root workspace). Only the **workspace knowledge** (`AGENTS.md` + skills) hot-reloads, via the watcher; agent bodies and all frontmatter (`tools`/`subagents`/`mode`/`model`/`workspace`/`env`) are read once at load and need a restart to change. MCP tools and the approval policy remain rooted at the session workspace / session-global.
 

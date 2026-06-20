@@ -1,13 +1,17 @@
-# Shell-approval rules for this workspace.
+# shell-approval rules for this workspace.
 #
-# Only the `shell` tool is gated. Evaluation order:
-#   1. a `deny` match            -> require human approval
-#   2. shell operators (; & | > < `` $() newline) -> require approval
-#   3. an `allow` match          -> auto-approve
-#   4. no match                  -> require approval (the safe default)
+# Only the `shell` tool is gated. A command is parsed and split into its simple
+# commands (on `;`, newlines, `&&`, `||`, `|`); each is evaluated independently. The whole
+# call auto-approves only when:
+#   - every simple command matches an `allow` pattern, and
+#   - no simple command matches a `deny` pattern (deny wins over allow), and
+#   - it uses only sequencing/pipe operators — anything that can't be statically
+#     vetted (backgrounding `&`, redirections `>`/`<`, command substitution
+#     `$(...)`/backticks, subshells/loops/`if`, or a parse error) falls back to
+#     requiring approval (the safe default).
 #
 # `write_file`, `edit_file`, and `ask_user` always require approval regardless.
-# Patterns are globs matched against the full command string.
+# Patterns are globs matched against each simple command's text.
 
 [permissions.shell]
 allow = [
