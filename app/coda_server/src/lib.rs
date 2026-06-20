@@ -10,7 +10,7 @@ use coda_agent::EnvRenderer;
 use coda_skills::Skills;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 pub static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
@@ -60,23 +60,30 @@ pub fn default_env_fields() -> Vec<EnvField> {
 /// Build the workspace-knowledge segment: the workspace's skills followed by its
 /// custom instructions (`AGENTS.md`). Returns an empty string when neither is
 /// present, so callers can treat "no knowledge" uniformly.
+///
+/// This is pure and quiet: it is re-run on every watcher poll (a few seconds
+/// apart), so it must not log per call. A missing skills directory — the common
+/// case — is silently "no skills"; the watcher logs once when the rendered text
+/// actually changes.
 pub fn build_workspace_knowledge(workspace_dir: &str) -> String {
     let mut out = String::new();
 
-    match Skills::from_dir(&Path::new(workspace_dir).join(".coda").join("skills")) {
-        Ok(skills) => {
-            info!("loaded {} skills", skills.0.len());
-            out.push_str(AGENT_SKILLS_PROMPT);
-            out.push('\n');
-            out.push_str(&skills.to_xml());
-        }
-        Err(err) => {
-            warn!("failed to load skills, proceeding without them: {err}");
+    let skills_dir = Path::new(workspace_dir).join(".coda").join("skills");
+    if skills_dir.exists() {
+        match Skills::from_dir(&skills_dir) {
+            Ok(skills) if !skills.0.is_empty() => {
+                out.push_str(AGENT_SKILLS_PROMPT);
+                out.push('\n');
+                out.push_str(&skills.to_xml());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!("failed to load skills, proceeding without them: {err}");
+            }
         }
     }
 
     if let Some(instructions) = read_custom_instructions(workspace_dir) {
-        info!("loaded custom instructions from {CUSTOM_INSTRUCTIONS_FILE}");
         if !out.is_empty() {
             out.push_str("\n\n");
         }
@@ -90,9 +97,10 @@ pub fn build_workspace_knowledge(workspace_dir: &str) -> String {
 
 /// Build a per-turn environment-context renderer for an agent rooted at
 /// `workspace_dir` and wanting `fields`. The static values (OS, shell, workspace
-/// path) are computed once, here; only the date is recomputed on each call, so
-/// it never goes stale in a long session without paying to re-probe the shell or
-/// OS version every turn. Returns `None` when `fields` is empty (no env block).
+/// path) are computed once, here, and only for the fields actually requested —
+/// so a `[date]`-only agent never spawns the shell/OS-version probes. Only the
+/// date is recomputed on each call, so it never goes stale in a long session.
+/// Returns `None` when `fields` is empty (no env block).
 ///
 /// The renderer captures its `workspace_dir`, so a per-agent workspace in Phase
 /// 2 only changes the captured value — not the shape of this seam.
@@ -101,29 +109,37 @@ pub fn make_env_renderer(workspace_dir: String, fields: Vec<EnvField>) -> Option
         return None;
     }
 
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let system = format!(
-        "  <os>{os}({arch})</os>{}",
-        get_os_version()
-            .map(|v| format!("\n  <os_version>{v}</os_version>"))
-            .unwrap_or_default()
-    );
-    let shell = format!("  <shell>{}</shell>", get_current_shell());
-    let workspace = format!("  <workspace>{workspace_dir}</workspace>");
+    let system = fields.contains(&EnvField::System).then(|| {
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        format!(
+            "  <os>{os}({arch})</os>{}",
+            get_os_version()
+                .map(|v| format!("\n  <os_version>{v}</os_version>"))
+                .unwrap_or_default()
+        )
+    });
+    let shell = fields
+        .contains(&EnvField::Shell)
+        .then(|| format!("  <shell>{}</shell>", get_current_shell()));
+    let workspace = fields
+        .contains(&EnvField::Workspace)
+        .then(|| format!("  <workspace>{workspace_dir}</workspace>"));
 
     Some(Arc::new(move || {
         let mut lines = Vec::with_capacity(fields.len());
         for field in &fields {
-            match field {
-                EnvField::Date => {
-                    let today = jiff::Zoned::now().date();
-                    lines.push(format!("  <date>{today}</date>"));
-                }
-                EnvField::System => lines.push(system.clone()),
-                EnvField::Shell => lines.push(shell.clone()),
-                EnvField::Workspace => lines.push(workspace.clone()),
-            }
+            // The static fields are `Some` exactly when requested, and we only
+            // reach their arm while iterating a requested field.
+            let line = match field {
+                EnvField::Date => format!("  <date>{}</date>", jiff::Zoned::now().date()),
+                EnvField::System => system.clone().expect("system computed when requested"),
+                EnvField::Shell => shell.clone().expect("shell computed when requested"),
+                EnvField::Workspace => workspace
+                    .clone()
+                    .expect("workspace computed when requested"),
+            };
+            lines.push(line);
         }
         format!(
             "<environment_context>\n{}\n</environment_context>",
@@ -207,6 +223,13 @@ mod tests {
     #[test]
     fn build_workspace_knowledge_empty_without_skills_or_instructions() {
         let dir = tempfile::tempdir().unwrap();
+        assert!(build_workspace_knowledge(&dir.path().to_string_lossy()).is_empty());
+    }
+
+    #[test]
+    fn build_workspace_knowledge_empty_for_present_but_empty_skills_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coda").join("skills")).unwrap();
         assert!(build_workspace_knowledge(&dir.path().to_string_lossy()).is_empty());
     }
 
