@@ -1,0 +1,10 @@
+{
+  "//": "MCP servers exposed to agents as `mcp__<server>__<tool>` tools. Loaded once from the root workspace and shared by every agent. Reference them in an agent's `tools` list by full name or with a `mcp__<server>__*` prefix pattern. Note: unlike coda-server.toml, values here are literal — there is no ${VAR} expansion.",
+  "mcpServers": {
+    "time": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone", "UTC"]
+    }
+  }
+}

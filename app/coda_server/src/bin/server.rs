@@ -6,16 +6,18 @@ use axum::{
 };
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
-    Shutdown, SystemPrompt, runtime::SessionStorage,
+    Shutdown, runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProviderConfig, Modality, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
-    agents::{AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file},
+    agents::{
+        AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file,
+        resolve_agent_workspace,
+    },
     ask_user::AskUserToolSpec,
     build_workspace_knowledge,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
-    make_env_renderer,
     mcp::McpServers,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
@@ -25,7 +27,7 @@ use coda_server::{
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1229,7 +1231,7 @@ fn spawn_workspace_knowledge_watcher(
                     if current != last {
                         last = current.clone();
                         workspace_knowledge.set(current);
-                        info!(workspace_id = %workspace_id, "workspace knowledge changed, reloaded");
+                        info!(workspace_id = %workspace_id, path = %workspace_str, "workspace knowledge changed, reloaded");
                     }
                 }
             }
@@ -1308,17 +1310,7 @@ async fn build_workspace(
         .system_prompt
         .clone()
         .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
-
-    // Three independently-lived segments. `base` is fixed for the session; the
-    // workspace-knowledge handle is refreshed in place by the watcher; the env
-    // block is rendered fresh every turn (so the date never goes stale).
-    let base = SharedSystemPrompt::new(base_prompt);
-    let workspace_knowledge = SharedSystemPrompt::new(build_workspace_knowledge(&workspace_str));
-    let mut root_system_prompt =
-        SystemPrompt::new(base).with_workspace_knowledge(workspace_knowledge.clone());
-    if let Some(env) = make_env_renderer(workspace_str.clone(), root_agent.env.clone()) {
-        root_system_prompt = root_system_prompt.with_env(env);
-    }
+    let root_base = SharedSystemPrompt::new(base_prompt);
 
     let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
     let storage = WorkspaceStorage::new(checkpoint_dir);
@@ -1342,9 +1334,42 @@ async fn build_workspace(
 
     let agent_files = load_agent_files(&workspace_dir).map_err(|e| e.to_string())?;
     let agent_models = resolve_agent_model_selections(&agent_files, providers)?;
+
+    // Resolve each agent's workspace (relative to the root, default = root). The
+    // root is the session workspace itself.
+    let mut agent_workspaces: HashMap<String, String> = HashMap::new();
+    for file in &agent_files {
+        let resolved = resolve_agent_workspace(file.name(), &workspace_str, file.workspace())
+            .map_err(|e| e.to_string())?;
+        if resolved != workspace_str {
+            agent_workspaces.insert(file.name().to_string(), resolved);
+        }
+    }
+
+    // One workspace-knowledge handle (and watcher) per distinct workspace, shared
+    // by every agent rooted there. The watcher refreshes the text in place; the
+    // env block is rendered fresh every turn.
+    let distinct: BTreeSet<String> = std::iter::once(workspace_str.clone())
+        .chain(agent_workspaces.values().cloned())
+        .collect();
+    let mut knowledge: HashMap<String, SharedSystemPrompt> = HashMap::new();
+    for ws in distinct {
+        let handle = SharedSystemPrompt::new(build_workspace_knowledge(&ws));
+        spawn_workspace_knowledge_watcher(
+            workspace.id.clone(),
+            ws.clone(),
+            handle.clone(),
+            shutdown.clone(),
+        );
+        knowledge.insert(ws, handle);
+    }
+
     let agent_team = build_agent_team(
         &workspace_str,
-        root_system_prompt,
+        root_base,
+        root_agent.env,
+        &knowledge,
+        &agent_workspaces,
         &registry,
         agent_files,
         root_agent.tools,
@@ -1359,13 +1384,6 @@ async fn build_workspace(
         );
         ToolApprovalConfig::default_for(&workspace_dir)
     });
-
-    spawn_workspace_knowledge_watcher(
-        workspace.id.clone(),
-        workspace_str.clone(),
-        workspace_knowledge,
-        shutdown.clone(),
-    );
 
     info!(
         workspace_id = %workspace.id,

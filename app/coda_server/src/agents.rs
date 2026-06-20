@@ -1,10 +1,11 @@
 //! File-based agent definitions.
 //!
 //! Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`:
-//! YAML frontmatter (description, mode, tools, subagents) followed by a markdown
-//! body used as the agent's system prompt. They become sub-agents of the
-//! top-level `coda` agent and may reference one another by name to form deeper
-//! graphs.
+//! YAML frontmatter (description, mode, tools, subagents, env, workspace, model,
+//! reasoning_effort) followed by a markdown body used as the agent's system
+//! prompt. They become
+//! sub-agents of the top-level `coda` agent and may reference one another by name
+//! to form deeper graphs.
 //!
 //! The top-level `coda` agent itself is configured by an optional
 //! `.coda/agents/AGENT.md` (a bare file, distinct from the per-agent directories).
@@ -20,7 +21,7 @@
 //! — a sub-agent that omits `tools` gets none. An unknown plain name is a hard
 //! error, surfaced at startup; a pattern that matches nothing only warns.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use coda_agent::{
@@ -59,6 +60,12 @@ pub enum LoadError {
         agent: String,
         tool: String,
     },
+    /// An agent's `workspace:` does not resolve to an existing directory.
+    InvalidWorkspace {
+        agent: String,
+        path: String,
+        reason: String,
+    },
     /// The assembled team failed structural validation: duplicate names,
     /// dangling sub-agent references, or tool/sub-agent namespace conflicts.
     Build(BuildError),
@@ -81,6 +88,11 @@ impl std::fmt::Display for LoadError {
             LoadError::UnknownTool { agent, tool } => {
                 write!(f, "agent '{agent}' requests unknown tool '{tool}'")
             }
+            LoadError::InvalidWorkspace {
+                agent,
+                path,
+                reason,
+            } => write!(f, "agent '{agent}' workspace '{path}' is invalid: {reason}"),
             LoadError::Build(e) => write!(f, "invalid agent configuration: {e}"),
         }
     }
@@ -182,6 +194,10 @@ struct Frontmatter {
     /// Optional environment-context fields. Absent means the default ([`date`]).
     #[serde(default)]
     env: Option<Vec<EnvField>>,
+    /// Optional per-agent workspace (tool root + knowledge source). Absolute, or
+    /// relative to the root workspace. Absent means inherit the root workspace.
+    #[serde(default)]
+    workspace: Option<String>,
     /// Optional model override, as a `{provider_id}:{model_id}` selection key.
     /// Absent means the agent inherits the session's default (root) model.
     #[serde(default)]
@@ -201,6 +217,7 @@ pub struct AgentFile {
     subagents: Vec<String>,
     system_prompt: String,
     env: Vec<EnvField>,
+    workspace: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -209,6 +226,11 @@ impl AgentFile {
     /// The agent's name (its directory name under `.coda/agents/`).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The raw `workspace:` frontmatter value, if any (unresolved).
+    pub fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
     }
 
     /// The configured model selection key (`{provider_id}:{model_id}`), if any.
@@ -308,6 +330,7 @@ fn parse_agent_file(name: &str, content: &str) -> Result<AgentFile, LoadError> {
         subagents: fm.subagents,
         system_prompt: body.to_string(),
         env: fm.env.unwrap_or_else(default_env_fields),
+        workspace: fm.workspace,
         model: fm.model,
         reasoning_effort: fm.reasoning_effort,
     })
@@ -458,19 +481,38 @@ fn resolve_tools(
 /// references, or tool/sub-agent conflicts ([`LoadError::Build`]).
 /// Agents unreachable from `coda` are ignored with a warning.
 ///
-/// The caller assembles `root_system_prompt` (it owns the base and
-/// workspace-knowledge handles a watcher refreshes). Sub-agent prompts are built
-/// here: a static base body plus a per-turn env block rendered against
-/// `workspace_dir` — the single workspace in Phase 1; per-agent in Phase 2.
-/// Sub-agents have no workspace knowledge yet (they gain it in Phase 2).
+/// Every agent's system prompt — root and sub alike — is assembled here from
+/// three segments: a base body handle, the workspace-knowledge handle for the
+/// agent's own workspace (looked up in `knowledge`), and a per-turn env block
+/// rendered against that workspace. Each agent's tool root is recorded on the
+/// returned team via [`AgentTeam::with_agent_workspaces`]. `agent_workspaces`
+/// maps sub-agent names to their resolved workspace; an agent absent there (and
+/// the root) uses `root_workspace`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_agent_team(
-    workspace_dir: &str,
-    root_system_prompt: SystemPrompt,
+    root_workspace: &str,
+    root_base: SharedSystemPrompt,
+    root_env: Vec<EnvField>,
+    knowledge: &HashMap<String, SharedSystemPrompt>,
+    agent_workspaces: &HashMap<String, String>,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
     root_tools: Option<Vec<String>>,
     root_subagents: Option<Vec<String>>,
 ) -> Result<AgentTeam, LoadError> {
+    // Assemble a three-segment prompt for an agent rooted at `workspace`: base
+    // body, that workspace's knowledge handle (if any), and a per-turn env block.
+    let assemble = |base: SharedSystemPrompt, workspace: &str, env: Vec<EnvField>| {
+        let mut prompt = SystemPrompt::new(base);
+        if let Some(handle) = knowledge.get(workspace) {
+            prompt = prompt.with_workspace_knowledge(handle.clone());
+        }
+        if let Some(renderer) = make_env_renderer(workspace.to_string(), env) {
+            prompt = prompt.with_env(renderer);
+        }
+        prompt
+    };
+
     let roots = match root_subagents {
         Some(explicit) => explicit,
         None => {
@@ -503,7 +545,7 @@ pub fn build_agent_team(
     let root = AgentSpec {
         name: ROOT_AGENT_NAME.to_string(),
         description: String::new(),
-        system_prompt: root_system_prompt,
+        system_prompt: assemble(root_base, root_workspace, root_env),
         mode: SubAgentMode::Stateful,
         tools: root_tools,
         subagents: roots,
@@ -512,10 +554,15 @@ pub fn build_agent_team(
     let mut subagents = Vec::with_capacity(files.len());
     for file in files {
         let tools = resolve_tools(registry, &file.name, &file.tools)?;
-        let mut system_prompt = SystemPrompt::new(SharedSystemPrompt::new(file.system_prompt));
-        if let Some(env) = make_env_renderer(workspace_dir.to_string(), file.env) {
-            system_prompt = system_prompt.with_env(env);
-        }
+        let workspace = agent_workspaces
+            .get(&file.name)
+            .map(String::as_str)
+            .unwrap_or(root_workspace);
+        let system_prompt = assemble(
+            SharedSystemPrompt::new(file.system_prompt),
+            workspace,
+            file.env,
+        );
         subagents.push(AgentSpec {
             name: file.name,
             description: file.description,
@@ -526,7 +573,53 @@ pub fn build_agent_team(
         });
     }
 
-    AgentTeam::new(root, subagents).map_err(LoadError::Build)
+    // The full name → workspace lookup the team roots tools through; the root is
+    // just another entry, not a special case.
+    let mut workspaces = agent_workspaces.clone();
+    workspaces.insert(ROOT_AGENT_NAME.to_string(), root_workspace.to_string());
+
+    AgentTeam::new(root, subagents)
+        .map(|team| team.with_agent_workspaces(workspaces))
+        .map_err(LoadError::Build)
+}
+
+/// Resolve an agent's `workspace:` frontmatter to an absolute, existing
+/// directory. A relative path is taken against `root_workspace`; an absent value
+/// inherits `root_workspace` itself. A path that does not resolve to an existing
+/// directory is a hard error — an agent must never silently root at the wrong
+/// place.
+pub fn resolve_agent_workspace(
+    agent: &str,
+    root_workspace: &str,
+    raw: Option<&str>,
+) -> Result<String, LoadError> {
+    let raw = match raw.map(str::trim) {
+        // Trim incidental YAML whitespace so `workspace: "./sub "` resolves like
+        // `./sub` instead of failing with a confusing "missing dir".
+        Some(raw) if !raw.is_empty() => raw,
+        _ => return Ok(root_workspace.to_string()),
+    };
+
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(root_workspace).join(path)
+    };
+
+    // Report the joined path (what was actually looked up), noting the raw value
+    // a relative `./sub` is otherwise ambiguous without its resolution base.
+    let invalid = |reason: String| LoadError::InvalidWorkspace {
+        agent: agent.to_string(),
+        path: joined.to_string_lossy().into_owned(),
+        reason: format!("{reason} (from workspace: '{raw}')"),
+    };
+
+    let canonical = joined.canonicalize().map_err(|e| invalid(e.to_string()))?;
+    if !canonical.is_dir() {
+        return Err(invalid("not a directory".to_string()));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -592,10 +685,111 @@ mod tests {
         std::fs::write(agents_dir.join("AGENT.md"), content).unwrap();
     }
 
+    /// Build a team rooted at `/ws` with no per-agent workspaces or knowledge —
+    /// enough for the structural/tool-resolution tests below.
+    fn build_team(
+        registry: &ToolRegistry,
+        files: Vec<AgentFile>,
+        root_tools: Option<Vec<String>>,
+        root_subagents: Option<Vec<String>>,
+    ) -> Result<AgentTeam, LoadError> {
+        build_agent_team(
+            "/ws",
+            SharedSystemPrompt::new("root"),
+            default_env_fields(),
+            &HashMap::new(),
+            &HashMap::new(),
+            registry,
+            files,
+            root_tools,
+            root_subagents,
+        )
+    }
+
     #[test]
     fn no_config_dir_loads_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_agent_files(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(
+            dir.path(),
+            "scoped",
+            "---\ndescription: x\nmode: stateless\nworkspace: ./sub\n---\nbody",
+        );
+        let files = load_agent_files(dir.path()).unwrap();
+        assert_eq!(files[0].workspace(), Some("./sub"));
+    }
+
+    #[test]
+    fn resolve_workspace_absent_inherits_root() {
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy();
+        assert_eq!(
+            resolve_agent_workspace("a", &root_str, None).unwrap(),
+            *root_str
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_relative_joins_root() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let root_str = root.path().to_string_lossy();
+        let resolved = resolve_agent_workspace("a", &root_str, Some("sub")).unwrap();
+        assert_eq!(resolved, sub.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_workspace_trims_incidental_whitespace() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let root_str = root.path().to_string_lossy();
+        let resolved = resolve_agent_workspace("a", &root_str, Some("  sub  ")).unwrap();
+        assert_eq!(resolved, sub.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_workspace_blank_inherits_root() {
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_string_lossy();
+        assert_eq!(
+            resolve_agent_workspace("a", &root_str, Some("   ")).unwrap(),
+            *root_str
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_absolute_is_used() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_str = other.path().to_string_lossy().into_owned();
+        let resolved =
+            resolve_agent_workspace("a", &root.path().to_string_lossy(), Some(&other_str)).unwrap();
+        assert_eq!(
+            resolved,
+            other.path().canonicalize().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_missing_dir_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let result = resolve_agent_workspace("a", &root.path().to_string_lossy(), Some("nope"));
+        assert!(matches!(result, Err(LoadError::InvalidWorkspace { .. })));
+    }
+
+    #[test]
+    fn resolve_workspace_file_not_dir_errors() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), "x").unwrap();
+        let result = resolve_agent_workspace("a", &root.path().to_string_lossy(), Some("file.txt"));
+        assert!(matches!(result, Err(LoadError::InvalidWorkspace { .. })));
     }
 
     #[test]
@@ -726,7 +920,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let result = build_agent_team("/ws", "root".into(), &registry, files, None, None);
+        let result = build_team(&registry, files, None, None);
         assert!(matches!(result, Err(LoadError::UnknownTool { .. })));
     }
 
@@ -745,7 +939,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let registry = ToolRegistry::new();
-        let team = build_agent_team("/ws", "root".into(), &registry, files, None, None).unwrap();
+        let team = build_team(&registry, files, None, None).unwrap();
 
         // Only `boss` is a direct sub-agent of coda; `worker` hangs under boss.
         assert_eq!(team.root().subagents, vec!["boss".to_string()]);
@@ -760,15 +954,7 @@ mod tests {
             "---\ndescription: x\nmode: stateful\nsubagents: [loop]\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team = build_agent_team(
-            "/ws",
-            "root".into(),
-            &ToolRegistry::new(),
-            files,
-            None,
-            None,
-        )
-        .unwrap();
+        let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
         // A self-loop doesn't count as "referenced by another agent", so `loop`
         // is still a root under coda (and thus reachable), not orphaned.
         assert_eq!(team.root().subagents, vec!["loop".to_string()]);
@@ -790,15 +976,7 @@ mod tests {
         let files = load_agent_files(dir.path()).unwrap();
         // `a` and `b` reference each other but neither is reachable from the
         // root, so both are dropped (with a warning) and the team still builds.
-        let team = build_agent_team(
-            "/ws",
-            "root".into(),
-            &ToolRegistry::new(),
-            files,
-            None,
-            None,
-        )
-        .unwrap();
+        let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
         assert!(team.root().subagents.is_empty());
     }
 
@@ -815,14 +993,7 @@ mod tests {
         let files = load_agent_files(dir.path()).unwrap();
         // Team construction catches the conflict from spec metadata alone — no
         // build.
-        let result = build_agent_team(
-            "/ws",
-            "root".into(),
-            &ToolRegistry::new(),
-            files,
-            None,
-            None,
-        );
+        let result = build_team(&ToolRegistry::new(), files, None, None);
         assert!(matches!(
             result,
             Err(LoadError::Build(BuildError::NameConflict { .. }))
@@ -848,15 +1019,7 @@ mod tests {
             "---\ndescription: x\nmode: stateless\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team = build_agent_team(
-            "/ws",
-            "root".into(),
-            &ToolRegistry::new(),
-            files,
-            None,
-            None,
-        )
-        .unwrap();
+        let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
         let agents = team.build(".");
         assert!(agents.contains_key("shared"));
         assert!(agents.contains_key("a"));
@@ -915,9 +1078,7 @@ mod tests {
             "---\ndescription: x\nmode: stateless\n---\nbody",
         );
         let files = load_agent_files(dir.path()).unwrap();
-        let team = build_agent_team(
-            "/ws",
-            "root".into(),
+        let team = build_team(
             &ToolRegistry::new(),
             files,
             None,
@@ -934,9 +1095,7 @@ mod tests {
     fn root_tools_override_unknown_tool_errors() {
         let dir = tempfile::tempdir().unwrap();
         let files = load_agent_files(dir.path()).unwrap();
-        let result = build_agent_team(
-            "/ws",
-            "root".into(),
+        let result = build_team(
             &ToolRegistry::new(),
             files,
             Some(vec!["no_such_tool".into()]),

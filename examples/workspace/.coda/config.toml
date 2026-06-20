@@ -1,0 +1,24 @@
+# Shell-approval rules for this workspace.
+#
+# Only the `shell` tool is gated. Evaluation order:
+#   1. a `deny` match            -> require human approval
+#   2. shell operators (; & | > < `` $() newline) -> require approval
+#   3. an `allow` match          -> auto-approve
+#   4. no match                  -> require approval (the safe default)
+#
+# `write_file`, `edit_file`, and `ask_user` always require approval regardless.
+# Patterns are globs matched against the full command string.
+
+[permissions.shell]
+allow = [
+  "ls *",
+  "cat *",
+  "git status",
+  "git diff *",
+  "cargo build",
+  "cargo test *",
+]
+deny = [
+  "rm -rf *",
+  "git push *",
+]
