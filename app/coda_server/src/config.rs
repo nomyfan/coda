@@ -366,7 +366,8 @@ fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
 /// Pattern-based permission rules for `shell` commands.
 ///
 /// A command is parsed into its constituent simple commands (splitting on `;`,
-/// `&&`, `||`, and `|`) and each is evaluated independently against the rules.
+/// newlines, `&&`, `||`, and `|`) and each is evaluated independently against
+/// the rules.
 /// The whole call auto-approves only when **every** simple command is allowed
 /// and **none** is denied. A command auto-approves iff:
 ///
@@ -499,7 +500,7 @@ fn is_auto_approved(command: &str, allow: &[String], deny: &[String]) -> bool {
 /// runs, e.g. `cd app && cargo test` → `["cd app", "cargo test"]`.
 ///
 /// Returns `None` when the command can't be statically reduced to plain simple
-/// commands joined by `;`/`&&`/`||`/`|`: a parse error, an async (`&`)
+/// commands joined by `;`/newline/`&&`/`||`/`|`: a parse error, an async (`&`)
 /// separator, a redirection, a command/process substitution, or any compound
 /// command (subshell, loop, conditional) or function definition.
 fn decompose(command: &str) -> Option<Vec<String>> {

@@ -1,7 +1,7 @@
 # shell-approval rules for this workspace.
 #
 # Only the `shell` tool is gated. A command is parsed and split into its simple
-# commands (on `;`, `&&`, `||`, `|`); each is evaluated independently. The whole
+# commands (on `;`, newlines, `&&`, `||`, `|`); each is evaluated independently. The whole
 # call auto-approves only when:
 #   - every simple command matches an `allow` pattern, and
 #   - no simple command matches a `deny` pattern (deny wins over allow), and
