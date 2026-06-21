@@ -4,6 +4,7 @@ use axum::{
     response::Response,
     routing::get,
 };
+use clap::Parser;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     Shutdown, runtime::SessionStorage,
@@ -34,6 +35,29 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Coda server
+#[derive(Parser)]
+#[command(name = "coda-server", version = coda_server::VERSION)]
+struct Cli {
+    /// Path to the server config file.
+    #[arg(
+        short,
+        long,
+        env = "CODA_SERVER_CONFIG",
+        default_value = "coda-server.toml"
+    )]
+    config: PathBuf,
+
+    /// Address the server listens on.
+    #[arg(
+        short,
+        long,
+        env = "CODA_LISTEN_ADDR",
+        default_value = "127.0.0.1:3000"
+    )]
+    listen_addr: String,
+}
 
 struct AppState {
     /// All configured providers, keyed by id. The dashboard chooses which one a
@@ -1239,12 +1263,6 @@ fn spawn_workspace_knowledge_watcher(
     });
 }
 
-fn server_config_path() -> PathBuf {
-    std::env::var("CODA_SERVER_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("coda-server.toml"))
-}
-
 fn display_path(path: &FsPath) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1426,7 +1444,9 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    // Load `.env` before parsing so the env-var fallbacks on `Cli` see it.
     dotenvy::dotenv().ok();
+    let cli = Cli::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1437,7 +1457,7 @@ async fn main() {
 
     let shutdown = CancellationToken::new();
 
-    let config_path = server_config_path();
+    let config_path = cli.config;
     let server_config = load_server_config(&config_path).unwrap_or_else(|e| {
         eprintln!("error loading {}: {e}", config_path.display());
         eprintln!("example:");
@@ -1524,10 +1544,12 @@ async fn main() {
         .route("/ws", get(dashboard_ws_handler))
         .with_state(state.clone());
 
-    let listen_addr =
-        std::env::var("CODA_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listen_addr = cli.listen_addr;
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
-    info!("coda_server listening on ws://{listen_addr}/ws");
+    info!(
+        "coda_server {} listening on ws://{listen_addr}/ws",
+        coda_server::VERSION
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await

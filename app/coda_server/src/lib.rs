@@ -15,6 +15,14 @@ use tracing::warn;
 pub static SYSTEM_PROMPT: &str = include_str!("system-prompt.md");
 pub static AGENT_SKILLS_PROMPT: &str = include_str!("agent-skills-prompt.md");
 
+/// Git HEAD short SHA captured at build time by `build.rs` (or "unknown" when the
+/// source wasn't a git checkout).
+pub const GIT_SHA: &str = env!("CODA_GIT_SHA");
+
+/// Build version: the crate version paired with the build-time git SHA, e.g.
+/// `0.1.0 (1bc5b49)`. Used as the `--version` string and in the startup log.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CODA_GIT_SHA"), ")");
+
 /// Name of the custom-instructions file read from the workspace root.
 pub const CUSTOM_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 
