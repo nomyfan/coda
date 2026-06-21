@@ -9,11 +9,11 @@ This project is in active development. Breaking changes to APIs, serialization f
 ## Git Workflow
 
 - Use Conventional Commits format for commit messages and pull request titles.
-- Every commit must include a `Co-authored-by` trailer that names the **AI agent** which made the change — not the human. The human is already the commit author, so listing them as co-author is redundant and wrong. Use the agent's own identity, e.g.:
+- Every commit must include a `Co-authored-by` trailer that names the **AI agent** which made the change — not the human. The human is already the commit author, so listing them as co-author is redundant and wrong. Use the agent's own identity, optionally followed by the model's display name (e.g. `Opus 4.8` — not a slug like `claude-opus-4-8`):
 
   ```
-  Co-authored-by: Claude [optional-model-slug] <noreply@anthropic.com>
-  Co-authored-by: Codex [optional-model-slug] <codex@openai.com>
+  Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+  Co-authored-by: Codex GPT-5 <codex@openai.com>
   ```
 
 ## Runtime Config
