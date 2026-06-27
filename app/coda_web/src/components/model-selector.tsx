@@ -104,8 +104,11 @@ export function ModelSelector({
         }}
         disabled={disabled}
       >
-        <SelectTrigger size="sm" className="w-auto gap-1.5 rounded-md text-xs">
-          <Cpu className="size-3.5 text-muted-foreground" />
+        <SelectTrigger
+          size="sm"
+          className="h-7 max-w-44 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70"
+        >
+          <Cpu className="size-3 text-muted-foreground" />
           <SelectValue placeholder="Model" />
         </SelectTrigger>
         <SelectContent position="popper" side="top">
@@ -118,8 +121,11 @@ export function ModelSelector({
           onValueChange={(value) => onSetModel(providerId, value as ReasoningEffort)}
           disabled={disabled}
         >
-          <SelectTrigger size="sm" className="w-auto gap-1.5 rounded-md text-xs">
-            <Brain className="size-3.5 text-muted-foreground" />
+          <SelectTrigger
+            size="sm"
+            className="h-7 max-w-32 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70"
+          >
+            <Brain className="size-3 text-muted-foreground" />
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>
           <SelectContent position="popper" side="top">

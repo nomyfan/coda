@@ -151,7 +151,7 @@ export const Transcript = memo(function Transcript({
     // the layoutId image thumbnails spuriously animate from their old position.
     <motion.section
       layoutScroll
-      className="scrollbar-fine min-h-0 flex-1 overflow-y-auto px-4 py-3"
+      className="scrollbar-fine fade-edge-bottom min-h-0 flex-1 overflow-y-auto bg-background px-4 py-3"
     >
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (
@@ -549,7 +549,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
 
   return (
     <div className="group/message">
-      <article className="rounded-md border border-border bg-card p-3 shadow-sm">
+      <article className="rounded-md bg-background p-3 shadow-sm">
         <div className="space-y-3">
           <Collapsible open={processOpen} onOpenChange={setProcessOpen}>
             <CollapsibleTrigger asChild>
@@ -788,7 +788,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
   if (entry.kind === "assistant") {
     return (
       <div className="group/message">
-        <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
+        <article className="rounded-md bg-background p-3 shadow-sm">
           <Markdown>{entry.content}</Markdown>
         </article>
         <div className="flex items-center gap-1">

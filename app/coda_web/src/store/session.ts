@@ -1497,6 +1497,15 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
 }
 
+/** Deselect whatever session is currently shown in the center pane (e.g. when
+ * switching into the new-session composer). */
+export function clearActiveSession() {
+  updateState(codaStore, (state) => {
+    state.activeServer = undefined;
+    state.activeKey = undefined;
+  });
+}
+
 export function sendTask(task: string, images: string[] = []) {
   const text = task.trim();
   const active = currentActive();
@@ -1751,6 +1760,19 @@ export const selectActiveAllowDrafts = (state: CodaStoreState) =>
 export const selectActiveApprovalCount = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals.length ?? 0;
 export const selectActiveWorkspace = (state: CodaStoreState) => activeSessionOf(state)?.workspaceId;
+/** Title of the active session (its first user message), for the header
+ * breadcrumb. `undefined` while a blank/draft session has no message yet. */
+export const selectActiveSessionTitle = (state: CodaStoreState): string | undefined => {
+  const session = activeSessionOf(state);
+  if (!session || session.draft) {
+    return undefined;
+  }
+  const server = activeServerOf(state);
+  const workspace = server?.catalog.find((ws) => ws.id === session.workspaceId);
+  const summary = workspace?.sessions.find((item) => item.id === session.sessionId);
+  const title = summary?.first_user_message ?? session.firstUserMessage;
+  return title?.trim() || session.sessionId;
+};
 export const selectActiveDraftFlag = (state: CodaStoreState) =>
   activeSessionOf(state)?.draft ?? false;
 export const selectActiveStatus = (state: CodaStoreState): ConnectionStatus =>

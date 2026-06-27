@@ -46,11 +46,11 @@ export function ContextUsage({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="group relative size-8 shrink-0 cursor-pointer rounded-full text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="group relative size-7 shrink-0 cursor-pointer rounded-full text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           title={`${formatTokens(contextTokens)} / ${formatTokens(contextWindow)} context tokens`}
           aria-label={`Context usage: ${formatTokens(contextTokens)} of ${formatTokens(contextWindow)} tokens`}
         >
-          <svg className="absolute inset-2 size-4 -rotate-90" viewBox="0 0 36 36">
+          <svg className="absolute inset-1.5 size-4 -rotate-90" viewBox="0 0 36 36">
             <circle
               cx="18"
               cy="18"

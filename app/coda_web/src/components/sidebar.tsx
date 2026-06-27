@@ -4,6 +4,7 @@ import {
   ChevronRight,
   Folder,
   CircleSmall,
+  MoreHorizontal,
   PanelLeft,
   Pencil,
   Plug,
@@ -25,6 +26,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { StatusDot, type DotTone } from "@/components/status-dot";
@@ -36,12 +44,16 @@ import {
   renameServer,
   selectActiveKey,
   selectActiveServer,
+  selectServers,
+  useCodaShallow,
   useCodaStore,
   type ConnectionStatus,
   type OpenedSession,
+  type ServerState,
   type SessionKey,
   type WorkspaceSummary,
 } from "@/store/session";
+import type { NewSessionTarget } from "@/store/new-session";
 import { cn } from "@/lib/utils";
 import { serverLabel, sessionTitle, statusCopy } from "@/components/session-utils";
 
@@ -75,7 +87,9 @@ const CollapsedServerButton = memo(function CollapsedServerButton({
     <Button
       variant="ghost"
       size="icon"
-      className="size-6"
+      // The dot's color is itself the status indicator, so keep it at full
+      // opacity even when the button is disabled (server not connected).
+      className="size-6 disabled:opacity-100"
       disabled={server.status !== "connected" || !firstWorkspace}
       onClick={() => firstWorkspace && onNewSession(url, firstWorkspace)}
       title={`New session · ${serverLabel(server)}`}
@@ -117,7 +131,7 @@ function AddServerDialog({
         }
       }}
     >
-      <DialogContent>
+      <DialogContent className="sm:max-w-sm">
         <DialogHeader>
           <DialogTitle>Add server</DialogTitle>
           <DialogDescription>Connect to a running Coda server by URL.</DialogDescription>
@@ -129,18 +143,13 @@ function AddServerDialog({
             commit();
           }}
         >
-          <div className="space-y-2">
-            <label htmlFor="server-url" className="text-sm font-medium">
-              Server URL
-            </label>
-            <Input
-              id="server-url"
-              autoFocus
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-              placeholder={defaultUrl}
-            />
-          </div>
+          <Input
+            id="server-url"
+            autoFocus
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+            placeholder={defaultUrl}
+          />
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               Cancel
@@ -155,6 +164,166 @@ function AddServerDialog({
     </Dialog>
   );
 }
+
+/** A connected server rendered as a collapsible group header; its workspaces
+ * nest beneath it, so workspace rows no longer need an `@server` suffix.
+ * Per-server management (rename / reconnect / disconnect / remove) lives in the
+ * header's hover actions. */
+const ServerGroup = memo(function ServerGroup({
+  server,
+  activeServer,
+  activeKey,
+  newSessionTarget,
+  onOpenSession,
+  onNewSession,
+  onDeleteSession,
+}: {
+  server: ServerState;
+  activeServer?: string;
+  activeKey?: SessionKey;
+  newSessionTarget: NewSessionTarget | null;
+  onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
+  onNewSession: (serverUrl: string, workspaceId: string) => void;
+  onDeleteSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [aliasDraft, setAliasDraft] = useState(server.alias ?? "");
+
+  function startEditing() {
+    setAliasDraft(server.alias ?? "");
+    setEditing(true);
+  }
+
+  function commitAlias() {
+    renameServer(server.url, aliasDraft);
+    setEditing(false);
+  }
+
+  const offline = server.status !== "connected" && server.status !== "connecting";
+
+  return (
+    <div className="space-y-0.5">
+      {editing ? (
+        <div className="flex items-center gap-1 px-1 py-1">
+          <Input
+            autoFocus
+            value={aliasDraft}
+            onChange={(event) => setAliasDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                commitAlias();
+              } else if (event.key === "Escape") {
+                setEditing(false);
+              }
+            }}
+            placeholder={server.url}
+            className="h-7 flex-1 px-2"
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6 text-emerald-600"
+            onClick={commitAlias}
+            title="Save name"
+          >
+            <Check className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            onClick={() => setEditing(false)}
+            title="Cancel"
+          >
+            <X className="size-4" />
+          </Button>
+        </div>
+      ) : (
+        <div className="group flex items-center gap-1 pr-1">
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-1 text-left text-sm font-medium hover:bg-accent"
+            onClick={() => setCollapsed((value) => !value)}
+            title={server.url}
+          >
+            {collapsed ? (
+              <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
+            )}
+            <ServerStatusDot status={server.status} />
+            <span className="min-w-0 flex-1 truncate">{serverLabel(server)}</span>
+          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+                title="Server actions"
+              >
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={startEditing}>
+                <Pencil />
+                Rename
+              </DropdownMenuItem>
+              {offline ? (
+                <DropdownMenuItem onClick={() => connectServer(server.url)}>
+                  <RotateCcw />
+                  Reconnect
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem onClick={() => disconnectServer(server.url)}>
+                  <Unplug />
+                  Disconnect
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onClick={() => removeServer(server.url)}>
+                <Trash2 />
+                Remove
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
+      {!collapsed ? (
+        <div className="space-y-0.5 pl-2.5">
+          {server.catalog.length > 0 ? (
+            server.catalog.map((workspace) => (
+              <WorkspaceNode
+                key={workspace.id}
+                serverUrl={server.url}
+                workspace={workspace}
+                displayName={workspace.id}
+                status={server.status}
+                activeServer={activeServer}
+                activeKey={activeKey}
+                isTargetWorkspace={
+                  newSessionTarget?.serverUrl === server.url &&
+                  newSessionTarget.workspaceId === workspace.id
+                }
+                sessions={server.sessions}
+                onOpenSession={onOpenSession}
+                onNewSession={onNewSession}
+                onDeleteSession={onDeleteSession}
+              />
+            ))
+          ) : (
+            <div className="px-2 py-1 text-xs text-muted-foreground">
+              {server.status === "connected" ? "No workspaces" : statusCopy[server.status].label}
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+});
 
 function SessionRow({
   serverUrl,
@@ -245,9 +414,11 @@ function SessionRow({
 function WorkspaceNode({
   serverUrl,
   workspace,
+  displayName,
   status,
   activeServer,
   activeKey,
+  isTargetWorkspace,
   sessions: openedSessions,
   onOpenSession,
   onNewSession,
@@ -255,9 +426,11 @@ function WorkspaceNode({
 }: {
   serverUrl: string;
   workspace: WorkspaceSummary;
+  displayName: string;
   status: ConnectionStatus;
   activeServer?: string;
   activeKey?: SessionKey;
+  isTargetWorkspace: boolean;
   sessions: Record<SessionKey, OpenedSession>;
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
@@ -274,7 +447,10 @@ function WorkspaceNode({
       <div className="flex items-center gap-1 pr-1 text-sm">
         <button
           type="button"
-          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-1 text-left hover:bg-accent"
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-1 text-left hover:bg-accent",
+            isTargetWorkspace && "bg-accent text-accent-foreground",
+          )}
           onClick={() => setCollapsed((value) => !value)}
         >
           {collapsed ? (
@@ -283,7 +459,9 @@ function WorkspaceNode({
             <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
           )}
           <Folder className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1 truncate font-medium">{workspace.id}</span>
+          <span className="min-w-0 flex-1 truncate font-medium" title={displayName}>
+            {displayName}
+          </span>
           <Badge variant="outline">{sessions.length}</Badge>
         </button>
         <Button
@@ -326,186 +504,66 @@ function WorkspaceNode({
   );
 }
 
-const ServerNode = memo(function ServerNode({
-  url,
-  onOpenSession,
-  onNewSession,
-}: {
-  url: string;
-  onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
-  onNewSession: (serverUrl: string, workspaceId: string) => void;
-}) {
-  // Subscribe to just this server, so streaming on one session only re-renders
-  // its own node — not every server in the sidebar.
-  const server = useCodaStore((state) => state.servers[url]);
-  const activeServer = useCodaStore(selectActiveServer);
-  const activeKey = useCodaStore(selectActiveKey);
-  const [collapsed, setCollapsed] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [aliasDraft, setAliasDraft] = useState(server?.alias ?? "");
-
-  if (!server) {
-    return null;
-  }
-
-  function startEditing() {
-    setAliasDraft(server.alias ?? "");
-    setEditing(true);
-  }
-
-  function commitAlias() {
-    renameServer(server.url, aliasDraft);
-    setEditing(false);
-  }
-
-  return (
-    <div className="space-y-0.5">
-      {editing ? (
-        <div className="flex items-center gap-1 pr-1">
-          <Input
-            autoFocus
-            value={aliasDraft}
-            onChange={(event) => setAliasDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                commitAlias();
-              } else if (event.key === "Escape") {
-                setEditing(false);
-              }
-            }}
-            placeholder={server.url}
-            className="h-7 flex-1"
-          />
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0 text-emerald-600"
-            onClick={commitAlias}
-            title="Save name"
-          >
-            <Check className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0"
-            onClick={() => setEditing(false)}
-            title="Cancel"
-          >
-            <X className="size-4" />
-          </Button>
-        </div>
-      ) : (
-        <div className="group flex items-center gap-1 pr-1">
-          <button
-            type="button"
-            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-1 text-left hover:bg-accent"
-            onClick={() => setCollapsed((value) => !value)}
-          >
-            {collapsed ? (
-              <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
-            ) : (
-              <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
-            )}
-            <ServerStatusDot status={server.status} />
-            <span className="min-w-0 flex-1 truncate text-sm font-medium" title={server.url}>
-              {serverLabel(server)}
-            </span>
-          </button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100"
-            onClick={startEditing}
-            title="Rename server"
-          >
-            <Pencil className="size-4" />
-          </Button>
-          {server.status !== "connected" && server.status !== "connecting" ? (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-6 shrink-0"
-              onClick={() => connectServer(server.url)}
-              title="Reconnect"
-            >
-              <RotateCcw className="size-4" />
-            </Button>
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-6 shrink-0"
-              onClick={() => disconnectServer(server.url)}
-              title="Disconnect"
-            >
-              <Unplug className="size-4" />
-            </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0"
-            onClick={() => removeServer(server.url)}
-            title="Remove server"
-          >
-            <X className="size-4" />
-          </Button>
-        </div>
-      )}
-      {!collapsed ? (
-        <div className="space-y-0.5 pl-4">
-          {server.catalog.map((workspace) => (
-            <WorkspaceNode
-              key={workspace.id}
-              serverUrl={server.url}
-              workspace={workspace}
-              status={server.status}
-              activeServer={activeServer}
-              activeKey={activeKey}
-              sessions={server.sessions}
-              onOpenSession={onOpenSession}
-              onNewSession={onNewSession}
-              onDeleteSession={deleteSession}
-            />
-          ))}
-          {server.catalog.length === 0 ? (
-            <div className="px-2 py-1 text-xs text-muted-foreground">
-              {server.status === "connected" ? "No workspaces" : statusCopy[server.status].label}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-});
-
 export function Sidebar({
+  newSessionTarget,
   onOpenSession,
   onStartNewSession,
   onNewSession,
 }: {
+  newSessionTarget: NewSessionTarget | null;
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
-  onStartNewSession: () => void;
+  onStartNewSession: (serverUrl: string, workspaceId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
 }) {
-  // `order` is stable while sessions stream (only changes when servers are
-  // added/removed), so the sidebar shell doesn't re-render on every token.
-  const order = useCodaStore((state) => state.order);
+  const activeServer = useCodaStore(selectActiveServer);
+  const activeKey = useCodaStore(selectActiveKey);
+  const servers = useCodaShallow(selectServers);
+  const activeWorkspaceId = activeKey?.split("/")[0];
+  const targetServer = newSessionTarget
+    ? servers.find((server) => server.url === newSessionTarget.serverUrl)
+    : undefined;
+  const targetWorkspace =
+    targetServer?.status === "connected"
+      ? targetServer.catalog.find((workspace) => workspace.id === newSessionTarget?.workspaceId)
+      : undefined;
+  const activeServerState = activeServer
+    ? servers.find((server) => server.url === activeServer)
+    : undefined;
+  const activeWorkspace =
+    activeServerState?.status === "connected"
+      ? activeServerState.catalog.find((workspace) => workspace.id === activeWorkspaceId)
+      : undefined;
+  const firstConnectedServer = servers.find(
+    (server) => server.status === "connected" && server.catalog.length > 0,
+  );
+  const startTarget =
+    targetServer && targetWorkspace
+      ? { serverUrl: targetServer.url, workspaceId: targetWorkspace.id }
+      : activeServerState && activeWorkspace
+        ? { serverUrl: activeServerState.url, workspaceId: activeWorkspace.id }
+        : firstConnectedServer
+          ? { serverUrl: firstConnectedServer.url, workspaceId: firstConnectedServer.catalog[0].id }
+          : undefined;
   const [adding, setAdding] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+
+  function startSelectedWorkspaceSession() {
+    if (startTarget) {
+      onStartNewSession(startTarget.serverUrl, startTarget.workspaceId);
+    }
+  }
 
   return (
     <aside
       className={cn(
-        "flex min-h-0 w-full flex-col gap-2 border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
+        // The width animates between collapsed/expanded; `overflow-hidden` lets
+        // the fixed-width content below act as a curtain-revealed layer so its
+        // children never reflow (slide) mid-animation. See `lg:w-[calc(...)]`.
+        "flex min-h-0 w-full shrink-0 flex-col gap-2 overflow-hidden border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
         collapsed && "lg:w-12",
       )}
     >
-      <div
-        className={cn("flex items-center", collapsed ? "justify-center" : "justify-between pl-1")}
-      >
+      <div className="flex items-center justify-start">
         {collapsed ? (
           <Button
             variant="ghost"
@@ -517,49 +575,46 @@ export function Sidebar({
             <PanelLeft className="size-4" />
           </Button>
         ) : (
-          <>
-            <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Sessions
-            </h2>
-            <div className="flex items-center gap-1">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6"
-                onClick={onStartNewSession}
-                title="New session"
-              >
-                <Plus className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6"
-                onClick={() => setAdding(true)}
-                title="Add server"
-              >
-                <Plug className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6"
-                onClick={() => setCollapsed(true)}
-                title="Collapse servers"
-              >
-                <PanelLeft className="size-4" />
-              </Button>
-            </div>
-          </>
+          <div className="flex min-w-0 flex-1 items-center gap-1 lg:w-[calc(256px-var(--spacing)*5)] lg:flex-none">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              onClick={() => setCollapsed(true)}
+              title="Collapse servers"
+            >
+              <PanelLeft className="size-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              disabled={!startTarget}
+              onClick={startSelectedWorkspaceSession}
+              title="New session"
+            >
+              <Plus className="size-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              onClick={() => setAdding(true)}
+              title="Add server"
+            >
+              <Plug className="size-4" />
+            </Button>
+          </div>
         )}
       </div>
       {collapsed ? (
-        <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto">
+        <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-start gap-1 overflow-y-auto">
           <Button
             variant="ghost"
             size="icon"
             className="size-6"
-            onClick={onStartNewSession}
+            disabled={!startTarget}
+            onClick={startSelectedWorkspaceSession}
             title="New session"
           >
             <Plus className="size-4" />
@@ -573,14 +628,14 @@ export function Sidebar({
           >
             <Plug className="size-4" />
           </Button>
-          {order.length > 0 ? <Separator className="my-1 w-6" /> : null}
-          {order.map((url) => (
-            <CollapsedServerButton key={url} url={url} onNewSession={onNewSession} />
+          {servers.length > 0 ? <Separator className="my-1 w-6" /> : null}
+          {servers.map((server) => (
+            <CollapsedServerButton key={server.url} url={server.url} onNewSession={onNewSession} />
           ))}
         </div>
       ) : (
-        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5">
-          {order.length === 0 ? (
+        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5 lg:w-[calc(256px_-_var(--spacing)*5)]">
+          {servers.length === 0 ? (
             <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
               <div className="text-sm font-medium">No servers</div>
               <p className="text-xs leading-5 text-muted-foreground">
@@ -593,12 +648,16 @@ export function Sidebar({
             </div>
           ) : (
             <>
-              {order.map((url) => (
-                <ServerNode
-                  key={url}
-                  url={url}
+              {servers.map((server) => (
+                <ServerGroup
+                  key={server.url}
+                  server={server}
+                  activeServer={activeServer}
+                  activeKey={activeKey}
+                  newSessionTarget={newSessionTarget}
                   onOpenSession={onOpenSession}
                   onNewSession={onNewSession}
+                  onDeleteSession={deleteSession}
                 />
               ))}
             </>

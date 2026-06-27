@@ -1,23 +1,9 @@
-import { CircleStop, Folder, ImagePlus, PlugZap, Send, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type {
-  ConnectionStatus,
-  ProviderInfo,
-  ReasoningEffort,
-  ServerSummary,
-  UsageRecord,
-} from "@/store/session";
-import { serverLabel } from "@/components/session-utils";
+import type { ConnectionStatus, ProviderInfo, ReasoningEffort, UsageRecord } from "@/store/session";
 import { ModelSelector } from "@/components/model-selector";
 import { ContextUsage } from "@/components/context-usage";
 import {
@@ -42,10 +28,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
-  server,
-  servers,
   workspace,
-  workspaces,
   selectingTarget,
   providers,
   providerId,
@@ -53,17 +36,13 @@ export const Composer = memo(function Composer({
   usage,
   sessionHasImages,
   onSetModel,
-  onChangeServer,
-  onChangeWorkspace,
   onSend,
   onAbort,
 }: {
   status: ConnectionStatus;
   running: boolean;
-  server?: string;
-  servers: ServerSummary[];
   workspace?: string;
-  workspaces: string[];
+  /** New-session mode: the send target is still being picked in the header. */
   selectingTarget: boolean;
   providers: ProviderInfo[];
   providerId?: string;
@@ -73,8 +52,6 @@ export const Composer = memo(function Composer({
    * text-only model can no longer serve this conversation. */
   sessionHasImages: boolean;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
-  onChangeServer: (serverUrl: string) => void;
-  onChangeWorkspace: (workspaceId: string) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
 }) {
@@ -104,7 +81,6 @@ export const Composer = memo(function Composer({
     !running &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);
-  const selectableServers = servers.filter((item) => item.catalog.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
   const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
 
@@ -169,7 +145,7 @@ export const Composer = memo(function Composer({
 
   return (
     <form
-      className="bg-background/95 p-3 backdrop-blur"
+      className="bg-background p-3"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -231,8 +207,7 @@ export const Composer = memo(function Composer({
             onPaste={handlePaste}
             placeholder="Ask Coda to edit, inspect, test, or explain...  (Enter to send, Shift+Enter for newline)"
             className={[
-              "min-h-[52px]",
-              acceptsImages ? "pr-20" : "pr-12",
+              "min-h-[80px] pb-10 pr-3",
               dragOver ? "border-primary ring-1 ring-primary" : "",
             ]
               .filter(Boolean)
@@ -251,12 +226,25 @@ export const Composer = memo(function Composer({
               e.target.value = "";
             }}
           />
-          <div className="absolute bottom-2 right-2 flex items-center gap-1">
+          <div className="absolute bottom-2 left-2 right-2 flex items-center justify-end gap-1">
+            {showControls && contextWindow ? (
+              <ContextUsage contextWindow={contextWindow} records={usage} />
+            ) : null}
+            {showControls ? (
+              <ModelSelector
+                providers={providers}
+                providerId={providerId}
+                reasoningEffort={reasoningEffort}
+                disabled={!connected || running}
+                requireImageModel={requireImageModel}
+                onSetModel={onSetModel}
+              />
+            ) : null}
             {acceptsImages && (
               <Button
                 size="icon"
                 variant="ghost"
-                className="size-8"
+                className="size-8 rounded-md"
                 type="button"
                 title={
                   images.length >= MAX_IMAGES ? `Maximum ${MAX_IMAGES} images` : "Attach images"
@@ -271,7 +259,7 @@ export const Composer = memo(function Composer({
               <Button
                 size="icon"
                 variant="secondary"
-                className="size-8"
+                className="size-8 rounded-md"
                 type="button"
                 onClick={onAbort}
                 disabled={!connected}
@@ -282,12 +270,12 @@ export const Composer = memo(function Composer({
             ) : (
               <Button
                 size="icon"
-                className="size-8"
+                className="size-8 rounded-md"
                 type="submit"
                 disabled={!canSend}
                 title={imagesBlockSend ? "Selected model does not support images" : "Send"}
               >
-                <Send />
+                <CornerDownLeft />
               </Button>
             )}
           </div>
@@ -298,68 +286,6 @@ export const Composer = memo(function Composer({
             the attached images.
           </p>
         )}
-        {showControls ? (
-          <div className="mx-auto mt-2 flex max-w-4xl flex-wrap items-center gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              {selectingTarget ? (
-                <Select
-                  value={server}
-                  onValueChange={onChangeServer}
-                  disabled={selectableServers.length === 0}
-                >
-                  <SelectTrigger size="sm" className="w-44 gap-1.5 rounded-md text-xs">
-                    <PlugZap className="size-3.5 text-muted-foreground" />
-                    <SelectValue placeholder="Server" />
-                  </SelectTrigger>
-                  <SelectContent position="popper" side="top">
-                    {selectableServers.map((item) => (
-                      <SelectItem key={item.url} value={item.url}>
-                        {serverLabel(item)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              ) : null}
-              <Select
-                value={workspace}
-                onValueChange={onChangeWorkspace}
-                disabled={!connected || workspaces.length === 0}
-              >
-                <SelectTrigger
-                  size="sm"
-                  className={
-                    selectingTarget
-                      ? "w-36 gap-1.5 rounded-md text-xs"
-                      : "w-auto gap-1.5 rounded-md text-xs"
-                  }
-                >
-                  <Folder className="size-3.5 text-muted-foreground" />
-                  <SelectValue placeholder="Workspace" />
-                </SelectTrigger>
-                <SelectContent position="popper" side="top">
-                  {workspaces.map((id) => (
-                    <SelectItem key={id} value={id}>
-                      {id}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-              <ModelSelector
-                providers={providers}
-                providerId={providerId}
-                reasoningEffort={reasoningEffort}
-                disabled={!connected || running}
-                requireImageModel={requireImageModel}
-                onSetModel={onSetModel}
-              />
-              {contextWindow ? (
-                <ContextUsage contextWindow={contextWindow} records={usage} />
-              ) : null}
-            </div>
-          </div>
-        ) : null}
         {lightboxIndex !== null && (
           <ImageLightbox
             images={images}

@@ -59,7 +59,9 @@ export function resolveNewSessionTarget(
   preferred?: NewSessionTarget | null,
   fallbackServer?: string,
 ): NewSessionTarget {
-  const available = servers.filter((server) => server.catalog.length > 0);
+  const available = servers.filter(
+    (server) => server.status === "connected" && server.catalog.length > 0,
+  );
   const preferredServer = available.find((server) => server.url === preferred?.serverUrl);
   if (preferredServer) {
     const preferredWorkspace = preferredServer.catalog.find(
@@ -94,7 +96,7 @@ export function beginNewSession(servers: ServerSummary[], fallbackServer?: strin
     fallbackServer,
   );
   newSessionStore.setState((state) => {
-    state.target = target;
+    state.target = validTarget(target) ? target : null;
   });
   rememberNewSessionTarget(target);
 }

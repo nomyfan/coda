@@ -1,9 +1,10 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --background: hsl(223.8136 0.0004% 98.0256%);
+  --background: hsl(0 0% 100%);
   --foreground: hsl(223.8136 0% 2.2326%);
   --card: hsl(223.8136 -172.5242% 100%);
   --card-foreground: hsl(223.8136 0% 2.2326%);
@@ -54,7 +55,10 @@
   --shadow-xl: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 8px 10px -1px hsl(0, 0, 0 / 0.1);
   --shadow-2xl: 0px 4px 10px 0px hsl(0, 0, 0 / 0.25);
   --tracking-normal: -0.01em;
-  --spacing: 0.25rem;
+  /* Global density lever: Tailwind v4 derives every numeric spacing/sizing
+   * utility (p-*, h-*, gap-*, size-*, …) from this, so shrinking it compacts the
+   * whole UI proportionally without touching typography or colors. */
+  --spacing: 0.23rem;
 }
 
 .dark {
@@ -204,5 +208,14 @@
   body {
     @apply bg-background text-foreground;
     letter-spacing: var(--tracking-normal);
+  }
+}
+
+@layer components {
+  /* Fade the bottom edge of a scroll area to transparent so content dissolves
+   * into the composer region instead of being hard-cut at the top edge. */
+  .fade-edge-bottom {
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
   }
 }

@@ -1,17 +1,16 @@
-import { Command } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Folder } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   abort,
-  codaStore,
-  newSession,
+  clearActiveSession,
   openSession,
-  selectActiveApprovalCount,
   selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
   selectActiveReasoningEffort,
   selectActiveRunning,
   selectActiveServer,
+  selectActiveSessionTitle,
   selectActiveStatus,
   selectActiveUsage,
   selectActiveWorkspace,
@@ -29,33 +28,146 @@ import { Sidebar } from "@/components/sidebar";
 import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
 import { ApprovalPanel } from "@/components/approval-panel";
+import { serverLabel } from "@/components/session-utils";
 import {
-  beginNewSession,
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   clearNewSessionTarget,
   newSessionStore,
   rememberNewSessionTarget,
+  type NewSessionTarget,
   resolveNewSessionTarget,
   setNewSessionTarget,
   useNewSessionStore,
 } from "@/store/new-session";
 
-/** Stable empty list so the composer's `servers` prop is referentially stable
- * in the active-session view (the list is only used while picking a target). */
-const NO_SERVERS: ServerSummary[] = [];
 const NO_USAGE: UsageRecord[] = [];
 
-function WorkspaceHeader({ approvalCount }: { approvalCount: number }) {
+function workspaceOptionValue(serverUrl: string, workspaceId: string) {
+  return JSON.stringify([serverUrl, workspaceId]);
+}
+
+function parseWorkspaceOptionValue(value: string): NewSessionTarget | null {
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string") {
+      return { serverUrl: parsed[0], workspaceId: parsed[1] };
+    }
+  } catch {
+    // Ignore malformed select values.
+  }
+  return null;
+}
+
+function WorkspaceTargetSelect({
+  servers,
+  target,
+  onSelectTarget,
+}: {
+  servers: ServerSummary[];
+  target: NewSessionTarget | null;
+  onSelectTarget: (target: NewSessionTarget) => void;
+}) {
+  const workspaceCount = servers.reduce((total, server) => total + server.catalog.length, 0);
+  // Server context lives in the group header (and a trigger hint), so workspace
+  // rows show only the bare workspace id — no `@server` suffix.
+  const multiServer = servers.length > 1;
+  const value = target ? workspaceOptionValue(target.serverUrl, target.workspaceId) : undefined;
+  const selectedServer = target
+    ? servers.find((server) => server.url === target.serverUrl)
+    : undefined;
+  const selectedWorkspace = selectedServer?.catalog.find(
+    (workspace) => workspace.id === target?.workspaceId,
+  );
+
   return (
-    <header className="flex h-11 shrink-0 items-center justify-between border-b bg-background/90 px-4 backdrop-blur">
-      <div className="flex min-w-0 items-center gap-2">
-        <div className="flex size-6 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm">
-          <Command className="size-3.5" />
-        </div>
-        <h1 className="truncate text-sm font-semibold tracking-normal">Coda</h1>
-        <span className="size-1 rounded-full bg-muted-foreground/45" />
-        <span className="text-xs text-muted-foreground">{approvalCount} pending approval(s)</span>
+    <Select
+      value={value}
+      onValueChange={(nextValue) => {
+        const nextTarget = parseWorkspaceOptionValue(nextValue);
+        if (nextTarget) {
+          onSelectTarget(nextTarget);
+        }
+      }}
+    >
+      <SelectTrigger
+        size="sm"
+        className="h-7 w-auto max-w-[220px] border border-input bg-background px-2 shadow-none hover:bg-accent"
+        disabled={workspaceCount === 0}
+        title="Workspace"
+      >
+        {selectedWorkspace && selectedServer ? (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Folder className="size-4 shrink-0 text-muted-foreground" />
+            <span className="truncate">{selectedWorkspace.id}</span>
+            {multiServer ? (
+              <span className="truncate text-muted-foreground/70">
+                · {serverLabel(selectedServer)}
+              </span>
+            ) : null}
+          </span>
+        ) : (
+          <SelectValue placeholder="Workspace" />
+        )}
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" className="w-56">
+        {servers.map((server) => (
+          <SelectGroup key={server.url}>
+            {multiServer ? <SelectLabel>{serverLabel(server)}</SelectLabel> : null}
+            {server.catalog.map((workspace) => (
+              <SelectItem
+                key={workspaceOptionValue(server.url, workspace.id)}
+                value={workspaceOptionValue(server.url, workspace.id)}
+                disabled={server.status !== "connected"}
+                className="pr-8"
+              >
+                <Folder className="size-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate">{workspace.id}</span>
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+function WorkspaceHeader({ sessionTitle }: { sessionTitle?: string }) {
+  return (
+    <header className="flex h-11 shrink-0 items-center border-b bg-background px-4">
+      <div className="flex min-w-0 items-center gap-2 text-sm">
+        {sessionTitle ? (
+          <span className="min-w-0 truncate font-medium" title={sessionTitle}>
+            {sessionTitle}
+          </span>
+        ) : null}
       </div>
     </header>
+  );
+}
+
+function WorkspaceTargetBar({
+  servers,
+  target,
+  onSelectTarget,
+}: {
+  servers: ServerSummary[];
+  target: NewSessionTarget | null;
+  onSelectTarget: (target: NewSessionTarget) => void;
+}) {
+  return (
+    <div className="bg-background px-3 pt-2">
+      <div className="mx-auto flex max-w-4xl items-center">
+        <WorkspaceTargetSelect servers={servers} target={target} onSelectTarget={onSelectTarget} />
+      </div>
+    </div>
   );
 }
 
@@ -72,7 +184,7 @@ export default function App() {
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
-  const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
+  const activeSessionTitle = useCodaStore(selectActiveSessionTitle);
   const activeUsage = useCodaStore(selectActiveUsage);
   const activeHasImages = useCodaStore(selectActiveHasImages);
 
@@ -86,11 +198,8 @@ export default function App() {
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
   const selectedServerState = servers.find((server) => server.url === selectedServerUrl);
   const selectedWorkspace = newSessionTarget?.workspaceId ?? activeWorkspace;
-  const workspaceIds = useMemo(
-    () => selectedServerState?.catalog.map((ws) => ws.id) ?? [],
-    [selectedServerState?.catalog],
-  );
   const showingNewSession = newSessionTarget !== null;
+  const showComposer = showingNewSession || Boolean(activeWorkspace);
 
   useEffect(() => {
     if (!newSessionTarget) {
@@ -98,6 +207,10 @@ export default function App() {
       return;
     }
     const resolved = resolveNewSessionTarget(servers, newSessionTarget, activeServer);
+    if (!resolved.serverUrl || !resolved.workspaceId) {
+      clearNewSessionTarget();
+      return;
+    }
     if (
       resolved.serverUrl !== newSessionTarget.serverUrl ||
       resolved.workspaceId !== newSessionTarget.workspaceId
@@ -132,12 +245,43 @@ export default function App() {
     );
   }, [newSessionModel, newSessionTarget, servers]);
 
+  // On first load, restore the workspace last selected (persisted as
+  // `recentTarget`). Prefer the remembered server: wait for it to connect rather
+  // than falling back to whichever server happens to come up first, and give up
+  // only if it's no longer configured or the user already picked something.
+  const restoredTargetRef = useRef(false);
+  useEffect(() => {
+    if (restoredTargetRef.current) {
+      return;
+    }
+    if (newSessionTarget || activeServer) {
+      restoredTargetRef.current = true;
+      return;
+    }
+    const recent = newSessionStore.getState().recentTarget;
+    if (!recent) {
+      restoredTargetRef.current = true;
+      return;
+    }
+    const server = servers.find((item) => item.url === recent.serverUrl);
+    if (!server || server.status !== "connected" || server.catalog.length === 0) {
+      // Not yet in the (still-populating) server list, or still connecting —
+      // keep waiting for the remembered server rather than giving up or falling
+      // back to whichever server happens to come up first.
+      return;
+    }
+    const workspace =
+      server.catalog.find((item) => item.id === recent.workspaceId) ?? server.catalog[0];
+    restoredTargetRef.current = true;
+    setNewSessionTarget({ serverUrl: server.url, workspaceId: workspace.id });
+  }, [servers, newSessionTarget, activeServer]);
+
   // Handlers read the latest store state at call time rather than closing over
   // the subscribed values, so they keep a stable identity across renders and
   // don't defeat the memoized children.
-  const startNewSession = useCallback(() => {
-    const state = codaStore.getState();
-    beginNewSession(selectServerSummaries(state), state.activeServer);
+  const startNewSession = useCallback((serverUrl: string, workspaceId: string) => {
+    clearActiveSession();
+    setNewSessionTarget({ serverUrl, workspaceId });
   }, []);
 
   const handleOpenSession = useCallback(
@@ -148,35 +292,6 @@ export default function App() {
     },
     [],
   );
-
-  const createWorkspaceSession = useCallback((serverUrl: string, workspaceId: string) => {
-    rememberNewSessionTarget({ serverUrl, workspaceId });
-    clearNewSessionTarget();
-    newSession(serverUrl, workspaceId);
-  }, []);
-
-  const changeNewSessionServer = useCallback((serverUrl: string) => {
-    const server = selectServerSummaries(codaStore.getState()).find(
-      (item) => item.url === serverUrl,
-    );
-    setNewSessionTarget({
-      serverUrl,
-      workspaceId: server?.catalog[0]?.id ?? "",
-    });
-  }, []);
-
-  const changeWorkspace = useCallback((workspaceId: string) => {
-    const target = newSessionStore.getState().target;
-    if (target) {
-      setNewSessionTarget({ ...target, workspaceId });
-      return;
-    }
-    const server = codaStore.getState().activeServer;
-    if (server) {
-      rememberNewSessionTarget({ serverUrl: server, workspaceId });
-      newSession(server, workspaceId);
-    }
-  }, []);
 
   const handleSend = useCallback(
     (task: string, images: string[] = []) => {
@@ -208,25 +323,31 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-screen min-h-[600px] flex-col overflow-hidden bg-background">
-      <WorkspaceHeader approvalCount={showingNewSession ? 0 : activeApprovalCount} />
-      <main className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[auto_minmax(0,1fr)]">
-        <Sidebar
-          onOpenSession={handleOpenSession}
-          onStartNewSession={startNewSession}
-          onNewSession={createWorkspaceSession}
-        />
-        <section className="flex min-h-0 flex-col">
-          <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
-          <div className="relative z-20 shrink-0">
-            {showingNewSession ? null : <ApprovalPanel />}
+    <div className="flex h-screen min-h-[600px] overflow-hidden bg-background">
+      <Sidebar
+        newSessionTarget={newSessionTarget}
+        onOpenSession={handleOpenSession}
+        onStartNewSession={startNewSession}
+        onNewSession={startNewSession}
+      />
+      <section className="flex min-h-0 flex-1 flex-col bg-background">
+        <WorkspaceHeader sessionTitle={activeSessionTitle} />
+        <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
+        <div className="relative z-20 shrink-0">
+          {showingNewSession ? (
+            <WorkspaceTargetBar
+              servers={servers}
+              target={newSessionTarget}
+              onSelectTarget={setNewSessionTarget}
+            />
+          ) : (
+            <ApprovalPanel />
+          )}
+          {showComposer ? (
             <Composer
               status={showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus}
               running={showingNewSession ? false : activeRunning}
-              server={selectedServerUrl}
-              servers={showingNewSession ? servers : NO_SERVERS}
               workspace={selectedWorkspace}
-              workspaces={workspaceIds}
               selectingTarget={showingNewSession}
               providers={
                 showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
@@ -240,14 +361,12 @@ export default function App() {
               usage={showingNewSession ? NO_USAGE : activeUsage}
               sessionHasImages={showingNewSession ? false : activeHasImages}
               onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
-              onChangeServer={changeNewSessionServer}
-              onChangeWorkspace={changeWorkspace}
               onSend={handleSend}
               onAbort={abort}
             />
-          </div>
-        </section>
-      </main>
+          ) : null}
+        </div>
+      </section>
     </div>
   );
 }
