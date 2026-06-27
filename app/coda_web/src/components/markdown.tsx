@@ -49,7 +49,7 @@ const components: Components = {
     );
   },
   pre: ({ children }) => (
-    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 first:mt-0 last:mb-0 [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit">
+    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 text-foreground first:mt-0 last:mb-0 [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit">
       {children}
     </pre>
   ),

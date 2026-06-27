@@ -202,6 +202,7 @@
 
   --animate-breathe: breathe 2s ease-in-out infinite;
   --animate-ping-soft: ping-soft 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+  --animate-text-shimmer: text-shimmer 1.4s linear infinite;
 }
 
 @keyframes breathe {
@@ -228,6 +229,17 @@
   }
 }
 
+/* Sweep a brighter band left-to-right across text to signal an in-progress step.
+ * Clips a moving gradient to the glyphs; non-text (icons) keep currentColor. */
+@keyframes text-shimmer {
+  0% {
+    background-position: 150% center;
+  }
+  100% {
+    background-position: -50% center;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -244,5 +256,25 @@
   .fade-edge-bottom {
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
+  }
+
+  /* In-progress label: a bright band sweeps across dimmed text, left to right.
+   * The base is muted to ~40% so the full-strength peak reads as an obvious
+   * moving highlight; the band is narrow for a crisp sweep. */
+  .text-shimmer {
+    background-image: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--muted-foreground) 40%, transparent) 0%,
+      color-mix(in srgb, var(--muted-foreground) 40%, transparent) 42%,
+      var(--foreground) 50%,
+      color-mix(in srgb, var(--muted-foreground) 40%, transparent) 58%,
+      color-mix(in srgb, var(--muted-foreground) 40%, transparent) 100%
+    );
+    background-size: 220% auto;
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: var(--animate-text-shimmer);
   }
 }

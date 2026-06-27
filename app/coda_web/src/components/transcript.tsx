@@ -1,4 +1,25 @@
-import { Check, ChevronDown, ChevronRight, Copy } from "lucide-react";
+import {
+  Bot,
+  Brain,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  Copy,
+  FilePen,
+  FilePlus2,
+  FileSearch,
+  FileText,
+  FolderTree,
+  ListChecks,
+  ListTodo,
+  type LucideIcon,
+  MessageSquare,
+  Plug,
+  Search,
+  SquareTerminal,
+  Wrench,
+} from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useEffect, useRef, useState } from "react";
 import {
@@ -12,11 +33,17 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Markdown } from "@/components/markdown";
 import {
   selectActiveEntries,
+  selectActiveKey,
   selectActiveRunning,
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
-import { isSubAgentToolName, subAgentDisplayName, toolDisplayName } from "@/lib/protocol";
+import {
+  isSubAgentToolName,
+  subAgentDisplayName,
+  SUBAGENT_TOOL_PREFIX,
+  toolDisplayName,
+} from "@/lib/protocol";
 import { cn, formatClockTime, formatDuration } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
@@ -30,18 +57,6 @@ const HOVER_REVEAL =
 /** A sub-agent's own events (its inner LLM turns, reasoning, tool calls). */
 function isSubAgentEntry(entry: TranscriptEntry) {
   return Boolean(entry.agentName && entry.agentName !== ROOT_AGENT);
-}
-
-function WorkingIndicator() {
-  return (
-    <div className="flex items-center gap-2 px-1 py-1 text-sm text-muted-foreground">
-      <span className="flex gap-1">
-        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.3s]" />
-        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.15s]" />
-        <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
-      </span>
-    </div>
-  );
 }
 
 type TranscriptRenderItem =
@@ -122,21 +137,51 @@ export const Transcript = memo(function Transcript({
 }) {
   const liveEntries = useCodaStore(selectActiveEntries);
   const liveRunning = useCodaStore(selectActiveRunning);
+  const activeKey = useCodaStore(selectActiveKey);
   const entries = suppressed ? NO_ENTRIES : liveEntries;
   const running = suppressed ? false : liveRunning;
+  const scrollRef = useRef<HTMLElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  // While true the view follows new content; it flips off once the user scrolls
+  // up to read, so streaming output no longer yanks them back to the bottom.
+  const stickToBottomRef = useRef(true);
   const renderItems = transcriptRenderItems(entries);
-  const lastEntryContent = entries.at(-1)?.content;
+  const lastEntry = entries.at(-1);
+  const lastEntryContent = lastEntry?.content;
+
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) {
+      return;
+    }
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 20;
+  }
+
+  // Switching sessions resumes following from the bottom, so a session opened
+  // after the user scrolled up in another still lands on its latest content.
+  // Runs before the scroll effect below so that effect sees a reset ref.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+  }, [activeKey]);
 
   useEffect(() => {
+    // Always snap to the bottom for the user's own just-sent message; otherwise
+    // only follow if they hadn't scrolled away.
+    if (!stickToBottomRef.current && lastEntry?.kind !== "user") {
+      return;
+    }
+    stickToBottomRef.current = true;
     bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [entries.length, lastEntryContent, running]);
+  }, [activeKey, entries.length, lastEntryContent, running, lastEntry?.kind]);
 
   return (
     // `layoutScroll` lets motion account for this container's scroll offset when
     // measuring layout, so scrolling to the bottom on a new message doesn't make
     // the layoutId image thumbnails spuriously animate from their old position.
     <motion.section
+      ref={scrollRef}
+      onScroll={handleScroll}
       layoutScroll
       className="scrollbar-fine fade-edge-bottom min-h-0 flex-1 overflow-y-auto bg-background px-4 py-3"
     >
@@ -161,7 +206,6 @@ export const Transcript = memo(function Transcript({
             ),
           )
         )}
-        {running ? <WorkingIndicator /> : null}
         <div ref={bottomRef} />
       </div>
     </motion.section>
@@ -173,6 +217,64 @@ function entryTitle(entry: TranscriptEntry) {
     return toolDisplayName(entry.title);
   }
   return entry.agentName ? `${entry.agentName}` : entry.kind;
+}
+
+/** Icons standing in for each built-in tool name (see `TOOL_DISPLAY_NAMES`). */
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  read_file: FileText,
+  write_file: FilePlus2,
+  edit_file: FilePen,
+  ls: FolderTree,
+  glob: FileSearch,
+  grep: Search,
+  shell: SquareTerminal,
+  read_todos: ListTodo,
+  write_todos: ListChecks,
+};
+
+/** Pick the glyph that stands in for an entry's tool/kind label. */
+function entryIcon(entry: TranscriptEntry): LucideIcon {
+  switch (entry.kind) {
+    case "reasoning":
+      return Brain;
+    case "assistant":
+      return MessageSquare;
+    case "error":
+      return CircleAlert;
+    default:
+      break;
+  }
+  const name = entry.title;
+  if (name) {
+    if (name.startsWith(SUBAGENT_TOOL_PREFIX)) {
+      return Bot;
+    }
+    if (name in TOOL_ICONS) {
+      return TOOL_ICONS[name];
+    }
+    if (name.startsWith("mcp__")) {
+      return Plug;
+    }
+  }
+  return Wrench;
+}
+
+/** A step is mid-flight while the runtime reports it as running or thinking. */
+function isEntryActive(entry: TranscriptEntry) {
+  return entry.status === "running" || entry.status === "thinking";
+}
+
+/** The icon that replaces an entry's text label; carries the name as a tooltip. */
+function EntryIcon({ entry, active }: { entry: TranscriptEntry; active?: boolean }) {
+  const Icon = entryIcon(entry);
+  return (
+    <span title={entryTitle(entry)} className="flex shrink-0 items-center">
+      <Icon
+        aria-hidden
+        className={cn("size-4", active ? "text-foreground" : "text-muted-foreground")}
+      />
+    </span>
+  );
 }
 
 function EntryDetail({ entry }: { entry: TranscriptEntry }) {
@@ -474,7 +576,18 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
             title={open ? "Collapse sub-agent" : "Expand sub-agent"}
           >
             <div className="flex min-w-0 items-center gap-2">
-              <span className="shrink-0 truncate text-sm font-medium">{item.agentName}</span>
+              <Bot
+                aria-hidden
+                className={cn(
+                  "size-4 shrink-0",
+                  complete ? "text-muted-foreground" : "text-foreground",
+                )}
+              />
+              <span
+                className={cn("shrink-0 truncate text-sm font-medium", !complete && "text-shimmer")}
+              >
+                {item.agentName}
+              </span>
               <Badge variant="cyan" className="shrink-0 whitespace-nowrap">
                 agent
               </Badge>
@@ -543,12 +656,16 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                 title={processOpen ? "Collapse process" : "Expand process"}
               >
                 <div className="flex min-w-0 items-center gap-2">
-                  <span className="truncate text-sm font-medium">{processTitle}</span>
-                  {activeSummary.detail && !processComplete ? (
-                    <span className="truncate font-mono text-xs text-muted-foreground">
-                      {activeSummary.detail}
-                    </span>
-                  ) : null}
+                  {processComplete ? (
+                    <span className="truncate text-sm font-medium">{processTitle}</span>
+                  ) : (
+                    <>
+                      {activeProcessEntry ? <EntryIcon entry={activeProcessEntry} active /> : null}
+                      <span className="truncate text-sm font-medium text-shimmer">
+                        {activeSummary.detail ?? processTitle}
+                      </span>
+                    </>
+                  )}
                 </div>
                 {processOpen ? (
                   <ChevronDown className="size-4 shrink-0" />
@@ -585,6 +702,7 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
 function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
   const [open, setOpen] = useState(false);
   const title = disclosureTitle(entry);
+  const active = isEntryActive(entry);
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -595,8 +713,21 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
           title={open ? "Collapse" : "Expand"}
         >
           <div className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="shrink-0 truncate text-sm">{title}</span>
-            <EntryDetail entry={entry} />
+            <EntryIcon entry={entry} active={active} />
+            {entry.detail ? (
+              <span
+                className={cn(
+                  "truncate font-mono text-xs",
+                  active ? "text-shimmer" : "text-muted-foreground",
+                )}
+              >
+                {entry.detail}
+              </span>
+            ) : (
+              <span className={cn("shrink-0 truncate text-sm", active && "text-shimmer")}>
+                {title}
+              </span>
+            )}
             <EntryTiming entry={entry} mode="duration" />
           </div>
           <div className="grid shrink-0 grid-cols-[6.5rem_1.75rem] items-center gap-2">
@@ -707,6 +838,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
   const header = (
     <div className="mb-2 flex items-center justify-between gap-3">
       <div className="flex min-w-0 items-center gap-2">
+        <EntryIcon entry={entry} />
         <span className="shrink-0 truncate text-sm font-medium">{title}</span>
         <EntryDetail entry={entry} />
         {entry.agentName && entry.agentName !== "coda" ? <Badge variant="cyan">agent</Badge> : null}
@@ -723,6 +855,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
+              <EntryIcon entry={entry} />
               <span className="shrink-0 truncate text-sm font-medium">{title}</span>
               <EntryDetail entry={entry} />
             </div>
