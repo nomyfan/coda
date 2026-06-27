@@ -38,7 +38,7 @@ const components: Components = {
   ),
   hr: () => <hr className="my-3 border-border" />,
   code: ({ className, children }) => {
-    const isBlock = /language-/.test(className ?? "");
+    const isBlock = /language-/.test(className ?? "") || String(children).includes("\n");
     if (isBlock) {
       return <code className={className}>{children}</code>;
     }
@@ -49,7 +49,7 @@ const components: Components = {
     );
   },
   pre: ({ children }) => (
-    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 first:mt-0 last:mb-0">
+    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 first:mt-0 last:mb-0 [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit">
       {children}
     </pre>
   ),

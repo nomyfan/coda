@@ -13,16 +13,38 @@ function parseTime(iso: string | null | undefined): number | undefined {
   return Number.isNaN(ms) ? undefined : ms;
 }
 
-/** Wall-clock time of a message as `HH:MM`, or `undefined` when absent/invalid. */
+function pad2(value: number): string {
+  return value.toString().padStart(2, "0");
+}
+
+function sameLocalDate(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+/** Wall-clock time of a message, including date when it is outside today. */
 export function formatClockTime(iso: string | null | undefined): string | undefined {
   const ms = parseTime(iso);
   if (ms === undefined) {
     return undefined;
   }
   const date = new Date(ms);
-  const hour = date.getHours().toString().padStart(2, "0");
-  const minute = date.getMinutes().toString().padStart(2, "0");
-  return `${hour}:${minute}`;
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  const today = new Date();
+
+  if (sameLocalDate(date, today)) {
+    return time;
+  }
+
+  const monthDay = `${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}`;
+  if (date.getFullYear() === today.getFullYear()) {
+    return `${monthDay} ${time}`;
+  }
+
+  return `${date.getFullYear()}/${monthDay} ${time}`;
 }
 
 /**

@@ -128,7 +128,6 @@ function WorkspaceTargetSelect({
                 disabled={server.status !== "connected"}
                 className="pr-8"
               >
-                <Folder className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate">{workspace.id}</span>
               </SelectItem>
             ))}

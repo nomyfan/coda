@@ -2,7 +2,6 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  Folder,
   CircleSmall,
   MoreHorizontal,
   PanelLeft,
@@ -11,7 +10,7 @@ import {
   Plus,
   PlugZap,
   RotateCcw,
-  Trash2,
+  Trash,
   Unplug,
   X,
 } from "lucide-react";
@@ -285,7 +284,7 @@ const ServerGroup = memo(function ServerGroup({
               )}
               <DropdownMenuSeparator />
               <DropdownMenuItem variant="destructive" onClick={() => removeServer(server.url)}>
-                <Trash2 />
+                <Trash />
                 Remove
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -404,7 +403,7 @@ function SessionRow({
           onClick={() => setConfirming(true)}
           title="Delete session"
         >
-          <Trash2 className="size-4" />
+          <Trash className="size-4" />
         </Button>
       )}
     </div>
@@ -458,7 +457,6 @@ function WorkspaceNode({
           ) : (
             <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
           )}
-          <Folder className="size-4 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1 truncate font-medium" title={displayName}>
             {displayName}
           </span>

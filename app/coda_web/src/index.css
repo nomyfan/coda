@@ -4,57 +4,70 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --background: hsl(0 0% 100%);
-  --foreground: hsl(223.8136 0% 2.2326%);
-  --card: hsl(223.8136 -172.5242% 100%);
-  --card-foreground: hsl(223.8136 0% 2.2326%);
-  --popover: hsl(223.8136 -172.5242% 100%);
-  --popover-foreground: hsl(223.8136 0% 2.2326%);
-  --primary: hsl(223.8136 0% 9.0527%);
-  --primary-foreground: hsl(359.1462 6.4586% 84.8971%);
-  --secondary: hsl(223.8136 0.0001% 93.448%);
-  --secondary-foreground: hsl(223.8136 0% 9.0527%);
-  --muted: hsl(223.8136 0.0001% 93.448%);
-  --muted-foreground: hsl(223.8136 0% 45.1519%);
-  --accent: hsl(223.8136 0.0001% 93.448%);
-  --accent-foreground: hsl(223.8136 0% 9.0527%);
-  --destructive: hsl(351.7303 123.6748% 40.5257%);
-  --destructive-foreground: oklch(0.12 0 0);
-  --border: hsl(223.8136 0% 86.9817%);
-  --input: hsl(223.8136 0.0001% 89.5577%);
-  --ring: hsl(223.8136 0% 74.3206%);
-  --chart-1: hsl(23.8137 138.2924% 40.3162%);
-  --chart-2: hsl(175.8622 177.4259% 21.2406%);
-  --chart-3: hsl(195.8236 72.1388% 22.8735%);
-  --chart-4: hsl(46.6817 159.6637% 38.5235%);
-  --chart-5: hsl(40.5818 156.0052% 38.8379%);
-  --sidebar: hsl(223.8136 0.0004% 98.0256%);
-  --sidebar-foreground: hsl(223.8136 0% 2.2326%);
-  --sidebar-primary: hsl(223.8136 0% 9.0527%);
-  --sidebar-primary-foreground: hsl(223.8136 0.0004% 98.0256%);
-  --sidebar-accent: hsl(223.8136 0.0001% 93.448%);
-  --sidebar-accent-foreground: hsl(223.8136 0% 9.0527%);
-  --sidebar-border: hsl(223.8136 0.0001% 89.8161%);
-  --sidebar-ring: hsl(223.8136 0% 74.3206%);
+  /* Vellum Light - Extra Light & Airy (Green Accent) */
+  --background: hsl(40 33.3% 98.2%);
+  --foreground: hsl(27 6.5% 22%);
+  --card: hsl(40 33% 99%);
+  --card-foreground: hsl(27 6.5% 22%);
+  --popover: hsl(40 33% 99%);
+  --popover-foreground: hsl(27 6.5% 22%);
+
+  /* Vellum 浅色模式下的绿色 */
+  --primary: hsl(99 32.6% 34.3%);
+  --primary-foreground: hsl(0 0% 100%);
+
+  --secondary: hsl(30 23.1% 94.9%);
+  --secondary-foreground: hsl(27 6.5% 22%);
+
+  --muted: hsl(30 23.1% 94.9%);
+  --muted-foreground: hsl(32 7.9% 37%);
+
+  --accent: hsl(33 21.6% 90%);
+  --accent-foreground: hsl(27 6.5% 22%);
+
+  --destructive: hsl(0 46.8% 56.5%);
+  --destructive-foreground: hsl(0 0% 100%);
+
+  /* 警示色（审批门等）— 暖琥珀，饱和度压到与 Vellum 一致 */
+  --warning: hsl(38 60% 50%);
+  --warning-foreground: hsl(30 50% 34%);
+
+  --border: hsl(34 23.3% 88.2%);
+  --input: hsl(34 23.3% 88.2%);
+  --ring: hsl(99 32.6% 34.3%); /* 同步焦点环为绿色 */
+
+  /* 数据图表配色 (将主色调绿色移至 chart-3，原橙色后移) */
+  --chart-1: hsl(44 58.4% 44.3%);
+  --chart-2: hsl(143 16.4% 37.1%);
+  --chart-3: hsl(99 32.6% 34.3%);
+  --chart-4: hsl(24 58.9% 49.6%);
+  --chart-5: hsl(317 22.7% 50.8%);
+
+  /* 侧边栏主色同步为绿色 */
+  --sidebar: hsl(30 23.1% 94.9%);
+  --sidebar-foreground: hsl(27 6.5% 22%);
+  --sidebar-primary: hsl(99 32.6% 34.3%);
+  --sidebar-primary-foreground: hsl(0 0% 100%);
+  --sidebar-accent: hsl(33 21.6% 90%);
+  --sidebar-accent-foreground: hsl(27 6.5% 22%);
+  --sidebar-border: hsl(34 23.3% 88.2%);
+  --sidebar-ring: hsl(99 32.6% 34.3%);
+
+  /* Retained Custom Configurations */
   --font-sans: Geist, ui-sans-serif, sans-serif, system-ui;
   --font-serif: Georgia, serif;
   --font-mono: Geist Mono, ui-monospace, monospace;
   --radius: 0.65rem;
-  --shadow-x: 0px;
-  --shadow-y: 4px;
-  --shadow-blur: 10px;
-  --shadow-spread: 0px;
-  --shadow-opacity: 0.1;
-  --shadow-color: 0, 0, 0;
-  --shadow-2xs: 0px 4px 10px 0px hsl(0, 0, 0 / 0.05);
-  --shadow-xs: 0px 4px 10px 0px hsl(0, 0, 0 / 0.05);
-  --shadow-sm: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 1px 2px -1px hsl(0, 0, 0 / 0.1);
-  --shadow: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 1px 2px -1px hsl(0, 0, 0 / 0.1);
-  --shadow-md: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 2px 4px -1px hsl(0, 0, 0 / 0.1);
-  --shadow-lg: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 4px 6px -1px hsl(0, 0, 0 / 0.1);
-  --shadow-xl: 0px 4px 10px 0px hsl(0, 0, 0 / 0.1), 0px 8px 10px -1px hsl(0, 0, 0 / 0.1);
-  --shadow-2xl: 0px 4px 10px 0px hsl(0, 0, 0 / 0.25);
-  --tracking-normal: -0.01em;
+  /* Flat theme — no elevation shadows; separation comes from borders/bg. */
+  --shadow-2xs: none;
+  --shadow-xs: none;
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+  --shadow-xl: none;
+  --shadow-2xl: none;
+  --tracking-normal: 0em;
   /* Global density lever: Tailwind v4 derives every numeric spacing/sizing
    * utility (p-*, h-*, gap-*, size-*, …) from this, so shrinking it compacts the
    * whole UI proportionally without touching typography or colors. */
@@ -62,56 +75,68 @@
 }
 
 .dark {
-  --background: hsl(223.8136 0% 1.292%);
-  --foreground: hsl(223.8136 0.0005% 98.6829%);
-  --card: hsl(223.8136 0% 5.1758%);
-  --card-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --popover: hsl(223.8136 0% 5.1758%);
-  --popover-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --primary: hsl(223.8136 0.0005% 98.6829%);
-  --primary-foreground: hsl(223.8136 0% 5.1758%);
-  --secondary: hsl(223.8136 0% 13.1499%);
-  --secondary-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --muted: hsl(223.8136 0% 13.1499%);
-  --muted-foreground: hsl(223.8136 0% 63.0163%);
-  --accent: hsl(223.8136 0% 13.1499%);
-  --accent-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --destructive: hsl(358.7594 101.8439% 69.8357%);
-  --destructive-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --border: hsl(0 0% 18.8235%);
-  --input: hsl(223.8136 -172.5242% 100%);
-  --ring: hsl(223.8136 0% 45.1519%);
-  --chart-1: hsl(225.3451 84.0953% 48.9841%);
-  --chart-2: hsl(164.3318 183.0013% 26.1055%);
-  --chart-3: hsl(40.5818 156.0052% 38.8379%);
-  --chart-4: hsl(272.1085 107.7718% 65.1513%);
-  --chart-5: hsl(223.8136 0% 9.0527%);
-  --sidebar: hsl(223.8136 0% 1.292%);
-  --sidebar-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --sidebar-primary: hsl(223.8136 0.0005% 98.6829%);
-  --sidebar-primary-foreground: hsl(223.8136 0% 5.1758%);
-  --sidebar-accent: hsl(223.8136 0% 13.1499%);
-  --sidebar-accent-foreground: hsl(223.8136 0.0005% 98.6829%);
-  --sidebar-border: hsl(223.8136 -172.5242% 100%);
-  --sidebar-ring: hsl(223.8136 0% 45.1519%);
+  /* Vellum Dark - Lighter & Softer (Green Accent) */
+  --background: hsl(24 6.3% 15.5%);
+  --foreground: hsl(43 16.3% 91.6%);
+  --card: hsl(26 7.4% 18.6%);
+  --card-foreground: hsl(43 16.3% 91.6%);
+  --popover: hsl(23 7.4% 21.2%);
+  --popover-foreground: hsl(43 16.3% 91.6%);
+
+  /* Vellum 深色模式下的绿色 */
+  --primary: hsl(89 34.8% 64.5%);
+  --primary-foreground: hsl(24 6.3% 15.5%);
+
+  --secondary: hsl(27 8% 22.2%);
+  --secondary-foreground: hsl(38 11.4% 86.3%);
+
+  --muted: hsl(26 7.4% 18.6%);
+  --muted-foreground: hsl(32 7.9% 62.9%);
+
+  --accent: hsl(27 7.3% 24.1%);
+  --accent-foreground: hsl(43 16.3% 91.6%);
+
+  --destructive: hsl(0 66% 71.2%);
+  --destructive-foreground: hsl(24 6.3% 15.5%);
+
+  /* 警示色（深色）— 暖琥珀 */
+  --warning: hsl(40 55% 62%);
+  --warning-foreground: hsl(42 45% 72%);
+
+  --border: hsl(30 9.2% 25.5%);
+  --input: hsl(30 9.2% 25.5%);
+  --ring: hsl(89 34.8% 64.5%); /* 同步焦点环为绿色 */
+
+  /* 数据图表配色 */
+  --chart-1: hsl(40 56.1% 67.8%);
+  --chart-2: hsl(134 12.6% 61%);
+  --chart-3: hsl(89 34.8% 64.5%);
+  --chart-4: hsl(23 67.5% 69.8%);
+  --chart-5: hsl(331 42.7% 72%);
+
+  /* 侧边栏主色同步为绿色 */
+  --sidebar: hsl(20 7% 16.9%);
+  --sidebar-foreground: hsl(43 16.3% 91.6%);
+  --sidebar-primary: hsl(89 34.8% 64.5%);
+  --sidebar-primary-foreground: hsl(24 6.3% 15.5%);
+  --sidebar-accent: hsl(23 7.4% 21.2%);
+  --sidebar-accent-foreground: hsl(43 16.3% 91.6%);
+  --sidebar-border: hsl(27 8% 22.2%);
+  --sidebar-ring: hsl(89 34.8% 64.5%);
+
+  /* Retained Custom Configurations */
   --font-sans: Geist, ui-sans-serif, sans-serif, system-ui;
   --font-serif: Georgia, serif;
   --font-mono: Geist Mono, ui-monospace, monospace;
   --radius: 0.65rem;
-  --shadow-x: 0px;
-  --shadow-y: 10px;
-  --shadow-blur: 20px;
-  --shadow-spread: 0px;
-  --shadow-opacity: 0.5;
-  --shadow-color: 0, 0, 0;
-  --shadow-2xs: 0px 10px 20px 0px hsl(0, 0, 0 / 0.25);
-  --shadow-xs: 0px 10px 20px 0px hsl(0, 0, 0 / 0.25);
-  --shadow-sm: 0px 10px 20px 0px hsl(0, 0, 0 / 0.5), 0px 1px 2px -1px hsl(0, 0, 0 / 0.5);
-  --shadow: 0px 10px 20px 0px hsl(0, 0, 0 / 0.5), 0px 1px 2px -1px hsl(0, 0, 0 / 0.5);
-  --shadow-md: 0px 10px 20px 0px hsl(0, 0, 0 / 0.5), 0px 2px 4px -1px hsl(0, 0, 0 / 0.5);
-  --shadow-lg: 0px 10px 20px 0px hsl(0, 0, 0 / 0.5), 0px 4px 6px -1px hsl(0, 0, 0 / 0.5);
-  --shadow-xl: 0px 10px 20px 0px hsl(0, 0, 0 / 0.5), 0px 8px 10px -1px hsl(0, 0, 0 / 0.5);
-  --shadow-2xl: 0px 10px 20px 0px hsl(0, 0, 0 / 1.25);
+  --shadow-2xs: none;
+  --shadow-xs: none;
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+  --shadow-xl: none;
+  --shadow-2xl: none;
 }
 
 @theme inline {
@@ -131,6 +156,8 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);

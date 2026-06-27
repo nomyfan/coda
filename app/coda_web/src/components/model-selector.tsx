@@ -1,4 +1,3 @@
-import { Brain, Cpu } from "lucide-react";
 import { useMemo } from "react";
 import {
   Select,
@@ -108,7 +107,6 @@ export function ModelSelector({
           size="sm"
           className="h-7 max-w-44 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70"
         >
-          <Cpu className="size-3 text-muted-foreground" />
           <SelectValue placeholder="Model" />
         </SelectTrigger>
         <SelectContent position="popper" side="top">
@@ -125,7 +123,6 @@ export function ModelSelector({
             size="sm"
             className="h-7 max-w-32 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70"
           >
-            <Brain className="size-3 text-muted-foreground" />
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>
           <SelectContent position="popper" side="top">

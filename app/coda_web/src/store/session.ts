@@ -17,6 +17,7 @@ import {
   type WorkspaceSummary,
   callArguments,
   describeTool,
+  extractShellCommand,
   outcomeText,
   outputText,
   subAgentDisplayName,
@@ -42,6 +43,8 @@ export type TranscriptEntry = {
   title?: string;
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
+  /** Executed shell command, shown alongside shell results. */
+  command?: string;
   content: string;
   /** Image URLs attached to a user message (base64 data-URIs or HTTPS URLs). */
   images?: string[];
@@ -354,11 +357,19 @@ function historyToEntries(
     return entries;
   }
   if ("Tool" in message) {
+    const argumentsJson = argsById[message.Tool.id];
     return [
       toolMessageToEntry(
         message.Tool,
         `history:tool:${index}`,
-        describeTool(message.Tool.name, argsById[message.Tool.id]),
+        describeTool(message.Tool.name, argumentsJson),
+        message.Tool.name === "shell"
+          ? extractShellCommand({
+              id: message.Tool.id,
+              name: message.Tool.name,
+              arguments: argumentsJson,
+            })
+          : undefined,
       ),
     ];
   }
@@ -378,6 +389,7 @@ function toolMessageToEntry(
   message: ToolMessage,
   id = newId("tool-result"),
   detail?: string,
+  command?: string,
 ): TranscriptEntry {
   return {
     id,
@@ -385,6 +397,7 @@ function toolMessageToEntry(
     callId: message.id,
     title: message.name,
     detail,
+    command,
     content: outputText(message.output),
     status: outcomeText(message.outcome),
     startedAt: message.started_at,
@@ -407,7 +420,12 @@ function finishToolEntry(
   // Carry over the detail derived from the call arguments at tool_start; the
   // tool_end message itself doesn't include them.
   entries[index] = {
-    ...toolMessageToEntry(event.message, entries[index].id, entries[index].detail),
+    ...toolMessageToEntry(
+      event.message,
+      entries[index].id,
+      entries[index].detail,
+      entries[index].command,
+    ),
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
@@ -649,6 +667,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
             callId: event.call.id,
             title: event.call.name,
             detail: describeTool(event.call.name, event.call.arguments),
+            command: event.call.name === "shell" ? extractShellCommand(event.call) : undefined,
             content: callArguments(event.call),
             status: "running",
           },

@@ -1,17 +1,4 @@
-import {
-  Ban,
-  Bot,
-  Brain,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Copy,
-  Cpu,
-  MessageSquareText,
-  ShieldCheck,
-  Sparkles,
-  TerminalSquare,
-} from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useEffect, useRef, useState } from "react";
 import {
@@ -156,9 +143,6 @@ export const Transcript = memo(function Transcript({
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (
           <div className="flex min-h-[48vh] flex-col items-center justify-center text-center">
-            <div className="mb-3 flex size-10 items-center justify-center rounded-md bg-accent text-accent-foreground">
-              <Sparkles className="size-5" />
-            </div>
             <div className="text-base font-semibold">
               {workspace ? "What should we do?" : "No session selected"}
             </div>
@@ -189,23 +173,6 @@ function entryTitle(entry: TranscriptEntry) {
     return toolDisplayName(entry.title);
   }
   return entry.agentName ? `${entry.agentName}` : entry.kind;
-}
-
-function EntryIcon({ entry }: { entry: TranscriptEntry }) {
-  const Icon =
-    entry.kind === "assistant"
-      ? MessageSquareText
-      : entry.kind === "reasoning"
-        ? Brain
-        : entry.kind === "tool_call"
-          ? TerminalSquare
-          : entry.kind === "tool_result"
-            ? ShieldCheck
-            : entry.kind === "error"
-              ? Ban
-              : Cpu;
-
-  return <Icon className="size-4 shrink-0 text-muted-foreground" />;
 }
 
 function EntryDetail({ entry }: { entry: TranscriptEntry }) {
@@ -255,6 +222,24 @@ function EntryStatus({ entry }: { entry: TranscriptEntry }) {
   }
   return (
     <Badge variant={entry.status === "running" ? "warning" : "secondary"}>{entry.status}</Badge>
+  );
+}
+
+function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
+  return (
+    <div className="space-y-3">
+      {entry.command ? (
+        <div className="space-y-1">
+          <div className="text-xs font-medium text-muted-foreground">Command</div>
+          <pre className="whitespace-pre-wrap break-words rounded-md border border-border/70 bg-background/70 p-2 pr-10 font-mono text-xs leading-5">
+            {entry.command}
+          </pre>
+        </div>
+      ) : null}
+      <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+        {entry.content}
+      </pre>
+    </div>
   );
 }
 
@@ -489,7 +474,6 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
             title={open ? "Collapse sub-agent" : "Expand sub-agent"}
           >
             <div className="flex min-w-0 items-center gap-2">
-              <Bot className="size-4 shrink-0" />
               <span className="shrink-0 truncate text-sm font-medium">{item.agentName}</span>
               <Badge variant="cyan" className="shrink-0 whitespace-nowrap">
                 agent
@@ -559,7 +543,6 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                 title={processOpen ? "Collapse process" : "Expand process"}
               >
                 <div className="flex min-w-0 items-center gap-2">
-                  <Brain className="size-4 shrink-0" />
                   <span className="truncate text-sm font-medium">{processTitle}</span>
                   {activeSummary.detail && !processComplete ? (
                     <span className="truncate font-mono text-xs text-muted-foreground">
@@ -612,7 +595,6 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
           title={open ? "Collapse" : "Expand"}
         >
           <div className="flex min-w-0 flex-1 items-center gap-2">
-            <EntryIcon entry={entry} />
             <span className="shrink-0 truncate text-sm">{title}</span>
             <EntryDetail entry={entry} />
             <EntryTiming entry={entry} mode="duration" />
@@ -643,9 +625,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
               <Markdown>{entry.content}</Markdown>
             </div>
           ) : (
-            <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
-              {entry.content}
-            </pre>
+            <ToolEntryContent entry={entry} />
           )}
         </div>
       </CollapsibleContent>
@@ -727,7 +707,6 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
   const header = (
     <div className="mb-2 flex items-center justify-between gap-3">
       <div className="flex min-w-0 items-center gap-2">
-        <EntryIcon entry={entry} />
         <span className="shrink-0 truncate text-sm font-medium">{title}</span>
         <EntryDetail entry={entry} />
         {entry.agentName && entry.agentName !== "coda" ? <Badge variant="cyan">agent</Badge> : null}
@@ -744,7 +723,6 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
         <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
-              <EntryIcon entry={entry} />
               <span className="shrink-0 truncate text-sm font-medium">{title}</span>
               <EntryDetail entry={entry} />
             </div>
@@ -775,9 +753,7 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
                   <CopyContentButton content={entry.content} label="result" />
                 </div>
               </div>
-              <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
-                {entry.content}
-              </pre>
+              <ToolEntryContent entry={entry} />
             </div>
           </CollapsibleContent>
         </Collapsible>

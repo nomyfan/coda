@@ -19,7 +19,7 @@ export function StatusDot({
   className?: string;
 }) {
   const color =
-    tone === "online" ? "bg-emerald-500" : tone === "busy" ? "bg-amber-500" : "bg-rose-500";
+    tone === "online" ? "bg-[#6FA755]" : tone === "busy" ? "bg-[#D39A2E]" : "bg-[#D96B6B]";
   return (
     <span
       className={cn("relative flex size-3 shrink-0 items-center justify-center", className)}

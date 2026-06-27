@@ -110,11 +110,11 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
 
   return (
     <div className="px-4 pt-2">
-      <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-amber-500/40 bg-amber-500/5">
+      <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-warning/40 bg-warning/8">
         <div className="flex max-h-[55vh] flex-col">
           <div className="flex items-center justify-between px-4 pt-2.5">
             <h2 className="flex items-center gap-2 text-sm font-medium">
-              <ShieldCheck className="size-4 text-amber-600" />
+              <ShieldCheck className="size-4 text-warning-foreground" />
               Approval required
             </h2>
             <Badge variant="warning">
@@ -270,7 +270,7 @@ function ApprovalCall({
             type="button"
             variant={remembering ? "secondary" : "outline"}
             aria-pressed={remembering}
-            className={cn(remembering && "border-amber-500/70 text-amber-700")}
+            className={cn(remembering && "border border-warning/70 text-warning-foreground")}
             onClick={() => {
               if (remembering) {
                 onSetAllow(null);
