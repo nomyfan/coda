@@ -1199,6 +1199,11 @@ async fn handle_session_envelope<
                 .is_some_and(|active_session| active_session.generation == generation)
             {
                 active.remove(&key);
+                // Drop any deferred close for this instance: a stream that ends
+                // without a settling event (the runtime terminated) would
+                // otherwise leave the key stranded. Gated on the same generation
+                // so a stale Closed can't clear a reopened session's request.
+                close_requested.remove(&key);
             }
             true
         }
