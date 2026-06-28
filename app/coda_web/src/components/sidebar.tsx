@@ -604,7 +604,7 @@ export function Sidebar({
           // The width animates between collapsed/expanded; `overflow-hidden` lets
           // the fixed-width content below act as a curtain-revealed layer so its
           // children never reflow (slide) mid-animation. See `lg:w-[calc(...)]`.
-          "fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[min(22rem,calc(100vw-2rem))] shrink-0 flex-col gap-2 overflow-hidden border-r bg-card p-2.5 transition-[transform,width] duration-200 lg:static lg:z-auto lg:w-[256px] lg:translate-x-0 lg:bg-card/55",
+          "absolute inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[min(22rem,calc(100vw-2rem))] shrink-0 flex-col gap-2 overflow-hidden border-r p-2.5 transition-[transform,width] duration-200 lg:static lg:z-auto lg:w-[256px] lg:translate-x-0 bg-background/70",
           mobileOpen ? "translate-x-0" : "-translate-x-full",
           collapsed && "lg:w-12",
         )}
@@ -693,7 +693,7 @@ export function Sidebar({
             ))}
           </div>
         ) : (
-          <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5 lg:w-[calc(256px_-_var(--spacing)*5)]">
+          <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md p-1.5 lg:w-[calc(256px-var(--spacing)*5)]">
             {servers.length === 0 ? (
               <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
                 <div className="text-sm font-medium">No servers</div>

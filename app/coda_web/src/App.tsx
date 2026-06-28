@@ -342,7 +342,7 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px]">
+    <div className="relative flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px]">
       <Sidebar
         mobileOpen={sidebarOpen}
         onMobileOpenChange={setSidebarOpen}
