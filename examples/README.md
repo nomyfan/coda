@@ -1,7 +1,7 @@
 # Configuration examples
 
 A self-contained, annotated example of everything coda can be configured with:
-providers, workspaces, a multi-agent team, MCP servers, shell-approval rules,
+providers, workspaces, a multi-agent team, MCP servers, tool approval rules,
 skills, workspace knowledge, and per-agent workspaces.
 
 Nothing here is wired into the build — it's reference material. Copy a file into
@@ -19,7 +19,7 @@ examples/
     │   └── .coda/skills/changelog/  #   its own skill (per-workspace, not shared)
     └── .coda/
         ├── mcp.json                 # MCP servers, shared by all agents
-        ├── config.toml              # shell-approval allow/deny rules
+        ├── config.toml              # tool approval + shell allow/deny rules
         ├── skills/code-review/      # a root-workspace skill
         └── agents/                  # the agent team (topology lives only here)
             ├── AGENT.md             #   root `coda` config (bare file)
@@ -57,7 +57,7 @@ where you launch from.
 | `docs-writer/` | A **per-agent workspace** (`workspace: ./docs`): its tool root and knowledge come from `docs/`, not the root. |
 | `docs/AGENTS.md` + `docs/.coda/skills/` | A per-agent workspace carries **its own** knowledge and skills, distinct from the root's. |
 | `.coda/mcp.json` | An MCP server over **stdio** (`mcp-server-time` via `uvx`); referenced from agents as `mcp__<server>__<tool>`. An **http** server uses `{ "type": "http", "url": ... }` instead. |
-| `.coda/config.toml` | **Shell-approval** `allow`/`deny` globs (only the `shell` tool is gated; `write_file`/`edit_file`/`ask_user` always pause). |
+| `.coda/config.toml` | Tool approval config: `approval_required` tool-name patterns plus `shell` `allow`/`deny` globs. `ask_user` always pauses to open the UI. |
 | `.coda/skills/code-review/` | A **skill** — name + description frontmatter plus a body, surfaced to agents in this workspace. |
 
 ## Notes on the model

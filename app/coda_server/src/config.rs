@@ -389,8 +389,19 @@ pub struct ToolApprovalConfig {
 struct Inner {
     allow: Vec<String>,
     deny: Vec<String>,
+    approval_required_tools: Vec<String>,
     config_path: PathBuf,
 }
+
+#[derive(Debug)]
+struct Permissions {
+    shell_allow: Vec<String>,
+    shell_deny: Vec<String>,
+    approval_required_tools: Vec<String>,
+}
+
+const INTERACTIVE_TOOLS: &[&str] = &["ask_user"];
+const DEFAULT_APPROVAL_REQUIRED_TOOLS: &[&str] = &["edit_file", "write_file", "ls", "grep", "glob"];
 
 impl ToolApprovalConfig {
     /// Create a default config (empty rules → all shell calls require approval)
@@ -400,6 +411,7 @@ impl ToolApprovalConfig {
             inner: Arc::new(Mutex::new(Inner {
                 allow: vec![],
                 deny: vec![],
+                approval_required_tools: default_approval_required_tools(),
                 config_path: workspace_dir.join(".coda").join("config.toml"),
             })),
         }
@@ -410,16 +422,17 @@ impl ToolApprovalConfig {
     /// if the file does not exist.
     pub fn load(workspace_dir: &Path) -> Result<Self, ConfigError> {
         let config_path = workspace_dir.join(".coda").join("config.toml");
-        let (allow, deny) = if config_path.exists() {
+        let permissions = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             parse_permissions(&content)?
         } else {
-            (vec![], vec![])
+            Permissions::default()
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                allow,
-                deny,
+                allow: permissions.shell_allow,
+                deny: permissions.shell_deny,
+                approval_required_tools: permissions.approval_required_tools,
                 config_path,
             })),
         })
@@ -430,23 +443,26 @@ impl ToolApprovalConfig {
     /// The returned closure captures the inner `Arc` so that patterns added via
     /// [`add_allow_pattern`] take effect immediately for subsequent tool calls.
     pub fn into_approval_mode(self) -> ToolApprovalMode {
-        ToolApprovalMode::RequireWhen(Arc::new(move |call| {
-            // `ask_user` has no real execution — it must always suspend so the
-            // caller can interactively answer and resolve it.
-            call.name == "ask_user"
-                || call.name == "edit_file"
-                || call.name == "write_file"
-                || self.requires_approval(call)
-        }))
+        ToolApprovalMode::RequireWhen(Arc::new(move |call| self.requires_approval(call)))
     }
 
     /// Whether `call` should be suspended for human approval.
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
+        if INTERACTIVE_TOOLS.iter().any(|tool| tool == &call.name) {
+            return true;
+        }
+        let inner = self.inner.lock().unwrap();
+        if inner
+            .approval_required_tools
+            .iter()
+            .any(|pattern| wildcard_match(pattern, &call.name))
+        {
+            return true;
+        }
         if call.name != "shell" {
             return false;
         }
         let command = extract_shell_command(call);
-        let inner = self.inner.lock().unwrap();
         !is_auto_approved(&command, &inner.allow, &inner.deny)
     }
 
@@ -475,6 +491,23 @@ impl ToolApprovalConfig {
             first_token.to_string()
         }
     }
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self {
+            shell_allow: vec![],
+            shell_deny: vec![],
+            approval_required_tools: default_approval_required_tools(),
+        }
+    }
+}
+
+fn default_approval_required_tools() -> Vec<String> {
+    DEFAULT_APPROVAL_REQUIRED_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect()
 }
 
 /// Whether `command` can be auto-approved against the given rules.
@@ -574,37 +607,47 @@ fn extract_shell_command(call: &ToolCall) -> String {
         .unwrap_or_default()
 }
 
-fn parse_permissions(content: &str) -> Result<(Vec<String>, Vec<String>), ConfigError> {
+fn parse_permissions(content: &str) -> Result<Permissions, ConfigError> {
     let doc = content
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-    let shell = match doc.get("permissions").and_then(|p| p.get("shell")) {
-        Some(t) => t,
-        None => return Ok((vec![], vec![])),
+    let mut permissions = Permissions::default();
+    let Some(root) = doc.get("permissions") else {
+        return Ok(permissions);
     };
 
-    let allow = shell
-        .get("allow")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    if let Some(shell) = root.get("shell") {
+        permissions.shell_allow = optional_string_array(shell, "allow")?.unwrap_or_default();
+        permissions.shell_deny = optional_string_array(shell, "deny")?.unwrap_or_default();
+    }
 
-    let deny = shell
-        .get("deny")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    if let Some(tools) = root.get("tools") {
+        permissions.approval_required_tools = optional_string_array(tools, "approval_required")?
+            .unwrap_or(permissions.approval_required_tools);
+    }
 
-    Ok((allow, deny))
+    Ok(permissions)
+}
+
+fn optional_string_array(
+    table: &toml_edit::Item,
+    key: &str,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| ConfigError::Parse(format!("permissions {key} must be an array")))?;
+    let mut parsed = Vec::new();
+    for item in array {
+        let value = item
+            .as_str()
+            .ok_or_else(|| ConfigError::Parse(format!("permissions {key} must be strings")))?;
+        parsed.push(value.to_string());
+    }
+    Ok(Some(parsed))
 }
 
 /// Rewrite the `[permissions.shell].allow` array in the config file,
@@ -738,9 +781,13 @@ mod tests {
 
     #[test]
     fn parse_empty_config() {
-        let (allow, deny) = parse_permissions("").unwrap();
-        assert!(allow.is_empty());
-        assert!(deny.is_empty());
+        let permissions = parse_permissions("").unwrap();
+        assert!(permissions.shell_allow.is_empty());
+        assert!(permissions.shell_deny.is_empty());
+        assert_eq!(
+            permissions.approval_required_tools,
+            vec!["edit_file", "write_file", "ls", "grep", "glob"]
+        );
     }
 
     const PROVIDERS: &str = r#"
@@ -965,13 +1012,41 @@ path = "/tmp/b"
     #[test]
     fn parse_full_config() {
         let toml = r#"
+[permissions.tools]
+approval_required = ["ask_user", "write_todos"]
+
 [permissions.shell]
 allow = ["git *", "cargo *"]
 deny = ["rm -rf *"]
 "#;
-        let (allow, deny) = parse_permissions(toml).unwrap();
-        assert_eq!(allow, vec!["git *", "cargo *"]);
-        assert_eq!(deny, vec!["rm -rf *"]);
+        let permissions = parse_permissions(toml).unwrap();
+        assert_eq!(permissions.shell_allow, vec!["git *", "cargo *"]);
+        assert_eq!(permissions.shell_deny, vec!["rm -rf *"]);
+        assert_eq!(
+            permissions.approval_required_tools,
+            vec!["ask_user", "write_todos"]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_rejects_non_array_approval_required() {
+        let err = parse_permissions("[permissions.tools]\napproval_required = \"write_file\"\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("permissions approval_required must be an array")
+        );
+    }
+
+    #[test]
+    fn parse_permissions_rejects_non_string_approval_required_item() {
+        let err =
+            parse_permissions("[permissions.tools]\napproval_required = [\"write_file\", 1]\n")
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("permissions approval_required must be strings")
+        );
     }
 
     #[test]
@@ -1001,6 +1076,83 @@ deny = ["rm -rf *"]
             arguments: None,
         };
         assert!(!config.requires_approval(&call));
+    }
+
+    #[test]
+    fn default_tools_require_approval() {
+        let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
+        assert!(config.requires_approval(&tool_call("edit_file")));
+        assert!(config.requires_approval(&tool_call("write_file")));
+        assert!(config.requires_approval(&tool_call("ls")));
+        assert!(config.requires_approval(&tool_call("grep")));
+        assert!(config.requires_approval(&tool_call("glob")));
+    }
+
+    #[test]
+    fn interactive_tools_always_require_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".coda").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[permissions.tools]\napproval_required = []\n",
+        )
+        .unwrap();
+
+        let config = ToolApprovalConfig::load(dir.path()).unwrap();
+        assert!(config.requires_approval(&tool_call("ask_user")));
+    }
+
+    #[test]
+    fn configured_tools_replace_default_required_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".coda").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[permissions.tools]\napproval_required = [\"write_todos\"]\n",
+        )
+        .unwrap();
+
+        let config = ToolApprovalConfig::load(dir.path()).unwrap();
+        assert!(config.requires_approval(&tool_call("write_todos")));
+        assert!(!config.requires_approval(&tool_call("write_file")));
+    }
+
+    #[test]
+    fn configured_tool_patterns_require_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".coda").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[permissions.tools]\napproval_required = [\"mcp__time__*\"]\n",
+        )
+        .unwrap();
+
+        let config = ToolApprovalConfig::load(dir.path()).unwrap();
+        assert!(config.requires_approval(&tool_call("mcp__time__get_current_time")));
+        assert!(config.requires_approval(&tool_call("mcp__time__convert_time")));
+        assert!(!config.requires_approval(&tool_call("mcp__filesystem__read_file")));
+    }
+
+    #[test]
+    fn configured_empty_tools_disable_default_required_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".coda").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[permissions.tools]\napproval_required = []\n",
+        )
+        .unwrap();
+
+        let config = ToolApprovalConfig::load(dir.path()).unwrap();
+        assert!(!config.requires_approval(&tool_call("edit_file")));
+        assert!(!config.requires_approval(&tool_call("write_file")));
+        assert!(!config.requires_approval(&tool_call("ls")));
+        assert!(!config.requires_approval(&tool_call("grep")));
+        assert!(!config.requires_approval(&tool_call("glob")));
     }
 
     #[test]
@@ -1179,6 +1331,14 @@ deny = ["rm -rf *"]
             id: "test".into(),
             name: "shell".into(),
             arguments: Some(args),
+        }
+    }
+
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "test".into(),
+            name: name.into(),
+            arguments: None,
         }
     }
 }

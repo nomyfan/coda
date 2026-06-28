@@ -5,6 +5,7 @@ import {
   ChevronRight,
   FilePen,
   FilePlus2,
+  FileQuestionMark,
   FileSearch,
   FileText,
   FolderTree,
@@ -62,6 +63,7 @@ function formatArguments(value: string) {
 type ApprovalItem = { approval: PendingApproval; call: ToolCall };
 
 const TOOL_ICONS: Record<string, LucideIcon> = {
+  ask_user: FileQuestionMark,
   read_file: FileText,
   write_file: FilePlus2,
   edit_file: FilePen,
@@ -85,7 +87,7 @@ function askUserResolvedText(decision: ToolCallResolution | undefined): string |
 
 function approvalHeader(call: ToolCall) {
   if (call.name === "ask_user") {
-    return { detail: parseAskUserParams(call).question, Icon: Wrench, label: "Ask" };
+    return { detail: parseAskUserParams(call).question, Icon: FileQuestionMark, label: "Ask" };
   }
   const Icon = call.name.startsWith(SUBAGENT_TOOL_PREFIX)
     ? Bot

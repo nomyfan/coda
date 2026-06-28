@@ -363,6 +363,8 @@ export function describeTool(
   }
 
   switch (name) {
+    case "ask_user":
+      return str(args.question);
     case "shell":
       return str(args.description) ?? str(args.command);
     case "read_file": {

@@ -64,6 +64,12 @@ The server reads `coda-server.toml` (overridable via `CODA_SERVER_CONFIG` env va
 
 Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first model of the first provider is the default.
 
+### Workspace Approval Configuration
+
+Tool approval rules live in each workspace's `.coda/config.toml`. Regular tools matching `[permissions.tools].approval_required` patterns suspend for human approval; by default this is `["edit_file", "write_file", "ls", "grep", "glob"]`. Use `mcp__server__*` to gate every tool from one MCP server. The `ask_user` tool is always interactive and always suspends to open the web UI.
+
+Shell approvals use `[permissions.shell]` allow/deny glob lists. A `shell` call auto-approves only when every decomposed simple command matches `allow`, no simple command matches `deny`, and the command uses only statically-vetted sequencing/pipe constructs; other shell constructs suspend for approval.
+
 ### Key Abstractions
 
 - **`LLMProvider`** (`coda_core::llm`) — Model provider trait; core method `stream()` returns `Stream<LLMStreamEvent>`.

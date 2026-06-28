@@ -8,6 +8,7 @@ import {
   Copy,
   FilePen,
   FilePlus2,
+  FileQuestionMark,
   FileSearch,
   FileText,
   FolderTree,
@@ -228,6 +229,7 @@ function entryTitle(entry: TranscriptEntry) {
 
 /** Icons standing in for each built-in tool name (see `TOOL_DISPLAY_NAMES`). */
 const TOOL_ICONS: Record<string, LucideIcon> = {
+  ask_user: FileQuestionMark,
   read_file: FileText,
   write_file: FilePlus2,
   edit_file: FilePen,

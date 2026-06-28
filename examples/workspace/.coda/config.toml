@@ -1,8 +1,12 @@
-# shell-approval rules for this workspace.
+# Tool approval rules for this workspace.
 #
-# Only the `shell` tool is gated. A command is parsed and split into its simple
-# commands (on `;`, newlines, `&&`, `||`, `|`); each is evaluated independently. The whole
-# call auto-approves only when:
+# `approval_required` lists regular tool-name patterns that pause for approval.
+# Use `mcp__server__*` to require approval for every tool from one MCP server.
+# `ask_user` is always interactive and always pauses to open the UI.
+#
+# Shell commands use allow/deny globs. A command is parsed and split into its
+# simple commands (on `;`, newlines, `&&`, `||`, `|`); each is evaluated
+# independently. The whole call auto-approves only when:
 #   - every simple command matches an `allow` pattern, and
 #   - no simple command matches a `deny` pattern (deny wins over allow), and
 #   - it uses only sequencing/pipe operators — anything that can't be statically
@@ -10,8 +14,17 @@
 #     `$(...)`/backticks, subshells/loops/`if`, or a parse error) falls back to
 #     requiring approval (the safe default).
 #
-# `write_file`, `edit_file`, and `ask_user` always require approval regardless.
 # Patterns are globs matched against each simple command's text.
+
+[permissions.tools]
+approval_required = [
+  "write_file",
+  "edit_file",
+  "ls",
+  "grep",
+  "glob",
+  "mcp__time__*",
+]
 
 [permissions.shell]
 allow = [
