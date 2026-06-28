@@ -187,6 +187,16 @@ pub enum ClientMessage {
         workspace_id: String,
         session_id: String,
     },
+    /// Close a live session: free its runtime memory while keeping the persisted
+    /// session on disk so it can be reopened later. An idle session is torn down
+    /// at once; one with a turn in flight is torn down when that turn settles
+    /// (finishes, suspends, aborts, or errors), so running work isn't aborted.
+    /// Reopening the session before then cancels the close. A no-op when the
+    /// session isn't currently live.
+    CloseSession {
+        workspace_id: String,
+        session_id: String,
+    },
     /// Append a glob pattern to the shell allow-list. Takes effect immediately
     /// for the live session.
     AddAllowPattern {
@@ -384,6 +394,23 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_close_session_roundtrips() {
+        let json = serde_json::to_string(&ClientMessage::CloseSession {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"close_session","workspace_id":"coda","session_id":"s1"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            ClientMessage::CloseSession { .. }
+        ));
     }
 
     #[test]
