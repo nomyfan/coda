@@ -771,6 +771,23 @@ async fn send_pending_approval_events<
     true
 }
 
+/// Shut down a live session and drop it, freeing its runtime while keeping the
+/// persisted checkpoint so it can be reopened. Graceful so an in-flight turn (if
+/// any still races the teardown) settles and checkpoints before aborting.
+async fn close_session_now(
+    active: &mut HashMap<(String, String), ActiveSession>,
+    key: &(String, String),
+) {
+    if let Some(active_session) = active.remove(key) {
+        active_session
+            .session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
+            .await;
+        info!(workspace_id = %key.0, session_id = %key.1, "session closed");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_dashboard_command<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
@@ -778,6 +795,7 @@ async fn handle_dashboard_command<
     app: &Arc<AppState>,
     active: &mut HashMap<(String, String), ActiveSession>,
     pending: &mut HashMap<(String, String), PendingOpen>,
+    close_requested: &mut HashSet<(String, String)>,
     tx: &mpsc::UnboundedSender<SessionEnvelope>,
     next_generation: &mut u64,
     command: ClientMessage,
@@ -796,6 +814,9 @@ async fn handle_dashboard_command<
                 return true;
             }
             let key = (workspace_id.clone(), session_id.clone());
+            // Reopening (e.g. switching back to a session left running) cancels a
+            // deferred close requested while the user was away.
+            close_requested.remove(&key);
             if active.contains_key(&key) || pending.contains_key(&key) {
                 return true;
             }
@@ -993,6 +1014,9 @@ async fn handle_dashboard_command<
                 active_session.session.shutdown(Shutdown::Abort).await;
             }
             pending.remove(&key);
+            // Drop any deferred close for this session: its settling event will
+            // never reach the close path now that the session is gone.
+            close_requested.remove(&key);
             let Some(workspace) = app.workspaces.get(&workspace_id) else {
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
                 return true;
@@ -1001,6 +1025,30 @@ async fn handle_dashboard_command<
                 warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to delete session: {err}");
             }
             send_workspace_catalog(transport, app).await
+        }
+        ClientMessage::CloseSession {
+            workspace_id,
+            session_id,
+        } => {
+            let key = (workspace_id.clone(), session_id.clone());
+            // Drop a not-yet-live pending open outright.
+            pending.remove(&key);
+            match active.get(&key) {
+                // A turn is in flight: defer the teardown until it settles
+                // (mirrors the disconnect path) so the running work isn't
+                // aborted. The settling event closes it; reopening before then
+                // cancels the request (see `OpenSession`).
+                Some(active_session) if active_session.turn_running => {
+                    close_requested.insert(key);
+                }
+                // Idle: free its runtime now. The persisted session is kept, so
+                // it reopens later from its checkpoint.
+                Some(_) => {
+                    close_session_now(active, &key).await;
+                }
+                None => {}
+            }
+            true
         }
         ClientMessage::AddAllowPattern {
             workspace_id,
@@ -1099,6 +1147,7 @@ async fn handle_session_envelope<
 >(
     transport: &T,
     active: &mut HashMap<(String, String), ActiveSession>,
+    close_requested: &mut HashSet<(String, String)>,
     envelope: SessionEnvelope,
     client_connected: bool,
 ) -> bool {
@@ -1116,19 +1165,28 @@ async fn handle_session_envelope<
             if active_session.generation != generation {
                 return true;
             }
-            if event_settles_turn(&event, &active_session.root_name) {
+            let settled = event_settles_turn(&event, &active_session.root_name);
+            if settled {
                 active_session.turn_running = false;
             }
-            if client_connected {
-                return transport
+            // Forward the event first so a still-connected dashboard sees the
+            // session settle, then honor any close deferred while a turn was in
+            // flight (the user switched away before it finished).
+            let forwarded = if client_connected {
+                transport
                     .send(&ServerMessage::Event {
                         workspace_id,
                         session_id,
                         event: *event,
                     })
-                    .await;
+                    .await
+            } else {
+                true
+            };
+            if settled && close_requested.remove(&key) {
+                close_session_now(active, &key).await;
             }
-            true
+            forwarded
         }
         SessionEnvelope::Closed {
             workspace_id,
@@ -1168,6 +1226,9 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut active = HashMap::<(String, String), ActiveSession>::new();
     let mut pending = HashMap::<(String, String), PendingOpen>::new();
+    // Sessions a `CloseSession` asked to free while a turn was still running;
+    // torn down once that turn settles (see `handle_session_envelope`).
+    let mut close_requested = HashSet::<(String, String)>::new();
     let mut next_generation = 1;
     let mut client_connected = true;
 
@@ -1189,6 +1250,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                             &app,
                             &mut active,
                             &mut pending,
+                            &mut close_requested,
                             &tx,
                             &mut next_generation,
                             command,
@@ -1208,7 +1270,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                 let Some(envelope) = envelope else {
                     break;
                 };
-                if !handle_session_envelope(&transport, &mut active, envelope, client_connected).await {
+                if !handle_session_envelope(&transport, &mut active, &mut close_requested, envelope, client_connected).await {
                     client_connected = false;
                     pending.clear();
                 }

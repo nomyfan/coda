@@ -132,6 +132,7 @@ export type ClientMessage =
     }
   | { type: "abort"; workspace_id: string; session_id: string }
   | { type: "delete_session"; workspace_id: string; session_id: string }
+  | { type: "close_session"; workspace_id: string; session_id: string }
   | { type: "add_allow_pattern"; workspace_id: string; pattern: string }
   | {
       type: "set_model";

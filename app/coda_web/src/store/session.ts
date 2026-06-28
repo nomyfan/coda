@@ -1478,6 +1478,7 @@ export function newSession(server: string, workspaceId: string) {
       )
     : undefined;
   const sessionId = reusable?.sessionId ?? freshSessionId();
+  closeActiveSession(server, sessionKey(workspace, sessionId));
   createDraftSession(codaStore, server, workspace, sessionId);
 }
 
@@ -1499,6 +1500,33 @@ export function deleteSession(server: string, workspaceId: string, sessionId: st
   deleteSessionState(codaStore, server, key);
 }
 
+/**
+ * Ask the server to close the currently-active session when switching away to
+ * `nextKey`, freeing its runtime memory. The server decides the timing: an idle
+ * session is torn down at once, one with a turn still running is torn down when
+ * that turn settles (so background work isn't aborted), and reopening before
+ * then cancels it. Drafts are skipped — they were never opened on the server.
+ * The local transcript is kept; reopening re-sends `open_session` and the server
+ * restores it from its persisted checkpoint.
+ */
+function closeActiveSession(nextServer?: string, nextKey?: SessionKey) {
+  const snapshot = codaStore.getState();
+  const server = snapshot.activeServer;
+  const key = snapshot.activeKey;
+  if (!server || !key || (server === nextServer && key === nextKey)) {
+    return;
+  }
+  const session = snapshot.servers[server]?.sessions[key];
+  if (!session || session.draft) {
+    return;
+  }
+  send(server, {
+    type: "close_session",
+    workspace_id: session.workspaceId,
+    session_id: session.sessionId,
+  });
+}
+
 export function openSession(server: string, workspaceId: string, sessionId: string) {
   const workspace = workspaceId.trim();
   const session = sessionId.trim();
@@ -1506,6 +1534,7 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
     return;
   }
   const local = codaStore.getState().servers[server]?.sessions[sessionKey(workspace, session)];
+  closeActiveSession(server, sessionKey(workspace, session));
   selectSession(codaStore, server, workspace, session);
   if (!local?.draft) {
     const opened =
@@ -1519,6 +1548,7 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
 /** Deselect whatever session is currently shown in the center pane (e.g. when
  * switching into the new-session composer). */
 export function clearActiveSession() {
+  closeActiveSession();
   updateState(codaStore, (state) => {
     state.activeServer = undefined;
     state.activeKey = undefined;
@@ -1572,6 +1602,7 @@ export function sendTaskToNewSession(
     : undefined;
   const sessionId = reusable?.sessionId ?? freshSessionId();
   const key = sessionKey(workspace, sessionId);
+  closeActiveSession(server, key);
   createDraftSession(codaStore, server, workspace, sessionId);
   if (providerId) {
     setSessionModel(codaStore, server, key, providerId, reasoningEffort);
