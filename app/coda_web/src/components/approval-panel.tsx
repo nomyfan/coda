@@ -9,6 +9,7 @@ import {
 import { memo, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -21,11 +22,13 @@ import {
   extractShellCommand,
   parseAskUserParams,
   toolDisplayName,
+  type AskUserParams,
   type PendingApproval,
   type ToolCall,
   type ToolCallResolution,
 } from "@/lib/protocol";
 import {
+  clearDraftCall,
   draftCall,
   selectActiveAllowDrafts,
   selectActiveApprovals,
@@ -46,6 +49,94 @@ function formatArguments(value: string) {
 
 type ApprovalItem = { approval: PendingApproval; call: ToolCall };
 
+type AskUserAnswer =
+  | { custom: false; answer: string | string[] }
+  | { custom: true; answer: string };
+
+function askUserResolvedText(decision: ToolCallResolution | undefined): string | null {
+  return decision && decision !== "Execute" && "Resolved" in decision && "Ok" in decision.Resolved
+    ? decision.Resolved.Ok
+    : null;
+}
+
+function parseAskUserAnswer(decision: ToolCallResolution | undefined): AskUserAnswer | null {
+  const text = askUserResolvedText(decision);
+  if (!text) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      const custom = (parsed as { custom?: unknown }).custom;
+      if (custom === true) {
+        const answer = (parsed as { answer?: unknown }).answer;
+        return typeof answer === "string" ? { custom, answer } : null;
+      }
+      if (custom === false) {
+        const answer = (parsed as { answer?: unknown }).answer;
+        if (typeof answer === "string") {
+          return { custom, answer };
+        }
+        return Array.isArray(answer)
+          ? { custom, answer: answer.filter((item): item is string => typeof item === "string") }
+          : null;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function encodeAskUserAnswer(answer: AskUserAnswer) {
+  return JSON.stringify(answer);
+}
+
+function askUserSelectedOptions(decision: ToolCallResolution | undefined, multiple: boolean) {
+  const answer = parseAskUserAnswer(decision);
+  if (answer && !answer.custom) {
+    return Array.isArray(answer.answer) ? answer.answer : [answer.answer];
+  }
+  const text = askUserResolvedText(decision);
+  if (!text) {
+    return [];
+  }
+  if (!multiple) {
+    return [text];
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function askUserCustomAnswer(decision: ToolCallResolution | undefined, askUser: AskUserParams) {
+  const answer = parseAskUserAnswer(decision);
+  if (answer?.custom) {
+    return answer.answer;
+  }
+  if (answer) {
+    return "";
+  }
+  const text = askUserResolvedText(decision);
+  if (!text) {
+    return "";
+  }
+  if (askUser.multiple) {
+    try {
+      const parsed = JSON.parse(text);
+      return Array.isArray(parsed) ? "" : text;
+    } catch {
+      return text;
+    }
+  }
+  return askUser.options.includes(text) ? "" : text;
+}
+
 function DecisionRadio({
   value,
   selected,
@@ -65,6 +156,129 @@ function DecisionRadio({
       <RadioGroupItem value={value} />
       {label}
     </Label>
+  );
+}
+
+function AskUserApprovalCall({
+  askUser,
+  decision,
+  onDraft,
+  onClearDraft,
+}: {
+  askUser: AskUserParams;
+  decision: ToolCallResolution | undefined;
+  onDraft: (resolution: ToolCallResolution) => void;
+  onClearDraft: () => void;
+}) {
+  const [answer, setAnswer] = useState(() => askUserCustomAnswer(decision, askUser));
+  const [selectedOptions, setSelectedOptions] = useState(() =>
+    askUserSelectedOptions(decision, askUser.multiple),
+  );
+  const resolvedAnswer = parseAskUserAnswer(decision);
+  const chosen =
+    resolvedAnswer && !resolvedAnswer.custom && "answer" in resolvedAnswer
+      ? resolvedAnswer.answer
+      : askUserResolvedText(decision);
+  const chosenIndex =
+    chosen === null ? -1 : askUser.options.findIndex((option) => option === chosen);
+  const selectedIndex = answer ? -1 : chosenIndex;
+  const toggleOption = (option: string) => {
+    const next = selectedOptions.includes(option)
+      ? selectedOptions.filter((selected) => selected !== option)
+      : [...selectedOptions, option];
+    setAnswer("");
+    setSelectedOptions(next);
+    if (next.length > 0) {
+      onDraft({ Resolved: { Ok: encodeAskUserAnswer({ custom: false, answer: next }) } });
+    } else {
+      onClearDraft();
+    }
+  };
+  const handleAnswerChange = (value: string) => {
+    setAnswer(value);
+    setSelectedOptions([]);
+    const trimmed = value.trim();
+    if (trimmed) {
+      onDraft({ Resolved: { Ok: encodeAskUserAnswer({ custom: true, answer: trimmed }) } });
+    } else {
+      onClearDraft();
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 text-sm font-medium">
+        <KeyRound className="size-4 text-muted-foreground" />
+        {toolDisplayName("ask_user")}
+      </div>
+      <p className="text-sm leading-6">{askUser.question}</p>
+      {askUser.options.length ? (
+        <>
+          {askUser.multiple ? (
+            <div className="scrollbar-fine grid max-h-52 gap-2 overflow-y-auto">
+              {askUser.options.map((option, optionIndex) => {
+                const selected = selectedOptions.includes(option);
+                return (
+                  <Label
+                    key={`${option}-${optionIndex}`}
+                    className={cn(
+                      "flex cursor-pointer items-start gap-3 rounded-md border px-3 py-2 text-sm leading-5 transition-colors",
+                      selected ? "border-primary bg-accent" : "border-input hover:bg-accent",
+                    )}
+                  >
+                    <Checkbox
+                      checked={selected}
+                      onCheckedChange={() => toggleOption(option)}
+                      className="mt-0.5"
+                    />
+                    <span className="min-w-0 whitespace-normal text-left">{option}</span>
+                  </Label>
+                );
+              })}
+            </div>
+          ) : (
+            <RadioGroup
+              value={selectedIndex >= 0 ? String(selectedIndex) : ""}
+              onValueChange={(value) => {
+                const option = askUser.options[Number(value)];
+                if (option !== undefined) {
+                  setAnswer("");
+                  onDraft({
+                    Resolved: {
+                      Ok: encodeAskUserAnswer({ custom: false, answer: option }),
+                    },
+                  });
+                }
+              }}
+              className="scrollbar-fine grid max-h-52 gap-2 overflow-y-auto"
+            >
+              {askUser.options.map((option, optionIndex) => {
+                const selected = selectedIndex === optionIndex;
+                return (
+                  <Label
+                    key={`${option}-${optionIndex}`}
+                    className={cn(
+                      "flex cursor-pointer items-start gap-3 rounded-md border px-3 py-2 text-sm leading-5 transition-colors",
+                      selected ? "border-primary bg-accent" : "border-input hover:bg-accent",
+                    )}
+                  >
+                    <RadioGroupItem value={String(optionIndex)} className="mt-0.5" />
+                    <span className="min-w-0 whitespace-normal text-left">{option}</span>
+                  </Label>
+                );
+              })}
+            </RadioGroup>
+          )}
+        </>
+      ) : null}
+      <div className="space-y-2 border-t pt-3">
+        <Textarea
+          value={answer}
+          onChange={(event) => handleAnswerChange(event.target.value)}
+          placeholder="Custom response"
+        />
+      </div>
+    </div>
   );
 }
 
@@ -107,6 +321,9 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
       setIndex(currentIndex + 1);
     }
   };
+  const handleClearDraft = () => {
+    clearDraftCall(current.approval, current.call);
+  };
 
   return (
     <div className="px-2 pt-2 sm:px-4">
@@ -128,6 +345,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               decision={decisionOf(current)}
               allowPattern={allowOf(current)}
               onDraft={handleDraft}
+              onClearDraft={handleClearDraft}
               onSetAllow={(pattern) => setAllowDraft(current.approval, current.call, pattern)}
             />
           </div>
@@ -169,6 +387,7 @@ function ApprovalCall({
   decision,
   allowPattern: stagedAllow,
   onDraft,
+  onClearDraft,
   onSetAllow,
 }: {
   call: ToolCall;
@@ -176,6 +395,7 @@ function ApprovalCall({
   /** The "always allow" pattern staged for this call, if any. */
   allowPattern: string | undefined;
   onDraft: (resolution: ToolCallResolution) => void;
+  onClearDraft: () => void;
   onSetAllow: (pattern: string | null) => void;
 }) {
   const [reason, setReason] = useState(() =>
@@ -183,7 +403,6 @@ function ApprovalCall({
       ? (decision.Rejected.reason ?? "")
       : "",
   );
-  const [answer, setAnswer] = useState("");
   const [allowPattern, setAllowPattern] = useState(
     () => stagedAllow ?? deriveAllowPattern(extractShellCommand(call)),
   );
@@ -193,50 +412,13 @@ function ApprovalCall({
   const remembering = Boolean(stagedAllow);
 
   if (askUser) {
-    const chosen =
-      decision && decision !== "Execute" && "Resolved" in decision
-        ? "Ok" in decision.Resolved
-          ? decision.Resolved.Ok
-          : null
-        : null;
     return (
-      <div className="space-y-3">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <KeyRound className="size-4 text-muted-foreground" />
-          ask_user
-        </div>
-        <p className="text-sm leading-6">{askUser.question}</p>
-        {askUser.options.length ? (
-          <div className="scrollbar-fine grid max-h-52 gap-2 overflow-y-auto">
-            {askUser.options.map((option) => (
-              <Button
-                key={option}
-                variant={chosen === option ? "secondary" : "outline"}
-                className="h-auto justify-start whitespace-normal py-2 text-left"
-                onClick={() => onDraft({ Resolved: { Ok: option } })}
-              >
-                {option}
-              </Button>
-            ))}
-          </div>
-        ) : null}
-        <div className="space-y-2 border-t pt-3">
-          <Textarea
-            value={answer}
-            onChange={(event) => setAnswer(event.target.value)}
-            placeholder="Custom response"
-          />
-          <Button
-            variant="secondary"
-            className="w-full"
-            disabled={!answer.trim()}
-            onClick={() => onDraft({ Resolved: { Ok: answer.trim() } })}
-          >
-            <Check />
-            Use this response
-          </Button>
-        </div>
-      </div>
+      <AskUserApprovalCall
+        askUser={askUser}
+        decision={decision}
+        onDraft={onDraft}
+        onClearDraft={onClearDraft}
+      />
     );
   }
 

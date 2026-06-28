@@ -1239,6 +1239,29 @@ function setDraftResolution(
   });
 }
 
+function clearDraftResolution(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  approval: PendingApproval,
+  call: ToolCall,
+) {
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const approvalId = approvalKey(approval);
+    const draft = session.drafts[approvalId];
+    if (draft) {
+      delete draft[call.id];
+      if (Object.keys(draft).length === 0) {
+        delete session.drafts[approvalId];
+      }
+    }
+  });
+}
+
 function setAllowDraftPattern(
   store: CodaStore,
   server: string,
@@ -1675,6 +1698,14 @@ export function draftCall(
     return;
   }
   setDraftResolution(codaStore, active.server, active.session.key, approval, call, resolution);
+}
+
+export function clearDraftCall(approval: PendingApproval, call: ToolCall) {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  clearDraftResolution(codaStore, active.server, active.session.key, approval, call);
 }
 
 export function submitApprovals() {

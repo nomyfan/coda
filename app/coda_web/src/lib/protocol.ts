@@ -264,6 +264,7 @@ export function subAgentDisplayName(name: string): string {
 
 /** Friendly action verbs for the built-in tools, e.g. `read_file` → `Read`. */
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  ask_user: "Ask",
   read_file: "Read",
   write_file: "Write",
   edit_file: "Edit",
@@ -420,6 +421,7 @@ export function deriveAllowPattern(command: string): string {
 export type AskUserParams = {
   question: string;
   options: string[];
+  multiple: boolean;
 };
 
 export function parseAskUserParams(call: ToolCall): AskUserParams {
@@ -427,12 +429,14 @@ export function parseAskUserParams(call: ToolCall): AskUserParams {
   if (args && typeof args === "object") {
     const question = (args as { question?: unknown }).question;
     const options = (args as { options?: unknown }).options;
+    const multiple = (args as { multiple?: unknown }).multiple;
     return {
       question: typeof question === "string" ? question : "Input required",
       options: Array.isArray(options)
         ? options.filter((item): item is string => typeof item === "string")
         : [],
+      multiple: multiple === true,
     };
   }
-  return { question: "Input required", options: [] };
+  return { question: "Input required", options: [], multiple: false };
 }

@@ -28,6 +28,9 @@ pub struct AskUserParams {
     pub question: String,
     /// The list of options for the user to choose from.
     pub options: Vec<String>,
+    /// Whether the user may choose more than one option.
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 impl Tool for AskUserTool {
@@ -39,7 +42,12 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Present the user with a question and a numbered list of options to choose from. \
+        "Present the user with a question and a list of options to choose from. \
+         Set multiple to true when the user may choose more than one option. \
+         The user may also type a custom response instead of choosing an option. \
+         The interactive result is a JSON object shaped like \
+         {\"custom\": boolean, \"answer\": string | string[]}. \
+         custom indicates whether the answer is typed input. \
          Use this when you need a decision from the user before proceeding."
     }
 
