@@ -109,10 +109,10 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
   };
 
   return (
-    <div className="px-4 pt-2">
+    <div className="px-2 pt-2 sm:px-4">
       <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-warning/40 bg-warning/8">
         <div className="flex max-h-[55vh] flex-col">
-          <div className="flex items-center justify-between px-4 pt-2.5">
+          <div className="flex items-center justify-between gap-2 px-3 pt-2.5 sm:px-4">
             <h2 className="flex items-center gap-2 text-sm font-medium">
               <ShieldCheck className="size-4 text-warning-foreground" />
               Approval required
@@ -121,7 +121,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               {decidedCount}/{items.length} reviewed
             </Badge>
           </div>
-          <div className="scrollbar-fine overflow-y-auto px-4 py-2.5">
+          <div className="scrollbar-fine overflow-y-auto px-3 py-2.5 sm:px-4">
             <ApprovalCall
               key={`${current.approval.thread_id}:${current.call.id}`}
               call={current.call}
@@ -131,7 +131,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               onSetAllow={(pattern) => setAllowDraft(current.approval, current.call, pattern)}
             />
           </div>
-          <div className="flex items-center justify-between gap-2 px-4 py-2">
+          <div className="flex items-center justify-between gap-2 px-3 py-2 sm:px-4">
             <div className="flex items-center gap-1">
               <Button
                 variant="ghost"
@@ -255,9 +255,10 @@ function ApprovalCall({
         {formatArguments(callArguments(call))}
       </pre>
       {call.name === "shell" ? (
-        <div className="flex gap-2">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
           <Input
             value={allowPattern}
+            className="min-w-0"
             onChange={(event) => {
               const value = event.target.value;
               setAllowPattern(value);
@@ -270,7 +271,10 @@ function ApprovalCall({
             type="button"
             variant={remembering ? "secondary" : "outline"}
             aria-pressed={remembering}
-            className={cn(remembering && "border border-warning/70 text-warning-foreground")}
+            className={cn(
+              "shrink-0",
+              remembering && "border border-warning/70 text-warning-foreground",
+            )}
             onClick={() => {
               if (remembering) {
                 onSetAllow(null);

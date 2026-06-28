@@ -68,10 +68,6 @@
   --shadow-xl: none;
   --shadow-2xl: none;
   --tracking-normal: 0em;
-  /* Global density lever: Tailwind v4 derives every numeric spacing/sizing
-   * utility (p-*, h-*, gap-*, size-*, …) from this, so shrinking it compacts the
-   * whole UI proportionally without touching typography or colors. */
-  --spacing: 0.23rem;
 }
 
 .dark {
@@ -243,6 +239,10 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+  }
+  /* Keep the root canvas aligned with the active theme for iOS safe-area chrome. */
+  html {
+    @apply bg-background;
   }
   body {
     @apply bg-background text-foreground;

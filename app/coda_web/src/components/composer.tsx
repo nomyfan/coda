@@ -145,7 +145,7 @@ export const Composer = memo(function Composer({
 
   return (
     <form
-      className="bg-background p-3"
+      className="bg-background p-2 sm:p-3"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -205,9 +205,9 @@ export const Composer = memo(function Composer({
               }
             }}
             onPaste={handlePaste}
-            placeholder="Ask Coda to edit, inspect, test, or explain...  (Enter to send, Shift+Enter for newline)"
+            placeholder="Enter to send, Shift+Enter for newline"
             className={[
-              "min-h-[80px] pb-10 pr-3",
+              "min-h-[104px] pb-20 pr-3 sm:min-h-[80px] sm:pb-10",
               dragOver ? "border-primary ring-1 ring-primary" : "",
             ]
               .filter(Boolean)
@@ -226,7 +226,7 @@ export const Composer = memo(function Composer({
               e.target.value = "";
             }}
           />
-          <div className="absolute bottom-2 left-2 right-2 flex items-center justify-end gap-1">
+          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-end gap-1">
             {showControls && contextWindow ? (
               <ContextUsage contextWindow={contextWindow} records={usage} />
             ) : null}

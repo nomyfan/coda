@@ -2,7 +2,31 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#fcfbf9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#2a2725" media="(prefers-color-scheme: dark)" />
+    <script>
+      (() => {
+        const colors = { light: "#fcfbf9", dark: "#2a2725" };
+        const saved = localStorage.getItem("coda-theme");
+        const preference =
+          saved === "light" || saved === "dark" || saved === "system" ? saved : "system";
+        const theme =
+          preference === "system"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : preference;
+        const color = colors[theme];
+        document.documentElement.classList.toggle("dark", theme === "dark");
+        document.documentElement.style.colorScheme = theme;
+        document.documentElement.style.setProperty("background-color", color, "important");
+        const style = document.createElement("style");
+        style.textContent = `html,body{background-color:${color}!important}`;
+        document.head.append(style);
+      })();
+    </script>
     <title>Coda</title>
   </head>
   <body>

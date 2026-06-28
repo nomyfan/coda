@@ -14,7 +14,7 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -503,11 +503,15 @@ function WorkspaceNode({
 }
 
 export function Sidebar({
+  mobileOpen,
+  onMobileOpenChange,
   newSessionTarget,
   onOpenSession,
   onStartNewSession,
   onNewSession,
 }: {
+  mobileOpen: boolean;
+  onMobileOpenChange: (open: boolean) => void;
   newSessionTarget: NewSessionTarget | null;
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onStartNewSession: (serverUrl: string, workspaceId: string) => void;
@@ -544,45 +548,122 @@ export function Sidebar({
           : undefined;
   const [adding, setAdding] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
+  const mobileDrawerHidden = isMobileViewport && !mobileOpen;
+
+  useEffect(() => {
+    if (mobileOpen) {
+      setCollapsed(false);
+    }
+  }, [mobileOpen]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1023.98px)");
+
+    function syncViewport() {
+      setIsMobileViewport(media.matches);
+    }
+
+    syncViewport();
+    media.addEventListener("change", syncViewport);
+
+    return () => media.removeEventListener("change", syncViewport);
+  }, []);
 
   function startSelectedWorkspaceSession() {
     if (startTarget) {
+      onMobileOpenChange(false);
       onStartNewSession(startTarget.serverUrl, startTarget.workspaceId);
     }
   }
 
+  function openSession(serverUrl: string, workspaceId: string, sessionId: string) {
+    onMobileOpenChange(false);
+    onOpenSession(serverUrl, workspaceId, sessionId);
+  }
+
+  function newSession(serverUrl: string, workspaceId: string) {
+    onMobileOpenChange(false);
+    onNewSession(serverUrl, workspaceId);
+  }
+
   return (
-    <aside
-      className={cn(
-        // The width animates between collapsed/expanded; `overflow-hidden` lets
-        // the fixed-width content below act as a curtain-revealed layer so its
-        // children never reflow (slide) mid-animation. See `lg:w-[calc(...)]`.
-        "flex min-h-0 w-full shrink-0 flex-col gap-2 overflow-hidden border-r bg-card/55 p-2.5 transition-[width] lg:w-[256px]",
-        collapsed && "lg:w-12",
-      )}
-    >
-      <div className="flex items-center justify-start">
-        {collapsed ? (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6"
-            onClick={() => setCollapsed(false)}
-            title="Expand servers"
-          >
-            <PanelLeft className="size-4" />
-          </Button>
-        ) : (
-          <div className="flex min-w-0 flex-1 items-center gap-1 lg:w-[calc(256px-var(--spacing)*5)] lg:flex-none">
+    <>
+      {mobileOpen ? (
+        <button
+          type="button"
+          className="fixed inset-0 z-40 bg-background/70 backdrop-blur-sm lg:hidden"
+          onClick={() => onMobileOpenChange(false)}
+          aria-label="Close sidebar"
+        />
+      ) : null}
+      <aside
+        aria-hidden={mobileDrawerHidden}
+        inert={mobileDrawerHidden ? true : undefined}
+        className={cn(
+          // The width animates between collapsed/expanded; `overflow-hidden` lets
+          // the fixed-width content below act as a curtain-revealed layer so its
+          // children never reflow (slide) mid-animation. See `lg:w-[calc(...)]`.
+          "fixed inset-y-0 left-0 z-50 flex h-dvh min-h-0 w-[min(22rem,calc(100vw-2rem))] shrink-0 flex-col gap-2 overflow-hidden border-r bg-card p-2.5 transition-[transform,width] duration-200 lg:static lg:z-auto lg:w-[256px] lg:translate-x-0 lg:bg-card/55",
+          mobileOpen ? "translate-x-0" : "-translate-x-full",
+          collapsed && "lg:w-12",
+        )}
+      >
+        <div className="flex items-center justify-start">
+          {collapsed ? (
             <Button
               variant="ghost"
               size="icon"
-              className="size-6"
-              onClick={() => setCollapsed(true)}
-              title="Collapse servers"
+              className="hidden size-6 lg:inline-flex"
+              onClick={() => setCollapsed(false)}
+              title="Expand servers"
             >
               <PanelLeft className="size-4" />
             </Button>
+          ) : (
+            <div className="flex min-w-0 flex-1 items-center gap-1 lg:w-[calc(256px-var(--spacing)*5)] lg:flex-none">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6 lg:hidden"
+                onClick={() => onMobileOpenChange(false)}
+                title="Close sidebar"
+              >
+                <X className="size-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="hidden size-6 lg:inline-flex"
+                onClick={() => setCollapsed(true)}
+                title="Collapse servers"
+              >
+                <PanelLeft className="size-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                disabled={!startTarget}
+                onClick={startSelectedWorkspaceSession}
+                title="New session"
+              >
+                <Plus className="size-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => setAdding(true)}
+                title="Add server"
+              >
+                <Plug className="size-4" />
+              </Button>
+            </div>
+          )}
+        </div>
+        {collapsed ? (
+          <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-start gap-1 overflow-y-auto">
             <Button
               variant="ghost"
               size="icon"
@@ -602,67 +683,48 @@ export function Sidebar({
             >
               <Plug className="size-4" />
             </Button>
+            {servers.length > 0 ? <Separator className="my-1 w-6" /> : null}
+            {servers.map((server) => (
+              <CollapsedServerButton
+                key={server.url}
+                url={server.url}
+                onNewSession={onNewSession}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5 lg:w-[calc(256px_-_var(--spacing)*5)]">
+            {servers.length === 0 ? (
+              <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
+                <div className="text-sm font-medium">No servers</div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  Connect to a local or remote Coda server.
+                </p>
+                <Button size="sm" onClick={() => setAdding(true)}>
+                  <Plug className="size-4" />
+                  Add server
+                </Button>
+              </div>
+            ) : (
+              <>
+                {servers.map((server) => (
+                  <ServerGroup
+                    key={server.url}
+                    server={server}
+                    activeServer={activeServer}
+                    activeKey={activeKey}
+                    newSessionTarget={newSessionTarget}
+                    onOpenSession={openSession}
+                    onNewSession={newSession}
+                    onDeleteSession={deleteSession}
+                  />
+                ))}
+              </>
+            )}
           </div>
         )}
-      </div>
-      {collapsed ? (
-        <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-start gap-1 overflow-y-auto">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6"
-            disabled={!startTarget}
-            onClick={startSelectedWorkspaceSession}
-            title="New session"
-          >
-            <Plus className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6"
-            onClick={() => setAdding(true)}
-            title="Add server"
-          >
-            <Plug className="size-4" />
-          </Button>
-          {servers.length > 0 ? <Separator className="my-1 w-6" /> : null}
-          {servers.map((server) => (
-            <CollapsedServerButton key={server.url} url={server.url} onNewSession={onNewSession} />
-          ))}
-        </div>
-      ) : (
-        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md bg-background/70 p-1.5 lg:w-[calc(256px_-_var(--spacing)*5)]">
-          {servers.length === 0 ? (
-            <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
-              <div className="text-sm font-medium">No servers</div>
-              <p className="text-xs leading-5 text-muted-foreground">
-                Connect to a local or remote Coda server.
-              </p>
-              <Button size="sm" onClick={() => setAdding(true)}>
-                <Plug className="size-4" />
-                Add server
-              </Button>
-            </div>
-          ) : (
-            <>
-              {servers.map((server) => (
-                <ServerGroup
-                  key={server.url}
-                  server={server}
-                  activeServer={activeServer}
-                  activeKey={activeKey}
-                  newSessionTarget={newSessionTarget}
-                  onOpenSession={onOpenSession}
-                  onNewSession={onNewSession}
-                  onDeleteSession={deleteSession}
-                />
-              ))}
-            </>
-          )}
-        </div>
-      )}
-      <AddServerDialog open={adding} onOpenChange={setAdding} onConnect={connectServer} />
-    </aside>
+        <AddServerDialog open={adding} onOpenChange={setAdding} onConnect={connectServer} />
+      </aside>
+    </>
   );
 }

@@ -1,4 +1,4 @@
-import { Folder } from "lucide-react";
+import { Folder, Menu } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   abort,
@@ -29,6 +29,7 @@ import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
 import { ApprovalPanel } from "@/components/approval-panel";
 import { serverLabel } from "@/components/session-utils";
+import { ThemeToggle } from "@/components/theme-toggle";
 import {
   Select,
   SelectContent,
@@ -138,16 +139,32 @@ function WorkspaceTargetSelect({
   );
 }
 
-function WorkspaceHeader({ sessionTitle }: { sessionTitle?: string }) {
+function WorkspaceHeader({
+  sessionTitle,
+  onOpenSidebar,
+}: {
+  sessionTitle?: string;
+  onOpenSidebar: () => void;
+}) {
   return (
-    <header className="flex h-11 shrink-0 items-center border-b bg-background px-4">
-      <div className="flex min-w-0 items-center gap-2 text-sm">
+    <header className="flex h-[calc(2.75rem_+_env(safe-area-inset-top))] shrink-0 items-center gap-2 border-b bg-background px-2 pt-[env(safe-area-inset-top)] sm:px-4">
+      <button
+        type="button"
+        className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground lg:hidden"
+        onClick={onOpenSidebar}
+        title="Open sidebar"
+        aria-label="Open sidebar"
+      >
+        <Menu className="size-4" />
+      </button>
+      <div className="min-w-0 flex-1 overflow-hidden text-sm">
         {sessionTitle ? (
-          <span className="min-w-0 truncate font-medium" title={sessionTitle}>
+          <span className="block truncate font-medium" title={sessionTitle}>
             {sessionTitle}
           </span>
         ) : null}
       </div>
+      <ThemeToggle />
     </header>
   );
 }
@@ -193,6 +210,7 @@ export default function App() {
     providerId: string;
     reasoningEffort: ReasoningEffort | null;
   } | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
   const selectedServerState = servers.find((server) => server.url === selectedServerUrl);
@@ -279,12 +297,14 @@ export default function App() {
   // the subscribed values, so they keep a stable identity across renders and
   // don't defeat the memoized children.
   const startNewSession = useCallback((serverUrl: string, workspaceId: string) => {
+    setSidebarOpen(false);
     clearActiveSession();
     setNewSessionTarget({ serverUrl, workspaceId });
   }, []);
 
   const handleOpenSession = useCallback(
     (serverUrl: string, workspaceId: string, sessionId: string) => {
+      setSidebarOpen(false);
       rememberNewSessionTarget({ serverUrl, workspaceId });
       clearNewSessionTarget();
       openSession(serverUrl, workspaceId, sessionId);
@@ -322,17 +342,22 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-screen min-h-[600px] overflow-hidden bg-background">
+    <div className="flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px]">
       <Sidebar
+        mobileOpen={sidebarOpen}
+        onMobileOpenChange={setSidebarOpen}
         newSessionTarget={newSessionTarget}
         onOpenSession={handleOpenSession}
         onStartNewSession={startNewSession}
         onNewSession={startNewSession}
       />
-      <section className="flex min-h-0 flex-1 flex-col bg-background">
-        <WorkspaceHeader sessionTitle={activeSessionTitle} />
+      <section className="flex min-w-0 min-h-0 flex-1 flex-col bg-background">
+        <WorkspaceHeader
+          sessionTitle={activeSessionTitle}
+          onOpenSidebar={() => setSidebarOpen(true)}
+        />
         <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
-        <div className="relative z-20 shrink-0">
+        <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
           {showingNewSession ? (
             <WorkspaceTargetBar
               servers={servers}
