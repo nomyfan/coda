@@ -1,10 +1,21 @@
 import {
+  Bot,
   Check,
   ChevronLeft,
   ChevronRight,
-  KeyRound,
+  FilePen,
+  FilePlus2,
+  FileSearch,
+  FileText,
+  FolderTree,
+  ListChecks,
+  ListTodo,
+  type LucideIcon,
+  Plug,
+  Search,
   ShieldCheck,
-  TerminalSquare,
+  SquareTerminal,
+  Wrench,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +32,7 @@ import {
   describeTool,
   extractShellCommand,
   parseAskUserParams,
+  SUBAGENT_TOOL_PREFIX,
   toolDisplayName,
   type AskUserParams,
   type PendingApproval,
@@ -49,6 +61,18 @@ function formatArguments(value: string) {
 
 type ApprovalItem = { approval: PendingApproval; call: ToolCall };
 
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  read_file: FileText,
+  write_file: FilePlus2,
+  edit_file: FilePen,
+  ls: FolderTree,
+  glob: FileSearch,
+  grep: Search,
+  shell: SquareTerminal,
+  read_todos: ListTodo,
+  write_todos: ListChecks,
+};
+
 type AskUserAnswer =
   | { custom: false; answer: string | string[] }
   | { custom: true; answer: string };
@@ -57,6 +81,24 @@ function askUserResolvedText(decision: ToolCallResolution | undefined): string |
   return decision && decision !== "Execute" && "Resolved" in decision && "Ok" in decision.Resolved
     ? decision.Resolved.Ok
     : null;
+}
+
+function approvalHeader(call: ToolCall) {
+  if (call.name === "ask_user") {
+    return { detail: parseAskUserParams(call).question, Icon: Wrench, label: "Ask" };
+  }
+  const Icon = call.name.startsWith(SUBAGENT_TOOL_PREFIX)
+    ? Bot
+    : call.name in TOOL_ICONS
+      ? TOOL_ICONS[call.name]
+      : call.name.startsWith("mcp__")
+        ? Plug
+        : Wrench;
+  return {
+    detail: describeTool(call.name, callArguments(call)),
+    Icon,
+    label: toolDisplayName(call.name),
+  };
 }
 
 function parseAskUserAnswer(decision: ToolCallResolution | undefined): AskUserAnswer | null {
@@ -207,11 +249,6 @@ function AskUserApprovalCall({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2 text-sm font-medium">
-        <KeyRound className="size-4 text-muted-foreground" />
-        {toolDisplayName("ask_user")}
-      </div>
-      <p className="text-sm leading-6">{askUser.question}</p>
       {askUser.options.length ? (
         <>
           {askUser.multiple ? (
@@ -310,6 +347,8 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
   const allowOf = (item: ApprovalItem) => allowDrafts[approvalKey(item.approval)]?.[item.call.id];
   const current = items[Math.min(index, items.length - 1)] ?? items[0];
   const currentIndex = items.indexOf(current);
+  const currentHeader = approvalHeader(current.call);
+  const CurrentHeaderIcon = "Icon" in currentHeader ? currentHeader.Icon : undefined;
   const decidedCount = items.filter((item) => decisionOf(item)).length;
   const allDecided = decidedCount === items.length;
 
@@ -329,12 +368,17 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
     <div className="px-2 pt-2 sm:px-4">
       <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-warning/40 bg-warning/8">
         <div className="flex max-h-[55vh] flex-col">
-          <div className="flex items-center justify-between gap-2 px-3 pt-2.5 sm:px-4">
-            <h2 className="flex items-center gap-2 text-sm font-medium">
-              <ShieldCheck className="size-4 text-warning-foreground" />
-              Approval required
-            </h2>
-            <Badge variant="warning">
+          <div className="flex items-start justify-between gap-3 px-3 pt-2.5 sm:px-4">
+            <div className="flex min-w-0 items-start gap-2 text-sm font-medium leading-6">
+              {CurrentHeaderIcon ? (
+                <CurrentHeaderIcon className="mt-1 size-4 shrink-0 text-muted-foreground" />
+              ) : null}
+              {"label" in currentHeader ? (
+                <span className="shrink-0 leading-6">{currentHeader.label}</span>
+              ) : null}
+              <span className="min-w-0 whitespace-normal break-words">{currentHeader.detail}</span>
+            </div>
+            <Badge variant="warning" className="shrink-0">
               {decidedCount}/{items.length} reviewed
             </Badge>
           </div>
@@ -424,15 +468,6 @@ function ApprovalCall({
 
   return (
     <div className="space-y-3">
-      <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-        <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
-        <span className="shrink-0">{toolDisplayName(call.name)}</span>
-        {describeTool(call.name, callArguments(call)) ? (
-          <span className="truncate font-mono text-xs font-normal text-muted-foreground">
-            {describeTool(call.name, callArguments(call))}
-          </span>
-        ) : null}
-      </div>
       <pre className="max-h-44 overflow-auto rounded-md bg-muted p-3 text-xs leading-5 text-muted-foreground">
         {formatArguments(callArguments(call))}
       </pre>

@@ -32,6 +32,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Markdown } from "@/components/markdown";
 import {
+  selectActiveApprovalCount,
   selectActiveEntries,
   selectActiveKey,
   selectActiveRunning,
@@ -137,9 +138,11 @@ export const Transcript = memo(function Transcript({
 }) {
   const liveEntries = useCodaStore(selectActiveEntries);
   const liveRunning = useCodaStore(selectActiveRunning);
+  const liveApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeKey = useCodaStore(selectActiveKey);
   const entries = suppressed ? NO_ENTRIES : liveEntries;
   const running = suppressed ? false : liveRunning;
+  const approvalPending = !suppressed && liveApprovalCount > 0;
   const scrollRef = useRef<HTMLElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   // While true the view follows new content; it flips off once the user scrolls
@@ -202,7 +205,11 @@ export const Transcript = memo(function Transcript({
             item.type === "entry" ? (
               <TranscriptItem key={item.entry.id} entry={item.entry} />
             ) : (
-              <AssistantTurnBubble key={item.id} entries={item.entries} />
+              <AssistantTurnBubble
+                key={item.id}
+                entries={item.entries}
+                approvalPending={approvalPending}
+              />
             ),
           )
         )}
@@ -621,7 +628,13 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
   );
 }
 
-function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
+function AssistantTurnBubble({
+  entries,
+  approvalPending,
+}: {
+  entries: TranscriptEntry[];
+  approvalPending: boolean;
+}) {
   const lastIndex = findFinalAssistantIndex(entries);
   const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
   const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
@@ -635,7 +648,9 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
   const processItems = groupProcessItems(intermediateEntries);
   const [processOpen, setProcessOpen] = useState(false);
   const activeProcessEntry = latestActiveProcessEntry(intermediateEntries);
-  const activeSummary = processEntrySummary(activeProcessEntry);
+  const activeSummary = approvalPending
+    ? { title: "Approval required" }
+    : processEntrySummary(activeProcessEntry);
   const stepText = processStepText(processItems.length);
   const duration = processDuration(intermediateEntries, completedFinalAssistant);
   const processTitle = processComplete
@@ -659,12 +674,9 @@ function AssistantTurnBubble({ entries }: { entries: TranscriptEntry[] }) {
                   {processComplete ? (
                     <span className="truncate text-sm font-medium">{processTitle}</span>
                   ) : (
-                    <>
-                      {activeProcessEntry ? <EntryIcon entry={activeProcessEntry} active /> : null}
-                      <span className="truncate text-sm font-medium text-shimmer">
-                        {activeSummary.detail ?? processTitle}
-                      </span>
-                    </>
+                    <span className="truncate text-sm font-medium text-shimmer">
+                      {activeSummary.detail ?? processTitle}
+                    </span>
                   )}
                 </div>
                 {processOpen ? (
