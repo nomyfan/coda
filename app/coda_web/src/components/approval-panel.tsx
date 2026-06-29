@@ -29,9 +29,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   approvalKey,
   callArguments,
-  deriveAllowPattern,
   describeTool,
-  extractShellCommand,
   parseAskUserParams,
   SUBAGENT_TOOL_PREFIX,
   toolDisplayName,
@@ -390,6 +388,9 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               call={current.call}
               decision={decisionOf(current)}
               allowPattern={allowOf(current)}
+              suggestedAllowPattern={
+                current.approval.suggested_shell_allow_patterns[current.call.id]
+              }
               onDraft={handleDraft}
               onClearDraft={handleClearDraft}
               onSetAllow={(pattern) => setAllowDraft(current.approval, current.call, pattern)}
@@ -432,6 +433,7 @@ function ApprovalCall({
   call,
   decision,
   allowPattern: stagedAllow,
+  suggestedAllowPattern,
   onDraft,
   onClearDraft,
   onSetAllow,
@@ -440,6 +442,7 @@ function ApprovalCall({
   decision: ToolCallResolution | undefined;
   /** The "always allow" pattern staged for this call, if any. */
   allowPattern: string | undefined;
+  suggestedAllowPattern: string | undefined;
   onDraft: (resolution: ToolCallResolution) => void;
   onClearDraft: () => void;
   onSetAllow: (pattern: string | null) => void;
@@ -450,12 +453,13 @@ function ApprovalCall({
       : "",
   );
   const [allowPattern, setAllowPattern] = useState(
-    () => stagedAllow ?? deriveAllowPattern(extractShellCommand(call)),
+    () => stagedAllow ?? suggestedAllowPattern ?? "",
   );
   const askUser = call.name === "ask_user" ? parseAskUserParams(call) : null;
   const approved = decision === "Execute";
   const rejected = Boolean(decision && decision !== "Execute" && "Rejected" in decision);
   const remembering = Boolean(stagedAllow);
+  const showAllowPattern = call.name === "shell" && Boolean(stagedAllow ?? suggestedAllowPattern);
 
   if (askUser) {
     return (
@@ -473,7 +477,7 @@ function ApprovalCall({
       <pre className="max-h-44 overflow-auto rounded-md bg-muted p-3 text-xs leading-5 text-muted-foreground">
         {formatArguments(callArguments(call))}
       </pre>
-      {call.name === "shell" ? (
+      {showAllowPattern ? (
         <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
           <Input
             value={allowPattern}

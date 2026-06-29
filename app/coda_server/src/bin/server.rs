@@ -23,8 +23,8 @@ use coda_server::{
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
-        ClientMessage, ProviderInfoWire, ServerMessage, SessionSummaryWire, WireEvent,
-        WorkspaceSummaryWire,
+        ClientMessage, PendingApprovalWire, ProviderInfoWire, ServerMessage, SessionSummaryWire,
+        WireEvent, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -607,7 +607,11 @@ async fn open_session_and_send_snapshot<
             workspace_id: workspace.id.clone(),
             session_id: session_id.to_string(),
             messages,
-            pending_approvals: pending.clone(),
+            pending_approvals: pending
+                .iter()
+                .cloned()
+                .map(PendingApprovalWire::from_agent)
+                .collect(),
             provider_id: provider_id.to_string(),
             reasoning_effort,
         })
@@ -755,7 +759,7 @@ async fn send_pending_approval_events<
         let event = WireEvent::Suspended {
             agent_name: approval.agent_name.clone(),
             thread_id: approval.thread_id.clone(),
-            approval: approval.clone(),
+            approval: PendingApprovalWire::from_agent(approval.clone()),
         };
         if !transport
             .send(&ServerMessage::Event {

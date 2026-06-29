@@ -70,6 +70,7 @@ export type PendingApproval = {
   agent_name: string;
   calls: ToolCall[];
   suspended_at: string;
+  suggested_shell_allow_patterns: Record<string, string>;
 };
 
 export type ToolCallResolution =
@@ -413,11 +414,6 @@ export function describeTool(
     default:
       return undefined;
   }
-}
-
-export function deriveAllowPattern(command: string): string {
-  const firstToken = command.trim().split(/\s+/)[0] ?? "";
-  return /\s/.test(command.trim()) ? `${firstToken} *` : firstToken;
 }
 
 export type AskUserParams = {

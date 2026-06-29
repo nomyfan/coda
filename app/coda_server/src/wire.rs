@@ -1,8 +1,8 @@
-use coda_agent::{
-    AbortedTarget, AgentEvent, EventOrigin, PendingApproval, ResumeDecision, SessionEvent,
-};
+use crate::config::{ToolApprovalConfig, extract_shell_command};
+use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{AssistantMessage, Message, Modality, ReasoningEffort, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -47,7 +47,7 @@ pub enum WireEvent {
     Suspended {
         agent_name: String,
         thread_id: String,
-        approval: PendingApproval,
+        approval: PendingApprovalWire,
     },
     #[serde(rename = "aborted")]
     Aborted {
@@ -123,7 +123,7 @@ impl WireEvent {
             AgentEvent::Suspended(approval) => WireEvent::Suspended {
                 agent_name,
                 thread_id,
-                approval,
+                approval: PendingApprovalWire::from_agent(approval),
             },
             AgentEvent::Aborted(target) => WireEvent::Aborted {
                 agent_name,
@@ -169,7 +169,7 @@ pub enum ClientMessage {
         images: Vec<String>,
     },
     /// Answer a suspended tool call. `agent_name` and `thread_id` come from the
-    /// [`PendingApproval`] carried by a [`ServerMessage::Event`] `Suspended`.
+    /// [`PendingApprovalWire`] carried by a [`ServerMessage::Event`] `Suspended`.
     Resume {
         workspace_id: String,
         session_id: String,
@@ -248,7 +248,7 @@ pub enum ServerMessage {
         session_id: String,
         messages: Vec<Message>,
         #[serde(default)]
-        pending_approvals: Vec<PendingApproval>,
+        pending_approvals: Vec<PendingApprovalWire>,
         provider_id: String,
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
@@ -301,10 +301,46 @@ pub struct SessionSummaryWire {
     pub first_user_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalWire {
+    pub thread_id: String,
+    pub agent_name: String,
+    pub calls: Vec<ToolCall>,
+    pub suspended_at: jiff::Timestamp,
+    pub suggested_shell_allow_patterns: BTreeMap<String, String>,
+}
+
+impl PendingApprovalWire {
+    pub fn from_agent(approval: coda_agent::PendingApproval) -> Self {
+        let suggested_shell_allow_patterns = approval
+            .calls
+            .iter()
+            .filter_map(|call| {
+                suggested_shell_allow_pattern(call).map(|pattern| (call.id.clone(), pattern))
+            })
+            .collect();
+        Self {
+            thread_id: approval.thread_id,
+            agent_name: approval.agent_name,
+            calls: approval.calls,
+            suspended_at: approval.suspended_at,
+            suggested_shell_allow_patterns,
+        }
+    }
+}
+
+fn suggested_shell_allow_pattern(call: &ToolCall) -> Option<String> {
+    if call.name != "shell" {
+        return None;
+    }
+    let command = extract_shell_command(call);
+    ToolApprovalConfig::derive_shell_allow_pattern(&command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coda_agent::ToolCallResolution;
+    use coda_agent::{PendingApproval, ToolCallResolution};
 
     fn roundtrip_client(msg: &ClientMessage) -> ClientMessage {
         serde_json::from_str(&serde_json::to_string(msg).unwrap()).unwrap()
@@ -440,6 +476,95 @@ mod tests {
             json,
             r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high"}"#
         );
+    }
+
+    #[test]
+    fn pending_approval_wire_suggests_shell_allow_patterns() {
+        let approval = PendingApproval {
+            thread_id: "t1".into(),
+            agent_name: "coda".into(),
+            calls: vec![
+                ToolCall {
+                    id: "call_shell".into(),
+                    name: "shell".into(),
+                    arguments: Some(r##"{"command":"# Run tests\ncargo test"}"##.into()),
+                },
+                ToolCall {
+                    id: "call_read".into(),
+                    name: "read_file".into(),
+                    arguments: Some(r#"{"path":"README.md"}"#.into()),
+                },
+            ],
+            suspended_at: jiff::Timestamp::default(),
+        };
+
+        let wire = PendingApprovalWire::from_agent(approval);
+
+        assert_eq!(
+            wire.suggested_shell_allow_patterns.get("call_shell"),
+            Some(&"cargo *".to_string())
+        );
+        assert!(
+            !wire
+                .suggested_shell_allow_patterns
+                .contains_key("call_read")
+        );
+    }
+
+    #[test]
+    fn pending_approval_wire_skips_compound_shell_calls() {
+        let approval = PendingApproval {
+            thread_id: "t1".into(),
+            agent_name: "coda".into(),
+            calls: vec![ToolCall {
+                id: "call_shell".into(),
+                name: "shell".into(),
+                arguments: Some(
+                    r##"{"command":"# Navigate\ncd /work/coda && cargo test"}"##.into(),
+                ),
+            }],
+            suspended_at: jiff::Timestamp::default(),
+        };
+
+        let wire = PendingApprovalWire::from_agent(approval);
+
+        assert!(wire.suggested_shell_allow_patterns.is_empty());
+    }
+
+    #[test]
+    fn pending_approval_wire_skips_shell_calls_with_only_comments() {
+        let approval = PendingApproval {
+            thread_id: "t1".into(),
+            agent_name: "coda".into(),
+            calls: vec![ToolCall {
+                id: "call_shell".into(),
+                name: "shell".into(),
+                arguments: Some(r##"{"command":"# just a comment"}"##.into()),
+            }],
+            suspended_at: jiff::Timestamp::default(),
+        };
+
+        let wire = PendingApprovalWire::from_agent(approval);
+
+        assert!(wire.suggested_shell_allow_patterns.is_empty());
+    }
+
+    #[test]
+    fn pending_approval_wire_skips_unresolvable_shell_calls() {
+        let approval = PendingApproval {
+            thread_id: "t1".into(),
+            agent_name: "coda".into(),
+            calls: vec![ToolCall {
+                id: "call_shell".into(),
+                name: "shell".into(),
+                arguments: Some(r##"{"command":"git status > /tmp/out"}"##.into()),
+            }],
+            suspended_at: jiff::Timestamp::default(),
+        };
+
+        let wire = PendingApprovalWire::from_agent(approval);
+
+        assert!(wire.suggested_shell_allow_patterns.is_empty());
     }
 
     #[test]

@@ -483,13 +483,32 @@ impl ToolApprovalConfig {
     /// Derive a sensible glob pattern from a concrete command.
     /// Takes the first token and appends ` *`.
     /// E.g. `git status --short` → `git *`.
-    pub fn derive_pattern(command: &str) -> String {
-        let first_token = command.split_whitespace().next().unwrap_or(command);
-        if command.contains(|c: char| c.is_whitespace()) {
+    ///
+    /// Leading blank and comment lines (`# …`) are stripped before deriving
+    /// the pattern, because the server-side shell decomposer strips comments
+    /// too. The resulting pattern matches the command the decomposer evaluates.
+    fn derive_pattern(command: &str) -> String {
+        let first_line = command
+            .lines()
+            .find(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .unwrap_or(command);
+        let first_token = first_line.split_whitespace().next().unwrap_or(first_line);
+        if first_line.contains(|c: char| c.is_whitespace()) {
             format!("{first_token} *")
         } else {
             first_token.to_string()
         }
+    }
+
+    pub(crate) fn derive_shell_allow_pattern(command: &str) -> Option<String> {
+        let commands = decompose(command)?;
+        let [command] = commands.as_slice() else {
+            return None;
+        };
+        Some(Self::derive_pattern(command))
     }
 }
 
@@ -599,7 +618,7 @@ fn simple_command_text(simple: &brush_parser::ast::SimpleCommand) -> Option<Stri
     Some(text)
 }
 
-fn extract_shell_command(call: &ToolCall) -> String {
+pub(crate) fn extract_shell_command(call: &ToolCall) -> String {
     let args = call.arguments.as_deref().unwrap_or("{}");
     serde_json::from_str::<serde_json::Value>(args)
         .ok()
@@ -1165,6 +1184,20 @@ deny = ["rm -rf *"]
         assert_eq!(
             ToolApprovalConfig::derive_pattern("cargo test --release"),
             "cargo *"
+        );
+        assert_eq!(
+            ToolApprovalConfig::derive_pattern("# Navigate to the project\ncd /path && cargo test"),
+            "cd *"
+        );
+        assert_eq!(
+            ToolApprovalConfig::derive_pattern(
+                "\n  \n# Navigate to the project\ncd /path && cargo test"
+            ),
+            "cd *"
+        );
+        assert_eq!(
+            ToolApprovalConfig::derive_pattern("# just a comment"),
+            "# *"
         );
     }
 
