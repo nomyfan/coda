@@ -502,7 +502,7 @@ mod tests {
 
         assert_eq!(
             wire.suggested_shell_allow_patterns.get("call_shell"),
-            Some(&"cargo *".to_string())
+            Some(&"cargo test".to_string())
         );
         assert!(
             !wire

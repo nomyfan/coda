@@ -481,8 +481,8 @@ impl ToolApprovalConfig {
     }
 
     /// Derive a sensible glob pattern from a concrete command.
-    /// Takes the first token and appends ` *`.
-    /// E.g. `git status --short` → `git *`.
+    /// Keeps the command plus subcommand, then appends ` *` when arguments
+    /// remain. E.g. `git status --short` → `git status *`.
     ///
     /// Leading blank and comment lines (`# …`) are stripped before deriving
     /// the pattern, because the server-side shell decomposer strips comments
@@ -495,11 +495,18 @@ impl ToolApprovalConfig {
                 !trimmed.is_empty() && !trimmed.starts_with('#')
             })
             .unwrap_or(command);
-        let first_token = first_line.split_whitespace().next().unwrap_or(first_line);
-        if first_line.contains(|c: char| c.is_whitespace()) {
-            format!("{first_token} *")
+        let mut tokens = first_line.split_whitespace();
+        let Some(command) = tokens.next() else {
+            return first_line.to_string();
+        };
+        let Some(subcommand) = tokens.next() else {
+            return command.to_string();
+        };
+        let prefix = format!("{command} {subcommand}");
+        if tokens.next().is_some() {
+            format!("{prefix} *")
         } else {
-            first_token.to_string()
+            prefix
         }
     }
 
@@ -1178,26 +1185,28 @@ deny = ["rm -rf *"]
     fn derive_pattern_works() {
         assert_eq!(
             ToolApprovalConfig::derive_pattern("git status --short"),
-            "git *"
+            "git status *"
         );
         assert_eq!(ToolApprovalConfig::derive_pattern("ls"), "ls");
         assert_eq!(
+            ToolApprovalConfig::derive_pattern("cargo test"),
+            "cargo test"
+        );
+        assert_eq!(
             ToolApprovalConfig::derive_pattern("cargo test --release"),
-            "cargo *"
+            "cargo test *"
         );
         assert_eq!(
-            ToolApprovalConfig::derive_pattern("# Navigate to the project\ncd /path && cargo test"),
-            "cd *"
+            ToolApprovalConfig::derive_pattern("# Run tests\ncargo test --release"),
+            "cargo test *"
         );
         assert_eq!(
-            ToolApprovalConfig::derive_pattern(
-                "\n  \n# Navigate to the project\ncd /path && cargo test"
-            ),
-            "cd *"
+            ToolApprovalConfig::derive_pattern("\n  \n# Run tests\ncargo test --release"),
+            "cargo test *"
         );
         assert_eq!(
             ToolApprovalConfig::derive_pattern("# just a comment"),
-            "# *"
+            "# just *"
         );
     }
 
@@ -1346,7 +1355,7 @@ deny = ["rm -rf *"]
     #[test]
     fn derive_pattern_with_tab() {
         let pattern = ToolApprovalConfig::derive_pattern("git\tstatus");
-        assert_eq!(pattern, "git *");
+        assert_eq!(pattern, "git status");
         assert!(wildcard_match(&pattern, "git\tstatus"));
         assert!(wildcard_match(&pattern, "git status"));
     }
