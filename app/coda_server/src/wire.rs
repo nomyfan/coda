@@ -299,6 +299,8 @@ pub struct SessionSummaryWire {
     pub updated_at_ms: Option<u64>,
     #[serde(default)]
     pub first_user_message: Option<String>,
+    #[serde(default)]
+    pub has_pending_approval: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +598,7 @@ mod tests {
                     id: "s1".into(),
                     updated_at_ms: Some(42),
                     first_user_message: Some("inspect the repo".into()),
+                    has_pending_approval: true,
                 }],
             }],
         };
@@ -604,6 +607,7 @@ mod tests {
             ServerMessage::WorkspaceCatalog { workspaces } => {
                 assert_eq!(workspaces[0].id, "coda");
                 assert_eq!(workspaces[0].sessions[0].id, "s1");
+                assert!(workspaces[0].sessions[0].has_pending_approval);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

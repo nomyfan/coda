@@ -86,6 +86,7 @@ export type WorkspaceSession = {
   id: string;
   updated_at_ms?: number | null;
   first_user_message?: string | null;
+  has_pending_approval: boolean;
 };
 
 export type WorkspaceSummary = {

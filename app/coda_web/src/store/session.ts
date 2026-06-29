@@ -764,7 +764,10 @@ function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, 
     }
     return {
       ...workspace,
-      sessions: [{ id: sessionId, updated_at_ms: null }, ...workspace.sessions],
+      sessions: [
+        { id: sessionId, updated_at_ms: null, has_pending_approval: false },
+        ...workspace.sessions,
+      ],
     };
   });
 }
@@ -794,7 +797,12 @@ function upsertCatalogTitled(
     return {
       ...workspace,
       sessions: [
-        { id: sessionId, updated_at_ms: Date.now(), first_user_message: title },
+        {
+          id: sessionId,
+          updated_at_ms: Date.now(),
+          first_user_message: title,
+          has_pending_approval: false,
+        },
         ...workspace.sessions,
       ],
     };
@@ -833,6 +841,7 @@ function mergeCatalog(
         id: session.sessionId,
         updated_at_ms: Date.now(),
         first_user_message: session.firstUserMessage ?? null,
+        has_pending_approval: session.approvals.length > 0,
       }));
     return { ...workspace, sessions: [...extras, ...filled] };
   });

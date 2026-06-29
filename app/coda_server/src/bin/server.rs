@@ -358,6 +358,7 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
                     id: session.session_id,
                     updated_at_ms: session.updated_at_ms,
                     first_user_message: session.first_user_message,
+                    has_pending_approval: session.has_pending_approval,
                 })
                 .collect(),
             Err(err) => {

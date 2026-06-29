@@ -486,7 +486,9 @@ function WorkspaceNode({
                 session={session}
                 isActive={activeServer === serverUrl && key === activeKey}
                 running={opened?.running ?? false}
-                awaitingApproval={(opened?.approvals.length ?? 0) > 0}
+                awaitingApproval={
+                  opened ? opened.approvals.length > 0 : session.has_pending_approval
+                }
                 disabled={status !== "connected"}
                 onOpen={onOpenSession}
                 onDelete={onDeleteSession}

@@ -1,6 +1,7 @@
-use coda_agent::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
+use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::Message;
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -46,6 +47,7 @@ pub struct SessionFile {
     pub session_id: String,
     pub updated_at_ms: Option<u64>,
     pub first_user_message: Option<String>,
+    pub has_pending_approval: bool,
 }
 
 impl WorkspaceStorage {
@@ -107,10 +109,12 @@ impl WorkspaceStorage {
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
                 .and_then(|duration| duration.as_millis().try_into().ok());
             let first_user_message = storage.first_user_message(session_id).await;
+            let has_pending_approval = storage.has_pending_approval(session_id).await;
             sessions.push(SessionFile {
                 session_id: session_id.to_string(),
                 updated_at_ms,
                 first_user_message,
+                has_pending_approval,
             });
         }
 
@@ -158,6 +162,42 @@ impl JsonFileStorage {
                 // string in sync with `IMAGE_ONLY_TITLE` in the web store.
                 None if msg.has_image() => Some(IMAGE_ONLY_PREVIEW.to_string()),
                 None => None,
+            })
+    }
+
+    async fn has_pending_approval(&self, session_id: &str) -> bool {
+        let mut seen = HashSet::from([session_id.to_string()]);
+        let mut thread_ids = vec![session_id.to_string()];
+
+        if let Some(snapshot) = self.load_session_snapshot(session_id).await.ok().flatten() {
+            for thread_id in snapshot.active_threads.into_values() {
+                if seen.insert(thread_id.clone()) {
+                    thread_ids.push(thread_id);
+                }
+            }
+        }
+
+        for thread_id in thread_ids {
+            if self.checkpoint_has_pending_approval(&thread_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn checkpoint_has_pending_approval(&self, thread_id: &str) -> bool {
+        self.load_checkpoint(thread_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|checkpoint| {
+                matches!(
+                    checkpoint.resume_point,
+                    StoredResumePoint::PendingApproval {
+                        pending_approval_calls,
+                        ..
+                    } if !pending_approval_calls.is_empty()
+                )
             })
     }
 }
@@ -328,6 +368,7 @@ mod tests {
             sessions[0].first_user_message.as_deref(),
             Some("recent session")
         );
+        assert!(!sessions[0].has_pending_approval);
     }
 
     #[tokio::test]
@@ -360,5 +401,55 @@ mod tests {
             session.first_user_message("images").await.as_deref(),
             Some(IMAGE_ONLY_PREVIEW)
         );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_marks_pending_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        let session = storage.session("review");
+        fs::create_dir_all(&session.dir).await.unwrap();
+
+        session
+            .save_session_snapshot(
+                "review".into(),
+                StoredRuntimeSnapshot {
+                    drained_envelopes: Default::default(),
+                    agent_drained_envelopes: Default::default(),
+                    active_threads: [("sub".to_string(), "sub-thread".to_string())].into(),
+                },
+            )
+            .await
+            .unwrap();
+        for thread_id in ["review", "sub-thread"] {
+            session
+                .save_checkpoint(
+                    thread_id.into(),
+                    StoredCheckpoint {
+                        thread_id: thread_id.into(),
+                        agent_name: "coda".into(),
+                        reply_target: None,
+                        messages: vec![],
+                        todos: vec![],
+                        resume_point: StoredResumePoint::PendingApproval {
+                            pending_approval_calls: vec![coda_core::llm::ToolCall {
+                                id: format!("{thread_id}-call"),
+                                name: "shell".into(),
+                                arguments: Some(r#"{"command":"cargo test"}"#.into()),
+                            }]
+                            .into(),
+                            pending_calls: vec![],
+                        },
+                        suspended_at: jiff::Timestamp::default(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let sessions = storage.list_sessions().await.unwrap();
+
+        assert_eq!(sessions[0].session_id, "review");
+        assert!(sessions[0].has_pending_approval);
     }
 }
