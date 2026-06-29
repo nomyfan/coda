@@ -881,6 +881,11 @@ function draftSession(state: CodaDraft, server: string, key: SessionKey) {
   return current.sessions[key];
 }
 
+type SessionRestoreMessage = {
+  message: ClientMessage;
+  key: SessionKey;
+};
+
 function markConnecting(store: CodaStore, server: string, alias?: string) {
   updateState(store, (state) => {
     const existing = state.servers[server];
@@ -933,11 +938,16 @@ function removeServerState(store: CodaStore, server: string) {
   });
 }
 
-function setCatalog(store: CodaStore, server: string, workspaces: WorkspaceSummary[]) {
+function setCatalog(
+  store: CodaStore,
+  server: string,
+  workspaces: WorkspaceSummary[],
+  mergeLocal = true,
+) {
   updateState(store, (state) => {
     const current = state.servers[server];
     if (current) {
-      current.catalog = mergeCatalog(workspaces, current.sessions);
+      current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
     }
   });
 }
@@ -1093,6 +1103,7 @@ function applySnapshot(
   approvals: PendingApproval[],
   providerId: string,
   reasoningEffort: ReasoningEffort | null,
+  replaceEmpty = false,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
@@ -1114,12 +1125,15 @@ function applySnapshot(
     session.providerId = providerId;
     session.reasoningEffort = reasoningEffort;
     session.usage = usage;
-    if (hasHistory) {
+    if (hasHistory || replaceEmpty) {
       session.entries = mapped;
       session.approvals = approvals;
       session.drafts = {};
       session.allowDrafts = {};
       session.running = false;
+    }
+    if (replaceEmpty && !hasHistory) {
+      session.firstUserMessage = undefined;
     }
   });
 }
@@ -1373,11 +1387,26 @@ function currentActive() {
   return session ? { server, session } : undefined;
 }
 
+function activeSessionToRestore(server: string): SessionRestoreMessage | undefined {
+  const snapshot = codaStore.getState();
+  if (snapshot.activeServer !== server || !snapshot.activeKey) {
+    return undefined;
+  }
+  const session = snapshot.servers[server]?.sessions[snapshot.activeKey];
+  return session?.draft
+    ? undefined
+    : {
+        message: openMessage(session),
+        key: snapshot.activeKey,
+      };
+}
+
 export function connectServer(rawUrl: string) {
   const server = rawUrl.trim();
   if (!server) {
     return;
   }
+  const sessionToRestore = activeSessionToRestore(server);
   closeSocket(codaStore, server);
   const stored = loadStoredServers();
   storeServers(addStored(stored, server));
@@ -1385,11 +1414,15 @@ export function connectServer(rawUrl: string) {
 
   const socket = new WebSocket(normalizeWsUrl(server));
   setSocket(codaStore, server, socket);
+  let replaceNextCatalog = true;
 
   socket.onopen = () => {
     setServerStatus(codaStore, server, "connected");
     socket.send(encode({ type: "list_workspaces" }));
     socket.send(encode({ type: "list_providers" }));
+    if (sessionToRestore) {
+      socket.send(encode(sessionToRestore.message));
+    }
   };
   socket.onclose = () => {
     if (currentSocket(codaStore, server) === socket) {
@@ -1401,7 +1434,8 @@ export function connectServer(rawUrl: string) {
     try {
       const message = JSON.parse(event.data) as ServerMessage;
       if (message.type === "workspace_catalog") {
-        setCatalog(codaStore, server, message.workspaces);
+        setCatalog(codaStore, server, message.workspaces, !replaceNextCatalog);
+        replaceNextCatalog = false;
         return;
       }
       if (message.type === "provider_catalog") {
@@ -1418,6 +1452,7 @@ export function connectServer(rawUrl: string) {
           message.pending_approvals ?? [],
           message.provider_id,
           message.reasoning_effort ?? null,
+          sessionToRestore?.key === sessionKey(message.workspace_id, message.session_id),
         );
         return;
       }
