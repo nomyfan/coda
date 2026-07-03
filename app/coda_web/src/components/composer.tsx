@@ -28,6 +28,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  evicted,
   workspace,
   selectingTarget,
   providers,
@@ -38,9 +39,12 @@ export const Composer = memo(function Composer({
   onSetModel,
   onSend,
   onAbort,
+  onTakeOver,
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** Another client took over this session; input is disabled until taken back. */
+  evicted: boolean;
   workspace?: string;
   /** New-session mode: the send target is still being picked in the header. */
   selectingTarget: boolean;
@@ -54,6 +58,7 @@ export const Composer = memo(function Composer({
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
+  onTakeOver: () => void;
 }) {
   const [task, setTask] = useState("");
   const [images, setImages] = useState<string[]>([]);
@@ -79,6 +84,7 @@ export const Composer = memo(function Composer({
     connected &&
     Boolean(workspace) &&
     !running &&
+    !evicted &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
@@ -152,6 +158,20 @@ export const Composer = memo(function Composer({
       }}
     >
       <LayoutGroup id={layoutGroupId}>
+        {evicted && (
+          <div className="mx-auto mb-1.5 flex max-w-4xl items-center justify-between gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+            <span>This session is being driven by another window.</span>
+            <Button
+              size="sm"
+              variant="outline"
+              type="button"
+              className="h-6 shrink-0 px-2 text-xs"
+              onClick={onTakeOver}
+            >
+              Take over
+            </Button>
+          </div>
+        )}
         <div
           className="relative mx-auto max-w-4xl"
           onDragOver={(e) => {
@@ -205,7 +225,12 @@ export const Composer = memo(function Composer({
               }
             }}
             onPaste={handlePaste}
-            placeholder="Enter to send, Shift+Enter for newline"
+            disabled={evicted}
+            placeholder={
+              evicted
+                ? "Session opened in another window — take over to continue"
+                : "Enter to send, Shift+Enter for newline"
+            }
             className={[
               "min-h-[104px] pb-20 pr-3 sm:min-h-[80px] sm:pb-10",
               dragOver ? "border-primary ring-1 ring-primary" : "",

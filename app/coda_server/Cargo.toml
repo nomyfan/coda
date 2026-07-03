@@ -13,6 +13,7 @@ coda_tools = { workspace = true }
 jiff = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

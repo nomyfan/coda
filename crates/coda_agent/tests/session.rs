@@ -11,7 +11,7 @@ use std::time::Duration;
 use coda_agent::runtime::MemoryStorage;
 use coda_agent::{
     AgentEvent, AgentSpec, AgentTeam, ModelProfile, ResumeDecision, RunConfig, Session,
-    SessionEvent, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    SessionEvent, SessionStreamItem, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, StreamError, ToolCall,
@@ -364,8 +364,11 @@ async fn collect_until_done(session: &Session) -> String {
     let deadline = Duration::from_secs(5);
     let result = timeout(deadline, async {
         loop {
-            let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
+            let Some(item) = session.recv().await else {
                 panic!("session closed before turn completed");
+            };
+            let SessionStreamItem::Event(SessionEvent { origin, kind, .. }) = item else {
+                continue;
             };
             if !origin.is_root() {
                 continue;
@@ -389,8 +392,11 @@ async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApprov
     let deadline = Duration::from_secs(5);
     let result = timeout(deadline, async {
         loop {
-            let Some(SessionEvent { origin, kind, .. }) = session.recv().await else {
+            let Some(item) = session.recv().await else {
                 panic!("session closed before suspension");
+            };
+            let SessionStreamItem::Event(SessionEvent { origin, kind, .. }) = item else {
+                continue;
             };
             if !origin.is_root() {
                 continue;

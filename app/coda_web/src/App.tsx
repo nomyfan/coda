@@ -4,6 +4,7 @@ import {
   abort,
   clearActiveSession,
   openSession,
+  selectActiveEvicted,
   selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
@@ -18,6 +19,7 @@ import {
   sendTask,
   sendTaskToNewSession,
   setModel,
+  takeOverActiveSession,
   useCodaBootstrap,
   useCodaStore,
   type ReasoningEffort,
@@ -197,6 +199,7 @@ export default function App() {
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
+  const activeEvicted = useCodaStore(selectActiveEvicted);
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
@@ -371,6 +374,7 @@ export default function App() {
             <Composer
               status={showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus}
               running={showingNewSession ? false : activeRunning}
+              evicted={showingNewSession ? false : activeEvicted}
               workspace={selectedWorkspace}
               selectingTarget={showingNewSession}
               providers={
@@ -387,6 +391,7 @@ export default function App() {
               onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
               onSend={handleSend}
               onAbort={abort}
+              onTakeOver={takeOverActiveSession}
             />
           ) : null}
         </div>

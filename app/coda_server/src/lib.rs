@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod ask_user;
 pub mod config;
+pub mod hub;
 pub mod mcp;
 pub mod storage;
 pub mod transport;

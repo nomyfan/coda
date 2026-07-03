@@ -541,6 +541,7 @@ dependencies = [
  "serde_yml",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml_edit",
  "tracing",

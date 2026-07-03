@@ -225,9 +225,12 @@ export type ServerMessage =
       pending_approvals?: PendingApproval[];
       provider_id: string;
       reasoning_effort?: ReasoningEffort | null;
+      /** A turn is still in flight; its events are replayed after the snapshot. */
+      turn_running?: boolean;
     }
   | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
-  | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null };
+  | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null }
+  | { type: "session_evicted"; workspace_id: string; session_id: string };
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {
   return "Ok" in output;

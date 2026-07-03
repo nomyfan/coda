@@ -7,9 +7,9 @@ use axum::{
 use clap::Parser;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
-    Shutdown, runtime::SessionStorage,
+    runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, Modality, ReasoningEffort};
+use coda_core::llm::{LLMProviderConfig, Message, Modality, ReasoningEffort};
 use coda_openai::OpenAI;
 use coda_server::{
     agents::{
@@ -19,6 +19,10 @@ use coda_server::{
     ask_user::AskUserToolSpec,
     build_workspace_knowledge,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
+    hub::{
+        AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub, SessionKey,
+        SessionOpener, SessionRelay,
+    },
     mcp::McpServers,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
@@ -28,11 +32,14 @@ use coda_server::{
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use futures::stream::BoxStream;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio_stream::{StreamExt as _, StreamMap};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -66,6 +73,9 @@ struct AppState {
     default_provider: String,
     shutdown: CancellationToken,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
+    /// Process-level session relay: live sessions belong here, not to the
+    /// connection that opened them. See `coda_server::hub`.
+    hub: Arc<dyn SessionRelay>,
 }
 
 /// A constructed provider model entry. `model_id` is the API model name sent in
@@ -114,52 +124,11 @@ struct ModelSelection {
     reasoning_effort: Option<ReasoningEffort>,
 }
 
-struct ActiveSession {
-    generation: u64,
-    session: Session,
-    root_name: String,
-    turn_running: bool,
-    /// The provider/model and reasoning setting this session was opened with.
-    /// Switching them reopens the session (see `SetModel`).
-    provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
-}
-
-struct PendingOpen {
-    workspace: Arc<WorkspaceState>,
-    session_id: String,
-    provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
-    needed: HashSet<String>,
-    decisions: HashMap<String, ResumeDecision>,
-}
-
-enum OpenedSession {
-    Live(Session),
-    Pending(Vec<coda_agent::PendingApproval>),
-}
-
 const MAX_TASK_IMAGES: usize = 5;
 const MAX_TASK_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TASK_IMAGE_URL_BYTES: usize = 2048;
 const ACCEPTED_TASK_IMAGE_MIME_TYPES: &[&str] =
     &["image/png", "image/jpeg", "image/webp", "image/gif"];
-
-enum SessionEnvelope {
-    Event {
-        workspace_id: String,
-        session_id: String,
-        generation: u64,
-        // Boxed: `WireEvent` is far larger than the other variant, so keeping it
-        // inline would bloat every `SessionEnvelope` (clippy large_enum_variant).
-        event: Box<WireEvent>,
-    },
-    Closed {
-        workspace_id: String,
-        session_id: String,
-        generation: u64,
-    },
-}
 
 fn sanitize_task_images(images: Vec<String>) -> Vec<String> {
     images
@@ -218,19 +187,72 @@ fn task_image_data_uri_decoded_len(image: &str) -> Option<usize> {
         .checked_sub(padding)
 }
 
+/// The hub's [`SessionOpener`]: builds sessions from the provider catalog and
+/// workspace registry. Holds its own map clones so it exists independently of
+/// `AppState` (the hub lives inside `AppState`).
+struct AppOpener {
+    providers: HashMap<String, Arc<ProviderHandle>>,
+    workspaces: HashMap<String, Arc<WorkspaceState>>,
+}
+
+impl SessionOpener for AppOpener {
+    fn open<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<ReasoningEffort>,
+        decisions: HashMap<String, ResumeDecision>,
+    ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| OpenError::Storage(format!("unknown workspace '{}'", key.0)))?;
+            open_session(
+                &self.providers,
+                workspace,
+                &key.1,
+                provider_id,
+                reasoning_effort,
+                decisions,
+            )
+            .await
+        })
+    }
+
+    fn load_messages<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(workspace) = self.workspaces.get(&key.0) else {
+                return Vec::new();
+            };
+            workspace
+                .storage
+                .session(&key.1)
+                .load_checkpoint(&key.1)
+                .await
+                .ok()
+                .flatten()
+                .map(|checkpoint| checkpoint.messages)
+                .unwrap_or_default()
+        })
+    }
+}
+
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
 /// tools, MCP tools, and approval policy. `decisions` covers any pending
 /// approvals carried over from a prior suspension.
 async fn open_session(
-    app: &AppState,
+    providers: &HashMap<String, Arc<ProviderHandle>>,
     workspace: &WorkspaceState,
     session_id: &str,
     provider_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Result<Session, OpenError> {
-    let provider = app
-        .providers
+    let provider = providers
         .get(provider_id)
         .expect("caller passes a validated provider id");
     // The root agent (and any agent without an override) runs on the session's
@@ -250,8 +272,7 @@ async fn open_session(
         .agent_models
         .iter()
         .map(|(name, selection)| {
-            let handle = app
-                .providers
+            let handle = providers
                 .get(&selection.provider_id)
                 .expect("agent model selections are validated at startup");
             let profile = ModelProfile {
@@ -561,193 +582,6 @@ async fn send_provider_catalog<T: Transport<Incoming = ClientMessage, Outgoing =
         .await
 }
 
-async fn open_session_and_send_snapshot<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
-    transport: &T,
-    app: &AppState,
-    workspace: &WorkspaceState,
-    session_id: &str,
-    provider_id: &str,
-    reasoning_effort: Option<ReasoningEffort>,
-    decisions: HashMap<String, ResumeDecision>,
-) -> Option<OpenedSession> {
-    let first = match open_session(
-        app,
-        workspace,
-        session_id,
-        provider_id,
-        reasoning_effort,
-        HashMap::new(),
-    )
-    .await
-    {
-        Ok(session) => Ok(session),
-        Err(OpenError::PendingApprovalsRequired(pending)) => Err(pending),
-        Err(err) => {
-            send_open_error(transport, &workspace.id, session_id, err).await;
-            return None;
-        }
-    };
-    let pending = match &first {
-        Err(pending) => pending.clone(),
-        _ => Vec::new(),
-    };
-
-    let messages = workspace
-        .storage
-        .session(session_id)
-        .load_checkpoint(session_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|checkpoint| checkpoint.messages)
-        .unwrap_or_default();
-    if !transport
-        .send(&ServerMessage::Snapshot {
-            workspace_id: workspace.id.clone(),
-            session_id: session_id.to_string(),
-            messages,
-            pending_approvals: pending
-                .iter()
-                .cloned()
-                .map(PendingApprovalWire::from_agent)
-                .collect(),
-            provider_id: provider_id.to_string(),
-            reasoning_effort,
-        })
-        .await
-    {
-        return None;
-    }
-
-    match first {
-        Ok(session) => Some(OpenedSession::Live(session)),
-        Err(_) if decisions.is_empty() => Some(OpenedSession::Pending(pending)),
-        Err(_) => match open_session(
-            app,
-            workspace,
-            session_id,
-            provider_id,
-            reasoning_effort,
-            decisions,
-        )
-        .await
-        {
-            Ok(session) => Some(OpenedSession::Live(session)),
-            Err(OpenError::PendingApprovalsRequired(more)) => Some(OpenedSession::Pending(more)),
-            Err(err) => {
-                send_open_error(transport, &workspace.id, session_id, err).await;
-                None
-            }
-        },
-    }
-}
-
-fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
-    match event {
-        WireEvent::LlmEnd {
-            agent_name,
-            message,
-            ..
-        } => agent_name == root_name && message.tool_calls.is_empty(),
-        WireEvent::Suspended { .. } => true,
-        WireEvent::Aborted { agent_name, .. } | WireEvent::Error { agent_name, .. } => {
-            agent_name == root_name
-        }
-        _ => false,
-    }
-}
-
-fn make_pending_open(
-    workspace: Arc<WorkspaceState>,
-    session_id: String,
-    provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
-    approvals: Vec<coda_agent::PendingApproval>,
-) -> PendingOpen {
-    PendingOpen {
-        workspace,
-        session_id,
-        provider_id,
-        reasoning_effort,
-        needed: approvals
-            .into_iter()
-            .map(|approval| approval.thread_id)
-            .collect(),
-        decisions: HashMap::new(),
-    }
-}
-
-fn spawn_session_forwarder(
-    workspace_id: String,
-    session_id: String,
-    generation: u64,
-    session: Session,
-    root_name: String,
-    tx: mpsc::UnboundedSender<SessionEnvelope>,
-) {
-    tokio::spawn(async move {
-        while let Some(event) = session.recv().await {
-            let event = WireEvent::from_session_event(event, &root_name);
-            if tx
-                .send(SessionEnvelope::Event {
-                    workspace_id: workspace_id.clone(),
-                    session_id: session_id.clone(),
-                    generation,
-                    event: Box::new(event),
-                })
-                .is_err()
-            {
-                return;
-            }
-        }
-        let _ = tx.send(SessionEnvelope::Closed {
-            workspace_id,
-            session_id,
-            generation,
-        });
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_active_session(
-    active: &mut HashMap<(String, String), ActiveSession>,
-    tx: &mpsc::UnboundedSender<SessionEnvelope>,
-    next_generation: &mut u64,
-    workspace: Arc<WorkspaceState>,
-    session_id: String,
-    session: Session,
-    provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
-) {
-    let generation = *next_generation;
-    *next_generation += 1;
-    let workspace_id = workspace.id.clone();
-    let root_name = session.root_name().to_string();
-    let turn_running = session.has_resuming_agents();
-    spawn_session_forwarder(
-        workspace_id.clone(),
-        session_id.clone(),
-        generation,
-        session.clone(),
-        root_name.clone(),
-        tx.clone(),
-    );
-    active.insert(
-        (workspace_id.clone(), session_id.clone()),
-        ActiveSession {
-            generation,
-            session,
-            root_name,
-            turn_running,
-            provider_id,
-            reasoning_effort,
-        },
-    );
-    info!(workspace_id = %workspace_id, session_id = %session_id, "session opened");
-}
-
 async fn send_pending_approval_events<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
@@ -776,33 +610,13 @@ async fn send_pending_approval_events<
     true
 }
 
-/// Shut down a live session and drop it, freeing its runtime while keeping the
-/// persisted checkpoint so it can be reopened. Graceful so an in-flight turn (if
-/// any still races the teardown) settles and checkpoints before aborting.
-async fn close_session_now(
-    active: &mut HashMap<(String, String), ActiveSession>,
-    key: &(String, String),
-) {
-    if let Some(active_session) = active.remove(key) {
-        active_session
-            .session
-            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
-            .await;
-        info!(workspace_id = %key.0, session_id = %key.1, "session closed");
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn handle_dashboard_command<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
     transport: &T,
     app: &Arc<AppState>,
-    active: &mut HashMap<(String, String), ActiveSession>,
-    pending: &mut HashMap<(String, String), PendingOpen>,
-    close_requested: &mut HashSet<(String, String)>,
-    tx: &mpsc::UnboundedSender<SessionEnvelope>,
-    next_generation: &mut u64,
+    conn_id: ConnId,
+    streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
     command: ClientMessage,
 ) -> bool {
     match command {
@@ -818,59 +632,49 @@ async fn handle_dashboard_command<
                 warn!(workspace_id = %workspace_id, "rejecting open: {err}");
                 return true;
             }
-            let key = (workspace_id.clone(), session_id.clone());
-            // Reopening (e.g. switching back to a session left running) cancels a
-            // deferred close requested while the user was away.
-            close_requested.remove(&key);
-            if active.contains_key(&key) || pending.contains_key(&key) {
-                return true;
-            }
-            let Some(workspace) = app.workspaces.get(&workspace_id).cloned() else {
+            if !app.workspaces.contains_key(&workspace_id) {
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
                 return true;
-            };
+            }
             // Honor the client's chosen model (e.g. picked on a new session),
-            // otherwise fall back to the default provider.
+            // otherwise fall back to the default provider. Ignored when the
+            // session is already live in the hub.
             let (provider_id, reasoning_effort) =
                 resolve_selection(app, provider_id, reasoning_effort);
-            match open_session_and_send_snapshot(
-                transport,
-                app,
-                &workspace,
-                &session_id,
-                &provider_id,
-                reasoning_effort,
-                HashMap::new(),
-            )
-            .await
+            let key = (workspace_id.clone(), session_id.clone());
+            match app
+                .hub
+                .attach(key.clone(), conn_id, provider_id, reasoning_effort)
+                .await
             {
-                Some(OpenedSession::Live(session)) => {
-                    insert_active_session(
-                        active,
-                        tx,
-                        next_generation,
-                        workspace,
-                        session_id,
-                        session,
-                        provider_id,
-                        reasoning_effort,
-                    );
+                Ok(AttachSession { snapshot, events }) => {
+                    if !transport
+                        .send(&ServerMessage::Snapshot {
+                            workspace_id,
+                            session_id,
+                            messages: snapshot.messages,
+                            pending_approvals: snapshot
+                                .pending_approvals
+                                .into_iter()
+                                .map(PendingApprovalWire::from_agent)
+                                .collect(),
+                            provider_id: snapshot.provider_id,
+                            reasoning_effort: snapshot.reasoning_effort,
+                            turn_running: snapshot.turn_running,
+                        })
+                        .await
+                    {
+                        return false;
+                    }
+                    // Replay + live events flow through the connection's
+                    // stream map from here on.
+                    streams.insert(key, events);
                     send_workspace_catalog(transport, app).await
                 }
-                Some(OpenedSession::Pending(approvals)) => {
-                    pending.insert(
-                        key,
-                        make_pending_open(
-                            workspace,
-                            session_id,
-                            provider_id,
-                            reasoning_effort,
-                            approvals,
-                        ),
-                    );
+                Err(err) => {
+                    send_open_error(transport, &workspace_id, &session_id, err).await;
                     true
                 }
-                None => true,
             }
         }
         ClientMessage::Task {
@@ -879,18 +683,18 @@ async fn handle_dashboard_command<
             task,
             images,
         } => {
-            let Some(active_session) = active.get_mut(&(workspace_id.clone(), session_id.clone()))
-            else {
-                return true;
-            };
+            let key = (workspace_id.clone(), session_id.clone());
             // Reject image input when the active model does not accept it. The
             // frontend already disables image sends for such models, so reaching
             // here means a UI bypass — surface an error rather than silently
             // dropping the attachments.
-            let accepts_images = app
-                .providers
-                .get(&active_session.provider_id)
-                .is_some_and(|h| h.input_modalities.contains(&Modality::Image));
+            let accepts_images = match app.hub.provider_of(key.clone()).await {
+                Some(provider_id) => app
+                    .providers
+                    .get(&provider_id)
+                    .is_some_and(|h| h.input_modalities.contains(&Modality::Image)),
+                None => return true, // no live/pending session for this key
+            };
             if !accepts_images && !images.is_empty() {
                 let event = WireEvent::Error {
                     agent_name: String::new(),
@@ -910,11 +714,9 @@ async fn handle_dashboard_command<
             if task.is_empty() && images.is_empty() {
                 return true;
             }
-            if let Err(err) = active_session.session.send(task, images).await {
-                warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to send task: {err}");
-            } else {
-                active_session.turn_running = true;
-            }
+            app.hub
+                .command(key, conn_id, SessionCommand::Task { task, images })
+                .await;
             true
         }
         ClientMessage::Resume {
@@ -925,83 +727,36 @@ async fn handle_dashboard_command<
             decision,
         } => {
             let key = (workspace_id.clone(), session_id.clone());
-            if let Some(active_session) = active.get_mut(&key) {
-                if let Err(err) = active_session
-                    .session
-                    .resume(&agent_name, &thread_id, decision)
-                    .await
-                {
-                    warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to resume: {err}");
-                } else {
-                    active_session.turn_running = true;
-                }
-                return true;
-            }
-
-            let Some(pending_open) = pending.get_mut(&key) else {
-                return true;
-            };
-            pending_open.needed.remove(&thread_id);
-            pending_open.decisions.insert(thread_id, decision);
-            if !pending_open.needed.is_empty() {
-                return true;
-            }
-
-            let Some(mut pending_open) = pending.remove(&key) else {
-                return true;
-            };
-            let provider_id = pending_open.provider_id.clone();
-            let reasoning_effort = pending_open.reasoning_effort;
-            match open_session(
-                app,
-                &pending_open.workspace,
-                &pending_open.session_id,
-                &provider_id,
-                reasoning_effort,
-                std::mem::take(&mut pending_open.decisions),
-            )
-            .await
+            match app
+                .hub
+                .command(
+                    key,
+                    conn_id,
+                    SessionCommand::Resume {
+                        agent_name,
+                        thread_id,
+                        decision,
+                    },
+                )
+                .await
             {
-                Ok(session) => {
-                    insert_active_session(
-                        active,
-                        tx,
-                        next_generation,
-                        pending_open.workspace,
-                        pending_open.session_id,
-                        session,
-                        provider_id,
-                        reasoning_effort,
-                    );
+                CommandOutcome::StillPending(more) => {
+                    send_pending_approval_events(transport, &workspace_id, &session_id, &more).await
                 }
-                Err(OpenError::PendingApprovalsRequired(more)) => {
-                    if !send_pending_approval_events(transport, &workspace_id, &session_id, &more)
-                        .await
-                    {
-                        return false;
-                    }
-                    pending.insert(
-                        key,
-                        make_pending_open(
-                            pending_open.workspace,
-                            pending_open.session_id,
-                            provider_id,
-                            reasoning_effort,
-                            more,
-                        ),
-                    );
+                CommandOutcome::OpenFailed(err) => {
+                    send_open_error(transport, &workspace_id, &session_id, err).await;
+                    true
                 }
-                Err(err) => send_open_error(transport, &workspace_id, &session_id, err).await,
+                _ => true,
             }
-            true
         }
         ClientMessage::Abort {
             workspace_id,
             session_id,
         } => {
-            if let Some(active_session) = active.get(&(workspace_id, session_id)) {
-                active_session.session.abort().await;
-            }
+            app.hub
+                .command((workspace_id, session_id), conn_id, SessionCommand::Abort)
+                .await;
             true
         }
         ClientMessage::DeleteSession {
@@ -1013,15 +768,11 @@ async fn handle_dashboard_command<
                 return true;
             }
             let key = (workspace_id.clone(), session_id.clone());
-            // Stop a live session before removing its files so no checkpoint is
-            // written back after deletion.
-            if let Some(active_session) = active.remove(&key) {
-                active_session.session.shutdown(Shutdown::Abort).await;
-            }
-            pending.remove(&key);
-            // Drop any deferred close for this session: its settling event will
-            // never reach the close path now that the session is gone.
-            close_requested.remove(&key);
+            // Drop our own stream first so this connection doesn't see its own
+            // eviction; then stop the runtime before removing its files so no
+            // checkpoint is written back after deletion.
+            streams.remove(&key);
+            app.hub.delete(key).await;
             let Some(workspace) = app.workspaces.get(&workspace_id) else {
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
                 return true;
@@ -1035,24 +786,11 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
         } => {
-            let key = (workspace_id.clone(), session_id.clone());
-            // Drop a not-yet-live pending open outright.
-            pending.remove(&key);
-            match active.get(&key) {
-                // A turn is in flight: defer the teardown until it settles
-                // (mirrors the disconnect path) so the running work isn't
-                // aborted. The settling event closes it; reopening before then
-                // cancels the request (see `OpenSession`).
-                Some(active_session) if active_session.turn_running => {
-                    close_requested.insert(key);
-                }
-                // Idle: free its runtime now. The persisted session is kept, so
-                // it reopens later from its checkpoint.
-                Some(_) => {
-                    close_session_now(active, &key).await;
-                }
-                None => {}
-            }
+            let key = (workspace_id, session_id);
+            streams.remove(&key);
+            // The hub keeps the session alive while a turn is in flight and
+            // releases it once idle — no per-connection deferral needed.
+            app.hub.detach(key, conn_id).await;
             true
         }
         ClientMessage::AddAllowPattern {
@@ -1077,170 +815,63 @@ async fn handle_dashboard_command<
             provider_id,
             reasoning_effort,
         } => {
-            let key = (workspace_id.clone(), session_id.clone());
             let Some(reasoning_effort) =
                 normalize_provider_selection(app, &provider_id, reasoning_effort)
             else {
                 warn!(workspace_id = %workspace_id, %provider_id, "set_model has an invalid selection");
                 return true;
             };
-            let Some(active_session) = active.get(&key) else {
-                return true;
-            };
-            // Nothing to do if the selection is unchanged.
-            if active_session.provider_id == provider_id
-                && active_session.reasoning_effort == reasoning_effort
-            {
-                return true;
-            }
-            // The session is rebuilt with a new RunConfig; only safe while idle.
-            if active_session.turn_running {
-                warn!(workspace_id = %workspace_id, session_id = %session_id, "ignoring set_model while a turn is running");
-                return true;
-            }
-            let Some(workspace) = app.workspaces.get(&workspace_id).cloned() else {
-                warn!(workspace_id = %workspace_id, "unknown workspace requested");
-                return true;
-            };
-            // Open the replacement before tearing down the current session, so a
-            // failed open leaves the existing one intact.
-            match open_session(
-                app,
-                &workspace,
-                &session_id,
-                &provider_id,
-                reasoning_effort,
-                HashMap::new(),
-            )
-            .await
-            {
-                Ok(session) => {
-                    if let Some(old) = active.remove(&key) {
-                        old.session.shutdown(Shutdown::Abort).await;
-                    }
-                    insert_active_session(
-                        active,
-                        tx,
-                        next_generation,
-                        workspace,
-                        session_id.clone(),
-                        session,
-                        provider_id.clone(),
+            let key = (workspace_id.clone(), session_id.clone());
+            match app
+                .hub
+                .command(
+                    key,
+                    conn_id,
+                    SessionCommand::SetModel {
+                        provider_id,
                         reasoning_effort,
-                    );
-                    return transport
+                    },
+                )
+                .await
+            {
+                CommandOutcome::ModelChanged {
+                    provider_id,
+                    reasoning_effort,
+                } => {
+                    transport
                         .send(&ServerMessage::ModelChanged {
                             workspace_id,
                             session_id,
                             provider_id,
                             reasoning_effort,
                         })
-                        .await;
+                        .await
                 }
-                Err(OpenError::PendingApprovalsRequired(_)) => {
-                    warn!(workspace_id = %workspace_id, session_id = %session_id, "cannot switch model while approvals are pending");
+                // Pending approvals: already warned in the hub, nothing to send.
+                CommandOutcome::OpenFailed(OpenError::PendingApprovalsRequired(_)) => true,
+                CommandOutcome::OpenFailed(err) => {
+                    send_open_error(transport, &workspace_id, &session_id, err).await;
+                    true
                 }
-                Err(err) => send_open_error(transport, &workspace_id, &session_id, err).await,
+                _ => true,
             }
-            true
         }
     }
 }
 
-async fn handle_session_envelope<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
-    transport: &T,
-    active: &mut HashMap<(String, String), ActiveSession>,
-    close_requested: &mut HashSet<(String, String)>,
-    envelope: SessionEnvelope,
-    client_connected: bool,
-) -> bool {
-    match envelope {
-        SessionEnvelope::Event {
-            workspace_id,
-            session_id,
-            generation,
-            event,
-        } => {
-            let key = (workspace_id.clone(), session_id.clone());
-            let Some(active_session) = active.get_mut(&key) else {
-                return true;
-            };
-            if active_session.generation != generation {
-                return true;
-            }
-            let settled = event_settles_turn(&event, &active_session.root_name);
-            if settled {
-                active_session.turn_running = false;
-            }
-            // Forward the event first so a still-connected dashboard sees the
-            // session settle, then honor any close deferred while a turn was in
-            // flight (the user switched away before it finished).
-            let forwarded = if client_connected {
-                transport
-                    .send(&ServerMessage::Event {
-                        workspace_id,
-                        session_id,
-                        event: *event,
-                    })
-                    .await
-            } else {
-                true
-            };
-            if settled && close_requested.remove(&key) {
-                close_session_now(active, &key).await;
-            }
-            forwarded
-        }
-        SessionEnvelope::Closed {
-            workspace_id,
-            session_id,
-            generation,
-        } => {
-            let key = (workspace_id, session_id);
-            if active
-                .get(&key)
-                .is_some_and(|active_session| active_session.generation == generation)
-            {
-                active.remove(&key);
-                // Drop any deferred close for this instance: a stream that ends
-                // without a settling event (the runtime terminated) would
-                // otherwise leave the key stranded. Gated on the same generation
-                // so a stale Closed can't clear a reopened session's request.
-                close_requested.remove(&key);
-            }
-            true
-        }
-    }
-}
-
-fn any_turn_running(active: &HashMap<(String, String), ActiveSession>) -> bool {
-    active.values().any(|session| session.turn_running)
-}
-
-async fn shutdown_active_sessions(active: HashMap<(String, String), ActiveSession>) {
-    for ((workspace_id, session_id), active_session) in active {
-        active_session
-            .session
-            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(5)))
-            .await;
-        info!(workspace_id = %workspace_id, session_id = %session_id, "session shut down");
-    }
-}
+/// Connection ids distinguish clients inside the hub (latest-wins eviction and
+/// stale-command rejection). Monotonic per process.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
     transport: T,
     app: Arc<AppState>,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut active = HashMap::<(String, String), ActiveSession>::new();
-    let mut pending = HashMap::<(String, String), PendingOpen>::new();
-    // Sessions a `CloseSession` asked to free while a turn was still running;
-    // torn down once that turn settles (see `handle_session_envelope`).
-    let mut close_requested = HashSet::<(String, String)>::new();
-    let mut next_generation = 1;
-    let mut client_connected = true;
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    // Event streams of the sessions this connection is attached to. A stream
+    // that ends silently (detach/takeover elsewhere) is dropped from the map
+    // automatically.
+    let mut streams: StreamMap<SessionKey, BoxStream<'static, RelayEvent>> = StreamMap::new();
 
     if !send_workspace_catalog(&transport, &app).await {
         return;
@@ -1252,46 +883,53 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
-            command = transport.recv(), if client_connected => {
+            command = transport.recv() => {
                 match command {
                     Some(command) => {
-                        client_connected = handle_dashboard_command(
+                        if !handle_dashboard_command(
                             &transport,
                             &app,
-                            &mut active,
-                            &mut pending,
-                            &mut close_requested,
-                            &tx,
-                            &mut next_generation,
+                            conn_id,
+                            &mut streams,
                             command,
-                        ).await;
-                    }
-                    None => {
-                        client_connected = false;
-                        pending.clear();
-                        if !any_turn_running(&active) {
+                        ).await {
                             break;
                         }
-                        info!("dashboard disconnected, waiting for active turns to settle");
                     }
+                    // Disconnect: sessions live in the hub; running turns keep
+                    // going and can be re-attached mid-flight on reconnect.
+                    None => break,
                 }
             }
-            envelope = rx.recv() => {
-                let Some(envelope) = envelope else {
-                    break;
+            Some((key, event)) = streams.next(), if !streams.is_empty() => {
+                let forwarded = match event {
+                    RelayEvent::Event(event) => {
+                        transport.send(&ServerMessage::Event {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            event: *event,
+                        }).await
+                    }
+                    RelayEvent::Evicted => {
+                        streams.remove(&key);
+                        transport.send(&ServerMessage::SessionEvicted {
+                            workspace_id: key.0,
+                            session_id: key.1,
+                        }).await
+                    }
+                    RelayEvent::Closed => {
+                        streams.remove(&key);
+                        true
+                    }
                 };
-                if !handle_session_envelope(&transport, &mut active, &mut close_requested, envelope, client_connected).await {
-                    client_connected = false;
-                    pending.clear();
-                }
-                if !client_connected && !any_turn_running(&active) {
+                if !forwarded {
                     break;
                 }
             }
         }
     }
 
-    shutdown_active_sessions(active).await;
+    app.hub.detach_all(conn_id).await;
 }
 
 async fn dashboard_ws_handler(
@@ -1594,11 +1232,19 @@ async fn main() {
         workspaces.insert(id, Arc::new(state));
     }
 
+    // The hub owns live sessions process-wide; its opener holds its own map
+    // clones so it exists independently of `AppState`.
+    let hub: Arc<dyn SessionRelay> = Arc::new(SessionHub::new(Arc::new(AppOpener {
+        providers: providers.clone(),
+        workspaces: workspaces.clone(),
+    })));
+
     let state = Arc::new(AppState {
         providers,
         default_provider,
         shutdown: shutdown.clone(),
         workspaces,
+        hub,
     });
 
     // On a shutdown signal, cancel the token: this both ends `axum::serve`'s
@@ -1627,8 +1273,15 @@ async fn main() {
         .await
         .unwrap();
 
+    // Stop every live session (graceful, checkpoints on disk) before tearing
+    // down the MCP connections their tools may still be using.
+    state.hub.shutdown_all().await;
+
     match Arc::try_unwrap(state) {
         Ok(app_state) => {
+            // Drop the hub first: its opener holds workspace references that
+            // would otherwise keep the `Arc::try_unwrap` below from succeeding.
+            drop(app_state.hub);
             for (workspace_id, workspace) in app_state.workspaces {
                 match Arc::try_unwrap(workspace) {
                     Ok(workspace) => workspace.mcp_servers.shutdown().await,

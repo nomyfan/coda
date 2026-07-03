@@ -83,6 +83,9 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** Another client took over this session (latest-wins); the transcript is
+   * read-only until the user takes it back by reopening. */
+  evicted: boolean;
   /** Created locally via "new session" but not yet opened on the server. */
   draft?: boolean;
   /** First user task, used as the session list title before the server persists it. */
@@ -166,6 +169,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     drafts: {},
     allowDrafts: {},
     running: false,
+    evicted: false,
     usage: [],
   };
 }
@@ -1112,6 +1116,7 @@ function applySnapshot(
   approvals: PendingApproval[],
   providerId: string,
   reasoningEffort: ReasoningEffort | null,
+  turnRunning: boolean,
   replaceEmpty = false,
 ) {
   const key = sessionKey(workspaceId, sessionId);
@@ -1134,12 +1139,16 @@ function applySnapshot(
     session.providerId = providerId;
     session.reasoningEffort = reasoningEffort;
     session.usage = usage;
+    // Always reflect the server's authoritative state: a snapshot means this
+    // client holds the session now (clearing any eviction), and `turnRunning`
+    // says whether replayed events of an in-flight turn follow.
+    session.approvals = approvals;
+    session.running = turnRunning;
+    session.evicted = false;
     if (hasHistory || replaceEmpty) {
       session.entries = mapped;
-      session.approvals = approvals;
       session.drafts = {};
       session.allowDrafts = {};
-      session.running = false;
     }
     if (replaceEmpty && !hasHistory) {
       session.firstUserMessage = undefined;
@@ -1160,6 +1169,23 @@ function setSessionModel(
       session.providerId = providerId;
       session.reasoningEffort = reasoningEffort;
     }
+  });
+}
+
+function applyEviction(store: CodaStore, server: string, workspaceId: string, sessionId: string) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.evicted = true;
+    session.running = false;
+    state.servers[server].sessions[key] = addActivity(session, {
+      tone: "warning",
+      label: "session taken over",
+      detail: "Another window opened this session; reopen to take it back.",
+    });
   });
 }
 
@@ -1461,8 +1487,13 @@ export function connectServer(rawUrl: string) {
           message.pending_approvals ?? [],
           message.provider_id,
           message.reasoning_effort ?? null,
+          message.turn_running ?? false,
           sessionToRestore?.key === sessionKey(message.workspace_id, message.session_id),
         );
+        return;
+      }
+      if (message.type === "session_evicted") {
+        applyEviction(codaStore, server, message.workspace_id, message.session_id);
         return;
       }
       if (message.type === "model_changed") {
@@ -1610,6 +1641,17 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
       send(server, openMessage(opened));
     }
   }
+}
+
+/** Re-open the active session, taking it back from whichever client evicted
+ * us (latest-wins: the server evicts them in turn and replays the in-flight
+ * turn to us). */
+export function takeOverActiveSession() {
+  const active = currentActive();
+  if (!active || active.session.draft) {
+    return;
+  }
+  send(active.server, openMessage(active.session));
 }
 
 /** Deselect whatever session is currently shown in the center pane (e.g. when
@@ -1876,6 +1918,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveEvicted = (state: CodaStoreState) =>
+  activeSessionOf(state)?.evicted ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
 export const selectActiveDrafts = (state: CodaStoreState) =>

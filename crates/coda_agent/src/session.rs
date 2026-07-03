@@ -55,6 +55,19 @@ pub struct SessionEvent {
     pub kind: AgentEvent,
 }
 
+/// An item yielded by [`Session::recv`]. `Lagged` surfaces broadcast overflow
+/// to the caller instead of silently dropping events: consumers that
+/// reconstruct state from the stream must know their view has a gap.
+// Not boxed: items are consumed immediately, so the size imbalance never sits
+// in a collection, and boxing would cost an allocation per event.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum SessionStreamItem {
+    Event(SessionEvent),
+    /// The receiver fell behind and `n` events were dropped.
+    Lagged(u64),
+}
+
 /// What to do when a graceful shutdown hits its timeout.
 #[derive(Debug, Clone, Copy)]
 pub enum OnTimeout {
@@ -68,7 +81,8 @@ pub enum OnTimeout {
 #[derive(Debug, Clone, Copy)]
 pub enum Shutdown {
     Graceful {
-        timeout: Duration,
+        /// `None` waits unbounded for agents to exit (`on_timeout` never fires).
+        timeout: Option<Duration>,
         on_timeout: OnTimeout,
     },
     Abort,
@@ -77,15 +91,25 @@ pub enum Shutdown {
 impl Shutdown {
     pub fn graceful(timeout: Duration) -> Self {
         Shutdown::Graceful {
-            timeout,
+            timeout: Some(timeout),
             on_timeout: OnTimeout::Return,
         }
     }
 
     pub fn graceful_then_abort(timeout: Duration) -> Self {
         Shutdown::Graceful {
-            timeout,
+            timeout: Some(timeout),
             on_timeout: OnTimeout::Abort,
+        }
+    }
+
+    /// Wait unbounded for in-flight work to reach its next checkpoint and the
+    /// agents to exit; never aborts. `shutdown` returning `true` is then a
+    /// durability barrier: every agent's final checkpoint is on disk.
+    pub fn graceful_unbounded() -> Self {
+        Shutdown::Graceful {
+            timeout: None,
+            on_timeout: OnTimeout::Return,
         }
     }
 
@@ -459,22 +483,21 @@ impl Session {
         self.inner.runtime.request_abort().await;
     }
 
-    /// Receive the next session event. `None` once the runtime has shut down
-    /// and all events have been drained.
+    /// Receive the next session stream item. `None` once the runtime has shut
+    /// down and all events have been drained.
     ///
-    /// Lagged receivers drop overflowed events (logged via `tracing::warn`)
-    /// rather than block runtime emitters.
-    pub async fn recv(&self) -> Option<SessionEvent> {
+    /// A lagged receiver yields [`SessionStreamItem::Lagged`] instead of
+    /// silently skipping the dropped events — the caller decides how to
+    /// recover (e.g. resync from the persisted checkpoint).
+    pub async fn recv(&self) -> Option<SessionStreamItem> {
         let mut rx = self.inner.events_rx.lock().await;
-        loop {
-            match rx.recv().await {
-                Ok(raw) => return Some(self.wrap_event(raw)),
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("session event stream lagged by {n} events; dropped");
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
+        match rx.recv().await {
+            Ok(raw) => Some(SessionStreamItem::Event(self.wrap_event(raw))),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("session event stream lagged by {n} events; dropped");
+                Some(SessionStreamItem::Lagged(n))
             }
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     }
 
@@ -487,7 +510,7 @@ impl Session {
                 on_timeout,
             } => {
                 self.inner.runtime.request_exit().await;
-                let ok = self.inner.runtime.wait_for_exit(Some(timeout)).await;
+                let ok = self.inner.runtime.wait_for_exit(timeout).await;
                 if !ok {
                     match on_timeout {
                         OnTimeout::Return => false,
