@@ -610,6 +610,61 @@ async fn send_pending_approval_events<
     true
 }
 
+/// Attach to `key` in the hub and wire the result to this connection: send the
+/// `Snapshot`, register the replay+live stream, and remember the model
+/// selection the session actually uses so a hub-initiated close can re-attach
+/// transparently. Returns `false` when the transport is gone.
+#[allow(clippy::too_many_arguments)]
+async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+    transport: &T,
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
+    selections: &mut HashMap<SessionKey, (String, Option<ReasoningEffort>)>,
+    key: SessionKey,
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> bool {
+    match app
+        .hub
+        .attach(key.clone(), conn_id, provider_id, reasoning_effort)
+        .await
+    {
+        Ok(AttachSession { snapshot, events }) => {
+            selections.insert(
+                key.clone(),
+                (snapshot.provider_id.clone(), snapshot.reasoning_effort),
+            );
+            if !transport
+                .send(&ServerMessage::Snapshot {
+                    workspace_id: key.0.clone(),
+                    session_id: key.1.clone(),
+                    messages: snapshot.messages,
+                    pending_approvals: snapshot
+                        .pending_approvals
+                        .into_iter()
+                        .map(PendingApprovalWire::from_agent)
+                        .collect(),
+                    provider_id: snapshot.provider_id,
+                    reasoning_effort: snapshot.reasoning_effort,
+                    turn_running: snapshot.turn_running,
+                })
+                .await
+            {
+                return false;
+            }
+            // Replay + live events flow through the connection's stream map
+            // from here on.
+            streams.insert(key, events);
+            true
+        }
+        Err(err) => {
+            send_open_error(transport, &key.0, &key.1, err).await;
+            true
+        }
+    }
+}
+
 async fn handle_dashboard_command<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
@@ -617,6 +672,7 @@ async fn handle_dashboard_command<
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
+    selections: &mut HashMap<SessionKey, (String, Option<ReasoningEffort>)>,
     command: ClientMessage,
 ) -> bool {
     match command {
@@ -641,41 +697,22 @@ async fn handle_dashboard_command<
             // session is already live in the hub.
             let (provider_id, reasoning_effort) =
                 resolve_selection(app, provider_id, reasoning_effort);
-            let key = (workspace_id.clone(), session_id.clone());
-            match app
-                .hub
-                .attach(key.clone(), conn_id, provider_id, reasoning_effort)
-                .await
+            let key = (workspace_id, session_id);
+            if !attach_and_stream(
+                transport,
+                app,
+                conn_id,
+                streams,
+                selections,
+                key,
+                provider_id,
+                reasoning_effort,
+            )
+            .await
             {
-                Ok(AttachSession { snapshot, events }) => {
-                    if !transport
-                        .send(&ServerMessage::Snapshot {
-                            workspace_id,
-                            session_id,
-                            messages: snapshot.messages,
-                            pending_approvals: snapshot
-                                .pending_approvals
-                                .into_iter()
-                                .map(PendingApprovalWire::from_agent)
-                                .collect(),
-                            provider_id: snapshot.provider_id,
-                            reasoning_effort: snapshot.reasoning_effort,
-                            turn_running: snapshot.turn_running,
-                        })
-                        .await
-                    {
-                        return false;
-                    }
-                    // Replay + live events flow through the connection's
-                    // stream map from here on.
-                    streams.insert(key, events);
-                    send_workspace_catalog(transport, app).await
-                }
-                Err(err) => {
-                    send_open_error(transport, &workspace_id, &session_id, err).await;
-                    true
-                }
+                return false;
             }
+            send_workspace_catalog(transport, app).await
         }
         ClientMessage::Task {
             workspace_id,
@@ -772,6 +809,7 @@ async fn handle_dashboard_command<
             // eviction; then stop the runtime before removing its files so no
             // checkpoint is written back after deletion.
             streams.remove(&key);
+            selections.remove(&key);
             app.hub.delete(key).await;
             let Some(workspace) = app.workspaces.get(&workspace_id) else {
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
@@ -788,6 +826,7 @@ async fn handle_dashboard_command<
         } => {
             let key = (workspace_id, session_id);
             streams.remove(&key);
+            selections.remove(&key);
             // The hub keeps the session alive while a turn is in flight and
             // releases it once idle — no per-connection deferral needed.
             app.hub.detach(key, conn_id).await;
@@ -872,6 +911,12 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
     // that ends silently (detach/takeover elsewhere) is dropped from the map
     // automatically.
     let mut streams: StreamMap<SessionKey, BoxStream<'static, RelayEvent>> = StreamMap::new();
+    // The model selection each attached session actually uses, so a
+    // hub-initiated close can re-attach with the same model.
+    let mut selections: HashMap<SessionKey, (String, Option<ReasoningEffort>)> = HashMap::new();
+    // Keys re-attached after a `Closed` that have produced no event since:
+    // a session that closes again right away is not retried (no reopen loop).
+    let mut reattached: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
 
     if !send_workspace_catalog(&transport, &app).await {
         return;
@@ -891,6 +936,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                             &app,
                             conn_id,
                             &mut streams,
+                            &mut selections,
                             command,
                         ).await {
                             break;
@@ -904,6 +950,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
             Some((key, event)) = streams.next(), if !streams.is_empty() => {
                 let forwarded = match event {
                     RelayEvent::Event(event) => {
+                        reattached.remove(&key);
                         transport.send(&ServerMessage::Event {
                             workspace_id: key.0.clone(),
                             session_id: key.1.clone(),
@@ -912,14 +959,41 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                     }
                     RelayEvent::Evicted => {
                         streams.remove(&key);
+                        selections.remove(&key);
+                        reattached.remove(&key);
                         transport.send(&ServerMessage::SessionEvicted {
                             workspace_id: key.0,
                             session_id: key.1,
                         }).await
                     }
+                    // The hub ended this stream: a lag drain (resync from
+                    // disk) or the runtime terminating. Re-attach with a fresh
+                    // snapshot instead of leaving the client without a signal;
+                    // the hub's release barrier makes the fresh attach wait for
+                    // the final checkpoint. Guarded to one silent retry so a
+                    // session that dies on open can't loop, and skipped during
+                    // process shutdown.
                     RelayEvent::Closed => {
                         streams.remove(&key);
-                        true
+                        let selection = selections.remove(&key);
+                        if let Some((provider_id, reasoning_effort)) = selection
+                            && !app.shutdown.is_cancelled()
+                            && reattached.insert(key.clone())
+                        {
+                            info!(workspace_id = %key.0, session_id = %key.1, "session closed by hub; re-attaching");
+                            attach_and_stream(
+                                &transport,
+                                &app,
+                                conn_id,
+                                &mut streams,
+                                &mut selections,
+                                key,
+                                provider_id,
+                                reasoning_effort,
+                            ).await
+                        } else {
+                            true
+                        }
                     }
                 };
                 if !forwarded {

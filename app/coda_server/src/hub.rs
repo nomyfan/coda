@@ -462,6 +462,10 @@ impl SessionHub {
             EntryPhase::Live(live) => Some(live.session),
             _ => None,
         };
+        // `Closed` is sent before the shutdown below completes; that cannot
+        // race a reattach past the checkpoint barrier, because an attach that
+        // arrives while the phase is `Releasing` waits for `done` (set only
+        // after shutdown returned and the map entry is gone).
         if let Some(attachment) = state.attached.take()
             && notify_closed
         {
