@@ -805,12 +805,16 @@ async fn handle_dashboard_command<
                 return true;
             }
             let key = (workspace_id.clone(), session_id.clone());
-            // Drop our own stream first so this connection doesn't see its own
-            // eviction; then stop the runtime before removing its files so no
-            // checkpoint is written back after deletion.
+            // Stop the runtime before removing its files so no checkpoint is
+            // written back after deletion. Rejected when another connection is
+            // attached — a stale client must not erase work someone else is
+            // driving; the persisted state stays too.
+            if !app.hub.delete(key.clone(), conn_id).await {
+                return true;
+            }
+            // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
             selections.remove(&key);
-            app.hub.delete(key).await;
             let Some(workspace) = app.workspaces.get(&workspace_id) else {
                 warn!(workspace_id = %workspace_id, "unknown workspace requested");
                 return true;
@@ -864,7 +868,7 @@ async fn handle_dashboard_command<
             match app
                 .hub
                 .command(
-                    key,
+                    key.clone(),
                     conn_id,
                     SessionCommand::SetModel {
                         provider_id,
@@ -877,6 +881,9 @@ async fn handle_dashboard_command<
                     provider_id,
                     reasoning_effort,
                 } => {
+                    // Keep the re-attach cache on the new selection so a
+                    // hub-initiated close doesn't reopen on the old model.
+                    selections.insert(key, (provider_id.clone(), reasoning_effort));
                     transport
                         .send(&ServerMessage::ModelChanged {
                             workspace_id,

@@ -1428,7 +1428,10 @@ function activeSessionToRestore(server: string): SessionRestoreMessage | undefin
     return undefined;
   }
   const session = snapshot.servers[server]?.sessions[snapshot.activeKey];
-  return session?.draft
+  // An evicted session belongs to another client now; restoring it on a
+  // transient reconnect would silently take it back — that must stay an
+  // explicit user action ("Take over").
+  return !session || session.draft || session.evicted
     ? undefined
     : {
         message: openMessage(session),

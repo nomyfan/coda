@@ -158,9 +158,17 @@ pub trait SessionRelay: Send + Sync {
     fn detach_all<'a>(&'a self, conn_id: ConnId) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Stop and remove the session immediately (aborting in-flight work, no
-    /// checkpoint write-back), evicting any attached client. Returns once the
-    /// runtime is gone so the caller can safely delete persisted state.
-    fn delete<'a>(&'a self, key: SessionKey) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// checkpoint write-back). Returns `true` once the runtime is gone so the
+    /// caller can safely delete persisted state, and `false` when the session
+    /// is currently attached by a *different* connection — a stale client must
+    /// not be able to erase work another client is driving (latest-wins).
+    /// Unattached sessions (e.g. deleting history from the catalog) are fair
+    /// game for any connection.
+    fn delete<'a>(
+        &'a self,
+        key: SessionKey,
+        conn_id: ConnId,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
     /// The provider a live (or pending) session was opened with.
     fn provider_of<'a>(
@@ -865,13 +873,31 @@ impl SessionRelay for SessionHub {
         })
     }
 
-    fn delete<'a>(&'a self, key: SessionKey) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    fn delete<'a>(
+        &'a self,
+        key: SessionKey,
+        conn_id: ConnId,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             let Some(entry) = self.get_entry(&key) else {
-                return;
+                return true; // nothing live; persisted state is free to go
             };
             let mut guard = entry.inner.clone().lock_owned().await;
             let state = &mut *guard;
+            // Latest-wins also covers destruction: only the attached client
+            // (or anyone, when nobody is attached) may delete a live session.
+            if state
+                .attached
+                .as_ref()
+                .is_some_and(|attachment| attachment.conn_id != conn_id)
+            {
+                warn!(
+                    workspace_id = %key.0,
+                    session_id = %key.1,
+                    "rejecting delete from a connection that is not attached"
+                );
+                return false;
+            }
             if matches!(
                 state.phase,
                 EntryPhase::Releasing { .. } | EntryPhase::Released
@@ -887,7 +913,7 @@ impl SessionRelay for SessionHub {
                         }
                     }
                 }
-                return;
+                return true;
             }
             if let Some(attachment) = state.attached.take() {
                 let _ = attachment.tx.send(RelayEvent::Evicted);
@@ -898,6 +924,7 @@ impl SessionRelay for SessionHub {
             drop(guard);
             // Inline: the caller deletes persisted state right after.
             release.await;
+            true
         })
     }
 
@@ -1707,9 +1734,10 @@ mod tests {
             },
         )
         .await;
-        // 2000 chunks exceed the old broadcast capacity (128) and stress the
-        // new one (1024); the pump must keep the receiver drained so nothing
-        // is lost and the turn settles normally.
+        // 600 chunks exceed the old broadcast capacity (128) while staying
+        // within the new one (1024), so the burst is deterministically
+        // lossless; the pump must keep the receiver drained and the turn
+        // settles normally.
         next_matching(&mut events1, is_settling_llm_end).await;
 
         let attach2 = hub
@@ -1808,8 +1836,31 @@ mod tests {
             .expect("attach");
         let mut events1 = attach1.events;
 
-        hub.delete(key()).await;
+        assert!(hub.delete(key(), 1).await);
         next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
+        assert!(hub.get_entry(&key()).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_from_stale_connection_is_rejected() {
+        // Latest-wins covers destruction too: after being evicted, the old
+        // connection must not be able to delete the session the new client is
+        // driving.
+        let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+        let _attach1 = hub
+            .attach(key(), 1, "prov".into(), None)
+            .await
+            .expect("attach");
+        let _attach2 = hub
+            .attach(key(), 2, "prov".into(), None)
+            .await
+            .expect("attach2 evicts conn 1");
+
+        assert!(!hub.delete(key(), 1).await);
+        assert!(hub.get_entry(&key()).is_some());
+
+        // The attached client itself may delete.
+        assert!(hub.delete(key(), 2).await);
         assert!(hub.get_entry(&key()).is_none());
     }
 
