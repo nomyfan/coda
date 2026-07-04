@@ -1802,6 +1802,12 @@ export function submitApprovals() {
   if (!active) {
     return;
   }
+  // Defense in depth behind the takeover mask: an evicted tab's approvals are
+  // a stale snapshot — resumes would be rejected server-side, but the staged
+  // allow-pattern writes would not, so nothing may be sent from here.
+  if (active.session.evicted) {
+    return;
+  }
   for (const approval of active.session.approvals) {
     const approvalId = approvalKey(approval);
     const draft = active.session.drafts[approvalId] ?? {};

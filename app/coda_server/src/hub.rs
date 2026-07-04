@@ -87,7 +87,9 @@ pub struct AttachSession {
 pub enum CommandOutcome {
     /// The command was accepted (or was a benign no-op).
     Ok,
-    /// Stale connection or invalid state; logged, nothing to send.
+    /// The command was not applied: stale connection, invalid state, or the
+    /// session did not accept it (e.g. runtime channel closed). Logged;
+    /// nothing to send.
     Ignored,
     /// A `Resume` against an approvals-gated open that still needs more
     /// decisions; the client should be shown these approvals.
@@ -573,11 +575,16 @@ impl SessionHub {
         // user message or a stuck running flag.
         if let Err(err) = live.session.send(task.clone(), images.clone()).await {
             warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
-            return CommandOutcome::Ok;
+            return CommandOutcome::Ignored;
         }
         live.turn_running = true;
         live.unsettled_users
             .push_back(Message::User(UserMessage::with_images(task, &images)));
+        // A task sent while approvals were pending supersedes them: the driver
+        // writes the discarded calls as aborted ToolMessages (announced via
+        // ToolCallEnd) and starts a fresh turn, so advertising them to a later
+        // attach would offer a resume for work that no longer exists.
+        live.pending_approvals.clear();
         CommandOutcome::Ok
     }
 
@@ -594,7 +601,7 @@ impl SessionHub {
             EntryPhase::Live(live) => {
                 if let Err(err) = live.session.resume(&agent_name, &thread_id, decision).await {
                     warn!(workspace_id = %key.0, session_id = %key.1, "failed to resume: {err}");
-                    return CommandOutcome::Ok;
+                    return CommandOutcome::Ignored;
                 }
                 live.turn_running = true;
                 live.pending_approvals
@@ -1828,6 +1835,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn new_task_clears_superseded_pending_approvals() {
+        // Suspend for approval, then send a fresh task instead of resuming:
+        // the driver discards the pending calls, so a later attach must not
+        // advertise the stale approval.
+        let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
+        let attach1 = hub
+            .attach(key(), 1, "prov".into(), None)
+            .await
+            .expect("attach");
+        let mut events1 = attach1.events;
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "needs approval".into(),
+                images: vec![],
+            },
+        )
+        .await;
+        next_matching(
+            &mut events1,
+            |e| matches!(e, RelayEvent::Event(ev) if matches!(&**ev, WireEvent::Suspended { .. })),
+        )
+        .await;
+
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "never mind, do this instead".into(),
+                images: vec![],
+            },
+        )
+        .await;
+        next_matching(&mut events1, is_settling_llm_end).await;
+
+        let attach2 = hub
+            .attach(key(), 2, "prov".into(), None)
+            .await
+            .expect("attach2");
+        assert!(attach2.snapshot.pending_approvals.is_empty());
+        // The discarded call is folded as an aborted tool message, before the
+        // superseding user prompt.
+        assert!(attach2.snapshot.messages.iter().any(|m| matches!(
+            m,
+            Message::Tool(t) if matches!(t.outcome, coda_core::llm::ToolCallOutcome::Aborted)
+        )));
+
+        hub.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn delete_evicts_attached_client_and_removes_entry() {
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let attach1 = hub
@@ -1888,7 +1947,7 @@ mod tests {
                 },
             )
             .await,
-            CommandOutcome::Ok
+            CommandOutcome::Ignored
         ));
         {
             let entry = hub.get_entry(&key()).expect("entry");
