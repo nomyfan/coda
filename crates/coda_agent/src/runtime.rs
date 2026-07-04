@@ -209,8 +209,9 @@ pub(crate) struct AgentRuntime {
 impl AgentRuntime {
     pub(crate) fn new(session_storage: impl SessionStorage + 'static, session_id: String) -> Self {
         // Sized for chunk-level event bursts (LLM streaming): a lagged receiver
-        // drops events, which consumers can only partially recover from.
-        let (global_event_tx, _) = broadcast::channel(1024);
+        // drops events, which consumers can only partially recover from. A
+        // margin against scheduling delays, not a response to an observed failure.
+        let (global_event_tx, _) = broadcast::channel(256);
         AgentRuntime {
             session_id,
             agents: Arc::new(Mutex::new(HashMap::new())),

@@ -72,8 +72,9 @@ fn user(text: &str) -> Message {
 
 #[test]
 fn event_log_overflow_drops_oldest_chunk_tier_first() {
-    let mut log = EventLog::default();
-    for i in 0..MAX_LOG_EVENTS {
+    let limits = RelayConfig::default();
+    let mut log = EventLog::new(limits);
+    for i in 0..limits.max_log_events {
         if i == 10 {
             log.push(tool_end("coda", tool_message("keep", "kept")));
         } else {
@@ -81,7 +82,7 @@ fn event_log_overflow_drops_oldest_chunk_tier_first() {
         }
     }
     log.push(llm_end("coda", assistant("fin")));
-    assert_eq!(log.entries.len(), MAX_LOG_EVENTS);
+    assert_eq!(log.entries.len(), limits.max_log_events);
     // The oldest chunk was evicted; the message-tier events survive.
     assert!(matches!(
         log.entries.front(),
@@ -99,17 +100,19 @@ fn event_log_all_message_tier_grows_past_chunk_cap() {
     // corrupt the fold. Bounding this case is `message_tier_overflowed`'s
     // job (checked below), enforced by the forwarder forcing a resync;
     // see `runaway_tool_calls_force_resync_instead_of_unbounded_log`.
-    let mut log = EventLog::default();
-    for i in 0..(MAX_LOG_EVENTS + 5) {
+    let limits = RelayConfig::default();
+    let mut log = EventLog::new(limits);
+    for i in 0..(limits.max_log_events + 5) {
         log.push(tool_end("coda", tool_message(&format!("m{i}"), "x")));
     }
-    assert_eq!(log.entries.len(), MAX_LOG_EVENTS + 5);
+    assert_eq!(log.entries.len(), limits.max_log_events + 5);
 }
 
 #[test]
 fn event_log_message_tier_overflow_flag() {
-    let mut log = EventLog::default();
-    for i in 0..MAX_MESSAGE_TIER_EVENTS {
+    let limits = RelayConfig::default();
+    let mut log = EventLog::new(limits);
+    for i in 0..limits.max_message_tier_events {
         log.push(tool_end("coda", tool_message(&format!("m{i}"), "x")));
         assert!(!log.message_tier_overflowed());
     }
@@ -129,7 +132,7 @@ fn fold_orders_stale_cleanup_before_user() {
     // then the new user prompt, then the assistant reply.
     let mut snapshot = vec![];
     let mut users = VecDeque::from([user("new task")]);
-    let mut log = EventLog::default();
+    let mut log = EventLog::new(RelayConfig::default());
     log.push(tool_end("coda", tool_message("stale1", "aborted")));
     log.push(tool_end("coda", tool_message("stale2", "aborted")));
     log.push(chunk("coda", "hi"));
@@ -150,7 +153,7 @@ fn fold_orders_stale_cleanup_before_user() {
 fn fold_skips_subagent_and_chunk_events() {
     let mut snapshot = vec![];
     let mut users = VecDeque::from([user("task")]);
-    let mut log = EventLog::default();
+    let mut log = EventLog::new(RelayConfig::default());
     log.push(chunk("coda", "x"));
     log.push(llm_end("coda", assistant("delegating")));
     log.push(llm_end("explore", assistant("sub result")));
@@ -175,7 +178,7 @@ fn fold_skips_subagent_and_chunk_events() {
 fn fold_tolerates_missing_user_for_resumed_turns() {
     let mut snapshot = vec![];
     let mut users = VecDeque::new();
-    let mut log = EventLog::default();
+    let mut log = EventLog::new(RelayConfig::default());
     log.push(tool_end("coda", tool_message("resolved", "ok")));
     log.push(llm_end("coda", assistant("after resume")));
 
@@ -252,21 +255,21 @@ impl LLMProvider for TestProvider {
                     ),
                 )
             }
-            // 600 chunks: far past the old broadcast capacity (128) but
-            // within the new one (1024), so even a fully starved pump
-            // cannot lag — the buffer holds the whole burst. (A real LLM
-            // stream awaits the network per chunk so the producer yields;
-            // this synchronous iter is already an adversarial case.)
+            // 200 chunks: comfortably within the broadcast channel's capacity
+            // (256), so even a fully starved pump cannot lag — the buffer
+            // holds the whole burst. (A real LLM stream awaits the network
+            // per chunk so the producer yields; this synchronous iter is
+            // already an adversarial case.)
             "burst" => {
-                let chunks: Vec<_> = (0..600)
+                let chunks: Vec<_> = (0..200)
                     .map(|i| Ok(LLMStreamEvent::ContentChunk(format!("c{i} "))))
                     .collect();
                 Box::pin(stream::iter(chunks).chain(Self::completed(assistant("burst done"))))
             }
             // One turn that fans out far more local tool calls than
-            // `MAX_MESSAGE_TIER_EVENTS` — each completion is a
-            // message-tier `ToolCallEnd`, so this turn must trip the
-            // forced-resync path long before it would ever settle.
+            // `RelayConfig::default().max_message_tier_events` — each
+            // completion is a message-tier `ToolCallEnd`, so this turn must
+            // trip the forced-resync path long before it would ever settle.
             "runaway" => {
                 let has_result = request
                     .messages
@@ -278,7 +281,7 @@ impl LLMProvider for TestProvider {
                     ))
                 } else {
                     let mut msg = assistant("");
-                    msg.tool_calls = (0..(MAX_MESSAGE_TIER_EVENTS + 10))
+                    msg.tool_calls = (0..(RelayConfig::default().max_message_tier_events + 10))
                         .map(|i| ToolCall {
                             id: format!("call_{i}"),
                             name: "read_todos".into(),
@@ -391,7 +394,7 @@ impl SessionOpener for TestOpener {
 fn hub_with(system_prompt: &str, approval: ToolApprovalMode) -> (SessionHub, Arc<Notify>) {
     let opener = Arc::new(TestOpener::new(system_prompt, approval));
     let gate = opener.provider.gate.clone();
-    (SessionHub::new(opener), gate)
+    (SessionHub::new(opener, RelayConfig::default()), gate)
 }
 
 fn key() -> SessionKey {
@@ -536,7 +539,7 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn detach_idle_releases_and_reattach_reopens_from_disk() {
+async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
         .attach(key(), 1, "prov".into(), None, false)
@@ -626,10 +629,9 @@ async fn burst_of_chunks_survives_replay_and_fold() {
         },
     )
     .await;
-    // 600 chunks exceed the old broadcast capacity (128) while staying
-    // within the new one (1024), so the burst is deterministically
-    // lossless; the pump must keep the receiver drained and the turn
-    // settles normally.
+    // 200 chunks stay within the broadcast channel's capacity (256), so
+    // the burst is deterministically lossless; the pump must keep the
+    // receiver drained and the turn settles normally.
     next_matching(&mut events1, is_settling_llm_end).await;
 
     let attach2 = hub
@@ -663,9 +665,9 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
     )
     .await;
 
-    // The log crosses MAX_MESSAGE_TIER_EVENTS long before the fan-out
-    // turn could ever settle; the client is told to resync rather than
-    // the hub buffering all of it in memory.
+    // The log crosses the configured message-tier cap long before the
+    // fan-out turn could ever settle; the client is told to resync rather
+    // than the hub buffering all of it in memory.
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
     wait_released(&hub).await;
 
@@ -901,7 +903,7 @@ async fn failed_resume_does_not_stick_turn_running() {
             panic!("expected live entry");
         };
         assert!(!live.turn_running);
-        assert!(live.unsettled_users.is_empty());
+        assert!(live.unsettled_user_messages.is_empty());
     }
 
     // With no stuck flag, walking away releases the entry.
@@ -913,9 +915,9 @@ async fn failed_resume_does_not_stick_turn_running() {
 async fn lagged_stream_drains_session_and_closes_client() {
     // A lagged event stream means the in-memory view has a gap; the hub
     // must drain the session behind a checkpoint barrier and end the
-    // client stream with `Closed` so it re-attaches from disk. Injected
-    // via a parallel forwarder — the real pump makes lag (deliberately)
-    // hard to reproduce.
+    // client stream with `Closed` so it re-attaches from the persisted
+    // state. Injected via a parallel forwarder — the real pump makes lag
+    // (deliberately) hard to reproduce.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
         .attach(key(), 1, "prov".into(), None, false)
@@ -937,7 +939,7 @@ async fn lagged_stream_drains_session_and_closes_client() {
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
     wait_released(&hub).await;
 
-    // Reopening reads the authoritative checkpoint from disk.
+    // Reopening reads the authoritative persisted checkpoint.
     let attach2 = hub
         .attach(key(), 2, "prov".into(), None, true)
         .await

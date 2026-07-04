@@ -75,7 +75,7 @@ struct AppState {
     workspaces: HashMap<String, Arc<WorkspaceState>>,
     /// Process-level session relay: live sessions belong here, not to the
     /// connection that opened them. See `coda_server::hub`.
-    hub: Arc<dyn SessionRelay>,
+    relay: Arc<dyn SessionRelay>,
 }
 
 /// A constructed provider model entry. `model_id` is the API model name sent in
@@ -610,6 +610,11 @@ async fn send_pending_approval_events<
     true
 }
 
+struct Selection {
+    provider_id: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
 /// Attach to `key` in the hub and wire the result to this connection: send the
 /// `Snapshot`, register the replay+live stream, and remember the model
 /// selection the session actually uses so a hub-initiated close can re-attach
@@ -620,14 +625,14 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
-    selections: &mut HashMap<SessionKey, (String, Option<ReasoningEffort>)>,
+    selections: &mut HashMap<SessionKey, Selection>,
     key: SessionKey,
     provider_id: String,
     reasoning_effort: Option<ReasoningEffort>,
     takeover: bool,
 ) -> bool {
     match app
-        .hub
+        .relay
         .attach(
             key.clone(),
             conn_id,
@@ -640,7 +645,10 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
         Ok(AttachSession { snapshot, events }) => {
             selections.insert(
                 key.clone(),
-                (snapshot.provider_id.clone(), snapshot.reasoning_effort),
+                Selection {
+                    provider_id: snapshot.provider_id.clone(),
+                    reasoning_effort: snapshot.reasoning_effort,
+                },
             );
             if !transport
                 .send(&ServerMessage::Snapshot {
@@ -682,14 +690,14 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
     }
 }
 
-async fn handle_dashboard_command<
+async fn handle_connection_command<
     T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
 >(
     transport: &T,
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
-    selections: &mut HashMap<SessionKey, (String, Option<ReasoningEffort>)>,
+    selections: &mut HashMap<SessionKey, Selection>,
     command: ClientMessage,
 ) -> bool {
     match command {
@@ -744,7 +752,7 @@ async fn handle_dashboard_command<
             // frontend already disables image sends for such models, so reaching
             // here means a UI bypass — surface an error rather than silently
             // dropping the attachments.
-            let accepts_images = match app.hub.provider_of(key.clone()).await {
+            let accepts_images = match app.relay.provider_of(key.clone()).await {
                 Some(provider_id) => app
                     .providers
                     .get(&provider_id)
@@ -770,7 +778,7 @@ async fn handle_dashboard_command<
             if task.is_empty() && images.is_empty() {
                 return true;
             }
-            app.hub
+            app.relay
                 .command(key, conn_id, SessionCommand::Task { task, images })
                 .await;
             true
@@ -784,7 +792,7 @@ async fn handle_dashboard_command<
         } => {
             let key = (workspace_id.clone(), session_id.clone());
             match app
-                .hub
+                .relay
                 .command(
                     key,
                     conn_id,
@@ -810,7 +818,7 @@ async fn handle_dashboard_command<
             workspace_id,
             session_id,
         } => {
-            app.hub
+            app.relay
                 .command((workspace_id, session_id), conn_id, SessionCommand::Abort)
                 .await;
             true
@@ -828,7 +836,7 @@ async fn handle_dashboard_command<
             // written back after deletion. Rejected when another connection is
             // attached — a stale client must not erase work someone else is
             // driving; the persisted state stays too.
-            if !app.hub.delete(key.clone(), conn_id).await {
+            if !app.relay.delete(key.clone(), conn_id).await {
                 return true;
             }
             // Drop our own stream (the hub evicted our attachment, if any).
@@ -852,7 +860,7 @@ async fn handle_dashboard_command<
             selections.remove(&key);
             // The hub keeps the session alive while a turn is in flight and
             // releases it once idle — no per-connection deferral needed.
-            app.hub.detach(key, conn_id).await;
+            app.relay.detach(key, conn_id).await;
             true
         }
         ClientMessage::AddAllowPattern {
@@ -885,7 +893,7 @@ async fn handle_dashboard_command<
             };
             let key = (workspace_id.clone(), session_id.clone());
             match app
-                .hub
+                .relay
                 .command(
                     key.clone(),
                     conn_id,
@@ -902,7 +910,13 @@ async fn handle_dashboard_command<
                 } => {
                     // Keep the re-attach cache on the new selection so a
                     // hub-initiated close doesn't reopen on the old model.
-                    selections.insert(key, (provider_id.clone(), reasoning_effort));
+                    selections.insert(
+                        key,
+                        Selection {
+                            provider_id: provider_id.clone(),
+                            reasoning_effort,
+                        },
+                    );
                     transport
                         .send(&ServerMessage::ModelChanged {
                             workspace_id,
@@ -928,7 +942,7 @@ async fn handle_dashboard_command<
 /// stale-command rejection). Monotonic per process.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
-async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
     transport: T,
     app: Arc<AppState>,
 ) {
@@ -939,7 +953,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
     let mut streams: StreamMap<SessionKey, BoxStream<'static, RelayEvent>> = StreamMap::new();
     // The model selection each attached session actually uses, so a
     // hub-initiated close can re-attach with the same model.
-    let mut selections: HashMap<SessionKey, (String, Option<ReasoningEffort>)> = HashMap::new();
+    let mut selections: HashMap<SessionKey, Selection> = HashMap::new();
     // Keys re-attached after a `Closed` that have produced no event since:
     // a session that closes again right away is not retried (no reopen loop).
     let mut reattached: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
@@ -957,7 +971,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
             command = transport.recv() => {
                 match command {
                     Some(command) => {
-                        if !handle_dashboard_command(
+                        if !handle_connection_command(
                             &transport,
                             &app,
                             conn_id,
@@ -992,17 +1006,20 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                             session_id: key.1,
                         }).await
                     }
-                    // The hub ended this stream: a lag drain (resync from
-                    // disk) or the runtime terminating. Re-attach with a fresh
-                    // snapshot instead of leaving the client without a signal;
-                    // the hub's release barrier makes the fresh attach wait for
-                    // the final checkpoint. Guarded to one silent retry so a
-                    // session that dies on open can't loop, and skipped during
-                    // process shutdown.
+                    // The hub ended this stream: a forced resync (lag or
+                    // buffer overflow) or the runtime terminating. Re-attach
+                    // with a fresh snapshot instead of leaving the client
+                    // without a signal; the hub's release barrier makes the
+                    // fresh attach wait for the final checkpoint. Guarded to
+                    // one silent retry so a session that dies on open can't
+                    // loop, and skipped during process shutdown.
                     RelayEvent::Closed => {
                         streams.remove(&key);
                         let selection = selections.remove(&key);
-                        if let Some((provider_id, reasoning_effort)) = selection
+                        if let Some(Selection {
+                            provider_id,
+                            reasoning_effort,
+                        }) = selection
                             && !app.shutdown.is_cancelled()
                             && reattached.insert(key.clone())
                         {
@@ -1033,17 +1050,17 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
         }
     }
 
-    app.hub.detach_all(conn_id).await;
+    app.relay.detach_all(conn_id).await;
 }
 
-async fn dashboard_ws_handler(
+async fn connection_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
-        info!("dashboard connected");
-        run_dashboard(WebSocketTransport::new(socket), state).await;
-        info!("dashboard connection closed");
+        info!("connection opened");
+        run_connection(WebSocketTransport::new(socket), state).await;
+        info!("connection closed");
     })
 }
 
@@ -1336,19 +1353,22 @@ async fn main() {
         workspaces.insert(id, Arc::new(state));
     }
 
-    // The hub owns live sessions process-wide; its opener holds its own map
+    // The relay owns live sessions process-wide; its opener holds its own map
     // clones so it exists independently of `AppState`.
-    let hub: Arc<dyn SessionRelay> = Arc::new(SessionHub::new(Arc::new(AppOpener {
-        providers: providers.clone(),
-        workspaces: workspaces.clone(),
-    })));
+    let relay: Arc<dyn SessionRelay> = Arc::new(SessionHub::new(
+        Arc::new(AppOpener {
+            providers: providers.clone(),
+            workspaces: workspaces.clone(),
+        }),
+        server_config.relay,
+    ));
 
     let state = Arc::new(AppState {
         providers,
         default_provider,
         shutdown: shutdown.clone(),
         workspaces,
-        hub,
+        relay,
     });
 
     // On a shutdown signal, cancel the token: this both ends `axum::serve`'s
@@ -1363,7 +1383,7 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/ws", get(dashboard_ws_handler))
+        .route("/ws", get(connection_ws_handler))
         .with_state(state.clone());
 
     let listen_addr = cli.listen_addr;
@@ -1379,13 +1399,13 @@ async fn main() {
 
     // Stop every live session (graceful, checkpoints on disk) before tearing
     // down the MCP connections their tools may still be using.
-    state.hub.shutdown_all().await;
+    state.relay.shutdown_all().await;
 
     match Arc::try_unwrap(state) {
         Ok(app_state) => {
             // Drop the hub first: its opener holds workspace references that
             // would otherwise keep the `Arc::try_unwrap` below from succeeding.
-            drop(app_state.hub);
+            drop(app_state.relay);
             for (workspace_id, workspace) in app_state.workspaces {
                 match Arc::try_unwrap(workspace) {
                     Ok(workspace) => workspace.mcp_servers.shutdown().await,

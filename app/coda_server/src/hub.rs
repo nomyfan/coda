@@ -5,7 +5,8 @@
 //! previous client) and receive a snapshot plus a single ordered event stream
 //! that replays the in-flight turn before switching to live events. A
 //! disconnect merely detaches; a running turn keeps going and the session is
-//! released (gracefully, checkpoint on disk) once it is idle *and* unattached.
+//! released (gracefully, its checkpoint persisted) once it is idle *and*
+//! unattached.
 //!
 //! [`SessionRelay`] is the only abstraction the connection layer sees. All its
 //! inputs/outputs are plain data (no closures), so a future multi-instance
@@ -26,6 +27,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
+use crate::config::RelayConfig;
 use crate::wire::WireEvent;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
@@ -216,28 +218,15 @@ pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
     }
 }
 
-/// Soft cap on buffered events for one turn. On overflow the oldest chunk-tier
-/// event is dropped first; message-bearing events are never dropped so the
-/// settle-fold cannot lose history.
-const MAX_LOG_EVENTS: usize = 8192;
-
-/// Hard cap on buffered *message*-tier events for one turn. These can't be
-/// evicted like chunk-tier events without corrupting the fold, so a turn that
-/// buffers more than this (a runaway tool-calling loop, say) is treated like
-/// a lagged stream: the forwarder forces a resync from disk instead of
-/// letting the log grow without bound. A turn that settles normally clears
-/// the log (and this count) long before reaching it.
-const MAX_MESSAGE_TIER_EVENTS: usize = 4096;
-
 /// The current turn's events, in order. Cleared when the turn settles (the
 /// settled turn is folded into the entry's snapshot instead).
-#[derive(Default)]
 struct EventLog {
     entries: VecDeque<WireEvent>,
     overflowed: bool,
-    /// Buffered message-tier entries; chunk-tier entries (evicted on the
-    /// `MAX_LOG_EVENTS` path above) don't count.
+    /// Buffered message-tier entries; chunk-tier entries (evicted by `push`'s
+    /// soft-cap eviction) don't count.
     message_tier_len: usize,
+    limits: RelayConfig,
 }
 
 fn is_chunk_tier(event: &WireEvent) -> bool {
@@ -251,18 +240,28 @@ fn is_chunk_tier(event: &WireEvent) -> bool {
 }
 
 impl EventLog {
+    fn new(limits: RelayConfig) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            overflowed: false,
+            message_tier_len: 0,
+            limits,
+        }
+    }
+
     fn push(&mut self, event: WireEvent) {
         // On overflow evict the oldest chunk-tier event; when the log is all
         // message-tier, let it grow here — `message_tier_overflowed` below is
         // what bounds that case, by forcing a resync instead of a silent drop.
-        if self.entries.len() >= MAX_LOG_EVENTS
+        if self.entries.len() >= self.limits.max_log_events
             && let Some(pos) = self.entries.iter().position(is_chunk_tier)
         {
             self.entries.remove(pos);
             if !self.overflowed {
                 self.overflowed = true;
+                let max_log_events = self.limits.max_log_events;
                 warn!(
-                    "event log overflowed {MAX_LOG_EVENTS} events; \
+                    "event log overflowed {max_log_events} events; \
                      dropping oldest chunk-tier events (replay will have gaps)"
                 );
             }
@@ -277,7 +276,7 @@ impl EventLog {
     /// by the forwarder after the settle check, so a turn that just folded
     /// (clearing the log) never trips this on its own final event.
     fn message_tier_overflowed(&self) -> bool {
-        self.message_tier_len > MAX_MESSAGE_TIER_EVENTS
+        self.message_tier_len > self.limits.max_message_tier_events
     }
 
     fn iter(&self) -> impl Iterator<Item = &WireEvent> {
@@ -296,7 +295,7 @@ impl EventLog {
 ///
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
-/// 2. The turn's user prompt (front of `unsettled_users`; absent for resumed
+/// 2. The turn's user message (front of `unsettled_user_messages`; absent for resumed
 ///    turns).
 /// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
 ///
@@ -304,7 +303,7 @@ impl EventLog {
 /// checkpoint history holds). The log is cleared afterwards.
 fn fold_settled_turn(
     snapshot: &mut Vec<Message>,
-    unsettled_users: &mut VecDeque<Message>,
+    unsettled_user_messages: &mut VecDeque<Message>,
     log: &mut EventLog,
     root_name: &str,
 ) {
@@ -321,7 +320,7 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
-    if let Some(user) = unsettled_users.pop_front() {
+    if let Some(user) = unsettled_user_messages.pop_front() {
         snapshot.push(user);
     }
     for event in entries {
@@ -357,11 +356,11 @@ struct LiveState {
     turn_running: bool,
     /// The settled conversation history, kept in memory. Authoritative for
     /// attach snapshots: the driver's final checkpoint lands *after* the settle
-    /// event, so re-reading disk mid-life would race — disk is only read when
-    /// an entry is created.
+    /// event, so re-reading the persisted state mid-life would race — it is
+    /// only read when an entry is created.
     snapshot: Vec<Message>,
-    /// User prompts of turns that have not settled (and thus not folded) yet.
-    unsettled_users: VecDeque<Message>,
+    /// User messages of turns that have not settled (and thus not folded) yet.
+    unsettled_user_messages: VecDeque<Message>,
     pending_approvals: Vec<PendingApproval>,
     log: EventLog,
 }
@@ -400,6 +399,9 @@ struct EntryState {
     attached: Option<Attachment>,
 }
 
+/// A cheap, cloneable handle to a session's slot, kept separate from the
+/// [`EntryGuard`] that locks its [`EntryState`] so it can be re-locked later
+/// (e.g. by a spawned forwarder task) after the guard is gone.
 struct SessionEntry {
     key: SessionKey,
     inner: Arc<Mutex<EntryState>>,
@@ -412,13 +414,15 @@ type Entries = Arc<std::sync::Mutex<HashMap<SessionKey, Arc<SessionEntry>>>>;
 pub struct SessionHub {
     opener: Arc<dyn SessionOpener>,
     entries: Entries,
+    limits: RelayConfig,
 }
 
 impl SessionHub {
-    pub fn new(opener: Arc<dyn SessionOpener>) -> Self {
+    pub fn new(opener: Arc<dyn SessionOpener>, limits: RelayConfig) -> Self {
         Self {
             opener,
             entries: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            limits,
         }
     }
 
@@ -527,18 +531,18 @@ impl SessionHub {
                 // fully stop (no `Shutdown::Graceful { on_timeout: Return }`),
                 // so this returning is the barrier that gates reopening the
                 // key: no agent task is still running, so a subsequent open's
-                // disk read can't race a checkpoint write. What that
-                // checkpoint *contains* still depends on the mode:
+                // read of the persisted state can't race a checkpoint write.
+                // What that checkpoint *contains* still depends on the mode:
                 // `graceful_unbounded` lets an in-flight turn reach its own
                 // natural stop (completed/suspended/errored) before saving,
-                // so the checkpoint is current — required for the lag-drain
-                // path below, which discards the in-memory view and must
-                // trust disk. `Abort` cancels first, so a turn that was still
-                // running saves an *aborted* checkpoint instead of a clean
-                // one; both call sites that use it are indifferent to that
-                // (delete removes the persisted files right after, and the
-                // stream-ended path only reaches here once the runtime has
-                // already stopped on its own).
+                // so the checkpoint is current — required for the forced-
+                // resync path below, which discards the in-memory view and
+                // must trust the persisted state. `Abort` cancels first, so a
+                // turn that was still running saves an *aborted* checkpoint
+                // instead of a clean one; both call sites that use it are
+                // indifferent to that (delete removes the persisted state
+                // right after, and the stream-ended path only reaches here
+                // once the runtime has already stopped on its own).
                 session.shutdown(mode).await;
             }
             {
@@ -606,9 +610,9 @@ impl SessionHub {
             generation,
             turn_running,
             snapshot,
-            unsettled_users: VecDeque::new(),
+            unsettled_user_messages: VecDeque::new(),
             pending_approvals: Vec::new(),
-            log: EventLog::default(),
+            log: EventLog::new(self.limits),
         }
     }
 
@@ -628,7 +632,7 @@ impl SessionHub {
             return CommandOutcome::Ignored;
         }
         live.turn_running = true;
-        live.unsettled_users
+        live.unsettled_user_messages
             .push_back(Message::User(UserMessage::with_images(task, &images)));
         // A task sent while approvals were pending supersedes them: the driver
         // writes the discarded calls as aborted ToolMessages (announced via
@@ -1061,7 +1065,7 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
             let mut messages = live.snapshot.clone();
-            messages.extend(live.unsettled_users.iter().cloned());
+            messages.extend(live.unsettled_user_messages.iter().cloned());
             Some(SnapshotPayload {
                 messages,
                 pending_approvals: live.pending_approvals.clone(),
@@ -1102,23 +1106,29 @@ fn spawn_event_pipeline(
     generation: u64,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(item) = session.recv().await {
-            if tx.send(item).is_err() {
-                break; // forwarder retired (generation swap or release)
+    {
+        let (workspace_id, session_id) = entry.key.clone();
+        tokio::spawn(async move {
+            info!(workspace_id = %workspace_id, session_id = %session_id, generation, "event pump started");
+            while let Some(item) = session.recv().await {
+                if tx.send(item).is_err() {
+                    break; // forwarder retired (generation swap or release)
+                }
             }
-        }
-        // Dropping `tx` signals end-of-stream to the forwarder.
-    });
+            // Dropping `tx` signals end-of-stream to the forwarder.
+            info!(workspace_id = %workspace_id, session_id = %session_id, generation, "event pump stopped");
+        });
+    }
     tokio::spawn(run_forwarder(entries, entry, rx, root_name, generation));
 }
 
-/// Force the entry to drain and resync from disk: used when the in-memory
-/// event log can no longer be trusted (a lagged broadcast receiver) or has
-/// grown past what it may safely buffer (a runaway turn). `graceful_unbounded`
-/// lets any turn still in flight reach its own checkpoint before the entry is
-/// removed, so the next attach reads a current, authoritative disk state
-/// instead of the discarded in-memory one.
+/// Force the entry to drain and resync from the persisted state: used when
+/// the in-memory event log can no longer be trusted (a lagged broadcast
+/// receiver) or has grown past what it may safely buffer (a runaway turn).
+/// `graceful_unbounded` lets any turn still in flight reach its own
+/// checkpoint before the entry is removed, so the next attach reads a
+/// current, authoritative persisted state instead of the discarded in-memory
+/// one.
 async fn force_resync(
     entries: &Entries,
     entry: &Arc<SessionEntry>,
@@ -1128,7 +1138,7 @@ async fn force_resync(
     error!(
         workspace_id = %entry.key.0,
         session_id = %entry.key.1,
-        "{reason}; draining session to resync from disk"
+        "{reason}; draining session to resync from the persisted state"
     );
     let release = SessionHub::begin_release(
         entries,
@@ -1148,6 +1158,7 @@ async fn run_forwarder(
     root_name: String,
     generation: u64,
 ) {
+    info!(workspace_id = %entry.key.0, session_id = %entry.key.1, generation, "event forwarder started");
     while let Some(item) = rx.recv().await {
         let mut guard = entry.inner.clone().lock_owned().await;
         let state = &mut *guard;
@@ -1197,7 +1208,7 @@ async fn run_forwarder(
                     }
                     fold_settled_turn(
                         &mut live.snapshot,
-                        &mut live.unsettled_users,
+                        &mut live.unsettled_user_messages,
                         &mut live.log,
                         &root_name,
                     );
@@ -1210,11 +1221,10 @@ async fn run_forwarder(
                 } else if live.log.message_tier_overflowed() {
                     // The turn hasn't settled and won't stop buffering
                     // message-tier history (which can't be evicted without
-                    // corrupting the fold); force the same resync-from-disk
-                    // path as a lagged stream rather than grow unbounded.
-                    let reason = format!(
-                        "event log exceeded {MAX_MESSAGE_TIER_EVENTS} buffered message-tier events"
-                    );
+                    // corrupting the fold); force the same forced-resync path
+                    // as a lagged stream rather than grow unbounded.
+                    let max = live.log.limits.max_message_tier_events;
+                    let reason = format!("event log exceeded {max} buffered message-tier events");
                     force_resync(&entries, &entry, guard, reason).await;
                     return;
                 }
@@ -1241,6 +1251,7 @@ async fn run_forwarder(
         drop(guard);
         release.await;
     }
+    info!(workspace_id = %entry.key.0, session_id = %entry.key.1, generation, "event forwarder stopped");
 }
 
 #[cfg(test)]
