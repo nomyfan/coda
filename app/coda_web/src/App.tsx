@@ -27,6 +27,7 @@ import {
   type UsageRecord,
 } from "@/store/session";
 import { Sidebar } from "@/components/sidebar";
+import { Button } from "@/components/ui/button";
 import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
 import { ApprovalPanel } from "@/components/approval-panel";
@@ -220,6 +221,10 @@ export default function App() {
   const selectedWorkspace = newSessionTarget?.workspaceId ?? activeWorkspace;
   const showingNewSession = newSessionTarget !== null;
   const showComposer = showingNewSession || Boolean(activeWorkspace);
+  // Evicted sessions get a full takeover mask over the conversation column:
+  // the local state is a frozen pre-eviction snapshot (the server ended this
+  // client's event stream), so nothing under it should look interactive.
+  const evictedTakeover = activeEvicted && !showingNewSession;
 
   useEffect(() => {
     if (!newSessionTarget) {
@@ -359,41 +364,64 @@ export default function App() {
           sessionTitle={activeSessionTitle}
           onOpenSidebar={() => setSidebarOpen(true)}
         />
-        <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
-        <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
-          {showingNewSession ? (
-            <WorkspaceTargetBar
-              servers={servers}
-              target={newSessionTarget}
-              onSelectTarget={setNewSessionTarget}
-            />
-          ) : (
-            <ApprovalPanel />
+        <div className="relative flex min-w-0 min-h-0 flex-1 flex-col">
+          {/* `inert` also blocks keyboard focus, which the overlay alone
+              wouldn't; the sidebar stays interactive for switching away. */}
+          <div
+            inert={evictedTakeover || undefined}
+            className="flex min-w-0 min-h-0 flex-1 flex-col"
+          >
+            <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
+            <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
+              {showingNewSession ? (
+                <WorkspaceTargetBar
+                  servers={servers}
+                  target={newSessionTarget}
+                  onSelectTarget={setNewSessionTarget}
+                />
+              ) : (
+                <ApprovalPanel />
+              )}
+              {showComposer ? (
+                <Composer
+                  status={
+                    showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
+                  }
+                  running={showingNewSession ? false : activeRunning}
+                  evicted={showingNewSession ? false : activeEvicted}
+                  workspace={selectedWorkspace}
+                  selectingTarget={showingNewSession}
+                  providers={
+                    showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
+                  }
+                  providerId={showingNewSession ? newSessionModel?.providerId : activeProviderId}
+                  reasoningEffort={
+                    showingNewSession
+                      ? (newSessionModel?.reasoningEffort ?? null)
+                      : activeReasoningEffort
+                  }
+                  usage={showingNewSession ? NO_USAGE : activeUsage}
+                  sessionHasImages={showingNewSession ? false : activeHasImages}
+                  onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
+                  onSend={handleSend}
+                  onAbort={abort}
+                />
+              ) : null}
+            </div>
+          </div>
+          {evictedTakeover && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/60 p-4 backdrop-blur-[2px]">
+              <div className="flex max-w-sm flex-col items-center gap-3 rounded-lg border border-border bg-background p-6 text-center shadow-lg">
+                <p className="text-sm text-muted-foreground">
+                  This session is being driven by another window. The view stopped updating when it
+                  was taken over.
+                </p>
+                <Button size="sm" onClick={takeOverActiveSession}>
+                  Take over
+                </Button>
+              </div>
+            </div>
           )}
-          {showComposer ? (
-            <Composer
-              status={showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus}
-              running={showingNewSession ? false : activeRunning}
-              evicted={showingNewSession ? false : activeEvicted}
-              workspace={selectedWorkspace}
-              selectingTarget={showingNewSession}
-              providers={
-                showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
-              }
-              providerId={showingNewSession ? newSessionModel?.providerId : activeProviderId}
-              reasoningEffort={
-                showingNewSession
-                  ? (newSessionModel?.reasoningEffort ?? null)
-                  : activeReasoningEffort
-              }
-              usage={showingNewSession ? NO_USAGE : activeUsage}
-              sessionHasImages={showingNewSession ? false : activeHasImages}
-              onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
-              onSend={handleSend}
-              onAbort={abort}
-              onTakeOver={takeOverActiveSession}
-            />
-          ) : null}
         </div>
       </section>
     </div>
