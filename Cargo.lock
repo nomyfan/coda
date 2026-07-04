@@ -466,9 +466,7 @@ dependencies = [
 name = "coda_agent"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "coda_core",
- "coda_openai",
  "coda_tools",
  "futures",
  "jiff",
@@ -541,11 +539,11 @@ dependencies = [
  "serde_yml",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml_edit",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

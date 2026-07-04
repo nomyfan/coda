@@ -1185,6 +1185,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
 
     let result = timeout(Duration::from_secs(2), async {
         let mut started = HashSet::new();
+        let mut ended = HashSet::new();
 
         loop {
             let (agent_name, _, event) = harness.next_event().await;
@@ -1195,9 +1196,18 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
                         harness.runtime.request_abort().await;
                     }
                 }
+                ("coda", AgentEvent::ToolCallEnd(tool))
+                    if matches!(tool.outcome, ToolCallOutcome::Aborted) =>
+                {
+                    ended.insert(tool.id);
+                }
                 ("coda", AgentEvent::Aborted(AbortedTarget::ToolCalls(ids))) => {
                     assert!(ids.contains(&"call_slow".to_string()));
                     assert!(ids.contains(&"call_explore".to_string()));
+                    // Every aborted ToolMessage written to history must have
+                    // been announced via ToolCallEnd before the Aborted marker.
+                    assert!(ended.contains("call_slow"));
+                    assert!(ended.contains("call_explore"));
                     break;
                 }
                 _ => {}
@@ -1256,6 +1266,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     let result = timeout(Duration::from_secs(2), async {
         let mut saw_chunk = false;
         let mut saw_reasoning = false;
+        let mut saw_aborted_llm_end = false;
 
         loop {
             let (agent_name, _, event) = harness.next_event().await;
@@ -1269,6 +1280,10 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                     saw_chunk = true;
                     harness.runtime.request_abort().await;
                 }
+                ("coda", AgentEvent::LLMEnd(msg)) if msg.aborted => {
+                    assert!(msg.content.contains("partial"));
+                    saw_aborted_llm_end = true;
+                }
                 ("coda", AgentEvent::Aborted(AbortedTarget::Generation)) => {
                     assert!(
                         saw_chunk,
@@ -1277,6 +1292,12 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                     assert!(
                         saw_reasoning,
                         "generation was aborted before any partial reasoning"
+                    );
+                    // The aborted partial message written to history must have
+                    // been announced via LLMEnd before the Aborted marker.
+                    assert!(
+                        saw_aborted_llm_end,
+                        "no LLMEnd was emitted for the aborted partial message"
                     );
                     break;
                 }
@@ -1401,6 +1422,128 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     .await;
     parent.shutdown().await;
     parent_result.expect("timed out waiting for subagent error reply");
+}
+
+#[tokio::test]
+async fn user_task_is_checkpointed_before_turn_completes() {
+    // The user prompt must be durable as soon as the turn starts — a mid-turn
+    // crash or reconnect must not lose it. `abort-generation-main` holds the
+    // LLM stream open, so observing the first chunk proves the turn is still
+    // in flight when we inspect the checkpoint.
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_spec(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::with_hold_generation(Arc::new(Notify::new())),
+        ToolApprovalMode::Auto,
+        "hold this task",
+    )
+    .await;
+
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if agent_name == "coda" && matches!(event, AgentEvent::LLMContentChunk(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    result.expect("timed out waiting for generation to start");
+
+    let checkpoint = harness
+        .storage
+        .checkpoint(&harness.thread_id)
+        .await
+        .expect("user task was not checkpointed at turn start");
+    assert!(matches!(
+        checkpoint.messages.last(),
+        Some(Message::User(user)) if user.first_text() == Some("hold this task")
+    ));
+    assert!(matches!(
+        checkpoint.resume_point,
+        crate::persist::StoredResumePoint::Generation
+    ));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_task_while_suspended_emits_tool_call_end_for_discarded_calls() {
+    // A new Task while suspended for approval writes aborted ToolMessages to
+    // history (stale-envelope cleanup); each must be announced via ToolCallEnd
+    // so event consumers stay consistent with the checkpoint.
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let agents = team.build(".");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        agents,
+        provider,
+        approval,
+        "phase1",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for suspension");
+
+    // Send a fresh task instead of resuming: the pending call is discarded.
+    harness.send_task("phase1").await;
+
+    let result = timeout(Duration::from_secs(2), async {
+        let mut saw_discarded_call = false;
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::ToolCallEnd(tool))
+                    if tool.id == "call_approve"
+                        && matches!(tool.outcome, ToolCallOutcome::Aborted) =>
+                {
+                    saw_discarded_call = true;
+                }
+                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {
+                    assert_eq!(msg.content, "interrupt-flow-ok");
+                    assert!(
+                        saw_discarded_call,
+                        "no ToolCallEnd was emitted for the discarded pending call"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    result.expect("timed out waiting for turn completion after new task");
+    harness.shutdown().await;
 }
 
 #[tokio::test]

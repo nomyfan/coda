@@ -63,10 +63,37 @@ pub struct WorkspaceConfig {
     pub path: PathBuf,
 }
 
+/// Tuning knobs for the process-level session relay (`hub::SessionHub`)'s
+/// per-session in-memory event buffering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayConfig {
+    /// Soft cap on buffered events for one turn. On overflow the oldest
+    /// chunk-tier event is dropped first; message-bearing events are never
+    /// dropped so the settle-fold cannot lose history.
+    pub max_log_events: usize,
+    /// Hard cap on buffered *message*-tier events for one turn. These can't
+    /// be evicted like chunk-tier events without corrupting the fold, so a
+    /// turn that buffers more than this (a runaway tool-calling loop, say) is
+    /// treated like a lagged stream: the forwarder forces a resync instead of
+    /// letting the log grow without bound. A turn that settles normally
+    /// clears the log (and this count) long before reaching it.
+    pub max_message_tier_events: usize,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            max_log_events: 8192,
+            max_message_tier_events: 4096,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
+    pub relay: RelayConfig,
 }
 
 pub fn load_server_config(path: &Path) -> Result<ServerConfig, ConfigError> {
@@ -81,11 +108,37 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
 
     let providers = parse_providers(&doc)?;
     let workspaces = parse_workspaces(&doc, base_dir)?;
+    let relay = parse_relay(&doc)?;
 
     Ok(ServerConfig {
         providers,
         workspaces,
+        relay,
     })
+}
+
+/// Parse the optional `[relay]` table, falling back to `RelayConfig::default()`
+/// for any field (or the whole table) that is absent.
+fn parse_relay(doc: &toml_edit::DocumentMut) -> Result<RelayConfig, ConfigError> {
+    let mut relay = RelayConfig::default();
+    let Some(table) = doc.get("relay") else {
+        return Ok(relay);
+    };
+    if let Some(value) = table.get("max_log_events") {
+        relay.max_log_events = positive_usize(value, "relay.max_log_events")?;
+    }
+    if let Some(value) = table.get("max_message_tier_events") {
+        relay.max_message_tier_events = positive_usize(value, "relay.max_message_tier_events")?;
+    }
+    Ok(relay)
+}
+
+fn positive_usize(value: &toml_edit::Item, field: &str) -> Result<usize, ConfigError> {
+    value
+        .as_integer()
+        .filter(|v| *v > 0)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| ConfigError::Parse(format!("{field} must be a positive integer")))
 }
 
 fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, ConfigError> {
@@ -1033,6 +1086,73 @@ path = "/tmp/b"
         .unwrap_err();
 
         assert!(err.to_string().contains("duplicate workspace id"));
+    }
+
+    #[test]
+    fn parse_server_config_defaults_relay_limits() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.relay, RelayConfig::default());
+    }
+
+    #[test]
+    fn parse_server_config_overrides_relay_limits() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[relay]
+max_log_events = 100
+max_message_tier_events = 50
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.relay,
+            RelayConfig {
+                max_log_events: 100,
+                max_message_tier_events: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_server_config_rejects_non_positive_relay_limit() {
+        let err = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[relay]
+max_log_events = 0
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("relay.max_log_events must be a positive integer")
+        );
     }
 
     #[test]

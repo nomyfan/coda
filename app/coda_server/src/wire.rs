@@ -150,7 +150,9 @@ pub enum ClientMessage {
     /// Open or switch the active session on this connection. `provider_id` and
     /// `reasoning_effort` carry a client-chosen selection (e.g. picked on a new
     /// session before the first message); both default to the server's defaults
-    /// when omitted.
+    /// when omitted. When another client holds the session, the open is refused
+    /// with [`ServerMessage::SessionBusy`] unless `takeover` is set — evicting
+    /// someone must be an explicit user decision.
     OpenSession {
         workspace_id: String,
         session_id: String,
@@ -158,6 +160,8 @@ pub enum ClientMessage {
         provider_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<ReasoningEffort>,
+        #[serde(default)]
+        takeover: bool,
     },
     /// Start a new turn with a user task, optionally with image attachments.
     Task {
@@ -243,6 +247,8 @@ pub enum ServerMessage {
     /// plus any approvals left pending from a prior suspension, which the client
     /// must answer with `Resume` before the session resumes. `provider_id` and
     /// `reasoning_effort` are the session's current model selection.
+    /// `turn_running` tells the client a turn is still in flight — the events
+    /// of that turn are replayed (then streamed) right after this message.
     Snapshot {
         workspace_id: String,
         session_id: String,
@@ -252,6 +258,8 @@ pub enum ServerMessage {
         provider_id: String,
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+        #[serde(default)]
+        turn_running: bool,
     },
     /// A live runtime event. Nested under `event` rather than flattened so the
     /// inner `type` tag of [`WireEvent`] does not collide with this enum's tag.
@@ -266,6 +274,20 @@ pub enum ServerMessage {
         pattern: String,
         #[serde(default)]
         error: Option<String>,
+    },
+    /// Another client opened this session; this connection lost drive rights.
+    /// Commands for the session are rejected until it is reopened with
+    /// takeover (which evicts the other client in turn).
+    SessionEvicted {
+        workspace_id: String,
+        session_id: String,
+    },
+    /// An `OpenSession` without `takeover` hit a session another client is
+    /// driving. Nothing changed; re-send with `takeover: true` after the user
+    /// confirms.
+    SessionBusy {
+        workspace_id: String,
+        session_id: String,
     },
 }
 
@@ -380,12 +402,42 @@ mod tests {
             session_id: "s1".into(),
             provider_id: None,
             reasoning_effort: None,
+            takeover: false,
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"open_session","workspace_id":"coda","session_id":"s1"}"#
+            r#"{"type":"open_session","workspace_id":"coda","session_id":"s1","takeover":false}"#
         );
+        // Older clients omit `takeover`; it defaults off (no silent eviction).
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"open_session","workspace_id":"coda","session_id":"s1"}"#
+            )
+            .unwrap(),
+            ClientMessage::OpenSession {
+                takeover: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn server_session_busy_roundtrips() {
+        let msg = ServerMessage::SessionBusy {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_busy","workspace_id":"coda","session_id":"s1"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::SessionBusy { workspace_id, session_id }
+                if workspace_id == "coda" && session_id == "s1"
+        ));
     }
 
     #[test]
@@ -472,12 +524,43 @@ mod tests {
             pending_approvals: vec![],
             provider_id: "deepseek".into(),
             reasoning_effort: Some(ReasoningEffort::High),
+            turn_running: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high"}"#
+            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","turn_running":true}"#
         );
+    }
+
+    #[test]
+    fn server_snapshot_without_turn_running_defaults_to_false() {
+        let json = r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(json).unwrap(),
+            ServerMessage::Snapshot {
+                turn_running: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn server_session_evicted_roundtrips() {
+        let msg = ServerMessage::SessionEvicted {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_evicted","workspace_id":"coda","session_id":"s1"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::SessionEvicted { workspace_id, session_id }
+                if workspace_id == "coda" && session_id == "s1"
+        ));
     }
 
     #[test]

@@ -83,6 +83,9 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** Another client took over this session (latest-wins); the transcript is
+   * read-only until the user takes it back by reopening. */
+  evicted: boolean;
   /** Created locally via "new session" but not yet opened on the server. */
   draft?: boolean;
   /** First user task, used as the session list title before the server persists it. */
@@ -166,6 +169,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     drafts: {},
     allowDrafts: {},
     running: false,
+    evicted: false,
     usage: [],
   };
 }
@@ -1112,6 +1116,7 @@ function applySnapshot(
   approvals: PendingApproval[],
   providerId: string,
   reasoningEffort: ReasoningEffort | null,
+  turnRunning: boolean,
   replaceEmpty = false,
 ) {
   const key = sessionKey(workspaceId, sessionId);
@@ -1134,12 +1139,16 @@ function applySnapshot(
     session.providerId = providerId;
     session.reasoningEffort = reasoningEffort;
     session.usage = usage;
+    // Always reflect the server's authoritative state: a snapshot means this
+    // client holds the session now (clearing any eviction), and `turnRunning`
+    // says whether replayed events of an in-flight turn follow.
+    session.approvals = approvals;
+    session.running = turnRunning;
+    session.evicted = false;
     if (hasHistory || replaceEmpty) {
       session.entries = mapped;
-      session.approvals = approvals;
       session.drafts = {};
       session.allowDrafts = {};
-      session.running = false;
     }
     if (replaceEmpty && !hasHistory) {
       session.firstUserMessage = undefined;
@@ -1160,6 +1169,34 @@ function setSessionModel(
       session.providerId = providerId;
       session.reasoningEffort = reasoningEffort;
     }
+  });
+}
+
+/** Mark a session as held by another client — either we were evicted or an
+ * open was refused as busy. Both land in the same read-only takeover state. */
+function applyHeldElsewhere(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  reason: "evicted" | "busy",
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.evicted = true;
+    session.running = false;
+    state.servers[server].sessions[key] = addActivity(session, {
+      tone: "warning",
+      label: reason === "evicted" ? "session taken over" : "session in use",
+      detail:
+        reason === "evicted"
+          ? "Another window took this session over."
+          : "Another window is driving this session.",
+    });
   });
 }
 
@@ -1352,11 +1389,12 @@ function encode(message: ClientMessage) {
  * has one (a draft seeds it locally) so the server opens on that provider rather
  * than the default.
  */
-function openMessage(session: OpenedSession): ClientMessage {
+function openMessage(session: OpenedSession, takeover = false): ClientMessage {
   return {
     type: "open_session",
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
+    ...(takeover ? { takeover } : {}),
     ...(session.providerId
       ? {
           provider_id: session.providerId,
@@ -1402,7 +1440,10 @@ function activeSessionToRestore(server: string): SessionRestoreMessage | undefin
     return undefined;
   }
   const session = snapshot.servers[server]?.sessions[snapshot.activeKey];
-  return session?.draft
+  // An evicted session belongs to another client now; restoring it on a
+  // transient reconnect would silently take it back — that must stay an
+  // explicit user action ("Take over").
+  return !session || session.draft || session.evicted
     ? undefined
     : {
         message: openMessage(session),
@@ -1461,8 +1502,17 @@ export function connectServer(rawUrl: string) {
           message.pending_approvals ?? [],
           message.provider_id,
           message.reasoning_effort ?? null,
+          message.turn_running ?? false,
           sessionToRestore?.key === sessionKey(message.workspace_id, message.session_id),
         );
+        return;
+      }
+      if (message.type === "session_evicted") {
+        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "evicted");
+        return;
+      }
+      if (message.type === "session_busy") {
+        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "busy");
         return;
       }
       if (message.type === "model_changed") {
@@ -1612,6 +1662,17 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
 }
 
+/** Re-open the active session with an explicit takeover, taking it from
+ * whichever client currently drives it (the server evicts them and replays
+ * the in-flight turn to us). */
+export function takeOverActiveSession() {
+  const active = currentActive();
+  if (!active || active.session.draft) {
+    return;
+  }
+  send(active.server, openMessage(active.session, true));
+}
+
 /** Deselect whatever session is currently shown in the center pane (e.g. when
  * switching into the new-session composer). */
 export function clearActiveSession() {
@@ -1757,6 +1818,12 @@ export function submitApprovals() {
   if (!active) {
     return;
   }
+  // Defense in depth behind the takeover mask: an evicted tab's approvals are
+  // a stale snapshot — resumes would be rejected server-side, but the staged
+  // allow-pattern writes would not, so nothing may be sent from here.
+  if (active.session.evicted) {
+    return;
+  }
   for (const approval of active.session.approvals) {
     const approvalId = approvalKey(approval);
     const draft = active.session.drafts[approvalId] ?? {};
@@ -1876,6 +1943,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveEvicted = (state: CodaStoreState) =>
+  activeSessionOf(state)?.evicted ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
 export const selectActiveDrafts = (state: CodaStoreState) =>

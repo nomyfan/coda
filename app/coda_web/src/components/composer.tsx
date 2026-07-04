@@ -28,6 +28,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  evicted,
   workspace,
   selectingTarget,
   providers,
@@ -41,6 +42,9 @@ export const Composer = memo(function Composer({
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** Another client took over this session. The takeover mask covers pointer
+   * access; these guards also close the keyboard/paste paths. */
+  evicted: boolean;
   workspace?: string;
   /** New-session mode: the send target is still being picked in the header. */
   selectingTarget: boolean;
@@ -70,7 +74,7 @@ export const Composer = memo(function Composer({
   const acceptsImages =
     Boolean(providerId) &&
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
-  const canAddImages = acceptsImages && images.length < MAX_IMAGES;
+  const canAddImages = acceptsImages && !evicted && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
@@ -79,6 +83,7 @@ export const Composer = memo(function Composer({
     connected &&
     Boolean(workspace) &&
     !running &&
+    !evicted &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
@@ -113,7 +118,7 @@ export const Composer = memo(function Composer({
 
   const handlePaste = useCallback(
     (event: React.ClipboardEvent) => {
-      if (!acceptsImages) return;
+      if (!acceptsImages || evicted) return;
       const files = Array.from(event.clipboardData.items)
         .filter((item) => item.kind === "file" && ACCEPTED_TYPES.has(item.type))
         .map((item) => item.getAsFile())
@@ -123,17 +128,17 @@ export const Composer = memo(function Composer({
         void addFiles(files);
       }
     },
-    [acceptsImages, addFiles],
+    [acceptsImages, evicted, addFiles],
   );
 
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
       setDragOver(false);
-      if (!acceptsImages) return;
+      if (!acceptsImages || evicted) return;
       void addFiles(event.dataTransfer.files);
     },
-    [acceptsImages, addFiles],
+    [acceptsImages, evicted, addFiles],
   );
 
   function submit() {
@@ -155,7 +160,7 @@ export const Composer = memo(function Composer({
         <div
           className="relative mx-auto max-w-4xl"
           onDragOver={(e) => {
-            if (acceptsImages) {
+            if (acceptsImages && !evicted) {
               e.preventDefault();
               setDragOver(true);
             }
@@ -205,7 +210,12 @@ export const Composer = memo(function Composer({
               }
             }}
             onPaste={handlePaste}
-            placeholder="Enter to send, Shift+Enter for newline"
+            disabled={evicted}
+            placeholder={
+              evicted
+                ? "Session opened in another window — take over to continue"
+                : "Enter to send, Shift+Enter for newline"
+            }
             className={[
               "min-h-[104px] pb-20 pr-3 sm:min-h-[80px] sm:pb-10",
               dragOver ? "border-primary ring-1 ring-primary" : "",
