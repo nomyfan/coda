@@ -18,7 +18,6 @@ coda_openai = { path = "crates/coda_openai" }
 coda_skills = { path = "crates/coda_skills" }
 coda_tools = { path = "crates/coda_tools" }
 async-stream = "0.3"
-either = "1.15.0"
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
