@@ -221,12 +221,23 @@ pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
 /// settle-fold cannot lose history.
 const MAX_LOG_EVENTS: usize = 8192;
 
+/// Hard cap on buffered *message*-tier events for one turn. These can't be
+/// evicted like chunk-tier events without corrupting the fold, so a turn that
+/// buffers more than this (a runaway tool-calling loop, say) is treated like
+/// a lagged stream: the forwarder forces a resync from disk instead of
+/// letting the log grow without bound. A turn that settles normally clears
+/// the log (and this count) long before reaching it.
+const MAX_MESSAGE_TIER_EVENTS: usize = 4096;
+
 /// The current turn's events, in order. Cleared when the turn settles (the
 /// settled turn is folded into the entry's snapshot instead).
 #[derive(Default)]
 struct EventLog {
     entries: VecDeque<WireEvent>,
     overflowed: bool,
+    /// Buffered message-tier entries; chunk-tier entries (evicted on the
+    /// `MAX_LOG_EVENTS` path above) don't count.
+    message_tier_len: usize,
 }
 
 fn is_chunk_tier(event: &WireEvent) -> bool {
@@ -242,7 +253,8 @@ fn is_chunk_tier(event: &WireEvent) -> bool {
 impl EventLog {
     fn push(&mut self, event: WireEvent) {
         // On overflow evict the oldest chunk-tier event; when the log is all
-        // message-tier, let it grow — losing one would corrupt the fold.
+        // message-tier, let it grow here — `message_tier_overflowed` below is
+        // what bounds that case, by forcing a resync instead of a silent drop.
         if self.entries.len() >= MAX_LOG_EVENTS
             && let Some(pos) = self.entries.iter().position(is_chunk_tier)
         {
@@ -255,7 +267,17 @@ impl EventLog {
                 );
             }
         }
+        if !is_chunk_tier(&event) {
+            self.message_tier_len += 1;
+        }
         self.entries.push_back(event);
+    }
+
+    /// `true` once buffered message-tier entries exceed the hard cap. Checked
+    /// by the forwarder after the settle check, so a turn that just folded
+    /// (clearing the log) never trips this on its own final event.
+    fn message_tier_overflowed(&self) -> bool {
+        self.message_tier_len > MAX_MESSAGE_TIER_EVENTS
     }
 
     fn iter(&self) -> impl Iterator<Item = &WireEvent> {
@@ -265,6 +287,7 @@ impl EventLog {
     fn clear(&mut self) {
         self.entries.clear();
         self.overflowed = false;
+        self.message_tier_len = 0;
     }
 }
 
@@ -500,10 +523,22 @@ impl SessionHub {
         let entry = entry.clone();
         async move {
             if let Some(session) = session {
-                // `graceful_unbounded` cannot time out and `Abort` waits for
-                // full shutdown, so this returning is the durability barrier:
-                // the final checkpoint (if any) is on disk before the key can
-                // be reopened.
+                // Every mode used here waits unbounded for the runtime to
+                // fully stop (no `Shutdown::Graceful { on_timeout: Return }`),
+                // so this returning is the barrier that gates reopening the
+                // key: no agent task is still running, so a subsequent open's
+                // disk read can't race a checkpoint write. What that
+                // checkpoint *contains* still depends on the mode:
+                // `graceful_unbounded` lets an in-flight turn reach its own
+                // natural stop (completed/suspended/errored) before saving,
+                // so the checkpoint is current — required for the lag-drain
+                // path below, which discards the in-memory view and must
+                // trust disk. `Abort` cancels first, so a turn that was still
+                // running saves an *aborted* checkpoint instead of a clean
+                // one; both call sites that use it are indifferent to that
+                // (delete removes the persisted files right after, and the
+                // stream-ended path only reaches here once the runtime has
+                // already stopped on its own).
                 session.shutdown(mode).await;
             }
             {
@@ -951,7 +986,9 @@ impl SessionRelay for SessionHub {
             if let Some(attachment) = state.attached.take() {
                 let _ = attachment.tx.send(RelayEvent::Evicted);
             }
-            // Abort: deletion must not write a checkpoint back to disk.
+            // Abort rather than graceful: a turn still in flight gets cut off
+            // instead of finishing, so nothing new is added to history before
+            // the caller deletes the persisted directory right after.
             let release =
                 Self::begin_release(&self.entries, &entry, state, Shutdown::abort(), false);
             drop(guard);
@@ -1076,6 +1113,34 @@ fn spawn_event_pipeline(
     tokio::spawn(run_forwarder(entries, entry, rx, root_name, generation));
 }
 
+/// Force the entry to drain and resync from disk: used when the in-memory
+/// event log can no longer be trusted (a lagged broadcast receiver) or has
+/// grown past what it may safely buffer (a runaway turn). `graceful_unbounded`
+/// lets any turn still in flight reach its own checkpoint before the entry is
+/// removed, so the next attach reads a current, authoritative disk state
+/// instead of the discarded in-memory one.
+async fn force_resync(
+    entries: &Entries,
+    entry: &Arc<SessionEntry>,
+    mut guard: EntryGuard,
+    reason: String,
+) {
+    error!(
+        workspace_id = %entry.key.0,
+        session_id = %entry.key.1,
+        "{reason}; draining session to resync from disk"
+    );
+    let release = SessionHub::begin_release(
+        entries,
+        entry,
+        &mut guard,
+        Shutdown::graceful_unbounded(),
+        true,
+    );
+    drop(guard);
+    release.await;
+}
+
 async fn run_forwarder(
     entries: Entries,
     entry: Arc<SessionEntry>,
@@ -1095,23 +1160,14 @@ async fn run_forwarder(
         match item {
             SessionStreamItem::Lagged(n) => {
                 // The stream has a gap: the in-memory snapshot can no longer
-                // be trusted to fold correctly. Drain: stop the runtime at its
-                // next checkpoint boundary and drop the entry — reopening
-                // reads the authoritative checkpoint from disk.
-                error!(
-                    workspace_id = %entry.key.0,
-                    session_id = %entry.key.1,
-                    "session event stream lagged by {n}; draining session to resync from disk"
-                );
-                let release = SessionHub::begin_release(
+                // be trusted to fold correctly.
+                force_resync(
                     &entries,
                     &entry,
-                    state,
-                    Shutdown::graceful_unbounded(),
-                    true,
-                );
-                drop(guard);
-                release.await;
+                    guard,
+                    format!("session event stream lagged by {n}"),
+                )
+                .await;
                 return;
             }
             SessionStreamItem::Event(event) => {
@@ -1151,6 +1207,16 @@ async fn run_forwarder(
                         release.await;
                         return;
                     }
+                } else if live.log.message_tier_overflowed() {
+                    // The turn hasn't settled and won't stop buffering
+                    // message-tier history (which can't be evicted without
+                    // corrupting the fold); force the same resync-from-disk
+                    // path as a lagged stream rather than grow unbounded.
+                    let reason = format!(
+                        "event log exceeded {MAX_MESSAGE_TIER_EVENTS} buffered message-tier events"
+                    );
+                    force_resync(&entries, &entry, guard, reason).await;
+                    return;
                 }
             }
         }
@@ -1276,12 +1342,31 @@ mod tests {
     }
 
     #[test]
-    fn event_log_all_message_tier_grows_past_cap() {
+    fn event_log_all_message_tier_grows_past_chunk_cap() {
+        // `push` itself never drops a message-tier entry — dropping one would
+        // corrupt the fold. Bounding this case is `message_tier_overflowed`'s
+        // job (checked below), enforced by the forwarder forcing a resync;
+        // see `runaway_tool_calls_force_resync_instead_of_unbounded_log`.
         let mut log = EventLog::default();
         for i in 0..(MAX_LOG_EVENTS + 5) {
             log.push(tool_end("coda", tool_message(&format!("m{i}"), "x")));
         }
         assert_eq!(log.entries.len(), MAX_LOG_EVENTS + 5);
+    }
+
+    #[test]
+    fn event_log_message_tier_overflow_flag() {
+        let mut log = EventLog::default();
+        for i in 0..MAX_MESSAGE_TIER_EVENTS {
+            log.push(tool_end("coda", tool_message(&format!("m{i}"), "x")));
+            assert!(!log.message_tier_overflowed());
+        }
+        log.push(tool_end("coda", tool_message("one_too_many", "x")));
+        assert!(log.message_tier_overflowed());
+
+        // Settling (which folds and clears the log) resets the count.
+        log.clear();
+        assert!(!log.message_tier_overflowed());
     }
 
     // --- fold_settled_turn ---------------------------------------------------
@@ -1426,6 +1511,31 @@ mod tests {
                         .collect();
                     Box::pin(stream::iter(chunks).chain(Self::completed(assistant("burst done"))))
                 }
+                // One turn that fans out far more local tool calls than
+                // `MAX_MESSAGE_TIER_EVENTS` — each completion is a
+                // message-tier `ToolCallEnd`, so this turn must trip the
+                // forced-resync path long before it would ever settle.
+                "runaway" => {
+                    let has_result = request
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m, Message::Tool(t) if t.name == "read_todos"));
+                    if has_result {
+                        Self::completed(assistant(
+                            "should not settle: resync should have fired first",
+                        ))
+                    } else {
+                        let mut msg = assistant("");
+                        msg.tool_calls = (0..(MAX_MESSAGE_TIER_EVENTS + 10))
+                            .map(|i| ToolCall {
+                                id: format!("call_{i}"),
+                                name: "read_todos".into(),
+                                arguments: Some("{}".into()),
+                            })
+                            .collect();
+                        Self::completed(msg)
+                    }
+                }
                 "approval" => {
                     let has_result = request
                         .messages
@@ -1457,11 +1567,12 @@ mod tests {
 
     impl TestOpener {
         fn new(system_prompt: &str, approval: ToolApprovalMode) -> Self {
-            let tools: Vec<Box<dyn coda_tools::ToolSpec>> = if system_prompt == "approval" {
-                vec![Box::new(ReadTodosToolSpec)]
-            } else {
-                vec![]
-            };
+            let tools: Vec<Box<dyn coda_tools::ToolSpec>> =
+                if matches!(system_prompt, "approval" | "runaway") {
+                    vec![Box::new(ReadTodosToolSpec)]
+                } else {
+                    vec![]
+                };
             let team = AgentTeam::new(
                 AgentSpec {
                     name: "coda".into(),
@@ -1784,6 +1895,39 @@ mod tests {
         ));
 
         hub.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
+        let (hub, _) = hub_with("runaway", ToolApprovalMode::Auto);
+        let attach1 = hub
+            .attach(key(), 1, "prov".into(), None, false)
+            .await
+            .expect("attach");
+        let mut events1 = attach1.events;
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            },
+        )
+        .await;
+
+        // The log crosses MAX_MESSAGE_TIER_EVENTS long before the fan-out
+        // turn could ever settle; the client is told to resync rather than
+        // the hub buffering all of it in memory.
+        next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
+        wait_released(&hub).await;
+
+        // Reopening reads the checkpoint the runtime saved once its (now
+        // exit-barriered) tool execution batch finished.
+        let attach2 = hub
+            .attach(key(), 2, "prov".into(), None, false)
+            .await
+            .expect("re-attach");
+        assert!(!attach2.snapshot.turn_running);
     }
 
     #[tokio::test(flavor = "multi_thread")]
