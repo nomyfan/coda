@@ -413,8 +413,8 @@ export default function App() {
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/60 p-4 backdrop-blur-[2px]">
               <div className="flex max-w-sm flex-col items-center gap-3 rounded-lg border border-border bg-background p-6 text-center shadow-lg">
                 <p className="text-sm text-muted-foreground">
-                  This session is being driven by another window. The view stopped updating when it
-                  was taken over.
+                  This session is being driven by another window and this view is not receiving
+                  updates. Taking over will disconnect it there.
                 </p>
                 <Button size="sm" onClick={takeOverActiveSession}>
                   Take over

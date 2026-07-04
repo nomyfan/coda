@@ -1172,7 +1172,15 @@ function setSessionModel(
   });
 }
 
-function applyEviction(store: CodaStore, server: string, workspaceId: string, sessionId: string) {
+/** Mark a session as held by another client — either we were evicted or an
+ * open was refused as busy. Both land in the same read-only takeover state. */
+function applyHeldElsewhere(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  reason: "evicted" | "busy",
+) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1183,8 +1191,11 @@ function applyEviction(store: CodaStore, server: string, workspaceId: string, se
     session.running = false;
     state.servers[server].sessions[key] = addActivity(session, {
       tone: "warning",
-      label: "session taken over",
-      detail: "Another window opened this session; reopen to take it back.",
+      label: reason === "evicted" ? "session taken over" : "session in use",
+      detail:
+        reason === "evicted"
+          ? "Another window took this session over."
+          : "Another window is driving this session.",
     });
   });
 }
@@ -1378,11 +1389,12 @@ function encode(message: ClientMessage) {
  * has one (a draft seeds it locally) so the server opens on that provider rather
  * than the default.
  */
-function openMessage(session: OpenedSession): ClientMessage {
+function openMessage(session: OpenedSession, takeover = false): ClientMessage {
   return {
     type: "open_session",
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
+    ...(takeover ? { takeover } : {}),
     ...(session.providerId
       ? {
           provider_id: session.providerId,
@@ -1496,7 +1508,11 @@ export function connectServer(rawUrl: string) {
         return;
       }
       if (message.type === "session_evicted") {
-        applyEviction(codaStore, server, message.workspace_id, message.session_id);
+        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "evicted");
+        return;
+      }
+      if (message.type === "session_busy") {
+        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "busy");
         return;
       }
       if (message.type === "model_changed") {
@@ -1646,15 +1662,15 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
 }
 
-/** Re-open the active session, taking it back from whichever client evicted
- * us (latest-wins: the server evicts them in turn and replays the in-flight
- * turn to us). */
+/** Re-open the active session with an explicit takeover, taking it from
+ * whichever client currently drives it (the server evicts them and replays
+ * the in-flight turn to us). */
 export function takeOverActiveSession() {
   const active = currentActive();
   if (!active || active.session.draft) {
     return;
   }
-  send(active.server, openMessage(active.session));
+  send(active.server, openMessage(active.session, true));
 }
 
 /** Deselect whatever session is currently shown in the center pane (e.g. when

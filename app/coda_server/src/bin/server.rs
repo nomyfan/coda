@@ -20,8 +20,8 @@ use coda_server::{
     build_workspace_knowledge,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
     hub::{
-        AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub, SessionKey,
-        SessionOpener, SessionRelay,
+        AttachError, AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub,
+        SessionKey, SessionOpener, SessionRelay,
     },
     mcp::McpServers,
     storage::{WorkspaceStorage, validate_session_id},
@@ -624,10 +624,17 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
     key: SessionKey,
     provider_id: String,
     reasoning_effort: Option<ReasoningEffort>,
+    takeover: bool,
 ) -> bool {
     match app
         .hub
-        .attach(key.clone(), conn_id, provider_id, reasoning_effort)
+        .attach(
+            key.clone(),
+            conn_id,
+            provider_id,
+            reasoning_effort,
+            takeover,
+        )
         .await
     {
         Ok(AttachSession { snapshot, events }) => {
@@ -658,7 +665,17 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
             streams.insert(key, events);
             true
         }
-        Err(err) => {
+        // Someone else is driving the session: tell the client so it can ask
+        // the user before retrying with takeover. Nothing changed server-side.
+        Err(AttachError::Busy) => {
+            transport
+                .send(&ServerMessage::SessionBusy {
+                    workspace_id: key.0,
+                    session_id: key.1,
+                })
+                .await
+        }
+        Err(AttachError::Open(err)) => {
             send_open_error(transport, &key.0, &key.1, err).await;
             true
         }
@@ -683,6 +700,7 @@ async fn handle_dashboard_command<
             session_id,
             provider_id,
             reasoning_effort,
+            takeover,
         } => {
             if let Err(err) = validate_session_id(&session_id) {
                 warn!(workspace_id = %workspace_id, "rejecting open: {err}");
@@ -707,6 +725,7 @@ async fn handle_dashboard_command<
                 key,
                 provider_id,
                 reasoning_effort,
+                takeover,
             )
             .await
             {
@@ -988,6 +1007,9 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                             && reattached.insert(key.clone())
                         {
                             info!(workspace_id = %key.0, session_id = %key.1, "session closed by hub; re-attaching");
+                            // No takeover: if another connection got there
+                            // first, the client is told the session is busy
+                            // rather than silently evicting them.
                             attach_and_stream(
                                 &transport,
                                 &app,
@@ -997,6 +1019,7 @@ async fn run_dashboard<T: Transport<Incoming = ClientMessage, Outgoing = ServerM
                                 key,
                                 provider_id,
                                 reasoning_effort,
+                                false,
                             ).await
                         } else {
                             true

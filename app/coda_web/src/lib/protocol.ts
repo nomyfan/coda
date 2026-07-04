@@ -122,6 +122,9 @@ export type ClientMessage =
       session_id: string;
       provider_id?: string;
       reasoning_effort?: ReasoningEffort | null;
+      /** Evict whoever currently holds the session (explicit user decision);
+       * without it the server answers `session_busy` instead. */
+      takeover?: boolean;
     }
   | { type: "task"; workspace_id: string; session_id: string; task: string; images?: string[] }
   | {
@@ -230,7 +233,9 @@ export type ServerMessage =
     }
   | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
   | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null }
-  | { type: "session_evicted"; workspace_id: string; session_id: string };
+  | { type: "session_evicted"; workspace_id: string; session_id: string }
+  /** An open without `takeover` hit a session another client is driving. */
+  | { type: "session_busy"; workspace_id: string; session_id: string };
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {
   return "Ok" in output;

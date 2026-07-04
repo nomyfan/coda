@@ -125,19 +125,34 @@ pub trait SessionOpener: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>>;
 }
 
+/// Why an attach was not served.
+#[derive(Debug)]
+pub enum AttachError {
+    /// Another connection currently holds the session and `takeover` was not
+    /// requested. Nothing changed; the caller should ask the user before
+    /// retrying with `takeover: true`.
+    Busy,
+    /// Opening the session failed.
+    Open(OpenError),
+}
+
 /// The connection layer's only interface to sessions. See the module docs.
 pub trait SessionRelay: Send + Sync {
-    /// Open-or-attach (latest-wins): evicts any client currently attached to
-    /// `key`. `provider_id`/`reasoning_effort` must be pre-validated against
-    /// the provider catalog; they only apply when the session is not already
-    /// live.
+    /// Open-or-attach. When another connection holds `key`: with `takeover`
+    /// it is evicted (latest-wins); without, the attach fails with
+    /// [`AttachError::Busy`] and nothing changes — taking a session away from
+    /// another client must be an explicit user decision, not a side effect of
+    /// opening it. `provider_id`/`reasoning_effort` must be pre-validated
+    /// against the provider catalog; they only apply when the session is not
+    /// already live.
     fn attach<'a>(
         &'a self,
         key: SessionKey,
         conn_id: ConnId,
         provider_id: String,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Pin<Box<dyn Future<Output = Result<AttachSession, OpenError>> + Send + 'a>>;
+        takeover: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>>;
 
     /// Drive an attached session. Rejected (with a warn) when `conn_id` is not
     /// the currently attached client.
@@ -723,13 +738,24 @@ impl SessionRelay for SessionHub {
         conn_id: ConnId,
         provider_id: String,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Pin<Box<dyn Future<Output = Result<AttachSession, OpenError>> + Send + 'a>> {
+        takeover: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>> {
         Box::pin(async move {
             let (entry, mut guard) = self.lock_entry_for_attach(&key).await;
             let state = &mut *guard;
 
-            // Latest-wins: displace whoever holds the slot. Same connection
-            // re-opening is an idempotent refresh (fresh snapshot + stream).
+            // Another client holds the slot: displacing it (latest-wins) needs
+            // an explicit takeover — opening a session must not silently rip
+            // it away from whoever is driving it. Same connection re-opening
+            // is an idempotent refresh (fresh snapshot + stream).
+            if state
+                .attached
+                .as_ref()
+                .is_some_and(|attachment| attachment.conn_id != conn_id)
+                && !takeover
+            {
+                return Err(AttachError::Busy);
+            }
             if let Some(previous) = state.attached.take()
                 && previous.conn_id != conn_id
             {
@@ -774,7 +800,7 @@ impl SessionRelay for SessionHub {
                             .lock()
                             .expect("entries mutex poisoned")
                             .remove(&key);
-                        return Err(err);
+                        return Err(AttachError::Open(err));
                     }
                 }
             }
@@ -1551,7 +1577,7 @@ mod tests {
     async fn task_settles_then_reattach_shows_folded_history() {
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         assert!(attach1.snapshot.messages.is_empty());
@@ -1575,7 +1601,7 @@ mod tests {
         // A second client takes over: folded history, no replay, first client
         // sees the eviction.
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("attach2");
         assert!(!attach2.snapshot.turn_running);
@@ -1593,7 +1619,7 @@ mod tests {
     async fn midturn_attach_replays_chunks_and_evicts_previous() {
         let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1614,7 +1640,7 @@ mod tests {
         .await;
 
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("attach2");
         // Mid-turn snapshot: the user prompt is visible, the turn is running,
@@ -1652,7 +1678,7 @@ mod tests {
     async fn detach_idle_releases_and_reattach_reopens_from_disk() {
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1672,7 +1698,7 @@ mod tests {
 
         // Reopen: history comes back from the persisted checkpoint.
         let attach2 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("re-attach");
         assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -1685,7 +1711,7 @@ mod tests {
     async fn disconnect_during_turn_keeps_session_until_settle() {
         let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1713,7 +1739,7 @@ mod tests {
         wait_released(&hub).await;
 
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("re-attach");
         assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -1728,7 +1754,7 @@ mod tests {
     async fn burst_of_chunks_survives_replay_and_fold() {
         let (hub, _) = hub_with("burst", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1748,7 +1774,7 @@ mod tests {
         next_matching(&mut events1, is_settling_llm_end).await;
 
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("attach2");
         assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -1764,7 +1790,7 @@ mod tests {
     async fn suspended_approval_survives_release_and_promotes_on_resume() {
         let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1795,7 +1821,7 @@ mod tests {
 
         // Reopen: the checkpointed approval gates the open (Pending entry).
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("re-attach");
         assert_eq!(attach2.snapshot.pending_approvals.len(), 1);
@@ -1841,7 +1867,7 @@ mod tests {
         // advertise the stale approval.
         let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1872,7 +1898,7 @@ mod tests {
         next_matching(&mut events1, is_settling_llm_end).await;
 
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("attach2");
         assert!(attach2.snapshot.pending_approvals.is_empty());
@@ -1890,7 +1916,7 @@ mod tests {
     async fn delete_evicts_attached_client_and_removes_entry() {
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1901,17 +1927,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn attach_without_takeover_is_refused_while_held() {
+        // Opening a session someone else is driving must not evict them
+        // unless the caller explicitly asked for a takeover.
+        let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+        let attach1 = hub
+            .attach(key(), 1, "prov".into(), None, false)
+            .await
+            .expect("attach");
+        let mut events1 = attach1.events;
+
+        assert!(matches!(
+            hub.attach(key(), 2, "prov".into(), None, false).await,
+            Err(AttachError::Busy)
+        ));
+        // The holder is untouched: no eviction was delivered.
+        assert!(matches!(
+            hub.command(key(), 1, SessionCommand::Abort).await,
+            CommandOutcome::Ok
+        ));
+
+        // An explicit takeover still works and evicts the holder.
+        hub.attach(key(), 2, "prov".into(), None, true)
+            .await
+            .expect("takeover");
+        next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
+
+        hub.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn delete_from_stale_connection_is_rejected() {
         // Latest-wins covers destruction too: after being evicted, the old
         // connection must not be able to delete the session the new client is
         // driving.
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let _attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let _attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("attach2 evicts conn 1");
 
@@ -1930,7 +1986,7 @@ mod tests {
         // could never be released.
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let _attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
 
@@ -1973,7 +2029,7 @@ mod tests {
         // hard to reproduce.
         let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
         let attach1 = hub
-            .attach(key(), 1, "prov".into(), None)
+            .attach(key(), 1, "prov".into(), None, false)
             .await
             .expect("attach");
         let mut events1 = attach1.events;
@@ -1994,7 +2050,7 @@ mod tests {
 
         // Reopening reads the authoritative checkpoint from disk.
         let attach2 = hub
-            .attach(key(), 2, "prov".into(), None)
+            .attach(key(), 2, "prov".into(), None, true)
             .await
             .expect("re-attach");
         assert!(!attach2.snapshot.turn_running);
