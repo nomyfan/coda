@@ -2,7 +2,6 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  CircleSmall,
   MoreHorizontal,
   PanelLeft,
   Pencil,
@@ -366,9 +365,7 @@ function SessionRow({
           <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
             <StatusDot tone="busy" motion="breathe" />
           </span>
-        ) : (
-          <CircleSmall className="size-4 shrink-0 text-muted-foreground scale-75" />
-        )}
+        ) : null}
         <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
       </Button>
       {confirming ? (

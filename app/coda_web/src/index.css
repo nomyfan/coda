@@ -72,35 +72,35 @@
 
 .dark {
   /* Vellum Dark - Lighter & Softer (Green Accent) */
-  --background: hsl(24 6.3% 15.5%);
+  --background: hsl(24 7.1% 13.9%);
   --foreground: hsl(43 16.3% 91.6%);
-  --card: hsl(26 7.4% 18.6%);
+  --card: hsl(26 8.2% 17%);
   --card-foreground: hsl(43 16.3% 91.6%);
-  --popover: hsl(23 7.4% 21.2%);
+  --popover: hsl(26 8.2% 17%);
   --popover-foreground: hsl(43 16.3% 91.6%);
 
   /* Vellum 深色模式下的绿色 */
   --primary: hsl(89 34.8% 64.5%);
   --primary-foreground: hsl(24 6.3% 15.5%);
 
-  --secondary: hsl(27 8% 22.2%);
+  --secondary: hsl(27 8.8% 20.6%);
   --secondary-foreground: hsl(38 11.4% 86.3%);
 
-  --muted: hsl(26 7.4% 18.6%);
+  --muted: hsl(26 8.2% 17%);
   --muted-foreground: hsl(32 7.9% 62.9%);
 
-  --accent: hsl(27 7.3% 24.1%);
+  --accent: hsl(27 8.1% 22.5%);
   --accent-foreground: hsl(43 16.3% 91.6%);
 
   --destructive: hsl(0 66% 71.2%);
   --destructive-foreground: hsl(24 6.3% 15.5%);
 
-  /* 警示色（深色）— 暖琥珀 */
-  --warning: hsl(40 55% 62%);
-  --warning-foreground: hsl(42 45% 72%);
+  /* 警示色（深色）— 暖琥珀，色相与饱和度贴近 Vellum 橙色调（chart-4） */
+  --warning: hsl(32 58% 60%);
+  --warning-foreground: hsl(32 48% 70%);
 
-  --border: hsl(30 9.2% 25.5%);
-  --input: hsl(30 9.2% 25.5%);
+  --border: hsl(30 10% 23.9%);
+  --input: hsl(30 10% 23.9%);
   --ring: hsl(89 34.8% 64.5%); /* 同步焦点环为绿色 */
 
   /* 数据图表配色 */
@@ -111,13 +111,13 @@
   --chart-5: hsl(331 42.7% 72%);
 
   /* 侧边栏主色同步为绿色 */
-  --sidebar: hsl(20 7% 16.9%);
+  --sidebar: hsl(20 7.8% 15.3%);
   --sidebar-foreground: hsl(43 16.3% 91.6%);
   --sidebar-primary: hsl(89 34.8% 64.5%);
   --sidebar-primary-foreground: hsl(24 6.3% 15.5%);
-  --sidebar-accent: hsl(23 7.4% 21.2%);
+  --sidebar-accent: hsl(27 8.1% 22.5%);
   --sidebar-accent-foreground: hsl(43 16.3% 91.6%);
-  --sidebar-border: hsl(27 8% 22.2%);
+  --sidebar-border: hsl(27 8.8% 20.6%);
   --sidebar-ring: hsl(89 34.8% 64.5%);
 
   /* Retained Custom Configurations */

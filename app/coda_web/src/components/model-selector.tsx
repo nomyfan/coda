@@ -105,7 +105,7 @@ export function ModelSelector({
       >
         <SelectTrigger
           size="sm"
-          className="h-7 max-w-36 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-44"
+          className="h-7 max-w-36 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-44 dark:bg-transparent dark:hover:bg-muted/70"
         >
           <SelectValue placeholder="Model" />
         </SelectTrigger>
@@ -121,7 +121,7 @@ export function ModelSelector({
         >
           <SelectTrigger
             size="sm"
-            className="h-7 max-w-28 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-32"
+            className="h-7 max-w-28 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-32 dark:bg-transparent dark:hover:bg-muted/70"
           >
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>

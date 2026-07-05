@@ -78,6 +78,9 @@ export type OpenedSession = {
   entries: TranscriptEntry[];
   activity: ActivityEntry[];
   approvals: PendingApproval[];
+  /** Suspended calls' original arguments, keyed by call id, kept around only
+   * until `tool_start`/`tool_end` resolves each one (see `finishToolEntry`). */
+  pendingCallInfo: Record<string, ToolCall>;
   drafts: Record<string, Record<string, ToolCallResolution>>;
   /** Per-call "always allow" patterns staged for an approval; sent to the
    * server only on submit, so the intent stays cancelable until then. */
@@ -166,6 +169,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     entries: [],
     activity: [],
     approvals: [],
+    pendingCallInfo: {},
     drafts: {},
     allowDrafts: {},
     running: false,
@@ -409,15 +413,54 @@ function toolMessageToEntry(
   };
 }
 
+/** Recall a suspended call's arguments to describe it once resolved: a
+ * rejected call never fires `tool_start`, so `finishToolEntry` otherwise has
+ * nothing but the bare tool name to show. */
+function withPendingCallInfo(
+  session: OpenedSession,
+  calls: ToolCall[],
+): OpenedSession["pendingCallInfo"] {
+  if (calls.length === 0) {
+    return session.pendingCallInfo;
+  }
+  const next = { ...session.pendingCallInfo };
+  for (const call of calls) {
+    next[call.id] = call;
+  }
+  return next;
+}
+
+function withoutPendingCallInfo(
+  session: OpenedSession,
+  callId: string,
+): OpenedSession["pendingCallInfo"] {
+  if (!(callId in session.pendingCallInfo)) {
+    return session.pendingCallInfo;
+  }
+  const next = { ...session.pendingCallInfo };
+  delete next[callId];
+  return next;
+}
+
 function finishToolEntry(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "tool_end" }>,
 ): OpenedSession {
   const index = session.entries.findIndex((entry) => entry.callId === event.message.id);
   if (index < 0) {
+    const call = session.pendingCallInfo[event.message.id];
     return {
       ...session,
-      entries: [...session.entries, toolMessageToEntry(event.message)],
+      pendingCallInfo: withoutPendingCallInfo(session, event.message.id),
+      entries: [
+        ...session.entries,
+        toolMessageToEntry(
+          event.message,
+          undefined,
+          call ? describeTool(call.name, call.arguments) : undefined,
+          call?.name === "shell" ? extractShellCommand(call) : undefined,
+        ),
+      ],
     };
   }
   const entries = [...session.entries];
@@ -661,6 +704,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
           detail: subAgentDisplayName(event.call.name),
         }),
         running: true,
+        pendingCallInfo: withoutPendingCallInfo(session, event.call.id),
         entries: [
           ...session.entries,
           {
@@ -693,6 +737,7 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
           detail: `${event.approval.calls.length} call(s) from ${event.agent_name}`,
         }),
         approvals: upsertApproval(session.approvals, event.approval),
+        pendingCallInfo: withPendingCallInfo(session, event.approval.calls),
         running: false,
       };
     case "aborted": {

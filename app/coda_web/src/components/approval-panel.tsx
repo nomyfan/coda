@@ -5,7 +5,7 @@ import {
   ChevronRight,
   FilePen,
   FilePlus2,
-  FileQuestionMark,
+  ShieldAlert,
   FileSearch,
   FileText,
   FolderTree,
@@ -61,7 +61,7 @@ function formatArguments(value: string) {
 type ApprovalItem = { approval: PendingApproval; call: ToolCall };
 
 const TOOL_ICONS: Record<string, LucideIcon> = {
-  ask_user: FileQuestionMark,
+  ask_user: ShieldAlert,
   read_file: FileText,
   write_file: FilePlus2,
   edit_file: FilePen,
@@ -85,7 +85,7 @@ function askUserResolvedText(decision: ToolCallResolution | undefined): string |
 
 function approvalHeader(call: ToolCall) {
   if (call.name === "ask_user") {
-    return { detail: parseAskUserParams(call).question, Icon: FileQuestionMark, label: "Ask" };
+    return { detail: parseAskUserParams(call).question, Icon: ShieldAlert, label: "Ask" };
   }
   const Icon = call.name.startsWith(SUBAGENT_TOOL_PREFIX)
     ? Bot
@@ -366,7 +366,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
 
   return (
     <div className="px-2 pt-2 sm:px-4">
-      <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border border-warning/40 bg-warning/8">
+      <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border">
         <div className="flex max-h-[55vh] flex-col">
           <div className="flex items-start justify-between gap-3 px-3 pt-2.5 sm:px-4">
             <div className="flex min-w-0 items-start gap-2 text-sm font-medium leading-6">
