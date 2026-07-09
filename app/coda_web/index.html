@@ -8,6 +8,9 @@
     <meta name="theme-color" content="#262321" media="(prefers-color-scheme: dark)" />
     <script>
       (() => {
+        // Pre-CSS seed to avoid a flash before the stylesheet loads; must match
+        // --background in src/index.css (:root / .dark). Cleared by
+        // applyThemePreference() once the app mounts and CSS takes over.
         const colors = { light: "#fcfbf9", dark: "#262321" };
         const saved = localStorage.getItem("coda-theme");
         const preference =
@@ -23,6 +26,7 @@
         document.documentElement.style.colorScheme = theme;
         document.documentElement.style.setProperty("background-color", color, "important");
         const style = document.createElement("style");
+        style.id = "theme-seed";
         style.textContent = `html,body{background-color:${color}!important}`;
         document.head.append(style);
       })();
