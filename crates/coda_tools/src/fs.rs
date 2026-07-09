@@ -3,8 +3,43 @@ use std::path::Path;
 use coda_core::tool::{Tool, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::debug;
+
+/// Open `path` and verify, from the opened handle, that it is a regular file
+/// — not a symlink (of the final path component), directory, or other special
+/// file. Callers must do all IO through the returned handle: re-opening by
+/// path would let a concurrent swap of the path redirect the IO. O_NONBLOCK
+/// only stops the open itself from hanging on a FIFO; it has no effect on
+/// regular-file IO.
+async fn open_regular_file(path: &Path, write: bool) -> ToolResult<tokio::fs::File> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                ToolError::InvalidParameters(
+                    "path is a symlink; only regular files are supported".to_string(),
+                )
+            } else {
+                ToolError::ExecutionError(format!("Failed to open file: {}", e))
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| ToolError::ExecutionError(format!("Failed to stat file: {}", e)))?;
+    if !metadata.is_file() {
+        return Err(ToolError::InvalidParameters(
+            "path is not a regular file".to_string(),
+        ));
+    }
+    Ok(file)
+}
 
 // ---- ReadFile ----
 
@@ -60,7 +95,9 @@ impl Tool for ReadFileTool {
                 ));
             }
 
-            let content = tokio::fs::read_to_string(path)
+            let mut file = open_regular_file(path, false).await?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
 
@@ -108,7 +145,7 @@ pub struct WriteFileTool {
 pub struct WriteFileToolParams {
     /// The absolute path to the file to write.
     file_path: String,
-    /// The content to write to the file. This will overwrite the existing file content.
+    /// The content to write to the new file.
     content: String,
 }
 
@@ -130,7 +167,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file. The file_path must be an absolute path. If the file exists, it will be overwritten. Parent directories will be created if they don't exist."
+        "Create a new file with the given content. The file_path must be an absolute path and must not already exist — use edit_file to modify an existing file. Parent directories will be created if they don't exist."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -156,8 +193,29 @@ impl Tool for WriteFileTool {
                 })?;
             }
 
+            // O_CREAT|O_EXCL fails atomically on any existing path, including
+            // symlinks (even dangling ones), closing the check-then-write race.
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .await
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        ToolError::InvalidParameters(
+                            "file_path already exists; use edit_file to modify an existing file"
+                                .to_string(),
+                        )
+                    } else {
+                        ToolError::ExecutionError(format!("Failed to create file: {}", e))
+                    }
+                })?;
+
             let bytes = params.content.len();
-            tokio::fs::write(path, &params.content)
+            file.write_all(params.content.as_bytes())
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+            file.flush()
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
 
@@ -241,7 +299,9 @@ impl Tool for EditFileTool {
                 ));
             }
 
-            let content = tokio::fs::read_to_string(path)
+            let mut file = open_regular_file(path, true).await?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to read file: {}", e)))?;
 
@@ -271,7 +331,16 @@ impl Tool for EditFileTool {
                 )
             };
 
-            tokio::fs::write(path, &updated)
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+            file.set_len(0)
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+            file.write_all(updated.as_bytes())
+                .await
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+            file.flush()
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
 
@@ -472,6 +541,119 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("coda_fs_test_{}_{}", std::process::id(), name));
+        path
+    }
+
+    #[tokio::test]
+    async fn write_creates_new_file() {
+        let path = tmp_path("write_new");
+        std::fs::remove_file(&path).ok();
+        let tool = WriteFileTool::new();
+        tool.execute(WriteFileToolParams {
+            file_path: path.to_str().unwrap().to_string(),
+            content: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn write_refuses_existing_file() {
+        let path = tmp_file("write_existing", "original\n");
+        let tool = WriteFileTool::new();
+        let err = tool
+            .execute(WriteFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                content: "clobbered".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn write_refuses_existing_symlink() {
+        let target = tmp_file("symlink_write_target", "content\n");
+        let link = tmp_path("symlink_write_link");
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let tool = WriteFileTool::new();
+        let err = tool
+            .execute(WriteFileToolParams {
+                file_path: link.to_str().unwrap().to_string(),
+                content: "clobbered".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "content\n");
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[tokio::test]
+    async fn read_refuses_symlink() {
+        let target = tmp_file("symlink_read_target", "content\n");
+        let link = tmp_path("symlink_read_link");
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let tool = ReadFileTool::new();
+        let err = tool
+            .execute(ReadFileToolParams {
+                file_path: link.to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[tokio::test]
+    async fn read_refuses_directory() {
+        let tool = ReadFileTool::new();
+        let err = tool
+            .execute(ReadFileToolParams {
+                file_path: std::env::temp_dir().to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_symlink() {
+        let target = tmp_file("symlink_edit_target", "content\n");
+        let link = tmp_path("symlink_edit_link");
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let tool = EditFileTool::new();
+        let err = tool
+            .execute(EditFileToolParams {
+                file_path: link.to_str().unwrap().to_string(),
+                old_string: "content".to_string(),
+                new_string: "changed".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "content\n");
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
     }
 
     #[tokio::test]
