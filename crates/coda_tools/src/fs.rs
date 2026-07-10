@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use coda_core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
+
+use crate::process::{CommandRun, run_command};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -108,6 +110,7 @@ impl Tool for ReadFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move {
             let path = Path::new(&params.file_path);
@@ -198,6 +201,7 @@ impl Tool for WriteFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move {
             let path = Path::new(&params.file_path);
@@ -308,6 +312,7 @@ impl Tool for EditFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move {
             let path = Path::new(&params.file_path);
@@ -428,6 +433,7 @@ impl Tool for ListDirectoryTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move {
             let path = Path::new(&params.path);
@@ -437,16 +443,24 @@ impl Tool for ListDirectoryTool {
                 ));
             }
 
-            let output = Command::new("fd")
-                .arg("--color=never")
+            let mut cmd = Command::new("fd");
+            cmd.arg("--color=never")
                 .arg("--glob")
                 .arg("*")
                 .arg("--exact-depth")
                 .arg("1")
-                .arg(&params.path)
-                .output()
+                .arg(&params.path);
+            let output = match run_command(cmd, ctx.cancel)
                 .await
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+                .map_err(|e| ToolError::ExecutionError(e.to_string()))?
+            {
+                CommandRun::Completed(output) => output,
+                CommandRun::Cancelled { .. } => {
+                    return Err(ToolError::Aborted(
+                        "Interrupted by the user before completion.".to_string(),
+                    ));
+                }
+            };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -473,17 +487,37 @@ mod tests {
         path
     }
 
+    /// The cancellation context must reach the child-process runner: a token
+    /// cancelled up front settles as Aborted instead of running fd.
+    #[tokio::test]
+    async fn ls_pre_cancelled_context_aborts() {
+        let ctx = ToolCallContext::default();
+        ctx.cancel.cancel();
+        let result = ListDirectoryTool::new()
+            .execute(
+                ListDirectoryToolParams {
+                    path: std::env::temp_dir().to_string_lossy().into_owned(),
+                },
+                ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Aborted(_))));
+    }
+
     #[tokio::test]
     async fn edit_replaces_unique_match() {
         let path = tmp_file("unique", "hello world\nfoo bar\n");
         let tool = EditFileTool::new();
         let result = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "foo bar".to_string(),
-                new_string: "baz qux".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "foo bar".to_string(),
+                    new_string: "baz qux".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap();
         assert!(result.contains("1 occurrence"));
@@ -499,12 +533,15 @@ mod tests {
         let path = tmp_file("notfound", "hello world\n");
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "missing".to_string(),
-                new_string: "x".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "missing".to_string(),
+                    new_string: "x".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -516,12 +553,15 @@ mod tests {
         let path = tmp_file("ambiguous", "x\nx\n");
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "x".to_string(),
-                new_string: "y".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "x".to_string(),
+                    new_string: "y".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -533,12 +573,15 @@ mod tests {
         let path = tmp_file("all", "x\nx\nx\n");
         let tool = EditFileTool::new();
         let result = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "x".to_string(),
-                new_string: "y".to_string(),
-                replace_all: Some(true),
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "x".to_string(),
+                    new_string: "y".to_string(),
+                    replace_all: Some(true),
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap();
         assert!(result.contains("3 occurrence"));
@@ -551,12 +594,15 @@ mod tests {
         let path = tmp_file("identical", "x\n");
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "x".to_string(),
-                new_string: "x".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "x".to_string(),
+                    new_string: "x".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -567,12 +613,15 @@ mod tests {
     async fn edit_requires_absolute_path() {
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: "relative.txt".to_string(),
-                old_string: "a".to_string(),
-                new_string: "b".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: "relative.txt".to_string(),
+                    old_string: "a".to_string(),
+                    new_string: "b".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -597,10 +646,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let tool = WriteFileTool::new();
         let err = tool
-            .execute(WriteFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                content: "a".repeat((MAX_FILE_SIZE + 1) as usize),
-            })
+            .execute(
+                WriteFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    content: "a".repeat((MAX_FILE_SIZE + 1) as usize),
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -612,11 +664,14 @@ mod tests {
         let path = tmp_huge_file("huge_read");
         let tool = ReadFileTool::new();
         let err = tool
-            .execute(ReadFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                offset: None,
-                limit: None,
-            })
+            .execute(
+                ReadFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -628,12 +683,15 @@ mod tests {
         let path = tmp_huge_file("huge_edit");
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "a".to_string(),
-                new_string: "b".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "a".to_string(),
+                    new_string: "b".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -646,11 +704,14 @@ mod tests {
         std::fs::write(&path, b"before \xFF\xFE after\n").unwrap();
         let tool = ReadFileTool::new();
         let result = tool
-            .execute(ReadFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                offset: None,
-                limit: None,
-            })
+            .execute(
+                ReadFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap();
         assert!(result.contains("before \u{FFFD}\u{FFFD} after"));
@@ -663,12 +724,15 @@ mod tests {
         std::fs::write(&path, b"before \xFF\xFE after\n").unwrap();
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "before".to_string(),
-                new_string: "changed".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "before".to_string(),
+                    new_string: "changed".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -681,10 +745,13 @@ mod tests {
         let path = tmp_path("write_new");
         std::fs::remove_file(&path).ok();
         let tool = WriteFileTool::new();
-        tool.execute(WriteFileToolParams {
-            file_path: path.to_str().unwrap().to_string(),
-            content: "hello".to_string(),
-        })
+        tool.execute(
+            WriteFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                content: "hello".to_string(),
+            },
+            ToolCallContext::default(),
+        )
         .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
@@ -696,10 +763,13 @@ mod tests {
         let path = tmp_file("write_existing", "original\n");
         let tool = WriteFileTool::new();
         let err = tool
-            .execute(WriteFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                content: "clobbered".to_string(),
-            })
+            .execute(
+                WriteFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    content: "clobbered".to_string(),
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -715,10 +785,13 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let tool = WriteFileTool::new();
         let err = tool
-            .execute(WriteFileToolParams {
-                file_path: link.to_str().unwrap().to_string(),
-                content: "clobbered".to_string(),
-            })
+            .execute(
+                WriteFileToolParams {
+                    file_path: link.to_str().unwrap().to_string(),
+                    content: "clobbered".to_string(),
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -735,11 +808,14 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let tool = ReadFileTool::new();
         let err = tool
-            .execute(ReadFileToolParams {
-                file_path: link.to_str().unwrap().to_string(),
-                offset: None,
-                limit: None,
-            })
+            .execute(
+                ReadFileToolParams {
+                    file_path: link.to_str().unwrap().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -751,11 +827,14 @@ mod tests {
     async fn read_refuses_directory() {
         let tool = ReadFileTool::new();
         let err = tool
-            .execute(ReadFileToolParams {
-                file_path: std::env::temp_dir().to_str().unwrap().to_string(),
-                offset: None,
-                limit: None,
-            })
+            .execute(
+                ReadFileToolParams {
+                    file_path: std::env::temp_dir().to_str().unwrap().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -769,12 +848,15 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: link.to_str().unwrap().to_string(),
-                old_string: "content".to_string(),
-                new_string: "changed".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: link.to_str().unwrap().to_string(),
+                    old_string: "content".to_string(),
+                    new_string: "changed".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));
@@ -788,12 +870,15 @@ mod tests {
         let path = tmp_file("empty_old", "hello\n");
         let tool = EditFileTool::new();
         let err = tool
-            .execute(EditFileToolParams {
-                file_path: path.to_str().unwrap().to_string(),
-                old_string: "".to_string(),
-                new_string: "x".to_string(),
-                replace_all: None,
-            })
+            .execute(
+                EditFileToolParams {
+                    file_path: path.to_str().unwrap().to_string(),
+                    old_string: "".to_string(),
+                    new_string: "x".to_string(),
+                    replace_all: None,
+                },
+                ToolCallContext::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidParameters(_)));

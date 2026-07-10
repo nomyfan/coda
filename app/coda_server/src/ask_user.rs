@@ -1,4 +1,4 @@
-use coda_core::tool::{Tool, ToolError, ToolObject, ToolResult, ToolWrapper};
+use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolObject, ToolResult, ToolWrapper};
 use coda_tools::{BuildContext, ToolSpec};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,7 @@ impl Tool for AskUserTool {
     fn execute(
         &self,
         _params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<String>> + Send + 'static {
         async {
             Err(ToolError::ExecutionError(

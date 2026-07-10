@@ -5,7 +5,7 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use coda_core::tool::{Tool, ToolResult};
+use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
@@ -65,6 +65,7 @@ impl Tool for ReadTodosTool {
     fn execute(
         &self,
         _params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let store = self.store.clone();
 
@@ -123,6 +124,7 @@ impl Tool for WriteTodosTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let store = self.store.clone();
 

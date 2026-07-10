@@ -659,6 +659,7 @@ mod tests {
         fn execute(
             self: Arc<Self>,
             _params: String,
+            _ctx: coda_core::tool::ToolCallContext,
         ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
             Box::pin(async { Ok(String::new()) })
         }
