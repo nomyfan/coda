@@ -18,7 +18,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How a [`run_command`] invocation ended.
-pub(crate) enum CommandRun {
+pub(crate) enum CommandOutcome {
     /// The command ran to completion (with any exit status).
     Completed(Output),
     /// Cancelled mid-flight: the process group was SIGKILLed and reaped; the
@@ -39,11 +39,11 @@ pub(crate) enum CommandRun {
 pub(crate) async fn run_command(
     mut cmd: Command,
     cancel: CancellationToken,
-) -> std::io::Result<CommandRun> {
+) -> std::io::Result<CommandOutcome> {
     // A context that is already cancelled must not start the process at all:
     // a fast command could finish its side effects before the group kill.
     if cancel.is_cancelled() {
-        return Ok(CommandRun::Cancelled {
+        return Ok(CommandOutcome::Cancelled {
             stdout: Vec::new(),
             stderr: Vec::new(),
         });
@@ -99,7 +99,7 @@ pub(crate) async fn run_command(
             // Kill the whole group, then reap the leader before we report
             // back. The pipes hit EOF, letting the reader tasks finish with
             // whatever was produced.
-            guard.kill_now();
+            guard.kill();
             let _ = child.wait().await;
             None
         }
@@ -110,12 +110,12 @@ pub(crate) async fn run_command(
     // at once — unless a descendant escaped the group (setsid) and holds one
     // open, which nothing will ever tear down. Bound the drain.
     let Some(status) = status else {
-        let run = CommandRun::Cancelled {
+        let outcome = CommandOutcome::Cancelled {
             stdout: drain_reader(&mut stdout_task).await,
             stderr: drain_reader(&mut stderr_task).await,
         };
         guard.disarm();
-        return Ok(run);
+        return Ok(outcome);
     };
 
     // A normal exit usually EOFs the pipes right away; a clean command whose
@@ -127,13 +127,13 @@ pub(crate) async fn run_command(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            guard.kill_now();
-            let run = CommandRun::Cancelled {
+            guard.kill();
+            let outcome = CommandOutcome::Cancelled {
                 stdout: drain_reader(&mut stdout_task).await,
                 stderr: drain_reader(&mut stderr_task).await,
             };
             guard.disarm();
-            Ok(run)
+            Ok(outcome)
         }
         bufs = async {
             (
@@ -142,7 +142,7 @@ pub(crate) async fn run_command(
             )
         } => {
             guard.disarm();
-            Ok(CommandRun::Completed(Output {
+            Ok(CommandOutcome::Completed(Output {
                 status: status?,
                 stdout: bufs.0,
                 stderr: bufs.1,
@@ -206,7 +206,7 @@ struct KillGroupGuard {
 impl KillGroupGuard {
     /// Kill the group now. The readers stay untouched so the cancellation
     /// path can still salvage partial output from them.
-    fn kill_now(&mut self) {
+    fn kill(&mut self) {
         kill_group(self.pgid.take());
     }
 

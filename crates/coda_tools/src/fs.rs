@@ -2,7 +2,7 @@ use std::path::Path;
 
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 
-use crate::process::{CommandRun, run_command};
+use crate::process::{CommandOutcome, run_command};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -454,8 +454,8 @@ impl Tool for ListDirectoryTool {
                 .await
                 .map_err(|e| ToolError::ExecutionError(e.to_string()))?
             {
-                CommandRun::Completed(output) => output,
-                CommandRun::Cancelled { .. } => {
+                CommandOutcome::Completed(output) => output,
+                CommandOutcome::Cancelled { .. } => {
                     return Err(ToolError::Aborted(
                         "Interrupted by the user before completion.".to_string(),
                     ));

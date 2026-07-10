@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::debug;
 
-use crate::process::{CommandRun, run_command};
+use crate::process::{CommandOutcome, run_command};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ShellToolParams {
@@ -71,7 +71,7 @@ impl Tool for ShellTool {
             })?;
 
             let output = match run {
-                CommandRun::Cancelled { stdout, stderr } => {
+                CommandOutcome::Cancelled { stdout, stderr } => {
                     let stdout = String::from_utf8_lossy(&stdout);
                     let stderr = String::from_utf8_lossy(&stderr);
                     let mut reason =
@@ -84,7 +84,7 @@ impl Tool for ShellTool {
                     }
                     return Err(ToolError::Aborted(reason));
                 }
-                CommandRun::Completed(output) => output,
+                CommandOutcome::Completed(output) => output,
             };
 
             let stdout = String::from_utf8_lossy(&output.stdout);

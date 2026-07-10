@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
 
-use crate::process::{CommandRun, run_command};
+use crate::process::{CommandOutcome, run_command};
 
 pub struct GrepTool {
     /// Absolute path to the directory where the grep command should be executed.
@@ -79,8 +79,8 @@ impl Tool for GrepTool {
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to execute rg: {}", e)))?
             {
-                CommandRun::Completed(output) => output,
-                CommandRun::Cancelled { .. } => {
+                CommandOutcome::Completed(output) => output,
+                CommandOutcome::Cancelled { .. } => {
                     return Err(ToolError::Aborted(
                         "Interrupted by the user before completion.".to_string(),
                     ));
