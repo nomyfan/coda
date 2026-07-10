@@ -107,7 +107,6 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::kill_group;
 
     fn tool() -> ShellTool {
         ShellTool::new(std::env::temp_dir().to_string_lossy().into_owned())
@@ -215,7 +214,12 @@ mod tests {
                 .copied()
                 .filter(|&pid| process_alive(pid))
                 .collect();
-            kill_group(Some(pids[0]));
+            // The group is led by the sentinel, not bash, so a group kill
+            // keyed on these pids would miss; kill them directly.
+            for &pid in &survivors {
+                // SAFETY: plain signal syscall on processes this test spawned.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             panic!("processes survived cancellation: {survivors:?}");
         });
 

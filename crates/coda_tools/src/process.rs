@@ -187,7 +187,7 @@ fn spawn_sentinel() -> std::io::Result<Child> {
 }
 
 /// Sends SIGKILL to the whole process group. A no-op for `None`.
-pub(crate) fn kill_group(pgid: Option<i32>) {
+fn kill_group(pgid: Option<i32>) {
     if let Some(pgid) = pgid {
         // SAFETY: plain signal syscall targeting a process group this module
         // spawned via `process_group(0)`.
