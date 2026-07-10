@@ -1,8 +1,10 @@
-use coda_core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
+
+use crate::process::{CommandOutcome, run_command};
 
 pub struct GrepTool {
     /// Absolute path to the directory where the grep command should be executed.
@@ -50,6 +52,7 @@ impl Tool for GrepTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
 
@@ -72,10 +75,17 @@ impl Tool for GrepTool {
 
             info!("Executing rg: {:?}", cmd);
 
-            let output = cmd
-                .output()
+            let output = match run_command(cmd, ctx.cancel)
                 .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute rg: {}", e)))?;
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute rg: {}", e)))?
+            {
+                CommandOutcome::Completed(output) => output,
+                CommandOutcome::Cancelled { .. } => {
+                    return Err(ToolError::Aborted(
+                        "Interrupted by the user before completion.".to_string(),
+                    ));
+                }
+            };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -90,5 +100,29 @@ impl Tool for GrepTool {
                 ))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cancellation context must reach the child-process runner: a token
+    /// cancelled up front settles as Aborted instead of running rg.
+    #[tokio::test]
+    async fn pre_cancelled_context_aborts() {
+        let ctx = ToolCallContext::default();
+        ctx.cancel.cancel();
+        let result = GrepTool::new(".".into())
+            .execute(
+                GrepToolParams {
+                    pattern: "x".into(),
+                    path: None,
+                    glob: None,
+                },
+                ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Aborted(_))));
     }
 }

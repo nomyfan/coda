@@ -1,6 +1,7 @@
 mod fs;
 mod glob;
 mod grep;
+mod process;
 mod shell;
 mod spec;
 mod todo;

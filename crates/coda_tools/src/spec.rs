@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_core::tool::{ToolObject, ToolResult, ToolWrapper};
+use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
 use crate::todo::TodoItem;
 use crate::{
@@ -184,8 +184,9 @@ impl ToolObject for SharedToolObject {
     fn execute(
         self: Arc<Self>,
         params: String,
+        ctx: ToolCallContext,
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
-        self.0.clone().execute(params)
+        self.0.clone().execute(params, ctx)
     }
 }
 

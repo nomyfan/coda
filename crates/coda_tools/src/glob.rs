@@ -1,8 +1,10 @@
-use coda_core::tool::{Tool, ToolError, ToolResult};
+use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
+
+use crate::process::{CommandOutcome, run_command};
 
 pub struct GlobTool {
     cwd: String,
@@ -45,6 +47,7 @@ impl Tool for GlobTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
 
@@ -60,10 +63,17 @@ impl Tool for GlobTool {
 
             info!("Executing fd: {:?}", cmd);
 
-            let output = cmd
-                .output()
+            let output = match run_command(cmd, ctx.cancel)
                 .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute fd: {}", e)))?;
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute fd: {}", e)))?
+            {
+                CommandOutcome::Completed(output) => output,
+                CommandOutcome::Cancelled { .. } => {
+                    return Err(ToolError::Aborted(
+                        "Interrupted by the user before completion.".to_string(),
+                    ));
+                }
+            };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -78,5 +88,28 @@ impl Tool for GlobTool {
                 ))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cancellation context must reach the child-process runner: a token
+    /// cancelled up front settles as Aborted instead of running fd.
+    #[tokio::test]
+    async fn pre_cancelled_context_aborts() {
+        let ctx = ToolCallContext::default();
+        ctx.cancel.cancel();
+        let result = GlobTool::new(".".into())
+            .execute(
+                GlobToolParams {
+                    pattern: "*.rs".into(),
+                    path: None,
+                },
+                ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Aborted(_))));
     }
 }

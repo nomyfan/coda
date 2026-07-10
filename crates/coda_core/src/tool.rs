@@ -5,14 +5,29 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+pub use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info, info_span};
 
 use super::llm::ToolDefinition;
+
+/// Per-invocation execution context handed to every tool call.
+///
+/// `cancel` fires when the caller aborts the invocation (e.g. the user aborts
+/// the turn). Tools driving external work — child processes, network calls —
+/// should observe it, tear that work down, and return [`ToolError::Aborted`]
+/// promptly; quick in-process tools may ignore it and run to completion.
+#[derive(Clone, Debug, Default)]
+pub struct ToolCallContext {
+    pub cancel: CancellationToken,
+}
 
 #[derive(Debug)]
 pub enum ToolError {
     InvalidParameters(String),
     ExecutionError(String),
+    /// The call observed cancellation and stopped early. The payload becomes
+    /// the recorded tool result and may carry partial output.
+    Aborted(String),
 }
 
 impl Display for ToolError {
@@ -20,6 +35,7 @@ impl Display for ToolError {
         match self {
             ToolError::InvalidParameters(reason) => write!(f, "Invalid parameters: {}", reason),
             ToolError::ExecutionError(reason) => write!(f, "Execution error: {}", reason),
+            ToolError::Aborted(reason) => write!(f, "Aborted: {}", reason),
         }
     }
 }
@@ -42,6 +58,7 @@ pub trait Tool: Send + Sync + 'static {
     fn execute(
         &self,
         params: Self::Parameters,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static;
 }
 
@@ -52,6 +69,7 @@ pub trait ToolObject: Send + Sync {
     fn execute(
         self: Arc<Self>,
         params: String,
+        ctx: ToolCallContext,
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
 }
 
@@ -76,6 +94,7 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
     fn execute(
         self: Arc<Self>,
         input: String,
+        ctx: ToolCallContext,
     ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
         let span = info_span!(
             "execute_tool",
@@ -95,7 +114,7 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
         Box::pin(
             async move {
                 info!("executing tool");
-                let result = self.0.execute(params).await;
+                let result = self.0.execute(params, ctx).await;
                 let span = Span::current();
                 match &result {
                     Ok(output) => span.record("output", output.to_string()),

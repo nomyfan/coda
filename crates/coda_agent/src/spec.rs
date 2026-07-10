@@ -261,7 +261,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
-    use coda_core::tool::{ToolObject, ToolResult};
+    use coda_core::tool::{ToolCallContext, ToolObject, ToolResult};
 
     use super::*;
 
@@ -293,6 +293,7 @@ mod tests {
         fn execute(
             self: Arc<Self>,
             _params: String,
+            _ctx: ToolCallContext,
         ) -> Pin<Box<dyn std::future::Future<Output = ToolResult<String>> + Send>> {
             Box::pin(async { Ok(String::new()) })
         }

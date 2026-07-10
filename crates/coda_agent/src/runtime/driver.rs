@@ -7,6 +7,7 @@ use coda_core::llm::{
     ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError, ToolCallOutcome,
     ToolMessage, ToolOutput, UserMessage,
 };
+use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,15 @@ use crate::{
     persist::StoredCheckpoint,
     runtime::AgentRuntime,
 };
+
+/// How long an aborted turn waits for in-flight tool calls to observe their
+/// cancellation token, tear down their work (e.g. kill child processes), and
+/// settle with partial output before their futures are dropped.
+/// Shortened under `cfg(test)` so tests exercising the timeout path stay fast.
+#[cfg(not(test))]
+const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[instrument(skip_all, fields(agent = %agent.name))]
 pub(crate) async fn run_agent(
@@ -366,6 +376,36 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 err
             );
         }
+    }
+
+    /// Record a settled local tool call. A call that observed cancellation
+    /// keeps whatever partial output it salvaged and is marked `Aborted`;
+    /// anything else keeps the outcome it started with. Returns whether the
+    /// call was recorded as aborted.
+    async fn settle_local_tool(
+        &mut self,
+        tc: PendingToolCall,
+        started_at: jiff::Timestamp,
+        result: ToolResult<String>,
+    ) -> bool {
+        let (output, outcome) = match result {
+            Ok(output) => (ToolOutput::Ok(output), tc.outcome),
+            Err(ToolError::Aborted(reason)) => (ToolOutput::Err(reason), ToolCallOutcome::Aborted),
+            Err(err) => (
+                ToolOutput::Err(format!("Tool execution error: {}", err)),
+                tc.outcome,
+            ),
+        };
+        let aborted = matches!(outcome, ToolCallOutcome::Aborted);
+        self.add_tool_message(ToolMessage::new(
+            tc.tool_call.id,
+            tc.tool_call.name,
+            output,
+            outcome,
+            Some(started_at),
+        ))
+        .await;
+        aborted
     }
 
     /// Append a tool message to history and emit the matching `ToolCallEnd`.
@@ -891,9 +931,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     .await;
                 pending_local.insert(tc.tool_call.id.clone(), (tc.clone(), started_at));
                 let tc = tc.clone();
+                // A child of the turn's token: aborting the turn cancels every
+                // in-flight tool, and (later) a single tool can be cancelled
+                // without touching its siblings.
+                let ctx = ToolCallContext {
+                    cancel: self.cancel.child_token(),
+                };
                 let future = async move {
                     let output = tool
-                        .execute(tc.tool_call.arguments.clone().unwrap_or_default())
+                        .execute(tc.tool_call.arguments.clone().unwrap_or_default(), ctx)
                         .await;
                     (tc, started_at, output)
                 };
@@ -929,16 +975,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 _ = self.cancel.cancelled() => break true,
                 Some((tc, started_at, result)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    self.add_tool_message(ToolMessage::new(
-                        tc.tool_call.id,
-                        tc.tool_call.name,
-                        match result {
-                            Ok(output) => ToolOutput::Ok(output),
-                            Err(err) => ToolOutput::Err(format!("Tool execution error: {}", err)),
-                        },
-                        tc.outcome,
-                        Some(started_at),
-                    )).await;
+                    self.settle_local_tool(tc, started_at, result).await;
                 }
             }
         };
@@ -948,7 +985,31 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             // Aborted ToolMessages go to history AND out as ToolCallEnd events
             // before the Aborted marker, so event consumers see every history
             // write; `Aborted` alone settles the turn.
-            let mut aborted_ids: Vec<String> = pending_local.keys().cloned().collect();
+            let mut aborted_ids: Vec<String> = Vec::new();
+            // The tools saw the cancellation through their context token; give
+            // them a grace period to tear down their work (kill child
+            // processes, collect partial output) and settle, rather than
+            // dropping their futures mid-flight. Tools that complete for real
+            // during the drain keep their genuine results.
+            let grace = tokio::time::sleep(TOOL_ABORT_GRACE);
+            tokio::pin!(grace);
+            while !futures.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = &mut grace => break,
+                    Some((tc, started_at, result)) = futures.next() => {
+                        pending_local.remove(&tc.tool_call.id);
+                        let id = tc.tool_call.id.clone();
+                        if self.settle_local_tool(tc, started_at, result).await {
+                            aborted_ids.push(id);
+                        }
+                    }
+                }
+            }
+            // Whatever outlived the grace period gets dropped mid-flight and
+            // recorded with a generic interruption message.
+            drop(futures);
+            aborted_ids.extend(pending_local.keys().cloned());
             for (id, (tc, started_at)) in pending_local {
                 self.add_tool_message(ToolMessage::new(
                     id,

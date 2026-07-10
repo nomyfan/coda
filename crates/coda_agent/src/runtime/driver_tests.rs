@@ -9,7 +9,7 @@ use coda_core::{
         AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
         ToolCall, ToolMessage,
     },
-    tool::{Tool, ToolObject, ToolResult, ToolWrapper},
+    tool::{Tool, ToolCallContext, ToolObject, ToolResult, ToolWrapper},
 };
 use coda_tools::{BuildContext, ReadTodosToolSpec, ToolSpec};
 use futures::{Stream, StreamExt, stream};
@@ -143,6 +143,7 @@ impl Tool for EchoTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         async move { Ok(params.text) }
     }
@@ -198,6 +199,7 @@ impl Tool for SlowTool {
     fn execute(
         &self,
         params: Self::Parameters,
+        _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let gate = self.gate.clone();
         async move {
@@ -217,6 +219,69 @@ impl ToolSpec for SlowToolSpec {
     }
     fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
         Box::new(ToolWrapper::from(SlowTool::new(self.gate.clone())))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CancelAwareToolParams {
+    label: String,
+}
+
+/// A tool that never completes on its own: it waits for its cancellation
+/// token and settles with `ToolError::Aborted` carrying partial output, the
+/// way a cancel-aware tool (e.g. shell) tears down and reports back.
+struct CancelAwareTool {
+    schema: Schema,
+}
+
+impl CancelAwareTool {
+    fn new() -> Self {
+        Self {
+            schema: schemars::schema_for!(CancelAwareToolParams),
+        }
+    }
+}
+
+impl Tool for CancelAwareTool {
+    type Parameters = CancelAwareToolParams;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "cancel_aware"
+    }
+
+    fn description(&self) -> &str {
+        "Waits for cancellation and reports partial output."
+    }
+
+    fn parameter_schema(&self) -> &serde_json::Value {
+        self.schema.as_value()
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn execute(
+        &self,
+        params: Self::Parameters,
+        ctx: ToolCallContext,
+    ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
+        async move {
+            ctx.cancel.cancelled().await;
+            Err(ToolError::Aborted(format!(
+                "partial output from {}",
+                params.label
+            )))
+        }
+    }
+}
+
+struct CancelAwareToolSpec;
+
+impl ToolSpec for CancelAwareToolSpec {
+    fn name(&self) -> &str {
+        "cancel_aware"
+    }
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(CancelAwareTool::new()))
     }
 }
 
@@ -434,6 +499,14 @@ impl LLMProvider for TestProvider {
                         arguments: Some(r#"{"task":"hold"}"#.into()),
                     },
                 ],
+                ..assistant()
+            }),
+            "abort-cancel-aware-main" => Self::completed(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_cancel".into(),
+                    name: "cancel_aware".into(),
+                    arguments: Some(r#"{"label":"teardown"}"#.into()),
+                }],
                 ..assistant()
             }),
             "hold-subagent" => {
@@ -1241,6 +1314,83 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     assert!(matches!(
         tool_message(&checkpoint.messages, "call_explore"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
+    ));
+}
+
+#[tokio::test]
+async fn abort_settles_cancel_aware_tool_with_partial_output() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_spec(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-cancel-aware-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(CancelAwareToolSpec)],
+            subagents: vec![],
+        },
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "abort cancel aware",
+    )
+    .await;
+
+    let result = timeout(Duration::from_secs(2), async {
+        let mut saw_end = false;
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::ToolCallStart(tool)) if tool.id == "call_cancel" => {
+                    harness.runtime.request_abort().await;
+                }
+                ("coda", AgentEvent::ToolCallEnd(tool)) if tool.id == "call_cancel" => {
+                    // The tool observed the cancellation and settled itself:
+                    // its salvaged partial output is recorded, not the generic
+                    // interruption message.
+                    assert!(matches!(tool.outcome, ToolCallOutcome::Aborted));
+                    assert!(matches!(
+                        &tool.output,
+                        ToolOutput::Err(reason) if reason.contains("partial output from teardown")
+                    ));
+                    saw_end = true;
+                }
+                ("coda", AgentEvent::Aborted(AbortedTarget::ToolCalls(ids))) => {
+                    assert!(ids.contains(&"call_cancel".to_string()));
+                    assert!(saw_end, "ToolCallEnd must precede the Aborted marker");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let checkpoint = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
+                && matches!(
+                    checkpoint.resume_point,
+                    crate::persist::StoredResumePoint::Generation
+                )
+            {
+                break checkpoint;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint was not saved after abort");
+
+    harness.shutdown().await;
+    result.expect("timed out waiting for abort event");
+    assert!(matches!(
+        tool_message(&checkpoint.messages, "call_cancel"),
+        Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
+            && matches!(
+                &tool.output,
+                ToolOutput::Err(reason) if reason.contains("partial output from teardown")
+            )
     ));
 }
 
