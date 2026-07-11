@@ -12,7 +12,5 @@ tokio = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3"
+tracing = { workspace = true }

@@ -183,7 +183,7 @@ mod tests {
 
     fn notice(id: &str) -> TaskNotice {
         TaskNotice::Task {
-            id: id.into(),
+            id: id.parse().expect("valid task id"),
             command: "cmd".into(),
             description: String::new(),
             status: TaskStatus::Exited {
@@ -191,6 +191,8 @@ mod tests {
                 at: jiff::Timestamp::now(),
             },
             output_tail: "tail".into(),
+            stdout_overwritten: 0,
+            stderr_overwritten: 0,
         }
     }
 
@@ -201,10 +203,16 @@ mod tests {
         let key = ("ws".to_string(), "s1".to_string());
         assert!(store.load(&key).await.unwrap().is_empty());
 
-        store.save(&key, &[notice("bg_a")]).await.unwrap();
+        let id = "bg_0123456789abcdef0123456789abcdef";
+        store.save(&key, &[notice(id)]).await.unwrap();
         let loaded = store.load(&key).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].task_ids(), vec!["bg_a".to_string()]);
+        assert_eq!(
+            loaded[0].keys(),
+            vec![coda_core::llm::TaskNoticeKey::Completed {
+                task_id: id.to_string()
+            }]
+        );
 
         // Release-time rewrite to empty clears the document.
         store.save(&key, &[]).await.unwrap();

@@ -33,9 +33,28 @@ pub enum ContentPart {
 pub enum UserOrigin {
     #[default]
     Human,
-    /// The task ids this notice message covers (including every id inside an
-    /// aggregate notice) — the dedupe keys for restore.
-    TaskNotice { task_ids: Vec<String> },
+    /// The stable notice fact keys this message delivered — the dedupe keys for
+    /// restore. A task's completion and its later output-expiration are
+    /// *different* facts with different keys, so re-delivering one never
+    /// suppresses the other.
+    TaskNotice { notice_keys: Vec<TaskNoticeKey> },
+}
+
+/// Stable identity of a background-task notice *fact*, independent of its
+/// mutable payload (status, timestamp, reason). Lives here (rather than in
+/// `coda_tools`) so wire/history types can carry it without a reverse crate
+/// dependency; it is identity-only and never used to build an archive path,
+/// hence the plain `String` task id.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskNoticeKey {
+    /// A task reached a terminal state.
+    Completed { task_id: String },
+    /// A task's retained output was later evicted by the session quota.
+    OutputExpired { task_id: String },
+    /// One overflow aggregate, identified by a stable id minted at creation so
+    /// facts it cannot enumerate individually are still deduped as a batch.
+    OverflowBatch { batch_id: String },
 }
 
 /// A user-turn message whose content may include text and/or images.
@@ -83,12 +102,12 @@ impl UserMessage {
     }
 
     /// Construct a background-task notice delivered as a user-turn message,
-    /// carrying the covered task ids for restore-time dedupe.
-    pub fn task_notice(text: impl Into<String>, task_ids: Vec<String>) -> Self {
+    /// carrying the covered notice fact keys for restore-time dedupe.
+    pub fn task_notice(text: impl Into<String>, notice_keys: Vec<TaskNoticeKey>) -> Self {
         Self {
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
-            origin: UserOrigin::TaskNotice { task_ids },
+            origin: UserOrigin::TaskNotice { notice_keys },
         }
     }
 

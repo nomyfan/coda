@@ -20,7 +20,7 @@ use std::sync::Arc;
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, ReasoningEffort, UserMessage, UserOrigin};
+use coda_core::llm::{Message, ReasoningEffort, TaskNoticeKey, UserMessage, UserOrigin};
 use coda_tools::{BackgroundProcesses, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -1325,18 +1325,20 @@ fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<d
     });
 }
 
-/// Crash-window dedupe for notices restored from the store: a notice whose
-/// task id already appears in the checkpoint history (a persisted
-/// `origin = TaskNotice` user message) was delivered before the store could
-/// be rewritten; delivering it again would duplicate it visibly. Aggregate
-/// notices are filtered id-by-id — the bare `uncounted` count has no ids to
-/// dedupe by and is kept as-is.
+/// Crash-window dedupe for notices restored from the store: a notice fact whose
+/// stable key already appears in the checkpoint history (a persisted
+/// `origin = TaskNotice` user message) was delivered before the store could be
+/// rewritten; delivering it again would duplicate it visibly. Dedupe is by
+/// *fact key*, so a task's completion never suppresses its later
+/// output-expiration. An aggregate is dropped whole if its batch key was
+/// delivered; otherwise its facts are filtered individually and the bare
+/// `uncounted` count is kept as-is.
 fn dedupe_restored_notices(restored: Vec<TaskNotice>, history: &[Message]) -> Vec<TaskNotice> {
-    let delivered: HashSet<&str> = history
+    let delivered: HashSet<TaskNoticeKey> = history
         .iter()
         .filter_map(|message| match message {
             Message::User(user) => match &user.origin {
-                UserOrigin::TaskNotice { task_ids } => Some(task_ids.iter().map(String::as_str)),
+                UserOrigin::TaskNotice { notice_keys } => Some(notice_keys.iter().cloned()),
                 UserOrigin::Human => None,
             },
             _ => None,
@@ -1345,15 +1347,34 @@ fn dedupe_restored_notices(restored: Vec<TaskNotice>, history: &[Message]) -> Ve
         .collect();
     restored
         .into_iter()
-        .filter_map(|notice| match notice {
-            TaskNotice::Task { ref id, .. } => (!delivered.contains(id.as_str())).then_some(notice),
-            TaskNotice::Overflow { dropped, uncounted } => {
-                let dropped: Vec<_> = dropped
-                    .into_iter()
-                    .filter(|(id, _)| !delivered.contains(id.as_str()))
-                    .collect();
-                (!dropped.is_empty() || uncounted > 0)
-                    .then_some(TaskNotice::Overflow { dropped, uncounted })
+        .filter_map(|notice| {
+            let keys = notice.keys();
+            match notice {
+                TaskNotice::Task { .. } | TaskNotice::OutputExpired { .. } => {
+                    // A single fact: keep unless its key was already delivered.
+                    (!keys.iter().any(|k| delivered.contains(k))).then_some(notice)
+                }
+                TaskNotice::Overflow {
+                    batch_id,
+                    dropped,
+                    uncounted,
+                } => {
+                    // Whole batch already delivered → drop it.
+                    if delivered.contains(&TaskNoticeKey::OverflowBatch {
+                        batch_id: batch_id.clone(),
+                    }) {
+                        return None;
+                    }
+                    let dropped: Vec<_> = dropped
+                        .into_iter()
+                        .filter(|fact| !delivered.contains(&fact.key()))
+                        .collect();
+                    (!dropped.is_empty() || uncounted > 0).then_some(TaskNotice::Overflow {
+                        batch_id,
+                        dropped,
+                        uncounted,
+                    })
+                }
             }
         })
         .collect()

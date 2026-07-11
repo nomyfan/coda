@@ -16,6 +16,13 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
+// Canonical background task ids (bg_ + 32 hex) for notice/dedupe tests.
+const BG_1: &str = "bg_00000000000000000000000000000001";
+const BG_A: &str = "bg_0000000000000000000000000000000a";
+const BG_B: &str = "bg_0000000000000000000000000000000b";
+const BG_C: &str = "bg_0000000000000000000000000000000c";
+const BG_NEW: &str = "bg_00000000000000000000000000000e0e";
+
 // --- pure helpers -----------------------------------------------------
 
 fn assistant(content: &str) -> AssistantMessage {
@@ -187,7 +194,12 @@ fn fold_places_task_notices_between_stale_cleanup_and_user() {
     log.push(WireEvent::TaskNotice {
         agent_name: "coda".into(),
         thread_id: "t".into(),
-        message: UserMessage::task_notice("Background task bg_1 finished", vec!["bg_1".into()]),
+        message: UserMessage::task_notice(
+            "Background task bg_1 finished",
+            vec![coda_core::llm::TaskNoticeKey::Completed {
+                task_id: BG_1.to_string(),
+            }],
+        ),
     });
     log.push(chunk("coda", "hi"));
     log.push(llm_end("coda", assistant("reply")));
@@ -200,7 +212,10 @@ fn fold_places_task_notices_between_stale_cleanup_and_user() {
         &snapshot[1],
         Message::User(u) if matches!(
             &u.origin,
-            UserOrigin::TaskNotice { task_ids } if task_ids == &vec!["bg_1".to_string()]
+            UserOrigin::TaskNotice { notice_keys }
+                if notice_keys == &vec![coda_core::llm::TaskNoticeKey::Completed {
+                    task_id: BG_1.to_string(),
+                }]
         )
     ));
     assert!(matches!(
@@ -212,32 +227,47 @@ fn fold_places_task_notices_between_stale_cleanup_and_user() {
 
 #[test]
 fn restored_notices_dedupe_against_checkpointed_deliveries() {
-    // The checkpoint says bg_a and bg_b were already delivered.
+    use coda_core::llm::TaskNoticeKey;
+    use coda_tools::TaskNoticeFact;
+
+    // The checkpoint says bg_a's completion and bg_b's completion were already
+    // delivered (by fact key).
     let history = vec![
         user("hello"),
         Message::User(UserMessage::task_notice(
             "delivered earlier",
-            vec!["bg_a".into(), "bg_b".into()],
+            vec![
+                TaskNoticeKey::Completed {
+                    task_id: BG_A.to_string(),
+                },
+                TaskNoticeKey::Completed {
+                    task_id: BG_B.to_string(),
+                },
+            ],
         )),
     ];
     let killed = TaskStatus::Killed {
         at: jiff::Timestamp::now(),
     };
     let full = |id: &str| TaskNotice::Task {
-        id: id.into(),
+        id: id.parse().unwrap(),
         command: "x".into(),
         description: String::new(),
         status: killed.clone(),
         output_tail: String::new(),
+        stdout_overwritten: 0,
+        stderr_overwritten: 0,
+    };
+    let fact = |id: &str| TaskNoticeFact::Completed {
+        id: id.parse().unwrap(),
+        status: killed.clone(),
     };
     let restored = vec![
-        full("bg_a"), // duplicate — drop
-        full("bg_new"),
+        full(BG_A), // duplicate completion — drop
+        full(BG_NEW),
         TaskNotice::Overflow {
-            dropped: vec![
-                ("bg_b".into(), killed.clone()),
-                ("bg_c".into(), killed.clone()),
-            ],
+            batch_id: "batch-x".into(),
+            dropped: vec![fact(BG_B), fact(BG_C)],
             uncounted: 2,
         },
     ];
@@ -245,11 +275,11 @@ fn restored_notices_dedupe_against_checkpointed_deliveries() {
     let deduped = dedupe_restored_notices(restored, &history);
 
     assert_eq!(deduped.len(), 2, "{deduped:?}");
-    assert!(matches!(&deduped[0], TaskNotice::Task { id, .. } if id == "bg_new"));
+    assert!(matches!(&deduped[0], TaskNotice::Task { id, .. } if id.as_str() == BG_NEW));
     assert!(matches!(
         &deduped[1],
-        TaskNotice::Overflow { dropped, uncounted: 2 }
-            if dropped.len() == 1 && dropped[0].0 == "bg_c"
+        TaskNotice::Overflow { dropped, uncounted: 2, .. }
+            if dropped.len() == 1 && matches!(&dropped[0], TaskNoticeFact::Completed { id, .. } if id.as_str() == BG_C)
     ));
 }
 
@@ -1150,7 +1180,13 @@ fn task_meta(command: &str) -> TaskMeta {
 
 /// Spawn a fake task on the entry's registry that completes when `gate` fires
 /// (or reports itself killed on cancellation).
-async fn spawn_gated_task(hub: &SessionHub, gate: Arc<Notify>) -> String {
+fn completed_keys(id: &coda_tools::TaskId) -> Vec<coda_core::llm::TaskNoticeKey> {
+    vec![coda_core::llm::TaskNoticeKey::Completed {
+        task_id: id.as_str().to_owned(),
+    }]
+}
+
+async fn spawn_gated_task(hub: &SessionHub, gate: Arc<Notify>) -> coda_tools::TaskId {
     let entry = hub.get_entry(&key()).expect("entry");
     entry
         .background
@@ -1205,7 +1241,7 @@ async fn background_task_pins_disconnected_entry_then_release_persists_notice() 
         1,
         "release persists the undelivered notice"
     );
-    assert_eq!(persisted[0].task_ids(), vec![id.clone()]);
+    assert_eq!(persisted[0].keys(), completed_keys(&id));
 
     // Reopen: entry initialization restores the pending notice.
     let _attach2 = hub
@@ -1215,7 +1251,7 @@ async fn background_task_pins_disconnected_entry_then_release_persists_notice() 
     let entry = hub.get_entry(&key()).expect("entry");
     let restored = entry.background.take_notices().await;
     assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0].task_ids(), vec![id]);
+    assert_eq!(restored[0].keys(), completed_keys(&id));
 }
 
 /// Roadmap ③: a model switch swaps the session but not the entry-owned
@@ -1269,7 +1305,7 @@ async fn model_switch_preserves_background_tasks_and_notices() {
     })
     .await
     .expect("notice after completion");
-    assert_eq!(collected[0].task_ids(), vec![id]);
+    assert_eq!(collected[0].keys(), completed_keys(&id));
 
     hub.detach(key(), 1).await;
     wait_released(&hub).await;
@@ -1283,7 +1319,7 @@ async fn persisted_notices_restore_once_per_entry() {
     notices.put(
         key(),
         vec![TaskNotice::Task {
-            id: "bg_prev".into(),
+            id: BG_1.parse().unwrap(),
             command: "old command".into(),
             description: String::new(),
             status: TaskStatus::Exited {
@@ -1291,6 +1327,8 @@ async fn persisted_notices_restore_once_per_entry() {
                 at: jiff::Timestamp::now(),
             },
             output_tail: String::new(),
+            stdout_overwritten: 0,
+            stderr_overwritten: 0,
         }],
     );
 
@@ -1528,7 +1566,7 @@ async fn attach_delivers_background_overview_and_pushes_changes() {
         unreachable!()
     };
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].id, id);
+    assert_eq!(tasks[0].id, id.as_str());
     assert!(tasks[0].status.is_running());
 
     task_gate.notify_one();

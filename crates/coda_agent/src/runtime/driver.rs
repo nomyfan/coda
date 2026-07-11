@@ -417,7 +417,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     /// the user message.
     async fn inject_task_notices(&mut self) {
         for notice in self.runtime.background.take_notices().await {
-            let message = UserMessage::task_notice(notice.render(), notice.task_ids());
+            let message = UserMessage::task_notice(notice.render(), notice.keys());
             self.agent.add_message(Message::User(message.clone())).await;
             self.runtime
                 .emit_event(

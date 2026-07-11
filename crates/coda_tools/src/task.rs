@@ -3,13 +3,14 @@
 //! any agent that is granted them (the registry handle is always present in
 //! the build context) — they are not tied to `shell`.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
-use crate::background::BackgroundProcesses;
+use crate::background::{BackgroundProcesses, TaskId};
 
 fn unknown_task(id: &str) -> String {
     format!(
@@ -17,6 +18,14 @@ fn unknown_task(id: &str) -> String {
          after a while; their final output was delivered in the completion \
          notice."
     )
+}
+
+/// Parse a model-supplied id into a validated [`TaskId`], or return the tool
+/// error text for a malformed one (which can never name an archive path).
+fn parse_id(raw: &str) -> Result<TaskId, String> {
+    TaskId::from_str(raw).map_err(|_| {
+        format!("Invalid task id: {raw}. Expected an id like \"bg_...\" as returned when the task started.")
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -66,13 +75,23 @@ impl Tool for TaskOutputTool {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
-            let Some(read) = background.read(&params.id).await else {
-                return Ok(unknown_task(&params.id));
+            let id = match parse_id(&params.id) {
+                Ok(id) => id,
+                Err(msg) => return Ok(msg),
+            };
+            let read = match background.read(&id).await {
+                Ok(Some(read)) => read,
+                Ok(None) => return Ok(unknown_task(&params.id)),
+                Err(e) => return Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
             };
             let mut out = format!("status: {}", read.status.describe());
+            if let Some(note) = &read.note {
+                out.push_str(&format!("\n({note})"));
+                return Ok(out);
+            }
             if read.stdout_lost > 0 {
                 out.push_str(&format!(
-                    "\n({} bytes of stdout were dropped from the buffer before this read)",
+                    "\n({} bytes of stdout were overwritten before they could be read)",
                     read.stdout_lost
                 ));
             }
@@ -81,7 +100,7 @@ impl Tool for TaskOutputTool {
             }
             if read.stderr_lost > 0 {
                 out.push_str(&format!(
-                    "\n({} bytes of stderr were dropped from the buffer before this read)",
+                    "\n({} bytes of stderr were overwritten before they could be read)",
                     read.stderr_lost
                 ));
             }
@@ -147,9 +166,14 @@ impl Tool for TaskKillTool {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
-            match background.kill(&params.id).await {
-                None => Ok(unknown_task(&params.id)),
-                Some(status) => Ok(format!("Task {}: {}.", params.id, status.describe())),
+            let id = match parse_id(&params.id) {
+                Ok(id) => id,
+                Err(msg) => return Ok(msg),
+            };
+            match background.kill(&id).await {
+                Ok(None) => Ok(unknown_task(&params.id)),
+                Ok(Some(status)) => Ok(format!("Task {}: {}.", params.id, status.describe())),
+                Err(e) => Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
             }
         }
     }
@@ -189,7 +213,7 @@ mod tests {
             loop {
                 let out = tool
                     .execute(
-                        TaskOutputToolParams { id: id.clone() },
+                        TaskOutputToolParams { id: id.to_string() },
                         ToolCallContext::default(),
                     )
                     .await
@@ -206,7 +230,7 @@ mod tests {
 
         let again = tool
             .execute(
-                TaskOutputToolParams { id: id.clone() },
+                TaskOutputToolParams { id: id.to_string() },
                 ToolCallContext::default(),
             )
             .await
@@ -219,7 +243,7 @@ mod tests {
         let missing = tool
             .execute(
                 TaskOutputToolParams {
-                    id: "bg_nonexistent".into(),
+                    id: "bg_00000000000000000000000000000000".into(),
                 },
                 ToolCallContext::default(),
             )
@@ -243,7 +267,7 @@ mod tests {
 
         let out = tool
             .execute(
-                TaskKillToolParams { id: id.clone() },
+                TaskKillToolParams { id: id.to_string() },
                 ToolCallContext::default(),
             )
             .await
@@ -253,7 +277,7 @@ mod tests {
         // Idempotent: reports the settled status instead of failing.
         let again = tool
             .execute(
-                TaskKillToolParams { id: id.clone() },
+                TaskKillToolParams { id: id.to_string() },
                 ToolCallContext::default(),
             )
             .await
@@ -263,7 +287,7 @@ mod tests {
         let missing = tool
             .execute(
                 TaskKillToolParams {
-                    id: "bg_nonexistent".into(),
+                    id: "bg_00000000000000000000000000000000".into(),
                 },
                 ToolCallContext::default(),
             )

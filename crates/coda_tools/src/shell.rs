@@ -279,16 +279,21 @@ mod tests {
             .execute(background_params("sleep 39.61"), ctx)
             .await
             .unwrap();
-        let id = out
+        let id: crate::background::TaskId = out
             .split_whitespace()
             .find(|w| w.starts_with("bg_"))
             .expect("task id in reply")
             .trim_end_matches('.')
-            .to_string();
+            .parse()
+            .expect("valid task id");
 
         cancel.cancel();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let read = background.read(&id).await.expect("task still known");
+        let read = background
+            .read(&id)
+            .await
+            .unwrap()
+            .expect("task still known");
         assert!(
             read.status.is_running(),
             "turn abort must not kill the background task: {:?}",

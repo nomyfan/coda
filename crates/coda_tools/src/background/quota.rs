@@ -627,7 +627,7 @@ mod tests {
         {
             use std::io::Write;
             let mut f = odir.create_file(ArchiveFileName::StdoutRing).unwrap();
-            f.write_all(&vec![0u8; 100]).unwrap();
+            f.write_all(&[0u8; 100]).unwrap();
         }
 
         let inv = scan_inventory(archive.root()).unwrap();
@@ -731,8 +731,10 @@ mod tests {
     #[tokio::test]
     async fn blocked_inventory_rejects_spawn() {
         let (_tmp, archive) = archive();
-        let mut inv = ArchiveInventory::default();
-        inv.spawn_blocked = true;
+        let inv = ArchiveInventory {
+            spawn_blocked: true,
+            ..Default::default()
+        };
         let quota = SessionQuota::from_inventory(&inv, SESSION_QUOTA_BYTES, archive);
         assert!(matches!(
             quota.reserve_for_create(1024).await,

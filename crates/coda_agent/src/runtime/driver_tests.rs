@@ -1911,7 +1911,7 @@ async fn task_notices_inject_ahead_of_the_user_message() {
     };
     assert!(matches!(
         &notice_message.origin,
-        coda_core::llm::UserOrigin::TaskNotice { task_ids } if task_ids.len() == 1
+        coda_core::llm::UserOrigin::TaskNotice { notice_keys } if notice_keys.len() == 1
     ));
     let notice_text = notice_message.first_text().expect("notice text");
     assert!(notice_text.contains("Background task bg_"), "{notice_text}");

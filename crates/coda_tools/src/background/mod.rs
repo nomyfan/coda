@@ -35,9 +35,9 @@ pub use task_id::{InvalidTaskId, TaskId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use coda_core::llm::TaskNoticeKey;
 use coda_core::tool::CancellationToken;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -55,8 +55,9 @@ const MAX_FULL_NOTICES: usize = 64;
 const MAX_OVERFLOW_ENTRIES: usize = 256;
 /// Output tail carried by one full notice.
 const NOTICE_TAIL_LIMIT: usize = 4096;
-/// Tail buffer capacity per stream (stdout / stderr).
-const TAIL_BUF_CAP: usize = 512 * 1024;
+/// Bytes returned per stream by one `read` (128 KiB); the cursor advances only
+/// over what is actually returned, so a large backlog drains across calls.
+const READ_CHUNK_LIMIT: usize = 128 * 1024;
 
 /// Caller-supplied identity of a task, echoed in summaries and notices.
 #[derive(Clone, Debug)]
@@ -134,31 +135,92 @@ pub struct TaskSummary {
     pub started_at: jiff::Timestamp,
 }
 
-/// A completion awaiting delivery. `Task` carries a bounded output tail;
-/// `Overflow` aggregates completions evicted from the full-notice window so
-/// the terminal *fact* survives even under a flood.
+/// One terminal fact carried inside an overflow aggregate: either a completion
+/// or an output-expiration, so the aggregate never has to fake a task id for a
+/// fact it cannot express.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TaskNoticeFact {
+    Completed { id: TaskId, status: TaskStatus },
+    OutputExpired { id: TaskId, reason: ExpireReason },
+}
+
+impl TaskNoticeFact {
+    /// The stable dedupe key for this fact.
+    pub fn key(&self) -> TaskNoticeKey {
+        match self {
+            TaskNoticeFact::Completed { id, .. } => TaskNoticeKey::Completed {
+                task_id: id.as_str().to_owned(),
+            },
+            TaskNoticeFact::OutputExpired { id, .. } => TaskNoticeKey::OutputExpired {
+                task_id: id.as_str().to_owned(),
+            },
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            TaskNoticeFact::Completed { id, status } => format!("{id}: {}", status.describe()),
+            TaskNoticeFact::OutputExpired { id, .. } => {
+                format!("{id}: output expired (session output quota)")
+            }
+        }
+    }
+}
+
+/// A notice awaiting delivery. `Task` carries a bounded output tail and the
+/// storage-level overwrite totals; `OutputExpired` is a separate later fact for
+/// a task whose retained output the quota evicted; `Overflow` aggregates facts
+/// evicted from the full-notice window so the terminal/expiration *fact*
+/// survives even under a flood.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TaskNotice {
     Task {
-        id: String,
+        id: TaskId,
         command: String,
         description: String,
         status: TaskStatus,
         output_tail: String,
+        /// Bytes this stream overwrote due to ring capacity, regardless of
+        /// whether the model had already read them (a storage fact).
+        #[serde(default)]
+        stdout_overwritten: u64,
+        #[serde(default)]
+        stderr_overwritten: u64,
+    },
+    OutputExpired {
+        id: TaskId,
+        expired_at: jiff::Timestamp,
+        reason: ExpireReason,
     },
     Overflow {
-        dropped: Vec<(String, TaskStatus)>,
+        /// Stable id minted when the aggregate is first created; preserved across
+        /// merge and NoticeStore round-trips so the whole batch dedupes as one.
+        #[serde(default)]
+        batch_id: String,
+        dropped: Vec<TaskNoticeFact>,
         uncounted: u64,
     },
 }
 
 impl TaskNotice {
-    /// Task ids this notice covers — the dedupe keys for restore.
-    pub fn task_ids(&self) -> Vec<String> {
+    /// Every stable fact key this notice covers. `Completed` and `OutputExpired`
+    /// of the same task produce *different* keys.
+    pub fn keys(&self) -> Vec<TaskNoticeKey> {
         match self {
-            TaskNotice::Task { id, .. } => vec![id.clone()],
-            TaskNotice::Overflow { dropped, .. } => {
-                dropped.iter().map(|(id, _)| id.clone()).collect()
+            TaskNotice::Task { id, .. } => vec![TaskNoticeKey::Completed {
+                task_id: id.as_str().to_owned(),
+            }],
+            TaskNotice::OutputExpired { id, .. } => vec![TaskNoticeKey::OutputExpired {
+                task_id: id.as_str().to_owned(),
+            }],
+            TaskNotice::Overflow {
+                batch_id, dropped, ..
+            } => {
+                let mut keys = vec![TaskNoticeKey::OverflowBatch {
+                    batch_id: batch_id.clone(),
+                }];
+                keys.extend(dropped.iter().map(TaskNoticeFact::key));
+                keys
             }
         }
     }
@@ -173,11 +235,19 @@ impl TaskNotice {
                 description,
                 status,
                 output_tail,
+                stdout_overwritten,
+                stderr_overwritten,
             } => {
                 let mut text = format!("Background task {id} finished: {}.", status.describe());
                 text.push_str(&format!("\nCommand: {command}"));
                 if !description.is_empty() {
                     text.push_str(&format!("\nDescription: {description}"));
+                }
+                let overwritten = stdout_overwritten + stderr_overwritten;
+                if overwritten > 0 {
+                    text.push_str(&format!(
+                        "\n({overwritten} bytes of earlier output were overwritten as the task ran)"
+                    ));
                 }
                 if !output_tail.is_empty() {
                     text.push_str(&format!("\nOutput tail:\n{output_tail}"));
@@ -186,12 +256,21 @@ impl TaskNotice {
                 }
                 text
             }
-            TaskNotice::Overflow { dropped, uncounted } => {
+            TaskNotice::OutputExpired { id, .. } => {
+                format!(
+                    "Background task {id}'s retained output was evicted to reclaim \
+                     the session output quota; it is no longer readable."
+                )
+            }
+            TaskNotice::Overflow {
+                dropped, uncounted, ..
+            } => {
                 let total = dropped.len() as u64 + uncounted;
-                let mut text =
-                    format!("{total} more background task(s) finished while notices were capped:");
-                for (id, status) in dropped {
-                    text.push_str(&format!("\n- {id}: {}", status.describe()));
+                let mut text = format!(
+                    "{total} more background task event(s) occurred while notices were capped:"
+                );
+                for fact in dropped {
+                    text.push_str(&format!("\n- {}", fact.describe()));
                 }
                 if *uncounted > 0 {
                     text.push_str(&format!("\n…and {uncounted} more (details dropped)."));
@@ -212,6 +291,9 @@ pub struct TaskRead {
     pub stderr: String,
     pub stdout_lost: u64,
     pub stderr_lost: u64,
+    /// A storage-level note (output consumed or quota-expired), separate from
+    /// the streams so it is never mistaken for task output.
+    pub note: Option<String>,
 }
 
 /// How the task's work future resolved. The process-backed runner reports
@@ -229,111 +311,74 @@ pub enum TaskExit {
     },
 }
 
-/// Bounded tail of one output stream, addressed by absolute offsets so a
-/// cursor survives the head being dropped: `start_offset..total_written` is
-/// the retained window.
-struct TailBuf {
-    bytes: Vec<u8>,
-    start_offset: u64,
-    total_written: u64,
-}
-
-impl TailBuf {
-    fn new() -> Self {
-        TailBuf {
-            bytes: Vec::new(),
-            start_offset: 0,
-            total_written: 0,
-        }
-    }
-
-    fn append(&mut self, data: &[u8]) {
-        self.bytes.extend_from_slice(data);
-        self.total_written += data.len() as u64;
-        if self.bytes.len() > TAIL_BUF_CAP {
-            let excess = self.bytes.len() - TAIL_BUF_CAP;
-            self.bytes.drain(..excess);
-            self.start_offset += excess as u64;
-        }
-    }
-
-    /// Bytes from `cursor` to the end, plus how many bytes between `cursor`
-    /// and the window start were lost. The new cursor is `total_written`.
-    fn read_from(&self, cursor: u64) -> (Vec<u8>, u64) {
-        let lost = self.start_offset.saturating_sub(cursor);
-        let from = (cursor.max(self.start_offset) - self.start_offset) as usize;
-        (self.bytes[from.min(self.bytes.len())..].to_vec(), lost)
-    }
-
-    fn tail_string(&self, limit: usize) -> String {
-        let from = self.bytes.len().saturating_sub(limit);
-        String::from_utf8_lossy(&self.bytes[from..]).into_owned()
-    }
-}
-
-struct TaskState {
-    status: TaskStatus,
-    stdout: TailBuf,
-    stderr: TailBuf,
-    /// Absolute output offsets consumed by `read` (stdout, stderr).
-    cursor: (u64, u64),
-}
-
+/// A live task entry: the archive-backed record plus its cancellation token.
+/// Output bytes live only in the record's ring files, never in memory here.
 struct TaskEntry {
-    id: String,
-    meta: TaskMeta,
-    started_at: jiff::Timestamp,
-    state: Mutex<TaskState>,
+    record: Arc<TaskRecord>,
     /// Independent of any turn token: only `kill`/`shutdown` cancel it.
     cancel: CancellationToken,
 }
 
 impl TaskEntry {
+    fn id(&self) -> &TaskId {
+        self.record.id()
+    }
+
     fn summary(&self, status: TaskStatus) -> TaskSummary {
         TaskSummary {
-            id: self.id.clone(),
-            command: self.meta.command.clone(),
-            description: self.meta.description.clone(),
-            agent_name: self.meta.agent_name.clone(),
+            id: self.record.id().as_str().to_owned(),
+            command: self.record.meta().command.clone(),
+            description: self.record.meta().description.clone(),
+            agent_name: self.record.meta().agent_name.clone(),
             status,
-            started_at: self.started_at,
+            started_at: self.record.started_at(),
         }
     }
 }
 
-/// Handle a task's work future uses to stream output into the registry.
+/// Handle a task's work future uses to stream output into its ring files.
+/// Appends take only the per-stream `DiskTail` lock — never the registry or
+/// commit lock — so a chatty task never contends with reads or bookkeeping.
 #[derive(Clone)]
 pub struct TaskCtx {
-    entry: Arc<TaskEntry>,
+    record: Arc<TaskRecord>,
+    cancel: CancellationToken,
 }
 
 impl TaskCtx {
     /// Cancellation requested via `kill`/`shutdown`. Process-backed work kills
     /// its group and resolves to [`TaskExit::Killed`]; fake work just races it.
     pub fn cancelled(&self) -> CancellationToken {
-        self.entry.cancel.clone()
+        self.cancel.clone()
     }
 
-    pub async fn append_stdout(&self, data: &[u8]) {
-        self.entry.state.lock().await.stdout.append(data);
+    pub async fn append_stdout(&self, data: &[u8]) -> std::io::Result<()> {
+        self.record.files().stdout.append(data).await
     }
 
-    pub async fn append_stderr(&self, data: &[u8]) {
-        self.entry.state.lock().await.stderr.append(data);
+    pub async fn append_stderr(&self, data: &[u8]) -> std::io::Result<()> {
+        self.record.files().stderr.append(data).await
     }
 }
 
+/// The overflow aggregate slot: a stable batch id plus the facts and a bare
+/// count. Never dropped, unlike the full notices feeding it.
+struct OverflowSlot {
+    batch_id: String,
+    dropped: Vec<TaskNoticeFact>,
+    uncounted: u64,
+}
+
 struct RegistryState {
-    tasks: HashMap<String, Arc<TaskEntry>>,
+    tasks: HashMap<TaskId, Arc<TaskEntry>>,
     /// Redundant indexes so everything below is answerable while holding this
-    /// lock alone — a task's `state` mutex is never taken under it.
+    /// lock alone — a task's ring/commit locks are never taken under it.
     running_count: usize,
-    summaries: HashMap<String, TaskSummary>,
-    terminal_order: VecDeque<String>,
-    monitors: HashMap<String, JoinHandle<()>>,
+    summaries: HashMap<TaskId, TaskSummary>,
+    terminal_order: VecDeque<TaskId>,
+    monitors: HashMap<TaskId, JoinHandle<()>>,
     notices: Vec<TaskNotice>,
-    /// The aggregate slot: never dropped, unlike the full notices feeding it.
-    overflow: Option<(Vec<(String, TaskStatus)>, u64)>,
+    overflow: Option<OverflowSlot>,
     closed: bool,
     summaries_tx: watch::Sender<Arc<[TaskSummary]>>,
 }
@@ -363,36 +408,88 @@ impl RegistryState {
         self.summaries_tx.send_replace(all.into());
     }
 
-    /// Fold terminal facts into the aggregate slot, spilling into the bare
-    /// count beyond its capacity.
-    fn merge_overflow(&mut self, entries: Vec<(String, TaskStatus)>, uncounted: u64) {
-        let (dropped, count) = self.overflow.get_or_insert_with(|| (Vec::new(), 0));
-        *count += uncounted;
-        for pair in entries {
-            if dropped.len() < MAX_OVERFLOW_ENTRIES {
-                dropped.push(pair);
+    /// Fold facts into the aggregate slot, spilling into the bare count beyond
+    /// its capacity. Mints a stable batch id the first time the slot is used.
+    fn merge_overflow(&mut self, facts: Vec<TaskNoticeFact>, uncounted: u64) {
+        let slot = self.overflow.get_or_insert_with(|| OverflowSlot {
+            batch_id: uuid::Uuid::new_v4().simple().to_string(),
+            dropped: Vec::new(),
+            uncounted: 0,
+        });
+        slot.uncounted += uncounted;
+        for fact in facts {
+            if slot.dropped.len() < MAX_OVERFLOW_ENTRIES {
+                slot.dropped.push(fact);
             } else {
-                *count += 1;
+                slot.uncounted += 1;
             }
         }
     }
 
-    /// `notices` holds only full `TaskNotice::Task` entries (aggregates live
-    /// in the `overflow` slot); the oldest degrades on overflow.
+    /// Preserve a restored aggregate's batch id so it dedupes as one batch.
+    fn merge_overflow_batch(
+        &mut self,
+        batch_id: String,
+        facts: Vec<TaskNoticeFact>,
+        uncounted: u64,
+    ) {
+        if self.overflow.is_none() {
+            self.overflow = Some(OverflowSlot {
+                batch_id,
+                dropped: Vec::new(),
+                uncounted: 0,
+            });
+        }
+        self.merge_overflow(facts, uncounted);
+    }
+
+    /// `notices` holds only full `Task`/`OutputExpired` entries (aggregates live
+    /// in the `overflow` slot); the oldest degrades to a fact on overflow.
     fn push_notice(&mut self, notice: TaskNotice) {
         self.notices.push(notice);
-        if self.notices.len() > MAX_FULL_NOTICES
-            && let TaskNotice::Task { id, status, .. } = self.notices.remove(0)
-        {
-            self.merge_overflow(vec![(id, status)], 0);
+        if self.notices.len() > MAX_FULL_NOTICES {
+            let demoted = self.notices.remove(0);
+            if let Some(fact) = notice_into_fact(demoted) {
+                self.merge_overflow(vec![fact], 0);
+            }
         }
     }
 }
 
-/// Session-scoped background task registry. Cheap to clone via `Arc`; the
-/// owner (hub entry, or the `Session` itself when self-built) is responsible
-/// for calling [`shutdown`](Self::shutdown) exactly per the ownership rules
-/// in the design doc.
+/// Demote a full notice to the fact the overflow aggregate carries.
+fn notice_into_fact(notice: TaskNotice) -> Option<TaskNoticeFact> {
+    match notice {
+        TaskNotice::Task { id, status, .. } => Some(TaskNoticeFact::Completed { id, status }),
+        TaskNotice::OutputExpired { id, reason, .. } => {
+            Some(TaskNoticeFact::OutputExpired { id, reason })
+        }
+        TaskNotice::Overflow { .. } => None,
+    }
+}
+
+/// The disk-backed store behind a live registry: the session archive plus its
+/// quota. `temp` is `Some` only for a self-owned (temporary) registry, whose
+/// output directory is deleted when the registry drops.
+struct Backend {
+    archive: Arc<TaskArchive>,
+    quota: SessionQuota,
+    /// Held only for its `Drop`: deletes the temporary output directory when the
+    /// registry drops. `None` for a session-backed registry (output persists).
+    #[allow(dead_code)]
+    temp: Option<tempfile::TempDir>,
+}
+
+/// Storage backing: enabled (archive + quota) or disabled (the session archive
+/// root could not be opened; the conversation still works, background is off).
+#[derive(Clone)]
+enum Store {
+    Enabled(Arc<Backend>),
+    Disabled(Arc<str>),
+}
+
+/// Session-scoped background task registry. The owner (hub entry, or the
+/// `Session` itself when self-built) is responsible for calling
+/// [`shutdown`](Self::shutdown) per the ownership rules in the design doc.
 pub struct BackgroundProcesses {
     inner: Arc<Mutex<RegistryState>>,
     summaries_rx: watch::Receiver<Arc<[TaskSummary]>>,
@@ -400,6 +497,7 @@ pub struct BackgroundProcesses {
     /// must hold for every caller, not just the one that drains the monitor
     /// handles first.
     shutdown_gate: Mutex<()>,
+    store: Store,
 }
 
 impl Default for BackgroundProcesses {
@@ -409,7 +507,7 @@ impl Default for BackgroundProcesses {
 }
 
 impl BackgroundProcesses {
-    pub fn new() -> Self {
+    fn with_store(store: Store) -> Self {
         let (summaries_tx, summaries_rx) = watch::channel(Arc::from(Vec::new().into_boxed_slice()));
         BackgroundProcesses {
             inner: Arc::new(Mutex::new(RegistryState {
@@ -425,63 +523,198 @@ impl BackgroundProcesses {
             })),
             summaries_rx,
             shutdown_gate: Mutex::new(()),
+            store,
+        }
+    }
+
+    /// A self-owned registry backed by a fresh temporary directory whose output
+    /// is deleted when the registry drops. The default backing for a standalone
+    /// `Session`.
+    pub fn temporary() -> Self {
+        match Self::try_temporary() {
+            Ok(reg) => reg,
+            Err(e) => Self::with_store(Store::Disabled(
+                format!("could not create temporary background archive: {e}").into(),
+            )),
+        }
+    }
+
+    fn try_temporary() -> std::io::Result<Self> {
+        let temp = tempfile::tempdir()?;
+        let root = ArchiveDir::open_or_create_root(&temp.path().join("background/tasks"))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let archive = Arc::new(TaskArchive::new(root));
+        let quota = SessionQuota::from_inventory(
+            &ArchiveInventory::default(),
+            SESSION_QUOTA_BYTES,
+            archive.clone(),
+        );
+        Ok(Self::with_store(Store::Enabled(Arc::new(Backend {
+            archive,
+            quota,
+            temp: Some(temp),
+        }))))
+    }
+
+    /// Equivalent to [`temporary`](Self::temporary); the historical name.
+    pub fn new() -> Self {
+        Self::temporary()
+    }
+
+    /// A hub-owned registry backed by a session archive directory. Runs the
+    /// session-local inventory to rebuild the quota and corruption blocker,
+    /// seeds the live overview from recent terminal summaries, and converts any
+    /// crash-`Running` task that passes validation to `Interrupted`. Output is
+    /// **not** deleted on shutdown.
+    pub async fn session_backed(archive_dir: ArchiveDir) -> Self {
+        let archive = Arc::new(TaskArchive::new(archive_dir));
+        let scan_root = archive.root().clone();
+        let inventory = match tokio::task::spawn_blocking(move || scan_inventory(&scan_root)).await
+        {
+            Ok(Ok(inv)) => inv,
+            Ok(Err(e)) => return Self::disabled_from(e.to_string()),
+            Err(e) => return Self::disabled_from(format!("inventory worker failed: {e}")),
+        };
+        let quota = SessionQuota::from_inventory(&inventory, SESSION_QUOTA_BYTES, archive.clone());
+        let reg = Self::with_store(Store::Enabled(Arc::new(Backend {
+            archive: archive.clone(),
+            quota,
+            temp: None,
+        })));
+        reg.seed_from_inventory(&archive, inventory).await;
+        reg
+    }
+
+    /// A disabled registry: the archive root could not be opened. Spawn/read/
+    /// kill return a clear error; summaries are empty; the conversation is
+    /// otherwise unaffected.
+    pub fn disabled(error: ArchiveError) -> Self {
+        Self::disabled_from(error.to_string())
+    }
+
+    fn disabled_from(error: String) -> Self {
+        Self::with_store(Store::Disabled(error.into()))
+    }
+
+    /// Seed the live overview from an inventory scan and convert recoverable
+    /// crash-`Running` tasks to `Interrupted` (durably, one commit each).
+    async fn seed_from_inventory(&self, archive: &TaskArchive, inventory: ArchiveInventory) {
+        let mut inner = self.inner.lock().await;
+        for summary in inventory.recent_terminal {
+            if let Ok(id) = summary.id.parse::<TaskId>() {
+                inner.summaries.insert(id, summary);
+            }
+        }
+        drop(inner);
+
+        for id in inventory.recoverable_running {
+            if let Ok(Some(record)) = archive.open(&id).await {
+                let mut guard = record.lock_commit().await;
+                let mut candidate = guard.current().clone();
+                candidate.status = TaskStatus::Interrupted {
+                    at: jiff::Timestamp::now(),
+                };
+                if guard.commit(candidate).await.is_ok() {
+                    let status = guard.current().status.clone();
+                    drop(guard);
+                    let mut inner = self.inner.lock().await;
+                    inner.summaries.insert(
+                        id.clone(),
+                        TaskSummary {
+                            id: id.as_str().to_owned(),
+                            command: record.meta().command.clone(),
+                            description: record.meta().description.clone(),
+                            agent_name: record.meta().agent_name.clone(),
+                            status,
+                            started_at: record.started_at(),
+                        },
+                    );
+                }
+            }
+        }
+        self.inner.lock().await.publish();
+    }
+
+    fn backend(&self) -> std::io::Result<Arc<Backend>> {
+        match &self.store {
+            Store::Enabled(b) => Ok(b.clone()),
+            Store::Disabled(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
 
     /// Start `cmd` as a background process task in its own sentinel-pinned
-    /// process group. Rejection (closed registry / running limit) is checked
-    /// *before* the process starts, so a rejected spawn has no side effects;
-    /// only `kill`/`shutdown` terminate it afterwards. Same visibility
-    /// guarantee as [`spawn_with`](Self::spawn_with).
-    pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<String> {
-        let mut inner = self.inner.lock().await;
-        inner.check_capacity()?;
-        // Sync and brief; holding the lock keeps the capacity check and the
-        // process start atomic.
+    /// process group. Rejection (closed / running limit / disabled / quota) has
+    /// no side effects; only `kill`/`shutdown` terminate a started task.
+    pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<TaskId> {
+        // The group is spawned first so a spawn failure has no archive residue;
+        // if the reservation/create fails, the unused closure drops the group
+        // (its Drop kills it).
         let group = GroupedChild::spawn(&mut cmd)?;
-        Ok(self.register(&mut inner, meta, move |ctx| run_process(group, ctx)))
+        self.register_task(meta, move |ctx| run_process(group, ctx))
+            .await
     }
 
-    /// Start `work` as a background task. The task is visible in the
-    /// summaries (and thus to keepalive watchers) before the id is returned.
-    /// Fails when the registry is closed or `MAX_RUNNING` tasks are running.
-    pub async fn spawn_with<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<String>
+    /// Start `work` as a background task. The task is visible in the summaries
+    /// (and thus to keepalive watchers) before the id is returned. Fails when
+    /// closed, at `MAX_RUNNING`, disabled, or the quota is blocked.
+    pub async fn spawn_with<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
     where
         F: FnOnce(TaskCtx) -> Fut,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
+        self.register_task(meta, work).await
+    }
+
+    /// Reserve quota, create the archive record, and register the task. The
+    /// registry lock is held across the whole sequence so the capacity check
+    /// and the registration are atomic (a concurrent spawn cannot exceed the
+    /// limit); this is deadlock-safe because no path holds a per-task commit or
+    /// quota lock while waiting for the registry lock. On any failure before
+    /// registration nothing is published, and the unused `work` closure drops
+    /// its process group.
+    async fn register_task<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
+    where
+        F: FnOnce(TaskCtx) -> Fut,
+        Fut: Future<Output = TaskExit> + Send + 'static,
+    {
+        let backend = self.backend()?;
         let mut inner = self.inner.lock().await;
         inner.check_capacity()?;
-        Ok(self.register(&mut inner, meta, work))
-    }
 
-    /// Registers a task under the held registry lock: entry, monitor,
-    /// indexes, and the summaries publish — the id is only handed out after
-    /// the task is visible to keepalive watchers.
-    fn register<F, Fut>(&self, inner: &mut RegistryState, meta: TaskMeta, work: F) -> String
-    where
-        F: FnOnce(TaskCtx) -> Fut,
-        Fut: Future<Output = TaskExit> + Send + 'static,
-    {
-        let id = format!("bg_{}", uuid::Uuid::new_v4().simple());
+        let outcome = backend
+            .quota
+            .reserve_for_create(2 * DEFAULT_STREAM_CAPACITY)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let id = TaskId::new();
+        let record = backend
+            .archive
+            .create(&id, &meta)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        outcome.reservation.commit();
+
+        // Enqueue any expirations the reservation caused (quota never touches
+        // the notice queue itself).
+        for fact in outcome.expirations {
+            inner.push_notice(TaskNotice::OutputExpired {
+                id: fact.id,
+                expired_at: fact.expired_at,
+                reason: fact.reason,
+            });
+        }
+        let cancel = CancellationToken::new();
         let entry = Arc::new(TaskEntry {
-            id: id.clone(),
-            meta,
-            started_at: jiff::Timestamp::now(),
-            state: Mutex::new(TaskState {
-                status: TaskStatus::Running,
-                stdout: TailBuf::new(),
-                stderr: TailBuf::new(),
-                cursor: (0, 0),
-            }),
-            cancel: CancellationToken::new(),
+            record: record.clone(),
+            cancel: cancel.clone(),
         });
-
-        let fut = work(TaskCtx {
-            entry: entry.clone(),
-        });
-        let monitor = tokio::spawn(monitor_task(self.inner.clone(), entry.clone(), fut));
-
+        let fut = work(TaskCtx { record, cancel });
+        let monitor = tokio::spawn(monitor_task(
+            self.inner.clone(),
+            backend.clone(),
+            entry.clone(),
+            fut,
+        ));
         inner.tasks.insert(id.clone(), entry.clone());
         inner.running_count += 1;
         inner
@@ -489,42 +722,132 @@ impl BackgroundProcesses {
             .insert(id.clone(), entry.summary(TaskStatus::Running));
         inner.monitors.insert(id.clone(), monitor);
         inner.publish();
-        id
+        Ok(id)
     }
 
     /// Incremental read: output since the previous read plus current status.
-    /// `None` for unknown or reclaimed ids.
-    pub async fn read(&self, id: &str) -> Option<TaskRead> {
-        let entry = self.inner.lock().await.tasks.get(id).cloned()?;
-        let mut state = entry.state.lock().await;
-        let (stdout, stdout_lost) = state.stdout.read_from(state.cursor.0);
-        let (stderr, stderr_lost) = state.stderr.read_from(state.cursor.1);
-        state.cursor = (state.stdout.total_written, state.stderr.total_written);
-        Some(TaskRead {
-            status: state.status.clone(),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            stdout_lost,
-            stderr_lost,
-        })
+    /// `Ok(None)` for an unknown id; `Err` for a disabled/corrupt archive. The
+    /// cursor is persisted before any bytes are returned, so a failed save
+    /// yields an error rather than silently advancing the cursor.
+    pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
+        let backend = self.enabled()?;
+        let Some(record) = backend
+            .archive
+            .open(id)
+            .await
+            .map_err(TaskAccessError::from)?
+        else {
+            return Ok(None);
+        };
+
+        let mut guard = record.lock_commit().await;
+        let state = guard.current().clone();
+        let status = state.status.clone();
+
+        // Cleaned-up output: no bytes, just the terminal status and a note.
+        if !state.disposition.rings_present() {
+            let note = match &state.disposition {
+                OutputDisposition::Expired { .. } => {
+                    "output expired: evicted to reclaim the session output quota".to_owned()
+                }
+                _ => "output fully consumed; nothing more to read".to_owned(),
+            };
+            return Ok(Some(TaskRead {
+                status,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_lost: 0,
+                stderr_lost: 0,
+                note: Some(note),
+            }));
+        }
+
+        let out = record
+            .files()
+            .stdout
+            .read_from(state.stdout_cursor, READ_CHUNK_LIMIT)
+            .await
+            .map_err(TaskAccessError::from)?;
+        let err = record
+            .files()
+            .stderr
+            .read_from(state.stderr_cursor, READ_CHUNK_LIMIT)
+            .await
+            .map_err(TaskAccessError::from)?;
+        let terminal = !status.is_running();
+        let (stdout, out_carry) = decode_with_carry(
+            &state.stdout_carry,
+            &out.bytes,
+            out.lost,
+            terminal && !out.has_more,
+        );
+        let (stderr, err_carry) = decode_with_carry(
+            &state.stderr_carry,
+            &err.bytes,
+            err.lost,
+            terminal && !err.has_more,
+        );
+
+        // Persist the advanced cursors + carry before returning any bytes.
+        let mut candidate = state;
+        candidate.stdout_cursor = out.next_cursor;
+        candidate.stderr_cursor = err.next_cursor;
+        candidate.stdout_carry = out_carry;
+        candidate.stderr_carry = err_carry;
+        guard
+            .commit(candidate)
+            .await
+            .map_err(TaskAccessError::from)?;
+        drop(guard);
+
+        // If this read drained a terminal task, reclaim its output.
+        if terminal && !out.has_more && !err.has_more {
+            let _ = backend.quota.finalize_consumed(&record).await;
+        }
+
+        Ok(Some(TaskRead {
+            status,
+            stdout,
+            stderr,
+            stdout_lost: out.lost,
+            stderr_lost: err.lost,
+            note: None,
+        }))
     }
 
     /// Request termination and wait for the monitor's *full* commit — the
     /// published terminal summary, not just the status flip, so an immediate
-    /// `take_notices` after returning sees the completion. Idempotent;
-    /// returns the settled status, `None` for unknown ids.
-    pub async fn kill(&self, id: &str) -> Option<TaskStatus> {
-        let entry = self.inner.lock().await.tasks.get(id).cloned()?;
+    /// `take_notices` after returning sees the completion. Idempotent; returns
+    /// the settled status, `Ok(None)` for an unknown id.
+    pub async fn kill(&self, id: &TaskId) -> Result<Option<TaskStatus>, TaskAccessError> {
+        let backend = self.enabled()?;
+        let live = self.inner.lock().await.tasks.get(id).cloned();
+        let Some(entry) = live else {
+            // Not live: report the archived task's terminal status, if any.
+            return match backend
+                .archive
+                .open(id)
+                .await
+                .map_err(TaskAccessError::from)?
+            {
+                Some(record) => Ok(Some(record.lock_commit().await.current().status.clone())),
+                None => Ok(None),
+            };
+        };
+
         let mut rx = self.summaries_rx.clone();
         entry.cancel.cancel();
         loop {
             {
                 let summaries = rx.borrow_and_update();
-                match summaries.iter().find(|summary| summary.id == entry.id) {
+                match summaries
+                    .iter()
+                    .find(|summary| summary.id == entry.id().as_str())
+                {
                     // Terminal in the published snapshot: the commit (notice
                     // included — publish is its last step) is complete.
                     Some(summary) if !summary.status.is_running() => {
-                        return Some(summary.status.clone());
+                        return Ok(Some(summary.status.clone()));
                     }
                     Some(_) => {}
                     // Absent: reclaimed, which only happens post-commit.
@@ -532,28 +855,31 @@ impl BackgroundProcesses {
                 }
             }
             if rx.changed().await.is_err() {
-                break; // registry gone; the entry state is all that's left
+                break; // registry gone; fall back to the record's state
             }
         }
-        let state = entry.state.lock().await;
-        Some(state.status.clone())
+        Ok(Some(
+            entry.record.lock_commit().await.current().status.clone(),
+        ))
     }
 
-    /// Drain accumulated completion notices (the overflow aggregate last).
+    fn enabled(&self) -> Result<Arc<Backend>, TaskAccessError> {
+        match &self.store {
+            Store::Enabled(b) => Ok(b.clone()),
+            Store::Disabled(e) => Err(TaskAccessError::Disabled(e.to_string())),
+        }
+    }
+
+    /// Drain accumulated notices (the overflow aggregate last).
     pub async fn take_notices(&self) -> Vec<TaskNotice> {
         let mut inner = self.inner.lock().await;
-        let mut notices = std::mem::take(&mut inner.notices);
-        if let Some((dropped, uncounted)) = inner.overflow.take() {
-            notices.push(TaskNotice::Overflow { dropped, uncounted });
-        }
-        notices
+        drain_notices(&mut inner)
     }
 
     /// Re-enqueue notices persisted by a previous incarnation: full notices
-    /// go ahead of any accumulated since, and a restored aggregate merges
-    /// into the overflow slot (`notices` must hold only full entries — a
-    /// stray aggregate would poison the demotion path). Once per registry
-    /// instance (the caller guarantees once per hub entry).
+    /// (`Task`/`OutputExpired`) go ahead of any accumulated since, and a
+    /// restored aggregate merges into the overflow slot keeping its batch id.
+    /// Once per registry instance (the caller guarantees once per hub entry).
     pub async fn restore_notices(&self, restored: Vec<TaskNotice>) {
         if restored.is_empty() {
             return;
@@ -562,9 +888,13 @@ impl BackgroundProcesses {
         let mut fulls = Vec::new();
         for notice in restored {
             match notice {
-                TaskNotice::Task { .. } => fulls.push(notice),
-                TaskNotice::Overflow { dropped, uncounted } => {
-                    inner.merge_overflow(dropped, uncounted);
+                TaskNotice::Task { .. } | TaskNotice::OutputExpired { .. } => fulls.push(notice),
+                TaskNotice::Overflow {
+                    batch_id,
+                    dropped,
+                    uncounted,
+                } => {
+                    inner.merge_overflow_batch(batch_id, dropped, uncounted);
                 }
             }
         }
@@ -596,15 +926,12 @@ impl BackgroundProcesses {
             entry.cancel.cancel();
         }
         // Join monitors *before* draining: every terminal state and notice is
-        // committed by the time we collect them.
+        // committed (rings flushed, manifests saved) by the time we collect them.
         for monitor in monitors {
             let _ = monitor.await;
         }
         let mut inner = self.inner.lock().await;
-        let mut notices = std::mem::take(&mut inner.notices);
-        if let Some((dropped, uncounted)) = inner.overflow.take() {
-            notices.push(TaskNotice::Overflow { dropped, uncounted });
-        }
+        let notices = drain_notices(&mut inner);
         // Wake watchers even when nothing changed (e.g. zero tasks) so a
         // keepalive watcher parked on this registry re-checks its entry and
         // can retire once the entry is released.
@@ -613,138 +940,277 @@ impl BackgroundProcesses {
     }
 }
 
-/// Drives one background process to completion: pumps stdout/stderr into the
-/// task's tail buffers and resolves when the leader exits and the pipes are
-/// drained. Cancellation (via `kill`/`shutdown`) SIGKILLs the whole group;
-/// pipe drains after a group kill are bounded, so a descendant that escaped
-/// the group (setsid) and holds a pipe open can't stall the terminal commit.
+/// Drain the notices and the overflow aggregate (aggregate last).
+fn drain_notices(inner: &mut RegistryState) -> Vec<TaskNotice> {
+    let mut notices = std::mem::take(&mut inner.notices);
+    if let Some(slot) = inner.overflow.take() {
+        notices.push(TaskNotice::Overflow {
+            batch_id: slot.batch_id,
+            dropped: slot.dropped,
+            uncounted: slot.uncounted,
+        });
+    }
+    notices
+}
+
+/// Errors from `read`/`kill` distinct from an unknown id (`Ok(None)`).
+#[derive(Debug)]
+pub enum TaskAccessError {
+    /// Background storage is disabled (the archive root could not be opened).
+    Disabled(String),
+    /// The archive entry is present but corrupt, or an I/O error occurred.
+    Archive(String),
+}
+
+impl std::fmt::Display for TaskAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskAccessError::Disabled(e) => write!(f, "background tasks are disabled: {e}"),
+            TaskAccessError::Archive(e) => write!(f, "background task archive error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TaskAccessError {}
+
+impl From<ArchiveError> for TaskAccessError {
+    fn from(e: ArchiveError) -> Self {
+        TaskAccessError::Archive(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for TaskAccessError {
+    fn from(e: std::io::Error) -> Self {
+        TaskAccessError::Archive(e.to_string())
+    }
+}
+
+/// Decode a chunk of raw output into a `String`, carrying a trailing incomplete
+/// UTF-8 sequence to the next read. The byte cursor never regresses: carried
+/// bytes are stored (not re-read), and a chunk boundary that split a scalar is
+/// stitched with `prev_carry`. When `flush` (terminal EOF with no more bytes),
+/// any trailing incomplete bytes are emitted as U+FFFD rather than carried. A
+/// consumer loss (`lost > 0`) discards a now-orphaned carry as one U+FFFD.
+fn decode_with_carry(prev_carry: &[u8], bytes: &[u8], lost: u64, flush: bool) -> (String, Vec<u8>) {
+    let mut out = String::new();
+    let mut work: Vec<u8> = Vec::with_capacity(prev_carry.len() + bytes.len());
+    if lost > 0 && !prev_carry.is_empty() {
+        // The carry's continuation was overwritten before we could read it.
+        out.push('\u{FFFD}');
+    } else {
+        work.extend_from_slice(prev_carry);
+    }
+    work.extend_from_slice(bytes);
+
+    match std::str::from_utf8(&work) {
+        Ok(s) => {
+            out.push_str(s);
+            (out, Vec::new())
+        }
+        Err(e) => {
+            let valid = e.valid_up_to();
+            // SAFETY-free: valid..end is guaranteed valid UTF-8.
+            out.push_str(std::str::from_utf8(&work[..valid]).unwrap());
+            let rest = &work[valid..];
+            match e.error_len() {
+                // Trailing incomplete sequence: carry it unless we must flush.
+                None if !flush && rest.len() <= 3 => (out, rest.to_vec()),
+                _ => {
+                    out.push_str(&String::from_utf8_lossy(rest));
+                    (out, Vec::new())
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamName {
+    Stdout,
+    Stderr,
+}
+
+impl StreamName {
+    fn label(self) -> &'static str {
+        match self {
+            StreamName::Stdout => "stdout",
+            StreamName::Stderr => "stderr",
+        }
+    }
+}
+
+/// How a pipe pump ended: clean EOF, or an irrecoverable read/spool failure
+/// (message already includes the stream and the cause).
+enum PumpResult {
+    Eof,
+    Failed { message: String },
+}
+
+/// Drives one background process: pumps stdout/stderr into the ring files and
+/// resolves when the leader exits and the pipes drain. A pump read/spool
+/// failure is terminal — the group is killed and the task settles `Failed`,
+/// never a clean exit. Cancellation (kill/shutdown) SIGKILLs the group and is
+/// biased to win over a concurrent failure so a user kill stays `Killed`. Pipe
+/// drains after a group kill are bounded, so a setsid descendant holding a pipe
+/// cannot stall the terminal commit.
 async fn run_process(mut group: GroupedChild, ctx: TaskCtx) -> TaskExit {
-    let mut stdout = group.child.stdout.take().expect("stdout is piped");
-    let mut stderr = group.child.stderr.take().expect("stderr is piped");
-    let mut out_pump = tokio::spawn({
-        let ctx = ctx.clone();
-        async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => ctx.append_stdout(&buf[..n]).await,
-                }
-            }
-        }
-    });
-    let mut err_pump = tokio::spawn({
-        let ctx = ctx.clone();
-        async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => ctx.append_stderr(&buf[..n]).await,
-                }
-            }
-        }
-    });
+    let stdout = group.child.stdout.take().expect("stdout is piped");
+    let stderr = group.child.stderr.take().expect("stderr is piped");
+    let mut out_pump = tokio::spawn(pump_stream(stdout, ctx.clone(), StreamName::Stdout));
+    let mut err_pump = tokio::spawn(pump_stream(stderr, ctx.clone(), StreamName::Stderr));
     let cancel = ctx.cancelled();
 
-    let status = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            // Kill the whole group, then reap the leader. The pipes hit EOF,
-            // letting the pumps flush whatever was produced.
+    let mut out_res: Option<PumpResult> = None;
+    let mut err_res: Option<PumpResult> = None;
+    let mut exited: Option<Option<i32>> = None;
+    let mut failure: Option<String> = None;
+
+    loop {
+        // Cancellation wins over everything (biased below reinforces this).
+        if cancel.is_cancelled() {
             group.kill_group();
+            drain_pump(&mut out_pump, &mut out_res).await;
+            drain_pump(&mut err_pump, &mut err_res).await;
             let _ = group.child.wait().await;
-            None
+            return TaskExit::Killed;
         }
-        status = group.child.wait() => Some(status),
-    };
-
-    let Some(status) = status else {
-        drain_pump(&mut out_pump).await;
-        drain_pump(&mut err_pump).await;
-        return TaskExit::Killed;
-    };
-
-    // Natural leader exit: the pipes usually EOF right away, but a
-    // backgrounded child holding an inherited pipe keeps streaming — keep
-    // pumping (that output is the task's to report) while racing
-    // cancellation, whose group kill ends the stream.
-    let killed = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
+        // A spool/read failure is terminal even if the leader already exited.
+        if let Some(message) = failure {
             group.kill_group();
-            drain_pump(&mut out_pump).await;
-            drain_pump(&mut err_pump).await;
-            true
+            drain_pump(&mut out_pump, &mut out_res).await;
+            drain_pump(&mut err_pump, &mut err_res).await;
+            let _ = group.child.wait().await;
+            return TaskExit::Failed { message };
         }
-        _ = async {
-            let _ = (&mut out_pump).await;
-            let _ = (&mut err_pump).await;
-        } => {
+        // Natural completion: leader reaped and both pipes drained to EOF.
+        if let Some(code) = exited
+            && out_res.is_some()
+            && err_res.is_some()
+        {
             group.disarm();
-            false
+            return TaskExit::Exited { code };
         }
-    };
-    if killed {
-        TaskExit::Killed
-    } else {
-        TaskExit::Exited {
-            code: status.ok().and_then(|s| s.code()),
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            res = &mut out_pump, if out_res.is_none() => {
+                record_pump(res, &mut out_res, &mut failure);
+            }
+            res = &mut err_pump, if err_res.is_none() => {
+                record_pump(res, &mut err_res, &mut failure);
+            }
+            status = group.child.wait(), if exited.is_none() => {
+                exited = Some(status.ok().and_then(|s| s.code()));
+            }
         }
     }
 }
 
-/// Bounded wait for a pipe pump after a group kill: the pipes normally EOF
-/// at once, and an escaped descendant holding one open must not stall the
-/// terminal commit — on expiry the pump is aborted and its remaining output
-/// forfeited.
-async fn drain_pump(pump: &mut JoinHandle<()>) {
-    if tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut *pump)
-        .await
-        .is_err()
+/// Store a completed pump's result, recording the first failure cause.
+fn record_pump(
+    res: Result<PumpResult, tokio::task::JoinError>,
+    slot: &mut Option<PumpResult>,
+    failure: &mut Option<String>,
+) {
+    let result = res.unwrap_or(PumpResult::Eof);
+    if let PumpResult::Failed { message } = &result
+        && failure.is_none()
     {
-        pump.abort();
+        *failure = Some(message.clone());
+    }
+    *slot = Some(result);
+}
+
+/// One stream's pump loop: read the pipe, append to the ring. A read or append
+/// error ends the pump with a structured failure rather than a silent EOF.
+async fn pump_stream<R>(mut reader: R, ctx: TaskCtx, stream: StreamName) -> PumpResult
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => return PumpResult::Eof,
+            Ok(n) => {
+                let appended = match stream {
+                    StreamName::Stdout => ctx.append_stdout(&buf[..n]).await,
+                    StreamName::Stderr => ctx.append_stderr(&buf[..n]).await,
+                };
+                if let Err(e) = appended {
+                    return PumpResult::Failed {
+                        message: format!("{} spool write failed: {e}", stream.label()),
+                    };
+                }
+            }
+            Err(e) => {
+                return PumpResult::Failed {
+                    message: format!("{} read failed: {e}", stream.label()),
+                };
+            }
+        }
     }
 }
 
-/// Awaits the task's work and commits the terminal state — the single writer
-/// of that transition. Commit order (load-bearing, see the design doc):
-/// entry status first, then (under the registry lock) notice enqueue,
-/// bookkeeping, and the summaries publish *last*.
+/// Bounded wait for a pipe pump after a group kill; on expiry it is aborted and
+/// its result treated as EOF, so an escaped descendant cannot stall teardown.
+async fn drain_pump(pump: &mut JoinHandle<PumpResult>, slot: &mut Option<PumpResult>) {
+    if slot.is_some() {
+        return;
+    }
+    match tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut *pump).await {
+        Ok(res) => *slot = Some(res.unwrap_or(PumpResult::Eof)),
+        Err(_) => {
+            pump.abort();
+            *slot = Some(PumpResult::Eof);
+        }
+    }
+}
+
+/// Snapshot for a task's terminal notice/summary, captured before any cleanup
+/// deletes the ring files.
+struct TerminalOutcome {
+    status: TaskStatus,
+    tail: String,
+    stdout_overwritten: u64,
+    stderr_overwritten: u64,
+}
+
+/// Awaits the task's work and commits the terminal state — the single writer of
+/// that transition. Order (load-bearing): terminal manifest commit first, then
+/// quota finalize (Consumed cleanup or victim registration), then (under the
+/// registry lock) notice enqueue, bookkeeping, and the summaries publish *last*
+/// so a watcher seeing zero running already has the notice drainable.
 async fn monitor_task(
     inner: Arc<Mutex<RegistryState>>,
+    backend: Arc<Backend>,
     entry: Arc<TaskEntry>,
     work: impl Future<Output = TaskExit>,
 ) {
     let exit = work.await;
-    let at = jiff::Timestamp::now();
-    let status = match exit {
-        TaskExit::Exited { code } => TaskStatus::Exited { code, at },
-        TaskExit::Killed => TaskStatus::Killed { at },
-        TaskExit::Failed { message } => TaskStatus::Failed { message, at },
-    };
+    let record = &entry.record;
+    let outcome = commit_terminal(record, exit).await;
 
-    let output_tail = {
-        let mut state = entry.state.lock().await;
-        state.status = status.clone();
-        let tail = state.stdout.tail_string(NOTICE_TAIL_LIMIT);
-        if tail.is_empty() {
-            state.stderr.tail_string(NOTICE_TAIL_LIMIT)
-        } else {
-            tail
-        }
-    };
+    // Reclaim (Consumed) or register as an eviction victim. Cleanup failure is
+    // only logged: the completion notice and summary must still publish.
+    if let Err(e) = backend.quota.finalize_terminal(record).await {
+        tracing::warn!(task = record.id().as_str(), error = %e, "task output finalize failed");
+    }
 
+    let id = record.id().clone();
     let mut inner = inner.lock().await;
     inner.push_notice(TaskNotice::Task {
-        id: entry.id.clone(),
-        command: entry.meta.command.clone(),
-        description: entry.meta.description.clone(),
-        status: status.clone(),
-        output_tail,
+        id: id.clone(),
+        command: record.meta().command.clone(),
+        description: record.meta().description.clone(),
+        status: outcome.status.clone(),
+        output_tail: outcome.tail,
+        stdout_overwritten: outcome.stdout_overwritten,
+        stderr_overwritten: outcome.stderr_overwritten,
     });
     inner.running_count -= 1;
-    inner.terminal_order.push_back(entry.id.clone());
+    inner.terminal_order.push_back(id.clone());
     if inner.terminal_order.len() > MAX_TERMINAL
         && let Some(oldest) = inner.terminal_order.pop_front()
     {
@@ -753,10 +1219,80 @@ async fn monitor_task(
         // A reclaimed task's monitor has long finished; drop its handle.
         inner.monitors.remove(&oldest);
     }
-    if let Some(summary) = inner.summaries.get_mut(&entry.id) {
-        summary.status = status;
+    if let Some(summary) = inner.summaries.get_mut(&id) {
+        summary.status = outcome.status;
     }
     inner.publish();
+}
+
+/// Flush the rings, snapshot the notice tail/overwrite totals, and atomically
+/// commit the terminal manifest. A flush or save failure degrades the task to
+/// `Failed` rather than reporting a clean exit whose output was not persisted.
+async fn commit_terminal(record: &TaskRecord, exit: TaskExit) -> TerminalOutcome {
+    let at = jiff::Timestamp::now();
+    let intended = match exit {
+        TaskExit::Exited { code } => TaskStatus::Exited { code, at },
+        TaskExit::Killed => TaskStatus::Killed { at },
+        TaskExit::Failed { message } => TaskStatus::Failed { message, at },
+    };
+    // Flush so the terminal manifest's logical range is durable, then snapshot
+    // the overwrite totals and tail before any cleanup can delete the rings.
+    let flush_ok = record.files().flush().await.is_ok();
+    let stdout_overwritten = record.files().stdout.logical_range().await.0;
+    let stderr_overwritten = record.files().stderr.logical_range().await.0;
+    let tail = terminal_tail(record).await;
+
+    let mut guard = record.lock_commit().await;
+    if !guard.current().status.is_running() {
+        // Already terminal (e.g. a concurrent kill settled first).
+        return TerminalOutcome {
+            status: guard.current().status.clone(),
+            tail,
+            stdout_overwritten,
+            stderr_overwritten,
+        };
+    }
+    let mut candidate = guard.current().clone();
+    candidate.status = intended.clone();
+    let committed = flush_ok && guard.commit(candidate).await.is_ok();
+    let status = if committed {
+        intended
+    } else {
+        let failed = TaskStatus::Failed {
+            message: "background output spool save failed".into(),
+            at,
+        };
+        let mut degraded = guard.current().clone();
+        degraded.status = failed.clone();
+        let _ = guard.commit(degraded).await; // best-effort
+        failed
+    };
+    TerminalOutcome {
+        status,
+        tail,
+        stdout_overwritten,
+        stderr_overwritten,
+    }
+}
+
+/// The notice tail: the last bytes of stdout, or stderr if stdout is empty.
+async fn terminal_tail(record: &TaskRecord) -> String {
+    let out = record
+        .files()
+        .stdout
+        .tail(NOTICE_TAIL_LIMIT)
+        .await
+        .unwrap_or_default();
+    if !out.is_empty() {
+        return String::from_utf8_lossy(&out).into_owned();
+    }
+    let err = record
+        .files()
+        .stderr
+        .tail(NOTICE_TAIL_LIMIT)
+        .await
+        .unwrap_or_default();
+    String::from_utf8_lossy(&err).into_owned()
 }
 
 #[cfg(test)]
@@ -764,6 +1300,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    /// The ring capacity a fresh stream is created with — the retained window.
+    const TAIL_BUF_CAP: usize = DEFAULT_STREAM_CAPACITY as usize;
 
     fn meta(command: &str) -> TaskMeta {
         TaskMeta {
@@ -795,7 +1334,7 @@ mod tests {
         // No await between spawn returning and this check: the watch already
         // carries the running task.
         assert_eq!(running_count(&rx), 1);
-        assert!(rx.borrow().iter().any(|s| s.id == id));
+        assert!(rx.borrow().iter().any(|s| s.id == id.as_str()));
         gate.notify_one();
     }
 
@@ -808,7 +1347,7 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let g = gate.clone();
         reg.spawn_with(meta("quick"), |ctx| async move {
-            ctx.append_stdout(b"done!").await;
+            ctx.append_stdout(b"done!").await.unwrap();
             g.notified().await;
             TaskExit::Exited { code: Some(0) }
         })
@@ -849,7 +1388,7 @@ mod tests {
         // Race the kill against the natural exit; either way the commit is
         // singular.
         tokio::time::sleep(Duration::from_millis(1)).await;
-        let status = reg.kill(&id).await.expect("task known");
+        let status = reg.kill(&id).await.unwrap().expect("task known");
         assert!(!status.is_running());
         let notices = reg.take_notices().await;
         assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
@@ -919,12 +1458,12 @@ mod tests {
         let g = gate.clone();
         let id = reg
             .spawn_with(meta("chatty"), move |ctx| async move {
-                ctx.append_stdout(b"first").await;
+                ctx.append_stdout(b"first").await.unwrap();
                 g.notified().await;
                 // Blow past the buffer cap so the head (including anything
                 // unread) is dropped.
                 let big = vec![b'x'; TAIL_BUF_CAP + 7];
-                ctx.append_stdout(&big).await;
+                ctx.append_stdout(&big).await.unwrap();
                 ctx.cancelled().cancelled().await;
                 TaskExit::Killed
             })
@@ -934,7 +1473,7 @@ mod tests {
         // First read consumes "first" (5 bytes, cursor -> 5).
         let mut seen = String::new();
         while seen.len() < 5 {
-            let read = reg.read(&id).await.unwrap();
+            let read = reg.read(&id).await.unwrap().unwrap();
             seen.push_str(&read.stdout);
             assert_eq!(read.stdout_lost, 0);
             tokio::task::yield_now().await;
@@ -942,27 +1481,38 @@ mod tests {
         assert_eq!(seen, "first");
         gate.notify_one();
 
-        // Wait until the big write landed, then read: 5 + cap + 7 total
-        // written, window holds the last cap bytes → 7 bytes lost.
-        let (total, lost, len) = loop {
-            let read = reg.read(&id).await.unwrap();
-            if !read.stdout.is_empty() || read.stdout_lost > 0 {
-                break (5 + TAIL_BUF_CAP + 7, read.stdout_lost, read.stdout.len());
+        // Wait until the big write landed, then drain: reads are chunked, so
+        // the retained window (cap bytes) comes back across several calls. Loss
+        // is reported exactly once, on the first read after the truncation.
+        let mut lost_total = 0u64;
+        let mut drained = 0usize;
+        loop {
+            let read = reg.read(&id).await.unwrap().unwrap();
+            lost_total += read.stdout_lost;
+            drained += read.stdout.len();
+            if drained >= TAIL_BUF_CAP {
+                break;
             }
             tokio::task::yield_now().await;
-        };
-        assert_eq!(lost, 7, "bytes dropped before the read are reported");
-        assert_eq!(len, TAIL_BUF_CAP);
+        }
+        assert_eq!(
+            lost_total, 7,
+            "bytes dropped before the read are reported once"
+        );
+        assert_eq!(
+            drained, TAIL_BUF_CAP,
+            "the whole retained window is drained"
+        );
         // Cursor is at total_written now: nothing further, nothing repeated.
-        let read = reg.read(&id).await.unwrap();
+        let read = reg.read(&id).await.unwrap().unwrap();
         assert_eq!(read.stdout.len(), 0);
         assert_eq!(read.stdout_lost, 0);
-        let _ = total;
         reg.shutdown().await;
     }
 
-    /// Terminal entries beyond MAX_TERMINAL are reclaimed oldest-first;
-    /// reclaimed ids read as None.
+    /// Terminal entries beyond MAX_TERMINAL are reclaimed from the in-memory
+    /// live overview oldest-first, but stay readable by id from the archive:
+    /// memory reclamation is decoupled from disk retention.
     #[tokio::test]
     async fn terminal_entries_are_reclaimed_beyond_cap() {
         let reg = BackgroundProcesses::new();
@@ -982,8 +1532,8 @@ mod tests {
                 let done = rx
                     .borrow_and_update()
                     .iter()
-                    .any(|s| s.id == id && !s.status.is_running());
-                let gone = i > 0 && !rx.borrow().iter().any(|s| s.id == id);
+                    .any(|s| s.id == id.as_str() && !s.status.is_running());
+                let gone = i > 0 && !rx.borrow().iter().any(|s| s.id == id.as_str());
                 if done || gone {
                     break;
                 }
@@ -991,11 +1541,20 @@ mod tests {
             }
         }
         let first = first_id.unwrap();
+        // Reclaimed from the live overview...
         assert!(
-            reg.read(&first).await.is_none(),
-            "oldest terminal task is reclaimed"
+            !reg.summaries()
+                .borrow()
+                .iter()
+                .any(|s| s.id == first.as_str()),
+            "oldest terminal task is reclaimed from the live overview"
         );
-        // Its notice still exists — reclamation frees buffers, not facts.
+        // ...but still readable by id from the archive on disk.
+        assert!(
+            reg.read(&first).await.unwrap().is_some(),
+            "a memory-reclaimed terminal task stays readable from disk"
+        );
+        // Its notice still exists — reclamation frees the overview slot, not facts.
         let notices = reg.take_notices().await;
         assert_eq!(notices.len(), MAX_TERMINAL + 1);
         reg.shutdown().await;
@@ -1018,8 +1577,8 @@ mod tests {
                 let settled = rx
                     .borrow_and_update()
                     .iter()
-                    .any(|s| s.id == id && !s.status.is_running())
-                    || !rx.borrow().iter().any(|s| s.id == id);
+                    .any(|s| s.id == id.as_str() && !s.status.is_running())
+                    || !rx.borrow().iter().any(|s| s.id == id.as_str());
                 if settled {
                     break;
                 }
@@ -1035,7 +1594,9 @@ mod tests {
         let overflow: Vec<_> = notices
             .iter()
             .filter_map(|n| match n {
-                TaskNotice::Overflow { dropped, uncounted } => Some((dropped.len(), *uncounted)),
+                TaskNotice::Overflow {
+                    dropped, uncounted, ..
+                } => Some((dropped.len(), *uncounted)),
                 _ => None,
             })
             .collect();
@@ -1043,24 +1604,47 @@ mod tests {
         reg.shutdown().await;
     }
 
+    fn completed_notice(id: &TaskId) -> TaskNotice {
+        TaskNotice::Task {
+            id: id.clone(),
+            command: "old".into(),
+            description: String::new(),
+            status: TaskStatus::Killed {
+                at: jiff::Timestamp::now(),
+            },
+            output_tail: String::new(),
+            stdout_overwritten: 0,
+            stderr_overwritten: 0,
+        }
+    }
+
+    fn fact_ids(dropped: &[TaskNoticeFact]) -> Vec<String> {
+        dropped
+            .iter()
+            .map(|f| match f {
+                TaskNoticeFact::Completed { id, .. } => id.as_str().to_owned(),
+                TaskNoticeFact::OutputExpired { id, .. } => id.as_str().to_owned(),
+            })
+            .collect()
+    }
+
     /// A restored aggregate merges into the overflow slot — never into the
     /// full-notice queue, where the demotion path only expects full notices.
     #[tokio::test]
     async fn restore_merges_persisted_aggregate_into_overflow_slot() {
         let reg = BackgroundProcesses::new();
-        let killed = TaskStatus::Killed {
-            at: jiff::Timestamp::now(),
-        };
+        let old = TaskId::new();
+        let x = TaskId::new();
         reg.restore_notices(vec![
-            TaskNotice::Task {
-                id: "bg_old".into(),
-                command: "old".into(),
-                description: String::new(),
-                status: killed.clone(),
-                output_tail: String::new(),
-            },
+            completed_notice(&old),
             TaskNotice::Overflow {
-                dropped: vec![("bg_x".into(), killed)],
+                batch_id: "batch-1".into(),
+                dropped: vec![TaskNoticeFact::Completed {
+                    id: x.clone(),
+                    status: TaskStatus::Killed {
+                        at: jiff::Timestamp::now(),
+                    },
+                }],
                 uncounted: 5,
             },
         ])
@@ -1080,8 +1664,8 @@ mod tests {
                 let settled = rx
                     .borrow_and_update()
                     .iter()
-                    .any(|s| s.id == id && !s.status.is_running())
-                    || !rx.borrow().iter().any(|s| s.id == id);
+                    .any(|s| s.id == id.as_str() && !s.status.is_running())
+                    || !rx.borrow().iter().any(|s| s.id == id.as_str());
                 if settled {
                     break;
                 }
@@ -1098,12 +1682,16 @@ mod tests {
         let (dropped, uncounted) = notices
             .iter()
             .find_map(|n| match n {
-                TaskNotice::Overflow { dropped, uncounted } => Some((dropped, *uncounted)),
+                TaskNotice::Overflow {
+                    dropped, uncounted, ..
+                } => Some((dropped, *uncounted)),
                 _ => None,
             })
             .expect("aggregate present");
-        let dropped_ids: Vec<&str> = dropped.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(dropped_ids, vec!["bg_x", "bg_old"]);
+        assert_eq!(
+            fact_ids(dropped),
+            vec![x.as_str().to_owned(), old.as_str().to_owned()]
+        );
         assert_eq!(uncounted, 5);
         reg.shutdown().await;
     }
@@ -1145,19 +1733,22 @@ mod tests {
         while running_count(&rx) > 0 {
             rx.changed().await.unwrap();
         }
-        reg.restore_notices(vec![TaskNotice::Task {
-            id: "bg_old".into(),
-            command: "old".into(),
-            description: String::new(),
-            status: TaskStatus::Killed {
-                at: jiff::Timestamp::now(),
-            },
-            output_tail: String::new(),
-        }])
-        .await;
+        let old = TaskId::new();
+        reg.restore_notices(vec![completed_notice(&old)]).await;
         let notices = reg.take_notices().await;
-        let ids: Vec<Vec<String>> = notices.iter().map(|n| n.task_ids()).collect();
-        assert_eq!(ids, vec![vec!["bg_old".to_string()], vec![id]]);
+        // Restored notice first, then the completion accumulated since.
+        let ids: Vec<Vec<TaskNoticeKey>> = notices.iter().map(|n| n.keys()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                vec![TaskNoticeKey::Completed {
+                    task_id: old.as_str().to_owned()
+                }],
+                vec![TaskNoticeKey::Completed {
+                    task_id: id.as_str().to_owned()
+                }],
+            ]
+        );
     }
 
     // ---- real-process tasks -------------------------------------------
@@ -1242,7 +1833,7 @@ mod tests {
         let (mut stdout, mut stderr) = (String::new(), String::new());
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let read = reg.read(&id).await.expect("task known");
+                let read = reg.read(&id).await.unwrap().expect("task known");
                 stdout.push_str(&read.stdout);
                 stderr.push_str(&read.stderr);
                 if !read.status.is_running() {
@@ -1255,7 +1846,7 @@ mod tests {
         .expect("process never settled");
         // One more read: the terminal commit happens after the pumps flushed,
         // so the remainder is fully readable.
-        let last = reg.read(&id).await.unwrap();
+        let last = reg.read(&id).await.unwrap().unwrap();
         stdout.push_str(&last.stdout);
         stderr.push_str(&last.stderr);
 
@@ -1292,7 +1883,7 @@ mod tests {
         let id = reg.spawn(bash(&command), meta("group")).await.unwrap();
         let pids = wait_pids(&pidfile, 2).await;
 
-        let status = reg.kill(&id).await.expect("task known");
+        let status = reg.kill(&id).await.unwrap().expect("task known");
         assert!(matches!(status, TaskStatus::Killed { .. }));
         assert_pids_die(&pids).await;
 
@@ -1337,11 +1928,16 @@ mod tests {
         .await
         .expect("shell leader did not exit");
         assert!(
-            reg.read(&id).await.expect("task known").status.is_running(),
+            reg.read(&id)
+                .await
+                .unwrap()
+                .expect("task known")
+                .status
+                .is_running(),
             "background child should keep the task draining"
         );
 
-        let status = reg.kill(&id).await.expect("task known");
+        let status = reg.kill(&id).await.unwrap().expect("task known");
         assert!(matches!(status, TaskStatus::Killed { .. }));
         assert_pids_die(&pids[1..]).await;
 
@@ -1369,6 +1965,7 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(2), reg.kill(&id))
             .await
             .expect("kill hung on the escaped descendant's pipe")
+            .unwrap()
             .expect("task known");
         assert!(matches!(status, TaskStatus::Killed { .. }));
 
