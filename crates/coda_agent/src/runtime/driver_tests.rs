@@ -537,6 +537,27 @@ impl LLMProvider for TestProvider {
                     },
                 )
             }
+            // Echoes the first line of every user message it sees, in order,
+            // so tests can assert what reached the model and in what order.
+            "notice-main" => Self::completed(AssistantMessage {
+                content: format!(
+                    "seen:{}",
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            Message::User(user) => user.first_text().map(|text| text
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+                ..assistant()
+            }),
             "error-main" => Self::errored(StreamError::InvalidResponse("main boom".into())),
             "error-parent-main" => {
                 let subagent_failed = matches!(
@@ -673,7 +694,11 @@ where
         let config = test_config(provider, approval);
 
         let thread_id = ThreadId::new();
-        let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
+        let mut runtime = AgentRuntime::new(
+            storage.clone(),
+            thread_id.as_ref().to_string(),
+            std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+        );
         runtime
             .bootstrap(agents, None, HashMap::new(), config)
             .await;
@@ -736,7 +761,11 @@ where
             .unwrap_or_default()
             .map(Into::into);
 
-        let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
+        let mut runtime = AgentRuntime::new(
+            self.storage.clone(),
+            session_id.clone(),
+            std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+        );
         let events = runtime.subscribe();
         runtime
             .bootstrap(agents, snapshot, resume_decisions, config)
@@ -789,7 +818,11 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
 
     let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
-    let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
+    let mut runtime = AgentRuntime::new(
+        MemoryStorage::default(),
+        "test-session".into(),
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     runtime
         .bootstrap(agents, None, HashMap::new(), config)
         .await;
@@ -1798,4 +1831,138 @@ async fn in_process_resume_after_suspension() {
     );
 
     harness.shutdown().await;
+}
+
+/// Background-task notices ride in at the next user turn, ahead of the user's
+/// message: the `TaskNotice` event precedes `LLMStart` and carries the exact
+/// message object persisted in the checkpoint, the model sees notice-then-user
+/// order, and delivery drains the registry (exactly once).
+#[tokio::test]
+async fn task_notices_inject_ahead_of_the_user_message() {
+    let storage = TestStorage::default();
+    let background = Arc::new(coda_tools::BackgroundProcesses::new());
+    background
+        .spawn_with(
+            coda_tools::TaskMeta {
+                command: "true".into(),
+                description: "quick".into(),
+                agent_name: "coda".into(),
+            },
+            |_ctx| async { coda_tools::TaskExit::Exited { code: Some(0) } },
+        )
+        .await
+        .expect("spawn fake task");
+    // Wait for the terminal commit so the notice is pending before the turn.
+    let mut summaries = background.summaries();
+    while summaries
+        .borrow_and_update()
+        .iter()
+        .any(|summary| summary.status.is_running())
+    {
+        summaries.changed().await.expect("summaries watch");
+    }
+
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "notice-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let agents = team.build(".", background.clone());
+
+    let thread_id = ThreadId::new();
+    let mut runtime = AgentRuntime::new(
+        storage.clone(),
+        thread_id.as_ref().to_string(),
+        background.clone(),
+    );
+    let mut events = runtime.subscribe();
+    runtime
+        .bootstrap(
+            agents,
+            None,
+            HashMap::new(),
+            test_config(TestProvider::default(), ToolApprovalMode::Auto),
+        )
+        .await;
+    runtime
+        .send_message(user_task(&thread_id, "hello"))
+        .await
+        .expect("send task");
+
+    // Injection happens while handling the Task envelope, before the request
+    // is built: TaskNotice must arrive ahead of LLMStart.
+    let notice_message = loop {
+        let (_, _, event) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timed out waiting for TaskNotice")
+            .expect("event stream open");
+        match event {
+            AgentEvent::TaskNotice(message) => break message,
+            AgentEvent::LLMStart(_) => panic!("TaskNotice must precede LLMStart"),
+            _ => {}
+        }
+    };
+    assert!(matches!(
+        &notice_message.origin,
+        coda_core::llm::UserOrigin::TaskNotice { task_ids } if task_ids.len() == 1
+    ));
+    let notice_text = notice_message.first_text().expect("notice text");
+    assert!(notice_text.contains("Background task bg_"), "{notice_text}");
+    assert!(notice_text.contains("exited with code 0"), "{notice_text}");
+
+    // The model saw the notice ahead of the user message.
+    let content = loop {
+        let (_, _, event) = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timed out waiting for LLMEnd")
+            .expect("event stream open");
+        if let AgentEvent::LLMEnd(message) = event {
+            break message.content;
+        }
+    };
+    assert!(content.starts_with("seen:Background task bg_"), "{content}");
+    assert!(content.ends_with("|hello"), "{content}");
+
+    // Checkpoint history holds the identical notice message, ahead of the
+    // user's, so fold-from-events and checkpoint restore agree field by field.
+    let checkpoint = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(checkpoint) = storage.checkpoint(&thread_id).await
+                && checkpoint.messages.len() >= 3
+            {
+                break checkpoint;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the final checkpoint");
+    let users: Vec<_> = checkpoint
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users.len(), 2, "notice + user message");
+    assert_eq!(
+        serde_json::to_string(users[0]).expect("serialize"),
+        serde_json::to_string(&notice_message).expect("serialize"),
+        "checkpointed notice differs from the emitted event's message"
+    );
+    assert_eq!(users[1].first_text(), Some("hello"));
+
+    // Exactly-once within the normal lifecycle: the registry is drained.
+    assert!(background.take_notices().await.is_empty());
+
+    runtime.request_exit().await;
+    assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }

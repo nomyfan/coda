@@ -64,10 +64,22 @@ impl TaskStatus {
     pub fn is_running(&self) -> bool {
         matches!(self, TaskStatus::Running)
     }
+
+    /// Model-facing one-line rendering.
+    pub fn describe(&self) -> String {
+        match self {
+            TaskStatus::Running => "running".into(),
+            TaskStatus::Exited {
+                code: Some(code), ..
+            } => format!("exited with code {code}"),
+            TaskStatus::Exited { code: None, .. } => "exited (unknown exit code)".into(),
+            TaskStatus::Killed { .. } => "killed".into(),
+        }
+    }
 }
 
 /// One row of the registry's live overview (dashboard / keepalive signal).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: String,
     pub command: String,
@@ -102,6 +114,44 @@ impl TaskNotice {
             TaskNotice::Task { id, .. } => vec![id.clone()],
             TaskNotice::Overflow { dropped, .. } => {
                 dropped.iter().map(|(id, _)| id.clone()).collect()
+            }
+        }
+    }
+
+    /// The text of the user-turn message that delivers this notice — what the
+    /// model (and the user, as a notice card) reads.
+    pub fn render(&self) -> String {
+        match self {
+            TaskNotice::Task {
+                id,
+                command,
+                description,
+                status,
+                output_tail,
+            } => {
+                let mut text = format!("Background task {id} finished: {}.", status.describe());
+                text.push_str(&format!("\nCommand: {command}"));
+                if !description.is_empty() {
+                    text.push_str(&format!("\nDescription: {description}"));
+                }
+                if !output_tail.is_empty() {
+                    text.push_str(&format!("\nOutput tail:\n{output_tail}"));
+                } else {
+                    text.push_str("\n(no output)");
+                }
+                text
+            }
+            TaskNotice::Overflow { dropped, uncounted } => {
+                let total = dropped.len() as u64 + uncounted;
+                let mut text =
+                    format!("{total} more background task(s) finished while notices were capped:");
+                for (id, status) in dropped {
+                    text.push_str(&format!("\n- {id}: {}", status.describe()));
+                }
+                if *uncounted > 0 {
+                    text.push_str(&format!("\n…and {uncounted} more (details dropped)."));
+                }
+                text
             }
         }
     }

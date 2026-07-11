@@ -24,6 +24,20 @@ pub enum ContentPart {
     Image { url: String },
 }
 
+/// Who produced a user-turn message: the human, or the runtime delivering
+/// background-task completion notices on their behalf. Persisted with the
+/// message; clients render notices differently, and restore paths use the
+/// carried task ids to dedupe re-delivery.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserOrigin {
+    #[default]
+    Human,
+    /// The task ids this notice message covers (including every id inside an
+    /// aggregate notice) — the dedupe keys for restore.
+    TaskNotice { task_ids: Vec<String> },
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -31,6 +45,10 @@ pub struct UserMessage {
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
     pub created_at: jiff::Timestamp,
+    /// Defaults to `Human`, so checkpoints written before this field existed
+    /// deserialize as ordinary user messages.
+    #[serde(default)]
+    pub origin: UserOrigin,
 }
 
 impl UserMessage {
@@ -39,6 +57,7 @@ impl UserMessage {
         Self {
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::Human,
         }
     }
 
@@ -59,6 +78,17 @@ impl UserMessage {
         Self {
             parts,
             created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::Human,
+        }
+    }
+
+    /// Construct a background-task notice delivered as a user-turn message,
+    /// carrying the covered task ids for restore-time dedupe.
+    pub fn task_notice(text: impl Into<String>, task_ids: Vec<String>) -> Self {
+        Self {
+            parts: vec![ContentPart::Text { text: text.into() }],
+            created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::TaskNotice { task_ids },
         }
     }
 

@@ -9,19 +9,7 @@ use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
-use crate::background::{BackgroundProcesses, TaskStatus};
-
-/// Model-facing one-line rendering of a task status.
-fn describe(status: &TaskStatus) -> String {
-    match status {
-        TaskStatus::Running => "running".into(),
-        TaskStatus::Exited {
-            code: Some(code), ..
-        } => format!("exited with code {code}"),
-        TaskStatus::Exited { code: None, .. } => "exited (unknown exit code)".into(),
-        TaskStatus::Killed { .. } => "killed".into(),
-    }
-}
+use crate::background::BackgroundProcesses;
 
 fn unknown_task(id: &str) -> String {
     format!(
@@ -81,7 +69,7 @@ impl Tool for TaskOutputTool {
             let Some(read) = background.read(&params.id).await else {
                 return Ok(unknown_task(&params.id));
             };
-            let mut out = format!("status: {}", describe(&read.status));
+            let mut out = format!("status: {}", read.status.describe());
             if read.stdout_lost > 0 {
                 out.push_str(&format!(
                     "\n({} bytes of stdout were dropped from the buffer before this read)",
@@ -161,7 +149,7 @@ impl Tool for TaskKillTool {
         async move {
             match background.kill(&params.id).await {
                 None => Ok(unknown_task(&params.id)),
-                Some(status) => Ok(format!("Task {}: {}.", params.id, describe(&status))),
+                Some(status) => Ok(format!("Task {}: {}.", params.id, status.describe())),
             }
         }
     }

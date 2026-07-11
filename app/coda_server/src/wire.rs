@@ -1,6 +1,9 @@
 use crate::config::{ToolApprovalConfig, extract_shell_command};
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
-use coda_core::llm::{AssistantMessage, Message, Modality, ReasoningEffort, ToolCall, ToolMessage};
+use coda_core::llm::{
+    AssistantMessage, Message, Modality, ReasoningEffort, ToolCall, ToolMessage, UserMessage,
+};
+use coda_tools::TaskSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -42,6 +45,15 @@ pub enum WireEvent {
         agent_name: String,
         thread_id: String,
         message: ToolMessage,
+    },
+    /// A background-task completion notice written into history ahead of the
+    /// user's next message. Carries the exact persisted [`UserMessage`]
+    /// (origin `task_notice`), so clients place it verbatim.
+    #[serde(rename = "task_notice")]
+    TaskNotice {
+        agent_name: String,
+        thread_id: String,
+        message: UserMessage,
     },
     #[serde(rename = "suspended")]
     Suspended {
@@ -116,6 +128,11 @@ impl WireEvent {
                 call,
             },
             AgentEvent::ToolCallEnd(message) => WireEvent::ToolCallEnd {
+                agent_name,
+                thread_id,
+                message,
+            },
+            AgentEvent::TaskNotice(message) => WireEvent::TaskNotice {
                 agent_name,
                 thread_id,
                 message,
@@ -267,6 +284,14 @@ pub enum ServerMessage {
         workspace_id: String,
         session_id: String,
         event: WireEvent,
+    },
+    /// Live overview of the session's background tasks: sent once on attach
+    /// with the current value, then again on every change (spawn, terminal
+    /// commit). The list is the full retained set, not a delta.
+    BackgroundTasks {
+        workspace_id: String,
+        session_id: String,
+        tasks: Vec<TaskSummary>,
     },
     /// Result of a requested shell allow-list update.
     AllowPatternResult {

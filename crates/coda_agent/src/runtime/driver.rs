@@ -408,6 +408,27 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         aborted
     }
 
+    /// v1 background-task notice delivery: no auto-wake — notices accumulated
+    /// in the session registry ride in with the next user turn, each written
+    /// to history (and emitted as `TaskNotice`, carrying the identical
+    /// message object) *ahead* of the user's own message. Called only for
+    /// user `Task` envelopes, which reach the root agent alone; the order
+    /// within a stale-state turn is: aborted ToolCallEnds → TaskNotices →
+    /// the user message.
+    async fn inject_task_notices(&mut self) {
+        for notice in self.runtime.background.take_notices().await {
+            let message = UserMessage::task_notice(notice.render(), notice.task_ids());
+            self.agent.add_message(Message::User(message.clone())).await;
+            self.runtime
+                .emit_event(
+                    self.agent.name.clone(),
+                    self.thread_id.clone(),
+                    AgentEvent::TaskNotice(message),
+                )
+                .await;
+        }
+    }
+
     /// Append a tool message to history and emit the matching `ToolCallEnd`.
     /// Every tool message written to history must go through this (or emit the
     /// event itself): event consumers reconstruct history from the stream, so a
@@ -433,6 +454,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 match &envelope.body {
                     EnvelopeBody::Task { task, images } => {
                         self.reply_target = None;
+                        self.inject_task_notices().await;
                         self.agent
                             .add_message(Message::User(UserMessage::with_images(
                                 task.clone(),
@@ -500,6 +522,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 ))
                                 .await;
                             }
+                            if matches!(envelope.body, EnvelopeBody::Task { .. }) {
+                                self.inject_task_notices().await;
+                            }
                             self.reply_target = reply_target_from_envelope(&envelope);
                             self.agent
                                 .add_message(Message::User(UserMessage::text(task.clone())))
@@ -555,6 +580,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 None,
                             ))
                             .await;
+                        }
+                        if matches!(envelope.body, EnvelopeBody::Task { .. }) {
+                            self.inject_task_notices().await;
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
                         self.agent

@@ -3,6 +3,7 @@ mod driver;
 use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
 use coda_core::llm::LLMProvider;
+use coda_tools::BackgroundProcesses;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -202,12 +203,19 @@ pub(crate) struct AgentRuntime {
     /// Global event bus — all agents forward their events here.
     global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
+    /// The session's background task registry; drivers drain its completion
+    /// notices into history at user turns.
+    background: Arc<BackgroundProcesses>,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
 }
 
 impl AgentRuntime {
-    pub(crate) fn new(session_storage: impl SessionStorage + 'static, session_id: String) -> Self {
+    pub(crate) fn new(
+        session_storage: impl SessionStorage + 'static,
+        session_id: String,
+        background: Arc<BackgroundProcesses>,
+    ) -> Self {
         // Sized for chunk-level event bursts (LLM streaming): a lagged receiver
         // drops events, which consumers can only partially recover from. A
         // margin against scheduling delays, not a response to an observed failure.
@@ -218,6 +226,7 @@ impl AgentRuntime {
             agent_tasks: Arc::new(Mutex::new(JoinSet::new())),
             global_event_tx,
             session_storage: Arc::new(session_storage),
+            background,
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
         }

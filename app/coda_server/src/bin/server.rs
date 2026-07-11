@@ -915,6 +915,13 @@ async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = Server
                             event: *event,
                         }).await
                     }
+                    RelayEvent::BackgroundTasks(tasks) => {
+                        transport.send(&ServerMessage::BackgroundTasks {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            tasks: tasks.to_vec(),
+                        }).await
+                    }
                     RelayEvent::Evicted => {
                         streams.remove(&key);
                         selections.remove(&key);

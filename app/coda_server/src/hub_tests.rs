@@ -177,6 +177,83 @@ fn fold_skips_subagent_and_chunk_events() {
 }
 
 #[test]
+fn fold_places_task_notices_between_stale_cleanup_and_user() {
+    // Driver write order on a notice-carrying stale turn:
+    // aborted ToolMessages → TaskNotice user messages → the human's message.
+    let mut snapshot = vec![];
+    let mut users = VecDeque::from([user("new task")]);
+    let mut log = EventLog::new(RelayConfig::default());
+    log.push(tool_end("coda", tool_message("stale", "aborted")));
+    log.push(WireEvent::TaskNotice {
+        agent_name: "coda".into(),
+        thread_id: "t".into(),
+        message: UserMessage::task_notice("Background task bg_1 finished", vec!["bg_1".into()]),
+    });
+    log.push(chunk("coda", "hi"));
+    log.push(llm_end("coda", assistant("reply")));
+
+    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda");
+
+    assert_eq!(snapshot.len(), 4);
+    assert!(matches!(&snapshot[0], Message::Tool(t) if t.id == "stale"));
+    assert!(matches!(
+        &snapshot[1],
+        Message::User(u) if matches!(
+            &u.origin,
+            UserOrigin::TaskNotice { task_ids } if task_ids == &vec!["bg_1".to_string()]
+        )
+    ));
+    assert!(matches!(
+        &snapshot[2],
+        Message::User(u) if u.origin == UserOrigin::Human
+    ));
+    assert!(matches!(&snapshot[3], Message::Assistant(a) if a.content == "reply"));
+}
+
+#[test]
+fn restored_notices_dedupe_against_checkpointed_deliveries() {
+    // The checkpoint says bg_a and bg_b were already delivered.
+    let history = vec![
+        user("hello"),
+        Message::User(UserMessage::task_notice(
+            "delivered earlier",
+            vec!["bg_a".into(), "bg_b".into()],
+        )),
+    ];
+    let killed = TaskStatus::Killed {
+        at: jiff::Timestamp::now(),
+    };
+    let full = |id: &str| TaskNotice::Task {
+        id: id.into(),
+        command: "x".into(),
+        description: String::new(),
+        status: killed.clone(),
+        output_tail: String::new(),
+    };
+    let restored = vec![
+        full("bg_a"), // duplicate — drop
+        full("bg_new"),
+        TaskNotice::Overflow {
+            dropped: vec![
+                ("bg_b".into(), killed.clone()),
+                ("bg_c".into(), killed.clone()),
+            ],
+            uncounted: 2,
+        },
+    ];
+
+    let deduped = dedupe_restored_notices(restored, &history);
+
+    assert_eq!(deduped.len(), 2, "{deduped:?}");
+    assert!(matches!(&deduped[0], TaskNotice::Task { id, .. } if id == "bg_new"));
+    assert!(matches!(
+        &deduped[1],
+        TaskNotice::Overflow { dropped, uncounted: 2 }
+            if dropped.len() == 1 && dropped[0].0 == "bg_c"
+    ));
+}
+
+#[test]
 fn fold_tolerates_missing_user_for_resumed_turns() {
     let mut snapshot = vec![];
     let mut users = VecDeque::new();
@@ -1339,4 +1416,56 @@ async fn failed_gated_reopen_releases_the_entry_and_ends_the_stream() {
     })
     .await
     .expect("relay stream must end after the failed gated reopen");
+}
+
+/// Attach yields the current background-task overview immediately; every
+/// registry change (spawn, terminal commit) pushes a fresh full overview to
+/// the attached client.
+#[tokio::test]
+async fn attach_delivers_background_overview_and_pushes_changes() {
+    let (hub, _gate) = hub_with("reply", ToolApprovalMode::Auto);
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+
+    // Head of the stream: the (empty) overview as of attach.
+    let RelayEvent::BackgroundTasks(tasks) =
+        next_matching(&mut events, |e| matches!(e, RelayEvent::BackgroundTasks(_))).await
+    else {
+        unreachable!()
+    };
+    assert!(tasks.is_empty());
+
+    let task_gate = Arc::new(Notify::new());
+    let id = spawn_gated_task(&hub, task_gate.clone()).await;
+    let RelayEvent::BackgroundTasks(tasks) = next_matching(
+        &mut events,
+        |e| matches!(e, RelayEvent::BackgroundTasks(tasks) if !tasks.is_empty()),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, id);
+    assert!(tasks[0].status.is_running());
+
+    task_gate.notify_one();
+    let RelayEvent::BackgroundTasks(tasks) = next_matching(&mut events, |e| {
+        matches!(
+            e,
+            RelayEvent::BackgroundTasks(tasks)
+                if !tasks.is_empty() && tasks.iter().all(|s| !s.status.is_running())
+        )
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(matches!(
+        tasks[0].status,
+        TaskStatus::Exited { code: Some(0), .. }
+    ));
 }

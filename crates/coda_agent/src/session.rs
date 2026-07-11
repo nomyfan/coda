@@ -323,7 +323,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                 || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
         });
 
-        let mut runtime = AgentRuntime::new(storage, session_id.clone());
+        let mut runtime = AgentRuntime::new(storage, session_id.clone(), background.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();

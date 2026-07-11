@@ -20,8 +20,8 @@ use std::sync::Arc;
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, ReasoningEffort, UserMessage};
-use coda_tools::BackgroundProcesses;
+use coda_core::llm::{Message, ReasoningEffort, UserMessage, UserOrigin};
+use coda_tools::{BackgroundProcesses, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -59,6 +59,10 @@ pub enum SessionCommand {
 #[derive(Debug)]
 pub enum RelayEvent {
     Event(Box<WireEvent>),
+    /// Full overview of the session's background tasks: sent once right after
+    /// attach and again on every registry change. Always the whole retained
+    /// set — a replacement, not a delta.
+    BackgroundTasks(Arc<[TaskSummary]>),
     /// Another client attached to this session; this stream ends after this.
     Evicted,
     /// The session runtime ended (released, deleted, or replaced); this stream
@@ -298,9 +302,11 @@ impl EventLog {
 ///
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
-/// 2. The turn's user message (front of `unsettled_user_messages`; absent for resumed
+/// 2. `TaskNotice` user messages — background-task notices the driver writes
+///    after the stale cleanups and ahead of the user message.
+/// 3. The turn's user message (front of `unsettled_user_messages`; absent for resumed
 ///    turns).
-/// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
+/// 4. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
 ///
 /// Sub-agent events and chunk-tier events are skipped (matching what the
 /// checkpoint history holds). The log is cleared afterwards.
@@ -323,6 +329,10 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
+    while let Some(WireEvent::TaskNotice { message, .. }) = entries.peek() {
+        snapshot.push(Message::User(message.clone()));
+        entries.next();
+    }
     if let Some(user) = unsettled_user_messages.pop_front() {
         snapshot.push(user);
     }
@@ -338,6 +348,10 @@ fn fold_settled_turn(
                 message,
                 ..
             } if agent_name == root_name => snapshot.push(Message::Tool(message.clone())),
+            // Placed verbatim wherever it appears; today the driver only
+            // writes notices at the head of a turn (handled above), but a
+            // future mid-turn delivery must not be silently dropped.
+            WireEvent::TaskNotice { message, .. } => snapshot.push(Message::User(message.clone())),
             _ => {}
         }
     }
@@ -884,10 +898,22 @@ impl SessionRelay for SessionHub {
                 // promotion) reuse the registry and must NOT restore again:
                 // that would duplicate the persisted batch.
                 match self.notices.load(&key).await {
-                    // TODO(step 6): drop notices whose task ids already
-                    // appear in the checkpoint history (origin=TaskNotice)
-                    // once message origins land — the crash-window dedupe.
-                    Ok(restored) => entry.background.restore_notices(restored).await,
+                    Ok(restored) => {
+                        // Crash-window dedupe: a notice whose task ids all
+                        // already appear in the checkpoint history was
+                        // delivered before the store was rewritten (crash or
+                        // failed save between injection and release) — drop
+                        // it rather than deliver twice.
+                        let restored = if restored.is_empty() {
+                            restored
+                        } else {
+                            dedupe_restored_notices(
+                                restored,
+                                &self.opener.load_messages(&key).await,
+                            )
+                        };
+                        entry.background.restore_notices(restored).await;
+                    }
                     Err(err) => {
                         warn!(
                             workspace_id = %key.0, session_id = %key.1,
@@ -955,6 +981,11 @@ impl SessionRelay for SessionHub {
             // section the forwarder appends under: every event lands in the
             // replay xor arrives live, exactly once and in order.
             let (tx, rx) = mpsc::unbounded_channel();
+            // Attach yields the current background-task overview immediately;
+            // the summaries watcher pushes every later change.
+            let _ = tx.send(RelayEvent::BackgroundTasks(
+                entry.background.summaries().borrow().clone(),
+            ));
             if let EntryPhase::Live(live) = &state.phase {
                 for event in live.log.iter() {
                     let _ = tx.send(RelayEvent::Event(Box::new(event.clone())));
@@ -1237,22 +1268,28 @@ fn spawn_event_pipeline(
     ));
 }
 
-/// Watches the entry's background registry and re-runs the release check
-/// whenever the running-task count returns to zero: `maybe_release` refuses
-/// to release while tasks run, so something must revisit the decision when
-/// the last one finishes (a disconnected, idle session would otherwise stay
-/// resident forever). Spawned once per initialized entry; `begin_release`
-/// wakes it a final time via the registry shutdown's publish, upon which it
-/// observes the terminal phase and retires.
+/// Watches the entry's background registry: every change is pushed to the
+/// attached client as a fresh [`RelayEvent::BackgroundTasks`] overview, and
+/// whenever the running-task count returns to zero the release check is
+/// re-run — `maybe_release` refuses to release while tasks run, so something
+/// must revisit the decision when the last one finishes (a disconnected,
+/// idle session would otherwise stay resident forever). Spawned once per
+/// initialized entry; `begin_release` wakes it a final time via the registry
+/// shutdown's publish, upon which it observes the terminal phase and retires.
 fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<dyn NoticeStore>) {
     tokio::spawn(async move {
         let mut summaries = entry.background.summaries();
         loop {
-            let running = summaries
-                .borrow_and_update()
-                .iter()
-                .any(|summary| summary.status.is_running());
-            if !running {
+            // Observe first, then act under the entry lock: push the fresh
+            // overview to whoever is attached (a duplicate of the attach-time
+            // send is harmless — it's a full replacement) and, once nothing
+            // runs, re-run the release check.
+            let (tasks, running) = {
+                let borrowed = summaries.borrow_and_update();
+                let running = borrowed.iter().any(|summary| summary.status.is_running());
+                (borrowed.clone(), running)
+            };
+            {
                 let mut guard = entry.inner.clone().lock_owned().await;
                 let state = &mut *guard;
                 if matches!(
@@ -1261,7 +1298,12 @@ fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<d
                 ) {
                     return;
                 }
-                if let Some(release) = SessionHub::maybe_release(&entries, &entry, state, &notices)
+                if let Some(attachment) = &state.attached {
+                    let _ = attachment.tx.send(RelayEvent::BackgroundTasks(tasks));
+                }
+                if !running
+                    && let Some(release) =
+                        SessionHub::maybe_release(&entries, &entry, state, &notices)
                 {
                     drop(guard);
                     release.await;
@@ -1273,6 +1315,40 @@ fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<d
             }
         }
     });
+}
+
+/// Crash-window dedupe for notices restored from the store: a notice whose
+/// task id already appears in the checkpoint history (a persisted
+/// `origin = TaskNotice` user message) was delivered before the store could
+/// be rewritten; delivering it again would duplicate it visibly. Aggregate
+/// notices are filtered id-by-id — the bare `uncounted` count has no ids to
+/// dedupe by and is kept as-is.
+fn dedupe_restored_notices(restored: Vec<TaskNotice>, history: &[Message]) -> Vec<TaskNotice> {
+    let delivered: HashSet<&str> = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => match &user.origin {
+                UserOrigin::TaskNotice { task_ids } => Some(task_ids.iter().map(String::as_str)),
+                UserOrigin::Human => None,
+            },
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    restored
+        .into_iter()
+        .filter_map(|notice| match notice {
+            TaskNotice::Task { ref id, .. } => (!delivered.contains(id.as_str())).then_some(notice),
+            TaskNotice::Overflow { dropped, uncounted } => {
+                let dropped: Vec<_> = dropped
+                    .into_iter()
+                    .filter(|(id, _)| !delivered.contains(id.as_str()))
+                    .collect();
+                (!dropped.is_empty() || uncounted > 0)
+                    .then_some(TaskNotice::Overflow { dropped, uncounted })
+            }
+        })
+        .collect()
 }
 
 /// Force the entry to drain and resync from the persisted state: used when
