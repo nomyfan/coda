@@ -1817,6 +1817,52 @@ mod tests {
         });
     }
 
+    /// A chatty real process producing far more than one ring's worth of output
+    /// streams end-to-end without stalling: incremental reads drain a bounded
+    /// window, and the completion notice reports the storage-level overwrite.
+    #[tokio::test]
+    async fn chatty_process_overflows_ring_and_reports_overwrite() {
+        let reg = BackgroundProcesses::new();
+        // ~10 bytes/line × 200_000 ≈ 2 MiB, well past the 512 KiB ring.
+        let id = reg
+            .spawn(
+                bash("for i in $(seq 1 200000); do echo \"ln $i\"; done"),
+                meta("chatty"),
+            )
+            .await
+            .unwrap();
+
+        // Drain incrementally until the process settles; reads must not block.
+        let mut seen = 0usize;
+        let status = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let read = reg.read(&id).await.unwrap().expect("task known");
+                seen += read.stdout.len();
+                if !read.status.is_running() && read.stdout.is_empty() {
+                    break read.status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("chatty process never settled");
+        assert!(matches!(status, TaskStatus::Exited { code: Some(0), .. }));
+        assert!(seen > 0, "streamed some output");
+
+        let notices = reg.take_notices().await;
+        let overwritten = notices.iter().find_map(|n| match n {
+            TaskNotice::Task {
+                stdout_overwritten, ..
+            } => Some(*stdout_overwritten),
+            _ => None,
+        });
+        assert!(
+            overwritten.is_some_and(|o| o > 0),
+            "producing >1 ring of output overwrote earlier bytes: {overwritten:?}"
+        );
+        reg.shutdown().await;
+    }
+
     /// spawn → incremental reads observe streamed output → natural exit
     /// commits the code and produces a notice carrying the tail.
     #[tokio::test]

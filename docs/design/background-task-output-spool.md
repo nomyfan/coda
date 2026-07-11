@@ -975,9 +975,11 @@ stderr pump result
 
 ## Implementation Roadmap
 
-> 进度（2026-07-11）：phase 1–3（磁盘存储引擎 + archive + manifest 事务 + inventory +
-> quota）已实现并通过验证（`cargo test -p coda_tools` 90 绿，workspace 全量编译通过）；
-> phase 4–10（registry/process/hub/notice 集成、UTF-8 carry、最终质检）待办。
+> 进度（2026-07-11）：**全部 10 个 phase 已实现并通过验证**——磁盘存储引擎、archive、
+> manifest 事务、inventory + quota、registry/process/hub/notice 集成、session-backed
+> 持久化、UTF-8 carry、web 状态渲染。`cargo clippy --workspace --all-targets` 干净、
+> `cargo test --workspace` 全绿、`pnpm --filter coda-web lint` + `tsc` 干净。详见每项
+> 末尾的落地说明与文末《实现说明》。
 
 - [x] **[risk validation] 实现独立 `DiskTail`，不接 registry** — 已实现
       Purpose：先证明固定文件容量下的逻辑偏移、wrap、lost 和 tail 正确。
@@ -1043,21 +1045,21 @@ stderr pump result
       计费但仍置 blocker（增长仍被封闭）；这是相对文档"按可测量 regular file 计费"的
       安全等价简化。
 
-- [ ] **[registry] 用 `TaskOutputFiles` 替换内存 `TailBuf`**
+- [x] **[registry] 用 `TaskOutputFiles` 替换内存 `TailBuf`**
       Purpose：消除常驻输出 bytes，并用 per-task commit lock 建立 manifest 线性化点。
       Verification：现有增量读/截尾测试迁移后断言不变；额外断言 registry 内不再保存
       stdout/stderr 正文 `Vec<u8>`；单次读取上限和 cursor 分段推进正确；barrier 测试
       两个并发 read 不重叠、Running read 不覆盖 terminal、release 不回退 cursor/status；
       manifest save 失败不返回 bytes 且 cursor 不前进。
 
-- [ ] **[process] 让 pipe pumps 写入 `DiskTail` 并加入 I/O failure 终态**
+- [x] **[process] 让 pipe pumps 写入 `DiskTail` 并加入 I/O failure 终态**
       Purpose：保持 leader/descendant/kill 语义，同时让磁盘错误诚实终止任务。
       Verification：leader 先退出后 kill、process group、setsid escape、有界 drain、
       stdout/stderr 流式读取测试全绿；pump EOF 不提前终止；创建失败不启动进程；
       stdout/stderr read/append failure 都 kill group 并提交唯一 `Failed`；child 先 exit 后
       pump failure 仍为 Failed；terminal manifest 失败不会卡住 keepalive/shutdown。
 
-- [ ] **[hub lifecycle] 接入 session-backed output root 和 archive restore**
+- [x] **[hub lifecycle] 接入 session-backed output root 和 archive restore**
       Purpose：证明未读输出跨 model switch、detach release/reopen、正常 server shutdown
       仍可按 task id 读取。
       Verification：集成测试覆盖 detached task 完成→release→reopen→notice→分段
@@ -1066,14 +1068,14 @@ stderr pump result
       校验通过的遗留 Running 转 Interrupted 并在一次 reopen 内立即落盘，ring/manifest
       不一致的 Running 进入 corrupt inventory 策略。
 
-- [ ] **[notice/tool] 区分 overwritten 与 lost 并更新模型文案**
+- [x] **[notice/tool] 区分 overwritten 与 lost 并更新模型文案**
       Purpose：无论模型只看通知还是调用 task_output，都能知道文件容量覆盖发生过。
       Verification：覆盖已读内容时 notice 报 overwritten、read 不报 lost；覆盖未读内容时
       两者分别报 storage total 和 consumer loss；同一 lost 不重复报告；checkpoint 已含
       `Completed(bg_x)` 后恢复 `OutputExpired(bg_x)` 仍会投递，反向亦然；同类 fact 重试
       去重；overflow batch key 跨 NoticeStore restore 稳定并覆盖 uncounted 去重。
 
-- [ ] **[cleanup/quota] 实现消费清理和 session 配额**
+- [x] **[cleanup/quota] 实现消费清理和 session 配额**
       Purpose：避免未读 archive 无界积累，同时不静默删除模型尚未读取的内容。
       Verification：64 MiB reservation 与配置下 active worst-case 的校验；active 永不
       淘汰；terminal 按 terminal_at 最老优先；create/quota check 串行；双 cursor 未到
@@ -1086,12 +1088,38 @@ stderr pump result
       terminal finalize 与 create 两种抢锁顺序，均不得产生 OutputExpired；cleanup failure
       仍发布 completion notice/summary，且 tail/overwritten 来自删除前快照。
 
-- [ ] **[presentation] 保持 byte cursor 并实现 UTF-8 carry**
+- [x] **[presentation] 保持 byte cursor 并实现 UTF-8 carry**
       Purpose：分段读取不因字符边界回退持久化 cursor，也不重复 replacement character。
       Verification：0..=3 byte carry roundtrip；每个 UTF-8 byte boundary、terminal EOF、
       crash/reopen 和 consumer lost 组合测试；cursor 始终按 bytes 单调前进。
 
-- [ ] **[validation] 全量质量检查和真实 chatty process 冒烟**
+- [x] **[validation] 全量质量检查和真实 chatty process 冒烟**
       Purpose：确认磁盘 I/O 没有破坏 runtime/hub 时序或前端协议。
       Verification：`cargo clippy`、`cargo test`、`pnpm --filter coda-web lint`；持续输出
       任务并发 task_output、断线重连、kill、session 删除的手工流程。
+
+### 实现说明（phase 4–10）
+
+- **registry/process**：`BackgroundProcesses` 改为 `Store`（archive + `SessionQuota`），
+  `new()=temporary()`、新增 `session_backed()`/`disabled()`；spawn 在 registry 锁下
+  reserve+create（无环锁序）；read 在 per-task commit lock 下分段读、写游标后才返回
+  bytes、drained terminal 触发 `finalize_consumed`；monitor 提交 terminal manifest →
+  `finalize_terminal` → 发 notice/summary。pump 返回结构化 `PumpResult`，read/spool
+  failure kill group 并提交唯一 `Failed`，cancellation biased 保持 `Killed`。read/kill
+  用强类型 `TaskId` 返回 `Result`，tool 边界解析。
+- **notice/tool**：`TaskNotice::Task` 带 `stdout/stderr_overwritten`，新增 `OutputExpired`，
+  overflow 带稳定 `batch_id`；`UserOrigin`、restore dedupe 全部按
+  `coda_core::llm::TaskNoticeKey`（fact 身份）。`task_output` 区分 overwritten(存储)
+  与 lost(消费者)，Consumed/Expired 返回 note 而非 unknown。
+- **hub lifecycle**：entry 首次 attach 惰性建 `session_backed`（rooted at
+  `<session_dir>/background/tasks`，随 `delete_session` 递归删除），跨 detach/reopen/
+  model switch/重启可读；inventory 重建 quota/blocker，恢复 recoverable Running→
+  Interrupted；archive 打不开则 background disabled 但对话可用。
+- **cleanup/quota**：消费清理由 cursor+terminal 双事件触发，Consumed/Expired 严格
+  manifest→delete→release，删除失败保留 reservation；淘汰按 terminal_at 最老优先，
+  fully-consumed 强制 Consumed；expiration 由 registry 在 quota 锁释放后入队。
+- **presentation**：read 路径以持久化 `utf8_carry` 跨 chunk 边界拼接解码，byte cursor
+  永不回退，terminal EOF/consumer loss 以 U+FFFD 收尾。
+- **web**：`TaskStatus` TS 类型补 `Failed`/`Interrupted`，`taskStatusText` 相应渲染。
+- **validation**：`cargo clippy --workspace --all-targets` 干净、`cargo test --workspace`
+  全绿、`pnpm --filter coda-web lint` 干净、tsc 无错；新增 chatty-process 冒烟测试。

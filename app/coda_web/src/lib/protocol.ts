@@ -261,7 +261,9 @@ export type ServerMessage =
 export type TaskStatus =
   | "Running"
   | { Exited: { code?: number | null; at: string } }
-  | { Killed: { at: string } };
+  | { Killed: { at: string } }
+  | { Failed: { message: string; at: string } }
+  | { Interrupted: { at: string } };
 
 export type TaskSummary = {
   id: string;
@@ -283,6 +285,12 @@ export function taskStatusText(status: TaskStatus): string {
   if ("Exited" in status) {
     const code = status.Exited.code;
     return code === null || code === undefined ? "exited" : `exited (${code})`;
+  }
+  if ("Failed" in status) {
+    return "failed";
+  }
+  if ("Interrupted" in status) {
+    return "interrupted";
   }
   return "killed";
 }
