@@ -240,8 +240,9 @@ TaskEntry
 - [x] **[process] 抽取 `GroupedChild` 原语**
       Verification:现有测试零改动全绿;clippy 干净。
       **状态:已完成**(2026-07-11)。sentinel-first spawn、入组、killpg、disarm 与 Drop 兜底收拢为 `GroupedChild`(`pub(crate)`,stdin null + stdout/stderr piped);`run_command` 改为其首个调用方,原 `KillGroupGuard` 缩减为只负责 reader abort 的 `AbortReadersGuard`(组的 Drop 兜底移入 `GroupedChild` 自身,killpg 在字段析构前执行,sentinel 仍钉住组)。coda_tools 40 测试零改动全绿。
-- [ ] **[registry] 接真进程**:监视任务、TailBuf(绝对偏移)、回收、通知上限与聚合
+- [x] **[registry] 接真进程**:监视任务、TailBuf(绝对偏移)、回收、通知上限与聚合
       Verification:单测:spawn→增量读→退出出通知;kill 全组;截尾后 read 报丢失字节且不重复不跳过;setsid 逃逸不阻塞;终态超 32 回收;**通知超 64 降级聚合、聚合超 256 计数、聚合槽不可丢**;shutdown 无残留。
+      **状态:已完成**(2026-07-11)。`BackgroundProcesses::spawn(Command, TaskMeta)` 持锁完成容量检查 + `GroupedChild::spawn`(拒绝先于进程启动,无副作用);`run_process` 泵 stdout/stderr 入 TailBuf,cancel → killpg 全组 → 有界排水(复用 `PIPE_DRAIN_TIMEOUT`,setsid 逃逸不阻塞终态提交);leader 自然退出后管道未闭继续泵(后台子进程的输出归任务),与 cancel 竞速。真进程测试 4 例(流式输出 + exit code、kill 全组、逃逸者有界落定、shutdown 无残留);截尾/回收/聚合沿用假任务测试(引擎共享)。
 - [ ] **[tools] `shell` 条件 schema;`task_output`/`task_kill`;注册 builtin**
       Verification:成套判定;观察者 agent 可构建;增量/幂等/expired 文案。
 - [ ] **[wiring] `BuildContext` 三字段 + build 判定 + hub entry 注入链路**

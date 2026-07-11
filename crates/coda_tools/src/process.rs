@@ -15,7 +15,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 /// inherited pipe open. Kept short so an abort settles within the driver's
 /// grace period; on expiry the readers are aborted and whatever partial
 /// output they had buffered is lost.
-const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How a [`run_command`] invocation ended.
 pub(crate) enum CommandOutcome {

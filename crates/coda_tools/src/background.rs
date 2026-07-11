@@ -17,8 +17,12 @@ use std::sync::Arc;
 
 use coda_core::tool::CancellationToken;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
+
+use crate::process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
 
 /// Concurrent `Running` tasks per session.
 const MAX_RUNNING: usize = 16;
@@ -233,6 +237,21 @@ struct RegistryState {
 }
 
 impl RegistryState {
+    /// Whether another task may start: rejects once closed or at the running
+    /// limit. Checked before any process is spawned, so rejection has no
+    /// side effects.
+    fn check_capacity(&self) -> std::io::Result<()> {
+        if self.closed {
+            return Err(std::io::Error::other("background registry is shut down"));
+        }
+        if self.running_count >= MAX_RUNNING {
+            return Err(std::io::Error::other(format!(
+                "too many running background tasks (limit {MAX_RUNNING})"
+            )));
+        }
+        Ok(())
+    }
+
     /// Recompute and publish the summaries snapshot. Per the terminal-commit
     /// protocol this must be the *last* mutation of a commit: when a watcher
     /// observes zero running tasks, the matching notice is already enqueued.
@@ -307,6 +326,20 @@ impl BackgroundProcesses {
         }
     }
 
+    /// Start `cmd` as a background process task in its own sentinel-pinned
+    /// process group. Rejection (closed registry / running limit) is checked
+    /// *before* the process starts, so a rejected spawn has no side effects;
+    /// only `kill`/`shutdown` terminate it afterwards. Same visibility
+    /// guarantee as [`spawn_with`](Self::spawn_with).
+    pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<String> {
+        let mut inner = self.inner.lock().await;
+        inner.check_capacity()?;
+        // Sync and brief; holding the lock keeps the capacity check and the
+        // process start atomic.
+        let group = GroupedChild::spawn(&mut cmd)?;
+        Ok(self.register(&mut inner, meta, move |ctx| run_process(group, ctx)))
+    }
+
     /// Start `work` as a background task. The task is visible in the
     /// summaries (and thus to keepalive watchers) before the id is returned.
     /// Fails when the registry is closed or `MAX_RUNNING` tasks are running.
@@ -316,15 +349,18 @@ impl BackgroundProcesses {
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
         let mut inner = self.inner.lock().await;
-        if inner.closed {
-            return Err(std::io::Error::other("background registry is shut down"));
-        }
-        if inner.running_count >= MAX_RUNNING {
-            return Err(std::io::Error::other(format!(
-                "too many running background tasks (limit {MAX_RUNNING})"
-            )));
-        }
+        inner.check_capacity()?;
+        Ok(self.register(&mut inner, meta, work))
+    }
 
+    /// Registers a task under the held registry lock: entry, monitor,
+    /// indexes, and the summaries publish — the id is only handed out after
+    /// the task is visible to keepalive watchers.
+    fn register<F, Fut>(&self, inner: &mut RegistryState, meta: TaskMeta, work: F) -> String
+    where
+        F: FnOnce(TaskCtx) -> Fut,
+        Fut: Future<Output = TaskExit> + Send + 'static,
+    {
         let id = format!("bg_{}", uuid::Uuid::new_v4().simple());
         let entry = Arc::new(TaskEntry {
             id: id.clone(),
@@ -351,7 +387,7 @@ impl BackgroundProcesses {
             .insert(id.clone(), entry.summary(TaskStatus::Running));
         inner.monitors.insert(id.clone(), monitor);
         inner.publish();
-        Ok(id)
+        id
     }
 
     /// Incremental read: output since the previous read plus current status.
@@ -472,6 +508,94 @@ impl BackgroundProcesses {
         // can retire once the entry is released.
         inner.publish();
         notices
+    }
+}
+
+/// Drives one background process to completion: pumps stdout/stderr into the
+/// task's tail buffers and resolves when the leader exits and the pipes are
+/// drained. Cancellation (via `kill`/`shutdown`) SIGKILLs the whole group;
+/// pipe drains after a group kill are bounded, so a descendant that escaped
+/// the group (setsid) and holds a pipe open can't stall the terminal commit.
+async fn run_process(mut group: GroupedChild, ctx: TaskCtx) -> TaskExit {
+    let mut stdout = group.child.stdout.take().expect("stdout is piped");
+    let mut stderr = group.child.stderr.take().expect("stderr is piped");
+    let mut out_pump = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => ctx.append_stdout(&buf[..n]).await,
+                }
+            }
+        }
+    });
+    let mut err_pump = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => ctx.append_stderr(&buf[..n]).await,
+                }
+            }
+        }
+    });
+    let cancel = ctx.cancelled();
+
+    let status = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // Kill the whole group, then reap the leader. The pipes hit EOF,
+            // letting the pumps flush whatever was produced.
+            group.kill_group();
+            let _ = group.child.wait().await;
+            None
+        }
+        status = group.child.wait() => Some(status),
+    };
+
+    let Some(status) = status else {
+        drain_pump(&mut out_pump).await;
+        drain_pump(&mut err_pump).await;
+        return TaskExit::Killed;
+    };
+
+    // Natural leader exit: the pipes usually EOF right away, but a
+    // backgrounded child holding an inherited pipe keeps streaming — keep
+    // pumping (that output is the task's to report) while racing
+    // cancellation, whose group kill ends the stream.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            group.kill_group();
+            drain_pump(&mut out_pump).await;
+            drain_pump(&mut err_pump).await;
+        }
+        _ = async {
+            let _ = (&mut out_pump).await;
+            let _ = (&mut err_pump).await;
+        } => {
+            group.disarm();
+        }
+    }
+    TaskExit::Exited {
+        code: status.ok().and_then(|s| s.code()),
+    }
+}
+
+/// Bounded wait for a pipe pump after a group kill: the pipes normally EOF
+/// at once, and an escaped descendant holding one open must not stall the
+/// terminal commit — on expiry the pump is aborted and its remaining output
+/// forfeited.
+async fn drain_pump(pump: &mut JoinHandle<()>) {
+    if tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut *pump)
+        .await
+        .is_err()
+    {
+        pump.abort();
     }
 }
 
@@ -925,5 +1049,206 @@ mod tests {
         let notices = reg.take_notices().await;
         let ids: Vec<Vec<String>> = notices.iter().map(|n| n.task_ids()).collect();
         assert_eq!(ids, vec![vec!["bg_old".to_string()], vec![id]]);
+    }
+
+    // ---- real-process tasks -------------------------------------------
+
+    fn bash(command: &str) -> Command {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Kills a helper process this test spawned, even if an assertion fails.
+    struct KillPidGuard(i32);
+
+    impl Drop for KillPidGuard {
+        fn drop(&mut self) {
+            // SAFETY: plain signal syscall on the helper this test spawned.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+
+    async fn wait_pids(pidfile: &std::path::Path, expect: usize) -> Vec<i32> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(content) = std::fs::read_to_string(pidfile) {
+                    let pids: Vec<i32> = content
+                        .split_whitespace()
+                        .filter_map(|p| p.parse().ok())
+                        .collect();
+                    if pids.len() == expect {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("command never wrote its pidfile")
+    }
+
+    async fn assert_pids_die(pids: &[i32]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pids.iter().all(|&pid| !process_alive(pid)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let survivors: Vec<i32> = pids
+                .iter()
+                .copied()
+                .filter(|&pid| process_alive(pid))
+                .collect();
+            for &pid in &survivors {
+                // SAFETY: plain signal syscall on processes this test spawned.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            panic!("processes survived the group kill: {survivors:?}");
+        });
+    }
+
+    /// spawn → incremental reads observe streamed output → natural exit
+    /// commits the code and produces a notice carrying the tail.
+    #[tokio::test]
+    async fn process_task_streams_output_and_notifies_on_exit() {
+        let reg = BackgroundProcesses::new();
+        let id = reg
+            .spawn(
+                bash("echo out-marker; echo err-marker >&2; exit 3"),
+                meta("markers"),
+            )
+            .await
+            .unwrap();
+
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let read = reg.read(&id).await.expect("task known");
+                stdout.push_str(&read.stdout);
+                stderr.push_str(&read.stderr);
+                if !read.status.is_running() {
+                    break read.status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process never settled");
+        // One more read: the terminal commit happens after the pumps flushed,
+        // so the remainder is fully readable.
+        let last = reg.read(&id).await.unwrap();
+        stdout.push_str(&last.stdout);
+        stderr.push_str(&last.stderr);
+
+        assert_eq!(
+            status, last.status,
+            "terminal status is stable across reads"
+        );
+        assert!(matches!(status, TaskStatus::Exited { code: Some(3), .. }));
+        assert_eq!(stdout, "out-marker\n");
+        assert_eq!(stderr, "err-marker\n");
+
+        let notices = reg.take_notices().await;
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(
+            &notices[0],
+            TaskNotice::Task { id: nid, status: TaskStatus::Exited { code: Some(3), .. }, output_tail, .. }
+                if *nid == id && output_tail.contains("out-marker")
+        ));
+        reg.shutdown().await;
+    }
+
+    /// kill terminates the whole process group — bash and its forked child —
+    /// and returns only after the full commit (notice drainable).
+    #[tokio::test]
+    async fn kill_kills_the_whole_process_group() {
+        let pidfile = std::env::temp_dir().join(format!("coda-bg-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let reg = BackgroundProcesses::new();
+        let command = format!(
+            "sleep 38.21 & echo \"$$ $!\" > '{}'; wait",
+            pidfile.display()
+        );
+        let id = reg.spawn(bash(&command), meta("group")).await.unwrap();
+        let pids = wait_pids(&pidfile, 2).await;
+
+        let status = reg.kill(&id).await.expect("task known");
+        assert!(matches!(status, TaskStatus::Killed { .. }));
+        assert_pids_die(&pids).await;
+
+        let notices = reg.take_notices().await;
+        assert!(
+            notices.iter().any(|n| matches!(
+                n,
+                TaskNotice::Task { id: nid, status: TaskStatus::Killed { .. }, .. } if *nid == id
+            )),
+            "kill's notice must be drainable once kill returned: {notices:?}"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+        reg.shutdown().await;
+    }
+
+    /// A setsid descendant escapes the group kill while holding the stdout
+    /// pipe open; the bounded drain still lets kill commit promptly.
+    #[tokio::test]
+    async fn kill_settles_promptly_when_a_descendant_escapes_the_group() {
+        let ready = std::env::temp_dir().join(format!("coda-bg-escape-{}", std::process::id()));
+        let _ = std::fs::remove_file(&ready);
+
+        let reg = BackgroundProcesses::new();
+        let command = format!(
+            "perl -MPOSIX -e 'POSIX::setsid(); open my $f, \">\", $ARGV[0]; print $f $$; close $f; exec \"sleep\", \"38.41\"' '{}' & wait",
+            ready.display()
+        );
+        let id = reg.spawn(bash(&command), meta("escape")).await.unwrap();
+        let escapee = wait_pids(&ready, 1).await[0];
+        let _cleanup = KillPidGuard(escapee);
+
+        // Must settle within the bounded drain, not when the sleep exits.
+        let status = tokio::time::timeout(Duration::from_secs(2), reg.kill(&id))
+            .await
+            .expect("kill hung on the escaped descendant's pipe")
+            .expect("task known");
+        assert!(matches!(status, TaskStatus::Killed { .. }));
+
+        let _ = std::fs::remove_file(&ready);
+        reg.shutdown().await;
+    }
+
+    /// shutdown kills every running process group and leaves no residue.
+    #[tokio::test]
+    async fn shutdown_leaves_no_process_residue() {
+        let pidfile = std::env::temp_dir().join(format!("coda-bg-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let reg = BackgroundProcesses::new();
+        let command = format!(
+            "sleep 38.61 & echo \"$$ $!\" > '{}'; wait",
+            pidfile.display()
+        );
+        let id = reg.spawn(bash(&command), meta("residue")).await.unwrap();
+        let pids = wait_pids(&pidfile, 2).await;
+
+        let notices = reg.shutdown().await;
+        assert!(
+            notices.iter().any(|n| matches!(
+                n,
+                TaskNotice::Task { id: nid, status: TaskStatus::Killed { .. }, .. } if *nid == id
+            )),
+            "shutdown returns the killed task's notice: {notices:?}"
+        );
+        assert_pids_die(&pids).await;
+        let _ = std::fs::remove_file(&pidfile);
     }
 }
