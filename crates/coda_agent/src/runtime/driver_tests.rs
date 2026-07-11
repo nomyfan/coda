@@ -1012,33 +1012,30 @@ async fn pending_approval_supports_mixed_resolutions() {
         let result = timeout(Duration::from_secs(2), async {
             loop {
                 let (agent_name, _, event) = harness.next_event().await;
-                match (agent_name.as_str(), event) {
-                    ("coda", AgentEvent::Suspended(pending)) => {
-                        assert_eq!(pending.calls.len(), 4);
-                        let mut decisions = HashMap::new();
-                        decisions.insert(
-                            pending.thread_id.clone(),
-                            ResumeDecision {
-                                resolutions: vec![
-                                    ("call_exec".into(), ToolCallResolution::Execute),
-                                    (
-                                        "call_resolved".into(),
-                                        ToolCallResolution::Resolved(ToolOutput::Ok(
-                                            "resolved-by-test".into(),
-                                        )),
-                                    ),
-                                    (
-                                        "call_rejected".into(),
-                                        ToolCallResolution::Rejected {
-                                            reason: Some("nope".into()),
-                                        },
-                                    ),
-                                ],
-                            },
-                        );
-                        return (pending.thread_id, decisions);
-                    }
-                    _ => {}
+                if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                    assert_eq!(pending.calls.len(), 4);
+                    let mut decisions = HashMap::new();
+                    decisions.insert(
+                        pending.thread_id.clone(),
+                        ResumeDecision {
+                            resolutions: vec![
+                                ("call_exec".into(), ToolCallResolution::Execute),
+                                (
+                                    "call_resolved".into(),
+                                    ToolCallResolution::Resolved(ToolOutput::Ok(
+                                        "resolved-by-test".into(),
+                                    )),
+                                ),
+                                (
+                                    "call_rejected".into(),
+                                    ToolCallResolution::Rejected {
+                                        reason: Some("nope".into()),
+                                    },
+                                ),
+                            ],
+                        },
+                    );
+                    return (pending.thread_id, decisions);
                 }
             }
         })
@@ -1108,9 +1105,8 @@ async fn reject_pending_approval_via_restart() {
         let result = timeout(Duration::from_secs(2), async {
             loop {
                 let (agent_name, _, event) = harness.next_event().await;
-                match (agent_name.as_str(), event) {
-                    ("coda", AgentEvent::Suspended(p)) => return p,
-                    _ => {}
+                if let ("coda", AgentEvent::Suspended(p)) = (agent_name.as_str(), event) {
+                    return p;
                 }
             }
         })
@@ -1753,11 +1749,11 @@ async fn in_process_resume_after_suspension() {
     let result = timeout(Duration::from_secs(2), async {
         loop {
             let (agent_name, _, event) = harness.next_event().await;
-            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event) {
-                if msg.tool_calls.is_empty() {
-                    assert_eq!(msg.content, "interrupt-flow-ok");
-                    return;
-                }
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                assert_eq!(msg.content, "interrupt-flow-ok");
+                return;
             }
         }
     })
