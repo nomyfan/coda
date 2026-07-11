@@ -617,22 +617,28 @@ async fn run_process(mut group: GroupedChild, ctx: TaskCtx) -> TaskExit {
     // backgrounded child holding an inherited pipe keeps streaming — keep
     // pumping (that output is the task's to report) while racing
     // cancellation, whose group kill ends the stream.
-    tokio::select! {
+    let killed = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             group.kill_group();
             drain_pump(&mut out_pump).await;
             drain_pump(&mut err_pump).await;
+            true
         }
         _ = async {
             let _ = (&mut out_pump).await;
             let _ = (&mut err_pump).await;
         } => {
             group.disarm();
+            false
         }
-    }
-    TaskExit::Exited {
-        code: status.ok().and_then(|s| s.code()),
+    };
+    if killed {
+        TaskExit::Killed
+    } else {
+        TaskExit::Exited {
+            code: status.ok().and_then(|s| s.code()),
+        }
     }
 }
 
@@ -1245,6 +1251,47 @@ mod tests {
             )),
             "kill's notice must be drainable once kill returned: {notices:?}"
         );
+        let _ = std::fs::remove_file(&pidfile);
+        reg.shutdown().await;
+    }
+
+    /// A shell leader may exit before a background child closes its inherited
+    /// pipes. Killing while the runner drains those pipes is still a kill,
+    /// not the leader's earlier successful exit.
+    #[tokio::test]
+    async fn kill_after_leader_exit_reports_killed() {
+        let pidfile =
+            std::env::temp_dir().join(format!("coda-bg-exited-leader-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let reg = BackgroundProcesses::new();
+        let command = format!(
+            "sleep 38.31 & echo \"$$ $!\" > '{}'; exit 0",
+            pidfile.display()
+        );
+        let id = reg
+            .spawn(bash(&command), meta("exited leader"))
+            .await
+            .unwrap();
+        let pids = wait_pids(&pidfile, 2).await;
+        let _child_cleanup = KillPidGuard(pids[1]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_alive(pids[0]) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shell leader did not exit");
+        assert!(
+            reg.read(&id).await.expect("task known").status.is_running(),
+            "background child should keep the task draining"
+        );
+
+        let status = reg.kill(&id).await.expect("task known");
+        assert!(matches!(status, TaskStatus::Killed { .. }));
+        assert_pids_die(&pids[1..]).await;
+
         let _ = std::fs::remove_file(&pidfile);
         reg.shutdown().await;
     }

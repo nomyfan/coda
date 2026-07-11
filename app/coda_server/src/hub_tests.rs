@@ -508,6 +508,35 @@ fn hub_full(
     )
 }
 
+#[derive(Default)]
+struct BlockingNoticeStore {
+    inner: MemNoticeStore,
+    save_started: Notify,
+    allow_save: Notify,
+}
+
+impl NoticeStore for BlockingNoticeStore {
+    fn load<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TaskNotice>, String>> + Send + 'a>> {
+        self.inner.load(key)
+    }
+
+    fn save<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        pending: &'a [TaskNotice],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.save_started.notify_one();
+            self.allow_save.notified().await;
+            self.inner.put(key.clone(), pending.to_vec());
+            Ok(())
+        })
+    }
+}
+
 fn key() -> SessionKey {
     ("ws".to_string(), "s1".to_string())
 }
@@ -680,6 +709,56 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
     assert!(!attach2.snapshot.turn_running);
 
     hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_all_waits_for_an_in_progress_release() {
+    let opener = Arc::new(TestOpener::new("reply", ToolApprovalMode::Auto));
+    let notices = Arc::new(BlockingNoticeStore::default());
+    let hub = Arc::new(SessionHub::new(
+        opener,
+        notices.clone(),
+        RelayConfig::default(),
+    ));
+    hub.attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    let entry = hub.get_entry(&key()).expect("entry exists");
+    let mut guard = entry.inner.clone().lock_owned().await;
+    let release = SessionHub::begin_release(
+        &hub.entries,
+        &entry,
+        &mut guard,
+        notices.clone(),
+        Shutdown::graceful_unbounded(),
+        false,
+    );
+    drop(guard);
+    let release = tokio::spawn(release);
+    timeout(Duration::from_secs(5), notices.save_started.notified())
+        .await
+        .expect("release did not reach notice persistence");
+
+    let mut shutdown = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.shutdown_all().await })
+    };
+    assert!(
+        timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "global shutdown returned before the active release finished"
+    );
+
+    notices.allow_save.notify_one();
+    timeout(Duration::from_secs(5), async {
+        release.await.expect("release task panicked");
+        shutdown.await.expect("shutdown task panicked");
+    })
+    .await
+    .expect("release barrier did not complete");
+    assert!(hub.get_entry(&key()).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

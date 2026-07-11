@@ -1171,11 +1171,19 @@ impl SessionRelay for SessionHub {
             for entry in entries {
                 let mut guard = entry.inner.clone().lock_owned().await;
                 let state = &mut *guard;
-                if matches!(
-                    state.phase,
-                    EntryPhase::Releasing { .. } | EntryPhase::Released | EntryPhase::Uninitialized
-                ) {
-                    continue;
+                match &state.phase {
+                    EntryPhase::Releasing { done } => {
+                        let mut done = done.clone();
+                        drop(guard);
+                        while !*done.borrow_and_update() {
+                            if done.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    EntryPhase::Released | EntryPhase::Uninitialized => continue,
+                    EntryPhase::Live(_) | EntryPhase::Pending(_) => {}
                 }
                 let release = Self::begin_release(
                     &self.entries,
