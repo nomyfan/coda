@@ -237,8 +237,16 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .take()
             .ok_or(OpenError::MissingField("run_config"))?;
 
+        // External registry (hub-owned): the session only borrows it. A
+        // self-built one is owned, and `shutdown` tears it down. Resolved
+        // before the agents are built — their tools capture this registry.
+        let (background, owns_background) = match self.background.take() {
+            Some(registry) => (registry, false),
+            None => (Arc::new(BackgroundProcesses::new()), true),
+        };
+
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
-        let agents = team.build(&workspace_dir);
+        let agents = team.build(&workspace_dir, background.clone());
         let root_name = team.root().name.to_string();
 
         let session_id = self
@@ -314,13 +322,6 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                     .any(|v| !v.is_empty())
                 || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
         });
-
-        // External registry (hub-owned): the session only borrows it. A
-        // self-built one is owned, and `shutdown` tears it down.
-        let (background, owns_background) = match self.background.take() {
-            Some(registry) => (registry, false),
-            None => (Arc::new(BackgroundProcesses::new()), true),
-        };
 
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between

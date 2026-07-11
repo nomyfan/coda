@@ -243,10 +243,12 @@ TaskEntry
 - [x] **[registry] 接真进程**:监视任务、TailBuf(绝对偏移)、回收、通知上限与聚合
       Verification:单测:spawn→增量读→退出出通知;kill 全组;截尾后 read 报丢失字节且不重复不跳过;setsid 逃逸不阻塞;终态超 32 回收;**通知超 64 降级聚合、聚合超 256 计数、聚合槽不可丢**;shutdown 无残留。
       **状态:已完成**(2026-07-11)。`BackgroundProcesses::spawn(Command, TaskMeta)` 持锁完成容量检查 + `GroupedChild::spawn`(拒绝先于进程启动,无副作用);`run_process` 泵 stdout/stderr 入 TailBuf,cancel → killpg 全组 → 有界排水(复用 `PIPE_DRAIN_TIMEOUT`,setsid 逃逸不阻塞终态提交);leader 自然退出后管道未闭继续泵(后台子进程的输出归任务),与 cancel 竞速。真进程测试 4 例(流式输出 + exit code、kill 全组、逃逸者有界落定、shutdown 无残留);截尾/回收/聚合沿用假任务测试(引擎共享)。
-- [ ] **[tools] `shell` 条件 schema;`task_output`/`task_kill`;注册 builtin**
+- [x] **[tools] `shell` 条件 schema;`task_output`/`task_kill`;注册 builtin**
       Verification:成套判定;观察者 agent 可构建;增量/幂等/expired 文案。
-- [ ] **[wiring] `BuildContext` 三字段 + build 判定 + hub entry 注入链路**
+      **状态:已完成**(2026-07-11)。`shell` 增 `run_in_background`(schema 按 `allow_background_shell` 移除属性;未授权时参数被忽略走前台,防模型幻觉参数越权);true 时预取消检查后 `spawn` 并以 "Started background task bg_…" 落定。`task_output`(状态行 + 新增输出 + 丢失字节说明 + no new output)与 `task_kill`(幂等,报既有终态)为薄壳;未知/回收 id 统一 expired 文案。注册进 `BUILTIN_TOOL_NAMES`/`spec_by_name`(紧随 shell)。
+- [x] **[wiring] `BuildContext` 三字段 + build 判定 + hub entry 注入链路**
       Verification:abort 不杀;切模型不杀且 task_output 连续可用;release 后无残留。
+      **状态:已完成**(2026-07-11)。`BuildContext` 增 `agent_name` / `background`(恒有,`new()` 自建缺省)/ `allow_background_shell`;`AgentTeam::build(workspace, background)` 逐 agent 判定成套(task_output+task_kill 齐备才开 shell 后台)并共享 session 注册表;`SessionBuilder::open` 在 build 前解析 Owned/External 并注入。测试:turn abort 不杀任务(shell.rs);成套判定 + 注册表指针共享(spec.rs);切模型/release 链路沿用 step 1 hub 测试(注册表挂 entry,不随 Session 重建)。
 - [ ] **[driver] 注入 `origin=TaskNotice{task_ids}` + `AgentEvent::TaskNotice` + checkpoint**
       Verification:注入顺序;事件对象与历史逐字段一致;checkpoint 与事件流一致。
 - [ ] **[server/web] fold 放置、`protocol.ts` origin、通知卡片(含聚合)、摘要推送(attach 发当前值)**

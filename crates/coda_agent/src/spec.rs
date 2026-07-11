@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_tools::{BuildContext, TodoItem, ToolSpec};
+use coda_tools::{BackgroundProcesses, BuildContext, TodoItem, ToolSpec};
 
 use crate::agent::{
     Agent, AgentState, SUBAGENT_TOOL_PREFIX, SubAgentMode, SubAgentTool, SystemPrompt,
@@ -203,12 +203,18 @@ impl AgentTeam {
     /// Build every spec into a fresh [`Agent`], keyed by name. Tools are rooted
     /// at the agent's own workspace ([`with_agent_workspaces`](Self::with_agent_workspaces)),
     /// falling back to `default_workspace` for any agent without an override.
-    /// Each spec is built exactly once, so the same agent may be a sub-agent of
-    /// several parents. Cycles are fine: sub-agents are addressed by name through
-    /// the resulting flat map, so building never recurses. Infallible — the team
-    /// was validated at construction. Call once per session: the returned agents
-    /// carry independent state.
-    pub fn build(&self, default_workspace: &str) -> HashMap<String, Agent> {
+    /// All agents share `background`, the session's task registry — background
+    /// tasks are session-scoped, not per-agent. Each spec is built exactly
+    /// once, so the same agent may be a sub-agent of several parents. Cycles
+    /// are fine: sub-agents are addressed by name through the resulting flat
+    /// map, so building never recurses. Infallible — the team was validated at
+    /// construction. Call once per session: the returned agents carry
+    /// independent state.
+    pub fn build(
+        &self,
+        default_workspace: &str,
+        background: Arc<BackgroundProcesses>,
+    ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
 
@@ -222,9 +228,20 @@ impl AgentTeam {
                 .get(&spec.name)
                 .map(String::as_str)
                 .unwrap_or(default_workspace);
+            // Backgrounding shell commands requires the full follow-up kit:
+            // an agent that can start tasks must also be able to observe and
+            // kill them. Granting only one of task_output/task_kill is still
+            // legal — that agent just can't *start* background work.
+            let allow_background_shell = {
+                let names: HashSet<&str> = spec.tools.iter().map(|t| t.name()).collect();
+                names.contains("task_output") && names.contains("task_kill")
+            };
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 todo_store: todo_store.clone(),
+                agent_name: spec.name.clone(),
+                background: background.clone(),
+                allow_background_shell,
             };
 
             let mut agent = Agent {
@@ -329,12 +346,66 @@ mod tests {
             .unwrap()
             .with_agent_workspaces(HashMap::from([("sub".to_string(), "/sub".to_string())]));
 
-        team.build("/root");
+        team.build("/root", Arc::new(BackgroundProcesses::new()));
 
         let mut got = seen.lock().unwrap().clone();
         got.sort();
         // Root falls back to the default workspace; `sub` uses its override.
         assert_eq!(got, vec!["/root".to_string(), "/sub".to_string()]);
+    }
+
+    /// Captures the background-task wiring each tool build sees.
+    struct BackgroundProbeSpec {
+        seen: Arc<StdMutex<Vec<(String, bool, usize)>>>,
+    }
+    impl ToolSpec for BackgroundProbeSpec {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+            self.seen.lock().unwrap().push((
+                ctx.agent_name.clone(),
+                ctx.allow_background_shell,
+                Arc::as_ptr(&ctx.background) as usize,
+            ));
+            Box::new(RecordingTool)
+        }
+    }
+
+    /// Background shell is granted per agent iff the agent holds the full
+    /// task_output + task_kill kit, and every agent shares the session's one
+    /// registry (tasks are session-scoped).
+    #[test]
+    fn build_grants_background_shell_by_toolset_and_shares_the_registry() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let probe = || {
+            Box::new(BackgroundProbeSpec { seen: seen.clone() }) as Box<dyn coda_tools::ToolSpec>
+        };
+        let tool = |name: &str| coda_tools::spec_by_name(name).expect("builtin");
+        let root = AgentSpec {
+            tools: vec![probe(), tool("task_output"), tool("task_kill")],
+            subagents: vec!["observer".into()],
+            ..spec("coda")
+        };
+        // Observer: may read task output but not start/kill background work.
+        let observer = AgentSpec {
+            tools: vec![probe(), tool("task_output")],
+            ..spec("observer")
+        };
+        let team = AgentTeam::new(root, vec![observer]).unwrap();
+        let background = Arc::new(BackgroundProcesses::new());
+        team.build(".", background.clone());
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        let registry = Arc::as_ptr(&background) as usize;
+        assert_eq!(
+            got,
+            vec![
+                ("coda".to_string(), true, registry),
+                ("observer".to_string(), false, registry),
+            ]
+        );
     }
 
     #[test]

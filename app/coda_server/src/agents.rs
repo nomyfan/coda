@@ -1021,7 +1021,10 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
-        let agents = team.build(".");
+        let agents = team.build(
+            ".",
+            std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+        );
         assert!(agents.contains_key("shared"));
         assert!(agents.contains_key("a"));
         assert!(agents.contains_key("b"));

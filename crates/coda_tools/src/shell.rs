@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::debug;
 
+use crate::background::{BackgroundProcesses, TaskMeta};
 use crate::process::{CommandOutcome, run_command};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -13,26 +16,51 @@ pub struct ShellToolParams {
     /// A short (5-10 word) description of what this command does, in active
     /// voice. For example: "List files in the current directory".
     description: String,
+    /// Run the command as a background task: the call returns immediately
+    /// with a task id. Use task_output to read its output incrementally and
+    /// task_kill to terminate it. Use this for long-running commands (dev
+    /// servers, watchers, long builds).
+    #[serde(default)]
+    run_in_background: Option<bool>,
 }
 
 pub struct ShellTool {
-    schema: Schema,
+    schema: serde_json::Value,
     description: String,
     cwd: String,
+    agent_name: String,
+    background: Arc<BackgroundProcesses>,
+    /// Only when true does `run_in_background` appear in the schema (and
+    /// take effect — the flag is ignored for agents not granted it).
+    allow_background: bool,
 }
 
 impl ShellTool {
-    pub fn new(cwd: String) -> Self {
+    pub fn new(
+        cwd: String,
+        agent_name: String,
+        background: Arc<BackgroundProcesses>,
+        allow_background: bool,
+    ) -> Self {
         let description =
             "Execute shell commands and return stdout and stderr. You are in a Unix environment."
                 .to_string();
-        let schema = schemars::schema_for!(ShellToolParams);
+        let mut schema = serde_json::to_value(schemars::schema_for!(ShellToolParams))
+            .expect("shell schema serializes");
+        if !allow_background
+            && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+        {
+            props.remove("run_in_background");
+        }
         debug!("ShellTool schema: {:?}", schema);
 
         ShellTool {
             schema,
             description,
             cwd,
+            agent_name,
+            background,
+            allow_background,
         }
     }
 }
@@ -50,7 +78,7 @@ impl Tool for ShellTool {
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
-        self.schema.as_value()
+        &self.schema
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -60,11 +88,44 @@ impl Tool for ShellTool {
         ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
+        let agent_name = self.agent_name.clone();
+        let background = self.background.clone();
+        let run_in_background = self.allow_background && params.run_in_background.unwrap_or(false);
         async move {
             debug!(description = %params.description, command = %params.command, "Executing shell command");
             // `shell` is the platform-agnostic tool name; `bash` is the current backend.
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(&params.command).current_dir(&cwd);
+
+            if run_in_background {
+                // The call settles now; the task lives outside tool-call
+                // semantics (only task_kill / registry shutdown end it). An
+                // already-aborted turn must not start work, mirroring the
+                // foreground pre-cancellation check.
+                if ctx.cancel.is_cancelled() {
+                    return Err(ToolError::Aborted(
+                        "Command was aborted by the user before it started.".into(),
+                    ));
+                }
+                let id = background
+                    .spawn(
+                        cmd,
+                        TaskMeta {
+                            command: params.command.clone(),
+                            description: params.description.clone(),
+                            agent_name,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ToolError::ExecutionError(format!("Failed to start background task: {e}"))
+                    })?;
+                return Ok(format!(
+                    "Started background task {id}. Use task_output to read its \
+                     output and task_kill to terminate it. You will be notified \
+                     when it finishes."
+                ));
+            }
 
             let run = run_command(cmd, ctx.cancel).await.map_err(|e| {
                 ToolError::ExecutionError(format!("Failed to execute command: {}", e))
@@ -109,13 +170,35 @@ mod tests {
     use super::*;
 
     fn tool() -> ShellTool {
-        ShellTool::new(std::env::temp_dir().to_string_lossy().into_owned())
+        ShellTool::new(
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            "coda".into(),
+            Arc::new(BackgroundProcesses::new()),
+            false,
+        )
+    }
+
+    fn background_tool() -> ShellTool {
+        ShellTool::new(
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            "coda".into(),
+            Arc::new(BackgroundProcesses::new()),
+            true,
+        )
     }
 
     fn params(command: &str) -> ShellToolParams {
         ShellToolParams {
             command: command.to_string(),
             description: "test command".to_string(),
+            run_in_background: None,
+        }
+    }
+
+    fn background_params(command: &str) -> ShellToolParams {
+        ShellToolParams {
+            run_in_background: Some(true),
+            ..params(command)
         }
     }
 
@@ -132,6 +215,101 @@ mod tests {
             // SAFETY: plain signal syscall on the helper this test spawned.
             unsafe { libc::kill(self.0, libc::SIGKILL) };
         }
+    }
+
+    /// `run_in_background` appears in the schema only for agents granted it.
+    #[test]
+    fn run_in_background_is_gated_by_the_schema() {
+        let gated = tool();
+        let props = gated.parameter_schema()["properties"].as_object().unwrap();
+        assert!(!props.contains_key("run_in_background"));
+
+        let allowed = background_tool();
+        let props = allowed.parameter_schema()["properties"]
+            .as_object()
+            .unwrap();
+        assert!(props.contains_key("run_in_background"));
+    }
+
+    /// A backgrounded command settles immediately with the task id and the
+    /// task is observable in the registry.
+    #[tokio::test]
+    async fn run_in_background_settles_immediately_with_a_task_id() {
+        let background = Arc::new(BackgroundProcesses::new());
+        let tool = ShellTool::new(
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            "coda".into(),
+            background.clone(),
+            true,
+        );
+        let out = tool
+            .execute(
+                background_params("echo bg-marker; sleep 39.41"),
+                ToolCallContext::default(),
+            )
+            .await
+            .unwrap();
+        let id = out
+            .split_whitespace()
+            .find(|w| w.starts_with("bg_"))
+            .expect("task id in reply")
+            .trim_end_matches('.');
+        assert!(out.starts_with("Started background task bg_"), "{out}");
+        assert!(
+            background.summaries().borrow().iter().any(|s| s.id == id),
+            "task not in registry"
+        );
+        background.shutdown().await;
+    }
+
+    /// A background task's lifetime is independent of the turn that started
+    /// it: aborting the turn (the tool-call cancel token) must not kill it.
+    #[tokio::test]
+    async fn background_task_survives_turn_abort() {
+        let background = Arc::new(BackgroundProcesses::new());
+        let tool = ShellTool::new(
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            "coda".into(),
+            background.clone(),
+            true,
+        );
+        let ctx = ToolCallContext::default();
+        let cancel = ctx.cancel.clone();
+        let out = tool
+            .execute(background_params("sleep 39.61"), ctx)
+            .await
+            .unwrap();
+        let id = out
+            .split_whitespace()
+            .find(|w| w.starts_with("bg_"))
+            .expect("task id in reply")
+            .trim_end_matches('.')
+            .to_string();
+
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let read = background.read(&id).await.expect("task still known");
+        assert!(
+            read.status.is_running(),
+            "turn abort must not kill the background task: {:?}",
+            read.status
+        );
+        background.shutdown().await;
+    }
+
+    /// The flag is ignored (foreground execution) for agents whose schema
+    /// does not expose it — a model hallucinating the parameter must not
+    /// gain background execution.
+    #[tokio::test]
+    async fn run_in_background_is_ignored_when_not_allowed() {
+        let out = tool()
+            .execute(
+                background_params("echo fg-marker"),
+                ToolCallContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "fg-marker\n");
     }
 
     #[tokio::test]

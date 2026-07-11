@@ -5,6 +5,7 @@ mod grep;
 mod process;
 mod shell;
 mod spec;
+mod task;
 mod todo;
 
 pub use background::{
@@ -17,6 +18,8 @@ pub use shell::ShellTool;
 pub use spec::{
     BUILTIN_TOOL_NAMES, BuildContext, EditFileToolSpec, GlobToolSpec, GrepToolSpec,
     ListDirectoryToolSpec, PrebuiltToolSpec, ReadFileToolSpec, ReadTodosToolSpec, ShellToolSpec,
-    ToolSpec, WriteFileToolSpec, WriteTodosToolSpec, builtin_specs, spec_by_name,
+    TaskKillToolSpec, TaskOutputToolSpec, ToolSpec, WriteFileToolSpec, WriteTodosToolSpec,
+    builtin_specs, spec_by_name,
 };
+pub use task::{TaskKillTool, TaskOutputTool};
 pub use todo::{ReadTodosTool, TodoItem, WriteTodosTool};

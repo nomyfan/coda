@@ -656,9 +656,10 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let agents = AgentTeam::new(root, subagents)
-            .expect("valid team")
-            .build(".");
+        let agents = AgentTeam::new(root, subagents).expect("valid team").build(
+            ".",
+            std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+        );
         Self::start_agents(storage, agents, provider, approval, initial_task).await
     }
 
@@ -781,7 +782,10 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         vec![],
     )
     .expect("valid team")
-    .build(".");
+    .build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
 
     let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
@@ -900,7 +904,10 @@ async fn stateless_subagent_replies_after_approval_resume() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let (root, subagents) = explore_read_todos_specs("main-system");
     let team = AgentTeam::new(root, subagents).expect("valid team");
-    let agents1 = team.build(".");
+    let agents1 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -940,7 +947,10 @@ async fn stateless_subagent_replies_after_approval_resume() {
             resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         },
     );
-    let agents2 = team.build(".");
+    let agents2 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = harness
         .restart(agents2, provider, approval, decisions)
         .await;
@@ -997,7 +1007,10 @@ async fn pending_approval_supports_mixed_resolutions() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1043,7 +1056,10 @@ async fn pending_approval_supports_mixed_resolutions() {
         result.expect("timed out waiting for suspension")
     };
     harness.shutdown().await;
-    let agents2 = team.build(".");
+    let agents2 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     harness = harness
         .restart(agents2, provider, approval, decisions_map)
         .await;
@@ -1090,7 +1106,10 @@ async fn reject_pending_approval_via_restart() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1136,7 +1155,10 @@ async fn reject_pending_approval_via_restart() {
                 .collect(),
         },
     );
-    let agents2 = team.build(".");
+    let agents2 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = harness
         .restart(agents2, provider, approval, reject_decisions)
         .await;
@@ -1177,7 +1199,10 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1201,7 +1226,10 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     };
     harness.shutdown().await;
 
-    let agents2 = team.build(".");
+    let agents2 = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = harness
         .restart(agents2, provider, approval, HashMap::new())
         .await;
@@ -1640,7 +1668,10 @@ async fn new_task_while_suspended_emits_tool_call_end_for_discarded_calls() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents = team.build(".");
+    let agents = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,
@@ -1712,7 +1743,10 @@ async fn in_process_resume_after_suspension() {
     let provider = TestProvider::default();
     let approval =
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
-    let agents = team.build(".");
+    let agents = team.build(
+        ".",
+        std::sync::Arc::new(coda_tools::BackgroundProcesses::new()),
+    );
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,
