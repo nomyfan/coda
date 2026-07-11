@@ -249,7 +249,9 @@ TaskEntry
 - [x] **[wiring] `BuildContext` 三字段 + build 判定 + hub entry 注入链路**
       Verification:abort 不杀;切模型不杀且 task_output 连续可用;release 后无残留。
       **状态:已完成**(2026-07-11)。`BuildContext` 增 `agent_name` / `background`(恒有,`new()` 自建缺省)/ `allow_background_shell`;`AgentTeam::build(workspace, background)` 逐 agent 判定成套(task_output+task_kill 齐备才开 shell 后台)并共享 session 注册表;`SessionBuilder::open` 在 build 前解析 Owned/External 并注入。测试:turn abort 不杀任务(shell.rs);成套判定 + 注册表指针共享(spec.rs);切模型/release 链路沿用 step 1 hub 测试(注册表挂 entry,不随 Session 重建)。
-- [ ] **[driver] 注入 `origin=TaskNotice{task_ids}` + `AgentEvent::TaskNotice` + checkpoint**
+- [x] **[driver] 注入 `origin=TaskNotice{task_ids}` + `AgentEvent::TaskNotice` + checkpoint**
       Verification:注入顺序;事件对象与历史逐字段一致;checkpoint 与事件流一致。
-- [ ] **[server/web] fold 放置、`protocol.ts` origin、通知卡片(含聚合)、摘要推送(attach 发当前值)**
+      **状态:已完成**(2026-07-11)。`UserMessage.origin`(serde default=Human,旧 checkpoint 兼容)+ `UserMessage::task_notice`;driver 在用户 `Task` envelope 三处(Generation / ToolExecution stale / PendingApproval stale)`take_notices` 后逐条写 User 消息并 emit `AgentEvent::TaskNotice`(同一对象),顺序为 stale ToolCallEnd → TaskNotice → 用户消息;通知句柄经 `AgentRuntime` 携带。hub entry 初始化恢复时按 checkpoint 中 `origin=TaskNotice` 的 task_ids 去重(step 1 的 TODO 关闭;聚合通知逐 id 过滤,`uncounted` 保留)。driver 测试:TaskNotice 先于 LLMStart、模型可见顺序、checkpoint 与事件逐字段一致(serde 串比较)、投递后注册表排空。
+- [x] **[server/web] fold 放置、`protocol.ts` origin、通知卡片(含聚合)、摘要推送(attach 发当前值)**
       Verification:lint;fold 顺序单测(`stale ToolCallEnd → TaskNotice → Human User`);手工:启 dev server→断线重连(列表立现)→task_output→切模型(任务在)→kill→通知出现在下一轮且刷新后仍为卡片。
+      **状态:代码完成**(2026-07-11),手工端到端验证待跑(需配置 provider 的真实 server)。`WireEvent::TaskNotice` + `ServerMessage::BackgroundTasks`(attach 即发当前值,idle watcher 每次 registry 变化推全量;修正:watcher 不能跳过首值,spawn 可能先于订阅);fold 在 stale 清理与用户消息之间放置 TaskNotice(fold 顺序单测);`protocol.ts` 增 `UserOrigin`/`TaskSummary`/`task_notice`/`background_tasks`;transcript 将 `origin=task_notice` 的 User 消息渲染为通知卡片(独立成项不并入 turn 折叠;聚合通知同卡),composer 上方新增运行中任务总览条。oxlint + tsc 通过;dev server 冒烟(空状态渲染无错)。

@@ -57,7 +57,15 @@ export type ToolMessage = {
 
 export type ContentPart = { type: "text"; text: string } | { type: "image"; url: string };
 
-export type UserMessage = { parts: ContentPart[]; created_at: string };
+/** Who produced a user-turn message: the human, or the runtime delivering
+ * background-task completion notices (carrying the covered task ids). */
+export type UserOrigin = { type: "human" } | { type: "task_notice"; task_ids: string[] };
+
+export type UserMessage = { parts: ContentPart[]; created_at: string; origin?: UserOrigin };
+
+export function isTaskNotice(message: UserMessage): boolean {
+  return message.origin?.type === "task_notice";
+}
 
 export type HistoryMessage =
   | { System: string }
@@ -185,6 +193,12 @@ export type WireEvent =
       message: ToolMessage;
     }
   | {
+      type: "task_notice";
+      agent_name: string;
+      thread_id: string;
+      message: UserMessage;
+    }
+  | {
       type: "suspended";
       agent_name: string;
       thread_id: string;
@@ -232,10 +246,46 @@ export type ServerMessage =
       turn_running?: boolean;
     }
   | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
+  | {
+      type: "background_tasks";
+      workspace_id: string;
+      session_id: string;
+      tasks: TaskSummary[];
+    }
   | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null }
   | { type: "session_evicted"; workspace_id: string; session_id: string }
   /** An open without `takeover` hit a session another client is driving. */
   | { type: "session_busy"; workspace_id: string; session_id: string };
+
+/** Where a background task stands, mirroring the server enum. */
+export type TaskStatus =
+  | "Running"
+  | { Exited: { code?: number | null; at: string } }
+  | { Killed: { at: string } };
+
+export type TaskSummary = {
+  id: string;
+  command: string;
+  description: string;
+  agent_name: string;
+  status: TaskStatus;
+  started_at: string;
+};
+
+export function isRunningTask(status: TaskStatus): boolean {
+  return status === "Running";
+}
+
+export function taskStatusText(status: TaskStatus): string {
+  if (status === "Running") {
+    return "running";
+  }
+  if ("Exited" in status) {
+    const code = status.Exited.code;
+    return code === null || code === undefined ? "exited" : `exited (${code})`;
+  }
+  return "killed";
+}
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {
   return "Ok" in output;
@@ -284,6 +334,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   shell: "Run",
   read_todos: "Read todos",
   write_todos: "Update todos",
+  task_output: "Task output",
+  task_kill: "Kill task",
 };
 
 /**
@@ -377,6 +429,9 @@ export function describeTool(
       return str(args.question);
     case "shell":
       return str(args.description) ?? str(args.command);
+    case "task_output":
+    case "task_kill":
+      return str(args.id);
     case "read_file": {
       const path = str(args.file_path);
       if (!path) {
