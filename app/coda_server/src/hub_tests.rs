@@ -429,6 +429,9 @@ struct TestOpener {
     approval: ToolApprovalMode,
     /// One-shot injected failure for the next `open` call.
     fail_next_open: std::sync::atomic::AtomicBool,
+    /// Stable on-disk root for per-key background archives, so a reopened entry
+    /// recovers the same archive.
+    archive_root: tempfile::TempDir,
 }
 
 impl TestOpener {
@@ -459,6 +462,7 @@ impl TestOpener {
             team,
             approval,
             fail_next_open: std::sync::atomic::AtomicBool::new(false),
+            archive_root: tempfile::tempdir().expect("temp archive root"),
         }
     }
 }
@@ -508,6 +512,16 @@ impl SessionOpener for TestOpener {
         _key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>> {
         Box::pin(async { vec![] })
+    }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_tools::ArchiveDir, String> {
+        let dir = self
+            .archive_root
+            .path()
+            .join(&key.0)
+            .join(&key.1)
+            .join("background/tasks");
+        coda_tools::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
     }
 }
 
@@ -1189,7 +1203,7 @@ fn completed_keys(id: &coda_tools::TaskId) -> Vec<coda_core::llm::TaskNoticeKey>
 async fn spawn_gated_task(hub: &SessionHub, gate: Arc<Notify>) -> coda_tools::TaskId {
     let entry = hub.get_entry(&key()).expect("entry");
     entry
-        .background
+        .background()
         .spawn_with(task_meta("fake-long-command"), move |ctx| async move {
             let cancel = ctx.cancelled();
             tokio::select! {
@@ -1203,7 +1217,7 @@ async fn spawn_gated_task(hub: &SessionHub, gate: Arc<Notify>) -> coda_tools::Ta
 
 fn running_tasks(entry: &Arc<SessionEntry>) -> usize {
     entry
-        .background
+        .background()
         .summaries()
         .borrow()
         .iter()
@@ -1249,7 +1263,7 @@ async fn background_task_pins_disconnected_entry_then_release_persists_notice() 
         .await
         .expect("re-attach");
     let entry = hub.get_entry(&key()).expect("entry");
-    let restored = entry.background.take_notices().await;
+    let restored = entry.background().take_notices().await;
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].keys(), completed_keys(&id));
 }
@@ -1281,8 +1295,8 @@ async fn model_switch_preserves_background_tasks_and_notices() {
 
     let entry_after = hub.get_entry(&key()).expect("entry survives the swap");
     assert!(Arc::ptr_eq(
-        &entry_before.background,
-        &entry_after.background
+        entry_before.background(),
+        entry_after.background()
     ));
     // The old session's asynchronous shutdown must leave the (external)
     // registry untouched; give it room to misbehave.
@@ -1296,7 +1310,7 @@ async fn model_switch_preserves_background_tasks_and_notices() {
     task_gate.notify_one();
     let collected = timeout(Duration::from_secs(5), async {
         loop {
-            let notices = entry_after.background.take_notices().await;
+            let notices = entry_after.background().take_notices().await;
             if !notices.is_empty() {
                 return notices;
             }
@@ -1349,7 +1363,7 @@ async fn persisted_notices_restore_once_per_entry() {
     assert!(matches!(outcome, CommandOutcome::ModelChanged { .. }));
 
     let entry = hub.get_entry(&key()).expect("entry");
-    let restored = entry.background.take_notices().await;
+    let restored = entry.background().take_notices().await;
     assert_eq!(
         restored.len(),
         1,

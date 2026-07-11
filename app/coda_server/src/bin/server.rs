@@ -242,6 +242,16 @@ impl SessionOpener for AppOpener {
                 .unwrap_or_default()
         })
     }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_tools::ArchiveDir, String> {
+        let workspace = self
+            .workspaces
+            .get(&key.0)
+            .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+        let session_dir = workspace.storage.session_dir(&key.1)?;
+        coda_tools::ArchiveDir::open_or_create_root(&session_dir.join("background/tasks"))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in

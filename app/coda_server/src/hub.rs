@@ -15,13 +15,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
 use coda_core::llm::{Message, ReasoningEffort, TaskNoticeKey, UserMessage, UserOrigin};
-use coda_tools::{BackgroundProcesses, TaskNotice, TaskSummary};
+use coda_tools::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -132,6 +132,12 @@ pub trait SessionOpener: Send + Sync + 'static {
         &'a self,
         key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>>;
+
+    /// Open (creating if needed) the session's background output archive
+    /// directory capability, rooted under the session's persisted storage so it
+    /// is deleted with the session. `Err` disables background storage for the
+    /// session without blocking the conversation.
+    fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String>;
 }
 
 /// Why an attach was not served.
@@ -426,8 +432,21 @@ struct SessionEntry {
     /// session rebuilds within this entry (a model switch) never touch
     /// running tasks or undelivered notices. Injected into every session
     /// opened for this entry; torn down (and its notices persisted) only by
-    /// `begin_release`.
-    background: Arc<BackgroundProcesses>,
+    /// `begin_release`. Initialized once, during the entry's first attach, to a
+    /// session-backed registry rooted at the session's archive directory (so
+    /// output survives release/reopen and restart); a `get_or_init` fallback
+    /// keeps it valid for any access that races initialization.
+    background_cell: OnceLock<Arc<BackgroundProcesses>>,
+}
+
+impl SessionEntry {
+    /// The entry's background registry. Set to a session-backed registry during
+    /// initialization; the fallback (a temporary registry) only applies if an
+    /// access somehow precedes initialization.
+    fn background(&self) -> &Arc<BackgroundProcesses> {
+        self.background_cell
+            .get_or_init(|| Arc::new(BackgroundProcesses::temporary()))
+    }
 }
 
 type EntryGuard = OwnedMutexGuard<EntryState>;
@@ -469,7 +488,7 @@ impl SessionHub {
                                 phase: EntryPhase::Uninitialized,
                                 attached: None,
                             })),
-                            background: Arc::new(BackgroundProcesses::new()),
+                            background_cell: OnceLock::new(),
                         })
                     })
                     .clone()
@@ -581,7 +600,7 @@ impl SessionHub {
             // whatever is still undelivered. A failed save loses notices new
             // to this incarnation (accepted, crash-tier degradation); the
             // previous document stays intact thanks to the atomic write.
-            let pending = entry.background.shutdown().await;
+            let pending = entry.background().shutdown().await;
             if let Err(err) = notices.save(&entry.key, &pending).await {
                 error!(
                     workspace_id = %entry.key.0,
@@ -619,7 +638,7 @@ impl SessionHub {
         // Running background tasks pin the entry across disconnects; the
         // idle watcher re-runs this check when they hit zero.
         if entry
-            .background
+            .background()
             .summaries()
             .borrow()
             .iter()
@@ -743,7 +762,7 @@ impl SessionHub {
                         &provider_id,
                         reasoning_effort,
                         decisions,
-                        entry.background.clone(),
+                        entry.background().clone(),
                     )
                     .await
                 {
@@ -823,7 +842,7 @@ impl SessionHub {
                 &provider_id,
                 reasoning_effort,
                 HashMap::new(),
-                entry.background.clone(),
+                entry.background().clone(),
             )
             .await
         {
@@ -897,6 +916,23 @@ impl SessionRelay for SessionHub {
                 // opens within this entry (model switch, approvals-gated
                 // promotion) reuse the registry and must NOT restore again:
                 // that would duplicate the persisted batch.
+
+                // Build the session-backed registry first, before any access to
+                // it, so it (not the fallback) is what handles this session's
+                // tasks. A failure to open the archive disables background
+                // storage but leaves the conversation working.
+                let registry = match self.opener.background_archive(&key) {
+                    Ok(archive) => BackgroundProcesses::session_backed(archive).await,
+                    Err(err) => {
+                        warn!(
+                            workspace_id = %key.0, session_id = %key.1,
+                            "background archive unavailable; background tasks disabled: {err}"
+                        );
+                        BackgroundProcesses::disabled(coda_tools::ArchiveError::corrupt(err))
+                    }
+                };
+                let _ = entry.background_cell.set(Arc::new(registry));
+
                 match self.notices.load(&key).await {
                     Ok(restored) => {
                         // Crash-window dedupe: a notice whose task ids all
@@ -912,7 +948,7 @@ impl SessionRelay for SessionHub {
                                 &self.opener.load_messages(&key).await,
                             )
                         };
-                        entry.background.restore_notices(restored).await;
+                        entry.background().restore_notices(restored).await;
                     }
                     Err(err) => {
                         warn!(
@@ -928,7 +964,7 @@ impl SessionRelay for SessionHub {
                         &provider_id,
                         reasoning_effort,
                         HashMap::new(),
-                        entry.background.clone(),
+                        entry.background().clone(),
                     )
                     .await
                 {
@@ -984,7 +1020,7 @@ impl SessionRelay for SessionHub {
             // Attach yields the current background-task overview immediately;
             // the summaries watcher pushes every later change.
             let _ = tx.send(RelayEvent::BackgroundTasks(
-                entry.background.summaries().borrow().clone(),
+                entry.background().summaries().borrow().clone(),
             ));
             if let EntryPhase::Live(live) = &state.phase {
                 for event in live.log.iter() {
@@ -1286,7 +1322,7 @@ fn spawn_event_pipeline(
 /// shutdown's publish, upon which it observes the terminal phase and retires.
 fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<dyn NoticeStore>) {
     tokio::spawn(async move {
-        let mut summaries = entry.background.summaries();
+        let mut summaries = entry.background().summaries();
         loop {
             // Observe first, then act under the entry lock: push the fresh
             // overview to whoever is attached (a duplicate of the attach-time
