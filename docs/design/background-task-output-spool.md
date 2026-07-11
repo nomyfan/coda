@@ -975,22 +975,48 @@ stderr pump result
 
 ## Implementation Roadmap
 
-- [ ] **[risk validation] 实现独立 `DiskTail`，不接 registry**
+> 进度（2026-07-11）：phase 1–3（磁盘存储引擎 + archive + manifest 事务 + inventory +
+> quota）已实现并通过验证（`cargo test -p coda_tools` 90 绿，workspace 全量编译通过）；
+> phase 4–10（registry/process/hub/notice 集成、UTF-8 carry、最终质检）待办。
+
+- [x] **[risk validation] 实现独立 `DiskTail`，不接 registry** — 已实现
       Purpose：先证明固定文件容量下的逻辑偏移、wrap、lost 和 tail 正确。
       Verification：覆盖空文件、单次超容量、恰好 capacity、多轮 wrap、跨边界读、
       cursor 落后、分段 read/has_more、不同 persisted capacity reopen 的单元测试；
       property test 与等价内存模型逐操作比较；未知 layout 和 file length/offset 不一致
       一律报 corrupt。
+      落地：`crates/coda_tools/src/background/disk_tail.rs`（`background.rs` 已改为
+      目录模块 `background/mod.rs`）。`DiskTail` 以 `Arc<std::fs::File>` + positioned
+      `pread`/`pwrite` 在 blocking pool 上做环形读写，per-stream `tokio::Mutex` 串行
+      append/read；`OutputChunk` 报告 `lost`/`next_cursor`/`has_more`；`create`/`reopen`
+      校验 capacity 上下界、`start_offset`/`total_written` 一致性与 ring 文件长度，
+      不一致返回 `InvalidData`（后续 phase 映射为 `ArchiveError::Corrupt`）。测试含
+      14 个用例，其中 `differential_against_model` 以确定性 xorshift 在 cap∈{1,2,3,7,8,16,33}
+      上对拍逐操作参考模型。`LAYOUT_VERSION` 常量留待 phase 2 manifest 消费。
+      验证命令：`cargo clippy -p coda_tools`、`cargo test -p coda_tools` 全绿。
 
-- [ ] **[storage model] 实现 task 目录和原子 manifest**
+- [x] **[storage model] 实现 task 目录和原子 manifest** — 已实现
       Purpose：建立 session-owned archive 与 terminal lazy reopen 边界。
       Verification：`TaskId` 拒绝 `../`、绝对路径、大小写和非 canonical 长度；所有 path
       helper 在类型上不接受 `&str`；create/open/guarded-commit/remove roundtrip；
       directory fd + openat(O_NOFOLLOW) + opened-fd fstat；用 barrier 在枚举/检查后替换
       symlink 仍不能逃出 archive；0700/0600、non-regular 拒绝；损坏 manifest 返回明确
       错误；Consumed/Expired 后 ring 删除但 status 仍可查询；session 目录递归删除全清理。
+      落地：新增 `task_id.rs`（强类型 `TaskId`，`FromStr`/`Deserialize` 严格校验，
+      拒绝 `../`/绝对路径/大小写/非 canonical），`archive_dir.rs`（`ArchiveDir` 以
+      `libc` `openat`/`mkdirat`/`renameat`/`unlinkat` + `O_NOFOLLOW` + opened-fd
+      `fstat` 做 fd-relative 操作，`ArchiveFileName` 闭集限定文件名，`entries` 惰性
+      迭代不物化目录），`manifest.rs`（`TaskOutputManifest`/`StreamManifest`/
+      `OutputDisposition`/`ExpireReason` + reopen 结构校验含 UTF-8 carry prefix 判定），
+      `task_archive.rs`（`TaskArchive` weak-index get-or-insert、`TaskRecord` +
+      per-task commit lock、`TaskCommitGuard::{current,commit,delete_rings}` 强制
+      status/cursor/disposition 单调 + manifest-first 原子保存、`TaskOutputFiles`、
+      terminal lazy reopen、rings 删除后经 `DiskTail::detached` 仍可查 status）。
+      `TaskStatus` 新增 `Failed`/`Interrupted`，`TaskExit` 新增 `Failed`。测试覆盖
+      symlink 拒绝、非目录拒绝、重复 create 拒绝、terminal 不可变、cursor 不回退、
+      Consumed 转换删除 ring 后重开仍可查询、manifest roundtrip 与校验拒绝。
 
-- [ ] **[inventory] 实现 session-local archive inventory**
+- [x] **[inventory] 实现 session-local archive inventory** — 已实现（含 quota）
       Purpose：在恢复任何 task 前建立完整 reservation 和 corruption blocker，不能让坏
       文件绕过 quota。
       Verification：valid Retained 按 persisted capacity；Consumed/Expired 残留按 file
@@ -1000,6 +1026,22 @@ stderr pump result
       构造大量 Consumed/Expired 和 orphan 后断言 fd 峰值为常数、recent summaries≤32、
       issue samples≤32、retained index≤512，且 Weak record map 未被 inventory 填充；
       directory entries 为 lazy iterator，超 64 KiB manifest 不读取正文，sample 文本有界。
+      落地：新增 `quota.rs`。`scan_inventory` streaming 分类每个 task 目录：valid
+      Retained 按 capacity 计费并入 ≤512 victim index、Consumed/Expired 残留 ring 按
+      长度计费、orphan/corrupt/unsafe 保守计费并置 `spawn_blocked`、crash-`Running`
+      经 ring 长度校验入 `recoverable_running`（不一致按 corrupt）；`recent_terminal`
+      2× 缓冲后 compact 到 32、issue 计数 + 前 32 sample、文本各截 512 bytes。
+      `SessionQuota`：counter/index/blocker 用叶子级 `std::sync::Mutex`，create 在锁内
+      认领 victim、锁外按 victim commit lock 做 manifest-first 淘汰（无锁跨 await，锁序
+      保持 quota 决策 → per-task commit 无环）；`reserve_for_create` 返回
+      `ReserveOutcome{reservation, expirations}`，`QuotaReservation` Drop 回滚未 commit
+      的预留；`finalize_terminal`/`finalize_consumed` recheck fully-consumed 强制
+      Consumed（不生成 expiration），否则登记为 victim。测试覆盖 Retained/orphan 计费
+      + blocker、按 terminal_at 最老优先淘汰并落 Expired、fully-consumed 落 Consumed 且
+      释放预留、blocked inventory 拒绝 spawn。
+      说明：非 canonical 名的 orphan 因类型化 API 只接受 `TaskId` 无法安全下降，按 0
+      计费但仍置 blocker（增长仍被封闭）；这是相对文档"按可测量 regular file 计费"的
+      安全等价简化。
 
 - [ ] **[registry] 用 `TaskOutputFiles` 替换内存 `TailBuf`**
       Purpose：消除常驻输出 bytes，并用 per-task commit lock 建立 manifest 线性化点。

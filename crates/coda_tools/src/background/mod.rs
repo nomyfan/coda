@@ -12,6 +12,26 @@
 //! future seam stays public: cross-crate lifecycle tests drive fake tasks
 //! through it.
 
+mod archive_dir;
+mod disk_tail;
+mod manifest;
+mod quota;
+mod task_archive;
+mod task_id;
+
+pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName};
+pub use disk_tail::{DiskTail, OutputChunk};
+pub use manifest::{ExpireReason, OutputDisposition, StreamManifest, TaskOutputManifest};
+pub use quota::{
+    ArchiveInventory, ExpirationFact, InventoryIssue, QuotaError, QuotaReservation, ReserveOutcome,
+    RetainedIndexEntry, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory,
+};
+pub use task_archive::{
+    DEFAULT_STREAM_CAPACITY, TaskArchive, TaskCommitGuard, TaskOutputFiles, TaskPersistentState,
+    TaskRecord,
+};
+pub use task_id::{InvalidTaskId, TaskId};
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -58,11 +78,34 @@ pub enum TaskStatus {
     Killed {
         at: jiff::Timestamp,
     },
+    /// The task's output spool failed irrecoverably (a ring append/read or a
+    /// terminal manifest save). The process outcome is subsumed by this state
+    /// so a spool failure is never misreported as a clean exit.
+    Failed {
+        message: String,
+        at: jiff::Timestamp,
+    },
+    /// A `Running` task left behind by a crash, recovered at reopen. The
+    /// process is gone; only the (possibly partial) output remains readable.
+    Interrupted {
+        at: jiff::Timestamp,
+    },
 }
 
 impl TaskStatus {
     pub fn is_running(&self) -> bool {
         matches!(self, TaskStatus::Running)
+    }
+
+    /// Terminal time of a settled task, `None` while `Running`.
+    pub fn terminal_at(&self) -> Option<jiff::Timestamp> {
+        match self {
+            TaskStatus::Running => None,
+            TaskStatus::Exited { at, .. }
+            | TaskStatus::Killed { at }
+            | TaskStatus::Failed { at, .. }
+            | TaskStatus::Interrupted { at } => Some(*at),
+        }
     }
 
     /// Model-facing one-line rendering.
@@ -74,6 +117,8 @@ impl TaskStatus {
             } => format!("exited with code {code}"),
             TaskStatus::Exited { code: None, .. } => "exited (unknown exit code)".into(),
             TaskStatus::Killed { .. } => "killed".into(),
+            TaskStatus::Failed { message, .. } => format!("failed: {message}"),
+            TaskStatus::Interrupted { .. } => "interrupted (server restarted)".into(),
         }
     }
 }
@@ -173,8 +218,15 @@ pub struct TaskRead {
 /// `Killed` when it tore the process group down in response to cancellation.
 #[derive(Debug)]
 pub enum TaskExit {
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
     Killed,
+    /// The output spool failed; the process was torn down and this cause is
+    /// carried to the terminal commit as [`TaskStatus::Failed`].
+    Failed {
+        message: String,
+    },
 }
 
 /// Bounded tail of one output stream, addressed by absolute offsets so a
@@ -669,6 +721,7 @@ async fn monitor_task(
     let status = match exit {
         TaskExit::Exited { code } => TaskStatus::Exited { code, at },
         TaskExit::Killed => TaskStatus::Killed { at },
+        TaskExit::Failed { message } => TaskStatus::Failed { message, at },
     };
 
     let output_tail = {
