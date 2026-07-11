@@ -1,4 +1,5 @@
 use super::*;
+use crate::notices::MemNoticeStore;
 use coda_agent::runtime::MemoryStorage;
 use coda_agent::{
     AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ToolApprovalMode,
@@ -9,6 +10,7 @@ use coda_core::llm::{
     ToolMessage, ToolOutput,
 };
 use coda_tools::ReadTodosToolSpec;
+use coda_tools::{TaskExit, TaskMeta, TaskNotice, TaskStatus};
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -318,6 +320,8 @@ struct TestOpener {
     provider: TestProvider,
     team: AgentTeam,
     approval: ToolApprovalMode,
+    /// One-shot injected failure for the next `open` call.
+    fail_next_open: std::sync::atomic::AtomicBool,
 }
 
 impl TestOpener {
@@ -347,6 +351,7 @@ impl TestOpener {
             },
             team,
             approval,
+            fail_next_open: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -358,8 +363,15 @@ impl SessionOpener for TestOpener {
         _provider_id: &'a str,
         _reasoning_effort: Option<ReasoningEffort>,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
+            if self
+                .fail_next_open
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(OpenError::Storage("injected open failure".into()));
+            }
             Session::builder()
                 .storage(self.storage.clone())
                 .team(&self.team, ".")
@@ -378,6 +390,7 @@ impl SessionOpener for TestOpener {
                 })
                 .session_id(key.1.clone())
                 .resume_decisions(decisions)
+                .background(background)
                 .open()
                 .await
         })
@@ -392,9 +405,30 @@ impl SessionOpener for TestOpener {
 }
 
 fn hub_with(system_prompt: &str, approval: ToolApprovalMode) -> (SessionHub, Arc<Notify>) {
-    let opener = Arc::new(TestOpener::new(system_prompt, approval));
+    let (hub, gate, _) = hub_with_notices(system_prompt, approval);
+    (hub, gate)
+}
+
+fn hub_with_notices(
+    system_prompt: &str,
+    approval: ToolApprovalMode,
+) -> (SessionHub, Arc<Notify>, Arc<MemNoticeStore>) {
+    let (hub, opener, notices) = hub_full(system_prompt, approval);
     let gate = opener.provider.gate.clone();
-    (SessionHub::new(opener, RelayConfig::default()), gate)
+    (hub, gate, notices)
+}
+
+fn hub_full(
+    system_prompt: &str,
+    approval: ToolApprovalMode,
+) -> (SessionHub, Arc<TestOpener>, Arc<MemNoticeStore>) {
+    let opener = Arc::new(TestOpener::new(system_prompt, approval));
+    let notices = Arc::new(MemNoticeStore::default());
+    (
+        SessionHub::new(opener.clone(), notices.clone(), RelayConfig::default()),
+        opener,
+        notices,
+    )
 }
 
 fn key() -> SessionKey {
@@ -930,6 +964,7 @@ async fn lagged_stream_drains_session_and_closes_client() {
     tokio::spawn(run_forwarder(
         hub.entries.clone(),
         entry,
+        hub.notices.clone(),
         rx,
         "coda".into(),
         0,
@@ -945,4 +980,363 @@ async fn lagged_stream_drains_session_and_closes_client() {
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
+}
+
+// --- background tasks: hub lifecycle --------------------------------------
+
+fn task_meta(command: &str) -> TaskMeta {
+    TaskMeta {
+        command: command.into(),
+        description: "lifecycle test task".into(),
+        agent_name: "coda".into(),
+    }
+}
+
+/// Spawn a fake task on the entry's registry that completes when `gate` fires
+/// (or reports itself killed on cancellation).
+async fn spawn_gated_task(hub: &SessionHub, gate: Arc<Notify>) -> String {
+    let entry = hub.get_entry(&key()).expect("entry");
+    entry
+        .background
+        .spawn_with(task_meta("fake-long-command"), move |ctx| async move {
+            let cancel = ctx.cancelled();
+            tokio::select! {
+                _ = gate.notified() => TaskExit::Exited { code: Some(0) },
+                _ = cancel.cancelled() => TaskExit::Killed,
+            }
+        })
+        .await
+        .expect("spawn fake task")
+}
+
+fn running_tasks(entry: &Arc<SessionEntry>) -> usize {
+    entry
+        .background
+        .summaries()
+        .borrow()
+        .iter()
+        .filter(|summary| summary.status.is_running())
+        .count()
+}
+
+/// Roadmap ①+②: a running background task pins a disconnected idle entry;
+/// when the last task finishes, the idle watcher releases the entry, the
+/// notice lands in the NoticeStore, and the next attach restores it.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_task_pins_disconnected_entry_then_release_persists_notice() {
+    let (hub, _gate, notices) = hub_with_notices("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let task_gate = Arc::new(Notify::new());
+    let id = spawn_gated_task(&hub, task_gate.clone()).await;
+
+    hub.detach(key(), 1).await;
+    // A wrong release is spawned asynchronously; give it room to happen.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "a running background task must pin the detached entry"
+    );
+
+    task_gate.notify_one();
+    wait_released(&hub).await;
+
+    let persisted = notices.get(&key());
+    assert_eq!(
+        persisted.len(),
+        1,
+        "release persists the undelivered notice"
+    );
+    assert_eq!(persisted[0].task_ids(), vec![id.clone()]);
+
+    // Reopen: entry initialization restores the pending notice.
+    let _attach2 = hub
+        .attach(key(), 2, "prov".into(), None, false)
+        .await
+        .expect("re-attach");
+    let entry = hub.get_entry(&key()).expect("entry");
+    let restored = entry.background.take_notices().await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].task_ids(), vec![id]);
+}
+
+/// Roadmap ③: a model switch swaps the session but not the entry-owned
+/// registry — tasks keep running and their notices stay collectable.
+#[tokio::test(flavor = "multi_thread")]
+async fn model_switch_preserves_background_tasks_and_notices() {
+    let (hub, _gate, _notices) = hub_with_notices("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let entry_before = hub.get_entry(&key()).expect("entry");
+    let task_gate = Arc::new(Notify::new());
+    let id = spawn_gated_task(&hub, task_gate.clone()).await;
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "prov2".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::ModelChanged { .. }));
+
+    let entry_after = hub.get_entry(&key()).expect("entry survives the swap");
+    assert!(Arc::ptr_eq(
+        &entry_before.background,
+        &entry_after.background
+    ));
+    // The old session's asynchronous shutdown must leave the (external)
+    // registry untouched; give it room to misbehave.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        running_tasks(&entry_after),
+        1,
+        "task survives the model switch"
+    );
+
+    task_gate.notify_one();
+    let collected = timeout(Duration::from_secs(5), async {
+        loop {
+            let notices = entry_after.background.take_notices().await;
+            if !notices.is_empty() {
+                return notices;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("notice after completion");
+    assert_eq!(collected[0].task_ids(), vec![id]);
+
+    hub.detach(key(), 1).await;
+    wait_released(&hub).await;
+}
+
+/// Roadmap ④: multiple opens within one entry (here: the model-switch
+/// replacement open) restore the persisted batch exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn persisted_notices_restore_once_per_entry() {
+    let (hub, _gate, notices) = hub_with_notices("reply", ToolApprovalMode::Auto);
+    notices.put(
+        key(),
+        vec![TaskNotice::Task {
+            id: "bg_prev".into(),
+            command: "old command".into(),
+            description: String::new(),
+            status: TaskStatus::Exited {
+                code: Some(0),
+                at: jiff::Timestamp::now(),
+            },
+            output_tail: String::new(),
+        }],
+    );
+
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "prov2".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::ModelChanged { .. }));
+
+    let entry = hub.get_entry(&key()).expect("entry");
+    let restored = entry.background.take_notices().await;
+    assert_eq!(
+        restored.len(),
+        1,
+        "two opens in one entry must restore exactly once"
+    );
+
+    hub.detach(key(), 1).await;
+    wait_released(&hub).await;
+}
+
+/// Roadmap ⑥+⑦ (Owned): a session-owned registry is torn down only once the
+/// runtime confirmedly exited — a graceful timeout that returns `false`
+/// leaves tasks running and the registry usable; the follow-up abort
+/// completes the teardown.
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_registry_teardown_follows_runtime_exit_confirmation() {
+    let opener = TestOpener::new("hold", ToolApprovalMode::Auto);
+    let session = Session::builder()
+        .storage(opener.storage.clone())
+        .team(&opener.team, ".")
+        .run_config(RunConfig {
+            default_model: ModelProfile {
+                provider: opener.provider.clone(),
+                model: "fake".into(),
+                label: "fake".into(),
+                temperature: None,
+                max_completion_tokens: None,
+                reasoning_effort: None,
+            },
+            agent_models: HashMap::new(),
+            tool_approval: ToolApprovalMode::Auto,
+            approval_timeout: None,
+        })
+        .open()
+        .await
+        .expect("open standalone session");
+
+    // Hang a turn on the provider gate so the graceful shutdown times out.
+    // Wait for the turn's first event: `send` only enqueues, and a shutdown
+    // racing the dequeue would let the agent exit before the turn starts.
+    session.send("hi", vec![]).await.expect("send");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match session.recv().await {
+                Some(coda_agent::SessionStreamItem::Event(event))
+                    if matches!(
+                        event.kind,
+                        coda_agent::AgentEvent::LLMStart(_)
+                            | coda_agent::AgentEvent::LLMContentChunk(_)
+                    ) =>
+                {
+                    return;
+                }
+                Some(_) => {}
+                None => panic!("session stream ended before the turn started"),
+            }
+        }
+    })
+    .await
+    .expect("turn did not start");
+
+    let task_gate = Arc::new(Notify::new());
+    let g = task_gate.clone();
+    session
+        .background()
+        .spawn_with(task_meta("owned"), move |ctx| async move {
+            let cancel = ctx.cancelled();
+            tokio::select! {
+                _ = g.notified() => TaskExit::Exited { code: Some(0) },
+                _ = cancel.cancelled() => TaskExit::Killed,
+            }
+        })
+        .await
+        .expect("spawn");
+
+    let exited = session
+        .shutdown(Shutdown::graceful(Duration::from_millis(100)))
+        .await;
+    assert!(!exited, "the held turn must time the graceful shutdown out");
+    let running = session
+        .background()
+        .summaries()
+        .borrow()
+        .iter()
+        .filter(|s| s.status.is_running())
+        .count();
+    assert_eq!(
+        running, 1,
+        "an unconfirmed exit must not tear down the owned registry"
+    );
+
+    // Unblock the held turn before the final shutdown: the driver consumed
+    // the first shutdown's Exit and is awaiting the turn's completion, where
+    // a later Abort cannot preempt it (pre-existing runtime behavior — see
+    // the TODO in `AgentRuntime::wait_for_exit`).
+    opener.provider.gate.notify_one();
+    let exited = session.shutdown(Shutdown::abort()).await;
+    assert!(exited);
+    let running = session
+        .background()
+        .summaries()
+        .borrow()
+        .iter()
+        .filter(|s| s.status.is_running())
+        .count();
+    assert_eq!(running, 0, "owned registry torn down after confirmed exit");
+    let err = session
+        .background()
+        .spawn_with(task_meta("late"), |_ctx| async {
+            TaskExit::Exited { code: None }
+        })
+        .await;
+    assert!(err.is_err(), "owned registry is closed after teardown");
+}
+
+/// Review fix: a failed approvals-gated reopen must go through the release
+/// path — a bare map removal would leave the entry's idle watcher (and the
+/// client's relay stream) parked forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_gated_reopen_releases_the_entry_and_ends_the_stream() {
+    let (hub, opener, _notices) = hub_full("approval", ToolApprovalMode::Manual);
+    let attach1 = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events1 = attach1.events;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "needs approval".into(),
+            images: vec![],
+        },
+    )
+    .await;
+    let suspended = next_matching(
+        &mut events1,
+        |e| matches!(e, RelayEvent::Event(ev) if matches!(&**ev, WireEvent::Suspended { .. })),
+    )
+    .await;
+    let RelayEvent::Event(event) = suspended else {
+        unreachable!()
+    };
+    let WireEvent::Suspended { approval, .. } = *event else {
+        unreachable!()
+    };
+
+    hub.detach(key(), 1).await;
+    wait_released(&hub).await;
+
+    // Reopen into the approvals-gated Pending phase, then make the
+    // promotion open fail with a non-approval error.
+    let attach2 = hub
+        .attach(key(), 2, "prov".into(), None, true)
+        .await
+        .expect("re-attach");
+    let mut events2 = attach2.events;
+    opener
+        .fail_next_open
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = hub
+        .command(
+            key(),
+            2,
+            SessionCommand::Resume {
+                agent_name: approval.agent_name.clone(),
+                thread_id: approval.thread_id.clone(),
+                decision: ResumeDecision {
+                    resolutions: vec![(approval.calls[0].id.clone(), ToolCallResolution::Execute)],
+                },
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::OpenFailed(_)));
+
+    // The entry is gone (idle watcher retired via the registry shutdown) and
+    // the client's stream terminates instead of dangling.
+    wait_released(&hub).await;
+    timeout(Duration::from_secs(5), async {
+        while let Some(_event) = events2.next().await {}
+    })
+    .await
+    .expect("relay stream must end after the failed gated reopen");
 }

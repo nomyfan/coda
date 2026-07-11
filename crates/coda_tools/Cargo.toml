@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 coda_core = { workspace = true }
+jiff = { workspace = true }
 libc = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

@@ -3,6 +3,7 @@ pub mod ask_user;
 pub mod config;
 pub mod hub;
 pub mod mcp;
+pub mod notices;
 pub mod storage;
 pub mod transport;
 pub mod wire;

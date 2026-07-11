@@ -1,3 +1,4 @@
+mod background;
 mod fs;
 mod glob;
 mod grep;
@@ -6,6 +7,9 @@ mod shell;
 mod spec;
 mod todo;
 
+pub use background::{
+    BackgroundProcesses, TaskCtx, TaskExit, TaskMeta, TaskNotice, TaskRead, TaskStatus, TaskSummary,
+};
 pub use fs::{EditFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
 pub use glob::GlobTool;
 pub use grep::GrepTool;

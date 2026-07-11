@@ -62,6 +62,13 @@ impl WorkspaceStorage {
         JsonFileStorage::new(self.root_dir.join(session_id))
     }
 
+    /// The directory holding one session's persisted files. Validates the id
+    /// (client-controlled) before joining it.
+    pub fn session_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        validate_session_id(session_id)?;
+        Ok(self.root_dir.join(session_id))
+    }
+
     /// Remove a session's directory and everything in it.
     pub async fn delete_session(&self, session_id: &str) -> Result<(), String> {
         validate_session_id(session_id)?;

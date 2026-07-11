@@ -233,9 +233,10 @@ TaskEntry
 
 ## Implementation Roadmap
 
-- [ ] **[lifecycle] 假任务打通 hub 闭环(风险最前置)**:注册表骨架(假任务,终态提交协议按真实实现)、`summaries` watch、Owned/External、keepalive + 归零重判、NoticeStore(Result + 原子写)、entry 初始化恢复(去重)
+- [x] **[lifecycle] 假任务打通 hub 闭环(风险最前置)**:注册表骨架(假任务,终态提交协议按真实实现)、`summaries` watch、Owned/External、keepalive + 归零重判、NoticeStore(Result + 原子写)、entry 初始化恢复(去重)
       Purpose:验证四轮评审全部 P1 的集中地。
       Verification:集成测试:① 启任务→settle→断线→完成→归零 release(NoticeStore 落盘)→重连 reopen→下一 turn 收到通知;② 运行中断线不 release;③ 运行/已完成未通知时切模型,任务、输出、通知不丢;④ 同一 entry 多次 open 只 restore 一次;⑤ barrier:通知入队先于归零可见 / kill 与自然退出恰一终态一通知 / shutdown join monitor 后返回通知 / spawn 返回前 keepalive 非零;⑥ Owned:独立 Session shutdown(确认退出)后无进程残留;⑦ **Owned + graceful 超时返回 false:任务仍活、注册表仍可用,随后 abort shutdown 完成清场**;⑧ NoticeStore:save 中途失败不损坏旧文件;损坏文件 load 按空并移侧。
+      **状态:已完成**(2026-07-11,`coda_tools::background` + `SessionBuilder::background` + hub keepalive/NoticeStore/idle watcher)。①的"下一 turn 收到通知"暂以 reopen 后注册表 `take_notices` 断言代替,driver 注入属第 6 步;④去重对照 checkpoint 同样待第 6 步 origin 落地(现以 TODO 标注)。实现评审补修四处:恢复的聚合通知并入 overflow 槽而非完整队列;门控 reopen 失败改走 `begin_release`(裸移除会泄漏 idle watcher 与 relay 流);`shutdown` 加互斥门串行并发调用;`kill` 等待 summaries 发布(完整提交)而非仅终态翻转。另证实既有 runtime 限制:Exit 被消费后 driver 等待 run_fut 期间,后续 Abort 无法抢占(见 `AgentRuntime::wait_for_exit` 的 TODO)。
 - [ ] **[process] 抽取 `GroupedChild` 原语**
       Verification:现有测试零改动全绿;clippy 干净。
 - [ ] **[registry] 接真进程**:监视任务、TailBuf(绝对偏移)、回收、通知上限与聚合

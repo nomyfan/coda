@@ -24,6 +24,7 @@ use coda_server::{
         SessionKey, SessionOpener, SessionRelay,
     },
     mcp::McpServers,
+    notices::FsNoticeStore,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
@@ -31,7 +32,7 @@ use coda_server::{
         WireEvent, WorkspaceSummaryWire,
     },
 };
-use coda_tools::{BuildContext, ToolSpec};
+use coda_tools::{BackgroundProcesses, BuildContext, ToolSpec};
 use futures::stream::BoxStream;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -202,6 +203,7 @@ impl SessionOpener for AppOpener {
         provider_id: &'a str,
         reasoning_effort: Option<ReasoningEffort>,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
@@ -215,6 +217,7 @@ impl SessionOpener for AppOpener {
                 provider_id,
                 reasoning_effort,
                 decisions,
+                background,
             )
             .await
         })
@@ -251,6 +254,7 @@ async fn open_session(
     provider_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
     decisions: HashMap<String, ResumeDecision>,
+    background: Arc<BackgroundProcesses>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)
@@ -301,6 +305,7 @@ async fn open_session(
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
+        .background(background)
         .open()
         .await
 }
@@ -1360,6 +1365,12 @@ async fn main() {
             providers: providers.clone(),
             workspaces: workspaces.clone(),
         }),
+        Arc::new(FsNoticeStore::new(
+            workspaces
+                .iter()
+                .map(|(id, state)| (id.clone(), state.storage.clone()))
+                .collect(),
+        )),
         server_config.relay,
     ));
 
