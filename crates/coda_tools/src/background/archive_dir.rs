@@ -173,12 +173,14 @@ impl ArchiveDir {
         };
         let fd = owned_or_err(raw)?;
         verify_regular(fd.as_raw_fd())?;
+        verify_mode(fd.as_raw_fd(), 0o600)?;
         // SAFETY: OwnedFd guarantees a valid, exclusively owned descriptor.
         Ok(std::fs::File::from(fd))
     }
 
-    /// Open an existing regular file `O_NOFOLLOW`, `fstat`-verifying regular +
-    /// owner. `write` selects `O_RDWR` (rings) vs `O_RDONLY` (manifest reads).
+    /// Open an existing regular file `O_NOFOLLOW`, `fstat`-verifying regular,
+    /// owner, and exact `0600` permissions. `write` selects `O_RDWR` (rings)
+    /// vs `O_RDONLY` (manifest reads).
     pub fn open_file(
         &self,
         name: ArchiveFileName,
@@ -192,6 +194,7 @@ impl ArchiveDir {
         let raw = unsafe { libc::openat(self.fd.as_raw_fd(), cname.as_ptr(), flags) };
         let fd = owned_or_err(raw)?;
         verify_regular(fd.as_raw_fd())?;
+        verify_mode(fd.as_raw_fd(), 0o600)?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -399,6 +402,7 @@ fn verify_mode(fd: RawFd, expected: libc::mode_t) -> Result<(), ArchiveError> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
 
     fn temp_root() -> (tempfile::TempDir, ArchiveDir) {
@@ -424,6 +428,24 @@ mod tests {
         // Reopen the task dir by id and confirm the mode is 0700.
         let reopened = root.open_dir(&id).unwrap();
         verify_mode(reopened.raw_fd(), 0o700).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_widened_file_permissions() {
+        let (tmp, root) = temp_root();
+        let id = TaskId::new();
+        let task = root.create_dir(&id).unwrap();
+        task.create_file(ArchiveFileName::Meta).unwrap();
+        let path = tmp
+            .path()
+            .join("background/tasks")
+            .join(id.as_str())
+            .join("meta.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            task.open_file(ArchiveFileName::Meta, false),
+            Err(ArchiveError::Corrupt(_))
+        ));
     }
 
     #[test]

@@ -608,29 +608,58 @@ impl BackgroundProcesses {
         drop(inner);
 
         for id in inventory.recoverable_running {
-            if let Ok(Some(record)) = archive.open(&id).await {
-                let mut guard = record.lock_commit().await;
-                let mut candidate = guard.current().clone();
-                candidate.status = TaskStatus::Interrupted {
-                    at: jiff::Timestamp::now(),
-                };
-                if guard.commit(candidate).await.is_ok() {
-                    let status = guard.current().status.clone();
-                    drop(guard);
-                    let mut inner = self.inner.lock().await;
-                    inner.summaries.insert(
-                        id.clone(),
-                        TaskSummary {
-                            id: id.as_str().to_owned(),
-                            command: record.meta().command.clone(),
-                            description: record.meta().description.clone(),
-                            agent_name: record.meta().agent_name.clone(),
-                            status,
-                            started_at: record.started_at(),
-                        },
+            let record = match archive.open(&id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    tracing::warn!(
+                        task = id.as_str(),
+                        "recoverable task disappeared during reopen"
                     );
+                    if let Ok(backend) = self.backend() {
+                        backend.quota.block_spawns();
+                    }
+                    continue;
                 }
+                Err(error) => {
+                    tracing::warn!(task = id.as_str(), error = %error, "recoverable task could not be reopened");
+                    if let Ok(backend) = self.backend() {
+                        backend.quota.block_spawns();
+                    }
+                    continue;
+                }
+            };
+            let mut guard = record.lock_commit().await;
+            let mut candidate = guard.current().clone();
+            candidate.status = TaskStatus::Interrupted {
+                at: jiff::Timestamp::now(),
+            };
+            if let Err(error) = guard.commit(candidate).await {
+                tracing::warn!(task = id.as_str(), error = %error, "Running task could not be converted to Interrupted");
+                drop(guard);
+                if let Ok(backend) = self.backend() {
+                    backend.quota.block_spawns();
+                }
+                continue;
             }
+            let status = guard.current().status.clone();
+            drop(guard);
+            if let Ok(backend) = self.backend()
+                && let Err(error) = backend.quota.finalize_terminal(&record).await
+            {
+                tracing::warn!(task = id.as_str(), error = %error, "Interrupted task output finalize failed");
+            }
+            let mut inner = self.inner.lock().await;
+            inner.summaries.insert(
+                id.clone(),
+                TaskSummary {
+                    id: id.as_str().to_owned(),
+                    command: record.meta().command.clone(),
+                    description: record.meta().description.clone(),
+                    agent_name: record.meta().agent_name.clone(),
+                    status,
+                    started_at: record.started_at(),
+                },
+            );
         }
         self.inner.lock().await.publish();
     }
@@ -646,12 +675,11 @@ impl BackgroundProcesses {
     /// process group. Rejection (closed / running limit / disabled / quota) has
     /// no side effects; only `kill`/`shutdown` terminate a started task.
     pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<TaskId> {
-        // The group is spawned first so a spawn failure has no archive residue;
-        // if the reservation/create fails, the unused closure drops the group
-        // (its Drop kills it).
-        let group = GroupedChild::spawn(&mut cmd)?;
-        self.register_task(meta, move |ctx| run_process(group, ctx))
-            .await
+        self.register_task(meta, move |ctx| {
+            let group = GroupedChild::spawn(&mut cmd)?;
+            Ok(run_process(group, ctx))
+        })
+        .await
     }
 
     /// Start `work` as a background task. The task is visible in the summaries
@@ -662,7 +690,7 @@ impl BackgroundProcesses {
         F: FnOnce(TaskCtx) -> Fut,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
-        self.register_task(meta, work).await
+        self.register_task(meta, move |ctx| Ok(work(ctx))).await
     }
 
     /// Reserve quota, create the archive record, and register the task. The
@@ -670,45 +698,58 @@ impl BackgroundProcesses {
     /// and the registration are atomic (a concurrent spawn cannot exceed the
     /// limit); this is deadlock-safe because no path holds a per-task commit or
     /// quota lock while waiting for the registry lock. On any failure before
-    /// registration nothing is published, and the unused `work` closure drops
-    /// its process group.
+    /// registration no task is published; a process-start failure rolls back
+    /// the prepared archive before returning.
     async fn register_task<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
     where
-        F: FnOnce(TaskCtx) -> Fut,
+        F: FnOnce(TaskCtx) -> std::io::Result<Fut>,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
         let backend = self.backend()?;
         let mut inner = self.inner.lock().await;
         inner.check_capacity()?;
 
-        let outcome = backend
-            .quota
-            .reserve_for_create(2 * DEFAULT_STREAM_CAPACITY)
-            .await
+        let outcome = backend.quota.reserve_for_create().await;
+        // These facts are already durable even if reservation or archive
+        // creation fails, so enqueue them before inspecting the result.
+        enqueue_expirations(&mut inner, outcome.expirations);
+        let reservation = outcome
+            .reservation
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let id = TaskId::new();
-        let record = backend
-            .archive
-            .create(&id, &meta)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        outcome.reservation.commit();
-
-        // Enqueue any expirations the reservation caused (quota never touches
-        // the notice queue itself).
-        for fact in outcome.expirations {
-            inner.push_notice(TaskNotice::OutputExpired {
-                id: fact.id,
-                expired_at: fact.expired_at,
-                reason: fact.reason,
-            });
-        }
+        let (record, reservation) = match backend.archive.create(&id, &meta, reservation).await {
+            Ok(record) => record,
+            Err(error) => {
+                // A create error can include a failed half-product cleanup.
+                // Stop further growth; the uncommitted reservation rolls back.
+                backend.quota.block_spawns();
+                return Err(std::io::Error::other(error.to_string()));
+            }
+        };
         let cancel = CancellationToken::new();
         let entry = Arc::new(TaskEntry {
             record: record.clone(),
             cancel: cancel.clone(),
         });
-        let fut = work(TaskCtx { record, cancel });
+        let fut = match work(TaskCtx {
+            record: record.clone(),
+            cancel,
+        }) {
+            Ok(fut) => fut,
+            Err(error) => {
+                if let Err(cleanup_error) = backend.archive.discard_created(&record).await {
+                    // Keep the reservation charged for files we could not
+                    // prove were removed, and close the session to new growth.
+                    reservation.commit();
+                    backend.quota.block_spawns();
+                    return Err(std::io::Error::other(format!(
+                        "{error}; background archive rollback failed: {cleanup_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        reservation.commit();
         let monitor = tokio::spawn(monitor_task(
             self.inner.clone(),
             backend.clone(),
@@ -872,7 +913,12 @@ impl BackgroundProcesses {
 
     /// Drain accumulated notices (the overflow aggregate last).
     pub async fn take_notices(&self) -> Vec<TaskNotice> {
+        let expirations = match &self.store {
+            Store::Enabled(backend) => backend.quota.take_expirations(),
+            Store::Disabled(_) => Vec::new(),
+        };
         let mut inner = self.inner.lock().await;
+        enqueue_expirations(&mut inner, expirations);
         drain_notices(&mut inner)
     }
 
@@ -930,13 +976,43 @@ impl BackgroundProcesses {
         for monitor in monitors {
             let _ = monitor.await;
         }
+        for entry in &entries {
+            let mut guard = entry.record.lock_commit().await;
+            if guard.current().persistence_dirty {
+                let candidate = guard.current().clone();
+                if let Err(error) = guard.commit(candidate).await {
+                    tracing::warn!(
+                        task = entry.id().as_str(),
+                        error = %error,
+                        "shutdown could not persist dirty Failed task state"
+                    );
+                }
+            }
+        }
+        if let Store::Enabled(backend) = &self.store {
+            backend.quota.settle().await;
+            backend.archive.settle().await;
+        }
         let mut inner = self.inner.lock().await;
+        if let Store::Enabled(backend) = &self.store {
+            enqueue_expirations(&mut inner, backend.quota.take_expirations());
+        }
         let notices = drain_notices(&mut inner);
         // Wake watchers even when nothing changed (e.g. zero tasks) so a
         // keepalive watcher parked on this registry re-checks its entry and
         // can retire once the entry is released.
         inner.publish();
         notices
+    }
+}
+
+fn enqueue_expirations(inner: &mut RegistryState, expirations: Vec<ExpirationFact>) {
+    for fact in expirations {
+        inner.push_notice(TaskNotice::OutputExpired {
+            id: fact.id,
+            expired_at: fact.expired_at,
+            reason: fact.reason,
+        });
     }
 }
 
@@ -1172,6 +1248,7 @@ async fn drain_pump(pump: &mut JoinHandle<PumpResult>, slot: &mut Option<PumpRes
 /// deletes the ring files.
 struct TerminalOutcome {
     status: TaskStatus,
+    persistence_dirty: bool,
     tail: String,
     stdout_overwritten: u64,
     stderr_overwritten: u64,
@@ -1191,6 +1268,10 @@ async fn monitor_task(
     let exit = work.await;
     let record = &entry.record;
     let outcome = commit_terminal(record, exit).await;
+
+    if outcome.persistence_dirty {
+        backend.quota.block_spawns();
+    }
 
     // Reclaim (Consumed) or register as an eviction victim. Cleanup failure is
     // only logged: the completion notice and summary must still publish.
@@ -1228,7 +1309,7 @@ async fn monitor_task(
 /// Flush the rings, snapshot the notice tail/overwrite totals, and atomically
 /// commit the terminal manifest. A flush or save failure degrades the task to
 /// `Failed` rather than reporting a clean exit whose output was not persisted.
-async fn commit_terminal(record: &TaskRecord, exit: TaskExit) -> TerminalOutcome {
+async fn commit_terminal(record: &Arc<TaskRecord>, exit: TaskExit) -> TerminalOutcome {
     let at = jiff::Timestamp::now();
     let intended = match exit {
         TaskExit::Exited { code } => TaskStatus::Exited { code, at },
@@ -1247,6 +1328,7 @@ async fn commit_terminal(record: &TaskRecord, exit: TaskExit) -> TerminalOutcome
         // Already terminal (e.g. a concurrent kill settled first).
         return TerminalOutcome {
             status: guard.current().status.clone(),
+            persistence_dirty: guard.current().persistence_dirty,
             tail,
             stdout_overwritten,
             stderr_overwritten,
@@ -1254,21 +1336,39 @@ async fn commit_terminal(record: &TaskRecord, exit: TaskExit) -> TerminalOutcome
     }
     let mut candidate = guard.current().clone();
     candidate.status = intended.clone();
-    let committed = flush_ok && guard.commit(candidate).await.is_ok();
-    let status = if committed {
-        intended
+    let commit_error = if flush_ok {
+        guard.commit(candidate).await.err()
     } else {
+        Some(ArchiveError::Io(std::io::Error::other(
+            "background output ring flush failed",
+        )))
+    };
+    let status = if let Some(error) = commit_error {
         let failed = TaskStatus::Failed {
             message: "background output spool save failed".into(),
             at,
         };
-        let mut degraded = guard.current().clone();
-        degraded.status = failed.clone();
-        let _ = guard.commit(degraded).await; // best-effort
+        // Settle the runtime exactly once even when no manifest write works.
+        // Then retry persisting that same in-memory Failed state best-effort.
+        guard
+            .fail_in_memory(failed.clone())
+            .expect("Running can always degrade to Failed");
+        let degraded = guard.current().clone();
+        if let Err(retry_error) = guard.commit(degraded).await {
+            tracing::warn!(
+                task = record.id().as_str(),
+                error = %error,
+                retry_error = %retry_error,
+                "terminal manifest could not be persisted; keeping in-memory Failed state"
+            );
+        }
         failed
+    } else {
+        intended
     };
     TerminalOutcome {
         status,
+        persistence_dirty: guard.current().persistence_dirty,
         tail,
         stdout_overwritten,
         stderr_overwritten,
@@ -1447,6 +1547,256 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("too many"));
         reg.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_process_spawn_has_no_command_side_effects() {
+        let reg = BackgroundProcesses::new();
+        reg.shutdown().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("should-not-exist");
+        let mut cmd = bash("printf x > \"$MARKER\"");
+        cmd.env("MARKER", &marker);
+
+        let error = reg.spawn(cmd, meta("rejected")).await.unwrap_err();
+        assert!(error.to_string().contains("shut down"));
+        assert!(!marker.exists(), "the rejected command was never started");
+    }
+
+    #[tokio::test]
+    async fn process_start_failure_rolls_back_archive_and_quota() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+        let archive = Arc::new(TaskArchive::new(root));
+        let quota = SessionQuota::from_inventory(
+            &ArchiveInventory::default(),
+            SESSION_QUOTA_BYTES,
+            archive.clone(),
+        );
+        let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+            archive: archive.clone(),
+            quota,
+            temp: None,
+        })));
+
+        let cmd = Command::new("/definitely/not/a/real/executable");
+        assert!(reg.spawn(cmd, meta("bad executable")).await.is_err());
+        assert_eq!(archive.root().entries().unwrap().count(), 0);
+        assert_eq!(reg.backend().unwrap().quota.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_detached_create_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+        let archive = Arc::new(TaskArchive::new(root));
+        let quota = SessionQuota::from_inventory(
+            &ArchiveInventory::default(),
+            SESSION_QUOTA_BYTES,
+            archive.clone(),
+        );
+        let reg = Arc::new(BackgroundProcesses::with_store(Store::Enabled(Arc::new(
+            Backend {
+                archive: archive.clone(),
+                quota,
+                temp: None,
+            },
+        ))));
+        let (entered, release) = archive.pause_next_create();
+        let spawn_reg = reg.clone();
+        let spawn = tokio::spawn(async move {
+            spawn_reg
+                .spawn_with(meta("cancelled create"), |_ctx| async {
+                    TaskExit::Exited { code: Some(0) }
+                })
+                .await
+        });
+        entered.notified().await;
+        spawn.abort();
+        assert!(matches!(spawn.await, Err(error) if error.is_cancelled()));
+
+        let shutdown_reg = reg.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_reg.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before detached create settled"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown did not resume after create settled")
+            .unwrap();
+        assert_eq!(archive.root().entries().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_failure_does_not_lose_prior_expiration_fact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+        let archive = Arc::new(TaskArchive::new(root));
+        let quota = SessionQuota::from_inventory(
+            &ArchiveInventory::default(),
+            2 * DEFAULT_STREAM_CAPACITY,
+            archive.clone(),
+        );
+        let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+            archive: archive.clone(),
+            quota,
+            temp: None,
+        })));
+        let old = reg
+            .spawn_with(meta("old"), |ctx| async move {
+                ctx.append_stdout(b"unread").await.unwrap();
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .unwrap();
+        let mut rx = reg.summaries();
+        while running_count(&rx) > 0 {
+            rx.changed().await.unwrap();
+        }
+
+        archive.fail_next_initial_manifest();
+        assert!(
+            reg.spawn_with(meta("create fails"), |_ctx| async {
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err()
+        );
+        let notices = reg.take_notices().await;
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            TaskNotice::OutputExpired { id, .. } if id == &old
+        )));
+        archive.settle().await;
+        assert_eq!(reg.backend().unwrap().quota.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
+        let reg = BackgroundProcesses::new();
+        let ready = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let task_finish = finish.clone();
+        let id = reg
+            .spawn_with(meta("partial utf8"), move |ctx| async move {
+                ctx.append_stdout(&[0xE2]).await.unwrap();
+                task_ready.notify_one();
+                task_finish.notified().await;
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .unwrap();
+
+        ready.notified().await;
+        let running = reg.read(&id).await.unwrap().unwrap();
+        assert!(running.stdout.is_empty(), "incomplete prefix is carried");
+        finish.notify_one();
+        let mut rx = reg.summaries();
+        while running_count(&rx) > 0 {
+            rx.changed().await.unwrap();
+        }
+
+        let terminal = reg.read(&id).await.unwrap().unwrap();
+        assert_eq!(terminal.stdout, "\u{FFFD}");
+        assert!(terminal.note.is_none());
+        let consumed = reg.read(&id).await.unwrap().unwrap();
+        assert!(consumed.note.as_deref().unwrap().contains("fully consumed"));
+    }
+
+    #[tokio::test]
+    async fn reopen_finalizes_interrupted_task_into_quota_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+        let archive = TaskArchive::new(root.clone());
+        let id = TaskId::new();
+        let record = archive
+            .create_unreserved(&id, &meta("crashed"))
+            .await
+            .unwrap();
+        record.files().stdout.append(b"saved").await.unwrap();
+        record.files().flush().await.unwrap();
+        {
+            let mut guard = record.lock_commit().await;
+            let candidate = guard.current().clone();
+            guard.commit(candidate).await.unwrap();
+        }
+        drop(record);
+        drop(archive);
+
+        let reg = BackgroundProcesses::session_backed(root).await;
+        let backend = reg.backend().unwrap();
+        assert!(backend.quota.retained_contains(&id));
+        assert_eq!(backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
+        let read = reg.read(&id).await.unwrap().unwrap();
+        assert!(matches!(read.status, TaskStatus::Interrupted { .. }));
+        assert_eq!(read.stdout, "saved");
+    }
+
+    #[tokio::test]
+    async fn shutdown_retries_dirty_in_memory_failed_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+        let archive = Arc::new(TaskArchive::new(root.clone()));
+        let quota = SessionQuota::from_inventory(
+            &ArchiveInventory::default(),
+            SESSION_QUOTA_BYTES,
+            archive.clone(),
+        );
+        let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+            archive: archive.clone(),
+            quota,
+            temp: None,
+        })));
+        let finish = Arc::new(Notify::new());
+        let task_finish = finish.clone();
+        let id = reg
+            .spawn_with(meta("manifest failure"), move |_ctx| async move {
+                task_finish.notified().await;
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .unwrap();
+        let task_path = tmp.path().join("background/tasks").join(id.as_str());
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        finish.notify_one();
+        let mut rx = reg.summaries();
+        while running_count(&rx) > 0 {
+            rx.changed().await.unwrap();
+        }
+        let summary = rx
+            .borrow()
+            .iter()
+            .find(|summary| summary.id == id.as_str())
+            .cloned();
+        assert!(matches!(summary.unwrap().status, TaskStatus::Failed { .. }));
+        let record = reg
+            .inner
+            .lock()
+            .await
+            .tasks
+            .get(&id)
+            .unwrap()
+            .record
+            .clone();
+        assert!(matches!(
+            record.lock_commit().await.current().status,
+            TaskStatus::Failed { .. }
+        ));
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        reg.shutdown().await;
+
+        let reopened = TaskArchive::new(root).open(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            reopened.lock_commit().await.current().status,
+            TaskStatus::Failed { .. }
+        ));
     }
 
     /// Incremental reads move an absolute cursor; a truncated head is

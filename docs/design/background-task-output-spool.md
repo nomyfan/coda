@@ -179,7 +179,8 @@ pub struct OutputChunk {
 
 impl DiskTail {
     /// 追加整个字节片段。超过容量时覆盖最旧内容，同时保持逻辑偏移单调递增。
-    /// 文件系统错误原样返回，调用方不得静默降级为丢输出。
+    /// owned transaction 持有 stream lock，调用方取消只放弃等待；flush/logical_range
+    /// 会等待已经开始的 pwrite 与 offset commit 一起完成。
     pub async fn append(&self, bytes: &[u8]) -> std::io::Result<()>;
 
     /// 从绝对逻辑 cursor 起最多读取 limit 字节；若 cursor 落在 retained start
@@ -255,13 +256,13 @@ impl TaskArchive {
     /// 创建 task 的私有输出目录和两个 stream 文件；全部成功后才允许启动进程。
     /// 必须消费 SessionQuota 发出的 reservation；失败时 reservation guard 自动回滚，
     /// 且不留下半成品目录。
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
-        reservation: QuotaReservation,
         id: &TaskId,
         meta: &TaskMeta,
+        reservation: QuotaReservation,
     )
-        -> std::io::Result<Arc<TaskRecord>>;
+        -> std::io::Result<(Arc<TaskRecord>, QuotaReservation)>;
 
     /// 按 id 打开 archived task（包括 crash 遗留的 Running）。未知、已清理或 manifest
     /// 损坏时返回错误，不把损坏记录误报成一个新的空 task。
@@ -292,9 +293,11 @@ impl SessionQuota {
     pub fn from_inventory(inventory: &ArchiveInventory, limit: u64) -> Self;
 
     /// 为新 task 串行取得 reservation；必要时按 terminal_at 淘汰 terminal victim。
-    /// 返回前 victim 已按 manifest→delete→release 完成且 quota lock 已释放，或整个
-    /// create 被拒绝。expiration facts 只作为返回值，quota 层不访问 notice queue。
-    pub async fn reserve_for_create(&self, bytes: u64) -> Result<ReserveOutcome, QuotaError>;
+    /// victim 只有在 manifest→delete 完成后才 release；delete 失败会保留计费并进入
+    /// residual retry。即使 reservation 失败，已提交的 expiration facts 仍随结果返回。
+    /// 固定为当前 task output layout 的两个 stream capacity；调用方不能指定 bytes。
+    /// 返回的一次性 QuotaReservation 不可 Clone。
+    pub async fn reserve_for_create(&self) -> ReserveOutcome;
 
     /// cursor commit 后调用；重新按 quota→commit 锁序确认 terminal + fully consumed，
     /// 再执行 manifest→delete→release。Running 或未读完时是无操作。
@@ -307,8 +310,8 @@ impl SessionQuota {
 }
 
 pub struct ReserveOutcome {
-    pub reservation: QuotaReservation,
-    /// 本次为了取得 reservation 而新完成的 expiration facts。
+    pub reservation: Result<QuotaReservation, QuotaError>,
+    /// 本次尝试中已经 durable commit 的 expiration facts，与 reservation 成败无关。
     /// 函数返回时 quota lock 已释放；SessionQuota 从不访问 registry notice queue。
     pub expirations: Vec<ExpirationFact>,
 }
@@ -654,8 +657,9 @@ DiskTail（每 stream 独立锁）
   普通 read 只取 commit → stream，不反向获取 quota lock；若 read 后达到 fully consumed，
   先完成 cursor commit 并释放 commit lock，再进入 quota cleanup，按全局锁序重新获取并
   recheck disposition/cursor。
-- append 只持对应 stream lock，不获取 task commit 或 quota lock；terminal commit 在
-  pumps 全部结束后才 flush/snapshot，因此不会与后续 append 竞态。
+- append 的 owned transaction 只持对应 stream lock，不获取 task commit 或 quota lock；
+  pwrite 成功后在释放锁前提交 offsets。pump 等待方被取消时 transaction 仍异步完成，
+  terminal flush/snapshot 获取同一 stream lock，因此必然越过所有已开始的 append。
 - 任何 terminal/release manifest 若引用新的 `start_offset/total_written`，必须经过两个
   有序屏障：先 `stdout.flush` + `stderr.flush` 成功，再 snapshot 逻辑范围并 atomic
   save manifest。manifest 不得先于其引用的 ring bytes 落盘。`task_output` 只提交已经
@@ -671,7 +675,14 @@ DiskTail（每 stream 独立锁）
   重试保存该 Failed manifest 一次。
 - 重试仍失败：terminal summary/notice 仍正常发布，避免 keepalive 永久卡住；完整输出
   archive 视为不可恢复，不删任何不确定文件。pending notice 仍可由独立 NoticeStore
-  持久化。该降级保持运行时可关停，但不声称 task archive 已可靠保存。
+  持久化。内存 state 标记为 dirty，禁止继续 spawn，并在 shutdown/release 屏障内再次
+  保存；该降级保持运行时可关停，但不声称重试成功前 task archive 已可靠保存。
+- manifest blocking save 一旦开始，调用方取消只能取消等待，不能把 rename 和内存 state
+  swap 拆开；owned commit transaction 持有 commit guard，异步完成 save + state swap，
+  archive activity barrier 让 shutdown 等待所有 detached commit 收敛。
+- task create 由 owned transaction 完成，并以 delivery ack 确认 record 已交给调用方；
+  等待方取消或消失时，事务持有共享 quota lease 直到清理完成；清理失败则保留计费、设置
+  spawn blocker 并记录错误。archive activity barrier 同样覆盖 detached create/cleanup。
 
 ### 生命周期
 
@@ -911,10 +922,11 @@ stderr pump result
     保证重试身份稳定。每个 overflow aggregate 另有持久化 batch id，覆盖无法逐项表达
     的 `uncounted` 身份。
 
-19. **quota 不操作 notice queue。** `reserve_for_create` 在 quota lock 内完成淘汰和
-    reservation，只把 `ExpirationFact` 放进 `ReserveOutcome`；registry 在函数返回、锁
-    已释放后统一入队。这样锁图保持 quota→commit→stream，不新增 quota→registry 的
-    反向依赖；即使后续新 task 文件创建失败，已经发生的 expiration 仍会通知。
+19. **quota 不操作 notice queue。** `reserve_for_create` 的 owned transaction 在 quota
+    lock 内完成淘汰和 reservation；durable expiration 先进入 quota 自身的 pending-fact
+    队列，正常返回时随 `ReserveOutcome` 交付，等待方取消时留待 registry 的 notice drain/
+    shutdown 提取。这样锁图保持 quota→commit→stream，不新增 quota→registry 的反向依赖；
+    即使调用方取消或后续新 task 文件创建失败，已经发生的 expiration 仍会通知。
 
 20. **corrupt 是局部读取失败、session 级 spawn blocker。** inventory 对能测量的文件
     保守计费，任何 corrupt/orphan/unsafe 项都禁止新 background spawn，但不阻止 attach

@@ -133,20 +133,10 @@ fn is_utf8_prefix(bytes: &[u8]) -> bool {
     if bytes.len() > 3 {
         return false;
     }
-    // Must not already decode to a complete string (that would not be a carry).
-    if std::str::from_utf8(bytes).is_ok() {
-        return false;
-    }
-    // Appending up to 3 continuation bytes must be able to complete it; if some
-    // completion decodes, it is a valid incomplete prefix.
-    for fill in 1..=3u8 {
-        let mut probe = bytes.to_vec();
-        probe.extend(std::iter::repeat_n(0x80, fill as usize));
-        if std::str::from_utf8(&probe).is_ok() {
-            return true;
-        }
-    }
-    false
+    matches!(
+        std::str::from_utf8(bytes),
+        Err(error) if error.error_len().is_none()
+    )
 }
 
 #[cfg(test)]
@@ -211,6 +201,21 @@ mod tests {
         let mut s = base_stream();
         s.utf8_carry = vec![0xFF];
         assert!(s.validate().is_err());
+
+        for carry in [
+            vec![0xE0],
+            vec![0xE0, 0xA0],
+            vec![0xF0],
+            vec![0xF0, 0x90, 0x80],
+        ] {
+            s.utf8_carry = carry;
+            assert!(s.validate().is_ok());
+        }
+
+        for carry in [vec![0xE0, 0x80], vec![0xF0, 0x80], vec![0xF5]] {
+            s.utf8_carry = carry;
+            assert!(s.validate().is_err());
+        }
     }
 
     #[test]

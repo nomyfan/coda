@@ -24,6 +24,9 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+
 use tokio::sync::Mutex;
 
 /// Physical layout format of a ring file. Persisted per stream; an unknown
@@ -60,6 +63,9 @@ struct Offsets {
     start_offset: u64,
     /// Next logical offset to be written (i.e. total bytes ever appended).
     total_written: u64,
+    /// First append failure, retained so a cancelled pump cannot hide it from
+    /// the terminal flush barrier.
+    failure: Option<String>,
 }
 
 /// A fixed-capacity ring file exposing a logically continuous byte stream.
@@ -70,7 +76,9 @@ pub struct DiskTail {
     /// the recorded logical range for manifest consistency but has no bytes.
     file: Option<Arc<std::fs::File>>,
     capacity: u64,
-    state: Mutex<Offsets>,
+    state: Arc<Mutex<Offsets>>,
+    #[cfg(test)]
+    append_pause: Arc<StdMutex<Option<AppendPause>>>,
 }
 
 impl DiskTail {
@@ -104,10 +112,13 @@ impl DiskTail {
         Ok(DiskTail {
             file: Some(Arc::new(file)),
             capacity,
-            state: Mutex::new(Offsets {
+            state: Arc::new(Mutex::new(Offsets {
                 start_offset: 0,
                 total_written: 0,
-            }),
+                failure: None,
+            })),
+            #[cfg(test)]
+            append_pause: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -126,10 +137,13 @@ impl DiskTail {
         Ok(DiskTail {
             file: None,
             capacity,
-            state: Mutex::new(Offsets {
+            state: Arc::new(Mutex::new(Offsets {
                 start_offset,
                 total_written,
-            }),
+                failure: None,
+            })),
+            #[cfg(test)]
+            append_pause: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -166,10 +180,13 @@ impl DiskTail {
         Ok(DiskTail {
             file: Some(Arc::new(file)),
             capacity,
-            state: Mutex::new(Offsets {
+            state: Arc::new(Mutex::new(Offsets {
                 start_offset,
                 total_written,
-            }),
+                failure: None,
+            })),
+            #[cfg(test)]
+            append_pause: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -193,7 +210,10 @@ impl DiskTail {
             return Ok(());
         }
         let cap = self.capacity;
-        let mut st = self.state.lock().await;
+        let mut st = self.state.clone().lock_owned().await;
+        if let Some(message) = &st.failure {
+            return Err(io::Error::other(message.clone()));
+        }
         let old_total = st.total_written;
         let new_total = old_total + bytes.len() as u64;
         // Only the last `capacity` bytes can survive, so never write more than
@@ -211,12 +231,46 @@ impl DiskTail {
             .file
             .clone()
             .ok_or_else(|| corrupt("append on a detached ring"))?;
-        tokio::task::spawn_blocking(move || write_ring(&file, cap, logical_start, &payload))
+        #[cfg(test)]
+        let pause = self.append_pause.lock().unwrap().take();
+        let transaction = tokio::spawn(async move {
+            let write = tokio::task::spawn_blocking(move || {
+                write_ring(&file, cap, logical_start, &payload)?;
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    let _ = pause.entered.send(());
+                    let _ = pause.release.recv();
+                }
+                Ok(())
+            })
             .await
-            .map_err(join_err)??;
-        st.total_written = new_total;
-        st.start_offset = new_total.saturating_sub(cap);
-        Ok(())
+            .map_err(join_err)
+            .and_then(|result| result);
+            if write.is_ok() {
+                st.total_written = new_total;
+                st.start_offset = new_total.saturating_sub(cap);
+            } else if let Err(error) = &write {
+                st.failure = Some(error.to_string());
+            }
+            write
+        });
+        transaction.await.map_err(join_err)?
+    }
+
+    #[cfg(test)]
+    fn pause_next_append(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.append_pause.lock().unwrap() = Some(AppendPause {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
     }
 
     /// Read up to `limit` bytes from absolute logical `cursor`. A cursor below
@@ -277,7 +331,10 @@ impl DiskTail {
     /// stream lock is held so the flushed range stays consistent with the
     /// logical range a manifest snapshot records right after.
     pub async fn flush(&self) -> io::Result<()> {
-        let _st = self.state.lock().await;
+        let st = self.state.lock().await;
+        if let Some(message) = &st.failure {
+            return Err(io::Error::other(message.clone()));
+        }
         let Some(file) = self.file.clone() else {
             return Ok(()); // detached: nothing to flush
         };
@@ -285,6 +342,12 @@ impl DiskTail {
             .await
             .map_err(join_err)?
     }
+}
+
+#[cfg(test)]
+struct AppendPause {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Write `data` (at most one ring's worth) so byte `data[i]` lands at physical
@@ -541,6 +604,43 @@ mod tests {
         reopened.append(b"CD").await.unwrap();
         assert_eq!(reopened.logical_range().await, (6, 14));
         assert_eq!(reopened.read_from(6, 64).await.unwrap().bytes, b"6789ABCD");
+    }
+
+    #[tokio::test]
+    async fn cancelled_append_finishes_offsets_before_flush_and_reopen() {
+        let file = temp_file();
+        let reopened_file = file.try_clone().unwrap();
+        let tail = Arc::new(DiskTail::create_inner(file, 16).unwrap());
+        let (entered, release) = tail.pause_next_append();
+        let append_tail = tail.clone();
+        let append = tokio::spawn(async move { append_tail.append(b"hello").await });
+        tokio::task::spawn_blocking(move || entered.recv().unwrap())
+            .await
+            .unwrap();
+
+        append.abort();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(100), append)
+            .await
+            .expect("cancelling append blocked the Tokio worker")
+            .unwrap_err();
+        assert!(cancelled.is_cancelled());
+
+        let flush_tail = tail.clone();
+        let mut flush = tokio::spawn(async move { flush_tail.flush().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut flush)
+                .await
+                .is_err(),
+            "flush passed an in-flight append"
+        );
+        release.send(()).unwrap();
+        flush.await.unwrap().unwrap();
+
+        let range = tail.logical_range().await;
+        assert_eq!(range, (0, 5));
+        drop(tail);
+        let reopened = DiskTail::reopen_inner(reopened_file, 16, range.0, range.1).unwrap();
+        assert_eq!(reopened.read_from(0, 16).await.unwrap().bytes, b"hello");
     }
 
     /// Reopen rejects a file whose length disagrees with the recorded range,
