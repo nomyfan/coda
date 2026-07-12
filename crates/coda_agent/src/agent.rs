@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, Message, ReasoningEffort, SystemMessage, ToolCall,
-    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, UserMessage,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
@@ -215,6 +215,12 @@ pub enum AgentEvent {
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
+    /// A background-task completion notice was written into history, ahead of
+    /// the user message of the turn that delivered it. Carries the exact
+    /// [`UserMessage`] persisted in the checkpoint (origin =
+    /// `TaskNotice { task_ids }`), so event consumers reconstructing history
+    /// place it verbatim.
+    TaskNotice(UserMessage),
     /// Emitted when tool calls require human approval. The agent thread exits
     /// after this event. The caller should shut down the session, collect
     /// decisions, and open a new session with `resume_decisions` to continue.

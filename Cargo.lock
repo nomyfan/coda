@@ -561,12 +561,16 @@ name = "coda_tools"
 version = "0.1.0"
 dependencies = [
  "coda_core",
+ "jiff",
  "libc",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

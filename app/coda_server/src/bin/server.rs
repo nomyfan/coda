@@ -24,6 +24,7 @@ use coda_server::{
         SessionKey, SessionOpener, SessionRelay,
     },
     mcp::McpServers,
+    notices::FsNoticeStore,
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
@@ -31,7 +32,7 @@ use coda_server::{
         WireEvent, WorkspaceSummaryWire,
     },
 };
-use coda_tools::{BuildContext, ToolSpec};
+use coda_tools::{BackgroundProcesses, BuildContext, ToolSpec};
 use futures::stream::BoxStream;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -202,6 +203,7 @@ impl SessionOpener for AppOpener {
         provider_id: &'a str,
         reasoning_effort: Option<ReasoningEffort>,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
@@ -215,6 +217,7 @@ impl SessionOpener for AppOpener {
                 provider_id,
                 reasoning_effort,
                 decisions,
+                background,
             )
             .await
         })
@@ -239,6 +242,16 @@ impl SessionOpener for AppOpener {
                 .unwrap_or_default()
         })
     }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_tools::ArchiveDir, String> {
+        let workspace = self
+            .workspaces
+            .get(&key.0)
+            .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+        let session_dir = workspace.storage.session_dir(&key.1)?;
+        coda_tools::ArchiveDir::open_or_create_root(&session_dir.join("background/tasks"))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -251,6 +264,7 @@ async fn open_session(
     provider_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
     decisions: HashMap<String, ResumeDecision>,
+    background: Arc<BackgroundProcesses>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)
@@ -301,6 +315,7 @@ async fn open_session(
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
+        .background(background)
         .open()
         .await
 }
@@ -449,93 +464,6 @@ fn normalize_provider_selection(
 ) -> Option<Option<ReasoningEffort>> {
     let provider = app.providers.get(provider_id)?;
     normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
-}
-
-#[cfg(test)]
-mod selection_tests {
-    use super::*;
-
-    #[test]
-    fn no_reasoning_controls_keep_none() {
-        assert_eq!(normalize_reasoning_effort(&[], None), Some(None));
-    }
-
-    #[test]
-    fn omitted_effort_uses_first_configured_level() {
-        assert_eq!(
-            normalize_reasoning_effort(&[ReasoningEffort::Low, ReasoningEffort::High], None),
-            Some(Some(ReasoningEffort::Low))
-        );
-    }
-
-    #[test]
-    fn reasoning_model_accepts_off_and_configured_levels() {
-        let configured = [ReasoningEffort::Low, ReasoningEffort::High];
-        assert_eq!(
-            normalize_reasoning_effort(&configured, Some(ReasoningEffort::None)),
-            Some(Some(ReasoningEffort::None))
-        );
-        assert_eq!(
-            normalize_reasoning_effort(&configured, Some(ReasoningEffort::High)),
-            Some(Some(ReasoningEffort::High))
-        );
-    }
-
-    #[test]
-    fn reasoning_model_rejects_unconfigured_levels() {
-        assert_eq!(
-            normalize_reasoning_effort(&[ReasoningEffort::Low], Some(ReasoningEffort::High)),
-            None
-        );
-        assert_eq!(
-            normalize_reasoning_effort(&[], Some(ReasoningEffort::None)),
-            None
-        );
-    }
-
-    #[test]
-    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
-        let images = (0..(MAX_TASK_IMAGES + 1))
-            .map(|index| format!("https://example.com/{index}.png"))
-            .collect();
-
-        let sanitized = sanitize_task_images(images);
-
-        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
-        assert_eq!(sanitized[0], "https://example.com/0.png");
-        assert_eq!(sanitized[4], "https://example.com/4.png");
-    }
-
-    #[test]
-    fn task_image_sanitizer_accepts_supported_data_uri_images() {
-        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
-
-        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
-    }
-
-    #[test]
-    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
-        let oversized_url = format!(
-            "https://example.com/{}",
-            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
-        );
-        let oversized_data = format!(
-            "data:image/png;base64,{}",
-            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
-        );
-        let images = vec![
-            "http://example.com/image.png".to_string(),
-            "data:text/plain;base64,AAAA".to_string(),
-            "data:image/png;base64,AAA".to_string(),
-            "data:image/png;base64,AA=A".to_string(),
-            oversized_url,
-            oversized_data,
-        ];
-
-        let sanitized = sanitize_task_images(images);
-
-        assert!(sanitized.is_empty());
-    }
 }
 
 /// The selectable models, sorted by id for a stable dashboard ordering. Each
@@ -997,6 +925,13 @@ async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = Server
                             event: *event,
                         }).await
                     }
+                    RelayEvent::BackgroundTasks(tasks) => {
+                        transport.send(&ServerMessage::BackgroundTasks {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            tasks: tasks.to_vec(),
+                        }).await
+                    }
                     RelayEvent::Evicted => {
                         streams.remove(&key);
                         selections.remove(&key);
@@ -1360,6 +1295,12 @@ async fn main() {
             providers: providers.clone(),
             workspaces: workspaces.clone(),
         }),
+        Arc::new(FsNoticeStore::new(
+            workspaces
+                .iter()
+                .map(|(id, state)| (id.clone(), state.storage.clone()))
+                .collect(),
+        )),
         server_config.relay,
     ));
 
@@ -1420,4 +1361,91 @@ async fn main() {
     }
 
     info!("server stopped");
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn no_reasoning_controls_keep_none() {
+        assert_eq!(normalize_reasoning_effort(&[], None), Some(None));
+    }
+
+    #[test]
+    fn omitted_effort_uses_first_configured_level() {
+        assert_eq!(
+            normalize_reasoning_effort(&[ReasoningEffort::Low, ReasoningEffort::High], None),
+            Some(Some(ReasoningEffort::Low))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_accepts_off_and_configured_levels() {
+        let configured = [ReasoningEffort::Low, ReasoningEffort::High];
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some(ReasoningEffort::None)),
+            Some(Some(ReasoningEffort::None))
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some(ReasoningEffort::High)),
+            Some(Some(ReasoningEffort::High))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_rejects_unconfigured_levels() {
+        assert_eq!(
+            normalize_reasoning_effort(&[ReasoningEffort::Low], Some(ReasoningEffort::High)),
+            None
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&[], Some(ReasoningEffort::None)),
+            None
+        );
+    }
+
+    #[test]
+    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
+        let images = (0..(MAX_TASK_IMAGES + 1))
+            .map(|index| format!("https://example.com/{index}.png"))
+            .collect();
+
+        let sanitized = sanitize_task_images(images);
+
+        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
+        assert_eq!(sanitized[0], "https://example.com/0.png");
+        assert_eq!(sanitized[4], "https://example.com/4.png");
+    }
+
+    #[test]
+    fn task_image_sanitizer_accepts_supported_data_uri_images() {
+        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
+
+        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
+    }
+
+    #[test]
+    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
+        let oversized_url = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
+        );
+        let oversized_data = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
+        );
+        let images = vec![
+            "http://example.com/image.png".to_string(),
+            "data:text/plain;base64,AAAA".to_string(),
+            "data:image/png;base64,AAA".to_string(),
+            "data:image/png;base64,AA=A".to_string(),
+            oversized_url,
+            oversized_data,
+        ];
+
+        let sanitized = sanitize_task_images(images);
+
+        assert!(sanitized.is_empty());
+    }
 }

@@ -27,6 +27,7 @@ tokio-stream = "0.1"
 schemars = "1.2.1"
 jiff = { version = "0.2", features = ["serde"] }
 libc = "0.2"
+rustix = { version = "1", features = ["fs", "process"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "v5"] }
 

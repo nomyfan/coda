@@ -12,11 +12,13 @@ import {
   type ServerMessage,
   type ToolCall,
   type ToolCallResolution,
+  type TaskSummary,
   type ToolMessage,
   type WireEvent,
   type WorkspaceSummary,
   callArguments,
   describeTool,
+  isTaskNotice,
   extractShellCommand,
   outcomeText,
   outputText,
@@ -37,7 +39,15 @@ export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | 
 
 export type TranscriptEntry = {
   id: string;
-  kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
+  kind:
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "system"
+    | "error"
+    | "task_notice";
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -93,6 +103,9 @@ export type OpenedSession = {
   draft?: boolean;
   /** First user task, used as the session list title before the server persists it. */
   firstUserMessage?: string;
+  /** Live overview of the session's background tasks (full replacement,
+   * pushed on attach and on every registry change). */
+  backgroundTasks: TaskSummary[];
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
@@ -174,6 +187,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     allowDrafts: {},
     running: false,
     evicted: false,
+    backgroundTasks: [],
     usage: [],
   };
 }
@@ -326,6 +340,16 @@ function historyToEntries(
     const images = message.User.parts
       .filter((p) => p.type === "image")
       .map((p) => (p as { type: "image"; url: string }).url);
+    if (isTaskNotice(message.User)) {
+      return [
+        {
+          id: `history:task-notice:${index}`,
+          kind: "task_notice",
+          content: textContent,
+          startedAt: message.User.created_at,
+        },
+      ];
+    }
     return [
       {
         id: `history:user:${index}`,
@@ -729,6 +753,30 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
           detail: subAgentDisplayName(event.message.name),
         }),
       };
+    case "task_notice": {
+      const text = event.message.parts
+        .filter((p) => p.type === "text")
+        .map((p) => (p as { type: "text"; text: string }).text)
+        .join("");
+      return {
+        ...addActivity(session, {
+          tone: "cyan",
+          label: "background task",
+          detail: text.split("\n", 1)[0],
+        }),
+        entries: [
+          ...session.entries,
+          {
+            id: newId("task-notice"),
+            kind: "task_notice",
+            agentName: event.agent_name,
+            threadId: event.thread_id,
+            content: text,
+            startedAt: event.message.created_at,
+          },
+        ],
+      };
+    }
     case "suspended":
       return {
         ...addActivity(session, {
@@ -1261,6 +1309,22 @@ function applyEvent(
   });
 }
 
+function applyBackgroundTasks(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  tasks: TaskSummary[],
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      session.backgroundTasks = tasks;
+    }
+  });
+}
+
 function addAllowResultActivity(
   store: CodaStore,
   server: string,
@@ -1572,6 +1636,16 @@ export function connectServer(rawUrl: string) {
       }
       if (message.type === "event") {
         applyEvent(codaStore, server, message.workspace_id, message.session_id, message.event);
+        return;
+      }
+      if (message.type === "background_tasks") {
+        applyBackgroundTasks(
+          codaStore,
+          server,
+          message.workspace_id,
+          message.session_id,
+          message.tasks,
+        );
         return;
       }
       addAllowResultActivity(
@@ -1992,6 +2066,9 @@ export const selectActiveEvicted = (state: CodaStoreState) =>
   activeSessionOf(state)?.evicted ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
+const EMPTY_TASKS: TaskSummary[] = [];
+export const selectActiveBackgroundTasks = (state: CodaStoreState) =>
+  activeSessionOf(state)?.backgroundTasks ?? EMPTY_TASKS;
 export const selectActiveDrafts = (state: CodaStoreState) =>
   activeSessionOf(state)?.drafts ?? EMPTY_DRAFTS;
 export const selectActiveAllowDrafts = (state: CodaStoreState) =>

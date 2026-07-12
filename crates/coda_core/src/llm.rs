@@ -24,6 +24,39 @@ pub enum ContentPart {
     Image { url: String },
 }
 
+/// Who produced a user-turn message: the human, or the runtime delivering
+/// background-task completion notices on their behalf. Persisted with the
+/// message; clients render notices differently, and restore paths use the
+/// carried task ids to dedupe re-delivery.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserOrigin {
+    #[default]
+    Human,
+    /// The stable notice fact keys this message delivered — the dedupe keys for
+    /// restore. A task's completion and its later output-expiration are
+    /// *different* facts with different keys, so re-delivering one never
+    /// suppresses the other.
+    TaskNotice { notice_keys: Vec<TaskNoticeKey> },
+}
+
+/// Stable identity of a background-task notice *fact*, independent of its
+/// mutable payload (status, timestamp, reason). Lives here (rather than in
+/// `coda_tools`) so wire/history types can carry it without a reverse crate
+/// dependency; it is identity-only and never used to build an archive path,
+/// hence the plain `String` task id.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskNoticeKey {
+    /// A task reached a terminal state.
+    Completed { task_id: String },
+    /// A task's retained output was later evicted by the session quota.
+    OutputExpired { task_id: String },
+    /// One overflow aggregate, identified by a stable id minted at creation so
+    /// facts it cannot enumerate individually are still deduped as a batch.
+    OverflowBatch { batch_id: String },
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -31,6 +64,10 @@ pub struct UserMessage {
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
     pub created_at: jiff::Timestamp,
+    /// Defaults to `Human`, so checkpoints written before this field existed
+    /// deserialize as ordinary user messages.
+    #[serde(default)]
+    pub origin: UserOrigin,
 }
 
 impl UserMessage {
@@ -39,6 +76,7 @@ impl UserMessage {
         Self {
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::Human,
         }
     }
 
@@ -59,6 +97,17 @@ impl UserMessage {
         Self {
             parts,
             created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::Human,
+        }
+    }
+
+    /// Construct a background-task notice delivered as a user-turn message,
+    /// carrying the covered notice fact keys for restore-time dedupe.
+    pub fn task_notice(text: impl Into<String>, notice_keys: Vec<TaskNoticeKey>) -> Self {
+        Self {
+            parts: vec![ContentPart::Text { text: text.into() }],
+            created_at: jiff::Timestamp::now(),
+            origin: UserOrigin::TaskNotice { notice_keys },
         }
     }
 

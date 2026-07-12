@@ -31,6 +31,7 @@ import { Button } from "@/components/ui/button";
 import { Composer } from "@/components/composer";
 import { Transcript } from "@/components/transcript";
 import { ApprovalPanel } from "@/components/approval-panel";
+import { BackgroundTasksBar } from "@/components/background-tasks";
 import { serverLabel } from "@/components/session-utils";
 import { ThemeToggle } from "@/components/theme-toggle";
 import {
@@ -380,7 +381,10 @@ export default function App() {
                   onSelectTarget={setNewSessionTarget}
                 />
               ) : (
-                <ApprovalPanel />
+                <>
+                  <BackgroundTasksBar />
+                  <ApprovalPanel />
+                </>
               )}
               {showComposer ? (
                 <Composer

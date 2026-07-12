@@ -103,14 +103,20 @@ function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem
 
   while (index < entries.length) {
     const entry = entries[index];
-    if (entry.kind === "user") {
+    // Task notices head a user turn: render both standalone so a notice never
+    // gets folded into the preceding assistant turn's disclosure group.
+    if (entry.kind === "user" || entry.kind === "task_notice") {
       items.push({ type: "entry", entry });
       index += 1;
       continue;
     }
 
     const start = index;
-    while (index < entries.length && entries[index].kind !== "user") {
+    while (
+      index < entries.length &&
+      entries[index].kind !== "user" &&
+      entries[index].kind !== "task_notice"
+    ) {
       index += 1;
     }
 
@@ -843,6 +849,26 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
 
   if (entry.kind === "user") {
     return <UserMessageBubble entry={entry} />;
+  }
+
+  // A background-task completion notice: delivered as a user-turn message but
+  // rendered as an informational card, not a user bubble. Aggregate notices
+  // (many completions folded into one) use the same card.
+  if (entry.kind === "task_notice") {
+    return (
+      <article className="rounded-md border border-cyan-500/35 bg-cyan-500/10 p-3 shadow-sm">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <SquareTerminal className="size-4 shrink-0 text-cyan-600 dark:text-cyan-400" />
+            <span className="shrink-0 truncate text-sm font-medium">Background task</span>
+          </div>
+          <EntryTiming entry={entry} mode="end" className="shrink-0" />
+        </div>
+        <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6">
+          {entry.content}
+        </pre>
+      </article>
+    );
   }
 
   const tone =

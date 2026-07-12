@@ -15,7 +15,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 /// inherited pipe open. Kept short so an abort settles within the driver's
 /// grace period; on expiry the readers are aborted and whatever partial
 /// output they had buffered is lost.
-const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How a [`run_command`] invocation ended.
 pub(crate) enum CommandOutcome {
@@ -49,32 +49,13 @@ pub(crate) async fn run_command(
         });
     }
 
-    // The sentinel spawns first: if it fails, the call fails before the
-    // command has run at all. The reverse order would leave a running
-    // command with no reliable way to kill it.
-    let sentinel = spawn_sentinel().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("failed to spawn group sentinel: {e}"))
-    })?;
-    let Some(pgid) = sentinel.id().map(|pid| pid as i32) else {
-        // A freshly spawned child has a pid; bail out defensively if not.
-        // kill_on_drop reaps the sentinel on return.
-        return Err(std::io::Error::other("group sentinel pid unavailable"));
-    };
-
-    // The command joins the sentinel's group. The group is guaranteed alive
-    // (the sentinel never exits on its own), so joining cannot race.
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(pgid)
-        .spawn()?;
+    let mut group = GroupedChild::spawn(&mut cmd)?;
 
     // Drain both pipes concurrently with wait(): a full pipe would block the
     // child forever. On cancellation the buffers collected so far become the
     // partial output.
-    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let mut stdout_pipe = group.child.stdout.take().expect("stdout is piped");
+    let mut stderr_pipe = group.child.stderr.take().expect("stderr is piped");
     let mut stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf).await;
@@ -86,12 +67,10 @@ pub(crate) async fn run_command(
         buf
     });
 
-    // Declared after `sentinel` so it drops first: the killpg in its Drop
-    // must run while the sentinel still pins the group.
-    let mut guard = KillGroupGuard {
-        pgid: Some(pgid),
-        readers: [stdout_task.abort_handle(), stderr_task.abort_handle()],
-    };
+    // If the future is dropped mid-flight, `group`'s Drop kills the process
+    // group; this guard aborts the pipe readers so no blocked reader task
+    // outlives the call unnoticed.
+    let _readers = AbortReadersGuard([stdout_task.abort_handle(), stderr_task.abort_handle()]);
 
     let status = tokio::select! {
         biased;
@@ -99,23 +78,21 @@ pub(crate) async fn run_command(
             // Kill the whole group, then reap the leader before we report
             // back. The pipes hit EOF, letting the reader tasks finish with
             // whatever was produced.
-            guard.kill();
-            let _ = child.wait().await;
+            group.kill_group();
+            let _ = group.child.wait().await;
             None
         }
-        status = child.wait() => Some(status),
+        status = group.child.wait() => Some(status),
     };
 
     // Cancelled before the leader exited: the group is dead, so the pipes EOF
     // at once — unless a descendant escaped the group (setsid) and holds one
     // open, which nothing will ever tear down. Bound the drain.
     let Some(status) = status else {
-        let outcome = CommandOutcome::Cancelled {
+        return Ok(CommandOutcome::Cancelled {
             stdout: drain_reader(&mut stdout_task).await,
             stderr: drain_reader(&mut stderr_task).await,
-        };
-        guard.disarm();
-        return Ok(outcome);
+        });
     };
 
     // A normal exit usually EOFs the pipes right away; a clean command whose
@@ -127,13 +104,11 @@ pub(crate) async fn run_command(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            guard.kill();
-            let outcome = CommandOutcome::Cancelled {
+            group.kill_group();
+            Ok(CommandOutcome::Cancelled {
                 stdout: drain_reader(&mut stdout_task).await,
                 stderr: drain_reader(&mut stderr_task).await,
-            };
-            guard.disarm();
-            Ok(outcome)
+            })
         }
         bufs = async {
             (
@@ -141,13 +116,83 @@ pub(crate) async fn run_command(
                 (&mut stderr_task).await.unwrap_or_default(),
             )
         } => {
-            guard.disarm();
+            group.disarm();
             Ok(CommandOutcome::Completed(Output {
                 status: status?,
                 stdout: bufs.0,
                 stderr: bufs.1,
             }))
         }
+    }
+}
+
+/// A child process running inside a fresh, sentinel-pinned process group,
+/// with stdin null and stdout/stderr piped. The primitive shared by the
+/// foreground [`run_command`] path and the background-task registry: spawn
+/// into a killable group, SIGKILL the whole group on demand, and never leak
+/// the group if the owner is dropped mid-flight.
+pub(crate) struct GroupedChild {
+    /// Pins the group so its numeric id stays ours for as long as we may
+    /// still signal it — see [`spawn_sentinel`]. Killed by the group kill;
+    /// kill_on_drop reaps it when this value drops.
+    _sentinel: Child,
+    /// `Some` until the group is killed or disarmed; taken so the group is
+    /// never signalled twice (the id may be recycled once every member is
+    /// reaped).
+    pgid: Option<i32>,
+    pub(crate) child: Child,
+}
+
+impl GroupedChild {
+    /// Spawns `cmd` in a fresh process group. The sentinel spawns first: if
+    /// it fails, the call fails before the command has run at all. The
+    /// reverse order would leave a running command with no reliable way to
+    /// kill it.
+    pub(crate) fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        let sentinel = spawn_sentinel().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to spawn group sentinel: {e}"))
+        })?;
+        let Some(pgid) = sentinel.id().map(|pid| pid as i32) else {
+            // A freshly spawned child has a pid; bail out defensively if not.
+            // kill_on_drop reaps the sentinel on return.
+            return Err(std::io::Error::other("group sentinel pid unavailable"));
+        };
+
+        // The command joins the sentinel's group. The group is guaranteed
+        // alive (the sentinel never exits on its own), so joining cannot
+        // race.
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(pgid)
+            .spawn()?;
+
+        Ok(Self {
+            _sentinel: sentinel,
+            pgid: Some(pgid),
+            child,
+        })
+    }
+
+    /// Sends SIGKILL to the whole process group. Idempotent: a no-op once
+    /// the group has been killed or disarmed.
+    pub(crate) fn kill_group(&mut self) {
+        kill_group(self.pgid.take());
+    }
+
+    /// The command settled without a group kill; the group may empty out and
+    /// its id be recycled, so never signal it again (including on drop).
+    pub(crate) fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for GroupedChild {
+    fn drop(&mut self) {
+        // Runs before the fields drop, so the sentinel still pins the group
+        // at the killpg.
+        kill_group(self.pgid.take());
     }
 }
 
@@ -196,31 +241,15 @@ fn kill_group(pgid: Option<i32>) {
 }
 
 /// Last-resort teardown if the [`run_command`] future is dropped mid-flight
-/// (a caller that discards tool futures instead of cancelling): kills the
-/// command's process group and aborts the pipe readers.
-struct KillGroupGuard {
-    pgid: Option<i32>,
-    readers: [AbortHandle; 2],
-}
+/// (a caller that discards tool futures instead of cancelling): aborts the
+/// pipe readers so they don't block forever on pipes nobody drains. The
+/// process group itself is killed by [`GroupedChild`]'s own Drop.
+struct AbortReadersGuard([AbortHandle; 2]);
 
-impl KillGroupGuard {
-    /// Kill the group now. The readers stay untouched so the cancellation
-    /// path can still salvage partial output from them.
-    fn kill(&mut self) {
-        kill_group(self.pgid.take());
-    }
-
-    /// The command settled; the pid may be recycled, so never signal it again.
-    fn disarm(&mut self) {
-        self.pgid = None;
-    }
-}
-
-impl Drop for KillGroupGuard {
+impl Drop for AbortReadersGuard {
     fn drop(&mut self) {
-        kill_group(self.pgid.take());
         // No-ops for readers that already ran to completion or were aborted.
-        for reader in &self.readers {
+        for reader in &self.0 {
             reader.abort();
         }
     }

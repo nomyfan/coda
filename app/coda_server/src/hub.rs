@@ -15,12 +15,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, ReasoningEffort, UserMessage};
+use coda_core::llm::{Message, ReasoningEffort, TaskNoticeKey, UserMessage, UserOrigin};
+use coda_tools::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -28,6 +29,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::config::RelayConfig;
+use crate::notices::NoticeStore;
 use crate::wire::WireEvent;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
@@ -57,6 +59,10 @@ pub enum SessionCommand {
 #[derive(Debug)]
 pub enum RelayEvent {
     Event(Box<WireEvent>),
+    /// Full overview of the session's background tasks: sent once right after
+    /// attach and again on every registry change. Always the whole retained
+    /// set — a replacement, not a delta.
+    BackgroundTasks(Arc<[TaskSummary]>),
     /// Another client attached to this session; this stream ends after this.
     Evicted,
     /// The session runtime ended (released, deleted, or replaced); this stream
@@ -116,6 +122,7 @@ pub trait SessionOpener: Send + Sync + 'static {
         provider_id: &'a str,
         reasoning_effort: Option<ReasoningEffort>,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
 
     /// Load the persisted conversation history for `key` (empty when none).
@@ -125,6 +132,12 @@ pub trait SessionOpener: Send + Sync + 'static {
         &'a self,
         key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>>;
+
+    /// Open (creating if needed) the session's background output archive
+    /// directory capability, rooted under the session's persisted storage so it
+    /// is deleted with the session. `Err` disables background storage for the
+    /// session without blocking the conversation.
+    fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String>;
 }
 
 /// Why an attach was not served.
@@ -295,9 +308,11 @@ impl EventLog {
 ///
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
-/// 2. The turn's user message (front of `unsettled_user_messages`; absent for resumed
+/// 2. `TaskNotice` user messages — background-task notices the driver writes
+///    after the stale cleanups and ahead of the user message.
+/// 3. The turn's user message (front of `unsettled_user_messages`; absent for resumed
 ///    turns).
-/// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
+/// 4. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
 ///
 /// Sub-agent events and chunk-tier events are skipped (matching what the
 /// checkpoint history holds). The log is cleared afterwards.
@@ -320,6 +335,10 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
+    while let Some(WireEvent::TaskNotice { message, .. }) = entries.peek() {
+        snapshot.push(Message::User(message.clone()));
+        entries.next();
+    }
     if let Some(user) = unsettled_user_messages.pop_front() {
         snapshot.push(user);
     }
@@ -335,6 +354,10 @@ fn fold_settled_turn(
                 message,
                 ..
             } if agent_name == root_name => snapshot.push(Message::Tool(message.clone())),
+            // Placed verbatim wherever it appears; today the driver only
+            // writes notices at the head of a turn (handled above), but a
+            // future mid-turn delivery must not be silently dropped.
+            WireEvent::TaskNotice { message, .. } => snapshot.push(Message::User(message.clone())),
             _ => {}
         }
     }
@@ -405,6 +428,25 @@ struct EntryState {
 struct SessionEntry {
     key: SessionKey,
     inner: Arc<Mutex<EntryState>>,
+    /// The entry — not the `Session` — owns the background task registry, so
+    /// session rebuilds within this entry (a model switch) never touch
+    /// running tasks or undelivered notices. Injected into every session
+    /// opened for this entry; torn down (and its notices persisted) only by
+    /// `begin_release`. Initialized once, during the entry's first attach, to a
+    /// session-backed registry rooted at the session's archive directory (so
+    /// output survives release/reopen and restart); a `get_or_init` fallback
+    /// keeps it valid for any access that races initialization.
+    background_cell: OnceLock<Arc<BackgroundProcesses>>,
+}
+
+impl SessionEntry {
+    /// The entry's background registry. Set to a session-backed registry during
+    /// initialization; the fallback (a temporary registry) only applies if an
+    /// access somehow precedes initialization.
+    fn background(&self) -> &Arc<BackgroundProcesses> {
+        self.background_cell
+            .get_or_init(|| Arc::new(BackgroundProcesses::temporary()))
+    }
 }
 
 type EntryGuard = OwnedMutexGuard<EntryState>;
@@ -415,14 +457,20 @@ pub struct SessionHub {
     opener: Arc<dyn SessionOpener>,
     entries: Entries,
     limits: RelayConfig,
+    notices: Arc<dyn NoticeStore>,
 }
 
 impl SessionHub {
-    pub fn new(opener: Arc<dyn SessionOpener>, limits: RelayConfig) -> Self {
+    pub fn new(
+        opener: Arc<dyn SessionOpener>,
+        notices: Arc<dyn NoticeStore>,
+        limits: RelayConfig,
+    ) -> Self {
         Self {
             opener,
             entries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             limits,
+            notices,
         }
     }
 
@@ -440,6 +488,7 @@ impl SessionHub {
                                 phase: EntryPhase::Uninitialized,
                                 attached: None,
                             })),
+                            background_cell: OnceLock::new(),
                         })
                     })
                     .clone()
@@ -505,6 +554,7 @@ impl SessionHub {
         entries: &Entries,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
+        notices: Arc<dyn NoticeStore>,
         mode: Shutdown,
         notify_closed: bool,
     ) -> impl Future<Output = ()> + Send + 'static {
@@ -545,6 +595,19 @@ impl SessionHub {
                 // once the runtime has already stopped on its own).
                 session.shutdown(mode).await;
             }
+            // The runtime is stopped (so no more notices can be taken for
+            // delivery): tear down the entry-owned registry and persist
+            // whatever is still undelivered. A failed save loses notices new
+            // to this incarnation (accepted, crash-tier degradation); the
+            // previous document stays intact thanks to the atomic write.
+            let pending = entry.background().shutdown().await;
+            if let Err(err) = notices.save(&entry.key, &pending).await {
+                error!(
+                    workspace_id = %entry.key.0,
+                    session_id = %entry.key.1,
+                    "failed to persist pending task notices: {err}"
+                );
+            }
             {
                 let mut map = entries.lock().expect("entries mutex poisoned");
                 if map
@@ -560,14 +623,27 @@ impl SessionHub {
         }
     }
 
-    /// Release the entry when nothing keeps it alive: no attached client and
-    /// no running turn. Returns the outside-the-lock work, if any.
+    /// Release the entry when nothing keeps it alive: no attached client, no
+    /// running turn, and no running background task. Returns the
+    /// outside-the-lock work, if any.
     fn maybe_release(
         entries: &Entries,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
+        notices: &Arc<dyn NoticeStore>,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
         if state.attached.is_some() {
+            return None;
+        }
+        // Running background tasks pin the entry across disconnects; the
+        // idle watcher re-runs this check when they hit zero.
+        if entry
+            .background()
+            .summaries()
+            .borrow()
+            .iter()
+            .any(|summary| summary.status.is_running())
+        {
             return None;
         }
         let idle = match &state.phase {
@@ -576,7 +652,14 @@ impl SessionHub {
             _ => false,
         };
         idle.then(|| {
-            Self::begin_release(entries, entry, state, Shutdown::graceful_unbounded(), false)
+            Self::begin_release(
+                entries,
+                entry,
+                state,
+                notices.clone(),
+                Shutdown::graceful_unbounded(),
+                false,
+            )
         })
     }
 
@@ -599,6 +682,7 @@ impl SessionHub {
         spawn_event_pipeline(
             self.entries.clone(),
             entry.clone(),
+            self.notices.clone(),
             session.clone(),
             root_name,
             generation,
@@ -673,7 +757,13 @@ impl SessionHub {
                 let decisions = std::mem::take(&mut pending.decisions);
                 match self
                     .opener
-                    .open(key, &provider_id, reasoning_effort, decisions)
+                    .open(
+                        key,
+                        &provider_id,
+                        reasoning_effort,
+                        decisions,
+                        entry.background().clone(),
+                    )
                     .await
                 {
                     Ok(session) => {
@@ -695,13 +785,23 @@ impl SessionHub {
                         CommandOutcome::StillPending(more)
                     }
                     Err(err) => {
-                        // Match the previous behavior: the gated open is
-                        // dropped; a fresh OpenSession retries from scratch.
-                        state.phase = EntryPhase::Released;
-                        self.entries
-                            .lock()
-                            .expect("entries mutex poisoned")
-                            .remove(key);
+                        // The gated open is dropped; a fresh OpenSession
+                        // retries from scratch. Route through the release
+                        // path rather than bare map removal: this entry is
+                        // initialized, so its idle watcher is parked on the
+                        // registry — only `begin_release`'s registry
+                        // shutdown wakes and retires it (a bare removal
+                        // would leak the watcher, its attachment, and the
+                        // relay stream on every failed retry).
+                        let release = Self::begin_release(
+                            &self.entries,
+                            entry,
+                            state,
+                            self.notices.clone(),
+                            Shutdown::abort(),
+                            false,
+                        );
+                        tokio::spawn(release);
                         CommandOutcome::OpenFailed(err)
                     }
                 }
@@ -732,9 +832,18 @@ impl SessionHub {
         // Open the replacement before tearing down the current session, so a
         // failed open leaves the existing one intact. The old session is idle,
         // so its checkpoint is durable and the new open reads current state.
+        // The entry-owned registry carries over: running background tasks and
+        // undelivered notices survive the swap (no restore here — restoring
+        // is once per entry, at initialization).
         match self
             .opener
-            .open(key, &provider_id, reasoning_effort, HashMap::new())
+            .open(
+                key,
+                &provider_id,
+                reasoning_effort,
+                HashMap::new(),
+                entry.background().clone(),
+            )
             .await
         {
             Ok(session) => {
@@ -803,9 +912,60 @@ impl SessionRelay for SessionHub {
             }
 
             if matches!(state.phase, EntryPhase::Uninitialized) {
+                // Entry initialization — once per entry incarnation. Later
+                // opens within this entry (model switch, approvals-gated
+                // promotion) reuse the registry and must NOT restore again:
+                // that would duplicate the persisted batch.
+
+                // Build the session-backed registry first, before any access to
+                // it, so it (not the fallback) is what handles this session's
+                // tasks. A failure to open the archive disables background
+                // storage but leaves the conversation working.
+                let registry = match self.opener.background_archive(&key) {
+                    Ok(archive) => BackgroundProcesses::session_backed(archive).await,
+                    Err(err) => {
+                        warn!(
+                            workspace_id = %key.0, session_id = %key.1,
+                            "background archive unavailable; background tasks disabled: {err}"
+                        );
+                        BackgroundProcesses::disabled(coda_tools::ArchiveError::corrupt(err))
+                    }
+                };
+                let _ = entry.background_cell.set(Arc::new(registry));
+
+                match self.notices.load(&key).await {
+                    Ok(restored) => {
+                        // Crash-window dedupe: a notice whose task ids all
+                        // already appear in the checkpoint history was
+                        // delivered before the store was rewritten (crash or
+                        // failed save between injection and release) — drop
+                        // it rather than deliver twice.
+                        let restored = if restored.is_empty() {
+                            restored
+                        } else {
+                            dedupe_restored_notices(
+                                restored,
+                                &self.opener.load_messages(&key).await,
+                            )
+                        };
+                        entry.background().restore_notices(restored).await;
+                    }
+                    Err(err) => {
+                        warn!(
+                            workspace_id = %key.0, session_id = %key.1,
+                            "failed to load pending task notices; proceeding without: {err}"
+                        );
+                    }
+                }
                 match self
                     .opener
-                    .open(&key, &provider_id, reasoning_effort, HashMap::new())
+                    .open(
+                        &key,
+                        &provider_id,
+                        reasoning_effort,
+                        HashMap::new(),
+                        entry.background().clone(),
+                    )
                     .await
                 {
                     Ok(session) => {
@@ -834,6 +994,8 @@ impl SessionRelay for SessionHub {
                     }
                     Err(err) => {
                         // Don't wedge the key: drop the half-built entry.
+                        // Restored notices die with it, but the store was not
+                        // rewritten — the next attempt restores them again.
                         state.phase = EntryPhase::Released;
                         self.entries
                             .lock()
@@ -842,6 +1004,10 @@ impl SessionRelay for SessionHub {
                         return Err(AttachError::Open(err));
                     }
                 }
+                // Only after a successful init: a discarded entry (above)
+                // would leave the watcher parked forever, since only
+                // `begin_release` wakes it via the registry shutdown.
+                spawn_idle_watcher(self.entries.clone(), entry.clone(), self.notices.clone());
             }
 
             let snapshot = compose_snapshot(&state.phase)
@@ -851,6 +1017,11 @@ impl SessionRelay for SessionHub {
             // section the forwarder appends under: every event lands in the
             // replay xor arrives live, exactly once and in order.
             let (tx, rx) = mpsc::unbounded_channel();
+            // Attach yields the current background-task overview immediately;
+            // the summaries watcher pushes every later change.
+            let _ = tx.send(RelayEvent::BackgroundTasks(
+                entry.background().summaries().borrow().clone(),
+            ));
             if let EntryPhase::Live(live) = &state.phase {
                 for event in live.log.iter() {
                     let _ = tx.send(RelayEvent::Event(Box::new(event.clone())));
@@ -923,7 +1094,8 @@ impl SessionRelay for SessionHub {
             {
                 state.attached = None;
             }
-            if let Some(release) = Self::maybe_release(&self.entries, &entry, state) {
+            if let Some(release) = Self::maybe_release(&self.entries, &entry, state, &self.notices)
+            {
                 drop(guard);
                 tokio::spawn(release);
             }
@@ -993,8 +1165,14 @@ impl SessionRelay for SessionHub {
             // Abort rather than graceful: a turn still in flight gets cut off
             // instead of finishing, so nothing new is added to history before
             // the caller deletes the persisted directory right after.
-            let release =
-                Self::begin_release(&self.entries, &entry, state, Shutdown::abort(), false);
+            let release = Self::begin_release(
+                &self.entries,
+                &entry,
+                state,
+                self.notices.clone(),
+                Shutdown::abort(),
+                false,
+            );
             drop(guard);
             // Inline: the caller deletes persisted state right after.
             release.await;
@@ -1029,16 +1207,25 @@ impl SessionRelay for SessionHub {
             for entry in entries {
                 let mut guard = entry.inner.clone().lock_owned().await;
                 let state = &mut *guard;
-                if matches!(
-                    state.phase,
-                    EntryPhase::Releasing { .. } | EntryPhase::Released | EntryPhase::Uninitialized
-                ) {
-                    continue;
+                match &state.phase {
+                    EntryPhase::Releasing { done } => {
+                        let mut done = done.clone();
+                        drop(guard);
+                        while !*done.borrow_and_update() {
+                            if done.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    EntryPhase::Released | EntryPhase::Uninitialized => continue,
+                    EntryPhase::Live(_) | EntryPhase::Pending(_) => {}
                 }
                 let release = Self::begin_release(
                     &self.entries,
                     &entry,
                     state,
+                    self.notices.clone(),
                     Shutdown::graceful_then_abort(std::time::Duration::from_secs(5)),
                     true,
                 );
@@ -1101,6 +1288,7 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
 fn spawn_event_pipeline(
     entries: Entries,
     entry: Arc<SessionEntry>,
+    notices: Arc<dyn NoticeStore>,
     session: Session,
     root_name: String,
     generation: u64,
@@ -1119,7 +1307,113 @@ fn spawn_event_pipeline(
             info!(workspace_id = %workspace_id, session_id = %session_id, generation, "event pump stopped");
         });
     }
-    tokio::spawn(run_forwarder(entries, entry, rx, root_name, generation));
+    tokio::spawn(run_forwarder(
+        entries, entry, notices, rx, root_name, generation,
+    ));
+}
+
+/// Watches the entry's background registry: every change is pushed to the
+/// attached client as a fresh [`RelayEvent::BackgroundTasks`] overview, and
+/// whenever the running-task count returns to zero the release check is
+/// re-run — `maybe_release` refuses to release while tasks run, so something
+/// must revisit the decision when the last one finishes (a disconnected,
+/// idle session would otherwise stay resident forever). Spawned once per
+/// initialized entry; `begin_release` wakes it a final time via the registry
+/// shutdown's publish, upon which it observes the terminal phase and retires.
+fn spawn_idle_watcher(entries: Entries, entry: Arc<SessionEntry>, notices: Arc<dyn NoticeStore>) {
+    tokio::spawn(async move {
+        let mut summaries = entry.background().summaries();
+        loop {
+            // Observe first, then act under the entry lock: push the fresh
+            // overview to whoever is attached (a duplicate of the attach-time
+            // send is harmless — it's a full replacement) and, once nothing
+            // runs, re-run the release check.
+            let (tasks, running) = {
+                let borrowed = summaries.borrow_and_update();
+                let running = borrowed.iter().any(|summary| summary.status.is_running());
+                (borrowed.clone(), running)
+            };
+            {
+                let mut guard = entry.inner.clone().lock_owned().await;
+                let state = &mut *guard;
+                if matches!(
+                    state.phase,
+                    EntryPhase::Releasing { .. } | EntryPhase::Released
+                ) {
+                    return;
+                }
+                if let Some(attachment) = &state.attached {
+                    let _ = attachment.tx.send(RelayEvent::BackgroundTasks(tasks));
+                }
+                if !running
+                    && let Some(release) =
+                        SessionHub::maybe_release(&entries, &entry, state, &notices)
+                {
+                    drop(guard);
+                    release.await;
+                    return;
+                }
+            }
+            if summaries.changed().await.is_err() {
+                return; // registry gone (entry dropped)
+            }
+        }
+    });
+}
+
+/// Crash-window dedupe for notices restored from the store: a notice fact whose
+/// stable key already appears in the checkpoint history (a persisted
+/// `origin = TaskNotice` user message) was delivered before the store could be
+/// rewritten; delivering it again would duplicate it visibly. Dedupe is by
+/// *fact key*, so a task's completion never suppresses its later
+/// output-expiration. An aggregate is dropped whole if its batch key was
+/// delivered; otherwise its facts are filtered individually and the bare
+/// `uncounted` count is kept as-is.
+fn dedupe_restored_notices(restored: Vec<TaskNotice>, history: &[Message]) -> Vec<TaskNotice> {
+    let delivered: HashSet<TaskNoticeKey> = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => match &user.origin {
+                UserOrigin::TaskNotice { notice_keys } => Some(notice_keys.iter().cloned()),
+                UserOrigin::Human => None,
+            },
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    restored
+        .into_iter()
+        .filter_map(|notice| {
+            let keys = notice.keys();
+            match notice {
+                TaskNotice::Task { .. } | TaskNotice::OutputExpired { .. } => {
+                    // A single fact: keep unless its key was already delivered.
+                    (!keys.iter().any(|k| delivered.contains(k))).then_some(notice)
+                }
+                TaskNotice::Overflow {
+                    batch_id,
+                    dropped,
+                    uncounted,
+                } => {
+                    // Whole batch already delivered → drop it.
+                    if delivered.contains(&TaskNoticeKey::OverflowBatch {
+                        batch_id: batch_id.clone(),
+                    }) {
+                        return None;
+                    }
+                    let dropped: Vec<_> = dropped
+                        .into_iter()
+                        .filter(|fact| !delivered.contains(&fact.key()))
+                        .collect();
+                    (!dropped.is_empty() || uncounted > 0).then_some(TaskNotice::Overflow {
+                        batch_id,
+                        dropped,
+                        uncounted,
+                    })
+                }
+            }
+        })
+        .collect()
 }
 
 /// Force the entry to drain and resync from the persisted state: used when
@@ -1132,6 +1426,7 @@ fn spawn_event_pipeline(
 async fn force_resync(
     entries: &Entries,
     entry: &Arc<SessionEntry>,
+    notices: Arc<dyn NoticeStore>,
     mut guard: EntryGuard,
     reason: String,
 ) {
@@ -1144,6 +1439,7 @@ async fn force_resync(
         entries,
         entry,
         &mut guard,
+        notices,
         Shutdown::graceful_unbounded(),
         true,
     );
@@ -1154,6 +1450,7 @@ async fn force_resync(
 async fn run_forwarder(
     entries: Entries,
     entry: Arc<SessionEntry>,
+    notices: Arc<dyn NoticeStore>,
     mut rx: mpsc::UnboundedReceiver<SessionStreamItem>,
     root_name: String,
     generation: u64,
@@ -1175,6 +1472,7 @@ async fn run_forwarder(
                 force_resync(
                     &entries,
                     &entry,
+                    notices,
                     guard,
                     format!("session event stream lagged by {n}"),
                 )
@@ -1213,7 +1511,9 @@ async fn run_forwarder(
                         &root_name,
                     );
                     live.turn_running = false;
-                    if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
+                    if let Some(release) =
+                        SessionHub::maybe_release(&entries, &entry, state, &notices)
+                    {
                         drop(guard);
                         release.await;
                         return;
@@ -1225,7 +1525,7 @@ async fn run_forwarder(
                     // as a lagged stream rather than grow unbounded.
                     let max = live.log.limits.max_message_tier_events;
                     let reason = format!("event log exceeded {max} buffered message-tier events");
-                    force_resync(&entries, &entry, guard, reason).await;
+                    force_resync(&entries, &entry, notices, guard, reason).await;
                     return;
                 }
             }
@@ -1244,6 +1544,7 @@ async fn run_forwarder(
             &entries,
             &entry,
             state,
+            notices,
             // The runtime is already gone; this is bookkeeping.
             Shutdown::abort(),
             true,
