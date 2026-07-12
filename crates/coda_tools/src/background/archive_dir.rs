@@ -12,11 +12,16 @@
 //! Methods are synchronous syscalls; async callers offload them to the blocking
 //! pool. The capability is cheap to clone (`Arc<OwnedFd>`).
 
-use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd};
+#[cfg(test)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
+
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Stat};
+use rustix::io::Errno;
+use rustix::process::geteuid;
 
 use super::task_id::TaskId;
 
@@ -42,6 +47,12 @@ impl std::error::Error for ArchiveError {}
 impl From<io::Error> for ArchiveError {
     fn from(e: io::Error) -> Self {
         ArchiveError::Io(e)
+    }
+}
+
+impl From<Errno> for ArchiveError {
+    fn from(e: Errno) -> Self {
+        ArchiveError::Io(e.into())
     }
 }
 
@@ -90,13 +101,14 @@ pub enum EntryKind {
     Unknown,
 }
 
-const DIR_OPEN_FLAGS: libc::c_int =
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
 /// An opened directory fd, confined: descendants are reached only fd-relative.
 #[derive(Clone)]
 pub struct ArchiveDir {
     fd: Arc<OwnedFd>,
+}
+
+fn dir_oflags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
 impl ArchiveDir {
@@ -106,17 +118,10 @@ impl ArchiveDir {
     /// `fstat`-verified as a directory we own, and forced to `0700`.
     pub fn open_or_create_root(path: &Path) -> Result<Self, ArchiveError> {
         std::fs::create_dir_all(path)?;
-        let cpath = cstring(path.as_os_str().as_encoded_bytes())?;
-        // SAFETY: `cpath` is a valid NUL-terminated C string; flags forbid
-        // following a symlinked leaf.
-        let raw = unsafe { libc::open(cpath.as_ptr(), DIR_OPEN_FLAGS) };
-        let fd = owned_or_err(raw)?;
-        verify_dir(fd.as_raw_fd())?;
+        let fd = fs::open(path, dir_oflags(), Mode::empty())?;
+        verify_dir(&fd)?;
         // Force restrictive perms on the leaf (create_dir_all honours umask).
-        // SAFETY: fd is an open directory we just verified we own.
-        if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
         Ok(ArchiveDir { fd: Arc::new(fd) })
     }
 
@@ -128,30 +133,24 @@ impl ArchiveDir {
     /// Lazily enumerate direct children, one classified entry at a time, without
     /// materialising the whole directory. Never follows symlinks.
     pub fn entries(&self) -> Result<ArchiveEntries, ArchiveError> {
-        ArchiveEntries::open(self.fd.as_raw_fd())
+        Ok(ArchiveEntries {
+            dir: fs::Dir::read_from(self.fd.as_fd())?,
+        })
     }
 
     /// Open a direct child directory named by a validated [`TaskId`]. Uses
     /// `O_NOFOLLOW`, then `fstat`-verifies directory + owner + `0700`.
     pub fn open_dir(&self, name: &TaskId) -> Result<ArchiveDir, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
-        // SAFETY: openat relative to our verified dir fd; O_NOFOLLOW blocks a
-        // symlinked child.
-        let raw = unsafe { libc::openat(self.fd.as_raw_fd(), cname.as_ptr(), DIR_OPEN_FLAGS) };
-        let fd = owned_or_err(raw)?;
-        verify_dir(fd.as_raw_fd())?;
-        verify_mode(fd.as_raw_fd(), 0o700)?;
+        let fd = fs::openat(self.fd.as_fd(), name.as_str(), dir_oflags(), Mode::empty())?;
+        verify_dir(&fd)?;
+        verify_mode(&fd, 0o700)?;
         Ok(ArchiveDir { fd: Arc::new(fd) })
     }
 
     /// `mkdirat(0700)` a fresh task directory then open and verify it. Fails if
     /// the name already exists (ids are unique).
     pub fn create_dir(&self, name: &TaskId) -> Result<ArchiveDir, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
-        // SAFETY: mkdirat relative to our dir fd with an explicit mode.
-        if unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        fs::mkdirat(self.fd.as_fd(), name.as_str(), Mode::from_raw_mode(0o700))?;
         self.open_dir(name)
     }
 
@@ -159,22 +158,16 @@ impl ArchiveDir {
     /// `fstat`-verify regular + owner + mode. Opened `O_RDWR` so ring files can
     /// be `pread`/`pwrite`n.
     pub fn create_file(&self, name: ArchiveFileName) -> Result<std::fs::File, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
         let flags =
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: openat relative to our dir fd; mode applies because O_CREAT.
-        let raw = unsafe {
-            libc::openat(
-                self.fd.as_raw_fd(),
-                cname.as_ptr(),
-                flags,
-                0o600 as libc::c_uint,
-            )
-        };
-        let fd = owned_or_err(raw)?;
-        verify_regular(fd.as_raw_fd())?;
-        verify_mode(fd.as_raw_fd(), 0o600)?;
-        // SAFETY: OwnedFd guarantees a valid, exclusively owned descriptor.
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = fs::openat(
+            self.fd.as_fd(),
+            name.as_str(),
+            flags,
+            Mode::from_raw_mode(0o600),
+        )?;
+        verify_regular(&fd)?;
+        verify_mode(&fd, 0o600)?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -186,99 +179,45 @@ impl ArchiveDir {
         name: ArchiveFileName,
         write: bool,
     ) -> Result<std::fs::File, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
-        let access = if write { libc::O_RDWR } else { libc::O_RDONLY };
-        let flags = access | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: openat relative to our dir fd; O_NOFOLLOW blocks a swapped
-        // symlink at this name.
-        let raw = unsafe { libc::openat(self.fd.as_raw_fd(), cname.as_ptr(), flags) };
-        let fd = owned_or_err(raw)?;
-        verify_regular(fd.as_raw_fd())?;
-        verify_mode(fd.as_raw_fd(), 0o600)?;
+        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
+        let flags = access | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = fs::openat(self.fd.as_fd(), name.as_str(), flags, Mode::empty())?;
+        verify_regular(&fd)?;
+        verify_mode(&fd, 0o600)?;
         Ok(std::fs::File::from(fd))
     }
 
     /// `renameat` within this directory — the manifest temp→final commit step.
     pub fn rename(&self, from: ArchiveFileName, to: ArchiveFileName) -> Result<(), ArchiveError> {
-        let cfrom = cstring(from.as_str().as_bytes())?;
-        let cto = cstring(to.as_str().as_bytes())?;
-        // SAFETY: both names resolved relative to the same dir fd.
-        let rc = unsafe {
-            libc::renameat(
-                self.fd.as_raw_fd(),
-                cfrom.as_ptr(),
-                self.fd.as_raw_fd(),
-                cto.as_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        fs::renameat(self.fd.as_fd(), from.as_str(), self.fd.as_fd(), to.as_str())?;
         Ok(())
     }
 
     /// `unlinkat` a known file. `ENOENT` is reported as `Ok(false)` so callers
     /// can treat an already-absent target as done.
     pub fn unlink(&self, name: ArchiveFileName) -> Result<bool, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
-        // SAFETY: unlinkat relative to our dir fd, no AT_REMOVEDIR (files only).
-        let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), 0) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOENT) {
-                return Ok(false);
-            }
-            return Err(err.into());
+        match fs::unlinkat(self.fd.as_fd(), name.as_str(), AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(e.into()),
         }
-        Ok(true)
     }
 
     /// Remove an (already emptied) task directory by validated id. Used by the
     /// temporary-registry teardown; the session-backed path keeps the dir.
     pub fn remove_dir(&self, name: &TaskId) -> Result<bool, ArchiveError> {
-        let cname = cstring(name.as_str().as_bytes())?;
-        // SAFETY: unlinkat with AT_REMOVEDIR removes the child directory.
-        let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOENT) {
-                return Ok(false);
-            }
-            return Err(err.into());
+        match fs::unlinkat(self.fd.as_fd(), name.as_str(), AtFlags::REMOVEDIR) {
+            Ok(()) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(e.into()),
         }
-        Ok(true)
     }
 }
 
-/// Streaming directory iterator backed by an owned `DIR*`.
+/// Streaming directory iterator. `rustix::fs::Dir` owns an independent fd
+/// (dup'd from ours internally) and closes it on drop.
 pub struct ArchiveEntries {
-    dir: *mut libc::DIR,
-}
-
-// The `DIR*` is exclusively owned by this value; it is only touched behind `&mut
-// self`, so moving it across threads is sound.
-unsafe impl Send for ArchiveEntries {}
-
-impl ArchiveEntries {
-    fn open(dirfd: RawFd) -> Result<Self, ArchiveError> {
-        // fdopendir consumes the fd it's given, so hand it a private duplicate
-        // (openat ".") rather than the capability's own fd.
-        let dot = cstring(b".").expect("`.` is a valid C string");
-        // SAFETY: reopen the directory itself relative to its own fd.
-        let raw = unsafe { libc::openat(dirfd, dot.as_ptr(), DIR_OPEN_FLAGS) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: `raw` is a fresh directory fd; fdopendir takes ownership.
-        let dir = unsafe { libc::fdopendir(raw) };
-        if dir.is_null() {
-            let err = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so we still own `raw`.
-            unsafe { libc::close(raw) };
-            return Err(err.into());
-        }
-        Ok(ArchiveEntries { dir })
-    }
+    dir: fs::Dir,
 }
 
 impl Iterator for ArchiveEntries {
@@ -286,99 +225,45 @@ impl Iterator for ArchiveEntries {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // errno must be cleared to distinguish end-of-stream from error.
-            // SAFETY: writing 0 to the thread's errno slot.
-            unsafe { *errno_location() = 0 };
-            // SAFETY: `self.dir` is a live DIR* we exclusively own.
-            let ent = unsafe { libc::readdir(self.dir) };
-            if ent.is_null() {
-                let err = io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(0) | None => None, // clean end of stream
-                    _ => Some(Err(err.into())),
-                };
-            }
-            // SAFETY: readdir returned a valid dirent for this iteration.
-            let (name, d_type) = unsafe {
-                let name_ptr = (*ent).d_name.as_ptr();
-                let cstr = std::ffi::CStr::from_ptr(name_ptr);
-                (cstr.to_bytes().to_vec(), (*ent).d_type)
+            let entry = match self.dir.next()? {
+                Ok(entry) => entry,
+                Err(e) => return Some(Err(e.into())),
             };
+            let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;
             }
-            let name = String::from_utf8_lossy(&name).into_owned();
-            let kind = match d_type {
-                libc::DT_DIR => EntryKind::Dir,
-                libc::DT_REG => EntryKind::File,
-                libc::DT_LNK => EntryKind::Symlink,
-                libc::DT_UNKNOWN => EntryKind::Unknown,
+            let kind = match entry.file_type() {
+                FileType::Directory => EntryKind::Dir,
+                FileType::RegularFile => EntryKind::File,
+                FileType::Symlink => EntryKind::Symlink,
+                FileType::Unknown => EntryKind::Unknown,
                 _ => EntryKind::Other,
             };
+            let name = String::from_utf8_lossy(name).into_owned();
             return Some(Ok(ArchiveEntry { name, kind }));
         }
     }
 }
 
-impl Drop for ArchiveEntries {
-    fn drop(&mut self) {
-        // SAFETY: closedir closes the DIR* (and its fd) exactly once.
-        unsafe { libc::closedir(self.dir) };
-    }
-}
-
-/// Thread-local errno slot, spelled differently per libc.
-#[cfg(target_os = "macos")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::__error() }
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::__errno_location() }
-}
-
-fn cstring(bytes: &[u8]) -> Result<CString, ArchiveError> {
-    CString::new(bytes).map_err(|_| ArchiveError::corrupt("name contains an interior NUL byte"))
-}
-
-fn owned_or_err(raw: RawFd) -> Result<OwnedFd, ArchiveError> {
-    if raw < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    // SAFETY: `raw` is a fresh, exclusively owned descriptor from open/openat.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-}
-
-fn fstat(fd: RawFd) -> Result<libc::stat, ArchiveError> {
-    // SAFETY: zeroed stat is a valid out-parameter; fd is open.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(st)
-}
-
-fn verify_dir(fd: RawFd) -> Result<(), ArchiveError> {
-    let st = fstat(fd)?;
-    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+fn verify_dir<Fd: AsFd>(fd: Fd) -> Result<(), ArchiveError> {
+    let st = fs::fstat(fd)?;
+    if FileType::from_raw_mode(st.st_mode as RawMode) != FileType::Directory {
         return Err(ArchiveError::corrupt("expected a directory"));
     }
     verify_owner(&st)
 }
 
-fn verify_regular(fd: RawFd) -> Result<(), ArchiveError> {
-    let st = fstat(fd)?;
-    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+fn verify_regular<Fd: AsFd>(fd: Fd) -> Result<(), ArchiveError> {
+    let st = fs::fstat(fd)?;
+    if FileType::from_raw_mode(st.st_mode as RawMode) != FileType::RegularFile {
         return Err(ArchiveError::corrupt("expected a regular file"));
     }
     verify_owner(&st)
 }
 
-fn verify_owner(st: &libc::stat) -> Result<(), ArchiveError> {
-    // SAFETY: geteuid is always safe.
-    let euid = unsafe { libc::geteuid() };
-    if st.st_uid != euid {
+fn verify_owner(st: &Stat) -> Result<(), ArchiveError> {
+    if st.st_uid != geteuid().as_raw() {
         return Err(ArchiveError::corrupt(
             "archive entry not owned by this user",
         ));
@@ -386,13 +271,12 @@ fn verify_owner(st: &libc::stat) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-fn verify_mode(fd: RawFd, expected: libc::mode_t) -> Result<(), ArchiveError> {
-    let st = fstat(fd)?;
-    if st.st_mode & 0o777 != expected {
+fn verify_mode<Fd: AsFd>(fd: Fd, expected: RawMode) -> Result<(), ArchiveError> {
+    let st = fs::fstat(fd)?;
+    let mode = st.st_mode as RawMode & 0o777;
+    if mode != expected {
         return Err(ArchiveError::corrupt(format!(
-            "unexpected permissions {:o}, wanted {:o}",
-            st.st_mode & 0o777,
-            expected
+            "unexpected permissions {mode:o}, wanted {expected:o}"
         )));
     }
     Ok(())
@@ -427,7 +311,9 @@ mod tests {
 
         // Reopen the task dir by id and confirm the mode is 0700.
         let reopened = root.open_dir(&id).unwrap();
-        verify_mode(reopened.raw_fd(), 0o700).unwrap();
+        // SAFETY: `reopened` keeps the fd alive for the duration of this call.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(reopened.raw_fd()) };
+        verify_mode(borrowed, 0o700).unwrap();
     }
 
     #[test]

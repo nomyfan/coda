@@ -563,6 +563,7 @@ dependencies = [
  "coda_core",
  "jiff",
  "libc",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
