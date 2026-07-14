@@ -140,14 +140,12 @@ export const RpcCode = {
   ALLOW_PATTERN_FAILED: -32030,
 } as const;
 
-export type RpcCode = (typeof RpcCode)[keyof typeof RpcCode];
-
 // --- Request results / server-push payloads ----------------------------------
 // These mirror the server's `wire.rs` structs. A `Snapshot` backs both the
 // `open_session` result and the unsolicited `snapshot` push; the catalogs back
 // both a request result and (historically) a push.
 
-export type Snapshot = {
+type Snapshot = {
   workspace_id: string;
   session_id: string;
   messages: HistoryMessage[];
@@ -158,21 +156,21 @@ export type Snapshot = {
   turn_running?: boolean;
 };
 
-export type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
+type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
 
-export type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
+type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
 
-export type ModelSelectionResult = {
+type ModelSelectionResult = {
   provider_id: string;
   reasoning_effort?: ReasoningEffort | null;
 };
 
 /** Params of an `event` push: one live runtime event, nested under `event`. */
-export type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
+type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
 
 /** A bare (workspace, session) reference — the params of `abort` / `close_session`
  * notifications and of the `session_evicted` push. */
-export type SessionRef = { workspace_id: string; session_id: string };
+type SessionRef = { workspace_id: string; session_id: string };
 
 // --- Request / notification params (client → server) -------------------------
 // Mirror the server's `wire.rs` param structs. Together with the result types
