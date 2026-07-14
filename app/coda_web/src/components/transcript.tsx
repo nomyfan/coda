@@ -202,17 +202,23 @@ export const Transcript = memo(function Transcript({
             </p>
           </div>
         ) : (
-          renderItems.map((item) =>
-            item.type === "entry" ? (
-              <TranscriptItem key={item.entry.id} entry={item.entry} />
-            ) : (
-              <AssistantTurnBubble
-                key={item.id}
-                entries={item.entries}
-                approvalPending={approvalPending}
-              />
-            ),
-          )
+          <>
+            {renderItems.map((item) =>
+              item.type === "entry" ? (
+                <TranscriptItem key={item.entry.id} entry={item.entry} />
+              ) : (
+                <AssistantTurnBubble
+                  key={item.id}
+                  entries={item.entries}
+                  approvalPending={approvalPending}
+                />
+              ),
+            )}
+            {/* Optimistic loading bubble: the turn is running but the backend
+             * hasn't streamed its first event yet, so no assistant turn exists
+             * to carry the shimmer. Shown from send until the first chunk/tool. */}
+            {running && lastEntry?.kind === "user" ? <PendingTurnBubble /> : null}
+          </>
         )}
         <div ref={bottomRef} />
       </div>
@@ -627,6 +633,20 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
         </CollapsibleContent>
       </article>
     </Collapsible>
+  );
+}
+
+/** Placeholder shown between sending a task and the first streamed event, so the
+ * turn reads as in-flight immediately instead of after the backend responds. */
+function PendingTurnBubble() {
+  return (
+    <div className="group/message">
+      <article className="rounded-md bg-background p-3 shadow-sm">
+        <div className="flex items-center gap-3 py-1">
+          <span className="truncate text-sm font-medium text-shimmer">Thinking…</span>
+        </div>
+      </article>
+    </div>
   );
 }
 
