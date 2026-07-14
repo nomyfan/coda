@@ -5,6 +5,10 @@ import {
   JSONRPCServerAndClient,
 } from "json-rpc-2.0";
 
+type RequestSchema<Requests> = {
+  [Method in keyof Requests]: { params: unknown; result: unknown };
+};
+
 /**
  * A thin adapter over `json-rpc-2.0` bound to one WebSocket. The library owns id
  * allocation, the pending-request map, and response correlation — we write no
@@ -12,22 +16,37 @@ import {
  * `notify` returns a boolean the caller can gate an optimistic update on, and
  * inbound frames are fed in through `receive`.
  */
-export type RpcClient = {
+export type RpcClient<
+  Requests extends RequestSchema<Requests>,
+  ClientNotifications extends object,
+  ServerNotifications extends object,
+> = {
   /**
    * Send a request and resolve with its typed result. Rejects with a
    * `JSONRPCErrorException` — carrying `.code` (an `RpcCode`), `.message`, and
    * `.data` — on a server error, or with a `CONNECTION_DROPPED_CODE` exception
    * when the socket dropped before the reply (see `isServerError`).
    */
-  request<T>(method: string, params?: unknown): Promise<T>;
+  request<Method extends keyof Requests & string>(
+    method: Method,
+    ...args: [Requests[Method]["params"]] extends [undefined]
+      ? []
+      : [params: Requests[Method]["params"]]
+  ): Promise<Requests[Method]["result"]>;
   /**
    * Fire-and-forget. Returns `false` (and sends nothing) when the socket is
    * absent or not `OPEN`, so the caller can withhold an optimistic update for a
    * message that never left the client; `true` once handed to the library.
    */
-  notify(method: string, params?: unknown): boolean;
+  notify<Method extends keyof ClientNotifications & string>(
+    method: Method,
+    params: ClientNotifications[Method],
+  ): boolean;
   /** Register a server-push handler (`event` / `snapshot` / `session_evicted`). */
-  addMethod(method: string, handler: (params: unknown) => void): void;
+  addMethod<Method extends keyof ServerNotifications & string>(
+    method: Method,
+    handler: (params: ServerNotifications[Method]) => void,
+  ): void;
   /** Feed one inbound frame (a response or a server push) to the library. */
   receive(payload: unknown): void;
   /** Reject every awaiting request so no caller hangs after the socket closes. */
@@ -52,7 +71,11 @@ export function isServerError(err: unknown): err is JSONRPCErrorException {
   return err instanceof JSONRPCErrorException && err.code !== CONNECTION_DROPPED_CODE;
 }
 
-export function createRpcClient(socket: WebSocket): RpcClient {
+export function createRpcClient<
+  Requests extends RequestSchema<Requests>,
+  ClientNotifications extends object,
+  ServerNotifications extends object,
+>(socket: WebSocket): RpcClient<Requests, ClientNotifications, ServerNotifications> {
   const serverAndClient = new JSONRPCServerAndClient(
     new JSONRPCServer(),
     new JSONRPCClient((payload) => {
@@ -66,9 +89,11 @@ export function createRpcClient(socket: WebSocket): RpcClient {
   );
 
   return {
-    request: <T>(method: string, params?: unknown): Promise<T> =>
-      serverAndClient.request(method, params, undefined) as Promise<T>,
-    notify: (method: string, params?: unknown): boolean => {
+    request: (method, ...args) =>
+      serverAndClient.request(method, args[0], undefined) as Promise<
+        Requests[typeof method]["result"]
+      >,
+    notify: (method, params): boolean => {
       if (socket.readyState !== WebSocket.OPEN) {
         return false;
       }

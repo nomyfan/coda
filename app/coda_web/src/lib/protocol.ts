@@ -170,8 +170,78 @@ export type ModelSelectionResult = {
 /** Params of an `event` push: one live runtime event, nested under `event`. */
 export type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
 
-/** Params of a `session_evicted` push: this connection lost drive rights. */
-export type SessionRefPush = { workspace_id: string; session_id: string };
+/** A bare (workspace, session) reference — the params of `abort` / `close_session`
+ * notifications and of the `session_evicted` push. */
+export type SessionRef = { workspace_id: string; session_id: string };
+
+// --- Request / notification params (client → server) -------------------------
+// Mirror the server's `wire.rs` param structs. Together with the result types
+// above they form the `RpcRequests` / `RpcNotifications` schema maps that type
+// the RPC client.
+
+type RpcRequest<Params, Result> = { params: Params; result: Result };
+
+/**
+ * Client → server **request** methods: each maps to its params and result type.
+ * A `params` of `undefined` marks a no-argument request (`list_*`). This is the
+ * `Req` schema the typed `RpcClient` keys `request(...)` on.
+ */
+export type RpcRequests = {
+  list_workspaces: RpcRequest<undefined, WorkspaceCatalog>;
+  list_providers: RpcRequest<undefined, ProviderCatalog>;
+  open_session: RpcRequest<
+    {
+      workspace_id: string;
+      session_id: string;
+      provider_id?: string;
+      reasoning_effort?: ReasoningEffort | null;
+      /** Evict whoever currently holds the session; without it the server
+       * rejects with `SESSION_BUSY`. */
+      takeover?: boolean;
+    },
+    Snapshot
+  >;
+  set_model: RpcRequest<
+    {
+      workspace_id: string;
+      session_id: string;
+      provider_id: string;
+      reasoning_effort: ReasoningEffort | null;
+    },
+    ModelSelectionResult
+  >;
+  add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
+  delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
+};
+
+/**
+ * Client → server **notification** methods: each maps to its params type. This
+ * is the `Notif` schema the typed `RpcClient` keys `notify(...)` on.
+ */
+export type RpcNotifications = {
+  task: {
+    workspace_id: string;
+    session_id: string;
+    task: string;
+    images?: string[];
+  };
+  resume: {
+    workspace_id: string;
+    session_id: string;
+    agent_name: string;
+    thread_id: string;
+    decision: ResumeDecision;
+  };
+  abort: SessionRef;
+  close_session: SessionRef;
+};
+
+/** Server → client notifications handled through `RpcClient.addMethod(...)`. */
+export type RpcPushes = {
+  event: EventPush;
+  snapshot: Snapshot;
+  session_evicted: SessionRef;
+};
 
 export type WireEvent =
   | {

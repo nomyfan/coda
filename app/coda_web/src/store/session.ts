@@ -4,21 +4,18 @@ import type { Draft } from "immer";
 import {
   approvalKey,
   type CompletionUsage,
-  type EventPush,
   type HistoryMessage,
-  type ModelSelectionResult,
   type PendingApproval,
-  type ProviderCatalog,
   type ProviderInfo,
   type ReasoningEffort,
+  type RpcNotifications,
+  type RpcPushes,
+  type RpcRequests,
   RpcCode,
-  type SessionRefPush,
-  type Snapshot,
   type ToolCall,
   type ToolCallResolution,
   type ToolMessage,
   type WireEvent,
-  type WorkspaceCatalog,
   type WorkspaceSummary,
   callArguments,
   describeTool,
@@ -140,11 +137,12 @@ type CodaState = {
 type SessionRuntimeState = {
   wsMap: Record<string, WebSocket>;
   /** One JSON-RPC adapter per connection, replaced on each reconnect. */
-  rpcMap: Record<string, RpcClient>;
+  rpcMap: Record<string, CodaRpcClient>;
   autoConnected: boolean;
 };
 
 type CodaStoreState = CodaState & SessionRuntimeState;
+type CodaRpcClient = RpcClient<RpcRequests, RpcNotifications, RpcPushes>;
 
 const rootName = "coda";
 
@@ -923,7 +921,7 @@ function currentSocket(store: CodaStore, server: string) {
   return store.getState().wsMap[server];
 }
 
-function setSocket(store: CodaStore, server: string, socket: WebSocket, rpc: RpcClient) {
+function setSocket(store: CodaStore, server: string, socket: WebSocket, rpc: CodaRpcClient) {
   updateState(store, (state) => {
     state.wsMap[server] = socket;
     state.rpcMap[server] = rpc;
@@ -1484,13 +1482,17 @@ export const codaStore = create<CodaStoreState>(initialStoreState);
 // --- Actions (plain functions, stable identity) ------------------------------
 
 /** The JSON-RPC adapter for `server`'s current connection, if any. */
-function rpcFor(server: string): RpcClient | undefined {
+function rpcFor(server: string): CodaRpcClient | undefined {
   return codaStore.getState().rpcMap[server];
 }
 
 /** Fire a notification, surfacing a dropped connection as an error status.
  * Returns whether the frame was handed to the socket (Decision 10/11 gate). */
-function notify(server: string, method: string, params: unknown): boolean {
+function notify<Method extends keyof RpcNotifications & string>(
+  server: string,
+  method: Method,
+  params: RpcNotifications[Method],
+): boolean {
   if (rpcFor(server)?.notify(method, params)) {
     return true;
   }
@@ -1557,7 +1559,7 @@ async function requestOpenAndApply(
     return false;
   }
   try {
-    const snap = await rpc.request<Snapshot>("open_session", openParams(session, options.takeover));
+    const snap = await rpc.request("open_session", openParams(session, options.takeover));
     applySnapshot(
       codaStore,
       server,
@@ -1589,7 +1591,7 @@ function requestDelete(server: string, workspaceId: string, sessionId: string) {
     return; // no connection: stays tombstoned until reconnect
   }
   rpc
-    .request<WorkspaceCatalog>("delete_session", {
+    .request("delete_session", {
       workspace_id: workspaceId,
       session_id: sessionId,
     })
@@ -1667,7 +1669,7 @@ export function connectServer(rawUrl: string) {
   markConnecting(codaStore, server, stored.find((entry) => entry.url === server)?.alias);
 
   const socket = new WebSocket(normalizeWsUrl(server));
-  const rpc = createRpcClient(socket);
+  const rpc = createRpcClient<RpcRequests, RpcNotifications, RpcPushes>(socket);
   setSocket(codaStore, server, socket, rpc);
 
   // Server pushes (notifications) feed the existing reducers — the same reducer
@@ -1675,38 +1677,35 @@ export function connectServer(rawUrl: string) {
   // (a hub re-attach). The `snapshot` push preserves the reconnect-restore
   // `replaceEmpty` parity by keying off the connect-time active session.
   rpc.addMethod("event", (params) => {
-    const push = params as EventPush;
-    applyEvent(codaStore, server, push.workspace_id, push.session_id, push.event);
+    applyEvent(codaStore, server, params.workspace_id, params.session_id, params.event);
   });
   rpc.addMethod("snapshot", (params) => {
-    const snap = params as Snapshot;
     applySnapshot(
       codaStore,
       server,
-      snap.workspace_id,
-      snap.session_id,
-      snap.messages,
-      snap.pending_approvals ?? [],
-      snap.provider_id,
-      snap.reasoning_effort ?? null,
-      snap.turn_running ?? false,
-      sessionToRestore?.key === sessionKey(snap.workspace_id, snap.session_id),
+      params.workspace_id,
+      params.session_id,
+      params.messages,
+      params.pending_approvals ?? [],
+      params.provider_id,
+      params.reasoning_effort ?? null,
+      params.turn_running ?? false,
+      sessionToRestore?.key === sessionKey(params.workspace_id, params.session_id),
     );
   });
   rpc.addMethod("session_evicted", (params) => {
-    const ref = params as SessionRefPush;
-    applyHeldElsewhere(codaStore, server, ref.workspace_id, ref.session_id, "evicted");
+    applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
   });
 
   socket.onopen = () => {
     setServerStatus(codaStore, server, "connected");
     // The client's own requests are the sole source of both catalogs.
     rpc
-      .request<WorkspaceCatalog>("list_workspaces")
+      .request("list_workspaces")
       .then((catalog) => setCatalog(codaStore, server, catalog.workspaces, false))
       .catch((err) => reportCatalogFetchError(server, err, "workspaces"));
     rpc
-      .request<ProviderCatalog>("list_providers")
+      .request("list_providers")
       .then((catalog) =>
         setProviderCatalog(codaStore, server, catalog.providers, catalog.default_provider),
       )
@@ -2002,7 +2001,7 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
   // session's stored model, which stays put until then — so an error needs no
   // explicit revert).
   rpc
-    .request<ModelSelectionResult>("set_model", {
+    .request("set_model", {
       workspace_id: session.workspaceId,
       session_id: session.sessionId,
       provider_id: providerId,
