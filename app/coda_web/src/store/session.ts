@@ -1532,6 +1532,16 @@ function handleOpenError(server: string, workspaceId: string, sessionId: string,
   });
 }
 
+/** Surface a genuine server error from a connect-time catalog fetch, so an
+ * empty sidebar / model selector is diagnosable instead of a silent degrade. A
+ * dropped connection (code 0) is left to `onclose` → "closed"; only a real
+ * fault flips the server to an error state. */
+function reportCatalogFetchError(server: string, err: unknown, what: string) {
+  if (isServerError(err)) {
+    setServerStatus(codaStore, server, "error", `Failed to load ${what}: ${err.message}`);
+  }
+}
+
 /** Send `open_session` and apply its snapshot result at the call site. The
  * unsolicited re-attach path applies the same reducer via the `snapshot` push.
  * Returns whether the session opened (so a caller can withhold a follow-up
@@ -1584,8 +1594,9 @@ function requestDelete(server: string, workspaceId: string, sessionId: string) {
       session_id: sessionId,
     })
     .then((catalog) => {
-      // Durable delete: reconcile the authoritative catalog, then drop the
-      // now-gone session.
+      // Durable delete: merge the returned catalog (the tombstoned session is
+      // skipped by `mergeCatalog`, so it isn't re-added as a local extra), then
+      // drop the now-gone session.
       setCatalog(codaStore, server, catalog.workspaces, true);
       deleteSessionState(codaStore, server, key);
     })
@@ -1693,13 +1704,13 @@ export function connectServer(rawUrl: string) {
     rpc
       .request<WorkspaceCatalog>("list_workspaces")
       .then((catalog) => setCatalog(codaStore, server, catalog.workspaces, false))
-      .catch(() => {});
+      .catch((err) => reportCatalogFetchError(server, err, "workspaces"));
     rpc
       .request<ProviderCatalog>("list_providers")
       .then((catalog) =>
         setProviderCatalog(codaStore, server, catalog.providers, catalog.default_provider),
       )
-      .catch(() => {});
+      .catch((err) => reportCatalogFetchError(server, err, "models"));
     if (sessionToRestore) {
       void requestOpenAndApply(server, sessionToRestore.session, { replaceEmpty: true });
     }

@@ -77,7 +77,11 @@ export function createRpcClient(socket: WebSocket): RpcClient {
     },
     addMethod: (method, handler) => serverAndClient.addMethod(method, handler),
     receive: (payload) => {
-      void serverAndClient.receiveAndSend(payload, undefined, undefined);
+      // `receiveAndSend` returns a Promise; a malformed frame or a throwing push
+      // handler would otherwise surface as an unhandled rejection.
+      serverAndClient.receiveAndSend(payload, undefined, undefined).catch((err) => {
+        console.error("failed to process an inbound JSON-RPC frame", err);
+      });
     },
     rejectAll: (reason) => serverAndClient.rejectAllPendingRequests(reason),
   };
