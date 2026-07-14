@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "node --disable-warning=ExperimentalWarning --experimental-strip-types --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint"
   },

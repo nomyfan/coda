@@ -26,7 +26,7 @@ Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (s
 
 When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first using `npx` (for example, `npx shadcn@latest add radio-group`) — not `pnpm dlx` — then adapt the generated component to the local UI.
 
-After modifying `app/coda_web` code, always run `pnpm --filter coda-web lint` (oxlint) as a final check.
+After modifying `app/coda_web` code, always run `pnpm --filter coda-web lint` (oxlint) and `pnpm --filter coda-web test` as final checks.
 
 ## Architecture
 

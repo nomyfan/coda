@@ -1,5 +1,5 @@
 import { Folder, Menu } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abort,
   clearActiveSession,
@@ -26,6 +26,7 @@ import {
   type ServerSummary,
   type UsageRecord,
 } from "@/store/session";
+import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
 import { Sidebar } from "@/components/sidebar";
 import { Button } from "@/components/ui/button";
 import { Composer } from "@/components/composer";
@@ -211,6 +212,7 @@ export default function App() {
   const newSessionTarget = useNewSessionStore((state) => state.target);
   const [newSessionModel, setNewSessionModel] = useState<{
     serverUrl: string;
+    workspaceId: string;
     providerId: string;
     reasoningEffort: ReasoningEffort | null;
   } | null>(null);
@@ -244,31 +246,29 @@ export default function App() {
     }
   }, [newSessionTarget, servers, activeServer]);
 
-  useEffect(() => {
-    if (!newSessionTarget) {
-      return;
+  const selectedNewSessionModel = useMemo(() => {
+    if (!newSessionTarget || !selectedServerState) {
+      return null;
     }
-    const server = servers.find((item) => item.url === newSessionTarget.serverUrl);
-    const currentProvider = server?.providers.find(
+    const currentProvider = selectedServerState.providers.find(
       (provider) =>
         provider.id === newSessionModel?.providerId &&
-        newSessionModel.serverUrl === newSessionTarget.serverUrl,
+        newSessionModel.serverUrl === newSessionTarget.serverUrl &&
+        newSessionModel.workspaceId === newSessionTarget.workspaceId,
     );
     if (currentProvider) {
-      return;
+      return newSessionModel;
     }
-    const provider =
-      server?.providers.find((item) => item.id === server.defaultProvider) ?? server?.providers[0];
-    setNewSessionModel(
-      provider
-        ? {
-            serverUrl: newSessionTarget.serverUrl,
-            providerId: provider.id,
-            reasoningEffort: provider.reasoning_efforts[0] ?? null,
-          }
-        : null,
-    );
-  }, [newSessionModel, newSessionTarget, servers]);
+    const selection = initialModelSelection(selectedServerState, newSessionTarget.workspaceId);
+    return selection.providerId
+      ? {
+          serverUrl: newSessionTarget.serverUrl,
+          workspaceId: newSessionTarget.workspaceId,
+          providerId: selection.providerId,
+          reasoningEffort: selection.reasoningEffort,
+        }
+      : null;
+  }, [newSessionModel, newSessionTarget, selectedServerState]);
 
   // On first load, restore the workspace last selected (persisted as
   // `recentTarget`). Prefer the remembered server: wait for it to connect rather
@@ -329,8 +329,8 @@ export default function App() {
           target.serverUrl,
           target.workspaceId,
           task,
-          newSessionModel?.providerId,
-          newSessionModel?.reasoningEffort ?? null,
+          selectedNewSessionModel?.providerId,
+          selectedNewSessionModel?.reasoningEffort ?? null,
           images,
         );
         clearNewSessionTarget();
@@ -338,13 +338,17 @@ export default function App() {
       }
       sendTask(task, images);
     },
-    [newSessionModel],
+    [selectedNewSessionModel],
   );
 
   const handleSetNewSessionModel = useCallback(
     (providerId: string, reasoningEffort: ReasoningEffort | null) => {
-      const serverUrl = newSessionStore.getState().target?.serverUrl ?? "";
-      setNewSessionModel({ serverUrl, providerId, reasoningEffort });
+      const target = newSessionStore.getState().target;
+      if (!target) {
+        return;
+      }
+      setNewSessionModel({ ...target, providerId, reasoningEffort });
+      rememberModelSelection(target.serverUrl, target.workspaceId, providerId, reasoningEffort);
     },
     [],
   );
@@ -394,10 +398,12 @@ export default function App() {
                   providers={
                     showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
                   }
-                  providerId={showingNewSession ? newSessionModel?.providerId : activeProviderId}
+                  providerId={
+                    showingNewSession ? selectedNewSessionModel?.providerId : activeProviderId
+                  }
                   reasoningEffort={
                     showingNewSession
-                      ? (newSessionModel?.reasoningEffort ?? null)
+                      ? (selectedNewSessionModel?.reasoningEffort ?? null)
                       : activeReasoningEffort
                   }
                   usage={showingNewSession ? NO_USAGE : activeUsage}
