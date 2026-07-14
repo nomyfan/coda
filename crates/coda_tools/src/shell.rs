@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -5,6 +7,8 @@ use tokio::process::Command;
 use tracing::debug;
 
 use crate::process::{CommandOutcome, run_command};
+
+const SHELL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ShellToolParams {
@@ -19,13 +23,14 @@ pub struct ShellTool {
     schema: Schema,
     description: String,
     cwd: String,
+    timeout: Duration,
 }
 
 impl ShellTool {
     pub fn new(cwd: String) -> Self {
-        let description =
-            "Execute shell commands and return stdout and stderr. You are in a Unix environment."
-                .to_string();
+        let description = "Execute Bash commands and return stdout and stderr. Commands have a \
+                           fixed 2-minute timeout."
+            .to_string();
         let schema = schemars::schema_for!(ShellToolParams);
         debug!("ShellTool schema: {:?}", schema);
 
@@ -33,6 +38,7 @@ impl ShellTool {
             schema,
             description,
             cwd,
+            timeout: SHELL_TIMEOUT,
         }
     }
 }
@@ -60,15 +66,26 @@ impl Tool for ShellTool {
         ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
+        let timeout = self.timeout;
         async move {
             debug!(description = %params.description, command = %params.command, "Executing shell command");
             // `shell` is the platform-agnostic tool name; `bash` is the current backend.
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(&params.command).current_dir(&cwd);
 
-            let run = run_command(cmd, ctx.cancel).await.map_err(|e| {
-                ToolError::ExecutionError(format!("Failed to execute command: {}", e))
-            })?;
+            let execution_cancel = ctx.cancel.child_token();
+            let mut command = Box::pin(run_command(cmd, execution_cancel.clone()));
+            let run = match tokio::time::timeout(timeout, &mut command).await {
+                Ok(run) => run,
+                Err(_) => {
+                    execution_cancel.cancel();
+                    let _ = command.await;
+                    return Err(ToolError::ExecutionError(String::from(
+                        "Command timed out after the 2-minute execution limit.",
+                    )));
+                }
+            }
+            .map_err(|e| ToolError::ExecutionError(format!("Failed to execute command: {}", e)))?;
 
             let output = match run {
                 CommandOutcome::Cancelled { stdout, stderr } => {
@@ -134,6 +151,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn description_describes_bash_and_the_fixed_timeout() {
+        assert_eq!(
+            tool().description(),
+            "Execute Bash commands and return stdout and stderr. Commands have a fixed 2-minute timeout."
+        );
+    }
+
     #[tokio::test]
     async fn completes_normally() {
         let out = tool()
@@ -151,6 +176,50 @@ mod tests {
             .unwrap();
         assert!(out.starts_with("exit code: 3"), "unexpected output: {out}");
         assert!(out.contains("oops"), "unexpected output: {out}");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_process_group() {
+        let pidfile =
+            std::env::temp_dir().join(format!("coda-shell-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let mut shell = tool();
+        shell.timeout = Duration::from_millis(500);
+        let command = format!(
+            "sleep 37.41 & echo \"$$ $!\" > '{}'; wait",
+            pidfile.display()
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            shell.execute(params(&command), ToolCallContext::default()),
+        )
+        .await
+        .expect("shell timeout did not settle promptly");
+
+        let reason = match result {
+            Err(ToolError::ExecutionError(reason)) => reason,
+            other => panic!("expected ExecutionError, got {other:?}"),
+        };
+        assert!(reason.contains("2-minute execution limit"));
+
+        let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
+            .expect("command never wrote its pidfile")
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("pidfile contained a non-PID"))
+            .collect();
+        assert_eq!(pids.len(), 2);
+        let _cleanup: Vec<_> = pids.iter().copied().map(KillPidGuard).collect();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pids.iter().any(|&pid| process_alive(pid)) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("processes survived the shell timeout");
+
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     #[tokio::test]
