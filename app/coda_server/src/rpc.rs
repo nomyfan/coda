@@ -64,8 +64,10 @@ pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
 pub const UNKNOWN_WORKSPACE: i32 = -32010;
 pub const INVALID_SESSION_ID: i32 = -32011;
 pub const INVALID_MODEL_SELECTION: i32 = -32012;
+pub const SESSION_NOT_FOUND: i32 = -32013;
 pub const OPEN_FAILED: i32 = -32020;
 pub const DELETE_FAILED: i32 = -32021;
+pub const RENAME_FAILED: i32 = -32022;
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
 
 impl RpcError {
@@ -204,22 +206,50 @@ pub fn decode(frame: &str) -> Incoming {
     }
 }
 
-/// Frame a successful result. `id` echoes the request's id verbatim.
-pub fn result(id: RpcId, payload: &impl Serialize) -> RpcOutgoing {
-    RpcOutgoing(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": to_value(payload),
-    }))
+/// Frame a successful result, echoing the request id verbatim.
+impl<T> From<(RpcId, &T)> for RpcOutgoing
+where
+    T: Serialize + ?Sized,
+{
+    fn from((id, payload): (RpcId, &T)) -> Self {
+        RpcOutgoing(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": to_value(payload),
+        }))
+    }
 }
 
-/// Frame a failure. `id` is `null` when a parse error left no id to echo.
-pub fn error(id: Option<RpcId>, err: RpcError) -> RpcOutgoing {
-    RpcOutgoing(json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(Value::Null),
-        "error": err,
-    }))
+/// Frame a failure without an echoable request id (for example, a parse error).
+impl From<RpcError> for RpcOutgoing {
+    fn from(error: RpcError) -> Self {
+        RpcOutgoing(json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": error,
+        }))
+    }
+}
+
+/// Frame a failure for a valid request, echoing its id verbatim.
+impl From<(RpcId, RpcError)> for RpcOutgoing {
+    fn from((id, error): (RpcId, RpcError)) -> Self {
+        RpcOutgoing(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": error,
+        }))
+    }
+}
+
+/// Frame a failure whose request id may not be recoverable.
+impl From<(Option<RpcId>, RpcError)> for RpcOutgoing {
+    fn from((id, error): (Option<RpcId>, RpcError)) -> Self {
+        match id {
+            Some(id) => (id, error).into(),
+            None => error.into(),
+        }
+    }
 }
 
 /// Frame a server-initiated notification (no id, never answered).
@@ -234,7 +264,7 @@ pub fn notify(method: &str, params: &impl Serialize) -> RpcOutgoing {
 /// Serialize a payload to a `Value`. Our payloads are plain derive-`Serialize`
 /// structs with string keys, so this is infallible in practice; a failure means
 /// a programming error in a payload type, not a runtime condition.
-fn to_value(payload: &impl Serialize) -> Value {
+fn to_value<T: Serialize + ?Sized>(payload: &T) -> Value {
     serde_json::to_value(payload).expect("rpc payload serializes to a JSON value")
 }
 
@@ -359,7 +389,7 @@ mod tests {
 
     #[test]
     fn result_frame_echoes_id_and_carries_result() {
-        let out = result(json!(3), &json!({"ok": true}));
+        let out: RpcOutgoing = (json!(3), &json!({"ok": true})).into();
         let obj = as_object(&out);
         assert_eq!(obj["jsonrpc"], json!("2.0"));
         assert_eq!(obj["id"], json!(3));
@@ -369,7 +399,7 @@ mod tests {
 
     #[test]
     fn error_frame_with_null_id_omits_absent_data() {
-        let out = error(None, RpcError::parse_error());
+        let out: RpcOutgoing = RpcError::parse_error().into();
         let obj = as_object(&out);
         assert_eq!(obj["id"], Value::Null);
         let err = obj["error"].as_object().expect("error object");
@@ -379,13 +409,28 @@ mod tests {
 
     #[test]
     fn error_frame_carries_detail_data() {
-        let out = error(
-            Some(json!(9)),
+        let out: RpcOutgoing = (
+            json!(9),
             RpcError::with_detail(ALLOW_PATTERN_FAILED, "allow pattern failed", "disk full"),
-        );
+        )
+            .into();
         let obj = as_object(&out);
         assert_eq!(obj["id"], json!(9));
         assert_eq!(obj["error"]["data"], json!("disk full"));
+    }
+
+    #[test]
+    fn optional_error_id_uses_available_id() {
+        let with_id: RpcOutgoing = (
+            Some(json!(7)),
+            RpcError::new(INVALID_REQUEST, "invalid request"),
+        )
+            .into();
+        assert_eq!(as_object(&with_id)["id"], json!(7));
+
+        let without_id: RpcOutgoing =
+            (None, RpcError::new(INVALID_REQUEST, "invalid request")).into();
+        assert_eq!(as_object(&without_id)["id"], Value::Null);
     }
 
     #[test]

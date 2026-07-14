@@ -11,8 +11,12 @@ export const statusCopy: Record<
   error: { label: "Error", tone: "danger" },
 };
 
-export function sessionTitle(session: { id: string; first_user_message?: string | null }) {
-  return session.first_user_message?.trim() || session.id;
+export function sessionTitle(session: {
+  id: string;
+  name?: string | null;
+  first_user_message?: string | null;
+}) {
+  return session.name?.trim() || session.first_user_message?.trim() || session.id;
 }
 
 export function serverLabel(server: { alias?: string; url: string }) {

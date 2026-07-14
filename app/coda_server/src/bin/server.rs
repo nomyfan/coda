@@ -25,13 +25,13 @@ use coda_server::{
     },
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
-    storage::{WorkspaceStorage, validate_session_id},
+    storage::{RenameSessionError, WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
-        PendingApprovalWire, ProviderCatalog, ProviderInfoWire, ResumeParams, SessionRef,
-        SessionSummaryWire, SetModelParams, Snapshot, TaskParams, WireEvent, WorkspaceCatalog,
-        WorkspaceSummaryWire,
+        PendingApprovalWire, ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams,
+        SessionName, SessionRef, SessionSummaryWire, SetModelParams, Snapshot, TaskParams,
+        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -389,6 +389,7 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
                 .into_iter()
                 .map(|session| SessionSummaryWire {
                     id: session.session_id,
+                    name: session.name,
                     updated_at_ms: session.updated_at_ms,
                     first_user_message: session.first_user_message,
                     has_pending_approval: session.has_pending_approval,
@@ -686,7 +687,10 @@ async fn handle_frame<T: Transport>(
             )
             .await
         }
-        rpc::Incoming::Invalid { id, error } => transport.send(&rpc::error(id, error)).await,
+        rpc::Incoming::Invalid { id, error } => {
+            let reply: RpcOutgoing = (id, error).into();
+            transport.send(&reply).await
+        }
     }
 }
 
@@ -702,39 +706,54 @@ async fn dispatch_request(
     params: Value,
 ) -> RpcOutgoing {
     match method {
-        "list_workspaces" => rpc::result(
+        "list_workspaces" => (
             id,
             &WorkspaceCatalog {
                 workspaces: workspace_catalog(app).await,
             },
-        ),
-        "list_providers" => rpc::result(
+        )
+            .into(),
+        "list_providers" => (
             id,
             &ProviderCatalog {
                 providers: provider_infos(app),
                 default_provider: app.default_provider.clone(),
             },
-        ),
+        )
+            .into(),
         "open_session" => {
             let params: OpenSessionParams = match parse_params(params) {
                 Ok(params) => params,
-                Err(err) => return rpc::error(Some(id), err),
+                Err(err) => return (id, err).into(),
             };
             if let Err(err) = validate_session_id(&params.session_id) {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", err),
-                );
+                )
+                    .into();
             }
-            if !app.workspaces.contains_key(&params.workspace_id) {
-                return rpc::error(
-                    Some(id),
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return (
+                    id,
                     RpcError::with_detail(
                         rpc::UNKNOWN_WORKSPACE,
                         "unknown workspace",
                         params.workspace_id,
                     ),
-                );
+                )
+                    .into();
+            };
+            if let Err(err) = workspace
+                .storage
+                .initialize_session(&params.session_id)
+                .await
+            {
+                return (
+                    id,
+                    RpcError::with_detail(rpc::OPEN_FAILED, "failed to initialize session", err),
+                )
+                    .into();
             }
             // Honor the client's chosen model (e.g. picked on a new session),
             // otherwise fall back to the default provider. Ignored when the
@@ -754,41 +773,44 @@ async fn dispatch_request(
             )
             .await
             {
-                Ok(snapshot) => rpc::result(id, &snapshot),
+                Ok(snapshot) => (id, &snapshot).into(),
                 // Held by another client: the client asks the user, then retries
                 // with takeover. Nothing changed server-side.
-                Err(AttachError::Busy) => rpc::error(
-                    Some(id),
+                Err(AttachError::Busy) => (
+                    id,
                     RpcError::new(rpc::SESSION_BUSY, "session is held by another client"),
-                ),
-                Err(AttachError::Open(err)) => rpc::error(
-                    Some(id),
+                )
+                    .into(),
+                Err(AttachError::Open(err)) => (
+                    id,
                     RpcError::with_detail(
                         rpc::OPEN_FAILED,
                         "failed to open session",
                         err.to_string(),
                     ),
-                ),
+                )
+                    .into(),
             }
         }
         "set_model" => {
             let params: SetModelParams = match parse_params(params) {
                 Ok(params) => params,
-                Err(err) => return rpc::error(Some(id), err),
+                Err(err) => return (id, err).into(),
             };
             // Invalid selections are caught here, before the hub — `OpenError`
             // has no "bad model" variant (Decision 8).
             let Some(reasoning_effort) =
                 normalize_provider_selection(app, &params.provider_id, params.reasoning_effort)
             else {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(
                         rpc::INVALID_MODEL_SELECTION,
                         "invalid model selection",
                         params.provider_id,
                     ),
-                );
+                )
+                    .into();
             };
             let key = (params.workspace_id, params.session_id);
             let requested_provider = params.provider_id.clone();
@@ -817,92 +839,101 @@ async fn dispatch_request(
                             reasoning_effort,
                         },
                     );
-                    rpc::result(
+                    (
                         id,
                         &ModelSelection {
                             provider_id,
                             reasoning_effort,
                         },
                     )
+                        .into()
                 }
                 // Already the selected model: idempotent success echoing it back.
-                CommandOutcome::Unchanged => rpc::result(
+                CommandOutcome::Unchanged => (
                     id,
                     &ModelSelection {
                         provider_id: requested_provider,
                         reasoning_effort,
                     },
-                ),
-                CommandOutcome::TurnRunning => rpc::error(
-                    Some(id),
+                )
+                    .into(),
+                CommandOutcome::TurnRunning => (
+                    id,
                     RpcError::new(
                         rpc::MODEL_SWITCH_WHILE_RUNNING,
                         "cannot switch model while a turn is running",
                     ),
-                ),
-                CommandOutcome::OpenFailed(err) => rpc::error(
-                    Some(id),
+                )
+                    .into(),
+                CommandOutcome::OpenFailed(err) => (
+                    id,
                     RpcError::with_detail(
                         rpc::OPEN_FAILED,
                         "failed to switch model",
                         err.to_string(),
                     ),
-                ),
+                )
+                    .into(),
                 // Residual `Ignored` — the stale/not-attached guard or the
                 // non-`Live` phase, both meaning "not live" (Decision 8).
-                _ => rpc::error(
-                    Some(id),
+                _ => (
+                    id,
                     RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
-                ),
+                )
+                    .into(),
             }
         }
         "add_allow_pattern" => {
             let params: AddAllowPatternParams = match parse_params(params) {
                 Ok(params) => params,
-                Err(err) => return rpc::error(Some(id), err),
+                Err(err) => return (id, err).into(),
             };
             let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(
                         rpc::UNKNOWN_WORKSPACE,
                         "unknown workspace",
                         params.workspace_id,
                     ),
-                );
+                )
+                    .into();
             };
             match add_allow_pattern(workspace.approval_config.clone(), params.pattern).await {
-                Ok(()) => rpc::result(id, &serde_json::json!({})),
-                Err(message) => rpc::error(
-                    Some(id),
+                Ok(()) => (id, &serde_json::json!({})).into(),
+                Err(message) => (
+                    id,
                     RpcError::with_detail(
                         rpc::ALLOW_PATTERN_FAILED,
                         "failed to add allow pattern",
                         message,
                     ),
-                ),
+                )
+                    .into(),
             }
         }
         "delete_session" => {
             let params: DeleteSessionParams = match parse_params(params) {
                 Ok(params) => params,
-                Err(err) => return rpc::error(Some(id), err),
+                Err(err) => return (id, err).into(),
             };
             if let Err(err) = validate_session_id(&params.session_id) {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", err),
-                );
+                )
+                    .into();
             }
             if !app.workspaces.contains_key(&params.workspace_id) {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(
                         rpc::UNKNOWN_WORKSPACE,
                         "unknown workspace",
                         params.workspace_id,
                     ),
-                );
+                )
+                    .into();
             }
             let key = (params.workspace_id.clone(), params.session_id.clone());
             // Stop the runtime before removing its files so no checkpoint is
@@ -910,10 +941,11 @@ async fn dispatch_request(
             // attached — a stale client must not erase work someone else is
             // driving (the persisted state stays too).
             if !app.relay.delete(key.clone(), conn_id).await {
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
-                );
+                )
+                    .into();
             }
             // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
@@ -924,20 +956,75 @@ async fn dispatch_request(
                 .expect("workspace presence checked above");
             if let Err(err) = workspace.storage.delete_session(&params.session_id).await {
                 warn!(workspace_id = %params.workspace_id, session_id = %params.session_id, "failed to delete session: {err}");
-                return rpc::error(
-                    Some(id),
+                return (
+                    id,
                     RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
-                );
+                )
+                    .into();
             }
             // The catalog is authoritative only after a durable delete.
-            rpc::result(
+            (
                 id,
                 &WorkspaceCatalog {
                     workspaces: workspace_catalog(app).await,
                 },
             )
+                .into()
         }
-        other => rpc::error(Some(id), RpcError::method_not_found(other)),
+        "rename_session" => {
+            let params: RenameSessionParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return (
+                    id,
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                )
+                    .into();
+            };
+            match workspace
+                .storage
+                .rename_session(&params.session_id, params.name.as_deref())
+                .await
+            {
+                Ok(name) => (id, &SessionName { name }).into(),
+                Err(RenameSessionError::InvalidSessionId(detail)) => (
+                    id,
+                    RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", detail),
+                )
+                    .into(),
+                Err(RenameSessionError::InvalidName(message)) => {
+                    (id, RpcError::new(rpc::INVALID_PARAMS, message)).into()
+                }
+                Err(RenameSessionError::SessionNotFound) => (
+                    id,
+                    RpcError::new(rpc::SESSION_NOT_FOUND, "session not found"),
+                )
+                    .into(),
+                Err(RenameSessionError::Persistence(detail)) => {
+                    warn!(
+                        workspace_id = %params.workspace_id,
+                        session_id = %params.session_id,
+                        "failed to rename session: {detail}"
+                    );
+                    (
+                        id,
+                        RpcError::with_detail(
+                            rpc::RENAME_FAILED,
+                            "failed to rename session",
+                            detail,
+                        ),
+                    )
+                        .into()
+                }
+            }
+        }
+        other => (id, RpcError::method_not_found(other)).into(),
     }
 }
 

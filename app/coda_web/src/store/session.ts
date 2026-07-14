@@ -26,6 +26,7 @@ import {
 } from "@/lib/protocol";
 import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
 import { useShallow } from "zustand/react/shallow";
+import { sessionTitle } from "@/components/session-utils";
 import { create, type Store } from "@/store/utils";
 
 export type {
@@ -825,7 +826,7 @@ function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, 
     return {
       ...workspace,
       sessions: [
-        { id: sessionId, updated_at_ms: null, has_pending_approval: false },
+        { id: sessionId, name: null, updated_at_ms: null, has_pending_approval: false },
         ...workspace.sessions,
       ],
     };
@@ -859,6 +860,7 @@ function upsertCatalogTitled(
       sessions: [
         {
           id: sessionId,
+          name: null,
           updated_at_ms: Date.now(),
           first_user_message: title,
           has_pending_approval: false,
@@ -902,6 +904,7 @@ function mergeCatalog(
       )
       .map((session) => ({
         id: session.sessionId,
+        name: null,
         updated_at_ms: Date.now(),
         first_user_message: session.firstUserMessage ?? null,
         has_pending_approval: session.approvals.length > 0,
@@ -1022,6 +1025,26 @@ function setCatalog(
     const current = state.servers[server];
     if (current) {
       current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
+    }
+  });
+}
+
+function applySessionName(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  name: string | null,
+) {
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    const workspace = current.catalog.find((item) => item.id === workspaceId);
+    const session = workspace?.sessions.find((item) => item.id === sessionId);
+    if (session) {
+      session.name = name;
     }
   });
 }
@@ -1790,6 +1813,62 @@ export function newSession(server: string, workspaceId: string) {
   createDraftSession(codaStore, server, workspace, sessionId);
 }
 
+export async function renameSession(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  rawName: string,
+): Promise<void> {
+  const workspace = workspaceId.trim();
+  const session = sessionId.trim();
+  if (!server || !workspace || !session) {
+    throw new Error("Invalid session");
+  }
+  const name = rawName.trim();
+  const invalid =
+    [...name].length > 120 ||
+    [...name].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return (
+        codePoint <= 0x1f ||
+        (codePoint >= 0x7f && codePoint <= 0x9f) ||
+        codePoint === 0x2028 ||
+        codePoint === 0x2029
+      );
+    });
+  if (invalid) {
+    throw new Error("Session name must be a single line and at most 120 characters");
+  }
+
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    throw new Error("Connection closed");
+  }
+
+  try {
+    const result = await rpc.request("rename_session", {
+      workspace_id: workspace,
+      session_id: session,
+      name: name || null,
+    });
+    applySessionName(codaStore, server, workspace, session, result.name);
+  } catch (err) {
+    const serverError = isServerError(err);
+    if (
+      serverError &&
+      (err.code === RpcCode.SESSION_NOT_FOUND || err.code === RpcCode.UNKNOWN_WORKSPACE)
+    ) {
+      void rpc
+        .request("list_workspaces")
+        .then((catalog) => setCatalog(codaStore, server, catalog.workspaces, false))
+        .catch((refreshError) => reportCatalogFetchError(server, refreshError, "workspaces"));
+    }
+    throw new Error(
+      serverError ? err.message : "Connection lost before the session name was saved",
+    );
+  }
+}
+
 export function deleteSession(server: string, workspaceId: string, sessionId: string) {
   const workspace = workspaceId.trim();
   const session = sessionId.trim();
@@ -2212,8 +2291,7 @@ export const selectActiveAllowDrafts = (state: CodaStoreState) =>
 export const selectActiveApprovalCount = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals.length ?? 0;
 export const selectActiveWorkspace = (state: CodaStoreState) => activeSessionOf(state)?.workspaceId;
-/** Title of the active session (its first user message), for the header
- * breadcrumb. `undefined` while a blank/draft session has no message yet. */
+/** Derived title of the active persisted session for the header breadcrumb. */
 export const selectActiveSessionTitle = (state: CodaStoreState): string | undefined => {
   const session = activeSessionOf(state);
   if (!session || session.draft) {
@@ -2222,8 +2300,11 @@ export const selectActiveSessionTitle = (state: CodaStoreState): string | undefi
   const server = activeServerOf(state);
   const workspace = server?.catalog.find((ws) => ws.id === session.workspaceId);
   const summary = workspace?.sessions.find((item) => item.id === session.sessionId);
-  const title = summary?.first_user_message ?? session.firstUserMessage;
-  return title?.trim() || session.sessionId;
+  return sessionTitle({
+    id: session.sessionId,
+    name: summary?.name,
+    first_user_message: summary?.first_user_message ?? session.firstUserMessage,
+  });
 };
 export const selectActiveDraftFlag = (state: CodaStoreState) =>
   activeSessionOf(state)?.draft ?? false;

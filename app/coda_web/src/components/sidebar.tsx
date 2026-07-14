@@ -2,6 +2,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  LoaderCircle,
   MoreHorizontal,
   PanelLeft,
   Pencil,
@@ -40,6 +41,7 @@ import {
   disconnectServer,
   removeServer,
   renameServer,
+  renameSession,
   selectActiveKey,
   selectActiveServer,
   selectServers,
@@ -344,7 +346,82 @@ function SessionRow({
   onOpen: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onDelete: (serverUrl: string, workspaceId: string, sessionId: string) => void;
 }) {
-  const [confirming, setConfirming] = useState(false);
+  const [mode, setMode] = useState<"idle" | "renaming" | "deleting">("idle");
+  const [nameDraft, setNameDraft] = useState(session.name ?? "");
+  const [renamePending, setRenamePending] = useState(false);
+  const [renameError, setRenameError] = useState<string>();
+
+  function startRenaming() {
+    setNameDraft(session.name ?? "");
+    setRenameError(undefined);
+    setMode("renaming");
+  }
+
+  async function commitName() {
+    if (renamePending) {
+      return;
+    }
+    setRenamePending(true);
+    setRenameError(undefined);
+    try {
+      await renameSession(serverUrl, workspaceId, session.id, nameDraft);
+      setMode("idle");
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : "Could not rename session");
+    } finally {
+      setRenamePending(false);
+    }
+  }
+
+  if (mode === "renaming") {
+    return (
+      <div className="space-y-1 pr-1">
+        <div className="flex items-center gap-1">
+          <Input
+            autoFocus
+            value={nameDraft}
+            disabled={renamePending}
+            onChange={(event) => setNameDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !renamePending) {
+                event.preventDefault();
+                void commitName();
+              } else if (event.key === "Escape" && !renamePending) {
+                setMode("idle");
+              }
+            }}
+            placeholder={sessionTitle({ ...session, name: null })}
+            className="h-7 flex-1 px-2"
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6 shrink-0 text-emerald-600"
+            disabled={renamePending}
+            onClick={() => void commitName()}
+            title="Save name"
+          >
+            {renamePending ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <Check className="size-4" />
+            )}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6 shrink-0"
+            disabled={renamePending}
+            onClick={() => setMode("idle")}
+            title="Cancel"
+          >
+            <X className="size-4" />
+          </Button>
+        </div>
+        {renameError ? <p className="px-2 text-xs text-destructive">{renameError}</p> : null}
+      </div>
+    );
+  }
 
   return (
     <div className="group flex items-center gap-1 pr-1">
@@ -368,14 +445,14 @@ function SessionRow({
         ) : null}
         <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
       </Button>
-      {confirming ? (
+      {mode === "deleting" ? (
         <>
           <Button
             variant="ghost"
             size="icon"
             className="size-6 shrink-0 text-destructive"
             onClick={() => {
-              setConfirming(false);
+              setMode("idle");
               onDelete(serverUrl, workspaceId, session.id);
             }}
             title="Confirm delete"
@@ -386,22 +463,37 @@ function SessionRow({
             variant="ghost"
             size="icon"
             className="size-6 shrink-0"
-            onClick={() => setConfirming(false)}
+            onClick={() => setMode("idle")}
             title="Cancel"
           >
             <X className="size-4" />
           </Button>
         </>
       ) : (
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6 shrink-0 text-muted-foreground opacity-0 hover:text-destructive group-hover:opacity-100"
-          onClick={() => setConfirming(true)}
-          title="Delete session"
-        >
-          <Trash className="size-4" />
-        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 max-lg:opacity-100"
+              disabled={disabled}
+              title="Session actions"
+            >
+              <MoreHorizontal className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={startRenaming}>
+              <Pencil />
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onClick={() => setMode("deleting")}>
+              <Trash />
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       )}
     </div>
   );
