@@ -7,6 +7,11 @@ on:
     paths-ignore:
       - "*.md"
   pull_request:
+    # Include `ready_for_review` alongside the defaults so marking a draft PR
+    # ready fires the workflow — otherwise the draft-skipped jobs (see the `if`
+    # guards below) never run once it becomes ready. Specifying `types` replaces
+    # the default set, so the defaults are listed explicitly.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - "*.md"
 
