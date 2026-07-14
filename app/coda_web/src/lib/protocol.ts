@@ -113,39 +113,133 @@ export type ProviderInfo = {
   input_modalities: Modality[];
 };
 
-export type ClientMessage =
-  | { type: "list_workspaces" }
-  | { type: "list_providers" }
-  | {
-      type: "open_session";
+/**
+ * Frozen JSON-RPC error codes. The wire carries only the number; this table
+ * mirrors the server's `rpc.rs` constants. Standard codes sit in the JSON-RPC
+ * range; app codes in the reserved server-error block (`-32000..-32099`).
+ */
+export const RpcCode = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+  /** `open_session`: another client holds it → drives the takeover UI. */
+  SESSION_BUSY: -32001,
+  /** `delete_session`: another connection is driving it. */
+  NOT_OWNER: -32002,
+  /** `set_model`: stale / not attached / not live. */
+  SESSION_NOT_LIVE: -32003,
+  /** `set_model`: a turn is in flight. */
+  MODEL_SWITCH_WHILE_RUNNING: -32004,
+  UNKNOWN_WORKSPACE: -32010,
+  INVALID_SESSION_ID: -32011,
+  INVALID_MODEL_SELECTION: -32012,
+  OPEN_FAILED: -32020,
+  DELETE_FAILED: -32021,
+  ALLOW_PATTERN_FAILED: -32030,
+} as const;
+
+// --- Request results / server-push payloads ----------------------------------
+// These mirror the server's `wire.rs` structs. A `Snapshot` backs both the
+// `open_session` result and the unsolicited `snapshot` push; the catalogs back
+// both a request result and (historically) a push.
+
+type Snapshot = {
+  workspace_id: string;
+  session_id: string;
+  messages: HistoryMessage[];
+  pending_approvals?: PendingApproval[];
+  provider_id: string;
+  reasoning_effort?: ReasoningEffort | null;
+  /** A turn is still in flight; its events are replayed after the snapshot. */
+  turn_running?: boolean;
+};
+
+type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
+
+type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
+
+type ModelSelectionResult = {
+  provider_id: string;
+  reasoning_effort?: ReasoningEffort | null;
+};
+
+/** Params of an `event` push: one live runtime event, nested under `event`. */
+type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
+
+/** A bare (workspace, session) reference — the params of `abort` / `close_session`
+ * notifications and of the `session_evicted` push. */
+type SessionRef = { workspace_id: string; session_id: string };
+
+// --- Request / notification params (client → server) -------------------------
+// Mirror the server's `wire.rs` param structs. Together with the result types
+// above they form the `RpcRequests` / `RpcNotifications` schema maps that type
+// the RPC client.
+
+type RpcRequest<Params, Result> = { params: Params; result: Result };
+
+/**
+ * Client → server **request** methods: each maps to its params and result type.
+ * A `params` of `undefined` marks a no-argument request (`list_*`). This is the
+ * `Req` schema the typed `RpcClient` keys `request(...)` on.
+ */
+export type RpcRequests = {
+  list_workspaces: RpcRequest<undefined, WorkspaceCatalog>;
+  list_providers: RpcRequest<undefined, ProviderCatalog>;
+  open_session: RpcRequest<
+    {
       workspace_id: string;
       session_id: string;
       provider_id?: string;
       reasoning_effort?: ReasoningEffort | null;
-      /** Evict whoever currently holds the session (explicit user decision);
-       * without it the server answers `session_busy` instead. */
+      /** Evict whoever currently holds the session; without it the server
+       * rejects with `SESSION_BUSY`. */
       takeover?: boolean;
-    }
-  | { type: "task"; workspace_id: string; session_id: string; task: string; images?: string[] }
-  | {
-      type: "resume";
-      workspace_id: string;
-      session_id: string;
-      agent_name: string;
-      thread_id: string;
-      decision: ResumeDecision;
-    }
-  | { type: "abort"; workspace_id: string; session_id: string }
-  | { type: "delete_session"; workspace_id: string; session_id: string }
-  | { type: "close_session"; workspace_id: string; session_id: string }
-  | { type: "add_allow_pattern"; workspace_id: string; pattern: string }
-  | {
-      type: "set_model";
+    },
+    Snapshot
+  >;
+  set_model: RpcRequest<
+    {
       workspace_id: string;
       session_id: string;
       provider_id: string;
       reasoning_effort: ReasoningEffort | null;
-    };
+    },
+    ModelSelectionResult
+  >;
+  add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
+  delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
+};
+
+/**
+ * Client → server **notification** methods: each maps to its params type. This
+ * is the `Notif` schema the typed `RpcClient` keys `notify(...)` on.
+ */
+export type RpcNotifications = {
+  task: {
+    workspace_id: string;
+    session_id: string;
+    task: string;
+    images?: string[];
+  };
+  resume: {
+    workspace_id: string;
+    session_id: string;
+    agent_name: string;
+    thread_id: string;
+    decision: ResumeDecision;
+  };
+  abort: SessionRef;
+  close_session: SessionRef;
+};
+
+/** Server → client notifications handled through `RpcClient.addMethod(...)`. */
+export type RpcPushes = {
+  event: EventPush;
+  snapshot: Snapshot;
+  session_evicted: SessionRef;
+};
 
 export type WireEvent =
   | {
@@ -202,40 +296,6 @@ export type WireEvent =
       thread_id: string;
       message: string;
     };
-
-export type ServerMessage =
-  | {
-      type: "workspace_catalog";
-      workspaces: WorkspaceSummary[];
-    }
-  | {
-      type: "provider_catalog";
-      providers: ProviderInfo[];
-      default_provider: string;
-    }
-  | {
-      type: "model_changed";
-      workspace_id: string;
-      session_id: string;
-      provider_id: string;
-      reasoning_effort?: ReasoningEffort | null;
-    }
-  | {
-      type: "snapshot";
-      workspace_id: string;
-      session_id: string;
-      messages: HistoryMessage[];
-      pending_approvals?: PendingApproval[];
-      provider_id: string;
-      reasoning_effort?: ReasoningEffort | null;
-      /** A turn is still in flight; its events are replayed after the snapshot. */
-      turn_running?: boolean;
-    }
-  | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
-  | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null }
-  | { type: "session_evicted"; workspace_id: string; session_id: string }
-  /** An open without `takeover` hit a session another client is driving. */
-  | { type: "session_busy"; workspace_id: string; session_id: string };
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {
   return "Ok" in output;

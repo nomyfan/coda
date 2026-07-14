@@ -3,13 +3,15 @@ import { useStore } from "zustand";
 import type { Draft } from "immer";
 import {
   approvalKey,
-  type ClientMessage,
   type CompletionUsage,
   type HistoryMessage,
   type PendingApproval,
   type ProviderInfo,
   type ReasoningEffort,
-  type ServerMessage,
+  type RpcNotifications,
+  type RpcPushes,
+  type RpcRequests,
+  RpcCode,
   type ToolCall,
   type ToolCallResolution,
   type ToolMessage,
@@ -22,6 +24,7 @@ import {
   outputText,
   subAgentDisplayName,
 } from "@/lib/protocol";
+import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
 import { useShallow } from "zustand/react/shallow";
 import { create, type Store } from "@/store/utils";
 
@@ -86,6 +89,10 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** A `delete_session` request is in flight (or tombstoned across a
+   * disconnect). While set, `open`/`task`/`set_model`/repeat-`delete` are
+   * no-ops for this key, and a reconnect re-sends the (idempotent) delete. */
+  deleting?: boolean;
   /** Another client took over this session (latest-wins); the transcript is
    * read-only until the user takes it back by reopening. */
   evicted: boolean;
@@ -129,10 +136,13 @@ type CodaState = {
 
 type SessionRuntimeState = {
   wsMap: Record<string, WebSocket>;
+  /** One JSON-RPC adapter per connection, replaced on each reconnect. */
+  rpcMap: Record<string, CodaRpcClient>;
   autoConnected: boolean;
 };
 
 type CodaStoreState = CodaState & SessionRuntimeState;
+type CodaRpcClient = RpcClient<RpcRequests, RpcNotifications, RpcPushes>;
 
 const rootName = "coda";
 
@@ -197,6 +207,7 @@ function initialStoreState(): CodaStoreState {
   return {
     ...initialState,
     wsMap: {},
+    rpcMap: {},
     autoConnected: false,
   };
 }
@@ -882,6 +893,9 @@ function mergeCatalog(
       .filter(
         (session) =>
           !session.draft &&
+          // A tombstoned (deleting) session must not be re-added as an extra:
+          // that is exactly the resurrection the delete-tombstone guards against.
+          !session.deleting &&
           session.workspaceId === workspace.id &&
           Boolean(session.firstUserMessage) &&
           !present.has(session.sessionId),
@@ -907,9 +921,10 @@ function currentSocket(store: CodaStore, server: string) {
   return store.getState().wsMap[server];
 }
 
-function setSocket(store: CodaStore, server: string, socket: WebSocket) {
+function setSocket(store: CodaStore, server: string, socket: WebSocket, rpc: CodaRpcClient) {
   updateState(store, (state) => {
     state.wsMap[server] = socket;
+    state.rpcMap[server] = rpc;
   });
 }
 
@@ -920,6 +935,7 @@ function closeSocket(store: CodaStore, server: string) {
 function removeSocket(store: CodaStore, server: string) {
   updateState(store, (state) => {
     delete state.wsMap[server];
+    delete state.rpcMap[server];
   });
 }
 
@@ -939,8 +955,8 @@ function draftSession(state: CodaDraft, server: string, key: SessionKey) {
   return current.sessions[key];
 }
 
-type SessionRestoreMessage = {
-  message: ClientMessage;
+type SessionRestore = {
+  session: OpenedSession;
   key: SessionKey;
 };
 
@@ -1109,6 +1125,18 @@ function validEffort(
     return effort;
   }
   return provider.reasoning_efforts[0];
+}
+
+/** Mark (or unmark) a session as delete-in-flight. The flag both gates local
+ * actions and survives a disconnect as a tombstone until the reconnect re-delete
+ * settles it (Decision 9). */
+function setSessionDeleting(store: CodaStore, server: string, key: SessionKey, deleting: boolean) {
+  updateState(store, (state) => {
+    const session = state.servers[server]?.sessions[key];
+    if (session) {
+      session.deleting = deleting;
+    }
+  });
 }
 
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
@@ -1425,18 +1453,13 @@ function normalizeWsUrl(input: string) {
   return `${protocol}//${window.location.host}/ws`;
 }
 
-function encode(message: ClientMessage) {
-  return JSON.stringify(message);
-}
-
 /**
- * Build an `open_session` command, carrying the session's chosen model when it
- * has one (a draft seeds it locally) so the server opens on that provider rather
+ * Build `open_session` params, carrying the session's chosen model when it has
+ * one (a draft seeds it locally) so the server opens on that provider rather
  * than the default.
  */
-function openMessage(session: OpenedSession, takeover = false): ClientMessage {
+function openParams(session: OpenedSession, takeover = false) {
   return {
-    type: "open_session",
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
     ...(takeover ? { takeover } : {}),
@@ -1458,14 +1481,154 @@ export const codaStore = create<CodaStoreState>(initialStoreState);
 
 // --- Actions (plain functions, stable identity) ------------------------------
 
-function send(server: string, message: ClientMessage) {
-  const socket = currentSocket(codaStore, server);
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(encode(message));
+/** The JSON-RPC adapter for `server`'s current connection, if any. */
+function rpcFor(server: string): CodaRpcClient | undefined {
+  return codaStore.getState().rpcMap[server];
+}
+
+/** Fire a notification, surfacing a dropped connection as an error status.
+ * Returns whether the frame was handed to the socket (Decision 10/11 gate). */
+function notify<Method extends keyof RpcNotifications & string>(
+  server: string,
+  method: Method,
+  params: RpcNotifications[Method],
+): boolean {
+  if (rpcFor(server)?.notify(method, params)) {
     return true;
   }
   setServerStatus(codaStore, server, "error", "Connection closed");
   return false;
+}
+
+/** Add an activity entry to a specific session (by key). */
+function addSessionActivity(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  entry: Omit<ActivityEntry, "id">,
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      state.servers[server].sessions[key] = addActivity(session, entry);
+    }
+  });
+}
+
+/** Branch an `open_session` failure: a busy session drives the takeover UI; any
+ * other server error shows an error activity. A dropped connection is ignored —
+ * the reconnect restore handles it. */
+function handleOpenError(server: string, workspaceId: string, sessionId: string, err: unknown) {
+  if (!isServerError(err)) {
+    return;
+  }
+  if (err.code === RpcCode.SESSION_BUSY) {
+    applyHeldElsewhere(codaStore, server, workspaceId, sessionId, "busy");
+    return;
+  }
+  addSessionActivity(server, workspaceId, sessionId, {
+    tone: "danger",
+    label: "open failed",
+    detail: err.message,
+  });
+}
+
+/** Surface a genuine server error from a connect-time catalog fetch, so an
+ * empty sidebar / model selector is diagnosable instead of a silent degrade. A
+ * dropped connection (code 0) is left to `onclose` → "closed"; only a real
+ * fault flips the server to an error state. */
+function reportCatalogFetchError(server: string, err: unknown, what: string) {
+  if (isServerError(err)) {
+    setServerStatus(codaStore, server, "error", `Failed to load ${what}: ${err.message}`);
+  }
+}
+
+/** Send `open_session` and apply its snapshot result at the call site. The
+ * unsolicited re-attach path applies the same reducer via the `snapshot` push.
+ * Returns whether the session opened (so a caller can withhold a follow-up
+ * task). */
+async function requestOpenAndApply(
+  server: string,
+  session: OpenedSession,
+  options: { takeover?: boolean; replaceEmpty?: boolean } = {},
+): Promise<boolean> {
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    return false;
+  }
+  try {
+    const snap = await rpc.request("open_session", openParams(session, options.takeover));
+    applySnapshot(
+      codaStore,
+      server,
+      snap.workspace_id,
+      snap.session_id,
+      snap.messages,
+      snap.pending_approvals ?? [],
+      snap.provider_id,
+      snap.reasoning_effort ?? null,
+      snap.turn_running ?? false,
+      options.replaceEmpty ?? false,
+    );
+    return true;
+  } catch (err) {
+    handleOpenError(server, session.workspaceId, session.sessionId, err);
+    return false;
+  }
+}
+
+/** Send a `delete_session` request and settle the tombstone on its outcome:
+ * success removes the session (and reconciles the returned catalog); an explicit
+ * server error clears the flag; a dropped connection keeps the tombstone for the
+ * reconnect re-delete (Decision 9). */
+function requestDelete(server: string, workspaceId: string, sessionId: string) {
+  const key = sessionKey(workspaceId, sessionId);
+  setSessionDeleting(codaStore, server, key, true);
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    return; // no connection: stays tombstoned until reconnect
+  }
+  rpc
+    .request("delete_session", {
+      workspace_id: workspaceId,
+      session_id: sessionId,
+    })
+    .then((catalog) => {
+      // Durable delete: merge the returned catalog (the tombstoned session is
+      // skipped by `mergeCatalog`, so it isn't re-added as a local extra), then
+      // drop the now-gone session.
+      setCatalog(codaStore, server, catalog.workspaces, true);
+      deleteSessionState(codaStore, server, key);
+    })
+    .catch((err) => {
+      if (isServerError(err)) {
+        // The delete definitively did not commit; return to normal.
+        setSessionDeleting(codaStore, server, key, false);
+        addSessionActivity(server, workspaceId, sessionId, {
+          tone: "danger",
+          label: "delete failed",
+          detail: err.message,
+        });
+      }
+      // else: dropped connection — keep the tombstone; reconnect re-deletes.
+    });
+}
+
+/** On (re)connect, re-send `delete_session` for every tombstoned session so a
+ * delete whose response was lost to a disconnect settles definitively (delete is
+ * idempotent server-side). */
+function resendPendingDeletes(server: string) {
+  const current = codaStore.getState().servers[server];
+  if (!current) {
+    return;
+  }
+  for (const session of Object.values(current.sessions)) {
+    if (session.deleting) {
+      requestDelete(server, session.workspaceId, session.sessionId);
+    }
+  }
 }
 
 function currentActive() {
@@ -1479,21 +1642,19 @@ function currentActive() {
   return session ? { server, session } : undefined;
 }
 
-function activeSessionToRestore(server: string): SessionRestoreMessage | undefined {
+function activeSessionToRestore(server: string): SessionRestore | undefined {
   const snapshot = codaStore.getState();
   if (snapshot.activeServer !== server || !snapshot.activeKey) {
     return undefined;
   }
   const session = snapshot.servers[server]?.sessions[snapshot.activeKey];
   // An evicted session belongs to another client now; restoring it on a
-  // transient reconnect would silently take it back — that must stay an
-  // explicit user action ("Take over").
-  return !session || session.draft || session.evicted
+  // transient reconnect would silently take it back — that must stay an explicit
+  // user action ("Take over"). A tombstoned (deleting) session must not be
+  // reopened either — that is the resurrection the delete-tombstone guards.
+  return !session || session.draft || session.evicted || session.deleting
     ? undefined
-    : {
-        message: openMessage(session),
-        key: snapshot.activeKey,
-      };
+    : { session, key: snapshot.activeKey };
 }
 
 export function connectServer(rawUrl: string) {
@@ -1508,18 +1669,56 @@ export function connectServer(rawUrl: string) {
   markConnecting(codaStore, server, stored.find((entry) => entry.url === server)?.alias);
 
   const socket = new WebSocket(normalizeWsUrl(server));
-  setSocket(codaStore, server, socket);
-  let replaceNextCatalog = true;
+  const rpc = createRpcClient<RpcRequests, RpcNotifications, RpcPushes>(socket);
+  setSocket(codaStore, server, socket, rpc);
+
+  // Server pushes (notifications) feed the existing reducers — the same reducer
+  // whether a snapshot is solicited (an `open_session` result) or pushed here
+  // (a hub re-attach). The `snapshot` push preserves the reconnect-restore
+  // `replaceEmpty` parity by keying off the connect-time active session.
+  rpc.addMethod("event", (params) => {
+    applyEvent(codaStore, server, params.workspace_id, params.session_id, params.event);
+  });
+  rpc.addMethod("snapshot", (params) => {
+    applySnapshot(
+      codaStore,
+      server,
+      params.workspace_id,
+      params.session_id,
+      params.messages,
+      params.pending_approvals ?? [],
+      params.provider_id,
+      params.reasoning_effort ?? null,
+      params.turn_running ?? false,
+      sessionToRestore?.key === sessionKey(params.workspace_id, params.session_id),
+    );
+  });
+  rpc.addMethod("session_evicted", (params) => {
+    applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
+  });
 
   socket.onopen = () => {
     setServerStatus(codaStore, server, "connected");
-    socket.send(encode({ type: "list_workspaces" }));
-    socket.send(encode({ type: "list_providers" }));
+    // The client's own requests are the sole source of both catalogs.
+    rpc
+      .request("list_workspaces")
+      .then((catalog) => setCatalog(codaStore, server, catalog.workspaces, false))
+      .catch((err) => reportCatalogFetchError(server, err, "workspaces"));
+    rpc
+      .request("list_providers")
+      .then((catalog) =>
+        setProviderCatalog(codaStore, server, catalog.providers, catalog.default_provider),
+      )
+      .catch((err) => reportCatalogFetchError(server, err, "models"));
     if (sessionToRestore) {
-      socket.send(encode(sessionToRestore.message));
+      void requestOpenAndApply(server, sessionToRestore.session, { replaceEmpty: true });
     }
+    resendPendingDeletes(server);
   };
   socket.onclose = () => {
+    // Reject any awaiting request so no caller hangs; a delete in flight keeps
+    // its tombstone (the rejection carries the dropped-connection code).
+    rpc.rejectAll("connection closed");
     if (currentSocket(codaStore, server) === socket) {
       setServerStatus(codaStore, server, "closed");
     }
@@ -1527,60 +1726,7 @@ export function connectServer(rawUrl: string) {
   socket.onerror = () => setServerStatus(codaStore, server, "error", "WebSocket connection failed");
   socket.onmessage = (event: MessageEvent<string>) => {
     try {
-      const message = JSON.parse(event.data) as ServerMessage;
-      if (message.type === "workspace_catalog") {
-        setCatalog(codaStore, server, message.workspaces, !replaceNextCatalog);
-        replaceNextCatalog = false;
-        return;
-      }
-      if (message.type === "provider_catalog") {
-        setProviderCatalog(codaStore, server, message.providers, message.default_provider);
-        return;
-      }
-      if (message.type === "snapshot") {
-        applySnapshot(
-          codaStore,
-          server,
-          message.workspace_id,
-          message.session_id,
-          message.messages,
-          message.pending_approvals ?? [],
-          message.provider_id,
-          message.reasoning_effort ?? null,
-          message.turn_running ?? false,
-          sessionToRestore?.key === sessionKey(message.workspace_id, message.session_id),
-        );
-        return;
-      }
-      if (message.type === "session_evicted") {
-        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "evicted");
-        return;
-      }
-      if (message.type === "session_busy") {
-        applyHeldElsewhere(codaStore, server, message.workspace_id, message.session_id, "busy");
-        return;
-      }
-      if (message.type === "model_changed") {
-        setSessionModel(
-          codaStore,
-          server,
-          sessionKey(message.workspace_id, message.session_id),
-          message.provider_id,
-          message.reasoning_effort ?? null,
-        );
-        return;
-      }
-      if (message.type === "event") {
-        applyEvent(codaStore, server, message.workspace_id, message.session_id, message.event);
-        return;
-      }
-      addAllowResultActivity(
-        codaStore,
-        server,
-        message.workspace_id,
-        message.pattern,
-        message.error,
-      );
+      rpc.receive(JSON.parse(event.data));
     } catch (error) {
       setServerStatus(
         codaStore,
@@ -1652,14 +1798,19 @@ export function deleteSession(server: string, workspaceId: string, sessionId: st
   }
   const key = sessionKey(workspace, session);
   const local = codaStore.getState().servers[server]?.sessions[key];
-  if (!local?.draft) {
-    send(server, {
-      type: "delete_session",
-      workspace_id: workspace,
-      session_id: session,
-    });
+  // A draft was never opened on the server; drop it locally and be done.
+  if (local?.draft) {
+    deleteSessionState(codaStore, server, key);
+    return;
   }
-  deleteSessionState(codaStore, server, key);
+  // Already in flight / tombstoned: don't send a duplicate.
+  if (local?.deleting) {
+    return;
+  }
+  // Mark deleting and remove only once the server confirms a durable delete;
+  // no optimistic removal (no phantom deletion, and no resurrection if the
+  // response is lost to a disconnect — Decision 9).
+  requestDelete(server, workspace, session);
 }
 
 /**
@@ -1682,8 +1833,7 @@ function closeActiveSession(nextServer?: string, nextKey?: SessionKey) {
   if (!session || session.draft) {
     return;
   }
-  send(server, {
-    type: "close_session",
+  notify(server, "close_session", {
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
   });
@@ -1695,14 +1845,18 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   if (!server || !workspace || !session) {
     return;
   }
-  const local = codaStore.getState().servers[server]?.sessions[sessionKey(workspace, session)];
-  closeActiveSession(server, sessionKey(workspace, session));
+  const key = sessionKey(workspace, session);
+  const local = codaStore.getState().servers[server]?.sessions[key];
+  // A session mid-delete must not be re-opened (resurrection vector).
+  if (local?.deleting) {
+    return;
+  }
+  closeActiveSession(server, key);
   selectSession(codaStore, server, workspace, session);
   if (!local?.draft) {
-    const opened =
-      local ?? codaStore.getState().servers[server]?.sessions[sessionKey(workspace, session)];
+    const opened = codaStore.getState().servers[server]?.sessions[key];
     if (opened) {
-      send(server, openMessage(opened));
+      void requestOpenAndApply(server, opened);
     }
   }
 }
@@ -1715,7 +1869,7 @@ export function takeOverActiveSession() {
   if (!active || active.session.draft) {
     return;
   }
-  send(active.server, openMessage(active.session, true));
+  void requestOpenAndApply(active.server, active.session, { takeover: true });
 }
 
 /** Deselect whatever session is currently shown in the center pane (e.g. when
@@ -1728,21 +1882,25 @@ export function clearActiveSession() {
   });
 }
 
-export function sendTask(task: string, images: string[] = []) {
+export async function sendTask(task: string, images: string[] = []) {
   const text = task.trim();
   const active = currentActive();
   if (!text && images.length === 0) {
     return;
   }
-  if (!active) {
+  if (!active || active.session.deleting) {
     return;
   }
-  if (active.session.draft) {
-    send(active.server, openMessage(active.session));
+  // A draft/new session must be live before its first task, or a fire-and-forget
+  // task would be dropped server-side while the UI already showed it running
+  // (Decision 10).
+  if (active.session.draft && !(await requestOpenAndApply(active.server, active.session))) {
+    return;
   }
+  // Append the optimistic user message only if the task frame actually left the
+  // client (a dead socket returns `false`).
   if (
-    send(active.server, {
-      type: "task",
+    notify(active.server, "task", {
       workspace_id: active.session.workspaceId,
       session_id: active.session.sessionId,
       task: text,
@@ -1753,7 +1911,7 @@ export function sendTask(task: string, images: string[] = []) {
   }
 }
 
-export function sendTaskToNewSession(
+export async function sendTaskToNewSession(
   server: string,
   workspaceId: string,
   task: string,
@@ -1784,10 +1942,12 @@ export function sendTaskToNewSession(
   if (!session) {
     return;
   }
-  send(server, openMessage(session));
+  // Open the new session first, then send the task only if it opened.
+  if (!(await requestOpenAndApply(server, session))) {
+    return;
+  }
   if (
-    send(server, {
-      type: "task",
+    notify(server, "task", {
       workspace_id: workspace,
       session_id: sessionId,
       task: text,
@@ -1801,8 +1961,7 @@ export function sendTaskToNewSession(
 export function abort() {
   const active = currentActive();
   if (active) {
-    send(active.server, {
-      type: "abort",
+    notify(active.server, "abort", {
       workspace_id: active.session.workspaceId,
       session_id: active.session.sessionId,
     });
@@ -1829,13 +1988,44 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
     setSessionModel(codaStore, active.server, active.session.key, providerId, reasoningEffort);
     return;
   }
-  send(active.server, {
-    type: "set_model",
-    workspace_id: active.session.workspaceId,
-    session_id: active.session.sessionId,
-    provider_id: providerId,
-    reasoning_effort: reasoningEffort,
-  });
+  if (active.session.deleting) {
+    return;
+  }
+  const rpc = rpcFor(active.server);
+  if (!rpc) {
+    setServerStatus(codaStore, active.server, "error", "Connection closed");
+    return;
+  }
+  const { server, session } = active;
+  // Apply the switch on the server's confirmation (the selector reads the
+  // session's stored model, which stays put until then — so an error needs no
+  // explicit revert).
+  rpc
+    .request("set_model", {
+      workspace_id: session.workspaceId,
+      session_id: session.sessionId,
+      provider_id: providerId,
+      reasoning_effort: reasoningEffort,
+    })
+    .then((result) =>
+      setSessionModel(
+        codaStore,
+        server,
+        session.key,
+        result.provider_id,
+        result.reasoning_effort ?? null,
+      ),
+    )
+    .catch((err) => {
+      if (isServerError(err)) {
+        addSessionActivity(server, session.workspaceId, session.sessionId, {
+          tone: "warning",
+          label: "model change failed",
+          detail: err.message,
+        });
+      }
+      // else: dropped connection — the reconnect restore re-syncs the model.
+    });
 }
 
 export function draftCall(
@@ -1858,7 +2048,7 @@ export function clearDraftCall(approval: PendingApproval, call: ToolCall) {
   clearDraftResolution(codaStore, active.server, active.session.key, approval, call);
 }
 
-export function submitApprovals() {
+export async function submitApprovals() {
   const active = currentActive();
   if (!active) {
     return;
@@ -1869,36 +2059,59 @@ export function submitApprovals() {
   if (active.session.evicted) {
     return;
   }
-  for (const approval of active.session.approvals) {
+  const { server, session } = active;
+  const rpc = rpcFor(server);
+  for (const approval of session.approvals) {
     const approvalId = approvalKey(approval);
-    const draft = active.session.drafts[approvalId] ?? {};
+    const draft = session.drafts[approvalId] ?? {};
     const complete = approval.calls.every((item) => draft[item.id]);
     if (!complete) {
       continue;
     }
-    // Persist staged "always allow" patterns for approved calls only.
-    const allow = active.session.allowDrafts[approvalId] ?? {};
-    for (const item of approval.calls) {
-      const pattern = allow[item.id];
-      if (pattern && draft[item.id] === "Execute") {
-        send(active.server, {
-          type: "add_allow_pattern",
-          workspace_id: active.session.workspaceId,
-          pattern,
-        });
+    // Persist staged "always allow" patterns for approved calls only. This is
+    // best-effort and must never block the resume: gather the writes with
+    // `allSettled` (a rejection only logs a non-fatal activity) (Decision 11).
+    const allow = session.allowDrafts[approvalId] ?? {};
+    const allowWrites: Promise<unknown>[] = [];
+    if (rpc) {
+      for (const item of approval.calls) {
+        const pattern = allow[item.id];
+        if (pattern && draft[item.id] === "Execute") {
+          allowWrites.push(
+            rpc
+              .request("add_allow_pattern", { workspace_id: session.workspaceId, pattern })
+              .then(() =>
+                addAllowResultActivity(codaStore, server, session.workspaceId, pattern, null),
+              )
+              .catch((err) =>
+                addAllowResultActivity(
+                  codaStore,
+                  server,
+                  session.workspaceId,
+                  pattern,
+                  isServerError(err) ? err.message : "connection closed",
+                ),
+              ),
+          );
+        }
       }
     }
-    send(active.server, {
-      type: "resume",
-      workspace_id: active.session.workspaceId,
-      session_id: active.session.sessionId,
-      agent_name: approval.agent_name,
-      thread_id: approval.thread_id,
-      decision: {
-        resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
-      },
-    });
-    clearApprovalState(codaStore, active.server, active.session.key, approval);
+    await Promise.allSettled(allowWrites);
+    // Clear the approval + allow drafts only when the resume actually left the
+    // client, so a disconnect leaves them intact for retry (Decision 11).
+    if (
+      notify(server, "resume", {
+        workspace_id: session.workspaceId,
+        session_id: session.sessionId,
+        agent_name: approval.agent_name,
+        thread_id: approval.thread_id,
+        decision: {
+          resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
+        },
+      })
+    ) {
+      clearApprovalState(codaStore, server, session.key, approval);
+    }
   }
 }
 

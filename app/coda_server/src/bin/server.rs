@@ -24,15 +24,21 @@ use coda_server::{
         SessionKey, SessionOpener, SessionRelay,
     },
     mcp::McpServers,
+    rpc::{self, RpcError, RpcId, RpcOutgoing},
     storage::{WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
-        ClientMessage, PendingApprovalWire, ProviderInfoWire, ServerMessage, SessionSummaryWire,
-        WireEvent, WorkspaceSummaryWire,
+        AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
+        PendingApprovalWire, ProviderCatalog, ProviderInfoWire, ResumeParams, SessionRef,
+        SessionSummaryWire, SetModelParams, Snapshot, TaskParams, WireEvent, WorkspaceCatalog,
+        WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
 use futures::stream::BoxStream;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
@@ -112,14 +118,14 @@ struct WorkspaceState {
     /// Static per-agent model overrides parsed from each agent's `AGENT.md`,
     /// keyed by agent name and validated against the provider catalog at startup.
     /// Agents absent here inherit the session's default (root) model.
-    agent_models: HashMap<String, ModelSelection>,
+    agent_models: HashMap<String, AgentModelSelection>,
     approval_config: ToolApprovalConfig,
 }
 
 /// A validated per-agent model override: a provider selection key plus the
 /// normalized reasoning effort. Resolved to a `ModelProfile` at session open.
 #[derive(Clone)]
-struct ModelSelection {
+struct AgentModelSelection {
     provider_id: String,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -321,28 +327,34 @@ async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) -> Resul
     }
 }
 
-async fn send_allow_pattern_result<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
-    transport: &T,
-    workspace_id: String,
-    approval_config: ToolApprovalConfig,
-    pattern: String,
-) -> bool {
-    let error = add_allow_pattern(approval_config, pattern.clone())
-        .await
-        .err();
-    transport
-        .send(&ServerMessage::AllowPatternResult {
-            workspace_id,
-            pattern,
-            error,
-        })
-        .await
+/// Frame and send a server-initiated notification.
+async fn send_notify<T: Transport>(transport: &T, method: &str, params: &impl Serialize) -> bool {
+    transport.send(&rpc::notify(method, params)).await
 }
 
-/// Send an `Error` event describing a failed session open.
-async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
+/// Push one live event to the client as an `event` notification.
+async fn send_event<T: Transport>(
+    transport: &T,
+    workspace_id: String,
+    session_id: String,
+    event: WireEvent,
+) -> bool {
+    send_notify(
+        transport,
+        "event",
+        &EventParams {
+            workspace_id,
+            session_id,
+            event,
+        },
+    )
+    .await
+}
+
+/// Push an `Error` event describing a failed session open. Used on the
+/// notification paths (`resume` promotion, `set_model` retry) where there is no
+/// request id to answer against.
+async fn send_open_error<T: Transport>(
     transport: &T,
     workspace_id: &str,
     session_id: &str,
@@ -353,13 +365,13 @@ async fn send_open_error<T: Transport<Incoming = ClientMessage, Outgoing = Serve
         thread_id: session_id.to_string(),
         message: format!("failed to open session: {err}"),
     };
-    transport
-        .send(&ServerMessage::Event {
-            workspace_id: workspace_id.to_string(),
-            session_id: session_id.to_string(),
-            event,
-        })
-        .await;
+    send_event(
+        transport,
+        workspace_id.to_string(),
+        session_id.to_string(),
+        event,
+    )
+    .await;
 }
 
 async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
@@ -557,34 +569,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
     infos
 }
 
-async fn send_workspace_catalog<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
-    transport: &T,
-    app: &AppState,
-) -> bool {
-    transport
-        .send(&ServerMessage::WorkspaceCatalog {
-            workspaces: workspace_catalog(app).await,
-        })
-        .await
-}
-
-async fn send_provider_catalog<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
-    transport: &T,
-    app: &AppState,
-) -> bool {
-    transport
-        .send(&ServerMessage::ProviderCatalog {
-            providers: provider_infos(app),
-            default_provider: app.default_provider.clone(),
-        })
-        .await
-}
-
-async fn send_pending_approval_events<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
+async fn send_pending_approval_events<T: Transport>(
     transport: &T,
     workspace_id: &str,
     session_id: &str,
@@ -596,13 +581,13 @@ async fn send_pending_approval_events<
             thread_id: approval.thread_id.clone(),
             approval: PendingApprovalWire::from_agent(approval.clone()),
         };
-        if !transport
-            .send(&ServerMessage::Event {
-                workspace_id: workspace_id.to_string(),
-                session_id: session_id.to_string(),
-                event,
-            })
-            .await
+        if !send_event(
+            transport,
+            workspace_id.to_string(),
+            session_id.to_string(),
+            event,
+        )
+        .await
         {
             return false;
         }
@@ -615,13 +600,14 @@ struct Selection {
     reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// Attach to `key` in the hub and wire the result to this connection: send the
-/// `Snapshot`, register the replay+live stream, and remember the model
-/// selection the session actually uses so a hub-initiated close can re-attach
-/// transparently. Returns `false` when the transport is gone.
+/// Attach to `key` in the hub, register the replay+live stream, and remember the
+/// model selection the session actually uses so a hub-initiated close can
+/// re-attach transparently. On success it *returns* the [`Snapshot`] payload
+/// rather than sending it, so the caller frames it either as an `open_session`
+/// request `result` (solicited) or a `snapshot` notification (unsolicited hub
+/// re-attach) — the only difference between the two paths is the envelope.
 #[allow(clippy::too_many_arguments)]
-async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
-    transport: &T,
+async fn attach_core(
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
@@ -630,8 +616,8 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
     provider_id: String,
     reasoning_effort: Option<ReasoningEffort>,
     takeover: bool,
-) -> bool {
-    match app
+) -> Result<Snapshot, AttachError> {
+    let AttachSession { snapshot, events } = app
         .relay
         .attach(
             key.clone(),
@@ -640,92 +626,123 @@ async fn attach_and_stream<T: Transport<Incoming = ClientMessage, Outgoing = Ser
             reasoning_effort,
             takeover,
         )
-        .await
-    {
-        Ok(AttachSession { snapshot, events }) => {
-            selections.insert(
-                key.clone(),
-                Selection {
-                    provider_id: snapshot.provider_id.clone(),
-                    reasoning_effort: snapshot.reasoning_effort,
-                },
-            );
-            if !transport
-                .send(&ServerMessage::Snapshot {
-                    workspace_id: key.0.clone(),
-                    session_id: key.1.clone(),
-                    messages: snapshot.messages,
-                    pending_approvals: snapshot
-                        .pending_approvals
-                        .into_iter()
-                        .map(PendingApprovalWire::from_agent)
-                        .collect(),
-                    provider_id: snapshot.provider_id,
-                    reasoning_effort: snapshot.reasoning_effort,
-                    turn_running: snapshot.turn_running,
-                })
-                .await
-            {
-                return false;
-            }
-            // Replay + live events flow through the connection's stream map
-            // from here on.
-            streams.insert(key, events);
-            true
-        }
-        // Someone else is driving the session: tell the client so it can ask
-        // the user before retrying with takeover. Nothing changed server-side.
-        Err(AttachError::Busy) => {
-            transport
-                .send(&ServerMessage::SessionBusy {
-                    workspace_id: key.0,
-                    session_id: key.1,
-                })
-                .await
-        }
-        Err(AttachError::Open(err)) => {
-            send_open_error(transport, &key.0, &key.1, err).await;
-            true
-        }
-    }
+        .await?;
+    selections.insert(
+        key.clone(),
+        Selection {
+            provider_id: snapshot.provider_id.clone(),
+            reasoning_effort: snapshot.reasoning_effort,
+        },
+    );
+    let wire_snapshot = Snapshot {
+        workspace_id: key.0.clone(),
+        session_id: key.1.clone(),
+        messages: snapshot.messages,
+        pending_approvals: snapshot
+            .pending_approvals
+            .into_iter()
+            .map(PendingApprovalWire::from_agent)
+            .collect(),
+        provider_id: snapshot.provider_id,
+        reasoning_effort: snapshot.reasoning_effort,
+        turn_running: snapshot.turn_running,
+    };
+    // Register the stream *before* returning; the caller sends the snapshot
+    // (result or notification) before the connection loop next polls the stream,
+    // so the snapshot always precedes the replayed events.
+    streams.insert(key, events);
+    Ok(wire_snapshot)
 }
 
-async fn handle_connection_command<
-    T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>,
->(
+/// Deserialize a request's `params` into the per-method type, mapping a failure
+/// to a `-32602` invalid-params error.
+fn parse_params<P: DeserializeOwned>(params: Value) -> Result<P, RpcError> {
+    serde_json::from_value(params).map_err(|err| RpcError::invalid_params(err.to_string()))
+}
+
+/// Classify one decoded frame and act on it. A *request* always produces exactly
+/// one framed reply (`result` or `error`); a *notification* runs for effect and
+/// is never answered (an unknown method or bad params on a notification is
+/// logged and dropped — there is no id to answer against); a structurally
+/// invalid frame is answered with the recovered id (or `null`). Returns `false`
+/// when the transport is gone and the connection should tear down.
+async fn handle_frame<T: Transport>(
     transport: &T,
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
     selections: &mut HashMap<SessionKey, Selection>,
-    command: ClientMessage,
+    frame: String,
 ) -> bool {
-    match command {
-        ClientMessage::ListWorkspaces => send_workspace_catalog(transport, app).await,
-        ClientMessage::ListProviders => send_provider_catalog(transport, app).await,
-        ClientMessage::OpenSession {
-            workspace_id,
-            session_id,
-            provider_id,
-            reasoning_effort,
-            takeover,
-        } => {
-            if let Err(err) = validate_session_id(&session_id) {
-                warn!(workspace_id = %workspace_id, "rejecting open: {err}");
-                return true;
+    match rpc::decode(&frame) {
+        rpc::Incoming::Request { id, method, params } => {
+            let reply =
+                dispatch_request(app, conn_id, streams, selections, id, &method, params).await;
+            transport.send(&reply).await
+        }
+        rpc::Incoming::Notification { method, params } => {
+            dispatch_notification(
+                transport, app, conn_id, streams, selections, &method, params,
+            )
+            .await
+        }
+        rpc::Incoming::Invalid { id, error } => transport.send(&rpc::error(id, error)).await,
+    }
+}
+
+/// Handle a request and build its single reply. Every arm returns exactly one
+/// `RpcOutgoing` — a `result` or a typed `error`; no request path drops silently.
+async fn dispatch_request(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
+    selections: &mut HashMap<SessionKey, Selection>,
+    id: RpcId,
+    method: &str,
+    params: Value,
+) -> RpcOutgoing {
+    match method {
+        "list_workspaces" => rpc::result(
+            id,
+            &WorkspaceCatalog {
+                workspaces: workspace_catalog(app).await,
+            },
+        ),
+        "list_providers" => rpc::result(
+            id,
+            &ProviderCatalog {
+                providers: provider_infos(app),
+                default_provider: app.default_provider.clone(),
+            },
+        ),
+        "open_session" => {
+            let params: OpenSessionParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return rpc::error(Some(id), err),
+            };
+            if let Err(err) = validate_session_id(&params.session_id) {
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", err),
+                );
             }
-            if !app.workspaces.contains_key(&workspace_id) {
-                warn!(workspace_id = %workspace_id, "unknown workspace requested");
-                return true;
+            if !app.workspaces.contains_key(&params.workspace_id) {
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                );
             }
             // Honor the client's chosen model (e.g. picked on a new session),
             // otherwise fall back to the default provider. Ignored when the
             // session is already live in the hub.
             let (provider_id, reasoning_effort) =
-                resolve_selection(app, provider_id, reasoning_effort);
-            let key = (workspace_id, session_id);
-            if !attach_and_stream(
-                transport,
+                resolve_selection(app, params.provider_id, params.reasoning_effort);
+            let key = (params.workspace_id, params.session_id);
+            match attach_core(
                 app,
                 conn_id,
                 streams,
@@ -733,172 +750,55 @@ async fn handle_connection_command<
                 key,
                 provider_id,
                 reasoning_effort,
-                takeover,
+                params.takeover,
             )
             .await
             {
-                return false;
+                Ok(snapshot) => rpc::result(id, &snapshot),
+                // Held by another client: the client asks the user, then retries
+                // with takeover. Nothing changed server-side.
+                Err(AttachError::Busy) => rpc::error(
+                    Some(id),
+                    RpcError::new(rpc::SESSION_BUSY, "session is held by another client"),
+                ),
+                Err(AttachError::Open(err)) => rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::OPEN_FAILED,
+                        "failed to open session",
+                        err.to_string(),
+                    ),
+                ),
             }
-            send_workspace_catalog(transport, app).await
         }
-        ClientMessage::Task {
-            workspace_id,
-            session_id,
-            task,
-            images,
-        } => {
-            let key = (workspace_id.clone(), session_id.clone());
-            // Reject image input when the active model does not accept it. The
-            // frontend already disables image sends for such models, so reaching
-            // here means a UI bypass — surface an error rather than silently
-            // dropping the attachments.
-            let accepts_images = match app.relay.provider_of(key.clone()).await {
-                Some(provider_id) => app
-                    .providers
-                    .get(&provider_id)
-                    .is_some_and(|h| h.input_modalities.contains(&Modality::Image)),
-                None => return true, // no live/pending session for this key
+        "set_model" => {
+            let params: SetModelParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return rpc::error(Some(id), err),
             };
-            if !accepts_images && !images.is_empty() {
-                let event = WireEvent::Error {
-                    agent_name: String::new(),
-                    thread_id: session_id.clone(),
-                    message: "the selected model does not accept image input".to_string(),
-                };
-                return transport
-                    .send(&ServerMessage::Event {
-                        workspace_id,
-                        session_id,
-                        event,
-                    })
-                    .await;
-            }
-            let images = sanitize_task_images(images);
-            let task = task.trim().to_string();
-            if task.is_empty() && images.is_empty() {
-                return true;
-            }
-            app.relay
-                .command(key, conn_id, SessionCommand::Task { task, images })
-                .await;
-            true
-        }
-        ClientMessage::Resume {
-            workspace_id,
-            session_id,
-            agent_name,
-            thread_id,
-            decision,
-        } => {
-            let key = (workspace_id.clone(), session_id.clone());
-            match app
-                .relay
-                .command(
-                    key,
-                    conn_id,
-                    SessionCommand::Resume {
-                        agent_name,
-                        thread_id,
-                        decision,
-                    },
-                )
-                .await
-            {
-                CommandOutcome::StillPending(more) => {
-                    send_pending_approval_events(transport, &workspace_id, &session_id, &more).await
-                }
-                CommandOutcome::OpenFailed(err) => {
-                    send_open_error(transport, &workspace_id, &session_id, err).await;
-                    true
-                }
-                _ => true,
-            }
-        }
-        ClientMessage::Abort {
-            workspace_id,
-            session_id,
-        } => {
-            app.relay
-                .command((workspace_id, session_id), conn_id, SessionCommand::Abort)
-                .await;
-            true
-        }
-        ClientMessage::DeleteSession {
-            workspace_id,
-            session_id,
-        } => {
-            if let Err(err) = validate_session_id(&session_id) {
-                warn!(workspace_id = %workspace_id, "rejecting delete: {err}");
-                return true;
-            }
-            let key = (workspace_id.clone(), session_id.clone());
-            // Stop the runtime before removing its files so no checkpoint is
-            // written back after deletion. Rejected when another connection is
-            // attached — a stale client must not erase work someone else is
-            // driving; the persisted state stays too.
-            if !app.relay.delete(key.clone(), conn_id).await {
-                return true;
-            }
-            // Drop our own stream (the hub evicted our attachment, if any).
-            streams.remove(&key);
-            selections.remove(&key);
-            let Some(workspace) = app.workspaces.get(&workspace_id) else {
-                warn!(workspace_id = %workspace_id, "unknown workspace requested");
-                return true;
-            };
-            if let Err(err) = workspace.storage.delete_session(&session_id).await {
-                warn!(workspace_id = %workspace_id, session_id = %session_id, "failed to delete session: {err}");
-            }
-            send_workspace_catalog(transport, app).await
-        }
-        ClientMessage::CloseSession {
-            workspace_id,
-            session_id,
-        } => {
-            let key = (workspace_id, session_id);
-            streams.remove(&key);
-            selections.remove(&key);
-            // The hub keeps the session alive while a turn is in flight and
-            // releases it once idle — no per-connection deferral needed.
-            app.relay.detach(key, conn_id).await;
-            true
-        }
-        ClientMessage::AddAllowPattern {
-            workspace_id,
-            pattern,
-        } => {
-            let Some(workspace) = app.workspaces.get(&workspace_id) else {
-                warn!(workspace_id = %workspace_id, "unknown workspace requested");
-                return true;
-            };
-            send_allow_pattern_result(
-                transport,
-                workspace_id,
-                workspace.approval_config.clone(),
-                pattern,
-            )
-            .await
-        }
-        ClientMessage::SetModel {
-            workspace_id,
-            session_id,
-            provider_id,
-            reasoning_effort,
-        } => {
+            // Invalid selections are caught here, before the hub — `OpenError`
+            // has no "bad model" variant (Decision 8).
             let Some(reasoning_effort) =
-                normalize_provider_selection(app, &provider_id, reasoning_effort)
+                normalize_provider_selection(app, &params.provider_id, params.reasoning_effort)
             else {
-                warn!(workspace_id = %workspace_id, %provider_id, "set_model has an invalid selection");
-                return true;
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::INVALID_MODEL_SELECTION,
+                        "invalid model selection",
+                        params.provider_id,
+                    ),
+                );
             };
-            let key = (workspace_id.clone(), session_id.clone());
+            let key = (params.workspace_id, params.session_id);
+            let requested_provider = params.provider_id.clone();
             match app
                 .relay
                 .command(
                     key.clone(),
                     conn_id,
                     SessionCommand::SetModel {
-                        provider_id,
+                        provider_id: params.provider_id,
                         reasoning_effort,
                     },
                 )
@@ -917,24 +817,265 @@ async fn handle_connection_command<
                             reasoning_effort,
                         },
                     );
-                    transport
-                        .send(&ServerMessage::ModelChanged {
-                            workspace_id,
-                            session_id,
+                    rpc::result(
+                        id,
+                        &ModelSelection {
                             provider_id,
                             reasoning_effort,
-                        })
-                        .await
+                        },
+                    )
                 }
-                // Pending approvals: already warned in the hub, nothing to send.
-                CommandOutcome::OpenFailed(OpenError::PendingApprovalsRequired(_)) => true,
-                CommandOutcome::OpenFailed(err) => {
-                    send_open_error(transport, &workspace_id, &session_id, err).await;
-                    true
-                }
-                _ => true,
+                // Already the selected model: idempotent success echoing it back.
+                CommandOutcome::Unchanged => rpc::result(
+                    id,
+                    &ModelSelection {
+                        provider_id: requested_provider,
+                        reasoning_effort,
+                    },
+                ),
+                CommandOutcome::TurnRunning => rpc::error(
+                    Some(id),
+                    RpcError::new(
+                        rpc::MODEL_SWITCH_WHILE_RUNNING,
+                        "cannot switch model while a turn is running",
+                    ),
+                ),
+                CommandOutcome::OpenFailed(err) => rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::OPEN_FAILED,
+                        "failed to switch model",
+                        err.to_string(),
+                    ),
+                ),
+                // Residual `Ignored` — the stale/not-attached guard or the
+                // non-`Live` phase, both meaning "not live" (Decision 8).
+                _ => rpc::error(
+                    Some(id),
+                    RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
+                ),
             }
         }
+        "add_allow_pattern" => {
+            let params: AddAllowPatternParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return rpc::error(Some(id), err),
+            };
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                );
+            };
+            match add_allow_pattern(workspace.approval_config.clone(), params.pattern).await {
+                Ok(()) => rpc::result(id, &serde_json::json!({})),
+                Err(message) => rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::ALLOW_PATTERN_FAILED,
+                        "failed to add allow pattern",
+                        message,
+                    ),
+                ),
+            }
+        }
+        "delete_session" => {
+            let params: DeleteSessionParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return rpc::error(Some(id), err),
+            };
+            if let Err(err) = validate_session_id(&params.session_id) {
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", err),
+                );
+            }
+            if !app.workspaces.contains_key(&params.workspace_id) {
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                );
+            }
+            let key = (params.workspace_id.clone(), params.session_id.clone());
+            // Stop the runtime before removing its files so no checkpoint is
+            // written back after deletion. Refused when another connection is
+            // attached — a stale client must not erase work someone else is
+            // driving (the persisted state stays too).
+            if !app.relay.delete(key.clone(), conn_id).await {
+                return rpc::error(
+                    Some(id),
+                    RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
+                );
+            }
+            // Drop our own stream (the hub evicted our attachment, if any).
+            streams.remove(&key);
+            selections.remove(&key);
+            let workspace = app
+                .workspaces
+                .get(&params.workspace_id)
+                .expect("workspace presence checked above");
+            if let Err(err) = workspace.storage.delete_session(&params.session_id).await {
+                warn!(workspace_id = %params.workspace_id, session_id = %params.session_id, "failed to delete session: {err}");
+                return rpc::error(
+                    Some(id),
+                    RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
+                );
+            }
+            // The catalog is authoritative only after a durable delete.
+            rpc::result(
+                id,
+                &WorkspaceCatalog {
+                    workspaces: workspace_catalog(app).await,
+                },
+            )
+        }
+        other => rpc::error(Some(id), RpcError::method_not_found(other)),
+    }
+}
+
+/// Run a notification for effect. No reply is ever produced; a bad method or
+/// bad params is logged and dropped. Returns `false` when a mid-handler push
+/// found the transport gone.
+async fn dispatch_notification<T: Transport>(
+    transport: &T,
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
+    selections: &mut HashMap<SessionKey, Selection>,
+    method: &str,
+    params: Value,
+) -> bool {
+    match method {
+        "task" => match parse_params::<TaskParams>(params) {
+            Ok(params) => handle_task(transport, app, conn_id, params).await,
+            Err(err) => {
+                warn!("ignoring malformed task notification: {}", err.message);
+                true
+            }
+        },
+        "resume" => match parse_params::<ResumeParams>(params) {
+            Ok(params) => handle_resume(transport, app, conn_id, params).await,
+            Err(err) => {
+                warn!("ignoring malformed resume notification: {}", err.message);
+                true
+            }
+        },
+        "abort" => match parse_params::<SessionRef>(params) {
+            Ok(params) => {
+                app.relay
+                    .command(
+                        (params.workspace_id, params.session_id),
+                        conn_id,
+                        SessionCommand::Abort,
+                    )
+                    .await;
+                true
+            }
+            Err(err) => {
+                warn!("ignoring malformed abort notification: {}", err.message);
+                true
+            }
+        },
+        "close_session" => match parse_params::<SessionRef>(params) {
+            Ok(params) => {
+                let key = (params.workspace_id, params.session_id);
+                streams.remove(&key);
+                selections.remove(&key);
+                // The hub keeps the session alive while a turn is in flight and
+                // releases it once idle — no per-connection deferral needed.
+                app.relay.detach(key, conn_id).await;
+                true
+            }
+            Err(err) => {
+                warn!(
+                    "ignoring malformed close_session notification: {}",
+                    err.message
+                );
+                true
+            }
+        },
+        other => {
+            warn!("ignoring unknown notification method: {other}");
+            true
+        }
+    }
+}
+
+/// Start a new turn. Rejects image input when the active model doesn't accept it
+/// (the frontend disables it, so reaching here is a UI bypass — surface an error
+/// event rather than silently dropping the attachments).
+async fn handle_task<T: Transport>(
+    transport: &T,
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    params: TaskParams,
+) -> bool {
+    let key = (params.workspace_id.clone(), params.session_id.clone());
+    let accepts_images = match app.relay.provider_of(key.clone()).await {
+        Some(provider_id) => app
+            .providers
+            .get(&provider_id)
+            .is_some_and(|handle| handle.input_modalities.contains(&Modality::Image)),
+        None => return true, // no live/pending session for this key
+    };
+    if !accepts_images && !params.images.is_empty() {
+        let event = WireEvent::Error {
+            agent_name: String::new(),
+            thread_id: params.session_id.clone(),
+            message: "the selected model does not accept image input".to_string(),
+        };
+        return send_event(transport, params.workspace_id, params.session_id, event).await;
+    }
+    let images = sanitize_task_images(params.images);
+    let task = params.task.trim().to_string();
+    if task.is_empty() && images.is_empty() {
+        return true;
+    }
+    app.relay
+        .command(key, conn_id, SessionCommand::Task { task, images })
+        .await;
+    true
+}
+
+/// Answer a suspended tool call. Any follow-up (more pending approvals, an open
+/// failure) streams back as `event` notifications; there is no request id here.
+async fn handle_resume<T: Transport>(
+    transport: &T,
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    params: ResumeParams,
+) -> bool {
+    let key = (params.workspace_id.clone(), params.session_id.clone());
+    match app
+        .relay
+        .command(
+            key,
+            conn_id,
+            SessionCommand::Resume {
+                agent_name: params.agent_name,
+                thread_id: params.thread_id,
+                decision: params.decision,
+            },
+        )
+        .await
+    {
+        CommandOutcome::StillPending(more) => {
+            send_pending_approval_events(transport, &params.workspace_id, &params.session_id, &more)
+                .await
+        }
+        CommandOutcome::OpenFailed(err) => {
+            send_open_error(transport, &params.workspace_id, &params.session_id, err).await;
+            true
+        }
+        _ => true,
     }
 }
 
@@ -942,10 +1083,7 @@ async fn handle_connection_command<
 /// stale-command rejection). Monotonic per process.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
-async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = ServerMessage>>(
-    transport: T,
-    app: Arc<AppState>,
-) {
+async fn run_connection<T: Transport>(transport: T, app: Arc<AppState>) {
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     // Event streams of the sessions this connection is attached to. A stream
     // that ends silently (detach/takeover elsewhere) is dropped from the map
@@ -958,26 +1096,22 @@ async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = Server
     // a session that closes again right away is not retried (no reopen loop).
     let mut reattached: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
 
-    if !send_workspace_catalog(&transport, &app).await {
-        return;
-    }
-    if !send_provider_catalog(&transport, &app).await {
-        return;
-    }
+    // No eager catalog pushes: the client requests `list_workspaces` and
+    // `list_providers` on connect and applies the results at the call site.
 
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
-            command = transport.recv() => {
-                match command {
-                    Some(command) => {
-                        if !handle_connection_command(
+            frame = transport.recv() => {
+                match frame {
+                    Some(frame) => {
+                        if !handle_frame(
                             &transport,
                             &app,
                             conn_id,
                             &mut streams,
                             &mut selections,
-                            command,
+                            frame,
                         ).await {
                             break;
                         }
@@ -991,17 +1125,13 @@ async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = Server
                 let forwarded = match event {
                     RelayEvent::Event(event) => {
                         reattached.remove(&key);
-                        transport.send(&ServerMessage::Event {
-                            workspace_id: key.0.clone(),
-                            session_id: key.1.clone(),
-                            event: *event,
-                        }).await
+                        send_event(&transport, key.0.clone(), key.1.clone(), *event).await
                     }
                     RelayEvent::Evicted => {
                         streams.remove(&key);
                         selections.remove(&key);
                         reattached.remove(&key);
-                        transport.send(&ServerMessage::SessionEvicted {
+                        send_notify(&transport, "session_evicted", &SessionRef {
                             workspace_id: key.0,
                             session_id: key.1,
                         }).await
@@ -1025,19 +1155,29 @@ async fn run_connection<T: Transport<Incoming = ClientMessage, Outgoing = Server
                         {
                             info!(workspace_id = %key.0, session_id = %key.1, "session closed by hub; re-attaching");
                             // No takeover: if another connection got there
-                            // first, the client is told the session is busy
-                            // rather than silently evicting them.
-                            attach_and_stream(
-                                &transport,
+                            // first the client is told it lost drive rights
+                            // (`session_evicted`) rather than silently evicting
+                            // whoever now holds it.
+                            match attach_core(
                                 &app,
                                 conn_id,
                                 &mut streams,
                                 &mut selections,
-                                key,
+                                key.clone(),
                                 provider_id,
                                 reasoning_effort,
                                 false,
-                            ).await
+                            ).await {
+                                Ok(snapshot) => send_notify(&transport, "snapshot", &snapshot).await,
+                                Err(AttachError::Busy) => send_notify(&transport, "session_evicted", &SessionRef {
+                                    workspace_id: key.0,
+                                    session_id: key.1,
+                                }).await,
+                                Err(AttachError::Open(err)) => {
+                                    send_open_error(&transport, &key.0, &key.1, err).await;
+                                    true
+                                }
+                            }
                         } else {
                             true
                         }
@@ -1107,7 +1247,7 @@ fn display_path(path: &FsPath) -> String {
 fn resolve_agent_model_selections(
     files: &[AgentFile],
     providers: &HashMap<String, Arc<ProviderHandle>>,
-) -> Result<HashMap<String, ModelSelection>, String> {
+) -> Result<HashMap<String, AgentModelSelection>, String> {
     let mut selections = HashMap::new();
     for file in files {
         let Some(model_key) = file.model() else {
@@ -1132,7 +1272,7 @@ fn resolve_agent_model_selections(
         };
         selections.insert(
             file.name().to_string(),
-            ModelSelection {
+            AgentModelSelection {
                 provider_id: model_key.to_string(),
                 reasoning_effort,
             },

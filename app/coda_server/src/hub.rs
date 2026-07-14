@@ -91,7 +91,9 @@ pub enum CommandOutcome {
     Ok,
     /// The command was not applied: stale connection, invalid state, or the
     /// session did not accept it (e.g. runtime channel closed). Logged;
-    /// nothing to send.
+    /// nothing to send. For a `SetModel`, the request dispatcher reads this as
+    /// `SESSION_NOT_LIVE` (the stale/not-attached guard *and* the non-`Live`
+    /// phase both land here — see Decision 8).
     Ignored,
     /// A `Resume` against an approvals-gated open that still needs more
     /// decisions; the client should be shown these approvals.
@@ -101,6 +103,12 @@ pub enum CommandOutcome {
         provider_id: String,
         reasoning_effort: Option<ReasoningEffort>,
     },
+    /// A `SetModel` selecting the model already in effect: a benign no-op the
+    /// request dispatcher reports as idempotent success (echoing the selection).
+    Unchanged,
+    /// A `SetModel` rejected because a turn is in flight (the session can only be
+    /// rebuilt while idle). Reported as `MODEL_SWITCH_WHILE_RUNNING`.
+    TurnRunning,
     /// Opening the session failed (approvals-gated promotion or `SetModel`).
     OpenFailed(OpenError),
 }
@@ -718,16 +726,20 @@ impl SessionHub {
         provider_id: String,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> CommandOutcome {
+        // Not `Live` (stale/not-attached is caught earlier by `command`'s guard;
+        // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
+        // `set_model` path as `SESSION_NOT_LIVE` (Decision 8).
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
+        // Selecting the current model is a benign no-op: idempotent success.
         if live.provider_id == provider_id && live.reasoning_effort == reasoning_effort {
-            return CommandOutcome::Ignored;
+            return CommandOutcome::Unchanged;
         }
         // The session is rebuilt with a new RunConfig; only safe while idle.
         if live.turn_running {
             warn!(workspace_id = %key.0, session_id = %key.1, "ignoring set_model while a turn is running");
-            return CommandOutcome::Ignored;
+            return CommandOutcome::TurnRunning;
         }
         // Open the replacement before tearing down the current session, so a
         // failed open leaves the existing one intact. The old session is idle,
