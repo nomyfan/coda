@@ -139,156 +139,144 @@ impl WireEvent {
     }
 }
 
-/// A command sent by the client over the WebSocket.
+// --- Request params (client→server) ------------------------------------------
+//
+// `list_workspaces` and `list_providers` carry no params. Each remaining method
+// deserializes its `params` object into one of these. Fields mirror the former
+// `ClientMessage` variants one-for-one.
+
+/// `open_session` params. `provider_id`/`reasoning_effort` carry a client-chosen
+/// selection (e.g. picked on a new session before the first message); both
+/// default to the server's defaults when omitted. `takeover` evicts whoever
+/// currently holds the session — an explicit user decision; without it a held
+/// session is refused with the `SESSION_BUSY` error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    /// Request the configured workspace/session catalog.
-    ListWorkspaces,
-    /// Request the selectable providers (static for the server's lifetime).
-    ListProviders,
-    /// Open or switch the active session on this connection. `provider_id` and
-    /// `reasoning_effort` carry a client-chosen selection (e.g. picked on a new
-    /// session before the first message); both default to the server's defaults
-    /// when omitted. When another client holds the session, the open is refused
-    /// with [`ServerMessage::SessionBusy`] unless `takeover` is set — evicting
-    /// someone must be an explicit user decision.
-    OpenSession {
-        workspace_id: String,
-        session_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<ReasoningEffort>,
-        #[serde(default)]
-        takeover: bool,
-    },
-    /// Start a new turn with a user task, optionally with image attachments.
-    Task {
-        workspace_id: String,
-        session_id: String,
-        task: String,
-        /// Base64 data-URIs (`data:image/<fmt>;base64,<b64>`) or HTTPS URLs.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        images: Vec<String>,
-    },
-    /// Answer a suspended tool call. `agent_name` and `thread_id` come from the
-    /// [`PendingApprovalWire`] carried by a [`ServerMessage::Event`] `Suspended`.
-    Resume {
-        workspace_id: String,
-        session_id: String,
-        agent_name: String,
-        thread_id: String,
-        decision: ResumeDecision,
-    },
-    /// Interrupt whatever the session is currently doing.
-    Abort {
-        workspace_id: String,
-        session_id: String,
-    },
-    /// Delete a session: stop it if live, then remove its persisted directory.
-    DeleteSession {
-        workspace_id: String,
-        session_id: String,
-    },
-    /// Close a live session: free its runtime memory while keeping the persisted
-    /// session on disk so it can be reopened later. An idle session is torn down
-    /// at once; one with a turn in flight is torn down when that turn settles
-    /// (finishes, suspends, aborts, or errors), so running work isn't aborted.
-    /// Reopening the session before then cancels the close. A no-op when the
-    /// session isn't currently live.
-    CloseSession {
-        workspace_id: String,
-        session_id: String,
-    },
-    /// Append a glob pattern to the shell allow-list. Takes effect immediately
-    /// for the live session.
-    AddAllowPattern {
-        workspace_id: String,
-        pattern: String,
-    },
-    /// Switch the provider/model and reasoning setting a session uses. Applies
-    /// from the next turn (the server reopens the session). For reasoning models,
-    /// `null` selects the first configured effort, `none` turns thinking off, and
-    /// any configured level turns it on at that level. Models without reasoning
-    /// controls keep `null`.
-    SetModel {
-        workspace_id: String,
-        session_id: String,
-        provider_id: String,
-        #[serde(default)]
-        reasoning_effort: Option<ReasoningEffort>,
-    },
+pub struct OpenSessionParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub takeover: bool,
 }
 
-/// A message pushed by the server over the WebSocket.
+/// `task` params — start a new turn, optionally with image attachments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    /// Configured workspaces and persisted sessions.
-    WorkspaceCatalog {
-        workspaces: Vec<WorkspaceSummaryWire>,
-    },
-    /// The providers the dashboard can choose between and the one new sessions
-    /// default to. Static for the server's lifetime; fetched once per connection.
-    ProviderCatalog {
-        providers: Vec<ProviderInfoWire>,
-        default_provider: String,
-    },
-    /// Confirms a successful provider/reasoning switch for a live session.
-    ModelChanged {
-        workspace_id: String,
-        session_id: String,
-        provider_id: String,
-        #[serde(default)]
-        reasoning_effort: Option<ReasoningEffort>,
-    },
-    /// Sent once, immediately after connect: the resumed conversation history
-    /// plus any approvals left pending from a prior suspension, which the client
-    /// must answer with `Resume` before the session resumes. `provider_id` and
-    /// `reasoning_effort` are the session's current model selection.
-    /// `turn_running` tells the client a turn is still in flight — the events
-    /// of that turn are replayed (then streamed) right after this message.
-    Snapshot {
-        workspace_id: String,
-        session_id: String,
-        messages: Vec<Message>,
-        #[serde(default)]
-        pending_approvals: Vec<PendingApprovalWire>,
-        provider_id: String,
-        #[serde(default)]
-        reasoning_effort: Option<ReasoningEffort>,
-        #[serde(default)]
-        turn_running: bool,
-    },
-    /// A live runtime event. Nested under `event` rather than flattened so the
-    /// inner `type` tag of [`WireEvent`] does not collide with this enum's tag.
-    Event {
-        workspace_id: String,
-        session_id: String,
-        event: WireEvent,
-    },
-    /// Result of a requested shell allow-list update.
-    AllowPatternResult {
-        workspace_id: String,
-        pattern: String,
-        #[serde(default)]
-        error: Option<String>,
-    },
-    /// Another client opened this session; this connection lost drive rights.
-    /// Commands for the session are rejected until it is reopened with
-    /// takeover (which evicts the other client in turn).
-    SessionEvicted {
-        workspace_id: String,
-        session_id: String,
-    },
-    /// An `OpenSession` without `takeover` hit a session another client is
-    /// driving. Nothing changed; re-send with `takeover: true` after the user
-    /// confirms.
-    SessionBusy {
-        workspace_id: String,
-        session_id: String,
-    },
+pub struct TaskParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub task: String,
+    /// Base64 data-URIs (`data:image/<fmt>;base64,<b64>`) or HTTPS URLs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+}
+
+/// `resume` params — answer a suspended tool call. `agent_name`/`thread_id` come
+/// from the [`PendingApprovalWire`] carried by a `Suspended` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub agent_name: String,
+    pub thread_id: String,
+    pub decision: ResumeDecision,
+}
+
+/// `abort` / `close_session` params — both identify only a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRef {
+    pub workspace_id: String,
+    pub session_id: String,
+}
+
+/// `delete_session` params.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteSessionParams {
+    pub workspace_id: String,
+    pub session_id: String,
+}
+
+/// `add_allow_pattern` params — append a glob to the shell allow-list; takes
+/// effect immediately for the live session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddAllowPatternParams {
+    pub workspace_id: String,
+    pub pattern: String,
+}
+
+/// `set_model` params — switch the provider/model and reasoning setting. Applies
+/// from the next turn (the server reopens the session). For reasoning models,
+/// `null` selects the first configured effort, `none` turns thinking off, and any
+/// configured level turns it on at that level. Models without reasoning controls
+/// keep `null`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetModelParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub provider_id: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+// --- Result / server-push payloads -------------------------------------------
+//
+// These serialize identically whether framed as a request `result` or a
+// notification `params`, so the same struct backs both the solicited and the
+// unsolicited path (see Load-Bearing Decision 5).
+
+/// Result of `list_workspaces` / `delete_session`, and (historically) a
+/// `workspace_catalog` push: the configured workspaces and their sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCatalog {
+    pub workspaces: Vec<WorkspaceSummaryWire>,
+}
+
+/// Result of `list_providers`: the models the dashboard can choose between and
+/// the one new sessions default to. Static for the server's lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCatalog {
+    pub providers: Vec<ProviderInfoWire>,
+    pub default_provider: String,
+}
+
+/// Result of `set_model`: the selection now in effect (echoed on a real switch
+/// and on an idempotent no-op).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSelection {
+    pub provider_id: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Result of `open_session`, and the payload of an unsolicited `snapshot`
+/// notification (hub re-attach): the resumed conversation history plus any
+/// approvals left pending from a prior suspension, which the client must answer
+/// with `resume` before the session resumes. `provider_id`/`reasoning_effort`
+/// are the session's current model selection. `turn_running` tells the client a
+/// turn is still in flight — its events are replayed (then streamed) right after.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApprovalWire>,
+    pub provider_id: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub turn_running: bool,
+}
+
+/// Params of an `event` notification: one live runtime event. Nested under
+/// `event` so the inner `type` tag of [`WireEvent`] does not collide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub event: WireEvent,
 }
 
 /// A model the dashboard can pick, grouped under a provider. `reasoning_efforts`
@@ -366,13 +354,9 @@ mod tests {
     use super::*;
     use coda_agent::{PendingApproval, ToolCallResolution};
 
-    fn roundtrip_client(msg: &ClientMessage) -> ClientMessage {
-        serde_json::from_str(&serde_json::to_string(msg).unwrap()).unwrap()
-    }
-
     #[test]
-    fn client_task_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::Task {
+    fn task_params_omits_empty_images() {
+        let json = serde_json::to_string(&TaskParams {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             task: "hello".into(),
@@ -381,85 +365,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"task","workspace_id":"coda","session_id":"s1","task":"hello"}"#
+            r#"{"workspace_id":"coda","session_id":"s1","task":"hello"}"#
         );
     }
 
     #[test]
-    fn client_list_workspaces_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::ListWorkspaces).unwrap();
-        assert_eq!(json, r#"{"type":"list_workspaces"}"#);
-        assert!(matches!(
-            serde_json::from_str::<ClientMessage>(&json).unwrap(),
-            ClientMessage::ListWorkspaces
-        ));
+    fn open_session_params_defaults_takeover_off() {
+        // Clients omit `takeover`; it defaults off (no silent eviction).
+        let params: OpenSessionParams =
+            serde_json::from_str(r#"{"workspace_id":"coda","session_id":"s1"}"#).unwrap();
+        assert!(!params.takeover);
+        assert!(params.provider_id.is_none());
+        assert!(params.reasoning_effort.is_none());
     }
 
     #[test]
-    fn client_open_session_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::OpenSession {
-            workspace_id: "coda".into(),
-            session_id: "s1".into(),
-            provider_id: None,
-            reasoning_effort: None,
-            takeover: false,
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"open_session","workspace_id":"coda","session_id":"s1","takeover":false}"#
-        );
-        // Older clients omit `takeover`; it defaults off (no silent eviction).
-        assert!(matches!(
-            serde_json::from_str::<ClientMessage>(
-                r#"{"type":"open_session","workspace_id":"coda","session_id":"s1"}"#
-            )
-            .unwrap(),
-            ClientMessage::OpenSession {
-                takeover: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn server_session_busy_roundtrips() {
-        let msg = ServerMessage::SessionBusy {
-            workspace_id: "coda".into(),
-            session_id: "s1".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"session_busy","workspace_id":"coda","session_id":"s1"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<ServerMessage>(&json).unwrap(),
-            ServerMessage::SessionBusy { workspace_id, session_id }
-                if workspace_id == "coda" && session_id == "s1"
-        ));
-    }
-
-    #[test]
-    fn client_abort_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::Abort {
-            workspace_id: "coda".into(),
-            session_id: "s1".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"abort","workspace_id":"coda","session_id":"s1"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<ClientMessage>(&json).unwrap(),
-            ClientMessage::Abort { .. }
-        ));
-    }
-
-    #[test]
-    fn client_resume_roundtrips() {
-        let msg = ClientMessage::Resume {
+    fn resume_params_roundtrips() {
+        let params = ResumeParams {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             agent_name: "coda".into(),
@@ -468,56 +390,44 @@ mod tests {
                 resolutions: vec![("call_1".into(), ToolCallResolution::Execute)],
             },
         };
-        match roundtrip_client(&msg) {
-            ClientMessage::Resume {
-                workspace_id,
-                session_id,
-                agent_name,
-                thread_id,
-                decision,
-            } => {
-                assert_eq!(workspace_id, "coda");
-                assert_eq!(session_id, "s1");
-                assert_eq!(agent_name, "coda");
-                assert_eq!(thread_id, "t1");
-                assert_eq!(decision.resolutions.len(), 1);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let back: ResumeParams =
+            serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(back.agent_name, "coda");
+        assert_eq!(back.thread_id, "t1");
+        assert_eq!(back.decision.resolutions.len(), 1);
     }
 
     #[test]
-    fn client_close_session_roundtrips() {
-        let json = serde_json::to_string(&ClientMessage::CloseSession {
+    fn session_ref_roundtrips() {
+        let json = serde_json::to_string(&SessionRef {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
         })
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"close_session","workspace_id":"coda","session_id":"s1"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<ClientMessage>(&json).unwrap(),
-            ClientMessage::CloseSession { .. }
-        ));
+        assert_eq!(json, r#"{"workspace_id":"coda","session_id":"s1"}"#);
     }
 
     #[test]
-    fn client_add_allow_pattern_roundtrips() {
-        let msg = ClientMessage::AddAllowPattern {
-            workspace_id: "coda".into(),
-            pattern: "git *".into(),
-        };
-        assert!(matches!(
-            roundtrip_client(&msg),
-            ClientMessage::AddAllowPattern { workspace_id, pattern } if workspace_id == "coda" && pattern == "git *"
-        ));
+    fn add_allow_pattern_params_roundtrips() {
+        let params: AddAllowPatternParams =
+            serde_json::from_str(r#"{"workspace_id":"coda","pattern":"git *"}"#).unwrap();
+        assert_eq!(params.workspace_id, "coda");
+        assert_eq!(params.pattern, "git *");
     }
 
     #[test]
-    fn server_snapshot_roundtrips() {
-        let msg = ServerMessage::Snapshot {
+    fn set_model_params_defaults_effort_to_none() {
+        let params: SetModelParams = serde_json::from_str(
+            r#"{"workspace_id":"coda","session_id":"s1","provider_id":"deepseek"}"#,
+        )
+        .unwrap();
+        assert_eq!(params.provider_id, "deepseek");
+        assert!(params.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn snapshot_serializes_without_type_tag() {
+        let msg = Snapshot {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             messages: vec![],
@@ -529,38 +439,27 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","turn_running":true}"#
+            r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","turn_running":true}"#
         );
     }
 
     #[test]
-    fn server_snapshot_without_turn_running_defaults_to_false() {
-        let json = r#"{"type":"snapshot","workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
-        assert!(matches!(
-            serde_json::from_str::<ServerMessage>(json).unwrap(),
-            ServerMessage::Snapshot {
-                turn_running: false,
-                ..
-            }
-        ));
+    fn snapshot_without_turn_running_defaults_to_false() {
+        let json = r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
+        let snapshot: Snapshot = serde_json::from_str(json).unwrap();
+        assert!(!snapshot.turn_running);
     }
 
     #[test]
-    fn server_session_evicted_roundtrips() {
-        let msg = ServerMessage::SessionEvicted {
-            workspace_id: "coda".into(),
-            session_id: "s1".into(),
+    fn model_selection_roundtrips() {
+        let result = ModelSelection {
+            provider_id: "openai:gpt-4o".into(),
+            reasoning_effort: None,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"session_evicted","workspace_id":"coda","session_id":"s1"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<ServerMessage>(&json).unwrap(),
-            ServerMessage::SessionEvicted { workspace_id, session_id }
-                if workspace_id == "coda" && session_id == "s1"
-        ));
+        let back: ModelSelection =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(back.provider_id, "openai:gpt-4o");
+        assert!(back.reasoning_effort.is_none());
     }
 
     #[test]
@@ -653,27 +552,22 @@ mod tests {
     }
 
     #[test]
-    fn client_set_model_roundtrips() {
-        let msg = ClientMessage::SetModel {
+    fn set_model_params_roundtrips() {
+        let params = SetModelParams {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             provider_id: "deepseek".into(),
             reasoning_effort: None,
         };
-        assert_eq!(
-            serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"set_model","workspace_id":"coda","session_id":"s1","provider_id":"deepseek","reasoning_effort":null}"#
-        );
-        assert!(matches!(
-            roundtrip_client(&msg),
-            ClientMessage::SetModel { provider_id, reasoning_effort, .. }
-                if provider_id == "deepseek" && reasoning_effort.is_none()
-        ));
+        let back: SetModelParams =
+            serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(back.provider_id, "deepseek");
+        assert!(back.reasoning_effort.is_none());
     }
 
     #[test]
-    fn server_workspace_catalog_roundtrips() {
-        let msg = ServerMessage::WorkspaceCatalog {
+    fn workspace_catalog_roundtrips() {
+        let msg = WorkspaceCatalog {
             workspaces: vec![WorkspaceSummaryWire {
                 id: "coda".into(),
                 path: "/work/coda".into(),
@@ -685,20 +579,16 @@ mod tests {
                 }],
             }],
         };
-        match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
-        {
-            ServerMessage::WorkspaceCatalog { workspaces } => {
-                assert_eq!(workspaces[0].id, "coda");
-                assert_eq!(workspaces[0].sessions[0].id, "s1");
-                assert!(workspaces[0].sessions[0].has_pending_approval);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let back: WorkspaceCatalog =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.workspaces[0].id, "coda");
+        assert_eq!(back.workspaces[0].sessions[0].id, "s1");
+        assert!(back.workspaces[0].sessions[0].has_pending_approval);
     }
 
     #[test]
-    fn server_provider_catalog_roundtrips() {
-        let msg = ServerMessage::ProviderCatalog {
+    fn provider_catalog_roundtrips() {
+        let msg = ProviderCatalog {
             providers: vec![ProviderInfoWire {
                 id: "deepseek:deepseek-reasoner".into(),
                 provider: "deepseek".into(),
@@ -709,40 +599,18 @@ mod tests {
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),
         };
-        match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
-        {
-            ServerMessage::ProviderCatalog {
-                providers,
-                default_provider,
-            } => {
-                assert_eq!(providers[0].id, "deepseek:deepseek-reasoner");
-                assert_eq!(providers[0].provider, "deepseek");
-                assert_eq!(providers[0].context_window, 128_000);
-                assert_eq!(providers[0].reasoning_efforts.len(), 2);
-                assert_eq!(default_provider, "deepseek:deepseek-reasoner");
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let back: ProviderCatalog =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.providers[0].id, "deepseek:deepseek-reasoner");
+        assert_eq!(back.providers[0].provider, "deepseek");
+        assert_eq!(back.providers[0].context_window, 128_000);
+        assert_eq!(back.providers[0].reasoning_efforts.len(), 2);
+        assert_eq!(back.default_provider, "deepseek:deepseek-reasoner");
     }
 
     #[test]
-    fn server_model_changed_roundtrips() {
-        let msg = ServerMessage::ModelChanged {
-            workspace_id: "coda".into(),
-            session_id: "s1".into(),
-            provider_id: "openai:gpt-4o".into(),
-            reasoning_effort: None,
-        };
-        assert!(matches!(
-            serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap(),
-            ServerMessage::ModelChanged { provider_id, reasoning_effort, .. }
-                if provider_id == "openai:gpt-4o" && reasoning_effort.is_none()
-        ));
-    }
-
-    #[test]
-    fn server_event_roundtrips() {
-        let msg = ServerMessage::Event {
+    fn event_params_roundtrips() {
+        let msg = EventParams {
             workspace_id: "coda".into(),
             session_id: "s1".into(),
             event: WireEvent::LlmContentChunk {
@@ -751,45 +619,13 @@ mod tests {
                 content: "hi".into(),
             },
         };
-        match serde_json::from_str::<ServerMessage>(&serde_json::to_string(&msg).unwrap()).unwrap()
-        {
-            ServerMessage::Event {
-                workspace_id,
-                session_id,
-                event: WireEvent::LlmContentChunk { content, .. },
-            } => {
-                assert_eq!(workspace_id, "coda");
-                assert_eq!(session_id, "s1");
-                assert_eq!(content, "hi");
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn server_allow_pattern_result_roundtrips() {
-        let ok = ServerMessage::AllowPatternResult {
-            workspace_id: "coda".into(),
-            pattern: "git *".into(),
-            error: None,
-        };
-        let json = serde_json::to_string(&ok).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"allow_pattern_result","workspace_id":"coda","pattern":"git *","error":null}"#
-        );
-
-        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
-            ServerMessage::AllowPatternResult {
-                workspace_id,
-                pattern,
-                error,
-            } => {
-                assert_eq!(workspace_id, "coda");
-                assert_eq!(pattern, "git *");
-                assert!(error.is_none());
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let back: EventParams =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back.workspace_id, "coda");
+        assert_eq!(back.session_id, "s1");
+        assert!(matches!(
+            back.event,
+            WireEvent::LlmContentChunk { content, .. } if content == "hi"
+        ));
     }
 }

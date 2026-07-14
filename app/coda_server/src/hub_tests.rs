@@ -946,3 +946,124 @@ async fn lagged_stream_drains_session_and_closes_client() {
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_to_current_selection_is_unchanged() {
+    // Re-selecting the model already in effect is a benign no-op the dispatcher
+    // reports as idempotent success (Decision 8).
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "prov".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await,
+        CommandOutcome::Unchanged
+    ));
+
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_switch_returns_model_changed() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "other".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await,
+        CommandOutcome::ModelChanged { provider_id, .. } if provider_id == "other"
+    ));
+
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_while_turn_running_is_rejected() {
+    // A live session can only be rebuilt while idle; a switch during an
+    // in-flight turn is a soft reject (→ MODEL_SWITCH_WHILE_RUNNING), not a
+    // silent `Ignored` that the dispatcher would misread as SESSION_NOT_LIVE.
+    let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    // `handle_task` flips `turn_running` synchronously once the session accepts
+    // the task, so the following `set_model` observes a running turn.
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "hold on".into(),
+                images: vec![],
+            },
+        )
+        .await,
+        CommandOutcome::Ok
+    ));
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "other".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await,
+        CommandOutcome::TurnRunning
+    ));
+
+    // Let the held turn settle so shutdown is prompt.
+    gate.notify_one();
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_on_unattached_connection_is_ignored() {
+    // The stale/not-attached guard in `command` returns `Ignored` *before*
+    // dispatch; the request layer reads that as SESSION_NOT_LIVE.
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    // Connection 2 never attached: its command is refused at the guard.
+    assert!(matches!(
+        hub.command(
+            key(),
+            2,
+            SessionCommand::SetModel {
+                provider_id: "other".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await,
+        CommandOutcome::Ignored
+    ));
+
+    hub.shutdown_all().await;
+}

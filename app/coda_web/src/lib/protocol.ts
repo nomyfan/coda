@@ -113,39 +113,65 @@ export type ProviderInfo = {
   input_modalities: Modality[];
 };
 
-export type ClientMessage =
-  | { type: "list_workspaces" }
-  | { type: "list_providers" }
-  | {
-      type: "open_session";
-      workspace_id: string;
-      session_id: string;
-      provider_id?: string;
-      reasoning_effort?: ReasoningEffort | null;
-      /** Evict whoever currently holds the session (explicit user decision);
-       * without it the server answers `session_busy` instead. */
-      takeover?: boolean;
-    }
-  | { type: "task"; workspace_id: string; session_id: string; task: string; images?: string[] }
-  | {
-      type: "resume";
-      workspace_id: string;
-      session_id: string;
-      agent_name: string;
-      thread_id: string;
-      decision: ResumeDecision;
-    }
-  | { type: "abort"; workspace_id: string; session_id: string }
-  | { type: "delete_session"; workspace_id: string; session_id: string }
-  | { type: "close_session"; workspace_id: string; session_id: string }
-  | { type: "add_allow_pattern"; workspace_id: string; pattern: string }
-  | {
-      type: "set_model";
-      workspace_id: string;
-      session_id: string;
-      provider_id: string;
-      reasoning_effort: ReasoningEffort | null;
-    };
+/**
+ * Frozen JSON-RPC error codes. The wire carries only the number; this table
+ * mirrors the server's `rpc.rs` constants. Standard codes sit in the JSON-RPC
+ * range; app codes in the reserved server-error block (`-32000..-32099`).
+ */
+export const RpcCode = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+  /** `open_session`: another client holds it → drives the takeover UI. */
+  SESSION_BUSY: -32001,
+  /** `delete_session`: another connection is driving it. */
+  NOT_OWNER: -32002,
+  /** `set_model`: stale / not attached / not live. */
+  SESSION_NOT_LIVE: -32003,
+  /** `set_model`: a turn is in flight. */
+  MODEL_SWITCH_WHILE_RUNNING: -32004,
+  UNKNOWN_WORKSPACE: -32010,
+  INVALID_SESSION_ID: -32011,
+  INVALID_MODEL_SELECTION: -32012,
+  OPEN_FAILED: -32020,
+  DELETE_FAILED: -32021,
+  ALLOW_PATTERN_FAILED: -32030,
+} as const;
+
+export type RpcCode = (typeof RpcCode)[keyof typeof RpcCode];
+
+// --- Request results / server-push payloads ----------------------------------
+// These mirror the server's `wire.rs` structs. A `Snapshot` backs both the
+// `open_session` result and the unsolicited `snapshot` push; the catalogs back
+// both a request result and (historically) a push.
+
+export type Snapshot = {
+  workspace_id: string;
+  session_id: string;
+  messages: HistoryMessage[];
+  pending_approvals?: PendingApproval[];
+  provider_id: string;
+  reasoning_effort?: ReasoningEffort | null;
+  /** A turn is still in flight; its events are replayed after the snapshot. */
+  turn_running?: boolean;
+};
+
+export type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
+
+export type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
+
+export type ModelSelectionResult = {
+  provider_id: string;
+  reasoning_effort?: ReasoningEffort | null;
+};
+
+/** Params of an `event` push: one live runtime event, nested under `event`. */
+export type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
+
+/** Params of a `session_evicted` push: this connection lost drive rights. */
+export type SessionRefPush = { workspace_id: string; session_id: string };
 
 export type WireEvent =
   | {
@@ -202,40 +228,6 @@ export type WireEvent =
       thread_id: string;
       message: string;
     };
-
-export type ServerMessage =
-  | {
-      type: "workspace_catalog";
-      workspaces: WorkspaceSummary[];
-    }
-  | {
-      type: "provider_catalog";
-      providers: ProviderInfo[];
-      default_provider: string;
-    }
-  | {
-      type: "model_changed";
-      workspace_id: string;
-      session_id: string;
-      provider_id: string;
-      reasoning_effort?: ReasoningEffort | null;
-    }
-  | {
-      type: "snapshot";
-      workspace_id: string;
-      session_id: string;
-      messages: HistoryMessage[];
-      pending_approvals?: PendingApproval[];
-      provider_id: string;
-      reasoning_effort?: ReasoningEffort | null;
-      /** A turn is still in flight; its events are replayed after the snapshot. */
-      turn_running?: boolean;
-    }
-  | { type: "event"; workspace_id: string; session_id: string; event: WireEvent }
-  | { type: "allow_pattern_result"; workspace_id: string; pattern: string; error?: string | null }
-  | { type: "session_evicted"; workspace_id: string; session_id: string }
-  /** An open without `takeover` hit a session another client is driving. */
-  | { type: "session_busy"; workspace_id: string; session_id: string };
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {
   return "Ok" in output;

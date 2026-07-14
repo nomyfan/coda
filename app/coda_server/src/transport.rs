@@ -1,50 +1,36 @@
 //! Transport abstraction for the client connection.
 //!
-//! A [`Transport`] hides connection setup, framing, and (de)serialization
-//! behind a tiny typed interface. Each side names what it receives and what it
-//! sends via the `Incoming`/`Outgoing` associated types (the server takes
-//! `ClientMessage` in, `ServerMessage` out). Today the wire is WebSocket; a
-//! future Unix-domain-socket transport can plug in by implementing this trait.
+//! A [`Transport`] hides connection setup and framing behind a tiny interface:
+//! `recv` hands up the **raw frame text** and `send` serializes a built
+//! [`RpcOutgoing`] envelope. The decode/encode asymmetry is deliberate — only
+//! the `rpc` layer can turn a malformed frame into an error *response*, so
+//! classification lives there, not here (this layer must not silently drop a bad
+//! frame the way a typed decode would). Today the wire is WebSocket; a future
+//! Unix-domain-socket transport can plug in by implementing this trait.
 
-use crate::wire::{ClientMessage, ServerMessage};
+use crate::rpc::RpcOutgoing;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use std::future::Future;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-/// A bidirectional, message-framed channel to the peer.
+/// A bidirectional, text-framed channel to the peer.
 ///
-/// `recv`/`send` take `&self` so a caller can await an inbound message and emit
-/// an outbound one concurrently (e.g. inside a `tokio::select!`).
+/// `recv`/`send` take `&self` so a caller can await an inbound frame and emit an
+/// outbound one concurrently (e.g. inside a `tokio::select!`).
 pub trait Transport {
-    /// Messages received from the peer.
-    type Incoming;
-    /// Messages sent to the peer.
-    type Outgoing;
+    /// The next inbound frame's raw text, or `None` once the connection is
+    /// closed. Non-data frames (ping/pong/binary) are skipped internally;
+    /// malformed *content* is handed up verbatim for the `rpc` layer to classify.
+    fn recv(&self) -> impl Future<Output = Option<String>> + Send;
 
-    /// The next inbound message, or `None` once the connection is closed.
-    /// Malformed or non-data frames are logged and skipped internally.
-    fn recv(&self) -> impl Future<Output = Option<Self::Incoming>> + Send;
-
-    /// Send a message. Returns `false` once the message cannot be delivered and
-    /// the caller should tear down.
-    fn send(&self, msg: &Self::Outgoing) -> impl Future<Output = bool> + Send;
-}
-
-/// Decode a text frame into `T`, logging and yielding `None` on malformed input.
-fn decode<T: DeserializeOwned>(text: &str) -> Option<T> {
-    match serde_json::from_str(text) {
-        Ok(msg) => Some(msg),
-        Err(e) => {
-            warn!("ignoring malformed message: {e}");
-            None
-        }
-    }
+    /// Send a built envelope. Returns `false` once the frame cannot be delivered
+    /// and the caller should tear down.
+    fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send;
 }
 
 /// [`Transport`] over an axum WebSocket (server side). The split halves are each
@@ -65,18 +51,11 @@ impl WebSocketTransport {
 }
 
 impl Transport for WebSocketTransport {
-    type Incoming = ClientMessage;
-    type Outgoing = ServerMessage;
-
-    async fn recv(&self) -> Option<ClientMessage> {
+    async fn recv(&self) -> Option<String> {
         let mut stream = self.stream.lock().await;
         loop {
             match stream.next().await {
-                Some(Ok(AxumMessage::Text(text))) => {
-                    if let Some(msg) = decode(&text) {
-                        return Some(msg);
-                    }
-                }
+                Some(Ok(AxumMessage::Text(text))) => return Some(text.to_string()),
                 Some(Ok(AxumMessage::Close(_))) | None => return None,
                 Some(Ok(_)) => {} // ping/pong/binary: ignore
                 Some(Err(e)) => {
@@ -87,13 +66,12 @@ impl Transport for WebSocketTransport {
         }
     }
 
-    async fn send(&self, msg: &ServerMessage) -> bool {
+    async fn send(&self, msg: &RpcOutgoing) -> bool {
         send_text(&self.sink, msg, |t| AxumMessage::Text(t.into())).await
     }
 }
 
 /// Serialize `msg` to a text frame (via `wrap`) and send it over `sink`.
-/// Shared by both WebSocket impls, which differ only in their `Message` type.
 async fn send_text<M, S, T>(sink: &Mutex<S>, msg: &T, wrap: impl Fn(String) -> M) -> bool
 where
     T: Serialize,
