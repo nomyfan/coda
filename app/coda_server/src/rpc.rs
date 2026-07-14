@@ -33,7 +33,8 @@ pub enum Incoming {
     Notification { method: String, params: Value },
     /// Not a well-formed call. A `-32700` parse error (not JSON: `id` is `None`,
     /// answered with id `null`) or a `-32600` invalid request (JSON but not a
-    /// call: `id` recovered when present). Always answered, never dropped.
+    /// well-formed `"2.0"` call: `id` echoed when it's a usable value, else
+    /// `null`). Always answered, never dropped.
     Invalid { id: Option<RpcId>, error: RpcError },
 }
 
@@ -107,8 +108,37 @@ impl RpcError {
 #[serde(transparent)]
 pub struct RpcOutgoing(Value);
 
+/// How a frame's `id` member is classified, kept separate from an absent member
+/// so a malformed id isn't silently downgraded to a notification.
+enum ReqId {
+    /// No `id` member at all — the one shape that makes a frame a notification.
+    Absent,
+    /// A spec-legal id (string, number, or the discouraged-but-allowed `null`),
+    /// echoed verbatim on the reply.
+    Present(RpcId),
+    /// An `id` of an unsupported type (bool / array / object): a malformed
+    /// request, not a notification. Can't be echoed, so its error id is `null`.
+    Unsupported,
+}
+
+impl ReqId {
+    /// The id to echo on an error for this frame: the present value (even
+    /// `null`), or `None` for an absent or unusable id.
+    fn echoable(&self) -> Option<RpcId> {
+        match self {
+            ReqId::Present(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Classify one raw inbound frame. Never fails: a bad frame becomes an
-/// `Invalid` the dispatcher answers.
+/// `Invalid` the dispatcher answers. A frame is a *request* only when it is a
+/// well-formed `"2.0"` call carrying a spec-legal `id`; a *notification* only
+/// when it is a well-formed `"2.0"` call with **no** `id` member. Everything
+/// else — non-JSON (`-32700`), a non-object, a wrong/absent `jsonrpc`, a
+/// missing `method`, or an unsupported `id` type — is `Invalid` (`-32600`), so
+/// a malformed frame can never slip through and drive a method.
 pub fn decode(frame: &str) -> Incoming {
     let value: Value = match serde_json::from_str(frame) {
         Ok(value) => value,
@@ -129,27 +159,47 @@ pub fn decode(frame: &str) -> Incoming {
         };
     };
 
-    // Recover the id only when it's a spec-legal string or number; anything else
-    // (object/array/bool) can't be echoed as an id.
-    let id = object
-        .get("id")
-        .filter(|value| value.is_string() || value.is_number())
-        .cloned();
-    let method = object
+    // Classify the id up front so it can be echoed on any error below.
+    let id = match object.get("id") {
+        None => ReqId::Absent,
+        Some(value @ (Value::String(_) | Value::Number(_) | Value::Null)) => {
+            ReqId::Present(value.clone())
+        }
+        Some(_) => ReqId::Unsupported,
+    };
+
+    // The `jsonrpc` version must be exactly "2.0"; a missing or mismatched
+    // version is not a valid call and must not execute a method.
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Incoming::Invalid {
+            id: id.echoable(),
+            error: RpcError::invalid_request(
+                "missing or unsupported 'jsonrpc' version (expected \"2.0\")",
+            ),
+        };
+    }
+
+    let Some(method) = object
         .get("method")
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+    else {
+        return Incoming::Invalid {
+            id: id.echoable(),
+            error: RpcError::invalid_request("missing or non-string 'method'"),
+        };
+    };
+
     let params = object.remove("params").unwrap_or(Value::Null);
 
-    match method {
-        Some(method) => match id {
-            Some(id) => Incoming::Request { id, method, params },
-            None => Incoming::Notification { method, params },
-        },
-        // A JSON object without a string `method` isn't a valid call.
-        None => Incoming::Invalid {
-            id,
-            error: RpcError::invalid_request("missing or non-string 'method'"),
+    match id {
+        ReqId::Absent => Incoming::Notification { method, params },
+        ReqId::Present(id) => Incoming::Request { id, method, params },
+        // An id member of an unsupported type makes this a malformed request,
+        // not a notification — reject it rather than run the method unanswered.
+        ReqId::Unsupported => Incoming::Invalid {
+            id: None,
+            error: RpcError::invalid_request("'id' must be a string, number, or null"),
         },
     }
 }
@@ -251,6 +301,56 @@ mod tests {
         match decode(r#"{"jsonrpc":"2.0","id":"abc"}"#) {
             Incoming::Invalid { id, error } => {
                 assert_eq!(id, Some(json!("abc")));
+                assert_eq!(error.code, INVALID_REQUEST);
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_missing_jsonrpc_is_invalid_request_and_never_runs_a_method() {
+        // A frame that omits `jsonrpc` must not execute a method (here a
+        // mutating one); it is answered with `-32600`, correlated to its id.
+        match decode(r#"{"id":5,"method":"delete_session","params":{}}"#) {
+            Incoming::Invalid { id, error } => {
+                assert_eq!(id, Some(json!(5)));
+                assert_eq!(error.code, INVALID_REQUEST);
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_wrong_jsonrpc_version_is_invalid_request() {
+        match decode(r#"{"jsonrpc":"1.0","id":1,"method":"list_workspaces"}"#) {
+            Incoming::Invalid { id, error } => {
+                assert_eq!(id, Some(json!(1)));
+                assert_eq!(error.code, INVALID_REQUEST);
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_null_id_is_a_request_not_a_notification() {
+        // `null` is a discouraged but spec-legal request id: it must be answered
+        // (with id `null`), not silently downgraded to a fire-and-forget call.
+        match decode(r#"{"jsonrpc":"2.0","id":null,"method":"open_session","params":{}}"#) {
+            Incoming::Request { id, method, .. } => {
+                assert_eq!(id, Value::Null);
+                assert_eq!(method, "open_session");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_unsupported_id_type_is_invalid_request_not_a_notification() {
+        // An `id` of an unsupported type is a malformed request; it must be
+        // rejected (`-32600`, id `null`), not run as an unanswered notification.
+        match decode(r#"{"jsonrpc":"2.0","id":{"x":1},"method":"task","params":{}}"#) {
+            Incoming::Invalid { id, error } => {
+                assert!(id.is_none());
                 assert_eq!(error.code, INVALID_REQUEST);
             }
             other => panic!("expected invalid, got {other:?}"),
