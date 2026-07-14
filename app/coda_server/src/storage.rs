@@ -3,10 +3,14 @@ use coda_agent::runtime::SessionStorage;
 use coda_core::llm::Message;
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Session-list preview shown for a session whose first user turn carried only
 /// images (no text). Kept in sync with `IMAGE_ONLY_TITLE` in the web store so the
@@ -40,21 +44,158 @@ pub fn validate_session_id(session_id: &str) -> Result<(), String> {
 #[derive(Clone, Debug)]
 pub struct WorkspaceStorage {
     root_dir: PathBuf,
+    metadata_write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+struct SessionMetadata {
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenameSessionError {
+    InvalidSessionId(String),
+    InvalidName(String),
+    SessionNotFound,
+    Persistence(String),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SessionFile {
     pub session_id: String,
+    pub name: Option<String>,
     pub updated_at_ms: Option<u64>,
     pub first_user_message: Option<String>,
     pub has_pending_approval: bool,
+}
+
+fn normalize_session_name(
+    requested_name: Option<&str>,
+) -> Result<Option<String>, RenameSessionError> {
+    let Some(name) = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(None);
+    };
+    if name.chars().count() > 120 {
+        return Err(RenameSessionError::InvalidName(
+            "session name must be at most 120 characters".to_string(),
+        ));
+    }
+    if name
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(RenameSessionError::InvalidName(
+            "session name must be a single line without control characters".to_string(),
+        ));
+    }
+    Ok(Some(name.to_string()))
 }
 
 impl WorkspaceStorage {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
+            metadata_write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn session_dir(&self, session_id: &str) -> PathBuf {
+        self.root_dir.join(session_id)
+    }
+
+    fn metadata_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("metadata.json")
+    }
+
+    /// Create the durable identity record for a newly opened session.
+    pub async fn initialize_session(&self, session_id: &str) -> Result<(), String> {
+        validate_session_id(session_id)?;
+        let _guard = self.metadata_write_lock.lock().await;
+        let dir = self.session_dir(session_id);
+        fs::create_dir_all(&dir).await.map_err(|err| {
+            format!(
+                "failed to create session directory {}: {err}",
+                dir.display()
+            )
+        })?;
+
+        let path = self.metadata_path(session_id);
+        match Self::read_metadata(&path).await {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Self::write_metadata(&path, &SessionMetadata::default()).await
+            }
+            Err(err) => Err(format!(
+                "failed to initialize session metadata {}: {err}",
+                path.display()
+            )),
+        }
+    }
+
+    pub async fn rename_session(
+        &self,
+        session_id: &str,
+        requested_name: Option<&str>,
+    ) -> Result<Option<String>, RenameSessionError> {
+        validate_session_id(session_id).map_err(RenameSessionError::InvalidSessionId)?;
+        let name = normalize_session_name(requested_name)?;
+        let _guard = self.metadata_write_lock.lock().await;
+        let path = self.metadata_path(session_id);
+        Self::read_metadata(&path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                RenameSessionError::SessionNotFound
+            } else {
+                RenameSessionError::Persistence(format!(
+                    "failed to read session metadata {}: {err}",
+                    path.display()
+                ))
+            }
+        })?;
+        Self::write_metadata(&path, &SessionMetadata { name: name.clone() })
+            .await
+            .map_err(RenameSessionError::Persistence)?;
+        Ok(name)
+    }
+
+    async fn read_metadata(path: &Path) -> Result<SessionMetadata, std::io::Error> {
+        let payload = fs::read(path).await?;
+        serde_json::from_slice(&payload).map_err(std::io::Error::other)
+    }
+
+    async fn write_metadata(path: &Path, metadata: &SessionMetadata) -> Result<(), String> {
+        let payload = serde_json::to_vec_pretty(metadata)
+            .map_err(|err| format!("failed to serialize session metadata: {err}"))?;
+        let temp_path =
+            path.with_file_name(format!(".metadata-{}.tmp", Uuid::new_v4().as_hyphenated()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to create temporary metadata file {}: {err}",
+                    temp_path.display()
+                )
+            })?;
+        let result = async {
+            file.write_all(&payload).await?;
+            file.sync_all().await?;
+            drop(file);
+            fs::rename(&temp_path, path).await
+        }
+        .await;
+        if let Err(err) = result {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(format!(
+                "failed to write session metadata {}: {err}",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     /// Storage scoped to one session's directory.
@@ -99,11 +240,22 @@ impl WorkspaceStorage {
             let Some(session_id) = file_name.to_str() else {
                 continue;
             };
+            let metadata_path = self.metadata_path(session_id);
+            let metadata = match Self::read_metadata(&metadata_path).await {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::warn!(
+                        session_id,
+                        path = %metadata_path.display(),
+                        "skipping session with invalid metadata: {err}"
+                    );
+                    continue;
+                }
+            };
             let storage = self.session(session_id);
             let updated_at_ms = fs::metadata(storage.checkpoint_path(session_id))
                 .await
                 .or(fs::metadata(storage.snapshot_path()).await)
-                .or(entry.metadata().await)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
@@ -112,6 +264,7 @@ impl WorkspaceStorage {
             let has_pending_approval = storage.has_pending_approval(session_id).await;
             sessions.push(SessionFile {
                 session_id: session_id.to_string(),
+                name: metadata.name,
                 updated_at_ms,
                 first_user_message,
                 has_pending_approval,
@@ -338,10 +491,10 @@ mod tests {
         let active = storage.session("active");
         let other = storage.session("other");
 
-        fs::create_dir_all(&active.dir).await.unwrap();
+        storage.initialize_session("active").await.unwrap();
         fs::write(active.snapshot_path(), b"{}").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        fs::create_dir_all(&other.dir).await.unwrap();
+        storage.initialize_session("other").await.unwrap();
         fs::write(other.snapshot_path(), b"{}").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         active
@@ -376,7 +529,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
         let session = storage.session("images");
-        fs::create_dir_all(&session.dir).await.unwrap();
+        storage.initialize_session("images").await.unwrap();
 
         session
             .save_checkpoint(
@@ -408,7 +561,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
         let session = storage.session("review");
-        fs::create_dir_all(&session.dir).await.unwrap();
+        storage.initialize_session("review").await.unwrap();
 
         session
             .save_session_snapshot(
@@ -451,5 +604,93 @@ mod tests {
 
         assert_eq!(sessions[0].session_id, "review");
         assert!(sessions[0].has_pending_approval);
+    }
+
+    #[test]
+    fn session_name_normalization_validates_length_and_controls() {
+        assert_eq!(
+            normalize_session_name(Some("  研究会话  ")).unwrap(),
+            Some("研究会话".to_string())
+        );
+        assert_eq!(normalize_session_name(Some("  ")).unwrap(), None);
+        assert!(normalize_session_name(Some(&"名".repeat(120))).is_ok());
+        assert!(matches!(
+            normalize_session_name(Some(&"名".repeat(121))),
+            Err(RenameSessionError::InvalidName(_))
+        ));
+        for invalid in [
+            "line\nbreak",
+            "line\rbreak",
+            "nul\0byte",
+            "line\u{2028}break",
+        ] {
+            assert!(matches!(
+                normalize_session_name(Some(invalid)),
+                Err(RenameSessionError::InvalidName(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_metadata_initializes_renames_and_clears() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        storage.initialize_session("session-1").await.unwrap();
+
+        assert_eq!(
+            storage
+                .rename_session("session-1", Some("  Investigation  "))
+                .await
+                .unwrap(),
+            Some("Investigation".to_string())
+        );
+        assert_eq!(
+            storage.list_sessions().await.unwrap()[0].name.as_deref(),
+            Some("Investigation")
+        );
+
+        assert_eq!(
+            storage
+                .rename_session("session-1", Some(" "))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(storage.list_sessions().await.unwrap()[0].name, None);
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_create_a_missing_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions_dir = workspace.path().join("sessions");
+        let storage = WorkspaceStorage::new(&sessions_dir);
+
+        assert_eq!(
+            storage.rename_session("missing", Some("name")).await,
+            Err(RenameSessionError::SessionNotFound)
+        );
+        assert!(!sessions_dir.join("missing").exists());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_missing_or_invalid_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions_dir = workspace.path().join("sessions");
+        let storage = WorkspaceStorage::new(&sessions_dir);
+        fs::create_dir_all(sessions_dir.join("missing"))
+            .await
+            .unwrap();
+        fs::create_dir_all(sessions_dir.join("invalid"))
+            .await
+            .unwrap();
+        fs::write(sessions_dir.join("invalid/metadata.json"), b"not json")
+            .await
+            .unwrap();
+        storage.initialize_session("valid").await.unwrap();
+
+        let sessions = storage.list_sessions().await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "valid");
     }
 }

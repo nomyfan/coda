@@ -198,6 +198,14 @@ pub struct DeleteSessionParams {
     pub session_id: String,
 }
 
+/// `rename_session` params. `null` or a blank name clears the custom name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSessionParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub name: Option<String>,
+}
+
 /// `add_allow_pattern` params — append a glob to the shell allow-list; takes
 /// effect immediately for the live session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +256,12 @@ pub struct ModelSelection {
     pub provider_id: String,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Result of `rename_session`: the normalized name persisted by the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionName {
+    pub name: Option<String>,
 }
 
 /// Result of `open_session`, and the payload of an unsolicited `snapshot`
@@ -305,6 +319,8 @@ pub struct WorkspaceSummaryWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummaryWire {
     pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
     #[serde(default)]
@@ -413,6 +429,22 @@ mod tests {
             serde_json::from_str(r#"{"workspace_id":"coda","pattern":"git *"}"#).unwrap();
         assert_eq!(params.workspace_id, "coda");
         assert_eq!(params.pattern, "git *");
+    }
+
+    #[test]
+    fn rename_session_params_and_result_roundtrip() {
+        let params: RenameSessionParams = serde_json::from_str(
+            r#"{"workspace_id":"coda","session_id":"s1","name":"  Investigation  "}"#,
+        )
+        .unwrap();
+        assert_eq!(params.name.as_deref(), Some("  Investigation  "));
+
+        let result = SessionName {
+            name: Some("Investigation".into()),
+        };
+        let back: SessionName =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(back.name.as_deref(), Some("Investigation"));
     }
 
     #[test]
@@ -573,6 +605,7 @@ mod tests {
                 path: "/work/coda".into(),
                 sessions: vec![SessionSummaryWire {
                     id: "s1".into(),
+                    name: Some("Investigation".into()),
                     updated_at_ms: Some(42),
                     first_user_message: Some("inspect the repo".into()),
                     has_pending_approval: true,
@@ -583,6 +616,10 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(back.workspaces[0].id, "coda");
         assert_eq!(back.workspaces[0].sessions[0].id, "s1");
+        assert_eq!(
+            back.workspaces[0].sessions[0].name.as_deref(),
+            Some("Investigation")
+        );
         assert!(back.workspaces[0].sessions[0].has_pending_approval);
     }
 

@@ -84,6 +84,7 @@ export type ResumeDecision = {
 
 export type WorkspaceSession = {
   id: string;
+  name: string | null;
   updated_at_ms?: number | null;
   first_user_message?: string | null;
   has_pending_approval: boolean;
@@ -135,8 +136,10 @@ export const RpcCode = {
   UNKNOWN_WORKSPACE: -32010,
   INVALID_SESSION_ID: -32011,
   INVALID_MODEL_SELECTION: -32012,
+  SESSION_NOT_FOUND: -32013,
   OPEN_FAILED: -32020,
   DELETE_FAILED: -32021,
+  RENAME_FAILED: -32022,
   ALLOW_PATTERN_FAILED: -32030,
 } as const;
 
@@ -210,6 +213,7 @@ export type RpcRequests = {
   >;
   add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
   delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
+  rename_session: RpcRequest<SessionRef & { name: string | null }, { name: string | null }>;
 };
 
 /**
