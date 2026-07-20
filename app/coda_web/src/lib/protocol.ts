@@ -111,6 +111,7 @@ export type ProviderInfo = {
   model: string;
   context_window: number;
   reasoning_efforts: ReasoningEffort[];
+  default_reasoning_effort?: ReasoningEffort | null;
   input_modalities: Modality[];
 };
 

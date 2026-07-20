@@ -305,6 +305,8 @@ pub struct ProviderInfoWire {
     pub model: String,
     pub context_window: u32,
     pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
     #[serde(default)]
     pub input_modalities: Vec<Modality>,
 }
@@ -632,6 +634,7 @@ mod tests {
                 model: "deepseek-reasoner".into(),
                 context_window: 128_000,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("high".into()),
                 input_modalities: vec![Modality::Text, Modality::Image],
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),
@@ -642,6 +645,10 @@ mod tests {
         assert_eq!(back.providers[0].provider, "deepseek");
         assert_eq!(back.providers[0].context_window, 128_000);
         assert_eq!(back.providers[0].reasoning_efforts.len(), 2);
+        assert_eq!(
+            back.providers[0].default_reasoning_effort,
+            Some("high".into())
+        );
         assert_eq!(back.default_provider, "deepseek:deepseek-reasoner");
     }
 

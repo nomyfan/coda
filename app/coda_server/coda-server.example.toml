@@ -7,7 +7,9 @@
 # dashboard label, defaults to `id`), a required `context_window`, optional
 # `reasoning_efforts` (arbitrary strings passed to the provider API; `"off"` is
 # reserved for turning thinking off — omit it if the model doesn't support
-# disabling thinking), and optional `input_modalities` (defaults to ["text"];
+# disabling thinking), optional `default_reasoning_effort` (the recommended
+# initial effort level — must be one of `reasoning_efforts`; defaults to the
+# first entry when absent), and optional `input_modalities` (defaults to ["text"];
 # add "image" to allow image attachments).
 # The dashboard picks which model a session uses; the first listed is the default.
 
@@ -17,7 +19,7 @@ kind = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com"
 models = [
-  { id = "deepseek-reasoner", name = "DeepSeek R1", context_window = 128000, reasoning_efforts = ["low", "medium", "high"] },
+  { id = "deepseek-reasoner", name = "DeepSeek R1", context_window = 128000, reasoning_efforts = ["low", "medium", "high"], default_reasoning_effort = "medium" },
   { id = "deepseek-chat", name = "DeepSeek V3", context_window = 128000 },
 ]
 

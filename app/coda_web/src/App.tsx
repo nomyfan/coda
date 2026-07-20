@@ -408,6 +408,8 @@ export default function App() {
                   }
                   usage={showingNewSession ? NO_USAGE : activeUsage}
                   sessionHasImages={showingNewSession ? false : activeHasImages}
+                  serverUrl={selectedServerUrl}
+                  workspaceId={selectedWorkspace ?? ""}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
                   onSend={handleSend}
                   onAbort={abort}

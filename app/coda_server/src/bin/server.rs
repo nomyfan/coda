@@ -98,6 +98,9 @@ struct ProviderHandle {
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
     reasoning_efforts: Vec<String>,
+    /// The model's recommended initial effort level. `None` when unconfigured
+    /// (the first entry in `reasoning_efforts` is the implicit default).
+    default_reasoning_effort: Option<String>,
     /// Input kinds this model accepts (always includes text; image enables attachments).
     input_modalities: Vec<Modality>,
 }
@@ -410,11 +413,13 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
     workspaces
 }
 
-/// A session's initial reasoning effort: the provider's first declared level, or
-/// `None` when the model has no reasoning controls. The dashboard switches it
-/// afterward with `SetModel`.
+/// A session's initial reasoning effort: the configured default, the first
+/// declared level, or `None` when the model has no reasoning controls.
 fn initial_reasoning_effort(provider: &ProviderHandle) -> Option<String> {
-    provider.reasoning_efforts.first().cloned()
+    provider
+        .default_reasoning_effort
+        .clone()
+        .or_else(|| provider.reasoning_efforts.first().cloned())
 }
 
 /// Normalize a client selection to the values exposed by the provider catalog.
@@ -564,6 +569,7 @@ fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
             model: handle.model_name.clone(),
             context_window: handle.context_window,
             reasoning_efforts: handle.reasoning_efforts.clone(),
+            default_reasoning_effort: handle.default_reasoning_effort.clone(),
             input_modalities: handle.input_modalities.clone(),
         })
         .collect();
@@ -1563,6 +1569,7 @@ async fn main() {
                     context_window: m.context_window,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
+                    default_reasoning_effort: m.default_reasoning_effort,
                     input_modalities: m.input_modalities,
                 };
                 (id, Arc::new(handle))

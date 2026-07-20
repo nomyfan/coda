@@ -15,7 +15,9 @@
 # `reasoning_efforts`, and `input_modalities` are optional.
 # `reasoning_efforts` is an array of arbitrary strings passed to the provider API;
 # `"off"` is reserved for turning thinking off (omit it if the model doesn't
-# support disabling thinking).
+# support disabling thinking). `default_reasoning_effort` optionally names the
+# recommended initial level (must be one of `reasoning_efforts`; defaults to
+# the first entry when absent).
 
 [[providers]]
 id = "deepseek"

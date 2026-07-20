@@ -9,7 +9,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ProviderInfo, ReasoningEffort } from "@/store/session";
+import type { ProviderInfo, ReasoningEffort } from "@/lib/protocol";
+import { resolveEffortForModel } from "@/store/model-preferences";
 
 function effortLabel(effort: ReasoningEffort) {
   if (effort === "off") return "Off";
@@ -27,30 +28,14 @@ function groupProviders(providers: ProviderInfo[]): ProviderGroups {
   return groups;
 }
 
-/**
- * Pick the reasoning value to carry over when switching model: a model with
- * no reasoning controls gets `null`; "off" and supported efforts carry over;
- * every other value becomes the model's first configured effort.
- */
-function carryReasoning(
-  model: ProviderInfo | undefined,
-  current: ReasoningEffort | null,
-): ReasoningEffort | null {
-  if (!model || model.reasoning_efforts.length === 0) {
-    return null;
-  }
-  if (current && model.reasoning_efforts.includes(current)) {
-    return current;
-  }
-  return model.reasoning_efforts[0];
-}
-
 export function ModelSelector({
   providers,
   providerId,
   reasoningEffort,
   disabled,
   requireImageModel,
+  serverUrl,
+  workspaceId,
   onSetModel,
 }: {
   providers: ProviderInfo[];
@@ -60,6 +45,8 @@ export function ModelSelector({
   /** Restrict selectable models to vision-capable ones (the conversation
    * already involves images). */
   requireImageModel: boolean;
+  serverUrl: string;
+  workspaceId: string;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
 }) {
   const groups = useMemo(() => groupProviders(providers), [providers]);
@@ -70,6 +57,8 @@ export function ModelSelector({
   if (providers.length === 0 || !providerId) {
     return null;
   }
+
+  const catalog = { url: serverUrl, providers };
 
   // Build a flat list of elements so Radix viewport receives only valid children.
   const dropdownItems = providerNames.flatMap((providerName, groupIndex) => {
@@ -97,7 +86,9 @@ export function ModelSelector({
         value={providerId}
         onValueChange={(id) => {
           const next = providers.find((info) => info.id === id);
-          onSetModel(id, carryReasoning(next, reasoningEffort));
+          if (!next) return;
+          const effort = resolveEffortForModel(catalog, workspaceId, next, reasoningEffort);
+          onSetModel(id, effort);
         }}
         disabled={disabled}
       >

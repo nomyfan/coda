@@ -36,6 +36,8 @@ export const Composer = memo(function Composer({
   reasoningEffort,
   usage,
   sessionHasImages,
+  serverUrl,
+  workspaceId,
   onSetModel,
   onSend,
   onAbort,
@@ -55,6 +57,8 @@ export const Composer = memo(function Composer({
   /** The active session's history already carries image attachments, so a
    * text-only model can no longer serve this conversation. */
   sessionHasImages: boolean;
+  serverUrl: string;
+  workspaceId: string;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
@@ -247,6 +251,8 @@ export const Composer = memo(function Composer({
                 reasoningEffort={reasoningEffort}
                 disabled={!connected || running}
                 requireImageModel={requireImageModel}
+                serverUrl={serverUrl}
+                workspaceId={workspaceId}
                 onSetModel={onSetModel}
               />
             ) : null}

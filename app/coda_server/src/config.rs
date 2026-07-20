@@ -42,6 +42,7 @@ pub struct ModelConfig {
     pub name: String,
     pub context_window: u32,
     pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
     pub input_modalities: Vec<Modality>,
 }
 
@@ -253,12 +254,15 @@ fn parse_models(
                 ))
             })?;
         let reasoning_efforts = parse_model_reasoning_efforts(table, provider_id, &id)?;
+        let default_reasoning_effort =
+            parse_default_reasoning_effort(table, provider_id, &id, &reasoning_efforts)?;
         let input_modalities = parse_model_input_modalities(table, provider_id, &id)?;
         models.push(ModelConfig {
             id,
             name,
             context_window,
             reasoning_efforts,
+            default_reasoning_effort,
             input_modalities,
         });
     }
@@ -292,6 +296,28 @@ fn parse_model_reasoning_efforts(
                 })
         })
         .collect()
+}
+
+fn parse_default_reasoning_effort(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+    reasoning_efforts: &[String],
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = model.get("default_reasoning_effort") else {
+        return Ok(None);
+    };
+    let effort = value.as_str().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "provider '{provider_id}' model '{model_name}' default_reasoning_effort must be a string"
+        ))
+    })?;
+    if !reasoning_efforts.contains(&effort.to_string()) {
+        return Err(ConfigError::Parse(format!(
+            "provider '{provider_id}' model '{model_name}' default_reasoning_effort '{effort}' is not in reasoning_efforts"
+        )));
+    }
+    Ok(Some(effort.to_string()))
 }
 
 /// Parses `input_modalities`. Absent means text-only (`[text]`).
@@ -920,6 +946,7 @@ path = "/tmp/scratch"
                         "medium".to_string(),
                         "high".to_string(),
                     ],
+                    default_reasoning_effort: None,
                     input_modalities: vec![Modality::Text],
                 }],
             }]
@@ -976,6 +1003,56 @@ path = "/tmp/coda"
         assert_eq!(
             config.providers[0].models[0].reasoning_efforts,
             vec!["off", "ultra", "max"]
+        );
+    }
+
+    #[test]
+    fn parse_server_config_parses_default_reasoning_effort() {
+        let config = parse_server_config(
+            r#"
+[[providers]]
+id = "deepseek"
+api_key = "sk-test"
+base_url = "https://api.deepseek.com/v1"
+models = [
+  { id = "deepseek-reasoner", context_window = 128000, reasoning_efforts = ["low", "medium", "high"], default_reasoning_effort = "medium" },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.providers[0].models[0].default_reasoning_effort,
+            Some("medium".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_server_config_rejects_invalid_default_reasoning_effort() {
+        let err = parse_server_config(
+            r#"
+[[providers]]
+id = "deepseek"
+api_key = "sk-test"
+base_url = "https://api.deepseek.com/v1"
+models = [
+  { id = "deepseek-reasoner", context_window = 128000, reasoning_efforts = ["low", "high"], default_reasoning_effort = "medium" },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("default_reasoning_effort 'medium' is not in reasoning_efforts")
         );
     }
 

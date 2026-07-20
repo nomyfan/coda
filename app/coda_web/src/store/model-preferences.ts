@@ -2,7 +2,11 @@ import type { ProviderInfo, ReasoningEffort } from "@/lib/protocol";
 
 const storageKey = "coda.modelPrefs";
 
-type ModelPref = { providerId: string; reasoningEffort: ReasoningEffort | null };
+type ModelPref = {
+  providerId: string;
+  reasoningEffort: ReasoningEffort | null;
+  modelEfforts: Record<string, ReasoningEffort>;
+};
 type ModelPrefs = Record<string, Record<string, ModelPref>>;
 type ModelCatalog = {
   url: string;
@@ -17,7 +21,9 @@ function isModelPref(value: unknown): value is ModelPref {
   const pref = value as Partial<ModelPref>;
   return (
     typeof pref.providerId === "string" &&
-    (pref.reasoningEffort === null || typeof pref.reasoningEffort === "string")
+    (pref.reasoningEffort === null || typeof pref.reasoningEffort === "string") &&
+    typeof pref.modelEfforts === "object" &&
+    pref.modelEfforts !== null
   );
 }
 
@@ -61,7 +67,12 @@ export function rememberModelSelection(
   try {
     const prefs = loadModelPrefs();
     prefs[server] ??= Object.create(null);
-    prefs[server][workspace] = { providerId, reasoningEffort };
+    const existing = prefs[server][workspace];
+    const modelEfforts = { ...existing?.modelEfforts };
+    if (reasoningEffort) {
+      modelEfforts[providerId] = reasoningEffort;
+    }
+    prefs[server][workspace] = { providerId, reasoningEffort, modelEfforts };
     window.localStorage.setItem(storageKey, JSON.stringify(prefs));
   } catch {
     // ignore storage failures (private mode, disabled storage)
@@ -87,22 +98,62 @@ export function initialModelSelection(
   if (!provider) {
     return { providerId: undefined, reasoningEffort: null };
   }
-  const reasoningEffort =
-    rememberedProvider && remembered
-      ? validEffort(provider, remembered.reasoningEffort)
-      : (provider.reasoning_efforts[0] ?? null);
+  const reasoningEffort = resolveEffort(provider, remembered);
   return { providerId: provider.id, reasoningEffort };
 }
 
-function validEffort(
+/**
+ * Resolve the reasoning effort for a model, following the fallback chain:
+ * 1. Per-model remembered effort (if still valid)
+ * 2. Server-declared default_reasoning_effort
+ * 3. First entry in reasoning_efforts
+ */
+function resolveEffort(
   provider: ProviderInfo,
-  effort: ReasoningEffort | null,
+  remembered: ModelPref | undefined,
 ): ReasoningEffort | null {
   if (provider.reasoning_efforts.length === 0) {
     return null;
   }
-  if (effort && provider.reasoning_efforts.includes(effort)) {
-    return effort;
+  const memorized = remembered?.modelEfforts[provider.id];
+  if (memorized && provider.reasoning_efforts.includes(memorized)) {
+    return memorized;
+  }
+  if (
+    provider.default_reasoning_effort &&
+    provider.reasoning_efforts.includes(provider.default_reasoning_effort)
+  ) {
+    return provider.default_reasoning_effort;
+  }
+  return provider.reasoning_efforts[0];
+}
+
+/**
+ * Resolve the effort for a model the user is switching to, using remembered
+ * per-model effort from the workspace preference.
+ */
+export function resolveEffortForModel(
+  server: ModelCatalog,
+  workspace: string,
+  provider: ProviderInfo,
+  currentEffort: ReasoningEffort | null,
+): ReasoningEffort | null {
+  if (provider.reasoning_efforts.length === 0) {
+    return null;
+  }
+  const remembered = loadModelPrefs()[server.url]?.[workspace];
+  const memorized = remembered?.modelEfforts[provider.id];
+  if (memorized && provider.reasoning_efforts.includes(memorized)) {
+    return memorized;
+  }
+  if (currentEffort && provider.reasoning_efforts.includes(currentEffort)) {
+    return currentEffort;
+  }
+  if (
+    provider.default_reasoning_effort &&
+    provider.reasoning_efforts.includes(provider.default_reasoning_effort)
+  ) {
+    return provider.default_reasoning_effort;
   }
   return provider.reasoning_efforts[0];
 }
