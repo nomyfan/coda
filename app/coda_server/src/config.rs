@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use coda_agent::ToolApprovalMode;
-use coda_core::llm::{Modality, ReasoningEffort, ToolCall};
+use coda_core::llm::{Modality, ToolCall};
 use coda_openai::ProviderKind;
 
 #[derive(Debug)]
@@ -41,7 +41,7 @@ pub struct ModelConfig {
     pub id: String,
     pub name: String,
     pub context_window: u32,
-    pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub reasoning_efforts: Vec<String>,
     pub input_modalities: Vec<Modality>,
 }
 
@@ -270,7 +270,7 @@ fn parse_model_reasoning_efforts(
     model: &toml_edit::InlineTable,
     provider_id: &str,
     model_name: &str,
-) -> Result<Vec<ReasoningEffort>, ConfigError> {
+) -> Result<Vec<String>, ConfigError> {
     let Some(array) = model.get("reasoning_efforts") else {
         return Ok(Vec::new());
     };
@@ -282,22 +282,14 @@ fn parse_model_reasoning_efforts(
     array
         .iter()
         .map(|value| {
-            let raw = value.as_str().ok_or_else(|| {
-                ConfigError::Parse(format!(
-                    "provider '{provider_id}' model '{model_name}' reasoning_efforts must be strings"
-                ))
-            })?;
-            match raw {
-                "minimal" => Ok(ReasoningEffort::Minimal),
-                "low" => Ok(ReasoningEffort::Low),
-                "medium" => Ok(ReasoningEffort::Medium),
-                "high" => Ok(ReasoningEffort::High),
-                "xhigh" => Ok(ReasoningEffort::Xhigh),
-                // `none` is the thinking-off state, not an offered level.
-                other => Err(ConfigError::Parse(format!(
-                    "provider '{provider_id}' model '{model_name}' has unknown reasoning effort '{other}' (expected 'minimal', 'low', 'medium', 'high', or 'xhigh')"
-                ))),
-            }
+            value
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    ConfigError::Parse(format!(
+                        "provider '{provider_id}' model '{model_name}' reasoning_efforts must be strings"
+                    ))
+                })
         })
         .collect()
 }
@@ -924,9 +916,9 @@ path = "/tmp/scratch"
                     name: "DeepSeek R1".to_string(),
                     context_window: 128_000,
                     reasoning_efforts: vec![
-                        ReasoningEffort::Low,
-                        ReasoningEffort::Medium,
-                        ReasoningEffort::High,
+                        "low".to_string(),
+                        "medium".to_string(),
+                        "high".to_string(),
                     ],
                     input_modalities: vec![Modality::Text],
                 }],
@@ -963,15 +955,15 @@ path = "/tmp/coda"
     }
 
     #[test]
-    fn parse_server_config_rejects_unknown_reasoning_effort() {
-        let err = parse_server_config(
+    fn parse_server_config_accepts_arbitrary_reasoning_efforts() {
+        let config = parse_server_config(
             r#"
 [[providers]]
 id = "deepseek"
 api_key = "sk-test"
 base_url = "https://api.deepseek.com/v1"
 models = [
-  { id = "deepseek-reasoner", context_window = 128000, reasoning_efforts = ["ultra"] },
+  { id = "deepseek-reasoner", context_window = 128000, reasoning_efforts = ["off", "ultra", "max"] },
 ]
 
 [[workspaces]]
@@ -980,8 +972,11 @@ path = "/tmp/coda"
 "#,
             Path::new("/srv"),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown reasoning effort 'ultra'"));
+        .unwrap();
+        assert_eq!(
+            config.providers[0].models[0].reasoning_efforts,
+            vec!["off", "ultra", "max"]
+        );
     }
 
     #[test]

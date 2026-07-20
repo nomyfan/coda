@@ -1,6 +1,6 @@
 use crate::config::{ToolApprovalConfig, extract_shell_command};
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
-use coda_core::llm::{AssistantMessage, Message, Modality, ReasoningEffort, ToolCall, ToolMessage};
+use coda_core::llm::{AssistantMessage, Message, Modality, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -157,7 +157,7 @@ pub struct OpenSessionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub takeover: bool,
 }
@@ -225,7 +225,7 @@ pub struct SetModelParams {
     pub session_id: String,
     pub provider_id: String,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
 }
 
 // --- Result / server-push payloads -------------------------------------------
@@ -255,7 +255,7 @@ pub struct ProviderCatalog {
 pub struct ModelSelection {
     pub provider_id: String,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
 }
 
 /// Result of `rename_session`: the normalized name persisted by the server.
@@ -279,7 +279,7 @@ pub struct Snapshot {
     pub pending_approvals: Vec<PendingApprovalWire>,
     pub provider_id: String,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub turn_running: bool,
 }
@@ -304,7 +304,7 @@ pub struct ProviderInfoWire {
     pub provider: String,
     pub model: String,
     pub context_window: u32,
-    pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub reasoning_efforts: Vec<String>,
     #[serde(default)]
     pub input_modalities: Vec<Modality>,
 }
@@ -465,7 +465,7 @@ mod tests {
             messages: vec![],
             pending_approvals: vec![],
             provider_id: "deepseek".into(),
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some("high".into()),
             turn_running: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -631,7 +631,7 @@ mod tests {
                 provider: "deepseek".into(),
                 model: "deepseek-reasoner".into(),
                 context_window: 128_000,
-                reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                reasoning_efforts: vec!["low".into(), "high".into()],
                 input_modalities: vec![Modality::Text, Modality::Image],
             }],
             default_provider: "deepseek:deepseek-reasoner".into(),

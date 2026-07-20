@@ -13,6 +13,9 @@
 # `api_key` / `base_url` may reference an environment variable as `${VAR}`.
 # Each model needs an `id` (the API model name) and a `context_window`; `name`,
 # `reasoning_efforts`, and `input_modalities` are optional.
+# `reasoning_efforts` is an array of arbitrary strings passed to the provider API;
+# `"off"` is reserved for turning thinking off (omit it if the model doesn't
+# support disabling thinking).
 
 [[providers]]
 id = "deepseek"

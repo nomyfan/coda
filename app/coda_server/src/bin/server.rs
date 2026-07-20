@@ -9,7 +9,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, Message, Modality, ReasoningEffort};
+use coda_core::llm::{LLMProviderConfig, Message, Modality};
 use coda_openai::OpenAI;
 use coda_server::{
     agents::{
@@ -97,7 +97,7 @@ struct ProviderHandle {
     /// The configured provider's id.
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
-    reasoning_efforts: Vec<ReasoningEffort>,
+    reasoning_efforts: Vec<String>,
     /// Input kinds this model accepts (always includes text; image enables attachments).
     input_modalities: Vec<Modality>,
 }
@@ -127,7 +127,7 @@ struct WorkspaceState {
 #[derive(Clone)]
 struct AgentModelSelection {
     provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 }
 
 const MAX_TASK_IMAGES: usize = 5;
@@ -206,7 +206,7 @@ impl SessionOpener for AppOpener {
         &'a self,
         key: &'a SessionKey,
         provider_id: &'a str,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
@@ -255,7 +255,7 @@ async fn open_session(
     workspace: &WorkspaceState,
     session_id: &str,
     provider_id: &str,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Result<Session, OpenError> {
     let provider = providers
@@ -287,7 +287,7 @@ async fn open_session(
                 label: selection.provider_id.clone(),
                 temperature: None,
                 max_completion_tokens: Some(10_000),
-                reasoning_effort: selection.reasoning_effort,
+                reasoning_effort: selection.reasoning_effort.clone(),
             };
             (name.clone(), profile)
         })
@@ -413,20 +413,19 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
 /// A session's initial reasoning effort: the provider's first declared level, or
 /// `None` when the model has no reasoning controls. The dashboard switches it
 /// afterward with `SetModel`.
-fn initial_reasoning_effort(provider: &ProviderHandle) -> Option<ReasoningEffort> {
-    provider.reasoning_efforts.first().copied()
+fn initial_reasoning_effort(provider: &ProviderHandle) -> Option<String> {
+    provider.reasoning_efforts.first().cloned()
 }
 
 /// Normalize a client selection to the values exposed by the provider catalog.
 /// Reasoning models use their first configured effort when the client omits one;
 /// models without reasoning controls keep `None`.
 fn normalize_reasoning_effort(
-    configured: &[ReasoningEffort],
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Option<Option<ReasoningEffort>> {
+    configured: &[String],
+    reasoning_effort: Option<String>,
+) -> Option<Option<String>> {
     match reasoning_effort {
-        None => Some(configured.first().copied()),
-        Some(ReasoningEffort::None) if !configured.is_empty() => Some(Some(ReasoningEffort::None)),
+        None => Some(configured.first().cloned()),
         Some(effort) if configured.contains(&effort) => Some(Some(effort)),
         Some(_) => None,
     }
@@ -437,8 +436,8 @@ fn normalize_reasoning_effort(
 fn resolve_selection(
     app: &AppState,
     provider_id: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
-) -> (String, Option<ReasoningEffort>) {
+    reasoning_effort: Option<String>,
+) -> (String, Option<String>) {
     if let Some(id) = provider_id
         && let Some(provider) = app.providers.get(&id)
         && let Some(reasoning_effort) =
@@ -458,8 +457,8 @@ fn resolve_selection(
 fn normalize_provider_selection(
     app: &AppState,
     provider_id: &str,
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Option<Option<ReasoningEffort>> {
+    reasoning_effort: Option<String>,
+) -> Option<Option<String>> {
     let provider = app.providers.get(provider_id)?;
     normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
 }
@@ -475,33 +474,35 @@ mod selection_tests {
 
     #[test]
     fn omitted_effort_uses_first_configured_level() {
+        let configured = vec!["low".to_string(), "high".to_string()];
         assert_eq!(
-            normalize_reasoning_effort(&[ReasoningEffort::Low, ReasoningEffort::High], None),
-            Some(Some(ReasoningEffort::Low))
+            normalize_reasoning_effort(&configured, None),
+            Some(Some("low".to_string()))
         );
     }
 
     #[test]
     fn reasoning_model_accepts_off_and_configured_levels() {
-        let configured = [ReasoningEffort::Low, ReasoningEffort::High];
+        let configured = vec!["off".to_string(), "low".to_string(), "high".to_string()];
         assert_eq!(
-            normalize_reasoning_effort(&configured, Some(ReasoningEffort::None)),
-            Some(Some(ReasoningEffort::None))
+            normalize_reasoning_effort(&configured, Some("off".to_string())),
+            Some(Some("off".to_string()))
         );
         assert_eq!(
-            normalize_reasoning_effort(&configured, Some(ReasoningEffort::High)),
-            Some(Some(ReasoningEffort::High))
+            normalize_reasoning_effort(&configured, Some("high".to_string())),
+            Some(Some("high".to_string()))
         );
     }
 
     #[test]
     fn reasoning_model_rejects_unconfigured_levels() {
+        let configured = vec!["low".to_string()];
         assert_eq!(
-            normalize_reasoning_effort(&[ReasoningEffort::Low], Some(ReasoningEffort::High)),
+            normalize_reasoning_effort(&configured, Some("high".to_string())),
             None
         );
         assert_eq!(
-            normalize_reasoning_effort(&[], Some(ReasoningEffort::None)),
+            normalize_reasoning_effort(&[], Some("off".to_string())),
             None
         );
     }
@@ -598,7 +599,7 @@ async fn send_pending_approval_events<T: Transport>(
 
 struct Selection {
     provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 }
 
 /// Attach to `key` in the hub, register the replay+live stream, and remember the
@@ -615,7 +616,7 @@ async fn attach_core(
     selections: &mut HashMap<SessionKey, Selection>,
     key: SessionKey,
     provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
     takeover: bool,
 ) -> Result<Snapshot, AttachError> {
     let AttachSession { snapshot, events } = app
@@ -632,7 +633,7 @@ async fn attach_core(
         key.clone(),
         Selection {
             provider_id: snapshot.provider_id.clone(),
-            reasoning_effort: snapshot.reasoning_effort,
+            reasoning_effort: snapshot.reasoning_effort.clone(),
         },
     );
     let wire_snapshot = Snapshot {
@@ -814,6 +815,7 @@ async fn dispatch_request(
             };
             let key = (params.workspace_id, params.session_id);
             let requested_provider = params.provider_id.clone();
+            let requested_effort = reasoning_effort.clone();
             match app
                 .relay
                 .command(
@@ -836,7 +838,7 @@ async fn dispatch_request(
                         key,
                         Selection {
                             provider_id: provider_id.clone(),
-                            reasoning_effort,
+                            reasoning_effort: reasoning_effort.clone(),
                         },
                     );
                     (
@@ -853,7 +855,7 @@ async fn dispatch_request(
                     id,
                     &ModelSelection {
                         provider_id: requested_provider,
-                        reasoning_effort,
+                        reasoning_effort: requested_effort,
                     },
                 )
                     .into(),

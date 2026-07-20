@@ -10,15 +10,6 @@ type ModelCatalog = {
   defaultProvider?: string;
 };
 
-const reasoningEfforts: readonly ReasoningEffort[] = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-];
-
 function isModelPref(value: unknown): value is ModelPref {
   if (!value || typeof value !== "object") {
     return false;
@@ -26,8 +17,7 @@ function isModelPref(value: unknown): value is ModelPref {
   const pref = value as Partial<ModelPref>;
   return (
     typeof pref.providerId === "string" &&
-    (pref.reasoningEffort === null ||
-      reasoningEfforts.includes(pref.reasoningEffort as ReasoningEffort))
+    (pref.reasoningEffort === null || typeof pref.reasoningEffort === "string")
   );
 }
 
@@ -111,7 +101,7 @@ function validEffort(
   if (provider.reasoning_efforts.length === 0) {
     return null;
   }
-  if (effort === "none" || (effort && provider.reasoning_efforts.includes(effort))) {
+  if (effort && provider.reasoning_efforts.includes(effort)) {
     return effort;
   }
   return provider.reasoning_efforts[0];

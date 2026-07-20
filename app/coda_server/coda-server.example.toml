@@ -5,7 +5,9 @@
 # `models` lists the models under this provider; each model has a required `id`
 # (the API model name sent in requests), an optional `name` (human-readable
 # dashboard label, defaults to `id`), a required `context_window`, optional
-# `reasoning_efforts`, and optional `input_modalities` (defaults to ["text"];
+# `reasoning_efforts` (arbitrary strings passed to the provider API; `"off"` is
+# reserved for turning thinking off — omit it if the model doesn't support
+# disabling thinking), and optional `input_modalities` (defaults to ["text"];
 # add "image" to allow image attachments).
 # The dashboard picks which model a session uses; the first listed is the default.
 

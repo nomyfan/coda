@@ -356,7 +356,7 @@ impl SessionOpener for TestOpener {
         &'a self,
         key: &'a SessionKey,
         _provider_id: &'a str,
-        _reasoning_effort: Option<ReasoningEffort>,
+        _reasoning_effort: Option<String>,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {

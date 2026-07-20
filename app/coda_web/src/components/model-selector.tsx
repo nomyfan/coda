@@ -12,6 +12,7 @@ import {
 import type { ProviderInfo, ReasoningEffort } from "@/store/session";
 
 function effortLabel(effort: ReasoningEffort) {
+  if (effort === "off") return "Off";
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
@@ -37,9 +38,6 @@ function carryReasoning(
 ): ReasoningEffort | null {
   if (!model || model.reasoning_efforts.length === 0) {
     return null;
-  }
-  if (current === "none") {
-    return current;
   }
   if (current && model.reasoning_efforts.includes(current)) {
     return current;
@@ -126,7 +124,6 @@ export function ModelSelector({
             <SelectValue placeholder="Reasoning" />
           </SelectTrigger>
           <SelectContent position="popper" side="top">
-            <SelectItem value="none">Off</SelectItem>
             {efforts.map((effort) => (
               <SelectItem key={effort} value={effort}>
                 {effortLabel(effort)}
