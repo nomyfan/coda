@@ -20,7 +20,7 @@ use std::sync::Arc;
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, ReasoningEffort, UserMessage};
+use coda_core::llm::{Message, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -49,7 +49,7 @@ pub enum SessionCommand {
     Abort,
     SetModel {
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     },
 }
 
@@ -70,7 +70,7 @@ pub struct SnapshotPayload {
     pub messages: Vec<Message>,
     pub pending_approvals: Vec<PendingApproval>,
     pub provider_id: String,
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     /// A turn is in flight; its events so far are replayed at the head of the
     /// attach stream.
     pub turn_running: bool,
@@ -101,7 +101,7 @@ pub enum CommandOutcome {
     /// A `SetModel` was applied.
     ModelChanged {
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     },
     /// A `SetModel` selecting the model already in effect: a benign no-op the
     /// request dispatcher reports as idempotent success (echoing the selection).
@@ -122,7 +122,7 @@ pub trait SessionOpener: Send + Sync + 'static {
         &'a self,
         key: &'a SessionKey,
         provider_id: &'a str,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
 
@@ -160,7 +160,7 @@ pub trait SessionRelay: Send + Sync {
         key: SessionKey,
         conn_id: ConnId,
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
         takeover: bool,
     ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>>;
 
@@ -357,7 +357,7 @@ struct Attachment {
 struct LiveState {
     session: Session,
     provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
     /// Bumped when `SetModel` swaps the underlying session so the previous
     /// forwarder retires itself.
     generation: u64,
@@ -375,7 +375,7 @@ struct LiveState {
 
 struct PendingState {
     provider_id: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
     /// Thread ids still awaiting a resume decision.
     needed: HashSet<String>,
     decisions: HashMap<String, ResumeDecision>,
@@ -595,7 +595,7 @@ impl SessionHub {
         entry: &Arc<SessionEntry>,
         session: Session,
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
         generation: u64,
     ) -> LiveState {
         let root_name = session.root_name().to_string();
@@ -677,11 +677,11 @@ impl SessionHub {
                     return CommandOutcome::Ok;
                 }
                 let provider_id = pending.provider_id.clone();
-                let reasoning_effort = pending.reasoning_effort;
+                let reasoning_effort = pending.reasoning_effort.clone();
                 let decisions = std::mem::take(&mut pending.decisions);
                 match self
                     .opener
-                    .open(key, &provider_id, reasoning_effort, decisions)
+                    .open(key, &provider_id, reasoning_effort.clone(), decisions)
                     .await
                 {
                     Ok(session) => {
@@ -724,7 +724,7 @@ impl SessionHub {
         state: &mut EntryState,
         key: &SessionKey,
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     ) -> CommandOutcome {
         // Not `Live` (stale/not-attached is caught earlier by `command`'s guard;
         // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
@@ -746,7 +746,7 @@ impl SessionHub {
         // so its checkpoint is durable and the new open reads current state.
         match self
             .opener
-            .open(key, &provider_id, reasoning_effort, HashMap::new())
+            .open(key, &provider_id, reasoning_effort.clone(), HashMap::new())
             .await
         {
             Ok(session) => {
@@ -755,7 +755,7 @@ impl SessionHub {
                     entry,
                     session,
                     provider_id.clone(),
-                    reasoning_effort,
+                    reasoning_effort.clone(),
                     generation,
                 );
                 // History is unchanged by a model swap; keep the in-memory
@@ -788,7 +788,7 @@ impl SessionRelay for SessionHub {
         key: SessionKey,
         conn_id: ConnId,
         provider_id: String,
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
         takeover: bool,
     ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>> {
         Box::pin(async move {
@@ -817,7 +817,7 @@ impl SessionRelay for SessionHub {
             if matches!(state.phase, EntryPhase::Uninitialized) {
                 match self
                     .opener
-                    .open(&key, &provider_id, reasoning_effort, HashMap::new())
+                    .open(&key, &provider_id, reasoning_effort.clone(), HashMap::new())
                     .await
                 {
                     Ok(session) => {
@@ -825,7 +825,7 @@ impl SessionRelay for SessionHub {
                             &entry,
                             session,
                             provider_id,
-                            reasoning_effort,
+                            reasoning_effort.clone(),
                             0,
                         ));
                         info!(workspace_id = %key.0, session_id = %key.1, "session opened");
@@ -1082,7 +1082,7 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
                 messages,
                 pending_approvals: live.pending_approvals.clone(),
                 provider_id: live.provider_id.clone(),
-                reasoning_effort: live.reasoning_effort,
+                reasoning_effort: live.reasoning_effort.clone(),
                 turn_running: live.turn_running,
             })
         }
@@ -1095,7 +1095,7 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
                 .cloned()
                 .collect(),
             provider_id: pending.provider_id.clone(),
-            reasoning_effort: pending.reasoning_effort,
+            reasoning_effort: pending.reasoning_effort.clone(),
             turn_running: false,
         }),
         _ => None,

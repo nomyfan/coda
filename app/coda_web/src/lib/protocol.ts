@@ -96,8 +96,8 @@ export type WorkspaceSummary = {
   sessions: WorkspaceSession[];
 };
 
-/** Reasoning effort levels, mirroring the server enum. */
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+/** Reasoning effort level — an arbitrary string configured per model. */
+export type ReasoningEffort = string;
 
 export type Modality = "text" | "image";
 
@@ -111,6 +111,7 @@ export type ProviderInfo = {
   model: string;
   context_window: number;
   reasoning_efforts: ReasoningEffort[];
+  default_reasoning_effort?: ReasoningEffort | null;
   input_modalities: Modality[];
 };
 

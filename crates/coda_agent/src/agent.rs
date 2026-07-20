@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, ReasoningEffort, SystemMessage, ToolCall,
-    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, Message, SystemMessage, ToolCall, ToolCallOutcome,
+    ToolDefinition, ToolMessage, ToolOutput,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
@@ -353,9 +353,9 @@ pub struct ModelProfile<P> {
     pub label: String,
     pub temperature: Option<f32>,
     pub max_completion_tokens: Option<u32>,
-    /// Reasoning effort sent on each generation request. Outer `None` leaves the
-    /// provider default untouched; `Some(ReasoningEffort::None)` turns thinking off.
-    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning effort sent on each generation request. `None` leaves the
+    /// provider default untouched; `Some("off")` turns thinking off.
+    pub reasoning_effort: Option<String>,
 }
 
 impl<P: Clone> Clone for ModelProfile<P> {
@@ -366,7 +366,7 @@ impl<P: Clone> Clone for ModelProfile<P> {
             label: self.label.clone(),
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort: self.reasoning_effort.clone(),
         }
     }
 }

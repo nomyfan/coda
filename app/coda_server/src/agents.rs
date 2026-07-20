@@ -27,7 +27,6 @@ use std::path::Path;
 use coda_agent::{
     AgentSpec, AgentTeam, BuildError, SharedSystemPrompt, SubAgentMode, SystemPrompt,
 };
-use coda_core::llm::ReasoningEffort;
 
 use crate::{EnvField, default_env_fields, make_env_renderer};
 use coda_core::tool::ToolObject;
@@ -205,7 +204,7 @@ struct Frontmatter {
     /// Optional reasoning effort for the overridden model. Validated against the
     /// model's configured levels at startup.
     #[serde(default)]
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 }
 
 /// A parsed agent file (before tool resolution).
@@ -219,7 +218,7 @@ pub struct AgentFile {
     env: Vec<EnvField>,
     workspace: Option<String>,
     model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 }
 
 impl AgentFile {
@@ -239,8 +238,8 @@ impl AgentFile {
     }
 
     /// The configured reasoning effort for the overridden model, if any.
-    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        self.reasoning_effort
+    pub fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort.clone()
     }
 }
 
@@ -853,7 +852,7 @@ mod tests {
         );
         let files = load_agent_files(dir.path()).unwrap();
         assert_eq!(files[0].model(), Some("deepseek:deepseek-reasoner"));
-        assert_eq!(files[0].reasoning_effort(), Some(ReasoningEffort::High));
+        assert_eq!(files[0].reasoning_effort(), Some("high".to_string()));
     }
 
     #[test]

@@ -12,12 +12,12 @@ use async_openai::types::chat::{
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
     CompletionTokensDetails as OpenAICompletionTokensDetails, CreateChatCompletionRequestArgs,
     FunctionCall, FunctionCallStream, FunctionObject, ImageUrl,
-    PromptTokensDetails as OpenAIPromptTokensDetails, ReasoningEffort as OpenAIReasoningEffort,
+    PromptTokensDetails as OpenAIPromptTokensDetails,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, ContentPart,
-    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ReasoningEffort,
-    StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, StreamError,
+    ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -262,17 +262,6 @@ pub enum ProviderKind {
     Deepseek,
 }
 
-fn map_effort(effort: ReasoningEffort) -> OpenAIReasoningEffort {
-    match effort {
-        ReasoningEffort::None => OpenAIReasoningEffort::None,
-        ReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
-        ReasoningEffort::Low => OpenAIReasoningEffort::Low,
-        ReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
-        ReasoningEffort::High => OpenAIReasoningEffort::High,
-        ReasoningEffort::Xhigh => OpenAIReasoningEffort::Xhigh,
-    }
-}
-
 fn inject_deepseek_reasoning(body: &mut serde_json::Value, messages: &[Message]) {
     let Some(wire_messages) = body
         .get_mut("messages")
@@ -313,7 +302,7 @@ impl LLMProvider for OpenAI {
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
         let kind = self.kind;
-        let reasoning_effort = request.reasoning_effort;
+        let reasoning_effort = request.reasoning_effort.clone();
         async_stream::stream! {
             let source_messages = request.messages.clone();
             let messages: Vec<ChatCompletionRequestMessage> = request
@@ -334,18 +323,6 @@ impl LLMProvider for OpenAI {
             if let Some(max_completion_tokens) = request.max_completion_tokens {
                 req.max_completion_tokens(max_completion_tokens);
             }
-            // The effort level maps onto the standard `reasoning_effort` field.
-            // DeepSeek toggles thinking off via its own `thinking` object instead,
-            // so the field is omitted there when reasoning is turned off.
-            if let Some(effort) = reasoning_effort {
-                let set_effort = match kind {
-                    ProviderKind::Generic => true,
-                    ProviderKind::Deepseek => effort != ReasoningEffort::None,
-                };
-                if set_effort {
-                    req.reasoning_effort(map_effort(effort));
-                }
-            }
             let mut req = req.build().unwrap();
             // The `byot` feature disables async-openai's automatic `stream: true`
             // injection, so set it explicitly here.
@@ -356,16 +333,27 @@ impl LLMProvider for OpenAI {
                     include_obfuscation: None,
                 });
             }
-            // Serialize to a JSON body so provider-specific fields (e.g. DeepSeek's
-            // `thinking`) can be injected before the request is sent.
+            // Serialize to a JSON body so reasoning_effort and provider-specific
+            // fields (e.g. DeepSeek's `thinking`) can be injected before the
+            // request is sent. Reasoning effort is always injected as a raw
+            // string (bypassing async-openai's enum) so arbitrary provider
+            // values pass through.
             let mut body = serde_json::to_value(&req).unwrap();
+            if let Some(effort) = &reasoning_effort {
+                let should_set = match kind {
+                    ProviderKind::Generic => true,
+                    ProviderKind::Deepseek => effort != "off",
+                };
+                if should_set {
+                    body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+                }
+            }
             if kind == ProviderKind::Deepseek {
                 inject_deepseek_reasoning(&mut body, &source_messages);
-                if let Some(effort) = reasoning_effort
+                if let Some(effort) = &reasoning_effort
                     && let Some(obj) = body.as_object_mut()
                 {
-                    let state =
-                        if effort == ReasoningEffort::None { "disabled" } else { "enabled" };
+                    let state = if effort == "off" { "disabled" } else { "enabled" };
                     obj.insert("thinking".to_string(), serde_json::json!({ "type": state }));
                 }
             }
