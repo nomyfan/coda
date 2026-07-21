@@ -81,6 +81,9 @@ jobs:
       - name: Format check
         run: pnpm fmt:check
 
+      - name: Test
+        run: pnpm test
+
       - name: Typecheck
         run: |
           pnpm typecheck
