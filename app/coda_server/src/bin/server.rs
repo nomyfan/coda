@@ -10,7 +10,7 @@ use coda_agent::{
     runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProviderConfig, Message, Modality};
-use coda_openai::OpenAI;
+use coda_openai::OpenAICompatible;
 use coda_server::{
     agents::{
         AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file,
@@ -25,7 +25,7 @@ use coda_server::{
     },
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
-    storage::{RenameSessionError, WorkspaceStorage, validate_session_id},
+    storage::{RenameSessionError, SessionModelBinding, WorkspaceStorage, validate_session_id},
     transport::{Transport, WebSocketTransport},
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
@@ -90,10 +90,11 @@ struct AppState {
 /// multiple models under one provider. `reasoning_efforts` is the list the UI
 /// offers; empty means the model has no reasoning controls.
 struct ProviderHandle {
-    provider: Arc<OpenAI>,
+    provider: Arc<OpenAICompatible>,
     model_id: String,
     model_name: String,
     context_window: u32,
+    max_completion_tokens: Option<u32>,
     /// The configured provider's id.
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
@@ -248,6 +249,35 @@ impl SessionOpener for AppOpener {
                 .unwrap_or_default()
         })
     }
+
+    fn update_reasoning_effort<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+            let provider = self
+                .providers
+                .get(provider_id)
+                .ok_or_else(|| format!("unknown provider/model '{provider_id}'"))?;
+            workspace
+                .storage
+                .update_reasoning_effort(
+                    &key.1,
+                    &provider.provider_id,
+                    &provider.model_id,
+                    reasoning_effort,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -271,7 +301,7 @@ async fn open_session(
         model: provider.model_id.clone(),
         label: provider_id.to_string(),
         temperature: None,
-        max_completion_tokens: Some(10_000),
+        max_completion_tokens: provider.max_completion_tokens,
         reasoning_effort,
     };
     // Sub-agents with a configured `model` run on their own provider/model. The
@@ -289,7 +319,7 @@ async fn open_session(
                 model: handle.model_id.clone(),
                 label: selection.provider_id.clone(),
                 temperature: None,
-                max_completion_tokens: Some(10_000),
+                max_completion_tokens: handle.max_completion_tokens,
                 reasoning_effort: selection.reasoning_effort.clone(),
             };
             (name.clone(), profile)
@@ -751,22 +781,56 @@ async fn dispatch_request(
                 )
                     .into();
             };
-            if let Err(err) = workspace
+            // Resolve the client selection only for first creation. Existing
+            // sessions reopen with their durable binding, regardless of the
+            // browser's latest workspace preference.
+            let (requested_provider_id, requested_reasoning_effort) =
+                resolve_selection(app, params.provider_id, params.reasoning_effort);
+            let requested_provider = app
+                .providers
+                .get(&requested_provider_id)
+                .expect("resolved provider selection exists");
+            let initialized = match workspace
                 .storage
-                .initialize_session(&params.session_id)
+                .initialize_session(
+                    &params.session_id,
+                    SessionModelBinding {
+                        provider_id: requested_provider.provider_id.clone(),
+                        model_id: requested_provider.model_id.clone(),
+                        reasoning_effort: requested_reasoning_effort,
+                    },
+                )
                 .await
             {
+                Ok(initialized) => initialized,
+                Err(err) => {
+                    return (
+                        id,
+                        RpcError::with_detail(
+                            rpc::OPEN_FAILED,
+                            "failed to initialize session",
+                            err.to_string(),
+                        ),
+                    )
+                        .into();
+                }
+            };
+            let provider_id = initialized.metadata.binding.selection_key();
+            let Some(reasoning_effort) = normalize_provider_selection(
+                app,
+                &provider_id,
+                initialized.metadata.binding.reasoning_effort,
+            ) else {
                 return (
                     id,
-                    RpcError::with_detail(rpc::OPEN_FAILED, "failed to initialize session", err),
+                    RpcError::with_detail(
+                        rpc::OPEN_FAILED,
+                        "session model binding is unavailable",
+                        provider_id,
+                    ),
                 )
                     .into();
-            }
-            // Honor the client's chosen model (e.g. picked on a new session),
-            // otherwise fall back to the default provider. Ignored when the
-            // session is already live in the hub.
-            let (provider_id, reasoning_effort) =
-                resolve_selection(app, params.provider_id, params.reasoning_effort);
+            };
             let key = (params.workspace_id, params.session_id);
             match attach_core(
                 app,
@@ -870,6 +934,23 @@ async fn dispatch_request(
                     RpcError::new(
                         rpc::MODEL_SWITCH_WHILE_RUNNING,
                         "cannot switch model while a turn is running",
+                    ),
+                )
+                    .into(),
+                CommandOutcome::ModelLocked => (
+                    id,
+                    RpcError::new(
+                        rpc::MODEL_LOCKED,
+                        "provider/model is locked for this session",
+                    ),
+                )
+                    .into(),
+                CommandOutcome::PersistenceFailed(detail) => (
+                    id,
+                    RpcError::with_detail(
+                        rpc::OPEN_FAILED,
+                        "failed to persist reasoning effort",
+                        detail,
                     ),
                 )
                     .into(),
@@ -1552,13 +1633,14 @@ async fn main() {
         .providers
         .into_iter()
         .flat_map(|p| {
-            let shared_provider = Arc::new(OpenAI::new(
+            let shared_provider = Arc::new(OpenAICompatible::new(
                 LLMProviderConfig {
                     api_key: p.api_key,
                     base_url: p.base_url,
                     include_usage: p.include_usage,
                 },
                 p.kind,
+                p.id.clone(),
             ));
             p.models.into_iter().map(move |m| {
                 let id = format!("{}:{}", p.id, m.id);
@@ -1567,6 +1649,7 @@ async fn main() {
                     model_id: m.id,
                     model_name: m.name,
                     context_window: m.context_window,
+                    max_completion_tokens: m.max_completion_tokens,
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                     default_reasoning_effort: m.default_reasoning_effort,

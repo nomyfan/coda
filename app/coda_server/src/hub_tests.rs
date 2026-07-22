@@ -23,6 +23,7 @@ fn assistant(content: &str) -> AssistantMessage {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        reasoning_continuation: None,
         reasoning_ended_at: None,
         aborted: false,
         started_at: now,
@@ -225,7 +226,9 @@ impl TestProvider {
     fn completed(
         message: AssistantMessage,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
-        Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(message))]))
+        Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(Box::new(
+            message,
+        )))]))
     }
 }
 
@@ -250,7 +253,7 @@ impl LLMProvider for TestProvider {
                     stream::iter(vec![Ok(LLMStreamEvent::ContentChunk("partial".into()))]).chain(
                         stream::once(async move {
                             gate.notified().await;
-                            Ok(LLMStreamEvent::Completed(assistant("final")))
+                            Ok(LLMStreamEvent::Completed(Box::new(assistant("final"))))
                         }),
                     ),
                 )
@@ -318,6 +321,7 @@ struct TestOpener {
     provider: TestProvider,
     team: AgentTeam,
     approval: ToolApprovalMode,
+    fail_effort_update: bool,
 }
 
 impl TestOpener {
@@ -347,6 +351,7 @@ impl TestOpener {
             },
             team,
             approval,
+            fail_effort_update: false,
         }
     }
 }
@@ -389,12 +394,34 @@ impl SessionOpener for TestOpener {
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>> {
         Box::pin(async { vec![] })
     }
+
+    fn update_reasoning_effort<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        _provider_id: &'a str,
+        _reasoning_effort: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        let fail = self.fail_effort_update;
+        Box::pin(async move {
+            if fail {
+                Err("injected metadata write failure".to_string())
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 fn hub_with(system_prompt: &str, approval: ToolApprovalMode) -> (SessionHub, Arc<Notify>) {
     let opener = Arc::new(TestOpener::new(system_prompt, approval));
     let gate = opener.provider.gate.clone();
     (SessionHub::new(opener, RelayConfig::default()), gate)
+}
+
+fn hub_with_failing_metadata(system_prompt: &str) -> SessionHub {
+    let mut opener = TestOpener::new(system_prompt, ToolApprovalMode::Auto);
+    opener.fail_effort_update = true;
+    SessionHub::new(Arc::new(opener), RelayConfig::default())
 }
 
 fn key() -> SessionKey {
@@ -974,7 +1001,7 @@ async fn set_model_to_current_selection_is_unchanged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn set_model_switch_returns_model_changed() {
+async fn set_model_effort_switch_returns_model_changed() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach = hub
         .attach(key(), 1, "prov".into(), None, false)
@@ -986,13 +1013,69 @@ async fn set_model_switch_returns_model_changed() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "other".into(),
+                provider_id: "prov".into(),
+                reasoning_effort: Some("high".into()),
+            },
+        )
+        .await,
+        CommandOutcome::ModelChanged { provider_id, reasoning_effort }
+            if provider_id == "prov" && reasoning_effort.as_deref() == Some("high")
+    ));
+
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_model_rejects_a_different_provider_or_model() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _attach = hub
+        .attach(key(), 1, "prov:model-a".into(), None, false)
+        .await
+        .expect("attach");
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "prov:model-b".into(),
                 reasoning_effort: None,
             },
         )
         .await,
-        CommandOutcome::ModelChanged { provider_id, .. } if provider_id == "other"
+        CommandOutcome::ModelLocked
     ));
+
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_effort_persistence_keeps_live_selection() {
+    let hub = hub_with_failing_metadata("reply");
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::SetModel {
+                provider_id: "prov".into(),
+                reasoning_effort: Some("high".into()),
+            },
+        )
+        .await,
+        CommandOutcome::PersistenceFailed(ref error)
+            if error == "injected metadata write failure"
+    ));
+    let refreshed = hub
+        .attach(key(), 1, "prov".into(), Some("high".into()), false)
+        .await
+        .expect("refresh attach");
+    assert_eq!(refreshed.snapshot.provider_id, "prov");
+    assert_eq!(refreshed.snapshot.reasoning_effort, None);
 
     hub.shutdown_all().await;
 }

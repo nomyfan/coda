@@ -33,6 +33,7 @@ export function ModelSelector({
   providerId,
   reasoningEffort,
   disabled,
+  modelLocked,
   requireImageModel,
   serverUrl,
   workspaceId,
@@ -42,6 +43,9 @@ export function ModelSelector({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   disabled: boolean;
+  /** Once a session is opened its provider/model is durable; only reasoning
+   * effort remains adjustable while idle. */
+  modelLocked: boolean;
   /** Restrict selectable models to vision-capable ones (the conversation
    * already involves images). */
   requireImageModel: boolean;
@@ -90,7 +94,7 @@ export function ModelSelector({
           const effort = resolveEffortForModel(catalog, workspaceId, next, reasoningEffort);
           onSetModel(id, effort);
         }}
-        disabled={disabled}
+        disabled={disabled || modelLocked}
       >
         <SelectTrigger
           size="sm"

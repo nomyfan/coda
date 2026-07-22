@@ -670,6 +670,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             tool_calls: Vec::new(),
                             usage: None,
                             reasoning_content: has_reasoning.then_some(partial_reasoning),
+                            reasoning_continuation: None,
                             reasoning_ended_at: has_reasoning.then_some(reasoning_ended_at.unwrap_or(ended_at)),
                             aborted: true,
                             started_at,
@@ -695,7 +696,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             partial_reasoning.push_str(&chunk);
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
-                        Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(message),
+                        Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(*message),
                         Some(Err(err)) => break Err(err.to_string()),
                         None => break Err(StreamError::InvalidResponse(
                             "LLM stream ended without Completed event".to_string(),

@@ -106,9 +106,15 @@ pub enum CommandOutcome {
     /// A `SetModel` selecting the model already in effect: a benign no-op the
     /// request dispatcher reports as idempotent success (echoing the selection).
     Unchanged,
+    /// Provider/model is immutable after the session is opened. Only the
+    /// reasoning effort of that exact model can be changed.
+    ModelLocked,
     /// A `SetModel` rejected because a turn is in flight (the session can only be
     /// rebuilt while idle). Reported as `MODEL_SWITCH_WHILE_RUNNING`.
     TurnRunning,
+    /// The replacement runtime was valid, but persisting its effort failed;
+    /// the current live runtime remains unchanged.
+    PersistenceFailed(String),
     /// Opening the session failed (approvals-gated promotion or `SetModel`).
     OpenFailed(OpenError),
 }
@@ -133,6 +139,15 @@ pub trait SessionOpener: Send + Sync + 'static {
         &'a self,
         key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>>;
+
+    /// Persist an effort update after a replacement runtime has been built but
+    /// before it becomes live.
+    fn update_reasoning_effort<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 /// Why an attach was not served.
@@ -741,6 +756,9 @@ impl SessionHub {
             warn!(workspace_id = %key.0, session_id = %key.1, "ignoring set_model while a turn is running");
             return CommandOutcome::TurnRunning;
         }
+        if live.provider_id != provider_id {
+            return CommandOutcome::ModelLocked;
+        }
         // Open the replacement before tearing down the current session, so a
         // failed open leaves the existing one intact. The old session is idle,
         // so its checkpoint is durable and the new open reads current state.
@@ -750,6 +768,14 @@ impl SessionHub {
             .await
         {
             Ok(session) => {
+                if let Err(error) = self
+                    .opener
+                    .update_reasoning_effort(key, &provider_id, reasoning_effort.as_deref())
+                    .await
+                {
+                    session.shutdown(Shutdown::abort()).await;
+                    return CommandOutcome::PersistenceFailed(error);
+                }
                 let generation = live.generation + 1;
                 let mut replacement = self.make_live(
                     entry,

@@ -1,6 +1,7 @@
 # Each provider is an OpenAI-compatible endpoint. `kind` selects request quirks:
 #   "generic"  — standard OpenAI-compatible API (default)
 #   "deepseek" — toggles thinking via DeepSeek's `thinking` field
+#   "openrouter" — OpenRouter reasoning details and continuation protocol
 # `api_key` and `base_url` may reference an environment variable as `${VAR}`.
 # `models` lists the models under this provider; each model has a required `id`
 # (the API model name sent in requests), an optional `name` (human-readable
@@ -10,7 +11,8 @@
 # disabling thinking), optional `default_reasoning_effort` (the recommended
 # initial effort level — must be one of `reasoning_efforts`; defaults to the
 # first entry when absent), and optional `input_modalities` (defaults to ["text"];
-# add "image" to allow image attachments).
+# add "image" to allow image attachments), and optional
+# `max_completion_tokens` (positive and no larger than `context_window`).
 # The dashboard picks which model a session uses; the first listed is the default.
 
 [[providers]]
@@ -24,11 +26,14 @@ models = [
 ]
 
 [[providers]]
-id = "openai"
-api_key = "${OPENAI_API_KEY}"
-base_url = "https://api.openai.com/v1"
+id = "openrouter"
+kind = "openrouter"
+api_key = "${OPENROUTER_API_KEY}"
+base_url = "https://openrouter.ai/api/v1"
 models = [
-  { id = "gpt-4o", name = "GPT-4o", context_window = 128000, input_modalities = ["text", "image"] },
+  { id = "x-ai/grok-4.5", name = "Grok 4.5", context_window = 500000, max_completion_tokens = 16384, reasoning_efforts = ["high", "medium", "low"], default_reasoning_effort = "high", input_modalities = ["text", "image"] },
+  { id = "moonshotai/kimi-k3", name = "Kimi K3", context_window = 1048576, max_completion_tokens = 32768, reasoning_efforts = ["off", "max", "high", "low"], default_reasoning_effort = "max", input_modalities = ["text", "image"] },
+  { id = "z-ai/glm-5.2", name = "GLM 5.2", context_window = 1048576, max_completion_tokens = 32768, reasoning_efforts = ["off", "xhigh", "high"], default_reasoning_effort = "high" },
 ]
 
 [[workspaces]]

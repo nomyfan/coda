@@ -6,8 +6,8 @@ use crate::{
 };
 use coda_core::{
     llm::{
-        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError,
-        ToolCall, ToolMessage,
+        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message,
+        ReasoningContinuation, StreamError, ToolCall, ToolMessage,
     },
     tool::{Tool, ToolCallContext, ToolObject, ToolResult, ToolWrapper},
 };
@@ -36,6 +36,7 @@ fn assistant() -> AssistantMessage {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        reasoning_continuation: None,
         reasoning_ended_at: None,
         aborted: false,
         started_at: now,
@@ -309,13 +310,27 @@ impl TestProvider {
     fn completed(
         message: AssistantMessage,
     ) -> Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
-        Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(message))]))
+        Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(Box::new(
+            message,
+        )))]))
     }
 
     fn errored(
         error: StreamError,
     ) -> Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
         Box::pin(stream::iter(vec![Err(error)]))
+    }
+
+    fn chunks_then_error(
+        error: StreamError,
+    ) -> Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
+        Box::pin(stream::iter(vec![
+            Ok(LLMStreamEvent::ReasoningChunk(
+                "uncommitted reasoning".into(),
+            )),
+            Ok(LLMStreamEvent::ContentChunk("uncommitted content".into())),
+            Err(error),
+        ]))
     }
 
     fn chunk_then_wait(
@@ -331,7 +346,7 @@ impl TestProvider {
             ])
             .chain(stream::once(async move {
                 gate.notified().await;
-                Ok(LLMStreamEvent::Completed(final_message))
+                Ok(LLMStreamEvent::Completed(Box::new(final_message)))
             })),
         )
     }
@@ -516,10 +531,10 @@ impl LLMProvider for TestProvider {
                     .expect("hold-subagent prompt requires a notify");
                 Box::pin(stream::once(async move {
                     hold_subagent.notified().await;
-                    Ok(LLMStreamEvent::Completed(AssistantMessage {
+                    Ok(LLMStreamEvent::Completed(Box::new(AssistantMessage {
                         content: "subagent done".into(),
                         ..assistant()
-                    }))
+                    })))
                 }))
             }
             "abort-generation-main" => {
@@ -537,7 +552,65 @@ impl LLMProvider for TestProvider {
                     },
                 )
             }
+            "continuation-main" => {
+                if tool_message(&request.messages, "call_read_todos").is_some() {
+                    let replayed =
+                        request.messages.iter().any(|message| {
+                            let Message::Assistant(assistant) = message else {
+                                return false;
+                            };
+                            assistant
+                                .tool_calls
+                                .iter()
+                                .any(|call| call.id == "call_read_todos")
+                                && assistant.reasoning_continuation.as_ref().and_then(
+                                    |continuation| {
+                                        continuation.payload_for("openrouter.reasoning_details.v1")
+                                    },
+                                ) == Some(&serde_json::json!([
+                                    {"type": "reasoning.text", "text": "Need todos."},
+                                    {"type": "reasoning.encrypted", "data": "opaque"}
+                                ]))
+                        });
+                    Self::completed(AssistantMessage {
+                        content: if replayed {
+                            "continuation-restored-ok".into()
+                        } else {
+                            "continuation-missing".into()
+                        },
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_read_todos".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        reasoning_content: Some("Need todos.".into()),
+                        reasoning_continuation: Some(
+                            ReasoningContinuation::try_new(
+                                "openrouter.reasoning_details.v1",
+                                serde_json::json!([
+                                    {"type": "reasoning.text", "text": "Need todos."},
+                                    {"type": "reasoning.encrypted", "data": "opaque"}
+                                ]),
+                            )
+                            .unwrap(),
+                        ),
+                        ..assistant()
+                    })
+                }
+            }
             "error-main" => Self::errored(StreamError::InvalidResponse("main boom".into())),
+            "partial-error-main" => {
+                Self::chunks_then_error(StreamError::Provider(coda_core::llm::ProviderError {
+                    provider_id: "test-provider".into(),
+                    status_code: Some(502),
+                    error_type: Some("upstream_error".into()),
+                    message: "upstream disconnected".into(),
+                }))
+            }
             "error-parent-main" => {
                 let subagent_failed = matches!(
                     tool_message(&request.messages, "call_explore"),
@@ -560,7 +633,7 @@ impl LLMProvider for TestProvider {
                     })
                 }
             }
-            "error-subagent" => Self::errored(StreamError::StreamingError("subagent boom".into())),
+            "error-subagent" => Self::errored(StreamError::TransportError("subagent boom".into())),
             other => panic!("unexpected system prompt: {other}"),
         }
     }
@@ -1228,6 +1301,70 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
 }
 
 #[tokio::test]
+async fn restart_replays_reasoning_continuation_after_tool_approval() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "continuation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build("."),
+        provider.clone(),
+        approval.clone(),
+        "inspect todos",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for tool approval");
+    harness.shutdown().await;
+
+    let decisions = [(
+        pending.thread_id.clone(),
+        ResumeDecision {
+            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+        },
+    )]
+    .into();
+    let mut harness = harness
+        .restart(team.build("."), provider, approval, decisions)
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(message)) = (agent_name.as_str(), event)
+                && message.tool_calls.is_empty()
+            {
+                assert_eq!(message.content, "continuation-restored-ok");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for completion after restored continuation");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let storage = TestStorage::default();
     let mut harness = Harness::start_with_team(
@@ -1488,6 +1625,72 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 }
 
 #[tokio::test]
+async fn partial_stream_error_does_not_enter_history_or_checkpoint() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_spec(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "partial-error-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "trigger partial error",
+    )
+    .await;
+
+    let mut saw_reasoning = false;
+    let mut saw_content = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::LLMReasoningChunk(chunk)) => {
+                    assert_eq!(chunk, "uncommitted reasoning");
+                    saw_reasoning = true;
+                }
+                ("coda", AgentEvent::LLMContentChunk(chunk)) => {
+                    assert_eq!(chunk, "uncommitted content");
+                    saw_content = true;
+                }
+                ("coda", AgentEvent::Error(error)) => {
+                    assert!(saw_reasoning && saw_content);
+                    assert_eq!(
+                        error,
+                        "Provider test-provider error 502 (upstream_error): upstream disconnected"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for partial stream error");
+
+    let checkpoint = storage
+        .checkpoint(&harness.thread_id)
+        .await
+        .expect("user task should remain checkpointed");
+    assert!(matches!(
+        checkpoint.messages.last(),
+        Some(Message::User(user)) if user.first_text() == Some("trigger partial error")
+    ));
+    assert!(!checkpoint.messages.iter().any(|message| matches!(
+        message,
+        Message::Assistant(assistant)
+            if assistant.content.contains("uncommitted")
+                || assistant.reasoning_content.as_deref().is_some_and(|value| value.contains("uncommitted"))
+    )));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     let mut root = Harness::start_with_spec(
         MemoryStorage::default(),
@@ -1554,7 +1757,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
                     saw_explore_error = true;
                     assert!(matches!(
                         tool.output,
-                        ToolOutput::Err(ref out) if out == "Streaming error: subagent boom"
+                        ToolOutput::Err(ref out) if out == "Transport error: subagent boom"
                     ));
                 }
                 ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {

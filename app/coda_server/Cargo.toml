@@ -15,7 +15,6 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
-uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15.7"
@@ -27,6 +26,7 @@ toml_edit = "0.25"
 axum = { version = "0.8", features = ["ws"] }
 brush-parser = "0.4.0"
 clap = { version = "4", features = ["derive", "env"] }
+atomic-write-file = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

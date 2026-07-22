@@ -134,6 +134,8 @@ export const RpcCode = {
   SESSION_NOT_LIVE: -32003,
   /** `set_model`: a turn is in flight. */
   MODEL_SWITCH_WHILE_RUNNING: -32004,
+  /** `set_model`: an opened session cannot change provider/model. */
+  MODEL_LOCKED: -32005,
   UNKNOWN_WORKSPACE: -32010,
   INVALID_SESSION_ID: -32011,
   INVALID_MODEL_SELECTION: -32012,

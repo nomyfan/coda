@@ -2,6 +2,73 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Opaque, provider-formatted reasoning state that must be replayed on a later
+/// request. The format tag prevents one provider dialect from interpreting
+/// another dialect's payload.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReasoningContinuation {
+    format: String,
+    payload: Value,
+}
+
+impl ReasoningContinuation {
+    pub fn try_new(format: impl Into<String>, payload: Value) -> Result<Self, String> {
+        let format = format.into();
+        if format.trim().is_empty() {
+            return Err("reasoning continuation format must not be empty".to_string());
+        }
+        let has_payload = match &payload {
+            Value::Array(values) => !values.is_empty(),
+            Value::Object(values) => !values.is_empty(),
+            _ => false,
+        };
+        if !has_payload {
+            return Err(
+                "reasoning continuation payload must be a non-empty object or array".to_string(),
+            );
+        }
+        Ok(Self { format, payload })
+    }
+
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    pub fn payload_for(&self, format: &str) -> Option<&Value> {
+        (self.format == format).then_some(&self.payload)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningContinuation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireContinuation {
+            format: String,
+            payload: Value,
+        }
+
+        let value = WireContinuation::deserialize(deserializer)?;
+        Self::try_new(value.format, value.payload).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Structured error returned by an upstream model provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderError {
+    /// Static provider identifier configured by the Coda deployment.
+    pub provider_id: String,
+    /// HTTP status for a rejected request, or the equivalent status reported
+    /// by an error envelope delivered after streaming has started.
+    pub status_code: Option<u16>,
+    /// Stable provider classification when one is available. For OpenRouter
+    /// this maps from `error.metadata.error_type`.
+    pub error_type: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
@@ -89,6 +156,10 @@ pub struct AssistantMessage {
     /// Request adapters decide when the provider needs it on later turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Opaque provider state used only when replaying a reasoning tool-call
+    /// turn. It is deliberately separate from user-visible reasoning text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_continuation: Option<ReasoningContinuation>,
     /// When the reasoning phase ended, when the provider streamed reasoning
     /// separately from answer content. This is distinct from `ended_at`, which
     /// covers the whole generation.
@@ -282,17 +353,36 @@ pub struct ChatCompletionRequest {
 
 #[derive(Debug, Clone)]
 pub enum StreamError {
-    /// Error occurred during streaming the response from the LLM.
-    StreamingError(String),
-    /// Error occurred while parsing the LLM's response.
+    /// Network transport or SSE framing failed while opening or consuming the
+    /// provider stream.
+    TransportError(String),
+    /// The provider adapter could not construct a valid outbound request from
+    /// the supplied request or persisted conversation state.
+    InvalidRequest(String),
+    /// A successful provider response could not be decoded or assembled into
+    /// a valid completion.
     InvalidResponse(String),
+    /// A structured error envelope returned by the provider, including errors
+    /// delivered inside an otherwise successful streaming HTTP response.
+    Provider(ProviderError),
 }
 
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StreamError::StreamingError(err) => write!(f, "Streaming error: {}", err),
+            StreamError::TransportError(err) => write!(f, "Transport error: {}", err),
+            StreamError::InvalidRequest(err) => write!(f, "Invalid request: {}", err),
             StreamError::InvalidResponse(err) => write!(f, "Invalid response: {}", err),
+            StreamError::Provider(err) => {
+                write!(f, "Provider {} error", err.provider_id)?;
+                if let Some(status_code) = err.status_code {
+                    write!(f, " {status_code}")?;
+                }
+                if let Some(error_type) = &err.error_type {
+                    write!(f, " ({error_type})")?;
+                }
+                write!(f, ": {}", err.message)
+            }
         }
     }
 }
@@ -305,7 +395,7 @@ pub enum LLMStreamEvent {
     /// A chunk of the model's reasoning / chain-of-thought text, from providers
     /// that expose a separate reasoning stream (e.g. DeepSeek).
     ReasoningChunk(String),
-    Completed(AssistantMessage),
+    Completed(Box<AssistantMessage>),
 }
 
 pub trait LLMProvider: Send + Sync + 'static {
@@ -336,6 +426,13 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: Some("tool reasoning".into()),
+            reasoning_continuation: Some(
+                ReasoningContinuation::try_new(
+                    "openrouter.reasoning_details.v1",
+                    serde_json::json!([{"type": "reasoning.encrypted", "data": "opaque"}]),
+                )
+                .unwrap(),
+            ),
             reasoning_ended_at: None,
             aborted: false,
             started_at: now,
@@ -345,6 +442,24 @@ mod tests {
         assert_eq!(
             value["reasoning_content"],
             serde_json::json!("tool reasoning")
+        );
+        assert_eq!(
+            value["reasoning_continuation"]["format"],
+            serde_json::json!("openrouter.reasoning_details.v1")
+        );
+
+        let roundtripped: AssistantMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            roundtripped
+                .reasoning_continuation
+                .as_ref()
+                .and_then(|continuation| {
+                    continuation.payload_for("openrouter.reasoning_details.v1")
+                }),
+            Some(&serde_json::json!([{
+                "type": "reasoning.encrypted",
+                "data": "opaque"
+            }]))
         );
 
         let now = jiff::Timestamp::now();
@@ -358,5 +473,46 @@ mod tests {
         }))
         .unwrap();
         assert!(without_reasoning.reasoning_content.is_none());
+        assert!(without_reasoning.reasoning_continuation.is_none());
+    }
+
+    #[test]
+    fn reasoning_continuation_rejects_invalid_envelopes() {
+        assert!(ReasoningContinuation::try_new("", serde_json::json!([{}])).is_err());
+        assert!(
+            ReasoningContinuation::try_new("openrouter.reasoning_details.v1", Value::Null).is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReasoningContinuation>(serde_json::json!({
+                "format": "openrouter.reasoning_details.v1",
+                "payload": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_error_display_keeps_structured_context() {
+        let error = StreamError::Provider(ProviderError {
+            provider_id: "openrouter".into(),
+            status_code: Some(429),
+            error_type: Some("rate_limit_exceeded".into()),
+            message: "slow down".into(),
+        });
+
+        assert_eq!(
+            error.to_string(),
+            "Provider openrouter error 429 (rate_limit_exceeded): slow down"
+        );
+    }
+
+    #[test]
+    fn invalid_request_display_identifies_the_outbound_boundary() {
+        let error = StreamError::InvalidRequest("continuation is malformed".into());
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid request: continuation is malformed"
+        );
     }
 }

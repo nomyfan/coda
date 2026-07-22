@@ -3,14 +3,13 @@ use coda_agent::runtime::SessionStorage;
 use coda_core::llm::Message;
 use std::collections::HashSet;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 /// Session-list preview shown for a session whose first user turn carried only
 /// images (no text). Kept in sync with `IMAGE_ONLY_TITLE` in the web store so the
@@ -47,10 +46,51 @@ pub struct WorkspaceStorage {
     metadata_write_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-struct SessionMetadata {
-    name: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SessionModelBinding {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
 }
+
+impl SessionModelBinding {
+    pub fn selection_key(&self) -> String {
+        format!("{}:{}", self.provider_id, self.model_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SessionMetadata {
+    pub name: Option<String>,
+    pub binding: SessionModelBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializedSession {
+    pub metadata: SessionMetadata,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionMetadataError {
+    InvalidSessionId(String),
+    SessionNotFound,
+    BindingMismatch,
+    Persistence(String),
+}
+
+impl std::fmt::Display for SessionMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSessionId(message) => write!(f, "{message}"),
+            Self::SessionNotFound => write!(f, "session not found"),
+            Self::BindingMismatch => write!(f, "session model binding does not match"),
+            Self::Persistence(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionMetadataError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenameSessionError {
@@ -111,27 +151,44 @@ impl WorkspaceStorage {
     }
 
     /// Create the durable identity record for a newly opened session.
-    pub async fn initialize_session(&self, session_id: &str) -> Result<(), String> {
-        validate_session_id(session_id)?;
+    pub async fn initialize_session(
+        &self,
+        session_id: &str,
+        requested_binding: SessionModelBinding,
+    ) -> Result<InitializedSession, SessionMetadataError> {
+        validate_session_id(session_id).map_err(SessionMetadataError::InvalidSessionId)?;
         let _guard = self.metadata_write_lock.lock().await;
         let dir = self.session_dir(session_id);
         fs::create_dir_all(&dir).await.map_err(|err| {
-            format!(
+            SessionMetadataError::Persistence(format!(
                 "failed to create session directory {}: {err}",
                 dir.display()
-            )
+            ))
         })?;
 
         let path = self.metadata_path(session_id);
         match Self::read_metadata(&path).await {
-            Ok(_) => Ok(()),
+            Ok(metadata) => Ok(InitializedSession {
+                metadata,
+                created: false,
+            }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Self::write_metadata(&path, &SessionMetadata::default()).await
+                let metadata = SessionMetadata {
+                    name: None,
+                    binding: requested_binding,
+                };
+                Self::write_metadata(&path, &metadata)
+                    .await
+                    .map_err(SessionMetadataError::Persistence)?;
+                Ok(InitializedSession {
+                    metadata,
+                    created: true,
+                })
             }
-            Err(err) => Err(format!(
+            Err(err) => Err(SessionMetadataError::Persistence(format!(
                 "failed to initialize session metadata {}: {err}",
                 path.display()
-            )),
+            ))),
         }
     }
 
@@ -144,7 +201,7 @@ impl WorkspaceStorage {
         let name = normalize_session_name(requested_name)?;
         let _guard = self.metadata_write_lock.lock().await;
         let path = self.metadata_path(session_id);
-        Self::read_metadata(&path).await.map_err(|err| {
+        let mut metadata = Self::read_metadata(&path).await.map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 RenameSessionError::SessionNotFound
             } else {
@@ -154,10 +211,43 @@ impl WorkspaceStorage {
                 ))
             }
         })?;
-        Self::write_metadata(&path, &SessionMetadata { name: name.clone() })
+        metadata.name = name.clone();
+        Self::write_metadata(&path, &metadata)
             .await
             .map_err(RenameSessionError::Persistence)?;
         Ok(name)
+    }
+
+    pub async fn update_reasoning_effort(
+        &self,
+        session_id: &str,
+        expected_provider_id: &str,
+        expected_model_id: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<SessionModelBinding, SessionMetadataError> {
+        validate_session_id(session_id).map_err(SessionMetadataError::InvalidSessionId)?;
+        let _guard = self.metadata_write_lock.lock().await;
+        let path = self.metadata_path(session_id);
+        let mut metadata = Self::read_metadata(&path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                SessionMetadataError::SessionNotFound
+            } else {
+                SessionMetadataError::Persistence(format!(
+                    "failed to read session metadata {}: {err}",
+                    path.display()
+                ))
+            }
+        })?;
+        if metadata.binding.provider_id != expected_provider_id
+            || metadata.binding.model_id != expected_model_id
+        {
+            return Err(SessionMetadataError::BindingMismatch);
+        }
+        metadata.binding.reasoning_effort = reasoning_effort.map(str::to_string);
+        Self::write_metadata(&path, &metadata)
+            .await
+            .map_err(SessionMetadataError::Persistence)?;
+        Ok(metadata.binding)
     }
 
     async fn read_metadata(path: &Path) -> Result<SessionMetadata, std::io::Error> {
@@ -168,34 +258,23 @@ impl WorkspaceStorage {
     async fn write_metadata(path: &Path, metadata: &SessionMetadata) -> Result<(), String> {
         let payload = serde_json::to_vec_pretty(metadata)
             .map_err(|err| format!("failed to serialize session metadata: {err}"))?;
-        let temp_path =
-            path.with_file_name(format!(".metadata-{}.tmp", Uuid::new_v4().as_hyphenated()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to create temporary metadata file {}: {err}",
-                    temp_path.display()
-                )
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut file = atomic_write_file::AtomicWriteFile::open(&path).map_err(|err| {
+                format!("failed to open session metadata {}: {err}", path.display())
             })?;
-        let result = async {
-            file.write_all(&payload).await?;
-            file.sync_all().await?;
-            drop(file);
-            fs::rename(&temp_path, path).await
-        }
-        .await;
-        if let Err(err) = result {
-            let _ = fs::remove_file(&temp_path).await;
-            return Err(format!(
-                "failed to write session metadata {}: {err}",
-                path.display()
-            ));
-        }
-        Ok(())
+            file.write_all(&payload).map_err(|err| {
+                format!("failed to write session metadata {}: {err}", path.display())
+            })?;
+            file.commit().map_err(|err| {
+                format!(
+                    "failed to commit session metadata {}: {err}",
+                    path.display()
+                )
+            })
+        })
+        .await
+        .map_err(|err| format!("session metadata writer task failed: {err}"))?
     }
 
     /// Storage scoped to one session's directory.
@@ -452,7 +531,16 @@ impl SessionStorage for JsonFileStorage {
 mod tests {
     use super::*;
     use coda_agent::persist::StoredResumePoint;
-    use coda_core::llm::UserMessage;
+    use coda_core::llm::{AssistantMessage, ReasoningContinuation, ToolCall, UserMessage};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn test_binding() -> SessionModelBinding {
+        SessionModelBinding {
+            provider_id: "openrouter".into(),
+            model_id: "x-ai/grok-4.5".into(),
+            reasoning_effort: Some("high".into()),
+        }
+    }
 
     #[test]
     fn validate_session_id_accepts_uuid_like_ids() {
@@ -491,10 +579,16 @@ mod tests {
         let active = storage.session("active");
         let other = storage.session("other");
 
-        storage.initialize_session("active").await.unwrap();
+        storage
+            .initialize_session("active", test_binding())
+            .await
+            .unwrap();
         fs::write(active.snapshot_path(), b"{}").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        storage.initialize_session("other").await.unwrap();
+        storage
+            .initialize_session("other", test_binding())
+            .await
+            .unwrap();
         fs::write(other.snapshot_path(), b"{}").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         active
@@ -529,7 +623,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
         let session = storage.session("images");
-        storage.initialize_session("images").await.unwrap();
+        storage
+            .initialize_session("images", test_binding())
+            .await
+            .unwrap();
 
         session
             .save_checkpoint(
@@ -557,11 +654,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_round_trips_reasoning_continuation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        let session = storage.session("continuation");
+        storage
+            .initialize_session("continuation", test_binding())
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now();
+        session
+            .save_checkpoint(
+                "continuation".into(),
+                StoredCheckpoint {
+                    thread_id: "continuation".into(),
+                    agent_name: "coda".into(),
+                    reply_target: None,
+                    messages: vec![Message::Assistant(AssistantMessage {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "call_weather".into(),
+                            name: "lookup_weather".into(),
+                            arguments: Some(r#"{"city":"Singapore"}"#.into()),
+                        }],
+                        usage: None,
+                        reasoning_content: Some("Need current weather.".into()),
+                        reasoning_continuation: Some(
+                            ReasoningContinuation::try_new(
+                                "openrouter.reasoning_details.v1",
+                                serde_json::json!([
+                                    {"type": "reasoning.text", "text": "Need current weather."},
+                                    {"type": "reasoning.encrypted", "data": "opaque"}
+                                ]),
+                            )
+                            .unwrap(),
+                        ),
+                        reasoning_ended_at: Some(now),
+                        aborted: false,
+                        started_at: now,
+                        ended_at: now,
+                    })],
+                    todos: vec![],
+                    resume_point: StoredResumePoint::Generation,
+                    suspended_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let checkpoint = session
+            .load_checkpoint("continuation")
+            .await
+            .unwrap()
+            .unwrap();
+        let Message::Assistant(message) = &checkpoint.messages[0] else {
+            panic!("expected assistant message");
+        };
+        let continuation = message
+            .reasoning_continuation
+            .as_ref()
+            .expect("reasoning continuation was not restored");
+        assert_eq!(continuation.format(), "openrouter.reasoning_details.v1");
+        assert_eq!(
+            continuation.payload_for("openrouter.reasoning_details.v1"),
+            Some(&serde_json::json!([
+                {"type": "reasoning.text", "text": "Need current weather."},
+                {"type": "reasoning.encrypted", "data": "opaque"}
+            ]))
+        );
+    }
+
+    #[tokio::test]
     async fn list_sessions_marks_pending_approval() {
         let workspace = tempfile::tempdir().unwrap();
         let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
         let session = storage.session("review");
-        storage.initialize_session("review").await.unwrap();
+        storage
+            .initialize_session("review", test_binding())
+            .await
+            .unwrap();
 
         session
             .save_session_snapshot(
@@ -635,7 +806,26 @@ mod tests {
     async fn session_metadata_initializes_renames_and_clears() {
         let workspace = tempfile::tempdir().unwrap();
         let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
-        storage.initialize_session("session-1").await.unwrap();
+        let initialized = storage
+            .initialize_session("session-1", test_binding())
+            .await
+            .unwrap();
+        assert!(initialized.created);
+        assert_eq!(initialized.metadata.binding, test_binding());
+
+        let reopened = storage
+            .initialize_session(
+                "session-1",
+                SessionModelBinding {
+                    provider_id: "other".into(),
+                    model_id: "different".into(),
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!reopened.created);
+        assert_eq!(reopened.metadata.binding, test_binding());
 
         assert_eq!(
             storage
@@ -648,6 +838,20 @@ mod tests {
             storage.list_sessions().await.unwrap()[0].name.as_deref(),
             Some("Investigation")
         );
+        let metadata = WorkspaceStorage::read_metadata(&storage.metadata_path("session-1"))
+            .await
+            .unwrap();
+        assert_eq!(metadata.binding, test_binding());
+
+        let binding = storage
+            .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", Some("low"))
+            .await
+            .unwrap();
+        assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
+        let metadata = WorkspaceStorage::read_metadata(&storage.metadata_path("session-1"))
+            .await
+            .unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Investigation"));
 
         assert_eq!(
             storage
@@ -657,6 +861,63 @@ mod tests {
             None
         );
         assert_eq!(storage.list_sessions().await.unwrap()[0].name, None);
+        let metadata = WorkspaceStorage::read_metadata(&storage.metadata_path("session-1"))
+            .await
+            .unwrap();
+        assert_eq!(metadata.binding.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn effort_update_rejects_a_different_model_binding() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        storage
+            .initialize_session("session-1", test_binding())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .update_reasoning_effort(
+                    "session-1",
+                    "openrouter",
+                    "moonshotai/kimi-k3",
+                    Some("low"),
+                )
+                .await,
+            Err(SessionMetadataError::BindingMismatch)
+        );
+        assert_eq!(
+            WorkspaceStorage::read_metadata(&storage.metadata_path("session-1"))
+                .await
+                .unwrap()
+                .binding,
+            test_binding()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_metadata_write_preserves_the_previous_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = WorkspaceStorage::new(workspace.path().join("sessions"));
+        storage
+            .initialize_session("session-1", test_binding())
+            .await
+            .unwrap();
+        let session_dir = storage.session_dir("session-1");
+        let original = fs::read(storage.metadata_path("session-1")).await.unwrap();
+
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = storage
+            .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", Some("low"))
+            .await;
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(result, Err(SessionMetadataError::Persistence(_))));
+        assert_eq!(
+            fs::read(storage.metadata_path("session-1")).await.unwrap(),
+            original
+        );
     }
 
     #[tokio::test]
@@ -686,7 +947,10 @@ mod tests {
         fs::write(sessions_dir.join("invalid/metadata.json"), b"not json")
             .await
             .unwrap();
-        storage.initialize_session("valid").await.unwrap();
+        storage
+            .initialize_session("valid", test_binding())
+            .await
+            .unwrap();
 
         let sessions = storage.list_sessions().await.unwrap();
 

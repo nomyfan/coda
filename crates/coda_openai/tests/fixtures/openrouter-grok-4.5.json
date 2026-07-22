@@ -1,0 +1,94 @@
+[
+  {
+    "choices": [
+      {
+        "delta": {
+          "content": "",
+          "reasoning": "The",
+          "reasoning_details": [
+            {
+              "type": "reasoning.summary",
+              "summary": "The",
+              "format": "xai-responses-v1",
+              "index": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "choices": [
+      {
+        "delta": {
+          "reasoning": " tool",
+          "reasoning_details": [
+            {
+              "type": "reasoning.summary",
+              "summary": " tool",
+              "format": "xai-responses-v1",
+              "index": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "choices": [
+      {
+        "delta": {
+          "reasoning": null,
+          "reasoning_details": [
+            {
+              "type": "reasoning.encrypted",
+              "data": "sanitized-encrypted-payload",
+              "format": "xai-responses-v1",
+              "id": "rs_sanitized",
+              "index": 1
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "choices": [
+      {
+        "delta": {
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call-grok-0",
+              "type": "function",
+              "function": { "name": "lookup_weather", "arguments": "" }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "choices": [
+      {
+        "delta": {
+          "tool_calls": [
+            {
+              "index": 0,
+              "function": { "arguments": "{\"city\":\"Singapore\"}" }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "choices": [],
+    "usage": {
+      "prompt_tokens": 315,
+      "completion_tokens": 37,
+      "total_tokens": 352,
+      "completion_tokens_details": { "reasoning_tokens": 25 }
+    }
+  }
+]
