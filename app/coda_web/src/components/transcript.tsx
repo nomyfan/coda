@@ -31,6 +31,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { CodaMark } from "@/components/logo";
 import { Markdown } from "@/components/markdown";
 import {
   selectActiveApprovalCount,
@@ -192,6 +193,7 @@ export const Transcript = memo(function Transcript({
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (
           <div className="flex min-h-[48vh] flex-col items-center justify-center text-center">
+            <CodaMark className="mb-4 size-12" />
             <div className="text-base font-semibold">
               {workspace ? "What should we do?" : "No session selected"}
             </div>

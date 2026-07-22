@@ -1,0 +1,27 @@
+<!--
+  Source for public/apple-touch-icon.png. iOS applies its own squircle mask, so
+  this stays a full-bleed square with no rounding of its own, and the background
+  is opaque (transparency renders black on the home screen).
+
+  One image serves both color schemes, so it hardcodes the dark-mode palette
+  rather than reusing favicon.svg — SVG rasterizers skip @media rules entirely
+  (resvg says so out loud, librsvg silently), and would always emit the light
+  branch.
+
+  The mark's own box is 40x48 inside a 64 viewBox; scaled 2.2x it occupies 88x106
+  of the 180 canvas, leaving room for the mask to round the corners off.
+
+  Regenerate with:
+    resvg app/coda_web/icons/apple-touch-icon.svg app/coda_web/public/apple-touch-icon.png
+
+  resvg writes RGBA, but the full-bleed rect below leaves every pixel at alpha
+  255, so there is nothing for iOS to render black. Keep that rect if you edit
+  this — it, not the PNG color type, is what makes the icon safe.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180">
+  <rect width="180" height="180" fill="#262321"/>
+  <g transform="translate(19.6 19.6) scale(2.2)">
+    <circle cx="32" cy="36" r="15" fill="none" stroke="#5f7a4e" stroke-width="10"/>
+    <path d="M47 36V8" fill="none" stroke="#a6c485" stroke-width="10"/>
+  </g>
+</svg>

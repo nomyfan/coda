@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    .bowl { stroke: #90ab78 }
+    .stem { stroke: #4f743b }
+    @media (prefers-color-scheme: dark) {
+      .bowl { stroke: #5f7a4e }
+      .stem { stroke: #a6c485 }
+    }
+  </style>
+  <circle class="bowl" cx="32" cy="36" r="15" fill="none" stroke-width="10"/>
+  <path class="stem" d="M47 36V8" stroke-width="10"/>
+</svg>
