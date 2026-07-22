@@ -53,7 +53,9 @@ fn user_message_count(messages: &[Message]) -> usize {
 fn completed(
     msg: AssistantMessage,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
-    Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(msg))]))
+    Box::pin(stream::iter(vec![Ok(LLMStreamEvent::Completed(Box::new(
+        msg,
+    )))]))
 }
 
 /// Base assistant message for tests; callers override the fields they care
@@ -65,6 +67,7 @@ fn assistant() -> AssistantMessage {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        reasoning_continuation: None,
         reasoning_ended_at: None,
         aborted: false,
         started_at: now,

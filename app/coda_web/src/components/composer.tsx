@@ -250,6 +250,7 @@ export const Composer = memo(function Composer({
                 providerId={providerId}
                 reasoningEffort={reasoningEffort}
                 disabled={!connected || running}
+                modelLocked={!selectingTarget}
                 requireImageModel={requireImageModel}
                 serverUrl={serverUrl}
                 workspaceId={workspaceId}

@@ -214,11 +214,10 @@ pub struct AddAllowPatternParams {
     pub pattern: String,
 }
 
-/// `set_model` params — switch the provider/model and reasoning setting. Applies
-/// from the next turn (the server reopens the session). For reasoning models,
-/// `null` selects the first configured effort, `none` turns thinking off, and any
-/// configured level turns it on at that level. Models without reasoning controls
-/// keep `null`.
+/// `set_model` params. An opened session rejects a different provider/model;
+/// the same model may update its reasoning setting while idle, applied from the
+/// next turn by reopening the runtime. `null` selects the first configured
+/// effort, `off` turns thinking off, and models without controls keep `null`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetModelParams {
     pub workspace_id: String,

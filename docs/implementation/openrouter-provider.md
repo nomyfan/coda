@@ -25,8 +25,11 @@ Out: 模型自动发现、Responses/Messages API、OpenRouter 托管工具与高
 ## Validation Findings
 
 - 问题：`reasoning_details` 流式对象是否需要按 `index`/`id` 做字段归并。方法：2026-07-22 使用同一工具 schema，分别调用 `x-ai/grok-4.5`（low）、`moonshotai/kimi-k3`（low）和 `z-ai/glm-5.2`（high），保存真实 SSE，并把完整 detail 序列原序放入 assistant 工具调用消息后提交 continuation。结果：三次首轮和三次 continuation 均为 HTTP 200 且无流内错误；同一 index 会对应多个完整的增量 detail 对象，Grok 还在 summary chunks 后给出独立 encrypted block。原序回传的 26、100、11 个对象分别被三家接受。影响：确认只按到达顺序追加对象，不按 index/id 合并、去重或改写；OpenRouter `delta.reasoning` 归一化到内部 `reasoning_content`，原始 details 单独持久化。
+- 问题：三个样本模型当前如何声明 reasoning capability。方法：2026-07-22 查询已认证的 OpenRouter `/api/v1/models` 目录。结果：Grok 4.5 `mandatory=true`，efforts 为 high/medium/low；Kimi K3 `mandatory=false`、默认开启，efforts 为 max/high/low；GLM 5.2 `mandatory=false`，efforts 为 xhigh/high。影响：样本配置仅给 Grok 省略 `off`，Kimi/GLM 增加 `off`；纠正需求调研阶段“Kimi 始终推理”的过时假设。运行时仍不读取目录。
 - 问题：是否需要替换 HTTP 客户端。方法：检查本地 `async-openai 0.40.2` 的 BYOT 实现。结果：请求可以发送任意 JSON，SSE data 可以反序列化为自定义响应类型，且库已处理注释事件和 `[DONE]`。影响：继续复用现有客户端，只扩展 wire codec。
 - 问题：OpenRouter 数据当前会怎样。方法：对照 `ReasoningStreamResponse` 与 OpenRouter schema。结果：Serde 会忽略 `reasoning`、`reasoning_details` 和顶层 `error`；流内错误带空 delta 时最终成为空成功消息。影响：响应超集和终止校验必须在 provider adapter 内完成。
+- 问题：OpenRouter 非 2xx 错误能否直接沿用 SDK 的错误类型。方法：通过 Rust adapter 在线测试 Kimi K3 时捕获真实 429。结果：OpenRouter 返回数值型 `error.code`，而 `async-openai 0.40.2` 的通用错误类型期望字符串，导致错误先落入 `JSONDeserialize`。影响：OpenRouter 方言会从 SDK 保留的原始响应体把数值 `error.code` 归一化为 `status_code`，同时恢复 `metadata.error_type` 和 `message`；真实限流不再退化成不透明的 JSON 反序列化错误。
+- 问题：原有 `StreamingError` 是否应承载 DeepSeek 等 provider 的 HTTP/API 错误。方法：检查 `async-openai 0.40.2` 的 HTTP 状态检查和 SSE 解码边界。结果：非 2xx 响应在创建 stream 时表现为 `ApiError`，或在错误体不符合 SDK schema 时表现为 `JSONDeserialize`；stream item 上的 `JSONDeserialize` 则是 HTTP 200 后的 SSE payload 解码失败。影响：所有方言的非 2xx/API 拒绝统一归为 `ProviderError`，流中 JSON 解码失败归为 `InvalidResponse`；原 variant 重命名为 `TransportError`，只承载网络传输、SSE framing 和其他 SDK 基础设施错误。
 - 问题：结构化推理放在哪里。方法：检查 checkpoint 路径。结果：`StoredCheckpoint` 直接持久化 `Vec<Message>`。影响：把 continuation 挂在 `AssistantMessage` 上即可自然覆盖工具轮次、重启恢复和子 Agent，无需另建存储表。
 - 问题：重启后如何保证仍使用原模型。方法：检查 session metadata、`open_session`、dashboard model preference 与 `set_model`。结果：metadata 当前不保存模型，历史会话会用 workspace 最近选择或默认模型重开，空闲 session 也允许保留历史切换模型。影响：“用户不主动切换”不足以保证 continuation 安全；必须由服务端持久化并执行模型绑定。
 - 问题：metadata 新字段能否由现有写入路径安全保留。方法：检查 `initialize_session`、`rename_session` 和原子写盘实现。结果：当前 rename 虽先读取 metadata，随后仍用只含 `name` 的新对象覆盖整个文件；并发写入只靠同一把锁串行，尚无统一的 read-modify-write 契约。影响：binding、name 和 effort 必须属于同一个聚合实体，所有 mutation 在同一锁下读取、修改并原子替换完整实体。
@@ -78,14 +81,17 @@ pub struct AssistantMessage {
 }
 
 pub struct ProviderError {
-    pub code: Option<u16>,
+    /// Static provider id from `[[providers]].id`.
+    pub provider_id: String,
+    /// Rejected request's HTTP status, or the equivalent in-band status.
+    pub status_code: Option<u16>,
     /// OpenRouter's stable classification from `error.metadata.error_type`.
     pub error_type: Option<String>,
     pub message: String,
 }
 ```
 
-`reasoning_content` 只服务于事件/UI；`reasoning_continuation` 只服务于协议续接。`StreamError` 新增携带 `ProviderError` 的分支，agent runtime 仍可通过 `Display` 输出用户可读错误。
+`reasoning_content` 只服务于事件/UI；`reasoning_continuation` 只服务于协议续接。`StreamError` 新增 `InvalidRequest` 区分本地请求编码失败，并新增携带 `ProviderError` 的分支；响应解析错误继续使用 `InvalidResponse`，agent runtime 仍可通过 `Display` 输出用户可读错误。
 
 ```rust
 impl ProviderDialect {
@@ -192,27 +198,31 @@ impl WorkspaceStorage {
 - [x] [risk validation] 使用具备三个样本模型访问权限和足够额度的 OpenRouter 凭据，捕获 Grok 4.5、Kimi K3、GLM 5.2 的真实 reasoning + tool-call SSE，确认 detail 是否可按到达顺序直接追加，并用原始序列完成真实 continuation
       Purpose: 在改动核心模型前锁定最不确定的 wire 行为；如果需要字段级组装，先修订并重新批准本设计
       Verification: 三份真实样本均能重建并原样回传 continuation；Grok 26 个 details（含 encrypted block）、Kimi 100 个、GLM 11 个，六次请求均为 HTTP 200 且无流内 error
-- [ ] [provider fixtures] 将三份真实响应脱敏后固化为 fixture，并补齐 reasoning 字符串、三种 details、并行工具、usage 和 HTTP 200 流内 error
+- [x] [provider fixtures] 将三份真实响应脱敏后固化为 fixture，并补齐 reasoning 字符串、三种 details、并行工具、usage 和 HTTP 200 流内 error
       Purpose: 把已验证的 wire 形态转成离线回归边界
-      Verification: fixture 测试先复现当前丢 reasoning 与吞 error，再随 adapter 实现转绿
-- [ ] [core model] 增加 `ReasoningContinuation`、`ProviderError` 和对应序列化/反序列化测试
+      Verification: 三份脱敏 fixture 保留 summary/text/encrypted、分片工具参数和 usage；独立测试覆盖交错并行工具与 HTTP 200 error envelope
+- [x] [core model] 增加 `ReasoningContinuation`、`ProviderError` 和对应序列化/反序列化测试
       Purpose: 建立展示、协议续接、持久化之间唯一的数据契约
-      Verification: message JSON round-trip 保留 continuation，非法 envelope 被拒绝
-- [ ] [provider adapter] 将现有 `OpenAI` 整理为 `OpenAICompatible` + `ProviderDialect`，实现 OpenRouter request/replay/stream/error，并保持 generic/deepseek fixture 不变
+      Verification: `cargo test -p coda_core` 通过；message JSON round-trip 保留 continuation，空 format、空/标量 payload 被拒绝，provider error 保留 provider/status/type/message
+- [x] [provider adapter] 将现有 `OpenAI` 整理为 `OpenAICompatible` + `ProviderDialect`，实现 OpenRouter request/replay/stream/error，并保持 generic/deepseek fixture 不变
       Purpose: 把所有兼容方言封装在一个可独立测试的深模块中
-      Verification: `cargo test -p coda_openai` 覆盖三种方言及单次/并行工具续接
-- [ ] [configuration] 支持 `kind = "openrouter"` 和可选 `max_completion_tokens`，更新 example config 与三样本静态配置示例，并对照实现时的 OpenRouter 官方目录人工确认 capability
+      Verification: `cargo test -p coda_openai` 22 项通过，覆盖三种方言、三份真实形态、details 原序回传、单次/交错并行工具、请求/响应错误分类、各方言 HTTP/API 错误、流中解码错误、SSE 传输错误、OpenRouter 流内错误和空流失败
+- [x] [configuration] 支持 `kind = "openrouter"` 和可选 `max_completion_tokens`，更新 example config 与三样本静态配置示例，并对照实现时的 OpenRouter 官方目录人工确认 capability
       Purpose: 让部署者可显式控制输出预算，同时保留 provider 默认行为
-      Verification: config 测试覆盖字段缺省、合法值、零值、超 context、未知 kind、effort/default 不一致
-- [ ] [session binding] 引入 `atomic-write-file 0.3` 默认 features，通过 `spawn_blocking` 写完整 metadata 聚合；在首次打开时持久化 provider/model/effort，恢复时采用绑定模型，并收紧 `set_model` 为“模型锁定、effort 可变”
+      Verification: `cargo test -p coda_server config::tests` 42 项通过；覆盖字段缺省、合法值、零/负/非整数/超 context，OpenRouter kind、effort/default 既有校验保持通过；server 不再暗设 10,000
+- [x] [session binding] 引入 `atomic-write-file 0.3` 默认 features，通过 `spawn_blocking` 写完整 metadata 聚合；在首次打开时持久化 provider/model/effort，恢复时采用绑定模型，并收紧 `set_model` 为“模型锁定、effort 可变”
       Purpose: 让同模型 continuation 与重启恢复成为服务端不变量，不依赖浏览器偏好
-      Verification: server 测试覆盖首次绑定、重开恢复、缺失模型报错、跨模型拒绝、同模型 effort 更新和运行中拒绝；storage/hub 测试覆盖 rename 保留 binding、effort 更新保留 name、原子替换失败保留旧文件，以及写盘失败不改变 live selection
-- [ ] [server integration] 从静态配置构造 profile，删除固定 10,000；验证 session 保存/恢复后仍回传 continuation，流中错误不持久化 partial assistant
+      Verification: server 测试覆盖首次绑定、重开时保留原绑定、跨模型拒绝、同模型 effort 更新和运行中拒绝；storage/hub 测试覆盖 rename 保留 binding、effort 更新保留 name、原子替换失败保留旧文件，以及写盘失败不改变 live selection
+- [x] [server integration] 从静态配置构造 profile，删除固定 10,000；验证 session 保存/恢复后仍回传 continuation，流中错误不持久化 partial assistant
       Purpose: 接通真实 Agent 生命周期并固定失败重试语义
-      Verification: server/agent 集成测试完成“模型 → 工具 → 恢复 → 模型”，断言第二次请求含原始 details；错误后 checkpoint 不含 partial assistant
-- [ ] [dashboard regression] 打开的 session 禁用 provider/model 下拉框但保留空闲时的 effort 选择；为图片请求编码、仅 `max`、不可关闭和含 `off` 的静态模型补充测试
+      Verification: agent 集成测试完成“模型 → 工具审批 → 重启恢复 → 模型”，断言第二次请求仍含原始 details；server checkpoint JSON round-trip 保留 continuation；错误后 checkpoint 只保留 user message、不含已展示的 partial assistant
+- [x] [dashboard regression] 打开的 session 禁用 provider/model 下拉框但保留空闲时的 effort 选择；为图片请求编码、仅 `max`、不可关闭和含 `off` 的静态模型补充测试
       Purpose: 证明 UI 执行模型绑定，同时准确表达输入模态和三类 reasoning 能力
-      Verification: fixture 覆盖图片输入编码及 Kimi K3“图片 → 工具 → continuation”；`pnpm --filter coda-web lint` 与 `pnpm --filter coda-web test`
-- [ ] [final verification] 运行全仓 Rust 检查，并复用风险验证凭据手工 smoke test 三个 OpenRouter 模型
+      Verification: OpenRouter request fixture 覆盖 Kimi K3“图片 → 工具 → continuation”；`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`（12 项）与 `pnpm --filter coda-web typecheck` 通过
+- [x] [final verification] 运行全仓 Rust 检查，并复用风险验证凭据手工 smoke test 三个 OpenRouter 模型
       Purpose: 捕获方言重构回归并验证真实 SSE 差异
-      Verification: `cargo clippy`、`cargo test`；手工确认三模型文本、reasoning、工具循环和错误展示
+      Verification: `cargo clippy`、`cargo test` 通过；ignored Rust smoke test 通过 `OpenAICompatible` 分别完成 Grok 4.5、Kimi K3、GLM 5.2 的工具调用与 continuation replay（六次真实请求）
+
+## Deviations from Design
+
+- 没有新增独立的 `ProviderDialect` 类型；`ProviderKind` 直接拥有私有的 request encode 与 response reduce 方法。方言边界和行为不变，但当前只有三个无状态分支，复用现有 enum 比再加一层策略类型更直接。

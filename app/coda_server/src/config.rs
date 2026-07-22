@@ -41,6 +41,7 @@ pub struct ModelConfig {
     pub id: String,
     pub name: String,
     pub context_window: u32,
+    pub max_completion_tokens: Option<u32>,
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
     pub input_modalities: Vec<Modality>,
@@ -158,9 +159,10 @@ fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, 
         let kind = match provider.get("kind").and_then(|v| v.as_str()) {
             None | Some("generic") => ProviderKind::Generic,
             Some("deepseek") => ProviderKind::Deepseek,
+            Some("openrouter") => ProviderKind::OpenRouter,
             Some(other) => {
                 return Err(ConfigError::Parse(format!(
-                    "provider '{id}' has unknown kind '{other}' (expected 'generic' or 'deepseek')"
+                    "provider '{id}' has unknown kind '{other}' (expected 'generic', 'deepseek', or 'openrouter')"
                 )));
             }
         };
@@ -257,10 +259,13 @@ fn parse_models(
         let default_reasoning_effort =
             parse_default_reasoning_effort(table, provider_id, &id, &reasoning_efforts)?;
         let input_modalities = parse_model_input_modalities(table, provider_id, &id)?;
+        let max_completion_tokens =
+            parse_max_completion_tokens(table, provider_id, &id, context_window)?;
         models.push(ModelConfig {
             id,
             name,
             context_window,
+            max_completion_tokens,
             reasoning_efforts,
             default_reasoning_effort,
             input_modalities,
@@ -268,6 +273,32 @@ fn parse_models(
     }
 
     Ok(models)
+}
+
+fn parse_max_completion_tokens(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+    context_window: u32,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = model.get("max_completion_tokens") else {
+        return Ok(None);
+    };
+    let max_completion_tokens = value
+        .as_integer()
+        .filter(|value| *value > 0)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            ConfigError::Parse(format!(
+                "provider '{provider_id}' model '{model_name}' max_completion_tokens must be a positive integer"
+            ))
+        })?;
+    if max_completion_tokens > context_window {
+        return Err(ConfigError::Parse(format!(
+            "provider '{provider_id}' model '{model_name}' max_completion_tokens ({max_completion_tokens}) must not exceed context_window ({context_window})"
+        )));
+    }
+    Ok(Some(max_completion_tokens))
 }
 
 fn parse_model_reasoning_efforts(
@@ -941,6 +972,7 @@ path = "/tmp/scratch"
                     id: "deepseek-reasoner".to_string(),
                     name: "DeepSeek R1".to_string(),
                     context_window: 128_000,
+                    max_completion_tokens: None,
                     reasoning_efforts: vec![
                         "low".to_string(),
                         "medium".to_string(),
@@ -1137,6 +1169,82 @@ path = "/tmp/coda"
             err.to_string()
                 .contains("context_window must be a positive integer")
         );
+    }
+
+    #[test]
+    fn parse_server_config_accepts_openrouter_and_optional_completion_limit() {
+        let config = parse_server_config(
+            r#"
+[[providers]]
+id = "openrouter"
+kind = "openrouter"
+api_key = "sk-test"
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  { id = "x-ai/grok-4.5", context_window = 500000, max_completion_tokens = 16384 },
+  { id = "z-ai/glm-5.2", context_window = 1048576 },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.providers[0].kind, ProviderKind::OpenRouter);
+        assert_eq!(
+            config.providers[0].models[0].max_completion_tokens,
+            Some(16_384)
+        );
+        assert_eq!(config.providers[0].models[1].max_completion_tokens, None);
+    }
+
+    #[test]
+    fn parse_server_config_rejects_unknown_provider_kind() {
+        let error = parse_server_config(
+            r#"
+[[providers]]
+id = "gateway"
+kind = "other"
+api_key = "sk-test"
+base_url = "https://example.com/v1"
+models = [{ id = "test", context_window = 1000 }]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown kind 'other'"));
+    }
+
+    #[test]
+    fn parse_server_config_rejects_invalid_completion_limits() {
+        for value in ["0", "-1", "1001", "\"large\""] {
+            let config = format!(
+                r#"
+[[providers]]
+id = "openrouter"
+kind = "openrouter"
+api_key = "sk-test"
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  {{ id = "test", context_window = 1000, max_completion_tokens = {value} }},
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            );
+            let error = parse_server_config(&config, Path::new("/srv")).unwrap_err();
+            assert!(error.to_string().contains("max_completion_tokens"));
+        }
     }
 
     #[test]
