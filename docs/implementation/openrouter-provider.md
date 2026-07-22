@@ -24,6 +24,7 @@ Out: 模型自动发现、Responses/Messages API、OpenRouter 托管工具与高
 
 ## Validation Findings
 
+- 问题：`reasoning_details` 流式对象是否需要按 `index`/`id` 做字段归并。方法：2026-07-22 使用同一工具 schema，分别调用 `x-ai/grok-4.5`（low）、`moonshotai/kimi-k3`（low）和 `z-ai/glm-5.2`（high），保存真实 SSE，并把完整 detail 序列原序放入 assistant 工具调用消息后提交 continuation。结果：三次首轮和三次 continuation 均为 HTTP 200 且无流内错误；同一 index 会对应多个完整的增量 detail 对象，Grok 还在 summary chunks 后给出独立 encrypted block。原序回传的 26、100、11 个对象分别被三家接受。影响：确认只按到达顺序追加对象，不按 index/id 合并、去重或改写；OpenRouter `delta.reasoning` 归一化到内部 `reasoning_content`，原始 details 单独持久化。
 - 问题：是否需要替换 HTTP 客户端。方法：检查本地 `async-openai 0.40.2` 的 BYOT 实现。结果：请求可以发送任意 JSON，SSE data 可以反序列化为自定义响应类型，且库已处理注释事件和 `[DONE]`。影响：继续复用现有客户端，只扩展 wire codec。
 - 问题：OpenRouter 数据当前会怎样。方法：对照 `ReasoningStreamResponse` 与 OpenRouter schema。结果：Serde 会忽略 `reasoning`、`reasoning_details` 和顶层 `error`；流内错误带空 delta 时最终成为空成功消息。影响：响应超集和终止校验必须在 provider adapter 内完成。
 - 问题：结构化推理放在哪里。方法：检查 checkpoint 路径。结果：`StoredCheckpoint` 直接持久化 `Vec<Message>`。影响：把 continuation 挂在 `AssistantMessage` 上即可自然覆盖工具轮次、重启恢复和子 Agent，无需另建存储表。
@@ -188,9 +189,12 @@ impl WorkspaceStorage {
 
 ## Implementation Roadmap
 
-- [ ] [risk validation] 使用具备三个样本模型访问权限和足够额度的 OpenRouter 凭据，捕获 Grok 4.5、Kimi K3、GLM 5.2 的真实 reasoning + tool-call SSE，确认 detail 是否可按到达顺序直接追加；脱敏后固化为 fixture，并补齐 reasoning 字符串、三种 details、并行工具、usage 和 HTTP 200 流内 error
+- [x] [risk validation] 使用具备三个样本模型访问权限和足够额度的 OpenRouter 凭据，捕获 Grok 4.5、Kimi K3、GLM 5.2 的真实 reasoning + tool-call SSE，确认 detail 是否可按到达顺序直接追加，并用原始序列完成真实 continuation
       Purpose: 在改动核心模型前锁定最不确定的 wire 行为；如果需要字段级组装，先修订并重新批准本设计
-      Verification: 三份真实样本能重建并原样回传 continuation；缺少任一真实样本则停止、不进入 core model；fixture 测试先复现当前丢 reasoning 与吞 error，再随实现转绿
+      Verification: 三份真实样本均能重建并原样回传 continuation；Grok 26 个 details（含 encrypted block）、Kimi 100 个、GLM 11 个，六次请求均为 HTTP 200 且无流内 error
+- [ ] [provider fixtures] 将三份真实响应脱敏后固化为 fixture，并补齐 reasoning 字符串、三种 details、并行工具、usage 和 HTTP 200 流内 error
+      Purpose: 把已验证的 wire 形态转成离线回归边界
+      Verification: fixture 测试先复现当前丢 reasoning 与吞 error，再随 adapter 实现转绿
 - [ ] [core model] 增加 `ReasoningContinuation`、`ProviderError` 和对应序列化/反序列化测试
       Purpose: 建立展示、协议续接、持久化之间唯一的数据契约
       Verification: message JSON round-trip 保留 continuation，非法 envelope 被拒绝

@@ -1,0 +1,125 @@
+{
+  "model": "z-ai/glm-5.2",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 2048,
+  "reasoning": {
+    "effort": "high",
+    "exclude": false
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call lookup_weather exactly once for Singapore. Do not answer directly."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "The",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " user",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " wants me",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " to call",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " lookup",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": "_weather",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " for Singapore",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " exactly once",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": ", and not",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " answer",
+          "format": "unknown",
+          "index": 0
+        },
+        {
+          "type": "reasoning.text",
+          "text": " directly.",
+          "format": "unknown",
+          "index": 0
+        }
+      ],
+      "tool_calls": [
+        {
+          "id": "call_e33a970c97764969a7641d52",
+          "type": "function",
+          "function": {
+            "name": "lookup_weather",
+            "arguments": "{\"city\": \"Singapore\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_e33a970c97764969a7641d52",
+      "content": "{\"temperature_c\":30,\"condition\":\"humid\"}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_weather",
+        "description": "Return the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": ["city"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "none"
+}
