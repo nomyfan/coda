@@ -8,7 +8,7 @@ pub mod storage;
 pub mod transport;
 pub mod wire;
 
-use coda_agent::EnvRenderer;
+use coda_agent::{SharedSystemPrompt, VarsProvider};
 use coda_skills::Skills;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,118 +46,125 @@ pub fn read_custom_instructions(workspace_dir: &str) -> Option<String> {
     }
 }
 
-/// A selectable field of the per-turn environment context block. Agents declare
-/// the set they want via the `env:` frontmatter list; omitting it defaults to
-/// just [`EnvField::Date`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EnvField {
-    /// Today's date — the one truly volatile field, recomputed every turn.
-    Date,
-    /// OS, architecture, and (best-effort) OS version.
-    System,
-    /// The current shell.
-    Shell,
-    /// The agent's workspace directory.
-    Workspace,
-}
-
-/// The default env field set when an agent omits `env:` — date only.
-pub fn default_env_fields() -> Vec<EnvField> {
-    vec![EnvField::Date]
-}
-
-/// Build the workspace-knowledge segment: the workspace's skills followed by its
-/// custom instructions (`AGENTS.md`). Returns an empty string when neither is
-/// present, so callers can treat "no knowledge" uniformly.
+/// The workspace's `<available_skills>` XML, or an empty string when the
+/// workspace declares no skills. This is the value of the `{{workspace_available_skills}}`
+/// template variable — the skills *guide* is a separate, constant variable
+/// ([`AGENT_SKILLS_PROMPT`], exposed as `{{skills_guide}}`).
 ///
-/// This is pure and quiet: it is re-run on every watcher poll (a few seconds
-/// apart), so it must not log per call. A missing skills directory — the common
-/// case — is silently "no skills"; the watcher logs once when the rendered text
-/// actually changes.
-pub fn build_workspace_knowledge(workspace_dir: &str) -> String {
-    let mut out = String::new();
-
+/// Pure and quiet: it is re-run on every watcher poll (a few seconds apart), so
+/// it must not log per call. A missing skills directory — the common case — is
+/// silently "no skills"; the watcher logs once when the rendered text changes.
+pub fn build_available_skills(workspace_dir: &str) -> String {
     let skills_dir = Path::new(workspace_dir).join(".coda").join("skills");
-    if skills_dir.exists() {
-        match Skills::from_dir(&skills_dir) {
-            Ok(skills) if !skills.0.is_empty() => {
-                out.push_str(AGENT_SKILLS_PROMPT);
-                out.push('\n');
-                out.push_str(&skills.to_xml());
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn!("failed to load skills, proceeding without them: {err}");
-            }
+    if !skills_dir.exists() {
+        return String::new();
+    }
+    match Skills::from_dir(&skills_dir) {
+        Ok(skills) if !skills.0.is_empty() => skills.to_xml(),
+        Ok(_) => String::new(),
+        Err(err) => {
+            warn!("failed to load skills, proceeding without them: {err}");
+            String::new()
         }
     }
-
-    if let Some(instructions) = read_custom_instructions(workspace_dir) {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str("<custom_instructions>\n");
-        out.push_str(&instructions);
-        out.push_str("\n</custom_instructions>");
-    }
-
-    out
 }
 
-/// Build a per-turn environment-context renderer for an agent rooted at
-/// `workspace_dir` and wanting `fields`. The static values (OS, shell, workspace
-/// path) are computed once, here, and only for the fields actually requested —
-/// so a `[date]`-only agent never spawns the OS-version probe. Only the
-/// date is recomputed on each call, so it never goes stale in a long session.
-/// Returns `None` when `fields` is empty (no env block).
-///
-/// The renderer captures its `workspace_dir`, so a per-agent workspace in Phase
-/// 2 only changes the captured value — not the shape of this seam.
-pub fn make_env_renderer(workspace_dir: String, fields: Vec<EnvField>) -> Option<EnvRenderer> {
-    if fields.is_empty() {
-        return None;
+/// The workspace's `AGENTS.md` wrapped in a `<custom_instructions>` block, or an
+/// empty string when absent/blank. This is the value of the
+/// `{{workspace_custom_instructions}}` template variable. Like
+/// [`build_available_skills`], this is re-run on every watcher poll and must
+/// stay quiet.
+pub fn build_workspace_custom_instructions(workspace_dir: &str) -> String {
+    match read_custom_instructions(workspace_dir) {
+        Some(instructions) => {
+            format!("<custom_instructions>\n{instructions}\n</custom_instructions>")
+        }
+        None => String::new(),
+    }
+}
+
+/// The per-workspace, hot-reloaded knowledge handles feeding the dynamic
+/// template variables. A per-workspace watcher refreshes each in place; the vars
+/// provider reads them on every turn, so edits reach the prompt without
+/// rebuilding agents. The skills *guide* needs no handle — it is a compile-time
+/// constant ([`AGENT_SKILLS_PROMPT`]).
+#[derive(Clone)]
+pub struct WorkspaceKnowledge {
+    /// `{{workspace_available_skills}}` — the `<available_skills>` XML, or empty.
+    pub available_skills: SharedSystemPrompt,
+    /// `{{workspace_custom_instructions}}` — `AGENTS.md` wrapped in
+    /// `<custom_instructions>`, or empty.
+    pub custom_instructions: SharedSystemPrompt,
+}
+
+impl WorkspaceKnowledge {
+    /// Handles seeded from the workspace's current on-disk state.
+    pub fn load(workspace_dir: &str) -> Self {
+        WorkspaceKnowledge {
+            available_skills: SharedSystemPrompt::new(build_available_skills(workspace_dir)),
+            custom_instructions: SharedSystemPrompt::new(build_workspace_custom_instructions(
+                workspace_dir,
+            )),
+        }
     }
 
-    let system = fields.contains(&EnvField::System).then(|| {
+    /// Empty handles, for an agent with no workspace knowledge (e.g. tests).
+    pub fn empty() -> Self {
+        WorkspaceKnowledge {
+            available_skills: SharedSystemPrompt::new(String::new()),
+            custom_instructions: SharedSystemPrompt::new(String::new()),
+        }
+    }
+}
+
+/// Build the per-turn template-variable provider for an agent rooted at
+/// `workspace_dir`. Every binding a prompt can reference is exposed here:
+///
+/// - `date` — today's date, recomputed on each call so it never goes stale.
+/// - `os` — OS, architecture, and (best-effort) version, e.g. `macos(aarch64) 15.6`.
+/// - `shell` — the interpreter the `shell` tool runs commands through (`bash`).
+/// - `workspace` — the agent's workspace directory.
+/// - `skills_guide` — the constant skills usage guide ([`AGENT_SKILLS_PROMPT`]).
+/// - `workspace_available_skills` — the workspace's `<available_skills>` XML (or empty).
+/// - `workspace_custom_instructions` — the workspace's `AGENTS.md` (or empty).
+///
+/// The static values (os, shell, workspace, skills guide) are fixed once, here;
+/// the date is produced fresh per call, and the two knowledge bindings are read
+/// from their hot-reloaded handles per call. The base body (`AGENT.md` /
+/// built-in template) is the only thing scanned for `{{name}}` placeholders —
+/// a binding's value is never re-scanned, so authored content (`AGENTS.md`, a
+/// skill description) is never treated as a template. Unreferenced bindings
+/// simply don't appear.
+pub fn make_vars_provider(workspace_dir: String, knowledge: WorkspaceKnowledge) -> VarsProvider {
+    let os = {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
-        format!(
-            "  <os>{os}({arch})</os>{}",
-            get_os_version()
-                .map(|v| format!("\n  <os_version>{v}</os_version>"))
-                .unwrap_or_default()
-        )
-    });
+        match get_os_version() {
+            Some(version) => format!("{os}({arch}) {version}"),
+            None => format!("{os}({arch})"),
+        }
+    };
     // The `shell` tool always executes via `bash -c`, regardless of the host's
     // login shell, so the advertised shell is fixed to its concrete backend.
-    let shell = fields
-        .contains(&EnvField::Shell)
-        .then(|| "  <shell>bash</shell>".to_string());
-    let workspace = fields
-        .contains(&EnvField::Workspace)
-        .then(|| format!("  <workspace>{workspace_dir}</workspace>"));
+    let shell = "bash".to_string();
 
-    Some(Arc::new(move || {
-        let mut lines = Vec::with_capacity(fields.len());
-        for field in &fields {
-            // The static fields are `Some` exactly when requested, and we only
-            // reach their arm while iterating a requested field.
-            let line = match field {
-                EnvField::Date => format!("  <date>{}</date>", jiff::Zoned::now().date()),
-                EnvField::System => system.clone().expect("system computed when requested"),
-                EnvField::Shell => shell.clone().expect("shell computed when requested"),
-                EnvField::Workspace => workspace
-                    .clone()
-                    .expect("workspace computed when requested"),
-            };
-            lines.push(line);
-        }
-        format!(
-            "<environment_context>\n{}\n</environment_context>",
-            lines.join("\n")
-        )
-    }))
+    Arc::new(move || {
+        vec![
+            ("date".to_string(), jiff::Zoned::now().date().to_string()),
+            ("os".to_string(), os.clone()),
+            ("shell".to_string(), shell.clone()),
+            ("workspace".to_string(), workspace_dir.clone()),
+            ("skills_guide".to_string(), AGENT_SKILLS_PROMPT.to_string()),
+            (
+                "workspace_available_skills".to_string(),
+                knowledge.available_skills.get(),
+            ),
+            (
+                "workspace_custom_instructions".to_string(),
+                knowledge.custom_instructions.get(),
+            ),
+        ]
+    })
 }
 
 fn get_os_version() -> Option<String> {
@@ -208,45 +215,87 @@ mod tests {
     }
 
     #[test]
-    fn build_workspace_knowledge_includes_custom_instructions() {
+    fn build_workspace_custom_instructions_wraps_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CUSTOM_INSTRUCTIONS_FILE),
             "always write tests.",
         )
         .unwrap();
-        let knowledge = build_workspace_knowledge(&dir.path().to_string_lossy());
-        assert!(knowledge.contains("<custom_instructions>"));
-        assert!(knowledge.contains("always write tests."));
+        let ci = build_workspace_custom_instructions(&dir.path().to_string_lossy());
+        assert!(ci.starts_with("<custom_instructions>"));
+        assert!(ci.contains("always write tests."));
+        assert!(ci.ends_with("</custom_instructions>"));
     }
 
     #[test]
-    fn build_workspace_knowledge_empty_without_skills_or_instructions() {
+    fn build_workspace_custom_instructions_empty_without_agents_md() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(build_workspace_knowledge(&dir.path().to_string_lossy()).is_empty());
+        assert!(build_workspace_custom_instructions(&dir.path().to_string_lossy()).is_empty());
     }
 
     #[test]
-    fn build_workspace_knowledge_empty_for_present_but_empty_skills_dir() {
+    fn build_available_skills_empty_without_or_for_empty_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
+        // No `.coda/skills` at all.
+        assert!(build_available_skills(&dir.path().to_string_lossy()).is_empty());
+        // Present but empty.
         std::fs::create_dir_all(dir.path().join(".coda").join("skills")).unwrap();
-        assert!(build_workspace_knowledge(&dir.path().to_string_lossy()).is_empty());
+        assert!(build_available_skills(&dir.path().to_string_lossy()).is_empty());
     }
 
     #[test]
-    fn env_renderer_recomputes_date_and_honors_fields() {
-        let renderer =
-            make_env_renderer("/ws".to_string(), vec![EnvField::Date, EnvField::Workspace])
-                .expect("non-empty fields yield a renderer");
-        let rendered = renderer();
-        assert!(rendered.contains("<date>"));
-        assert!(rendered.contains("<workspace>/ws</workspace>"));
-        assert!(!rendered.contains("<shell>"));
-        assert!(!rendered.contains("<os>"));
+    fn vars_provider_exposes_all_bindings() {
+        let knowledge = WorkspaceKnowledge {
+            available_skills: SharedSystemPrompt::new("<available_skills>x</available_skills>"),
+            custom_instructions: SharedSystemPrompt::new(
+                "<custom_instructions>y</custom_instructions>",
+            ),
+        };
+        let vars = make_vars_provider("/ws".to_string(), knowledge)();
+        let lookup = |name: &str| {
+            vars.iter()
+                .find(|(var, _)| var == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(lookup("workspace"), Some("/ws"));
+        assert_eq!(lookup("shell"), Some("bash"));
+        assert!(lookup("date").is_some_and(|d| !d.is_empty()));
+        assert!(lookup("os").is_some_and(|os| os.contains(std::env::consts::OS)));
+        assert_eq!(lookup("skills_guide"), Some(AGENT_SKILLS_PROMPT));
+        assert_eq!(
+            lookup("workspace_available_skills"),
+            Some("<available_skills>x</available_skills>")
+        );
+        assert_eq!(
+            lookup("workspace_custom_instructions"),
+            Some("<custom_instructions>y</custom_instructions>")
+        );
     }
 
     #[test]
-    fn env_renderer_none_for_empty_fields() {
-        assert!(make_env_renderer("/ws".to_string(), vec![]).is_none());
+    fn vars_provider_recomputes_date_and_rereads_handles_per_call() {
+        // The date is fresh each call, and the knowledge bindings reflect
+        // in-place handle updates (hot-reload) on the next call.
+        let knowledge = WorkspaceKnowledge::empty();
+        let provider = make_vars_provider("/ws".to_string(), knowledge.clone());
+        let lookup = |vars: &[(String, String)], name: &str| {
+            vars.iter()
+                .find(|(var, _)| var == name)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        let first = provider();
+        assert_eq!(
+            lookup(&first, "date"),
+            jiff::Zoned::now().date().to_string()
+        );
+        assert_eq!(lookup(&first, "workspace_available_skills"), "");
+
+        knowledge.available_skills.set("<available_skills/>");
+        assert_eq!(
+            lookup(&provider(), "workspace_available_skills"),
+            "<available_skills/>"
+        );
     }
 }

@@ -224,74 +224,95 @@ pub enum AgentEvent {
     Error(String), // TODO: make this more structured
 }
 
-/// Renders the per-turn environment context block (date, system, shell,
-/// workspace). Invoked fresh at the start of every turn so volatile values —
-/// the date above all — are never stale. The closure captures the agent's
-/// workspace directory and the selected fields; only truly volatile values are
-/// recomputed per call (see the renderer constructed in `coda_server`).
-pub type EnvRenderer = Arc<dyn Fn() -> String + Send + Sync>;
+/// Produces the template-variable bindings for a turn — the `{{name}}` values
+/// substituted into the assembled system prompt (date, os, shell, workspace, …).
+/// Invoked fresh at the start of every turn so volatile values — the date above
+/// all — are never stale. The closure captures the agent's workspace directory
+/// and computes the static values once; only truly volatile values are
+/// recomputed per call (see the provider constructed in `coda_server`).
+pub type VarsProvider = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+
+/// Substitute `{{ name }}` placeholders in `template` with values from `vars`
+/// (optional inner whitespace allowed; names are `[A-Za-z0-9_]`). Anything that
+/// isn't a resolvable placeholder — an unknown name, a malformed span, or a
+/// stray `{{` — is emitted verbatim. Substitution is single-pass: a value that
+/// itself contains `{{…}}` is not re-scanned, so bindings can't inject further
+/// placeholders.
+pub fn substitute(template: &str, vars: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let mut resolved = false;
+        if let Some(close) = after.find("}}") {
+            let name = after[..close].trim();
+            if !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && let Some((_, value)) = vars.iter().find(|(var, _)| var == name)
+            {
+                out.push_str(value);
+                rest = &after[close + 2..];
+                resolved = true;
+            }
+        }
+        if !resolved {
+            // Not a resolvable placeholder: emit the literal `{{` and keep
+            // scanning from just after it, so later braces still get a chance.
+            out.push_str("{{");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// The system prompt an agent prepends to its messages at the start of every
-/// turn, assembled from three independently-lived segments:
+/// turn. There is a single template — the `base` body — plus the per-turn
+/// variables substituted into it:
 ///
-/// - `base` — the agent's own body (built-in default or `AGENT.md` body). Held
-///   behind a handle so it *can* be updated in place without rebuilding the
-///   agent, though the server currently sets it once at load.
-/// - `workspace_knowledge` — the workspace's `AGENTS.md` and skills. A handle a
-///   per-workspace watcher refreshes in place. `None` only for an agent not
-///   bound to a workspace (e.g. a bare prompt built via `From<&str>`).
-/// - `env` — the environment context, rendered fresh every turn so the date and
-///   other volatile values stay current.
+/// - `base` — the agent's own body (built-in default or `AGENT.md` body), the
+///   one and only template. Held behind a handle so it *can* be updated in place
+///   without rebuilding the agent, though the server currently sets it once at
+///   load.
+/// - `vars` — the per-turn template-variable bindings (date, os, shell,
+///   workspace, skills, workspace custom instructions, …), produced fresh every
+///   turn so the date and other volatile values stay current. Everything
+///   dynamic — the environment context, the skills guide and list, and the
+///   workspace's `AGENTS.md` — is a `{{name}}` binding the base body composes.
+///   Because substitution is single-pass, a binding's value (e.g. `AGENTS.md`
+///   or a skill description) is never re-scanned, so authored content is not
+///   itself treated as a template.
 ///
-/// [`resolve`](Self::resolve) concatenates the three each turn.
+/// [`resolve`](Self::resolve) substitutes the variables into the base each turn.
 #[derive(Clone)]
 pub struct SystemPrompt {
     base: SharedSystemPrompt,
-    workspace_knowledge: Option<SharedSystemPrompt>,
-    env: Option<EnvRenderer>,
+    vars: Option<VarsProvider>,
 }
 
 impl SystemPrompt {
-    /// A prompt with only a base body — no workspace knowledge, no env block.
+    /// A prompt with only a base body — no variables.
     pub fn new(base: SharedSystemPrompt) -> Self {
-        SystemPrompt {
-            base,
-            workspace_knowledge: None,
-            env: None,
-        }
+        SystemPrompt { base, vars: None }
     }
 
-    /// Attach the workspace-knowledge handle (`AGENTS.md` + skills).
-    pub fn with_workspace_knowledge(mut self, knowledge: SharedSystemPrompt) -> Self {
-        self.workspace_knowledge = Some(knowledge);
+    /// Attach the per-turn template-variable provider. Its bindings are
+    /// substituted into the base body each turn.
+    pub fn with_vars(mut self, vars: VarsProvider) -> Self {
+        self.vars = Some(vars);
         self
     }
 
-    /// Attach the per-turn environment renderer.
-    pub fn with_env(mut self, env: EnvRenderer) -> Self {
-        self.env = Some(env);
-        self
-    }
-
-    /// The current prompt text: base, then workspace knowledge, then a freshly
-    /// rendered environment block. Empty segments are skipped.
+    /// The current prompt text: the base body with the per-turn variables
+    /// substituted into it. Unknown `{{placeholders}}` are left untouched, and a
+    /// binding's value is never re-scanned (single pass).
     pub fn resolve(&self) -> String {
-        let mut out = self.base.get();
-        if let Some(knowledge) = &self.workspace_knowledge {
-            let text = knowledge.get();
-            if !text.is_empty() {
-                out.push_str("\n---\n");
-                out.push_str(&text);
-            }
+        let base = self.base.get();
+        match &self.vars {
+            Some(vars) => substitute(&base, &vars()),
+            None => base,
         }
-        if let Some(env) = &self.env {
-            let text = env();
-            if !text.is_empty() {
-                out.push_str("\n\n");
-                out.push_str(&text);
-            }
-        }
-        out
     }
 }
 
@@ -534,30 +555,68 @@ mod system_prompt_tests {
     }
 
     #[test]
-    fn resolve_concatenates_all_three_segments_in_order() {
-        let env: EnvRenderer = Arc::new(|| "<env/>".to_string());
-        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
-            .with_workspace_knowledge(SharedSystemPrompt::new("knowledge"))
-            .with_env(env);
-        assert_eq!(sp.resolve(), "base\n---\nknowledge\n\n<env/>");
+    fn resolve_composes_everything_from_vars_including_authored_content() {
+        // The base body places both the env date and the workspace's AGENTS.md
+        // (as a variable). The AGENTS.md value contains `{{date}}` but, being a
+        // binding value, is not re-scanned — it stays verbatim.
+        let vars: VarsProvider = Arc::new(|| {
+            vec![
+                ("date".into(), "2026-07-24".into()),
+                (
+                    "workspace_custom_instructions".into(),
+                    "be concise. today is {{date}}".into(),
+                ),
+            ]
+        });
+        let sp = SystemPrompt::new(SharedSystemPrompt::new(
+            "today: {{date}}\n---\n{{workspace_custom_instructions}}",
+        ))
+        .with_vars(vars);
+        assert_eq!(
+            sp.resolve(),
+            "today: 2026-07-24\n---\nbe concise. today is {{date}}"
+        );
     }
 
     #[test]
-    fn resolve_skips_empty_segments() {
-        let env: EnvRenderer = Arc::new(String::new);
-        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
-            .with_workspace_knowledge(SharedSystemPrompt::new(""))
-            .with_env(env);
-        assert_eq!(sp.resolve(), "base");
+    fn resolve_injects_empty_string_for_empty_bindings() {
+        let vars: VarsProvider = Arc::new(|| vec![("available_skills".into(), String::new())]);
+        let sp =
+            SystemPrompt::new(SharedSystemPrompt::new("root{{available_skills}}")).with_vars(vars);
+        assert_eq!(sp.resolve(), "root");
     }
 
     #[test]
-    fn resolve_reflects_workspace_knowledge_updates_in_place() {
-        let knowledge = SharedSystemPrompt::new("old");
-        let sp = SystemPrompt::new(SharedSystemPrompt::new("base"))
-            .with_workspace_knowledge(knowledge.clone());
-        assert_eq!(sp.resolve(), "base\n---\nold");
-        knowledge.set("new");
-        assert_eq!(sp.resolve(), "base\n---\nnew");
+    fn substitute_leaves_unknown_and_malformed_placeholders_untouched() {
+        let vars = [("date".to_string(), "2026-07-23".to_string())];
+        // Unknown name, no closing braces, and a non-name span all pass through.
+        assert_eq!(
+            substitute("{{date}} {{unknown}} {{ a b }} {{oops", &vars),
+            "2026-07-23 {{unknown}} {{ a b }} {{oops"
+        );
+    }
+
+    #[test]
+    fn substitute_does_not_rescan_values() {
+        // A value containing `{{date}}` must not be expanded again.
+        let vars = [("x".to_string(), "{{date}}".to_string())];
+        assert_eq!(substitute("{{x}}", &vars), "{{date}}");
+    }
+
+    #[test]
+    fn resolve_reflects_binding_handle_updates_in_place() {
+        // A binding sourced from a shared handle (as the server wires skills /
+        // custom instructions) reflects in-place updates on the next resolve —
+        // this is how workspace-knowledge hot-reload reaches the prompt now.
+        let handle = SharedSystemPrompt::new("old");
+        let vars: VarsProvider = {
+            let handle = handle.clone();
+            Arc::new(move || vec![("available_skills".into(), handle.get())])
+        };
+        let sp = SystemPrompt::new(SharedSystemPrompt::new("skills: {{available_skills}}"))
+            .with_vars(vars);
+        assert_eq!(sp.resolve(), "skills: old");
+        handle.set("new");
+        assert_eq!(sp.resolve(), "skills: new");
     }
 }

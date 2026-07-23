@@ -12,3 +12,16 @@ Prefer dedicated tools over `shell` when one fits:
 - Search file contents → `grep`
 
 Reserve `shell` for operations without a dedicated tool: git, build commands, package managers, running programs, etc.
+
+{{skills_guide}}
+
+{{workspace_available_skills}}
+
+<environment_context>
+  <date>{{date}}</date>
+  <os>{{os}}</os>
+  <shell>{{shell}}</shell>
+  <workspace>{{workspace}}</workspace>
+</environment_context>
+
+{{workspace_custom_instructions}}

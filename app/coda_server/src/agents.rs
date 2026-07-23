@@ -28,7 +28,7 @@ use coda_agent::{
     AgentSpec, AgentTeam, BuildError, SharedSystemPrompt, SubAgentMode, SystemPrompt,
 };
 
-use crate::{EnvField, default_env_fields, make_env_renderer};
+use crate::{WorkspaceKnowledge, make_vars_provider};
 use coda_core::tool::ToolObject;
 use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
 use serde::Deserialize;
@@ -190,9 +190,6 @@ struct Frontmatter {
     tools: Vec<String>,
     #[serde(default)]
     subagents: Vec<String>,
-    /// Optional environment-context fields. Absent means the default ([`date`]).
-    #[serde(default)]
-    env: Option<Vec<EnvField>>,
     /// Optional per-agent workspace (tool root + knowledge source). Absolute, or
     /// relative to the root workspace. Absent means inherit the root workspace.
     #[serde(default)]
@@ -215,7 +212,6 @@ pub struct AgentFile {
     tools: Vec<String>,
     subagents: Vec<String>,
     system_prompt: String,
-    env: Vec<EnvField>,
     workspace: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -252,33 +248,18 @@ struct RootFrontmatter {
     tools: Option<Vec<String>>,
     #[serde(default)]
     subagents: Option<Vec<String>>,
-    #[serde(default)]
-    env: Option<Vec<EnvField>>,
 }
 
 /// Parsed top-level `coda` configuration. Each field is an explicit override of a
 /// default when `Some`/non-empty; otherwise the built-in behavior applies. See
 /// [`build_agent_team`] (tools, sub-agents) and the system-prompt assembly (body).
+#[derive(Default)]
 pub struct RootAgentFile {
     pub tools: Option<Vec<String>>,
     pub subagents: Option<Vec<String>>,
     /// The body, used as the root agent's base system prompt; `None` when the
     /// file is absent or its body is empty (fall back to the built-in default).
     pub system_prompt: Option<String>,
-    /// Environment-context fields for the root agent. Defaults to [`date`] when
-    /// the file is absent or omits `env:`.
-    pub env: Vec<EnvField>,
-}
-
-impl Default for RootAgentFile {
-    fn default() -> Self {
-        RootAgentFile {
-            tools: None,
-            subagents: None,
-            system_prompt: None,
-            env: default_env_fields(),
-        }
-    }
 }
 
 /// True if `name` is a syntactically valid agent name (lowercase alphanumerics
@@ -328,7 +309,6 @@ fn parse_agent_file(name: &str, content: &str) -> Result<AgentFile, LoadError> {
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: body.to_string(),
-        env: fm.env.unwrap_or_else(default_env_fields),
         workspace: fm.workspace,
         model: fm.model,
         reasoning_effort: fm.reasoning_effort,
@@ -397,7 +377,6 @@ fn parse_root_agent_file(content: &str) -> Result<RootAgentFile, LoadError> {
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: (!body.is_empty()).then(|| body.to_string()),
-        env: fm.env.unwrap_or_else(default_env_fields),
     })
 }
 
@@ -480,36 +459,37 @@ fn resolve_tools(
 /// references, or tool/sub-agent conflicts ([`LoadError::Build`]).
 /// Agents unreachable from `coda` are ignored with a warning.
 ///
-/// Every agent's system prompt — root and sub alike — is assembled here from
-/// three segments: a base body handle, the workspace-knowledge handle for the
-/// agent's own workspace (looked up in `knowledge`), and a per-turn env block
-/// rendered against that workspace. Each agent's tool root is recorded on the
-/// returned team via [`AgentTeam::with_agent_workspaces`]. `agent_workspaces`
-/// maps sub-agent names to their resolved workspace; an agent absent there (and
-/// the root) uses `root_workspace`.
+/// Every agent's system prompt — root and sub alike — is the agent's base body
+/// (its own template) plus a per-turn variable provider rooted at that agent's
+/// workspace. The provider's bindings (`{{date}}`, `{{workspace}}`,
+/// `{{workspace_available_skills}}`, `{{workspace_custom_instructions}}`, …) are
+/// substituted into the base body; the workspace's skills and `AGENTS.md` are
+/// two of those bindings, sourced from that workspace's hot-reloaded
+/// [`WorkspaceKnowledge`] handles (looked up in `knowledge`). Each agent's tool
+/// root is recorded on the returned team via [`AgentTeam::with_agent_workspaces`].
+/// `agent_workspaces` maps sub-agent names to their resolved workspace; an agent
+/// absent there (and the root) uses `root_workspace`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_agent_team(
     root_workspace: &str,
     root_base: SharedSystemPrompt,
-    root_env: Vec<EnvField>,
-    knowledge: &HashMap<String, SharedSystemPrompt>,
+    knowledge: &HashMap<String, WorkspaceKnowledge>,
     agent_workspaces: &HashMap<String, String>,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
     root_tools: Option<Vec<String>>,
     root_subagents: Option<Vec<String>>,
 ) -> Result<AgentTeam, LoadError> {
-    // Assemble a three-segment prompt for an agent rooted at `workspace`: base
-    // body, that workspace's knowledge handle (if any), and a per-turn env block.
-    let assemble = |base: SharedSystemPrompt, workspace: &str, env: Vec<EnvField>| {
-        let mut prompt = SystemPrompt::new(base);
-        if let Some(handle) = knowledge.get(workspace) {
-            prompt = prompt.with_workspace_knowledge(handle.clone());
-        }
-        if let Some(renderer) = make_env_renderer(workspace.to_string(), env) {
-            prompt = prompt.with_env(renderer);
-        }
-        prompt
+    // Assemble a prompt for an agent rooted at `workspace`: its base body plus a
+    // per-turn variable provider carrying that workspace's knowledge handles.
+    // Every dynamic piece (env, skills, AGENTS.md) is a `{{name}}` binding the
+    // base body composes.
+    let assemble = |base: SharedSystemPrompt, workspace: &str| {
+        let knowledge = knowledge
+            .get(workspace)
+            .cloned()
+            .unwrap_or_else(WorkspaceKnowledge::empty);
+        SystemPrompt::new(base).with_vars(make_vars_provider(workspace.to_string(), knowledge))
     };
 
     let roots = match root_subagents {
@@ -544,7 +524,7 @@ pub fn build_agent_team(
     let root = AgentSpec {
         name: ROOT_AGENT_NAME.to_string(),
         description: String::new(),
-        system_prompt: assemble(root_base, root_workspace, root_env),
+        system_prompt: assemble(root_base, root_workspace),
         mode: SubAgentMode::Stateful,
         tools: root_tools,
         subagents: roots,
@@ -557,11 +537,7 @@ pub fn build_agent_team(
             .get(&file.name)
             .map(String::as_str)
             .unwrap_or(root_workspace);
-        let system_prompt = assemble(
-            SharedSystemPrompt::new(file.system_prompt),
-            workspace,
-            file.env,
-        );
+        let system_prompt = assemble(SharedSystemPrompt::new(file.system_prompt), workspace);
         subagents.push(AgentSpec {
             name: file.name,
             description: file.description,
@@ -696,7 +672,6 @@ mod tests {
         build_agent_team(
             "/ws",
             SharedSystemPrompt::new("root"),
-            default_env_fields(),
             &HashMap::new(),
             &HashMap::new(),
             registry,
@@ -806,40 +781,6 @@ mod tests {
         assert_eq!(files[0].mode, SubAgentMode::Stateless);
         assert_eq!(files[0].tools, vec!["read_file", "grep"]);
         assert_eq!(files[0].system_prompt, "You explore.");
-        // Omitting `env:` defaults to date only.
-        assert_eq!(files[0].env, vec![EnvField::Date]);
-    }
-
-    #[test]
-    fn parses_explicit_env_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        write_agent(
-            dir.path(),
-            "coder",
-            "---\ndescription: codes\nmode: stateful\nenv: [date, system, shell, workspace]\n---\nYou code.",
-        );
-        let files = load_agent_files(dir.path()).unwrap();
-        assert_eq!(
-            files[0].env,
-            vec![
-                EnvField::Date,
-                EnvField::System,
-                EnvField::Shell,
-                EnvField::Workspace
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_empty_env_to_no_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        write_agent(
-            dir.path(),
-            "quiet",
-            "---\ndescription: quiet\nmode: stateless\nenv: []\n---\nYou are quiet.",
-        );
-        let files = load_agent_files(dir.path()).unwrap();
-        assert!(files[0].env.is_empty());
     }
 
     #[test]

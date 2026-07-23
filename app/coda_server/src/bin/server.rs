@@ -12,12 +12,13 @@ use coda_agent::{
 use coda_core::llm::{LLMProviderConfig, Message, Modality};
 use coda_openai::OpenAICompatible;
 use coda_server::{
+    WorkspaceKnowledge,
     agents::{
         AgentFile, ToolRegistry, build_agent_team, load_agent_files, load_root_agent_file,
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_workspace_knowledge,
+    build_available_skills, build_workspace_custom_instructions,
     config::{ToolApprovalConfig, WorkspaceConfig, load_server_config},
     hub::{
         AttachError, AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub,
@@ -1388,21 +1389,28 @@ async fn connection_ws_handler(
 fn spawn_workspace_knowledge_watcher(
     workspace_id: String,
     workspace_str: String,
-    workspace_knowledge: SharedSystemPrompt,
+    knowledge: WorkspaceKnowledge,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut last = workspace_knowledge.get();
+        let mut last_skills = knowledge.available_skills.get();
+        let mut last_instructions = knowledge.custom_instructions.get();
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let current = build_workspace_knowledge(&workspace_str);
-                    if current != last {
-                        last = current.clone();
-                        workspace_knowledge.set(current);
-                        info!(workspace_id = %workspace_id, path = %workspace_str, "workspace knowledge changed, reloaded");
+                    let skills = build_available_skills(&workspace_str);
+                    if skills != last_skills {
+                        last_skills = skills.clone();
+                        knowledge.available_skills.set(skills);
+                        info!(workspace_id = %workspace_id, path = %workspace_str, "workspace skills changed, reloaded");
+                    }
+                    let instructions = build_workspace_custom_instructions(&workspace_str);
+                    if instructions != last_instructions {
+                        last_instructions = instructions.clone();
+                        knowledge.custom_instructions.set(instructions);
+                        info!(workspace_id = %workspace_id, path = %workspace_str, "workspace custom instructions changed, reloaded");
                     }
                 }
             }
@@ -1511,28 +1519,27 @@ async fn build_workspace(
         }
     }
 
-    // One workspace-knowledge handle (and watcher) per distinct workspace, shared
-    // by every agent rooted there. The watcher refreshes the text in place; the
-    // env block is rendered fresh every turn.
+    // One set of workspace-knowledge handles (and one watcher) per distinct
+    // workspace, shared by every agent rooted there. The watcher refreshes the
+    // skills/AGENTS.md text in place; the vars provider reads it every turn.
     let distinct: BTreeSet<String> = std::iter::once(workspace_str.clone())
         .chain(agent_workspaces.values().cloned())
         .collect();
-    let mut knowledge: HashMap<String, SharedSystemPrompt> = HashMap::new();
+    let mut knowledge: HashMap<String, WorkspaceKnowledge> = HashMap::new();
     for ws in distinct {
-        let handle = SharedSystemPrompt::new(build_workspace_knowledge(&ws));
+        let handles = WorkspaceKnowledge::load(&ws);
         spawn_workspace_knowledge_watcher(
             workspace.id.clone(),
             ws.clone(),
-            handle.clone(),
+            handles.clone(),
             shutdown.clone(),
         );
-        knowledge.insert(ws, handle);
+        knowledge.insert(ws, handles);
     }
 
     let agent_team = build_agent_team(
         &workspace_str,
         root_base,
-        root_agent.env,
         &knowledge,
         &agent_workspaces,
         &registry,

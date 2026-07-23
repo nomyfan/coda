@@ -49,12 +49,12 @@ where you launch from.
 | File | Capability |
 | --- | --- |
 | `coda-server.toml` | Multiple providers, per-model `context_window` / `reasoning_efforts` / `input_modalities`, `${VAR}` expansion, workspace declaration. |
-| `workspace/AGENTS.md` | Root **workspace knowledge** — injected into every agent here and hot-reloaded on change. |
-| `.coda/agents/AGENT.md` | Root `coda` overrides: explicit `subagents`, and `env: [date, system, shell, workspace]` (the env default is just `[date]`). |
-| `planner/` | A **stateful** orchestrator with a minimal tool set (`read_todos`/`write_todos`) and its own `subagents` — a deeper graph under `coda`. |
-| `researcher/` | **Stateless**, read-only tools, an MCP **prefix pattern** (`mcp__time__*`), a per-agent **model override** to a cheaper model, default `[date]` env. |
-| `coder/` | A fuller tool set incl. `shell`, full env, a **reasoning model** override with `reasoning_effort: high`. |
-| `docs-writer/` | A **per-agent workspace** (`workspace: ./docs`): its tool root and knowledge come from `docs/`, not the root. |
+| `workspace/AGENTS.md` | Root **workspace knowledge**, exposed to bodies as the `{{workspace_custom_instructions}}` variable and hot-reloaded on change. |
+| `.coda/agents/AGENT.md` | Root `coda` overrides: explicit `subagents`, plus a custom body that composes the env, `{{skills_guide}}`/`{{workspace_available_skills}}`, and `{{workspace_custom_instructions}}` variables. |
+| `planner/` | A **stateful** orchestrator with a minimal tool set (`read_todos`/`write_todos`) and its own `subagents` — a deeper graph under `coda`. A pure delegator, so its body pulls in the env and custom instructions but **not** the skills variables. |
+| `researcher/` | **Stateless**, read-only tools, an MCP **prefix pattern** (`mcp__time__*`), a per-agent **model override** to a cheaper model, and a body that references the skills variables. |
+| `coder/` | A fuller tool set incl. `shell`, the full env block plus `{{skills_guide}}`/`{{workspace_available_skills}}`, a **reasoning model** override with `reasoning_effort: high`. |
+| `docs-writer/` | A **per-agent workspace** (`workspace: ./docs`): its tool root and knowledge come from `docs/`, so its `{{workspace_available_skills}}`/`{{workspace_custom_instructions}}` resolve against `docs/`, not the root. |
 | `docs/AGENTS.md` + `docs/.coda/skills/` | A per-agent workspace carries **its own** knowledge and skills, distinct from the root's. |
 | `.coda/mcp.json` | An MCP server over **stdio** (`mcp-server-time` via `uvx`); referenced from agents as `mcp__<server>__<tool>`. An **http** server uses `{ "type": "http", "url": ... }` instead. |
 | `.coda/config.toml` | Tool approval config: `approval_required` tool-name patterns plus `shell` `allow`/`deny` globs. `ask_user` always pauses to open the UI. |
