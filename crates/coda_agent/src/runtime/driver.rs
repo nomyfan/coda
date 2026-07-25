@@ -4,8 +4,8 @@ use std::{
 };
 
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError, ToolCallOutcome,
-    ToolMessage, ToolOutput, UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, MessageOrigin,
+    StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -127,6 +127,7 @@ pub(crate) async fn run_agent(
             config: config.clone(),
             thread_id: thread_id.clone(),
             reply_target: None,
+            origin_thread: None,
         };
         let mut run_fut = std::pin::pin!(agent_loop.run(envelope));
 
@@ -232,6 +233,18 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
     config: AgentRunConfig<C>,
     thread_id: ThreadId,
     reply_target: Option<ReplyTarget>,
+    /// How this thread was addressed by whoever spawned it. Unlike
+    /// `reply_target` these outlive the call that set them: they are the thread's
+    /// place in the tree, not a pending obligation.
+    origin_thread: Option<OriginThread>,
+}
+
+/// A thread's position under its parent: who spawned it, and the name its own id
+/// was derived from.
+#[derive(Debug, Clone)]
+struct OriginThread {
+    parent_thread_id: String,
+    derivation_key: String,
 }
 
 impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
@@ -250,6 +263,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     .restore_history(stored.messages, stored.todos)
                     .await;
                 self.reply_target = stored.reply_target;
+                self.origin_thread = stored.parent_thread_id.zip(stored.derivation_key).map(
+                    |(parent_thread_id, derivation_key)| OriginThread {
+                        parent_thread_id,
+                        derivation_key,
+                    },
+                );
                 (stored.resume_point.into(), stored.suspended_at)
             } else {
                 // The Agent instance may be reused across different thread IDs
@@ -257,6 +276,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // in-memory state to avoid leaking conversation across threads.
                 self.agent.restore_history(vec![], vec![]).await;
                 self.reply_target = None;
+                self.origin_thread = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
             };
 
@@ -315,6 +335,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                 }
                 ResumePoint::PendingApproval {
+                    parent_message_id,
                     pending_approval_calls,
                     pending_calls,
                 } => {
@@ -326,6 +347,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         suspended_at,
                     };
                     resume_point = ResumePoint::PendingApproval {
+                        parent_message_id,
                         pending_approval_calls,
                         pending_calls,
                     };
@@ -358,6 +380,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let stored = StoredCheckpoint {
             thread_id: self.thread_id.as_ref().to_string(),
             agent_name: self.agent.name.to_string(),
+            parent_thread_id: self
+                .origin_thread
+                .as_ref()
+                .map(|origin| origin.parent_thread_id.clone()),
+            derivation_key: self
+                .origin_thread
+                .as_ref()
+                .map(|origin| origin.derivation_key.clone()),
             reply_target: self.reply_target.clone(),
             messages: self.agent.history().await,
             todos: self.agent.todos().await,
@@ -428,29 +458,22 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         resume_point: ResumePoint,
         envelope: Envelope,
     ) -> AgentLoopState {
+        // Only a `ToolCall` states this thread's place in the tree; other
+        // envelopes say nothing about it, so they leave whatever the checkpoint
+        // restored intact rather than clearing it.
+        if let Some(origin_thread) = origin_thread_from_envelope(&envelope) {
+            self.origin_thread = Some(origin_thread);
+        }
         match resume_point {
             ResumePoint::Generation => {
-                match &envelope.body {
-                    EnvelopeBody::Task { task, images } => {
-                        self.reply_target = None;
-                        self.agent
-                            .add_message(Message::User(UserMessage::with_images(
-                                task.clone(),
-                                images,
-                            )))
-                            .await
-                    }
-                    EnvelopeBody::ToolCall { task, .. } => {
-                        self.reply_target = reply_target_from_envelope(&envelope);
-                        self.agent
-                            .add_message(Message::User(UserMessage::text(task.clone())))
-                            .await
-                    }
-                    _ => {
-                        warn!("unexpected envelope {:?}", envelope);
-                        return AgentLoopState::Done(ResumePoint::Generation);
-                    }
-                }
+                let Some((turn_id, user)) = opening_user_message(&envelope.body) else {
+                    warn!("unexpected envelope {:?}", envelope);
+                    return AgentLoopState::Done(ResumePoint::Generation);
+                };
+                // `None` for a root task, whose sender is the user rather than
+                // a calling agent.
+                self.reply_target = reply_target_from_envelope(&envelope);
+                self.agent.add_user_message(turn_id, user).await;
                 AgentLoopState::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
@@ -477,8 +500,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         Envelope {
-                            body:
-                                EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. },
+                            body: EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. },
                             ..
                         } => {
                             // A new task/tool-call arrived while waiting for subagent replies
@@ -501,9 +523,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .await;
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
-                            self.agent
-                                .add_message(Message::User(UserMessage::text(task.clone())))
-                                .await;
+                            if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
+                                self.agent.add_user_message(turn_id, user).await;
+                            }
                             return AgentLoopState::Next(ResumePoint::Generation);
                         }
                         _ => {
@@ -520,11 +542,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution))
             }
             ResumePoint::PendingApproval {
+                parent_message_id,
                 mut pending_approval_calls,
                 mut pending_calls,
             } => {
                 match &envelope.body {
-                    EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. } => {
+                    EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. } => {
                         // Stale PendingApproval state: new task or sub-agent re-invocation
                         // arrived (e.g. after abort). Write aborted ToolMessages for all
                         // pending calls so the history stays valid, then start fresh.
@@ -557,9 +580,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             .await;
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
-                        self.agent
-                            .add_message(Message::User(UserMessage::text(task.clone())))
-                            .await;
+                        if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
+                            self.agent.add_user_message(turn_id, user).await;
+                        }
                         AgentLoopState::Next(ResumePoint::Generation)
                     }
                     EnvelopeBody::Resume(decision) => {
@@ -604,6 +627,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            parent_message_id,
                             pending_replies: vec![],
                             tool_calls: pending_calls.clone(),
                         }))
@@ -614,6 +638,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             envelope
                         );
                         AgentLoopState::Done(ResumePoint::PendingApproval {
+                            parent_message_id,
                             pending_approval_calls,
                             pending_calls,
                         })
@@ -666,6 +691,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             partial_content + "\n[Generation was interrupted by the user]"
                         };
                         let message = coda_core::llm::AssistantMessage {
+                            message_id: MessageId::new(),
                             content,
                             tool_calls: Vec::new(),
                             usage: None,
@@ -755,6 +781,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                     AgentLoopState::Done(ResumePoint::Generation)
                 } else {
+                    // Every call in this batch came from this one message; the
+                    // batch state carries its id so a sub-agent dispatched later
+                    // — possibly after an approval suspension or a restart —
+                    // can still record what triggered it.
+                    let parent_message_id = assistant_message.message_id;
                     let (pending_approval_calls, auto_calls) = {
                         match &self.config.tool_approval {
                             ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls),
@@ -765,27 +796,24 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .partition(|call| predicate(call)),
                         }
                     };
+                    let auto_calls: VecDeque<_> = auto_calls
+                        .into_iter()
+                        .map(|call| PendingToolCall {
+                            tool_call: call,
+                            outcome: ToolCallOutcome::Auto,
+                        })
+                        .collect();
                     if !pending_approval_calls.is_empty() {
                         AgentLoopState::Next(ResumePoint::PendingApproval {
+                            parent_message_id,
                             pending_approval_calls: pending_approval_calls.into(),
-                            pending_calls: auto_calls
-                                .into_iter()
-                                .map(|call| PendingToolCall {
-                                    tool_call: call,
-                                    outcome: ToolCallOutcome::Auto,
-                                })
-                                .collect(),
+                            pending_calls: auto_calls,
                         })
                     } else {
                         AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            parent_message_id,
                             pending_replies: vec![],
-                            tool_calls: auto_calls
-                                .into_iter()
-                                .map(|call| PendingToolCall {
-                                    tool_call: call,
-                                    outcome: ToolCallOutcome::Auto,
-                                })
-                                .collect(),
+                            tool_calls: auto_calls,
                         }))
                     }
                 }
@@ -837,6 +865,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             concurrent_stateful_subagents(self.agent, &tool_execution.tool_calls);
         // Tracks local tool calls that have not yet completed, keyed by tool call id.
         // The timestamp records when execution began, for the result's duration.
+        // Handed to every sub-agent dispatched below so their messages group with
+        // the submission that ultimately caused them.
+        let turn_id = self.agent.current_turn().await;
         let mut pending_local: HashMap<String, (PendingToolCall, jiff::Timestamp)> = HashMap::new();
         let mut futures = futures::stream::FuturesUnordered::new();
         for tc in &tool_execution.tool_calls {
@@ -855,16 +886,25 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     continue;
                 }
 
-                let subagent_thread_id = if subagent.mode == SubAgentMode::Stateless {
-                    // Stateless: derive thread id from the parent thread + call id so each
-                    // invocation gets an independent session. The parent thread_id is a
-                    // valid UUID, so the uuid5 derivation never falls back to nil.
-                    ThreadId::from_uuid5(&self.thread_id, &tc.tool_call.id)
-                } else {
-                    // Stateful: stable thread id derived from the parent thread so the
-                    // sub-agent session persists across calls within the same conversation.
-                    ThreadId::from_uuid5(&self.thread_id, &subagent.name)
+                let origin = MessageOrigin {
+                    message_id: tool_execution.parent_message_id,
+                    call_id: tc.tool_call.id.clone(),
                 };
+                let derivation_key = if subagent.mode == SubAgentMode::Stateless {
+                    // Stateless: each invocation gets its own thread, so derive
+                    // from what identifies the invocation. The call id alone
+                    // won't do — it is only unique within one assistant message,
+                    // so reusing it across turns would derive the same thread
+                    // twice and the second invocation would inherit the first
+                    // one's conversation (nothing ever deletes a thread's
+                    // checkpoint).
+                    origin.derivation_key()
+                } else {
+                    // Stateful: derive from the agent name so the sub-agent's
+                    // session persists across calls in the same conversation.
+                    subagent.name.clone()
+                };
+                let subagent_thread_id = ThreadId::from_uuid5(&self.thread_id, &derivation_key);
                 let subagent_tool_call_envelope = Envelope::with_id(|id| Envelope {
                     id,
                     from: Sender::Agent {
@@ -879,7 +919,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     },
                     reply_to: None,
                     body: EnvelopeBody::ToolCall {
-                        call_id: tc.tool_call.id.clone(),
+                        call_id: origin.call_id.clone(),
+                        parent_message_id: origin.message_id,
+                        derivation_key: derivation_key.clone(),
+                        turn_id,
                         // Sub-agent tools always take {"task": "..."} — extract the string.
                         task: serde_json::from_str::<serde_json::Value>(
                             tc.tool_call.arguments.as_deref().unwrap_or("{}"),
@@ -1048,6 +1091,62 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         } else {
             AgentLoopState::Next(ResumePoint::Generation)
         }
+    }
+}
+
+/// The user message that opens the work an envelope asks for, or `None` for
+/// envelopes that continue existing work (`Reply`, `Resume`) rather than start
+/// any.
+///
+/// A root task carries the id minted at the request boundary, and that id also
+/// names the turn it begins. A sub-agent invocation mints its own message id
+/// here — this is that message's only construction point, so there is no second
+/// copy to stay in sync with — inherits the caller's turn, and records the
+/// calling thread's tool call as its origin, which is what later lets a rewind
+/// tell this invocation's messages from another invocation's in the same thread.
+fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, UserMessage)> {
+    match body {
+        EnvelopeBody::Task {
+            message_id,
+            task,
+            images,
+        } => Some((
+            TurnId::from(*message_id),
+            UserMessage::with_images(*message_id, task.clone(), images),
+        )),
+        EnvelopeBody::ToolCall {
+            call_id,
+            parent_message_id,
+            turn_id,
+            task,
+            ..
+        } => Some((
+            *turn_id,
+            UserMessage::from_subagent_call(
+                MessageId::new(),
+                task.clone(),
+                MessageOrigin {
+                    message_id: *parent_message_id,
+                    call_id: call_id.clone(),
+                },
+            ),
+        )),
+        EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => None,
+    }
+}
+
+/// This thread's place under its caller, as announced by a `ToolCall` envelope.
+/// `None` for anything else, since only being called as a tool gives a thread a
+/// parent.
+fn origin_thread_from_envelope(envelope: &Envelope) -> Option<OriginThread> {
+    match (&envelope.from, &envelope.body) {
+        (Sender::Agent { thread_id, .. }, EnvelopeBody::ToolCall { derivation_key, .. }) => {
+            Some(OriginThread {
+                parent_thread_id: thread_id.as_ref().to_string(),
+                derivation_key: derivation_key.clone(),
+            })
+        }
+        _ => None,
     }
 }
 

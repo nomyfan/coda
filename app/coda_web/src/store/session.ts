@@ -91,6 +91,11 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** A draft session's opening `open_session` is in flight, ahead of its first
+   * task. `running` can't cover this window — it isn't set until the task is
+   * actually sent — so without it a second submit during the round trip would
+   * open the session and start a turn twice. */
+  starting?: boolean;
   /** A `delete_session` request is in flight (or tombstoned across a
    * disconnect). While set, `open`/`task`/`set_model`/repeat-`delete` are
    * no-ops for this key, and a reconnect re-sends the (idempotent) delete. */
@@ -290,9 +295,11 @@ function collectToolArgs(messages: HistoryMessage[]): Record<string, string | nu
   return map;
 }
 
+/** Entry ids are derived from the server's `message_id` so a message keeps the
+ * same key across a reload or reconnect. One assistant message can yield two
+ * entries (its reasoning and its answer), which the kind prefix separates. */
 function historyToEntries(
   message: HistoryMessage,
-  index: number,
   argsById: Record<string, string | null | undefined> = {},
 ): TranscriptEntry[] {
   if ("System" in message) {
@@ -308,7 +315,7 @@ function historyToEntries(
       .map((p) => (p as { type: "image"; url: string }).url);
     return [
       {
-        id: `history:user:${index}`,
+        id: userEntryId(message.User.message_id),
         kind: "user",
         content: textContent,
         images: images.length > 0 ? images : undefined,
@@ -321,7 +328,7 @@ function historyToEntries(
     const entries: TranscriptEntry[] = [];
     if (assistant.reasoning_content) {
       entries.push({
-        id: `history:reasoning:${index}`,
+        id: `reasoning:${assistant.message_id}`,
         kind: "reasoning",
         agentName: rootName,
         title: "Thinking",
@@ -332,7 +339,7 @@ function historyToEntries(
     }
     if (assistant.content) {
       entries.push({
-        id: `history:assistant:${index}`,
+        id: `assistant:${assistant.message_id}`,
         kind: "assistant",
         agentName: rootName,
         content: assistant.content,
@@ -349,7 +356,7 @@ function historyToEntries(
     return [
       toolMessageToEntry(
         message.Tool,
-        `history:tool:${index}`,
+        `tool:${message.Tool.message_id}`,
         describeTool(message.Tool.name, argumentsJson),
         message.Tool.name === "shell"
           ? extractShellCommand({
@@ -1088,6 +1095,15 @@ function setSessionDeleting(store: CodaStore, server: string, key: SessionKey, d
   });
 }
 
+function setSessionStarting(store: CodaStore, server: string, key: SessionKey, starting: boolean) {
+  updateState(store, (state) => {
+    const session = state.servers[server]?.sessions[key];
+    if (session) {
+      session.starting = starting;
+    }
+  });
+}
+
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -1143,7 +1159,7 @@ function applySnapshot(
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
-  const mapped = messages.flatMap((message, index) => historyToEntries(message, index, argsById));
+  const mapped = messages.flatMap((message) => historyToEntries(message, argsById));
   const usage = historyUsage(messages);
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
@@ -1263,13 +1279,23 @@ function addAllowResultActivity(
   });
 }
 
+/** The transcript key for a user message, from the id the server minted for it.
+ * Shared by the optimistic path and the replayed-history path so one message
+ * keeps one key. */
+function userEntryId(messageId: string) {
+  return `user:${messageId}`;
+}
+
+/** Render the user's message immediately, returning the id of the entry created
+ * so the caller can reconcile it once the server answers with the real one. */
 function appendUserMessage(
   store: CodaStore,
   server: string,
   key: SessionKey,
   content: string,
   images?: string[],
-) {
+): string {
+  const entryId = newId("user");
   updateState(store, (state) => {
     const current = state.servers[server];
     const session = draftSession(state, server, key);
@@ -1287,7 +1313,7 @@ function appendUserMessage(
     session.running = true;
     session.firstUserMessage = firstUserMessage;
     session.entries.push({
-      id: newId("user"),
+      id: entryId,
       kind: "user",
       content,
       images: images && images.length > 0 ? images : undefined,
@@ -1300,6 +1326,72 @@ function appendUserMessage(
       firstUserMessage,
     );
   });
+  return entryId;
+}
+
+/** Re-key an optimistic user entry onto the id derived from the server's
+ * `message_id`, so it matches the key the same message gets when replayed from
+ * history. */
+function adoptServerMessageId(server: string, key: SessionKey, entryId: string, settledId: string) {
+  updateState(codaStore, (state) => {
+    const entry = draftSession(state, server, key)?.entries.find((e) => e.id === entryId);
+    if (entry) {
+      entry.id = settledId;
+    }
+  });
+}
+
+/** Undo an optimistic user entry whose task never started. The session's title
+ * and non-draft flag are left as they are — a later catalog refresh corrects
+ * them, and unwinding them here would clobber a session that has other turns. */
+function discardOptimisticTask(server: string, key: SessionKey, entryId: string) {
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.entries = session.entries.filter((e) => e.id !== entryId);
+    session.running = false;
+  });
+}
+
+/** Start a turn: show the user's message right away, then reconcile it with the
+ * id the server minted. Rendering first costs a round trip of staleness on the
+ * entry's key but avoids stalling the user's own message behind the ack.
+ * Returns whether the turn started. */
+async function startTurn(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  text: string,
+  images: string[],
+): Promise<boolean> {
+  const key = sessionKey(workspaceId, sessionId);
+  const entryId = appendUserMessage(codaStore, server, key, text, images);
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    discardOptimisticTask(server, key, entryId);
+    return false;
+  }
+  try {
+    const { message_id } = await rpc.request("task", {
+      workspace_id: workspaceId,
+      session_id: sessionId,
+      task: text,
+      images: images.length > 0 ? images : undefined,
+    });
+    adoptServerMessageId(server, key, entryId, userEntryId(message_id));
+    return true;
+  } catch (err) {
+    discardOptimisticTask(server, key, entryId);
+    addSessionActivity(server, workspaceId, sessionId, {
+      tone: "danger",
+      label: "task rejected",
+      detail: isServerError(err) ? err.message : "Connection lost before the task started",
+    });
+    return false;
+  }
 }
 
 function setDraftResolution(
@@ -1525,6 +1617,19 @@ async function requestOpenAndApply(
   } catch (err) {
     handleOpenError(server, session.workspaceId, session.sessionId, err);
     return false;
+  }
+}
+
+/** Open a draft session ahead of its first task, holding `starting` for the
+ * round trip. That flag is the only thing standing between a second submit and
+ * a duplicate turn: the composer's send gate keys on `running`, which nothing
+ * sets until the task itself goes out. */
+async function openBeforeFirstTask(server: string, session: OpenedSession): Promise<boolean> {
+  setSessionStarting(codaStore, server, session.key, true);
+  try {
+    return await requestOpenAndApply(server, session);
+  } finally {
+    setSessionStarting(codaStore, server, session.key, false);
   }
 }
 
@@ -1893,27 +1998,22 @@ export async function sendTask(task: string, images: string[] = []) {
   if (!text && images.length === 0) {
     return;
   }
-  if (!active || active.session.deleting) {
+  if (!active || active.session.deleting || active.session.starting) {
     return;
   }
-  // A draft/new session must be live before its first task, or a fire-and-forget
-  // task would be dropped server-side while the UI already showed it running
+  // A draft/new session must be live before its first task, or the task would
+  // come back `SESSION_NOT_LIVE` while the UI already showed it running
   // (Decision 10).
-  if (active.session.draft && !(await requestOpenAndApply(active.server, active.session))) {
+  if (active.session.draft && !(await openBeforeFirstTask(active.server, active.session))) {
     return;
   }
-  // Append the optimistic user message only if the task frame actually left the
-  // client (a dead socket returns `false`).
-  if (
-    notify(active.server, "task", {
-      workspace_id: active.session.workspaceId,
-      session_id: active.session.sessionId,
-      task: text,
-      images: images.length > 0 ? images : undefined,
-    })
-  ) {
-    appendUserMessage(codaStore, active.server, active.session.key, text, images);
-  }
+  await startTurn(
+    active.server,
+    active.session.workspaceId,
+    active.session.sessionId,
+    text,
+    images,
+  );
 }
 
 export async function sendTaskToNewSession(
@@ -1948,19 +2048,10 @@ export async function sendTaskToNewSession(
     return;
   }
   // Open the new session first, then send the task only if it opened.
-  if (!(await requestOpenAndApply(server, session))) {
+  if (!(await openBeforeFirstTask(server, session))) {
     return;
   }
-  if (
-    notify(server, "task", {
-      workspace_id: workspace,
-      session_id: sessionId,
-      task: text,
-      images: images.length > 0 ? images : undefined,
-    })
-  ) {
-    appendUserMessage(codaStore, server, key, text, images);
-  }
+  await startTurn(server, workspace, sessionId, text, images);
 }
 
 export function abort() {
@@ -2212,6 +2303,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveStarting = (state: CodaStoreState) =>
+  activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
   activeSessionOf(state)?.evicted ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>

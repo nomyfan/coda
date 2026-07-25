@@ -17,8 +17,9 @@ use async_openai::types::chat::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, ContentPart,
-    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, PromptTokensDetails, ProviderError,
-    ReasoningContinuation, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolOutput,
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId, PromptTokensDetails,
+    ProviderError, ReasoningContinuation, StreamError, ToolCall, ToolCallOutcome, ToolDefinition,
+    ToolOutput,
 };
 use futures::{Stream, StreamExt};
 
@@ -772,6 +773,10 @@ impl TryFrom<CompletionAccumulator> for AssistantMessage {
             return Err("stream completed without content, reasoning, or tool calls".to_string());
         }
         Ok(AssistantMessage {
+            // This is the message's only construction point, so minting here
+            // means one object with one id all the way to storage. The runtime
+            // overwrites the timing below but leaves the id alone.
+            message_id: MessageId::new(),
             content: value.content,
             tool_calls,
             usage: value.usage,
@@ -800,6 +805,7 @@ mod tests {
     fn assistant() -> AssistantMessage {
         let now = jiff::Timestamp::now();
         AssistantMessage {
+            message_id: MessageId::new(),
             content: String::new(),
             tool_calls: vec![],
             usage: None,
@@ -815,7 +821,8 @@ mod tests {
     #[test]
     fn user_text_message_uses_text_content_form() {
         let message: ChatCompletionRequestMessage =
-            Message::User(coda_core::llm::UserMessage::text("hello")).into_openai_type();
+            Message::User(coda_core::llm::UserMessage::text(MessageId::new(), "hello"))
+                .into_openai_type();
 
         let ChatCompletionRequestMessage::User(user) = message else {
             panic!("expected user message");
@@ -829,10 +836,13 @@ mod tests {
     #[test]
     fn user_image_message_uses_array_content_form() {
         let image_url = "data:image/png;base64,abc123".to_string();
-        let message: ChatCompletionRequestMessage = Message::User(
-            coda_core::llm::UserMessage::with_images("look", std::slice::from_ref(&image_url)),
-        )
-        .into_openai_type();
+        let message: ChatCompletionRequestMessage =
+            Message::User(coda_core::llm::UserMessage::with_images(
+                MessageId::new(),
+                "look",
+                std::slice::from_ref(&image_url),
+            ))
+            .into_openai_type();
 
         let ChatCompletionRequestMessage::User(user) = message else {
             panic!("expected user message");
@@ -1190,6 +1200,7 @@ mod tests {
             model: "moonshotai/kimi-k3".into(),
             messages: vec![
                 Message::User(coda_core::llm::UserMessage::with_images(
+                    MessageId::new(),
                     "inspect",
                     &["data:image/png;base64,abc123".to_string()],
                 )),

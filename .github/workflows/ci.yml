@@ -55,6 +55,50 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  # PostgreSQL is the only storage backend, so its tests have to actually run.
+  # They can't join the `rust` matrix: that includes a macOS runner, which has no
+  # PostgreSQL service. Hence a third job, and a `pg-tests` feature so the plain
+  # `cargo test` there doesn't even compile this target.
+  storage-pg:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: coda_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ubuntu-latest-cargo
+
+      # No `DATABASE_URL` makes this fail rather than skip: a suite that skips
+      # itself would leave persistence untested while the job still went green.
+      - name: Storage tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/coda_test
+        run: cargo test -p coda_server --features pg-tests --test storage_pg
+
   web:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest

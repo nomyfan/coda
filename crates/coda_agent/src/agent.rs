@@ -6,12 +6,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, SystemMessage, ToolCall, ToolCallOutcome,
-    ToolDefinition, ToolMessage, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, Message, MessageId, SystemMessage, ToolCall,
+    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Prefix applied to sub-agent names when they are exposed to the LLM as tools,
 /// mirroring how MCP tools are prefixed with `mcp__`. It makes a sub-agent
@@ -78,6 +78,11 @@ pub struct PendingReply {
 
 #[derive(Debug, Clone)]
 pub struct ToolExecutionState {
+    /// The assistant message these calls came from. One generation produces one
+    /// batch, so the whole batch shares a parent; carrying it here (rather than
+    /// per call) keeps it available after an approval suspension or a process
+    /// restart, when the message itself is no longer in scope.
+    pub parent_message_id: MessageId,
     /// Replies waiting from stateful sub-agents.
     pub pending_replies: Vec<PendingReply>,
     pub tool_calls: VecDeque<PendingToolCall>,
@@ -95,6 +100,11 @@ pub enum ResumePoint {
     Generation,
     ToolExecution(ToolExecutionState),
     PendingApproval {
+        /// The assistant message these calls came from — see
+        /// [`ToolExecutionState::parent_message_id`]. Persisted with the
+        /// suspension so a sub-agent dispatched after the approval still knows
+        /// what triggered it, even across a process restart.
+        parent_message_id: MessageId,
         /// Tool calls waiting for approval.
         pending_approval_calls: VecDeque<ToolCall>,
         /// Tool calls to execute.
@@ -102,8 +112,25 @@ pub enum ResumePoint {
     },
 }
 
+/// One message in a thread's history, tagged with the turn it belongs to.
+///
+/// `turn_id` sits out here rather than inside `Message` for the same reason
+/// `thread_id` does: it describes where the message falls in the session's
+/// control flow, not what the message says. Keeping it out also means the
+/// provider adapter — which builds assistant messages and has no idea what a
+/// turn is — never has to supply it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub turn_id: TurnId,
+    pub message: Message,
+}
+
 pub struct AgentState {
-    pub messages: Vec<Message>,
+    pub messages: Vec<HistoryEntry>,
+    /// The turn newly appended messages belong to. Advances only when a user
+    /// message is appended (see [`Agent::add_user_message`]); `None` only before
+    /// this thread has any history at all.
+    pub current_turn: Option<TurnId>,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -124,13 +151,26 @@ impl Default for ThreadId {
     }
 }
 
+/// Namespace for hashing a non-UUID thread id into a usable uuid5 namespace.
+/// Arbitrary but fixed: changing it changes every derived thread id.
+const NON_UUID_THREAD_NAMESPACE: Uuid = Uuid::from_u128(0x3f7a1c62_5be4_4d0f_9a31_c6d84b7e02f5);
+
 impl ThreadId {
     pub fn new() -> Self {
         ThreadId(Uuid::new_v4().to_string())
     }
 
+    /// Derive a child thread id from its parent and a name.
+    ///
+    /// A parent id that isn't a UUID — the root thread id is the client-supplied
+    /// session id, which is only required to be a safe string — is hashed into a
+    /// namespace rather than falling back to the nil one. Falling back would
+    /// give every such session the *same* namespace, so two sessions would
+    /// derive identical child ids and "a different parent means different
+    /// children" would silently stop holding.
     pub fn from_uuid5(namespace: &ThreadId, name: &str) -> Self {
-        let ns = Uuid::parse_str(&namespace.0).unwrap_or(Uuid::nil());
+        let ns = Uuid::parse_str(&namespace.0)
+            .unwrap_or_else(|_| Uuid::new_v5(&NON_UUID_THREAD_NAMESPACE, namespace.0.as_bytes()));
         ThreadId(Uuid::new_v5(&ns, name.as_bytes()).to_string())
     }
 }
@@ -165,6 +205,11 @@ pub struct Receiver {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnvelopeBody {
     Task {
+        /// Identity for the user message this task becomes, minted once at the
+        /// request boundary. The relay builds its own copy of that message for
+        /// the live snapshot, so the id has to travel with the task rather than
+        /// be minted here.
+        message_id: MessageId,
         task: String,
         /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -173,6 +218,19 @@ pub enum EnvelopeBody {
     /// Call agent as a tool
     ToolCall {
         call_id: String,
+        /// The assistant message in the calling thread whose tool call this is.
+        /// Paired with `call_id` it forms the [`MessageOrigin`] the receiving
+        /// thread stamps on its opening message; only the parent id travels
+        /// here, since `call_id` is already alongside it.
+        parent_message_id: MessageId,
+        /// The name the caller derived the receiving thread's id from. Sent so
+        /// the receiver can record how it was addressed without re-deriving it
+        /// (which would mean knowing the caller's mode for it).
+        derivation_key: String,
+        /// The turn this call is part of. A sub-agent doesn't start a turn — it
+        /// works inside the caller's — so the turn has to be handed down for its
+        /// messages to group with the submission that ultimately caused them.
+        turn_id: TurnId,
         task: String,
     },
     /// Reply from a agent, containing the tool output.
@@ -450,14 +508,51 @@ impl Agent {
         &self.name
     }
 
+    /// Append a user message and make its turn this thread's current one, in a
+    /// single critical section.
+    ///
+    /// Advancing the turn is deliberately tied to appending the user message
+    /// rather than to receiving an envelope. When a new task pre-empts calls that
+    /// were awaiting approval, the driver first writes those calls off as aborted
+    /// `ToolMessage`s; those results belong to the *previous* turn. Were the turn
+    /// advanced on arrival, a rewind to the new turn would delete them and leave
+    /// the earlier assistant message with tool calls that have no results —
+    /// history the provider rejects. Advancing here lets them keep the old turn.
+    pub async fn add_user_message(&self, turn_id: TurnId, message: UserMessage) {
+        debug!("Adding user message: {:?}", message);
+        let mut state = self.state.lock().await;
+        state.current_turn = Some(turn_id);
+        state.messages.push(HistoryEntry {
+            turn_id,
+            message: Message::User(message),
+        });
+    }
+
+    /// Append a message to the current turn. Used for assistant and tool
+    /// messages, which never start a turn.
     pub async fn add_message(&self, message: Message) {
         debug!("Adding message: {:?}", message);
-        self.state.lock().await.messages.push(message);
+        let mut state = self.state.lock().await;
+        let turn_id = state.stamp();
+        state.messages.push(HistoryEntry { turn_id, message });
     }
 
     pub async fn add_messages(&self, messages: Vec<Message>) {
         debug!("Adding messages: {:?}", messages);
-        self.state.lock().await.messages.extend(messages);
+        let mut state = self.state.lock().await;
+        let turn_id = state.stamp();
+        state.messages.extend(
+            messages
+                .into_iter()
+                .map(|message| HistoryEntry { turn_id, message }),
+        );
+    }
+
+    /// The turn this thread is in: what a message appended now is tagged with,
+    /// and what a sub-agent call hands down so the callee's messages group with
+    /// the submission that ultimately caused them.
+    pub async fn current_turn(&self) -> TurnId {
+        self.state.lock().await.stamp()
     }
 
     pub async fn todos(&self) -> Vec<TodoItem> {
@@ -465,27 +560,47 @@ impl Agent {
     }
 
     pub async fn messages(&self) -> Vec<Message> {
-        let mut messages = self.state.lock().await.messages.clone();
-        messages.insert(
-            0,
-            Message::System(SystemMessage(self.system_prompt.resolve())),
-        );
+        let history = self.state.lock().await;
+        let mut messages = Vec::with_capacity(history.messages.len() + 1);
+        messages.push(Message::System(SystemMessage(self.system_prompt.resolve())));
+        messages.extend(history.messages.iter().map(|entry| entry.message.clone()));
         messages
     }
 
     /// Returns conversation history without the system prompt (suitable for checkpointing).
-    pub async fn history(&self) -> Vec<Message> {
+    pub async fn history(&self) -> Vec<HistoryEntry> {
         self.state.lock().await.messages.clone()
     }
 
-    pub async fn restore_history(&self, messages: Vec<Message>, todos: Vec<TodoItem>) {
+    pub async fn restore_history(&self, messages: Vec<HistoryEntry>, todos: Vec<TodoItem>) {
         let mut state = self.state.lock().await;
-        // Filter out any SystemMessage that may have been saved in old checkpoints.
-        state.messages = messages
-            .into_iter()
-            .filter(|m| !matches!(m, Message::System(_)))
-            .collect();
+        state.messages = messages;
+        // Whatever work is being resumed belongs to the turn of the last message
+        // written, so the turn needs no separate persistence.
+        state.current_turn = state.messages.last().map(|entry| entry.turn_id);
         *self.todo_store.lock().await = todos;
+    }
+}
+
+impl AgentState {
+    /// The turn to tag a newly appended assistant/tool message with.
+    ///
+    /// `current_turn` is `None` only before a thread has any history, and an
+    /// assistant or tool message can't be the first thing in a thread — one
+    /// always follows the user message that prompted it. Should that ever break,
+    /// keeping the message under a fresh turn beats dropping it: a mis-grouped
+    /// message is a rewind inaccuracy, a missing tool result is history the
+    /// provider refuses outright.
+    fn stamp(&mut self) -> TurnId {
+        match self.current_turn {
+            Some(turn_id) => turn_id,
+            None => {
+                error!("appending to a thread with no current turn; tagging a fresh one");
+                let turn_id = TurnId::from(MessageId::new());
+                self.current_turn = Some(turn_id);
+                turn_id
+            }
+        }
     }
 }
 
@@ -541,6 +656,39 @@ impl SubAgents {
                 }),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod thread_id_tests {
+    use super::*;
+
+    /// The root thread id is whatever session id the client chose, and it is not
+    /// required to be a UUID — the web client falls back to a non-UUID form
+    /// whenever `crypto.randomUUID` is unavailable, which is every plain-HTTP
+    /// origin. Two such sessions must still derive distinct child threads.
+    #[test]
+    fn non_uuid_parents_derive_distinct_children() {
+        let one = ThreadId::from("session-mf3k2x".to_string());
+        let other = ThreadId::from("session-mf3k2y".to_string());
+
+        assert_ne!(
+            ThreadId::from_uuid5(&one, "explore"),
+            ThreadId::from_uuid5(&other, "explore")
+        );
+    }
+
+    /// Deriving from a parent that *is* a UUID must keep using it as the
+    /// namespace directly, so existing stateful thread ids are unaffected by the
+    /// non-UUID handling above.
+    #[test]
+    fn uuid_parent_is_used_as_the_namespace_directly() {
+        let parent = ThreadId::from("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string());
+
+        assert_eq!(
+            ThreadId::from_uuid5(&parent, "explore").as_ref(),
+            Uuid::new_v5(&Uuid::parse_str(parent.as_ref()).unwrap(), b"explore").to_string()
+        );
     }
 }
 

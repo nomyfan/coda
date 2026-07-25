@@ -28,6 +28,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  starting,
   evicted,
   workspace,
   selectingTarget,
@@ -44,6 +45,11 @@ export const Composer = memo(function Composer({
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** The session is being opened for its first task. Blocks send without
+   * offering Abort — there is no turn to abort yet. An Enter landing in this
+   * window returns before the draft is cleared, so the text survives for the
+   * user to send again. */
+  starting: boolean;
   /** Another client took over this session. The takeover mask covers pointer
    * access; these guards also close the keyboard/paste paths. */
   evicted: boolean;
@@ -87,6 +93,7 @@ export const Composer = memo(function Composer({
     connected &&
     Boolean(workspace) &&
     !running &&
+    !starting &&
     !evicted &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);

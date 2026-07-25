@@ -215,7 +215,10 @@ impl AgentTeam {
         let mut agents = HashMap::new();
         for spec in all() {
             let todo_store = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
-            let state = Arc::new(Mutex::new(AgentState { messages: vec![] }));
+            let state = Arc::new(Mutex::new(AgentState {
+                messages: vec![],
+                current_turn: None,
+            }));
 
             let workspace_dir = self
                 .agent_workspaces

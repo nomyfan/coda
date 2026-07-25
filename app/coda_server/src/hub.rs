@@ -20,7 +20,7 @@ use std::sync::Arc;
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, UserMessage};
+use coda_core::llm::{Message, MessageId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -89,6 +89,10 @@ pub struct AttachSession {
 pub enum CommandOutcome {
     /// The command was accepted (or was a benign no-op).
     Ok,
+    /// A `Task` was accepted, carrying the id minted for the user message it
+    /// became. The request dispatcher answers the client with it so the client
+    /// and the server name that message the same way.
+    TaskAccepted { message_id: MessageId },
     /// The command was not applied: stale connection, invalid state, or the
     /// session did not accept it (e.g. runtime channel closed). Logged;
     /// nothing to send. For a `SetModel`, the request dispatcher reads this as
@@ -648,21 +652,32 @@ impl SessionHub {
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
+        // This task becomes one user message that gets built twice: once inside
+        // the session (its persisted history) and once here (the snapshot served
+        // to attaching clients). Mint the id once so both copies — and every
+        // later reference to them, like a rewind target — agree.
+        let message_id = MessageId::new();
         // Send first, record after: a failed send must not leave a phantom
         // user message or a stuck running flag.
-        if let Err(err) = live.session.send(task.clone(), images.clone()).await {
+        if let Err(err) = live
+            .session
+            .send(message_id, task.clone(), images.clone())
+            .await
+        {
             warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
             return CommandOutcome::Ignored;
         }
         live.turn_running = true;
         live.unsettled_user_messages
-            .push_back(Message::User(UserMessage::with_images(task, &images)));
+            .push_back(Message::User(UserMessage::with_images(
+                message_id, task, &images,
+            )));
         // A task sent while approvals were pending supersedes them: the driver
         // writes the discarded calls as aborted ToolMessages (announced via
         // ToolCallEnd) and starts a fresh turn, so advertising them to a later
         // attach would offer a resume for work that no longer exists.
         live.pending_approvals.clear();
-        CommandOutcome::Ok
+        CommandOutcome::TaskAccepted { message_id }
     }
 
     async fn handle_resume(

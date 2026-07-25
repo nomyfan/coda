@@ -41,6 +41,14 @@ models = [
   { id = "z-ai/glm-5.2", name = "GLM 5.2", context_window = 1048576, max_completion_tokens = 32768, reasoning_efforts = ["off", "xhigh", "high"], default_reasoning_effort = "high" },
 ]
 
+# --- Database ----------------------------------------------------------------
+# Sessions are persisted in PostgreSQL. Required — there is no other backend.
+# The schema is created and migrated when the server starts. `url` may reference
+# an environment variable as `${VAR}`.
+
+[database]
+url = "${DATABASE_URL}"
+
 # --- Workspaces --------------------------------------------------------------
 # Sessions are scoped to a workspace. `path` is resolved (and canonicalized) at
 # startup, relative to *this config file's directory* (so `workspace` points at
