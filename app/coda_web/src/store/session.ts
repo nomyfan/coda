@@ -1279,15 +1279,15 @@ function addAllowResultActivity(
   });
 }
 
-/** Render the user's message immediately, returning the id of the entry created
- * so the caller can reconcile it once the server answers with the real one. */
-/// The transcript key for a user message, from the id the server minted for it.
-/// Shared by the optimistic path and the replayed-history path so one message
-/// keeps one key.
+/** The transcript key for a user message, from the id the server minted for it.
+ * Shared by the optimistic path and the replayed-history path so one message
+ * keeps one key. */
 function userEntryId(messageId: string) {
   return `user:${messageId}`;
 }
 
+/** Render the user's message immediately, returning the id of the entry created
+ * so the caller can reconcile it once the server answers with the real one. */
 function appendUserMessage(
   store: CodaStore,
   server: string,
