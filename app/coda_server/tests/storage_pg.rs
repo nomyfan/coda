@@ -18,19 +18,28 @@ use coda_core::llm::{
     AssistantMessage, Message, MessageId, MessageOrigin, ReasoningContinuation, ToolCall,
     ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
+use coda_server::storage::DbPool;
 use coda_server::storage::{
     PgSessionStorage, RenameSessionError, SessionMetadataError, SessionModelBinding,
     WorkspaceStorage,
 };
 use coda_tools::TodoItem;
-use sqlx::{PgPool, Row};
+use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::deadpool::Object;
 
-/// A fresh pool per test. A sqlx pool is tied to the runtime that created it and
+/// A fresh pool per test. A pool is tied to the runtime that created it and
 /// `#[tokio::test]` gives every test its own, so a pool shared through a static
 /// starts timing out the moment the first test's runtime shuts down. Connections
 /// are opened on demand, and the migrator takes a PostgreSQL advisory lock, so
 /// paying for a pool per test costs one connection and one version check.
-async fn pool() -> PgPool {
+///
+/// Every test here runs on a multi-threaded runtime because applying the
+/// migrations goes through `block_in_place`, which panics on the current-thread
+/// flavour `#[tokio::test]` would otherwise give it.
+async fn pool() -> DbPool {
     let url = std::env::var("DATABASE_URL").expect(
         "DATABASE_URL must point at a throwaway PostgreSQL database \
          (this suite migrates, writes and deletes)",
@@ -38,6 +47,67 @@ async fn pool() -> PgPool {
     coda_server::storage::connect(&url)
         .await
         .expect("connect to DATABASE_URL and apply migrations")
+}
+
+/// A connection for the raw-SQL probes below. Those deliberately go around the
+/// storage API to check what actually landed in the database — column values,
+/// row versions, cascade behaviour — which is not something the DSL should be
+/// asked to express.
+async fn conn(pool: &DbPool) -> Object<AsyncPgConnection> {
+    pool.get().await.expect("a pooled connection")
+}
+
+#[derive(QueryableByName)]
+struct SessionIdRow {
+    #[diesel(sql_type = Text)]
+    session_id: String,
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+#[derive(QueryableByName)]
+struct BoolRow {
+    #[diesel(sql_type = Bool)]
+    ok: bool,
+}
+
+/// `xmin` is the transaction that last wrote the row, cast to text so it needs no
+/// special type support.
+#[derive(QueryableByName)]
+struct RowVersion {
+    #[diesel(sql_type = Integer)]
+    seq: i32,
+    #[diesel(sql_type = Text)]
+    version: String,
+}
+
+#[derive(QueryableByName)]
+struct ThreadSeqRow {
+    #[diesel(sql_type = Text)]
+    thread_id: String,
+    #[diesel(sql_type = Integer)]
+    seq: i32,
+}
+
+/// The columns split out of a message's payload, joined to its thread's state.
+#[derive(QueryableByName)]
+struct SplitColumnsRow {
+    #[diesel(sql_type = Text)]
+    role: String,
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    turn_id: uuid::Uuid,
+    #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
+    origin_message_id: Option<uuid::Uuid>,
+    #[diesel(sql_type = Nullable<Text>)]
+    origin_call_id: Option<String>,
+    #[diesel(sql_type = Bool)]
+    pending_approval: bool,
+    #[diesel(sql_type = Integer)]
+    message_count: i32,
 }
 
 fn workspace_id(test: &str) -> String {
@@ -53,7 +123,7 @@ fn test_binding() -> SessionModelBinding {
 }
 
 /// The session row everything else hangs off, written the way production does.
-async fn seed_session(pool: &PgPool, workspace: &str, session: &str) {
+async fn seed_session(pool: &DbPool, workspace: &str, session: &str) {
     WorkspaceStorage::new(pool.clone(), workspace)
         .initialize_session(session, test_binding())
         .await
@@ -97,90 +167,92 @@ fn assistant(content: &str) -> Message {
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_session_takes_its_threads_messages_and_snapshot_with_it() {
     let pool = pool().await;
     let workspace = workspace_id("cascade");
 
-    sqlx::query(
+    let mut conn = conn(&pool).await;
+
+    diesel::sql_query(
         "insert into sessions (workspace_id, session_id, model_binding)
          values ($1, 'doomed', '{}'::jsonb), ($1, 'keeper', '{}'::jsonb)",
     )
-    .bind(&workspace)
-    .execute(&pool)
+    .bind::<Text, _>(&workspace)
+    .execute(&mut conn)
     .await
     .unwrap();
 
     for session in ["doomed", "keeper"] {
-        sqlx::query(
+        diesel::sql_query(
             "insert into thread_checkpoints
                 (workspace_id, session_id, thread_id, agent_name, resume_point,
                  todos, suspended_at, message_count, pending_approval)
              values ($1, $2, $2, 'coda', '\"Generation\"'::jsonb, '[]'::jsonb, now(), 1, false)",
         )
-        .bind(&workspace)
-        .bind(session)
-        .execute(&pool)
+        .bind::<Text, _>(&workspace)
+        .bind::<Text, _>(session)
+        .execute(&mut conn)
         .await
         .unwrap();
-        sqlx::query(
+        diesel::sql_query(
             "insert into messages
                 (workspace_id, session_id, thread_id, seq, message_id, turn_id, role, payload)
              values ($1, $2, $2, 0, gen_random_uuid(), gen_random_uuid(), 'user', '{}'::jsonb)",
         )
-        .bind(&workspace)
-        .bind(session)
-        .execute(&pool)
+        .bind::<Text, _>(&workspace)
+        .bind::<Text, _>(session)
+        .execute(&mut conn)
         .await
         .unwrap();
-        sqlx::query(
+        diesel::sql_query(
             "insert into runtime_snapshots (workspace_id, session_id, snapshot)
              values ($1, $2, '{}'::jsonb)",
         )
-        .bind(&workspace)
-        .bind(session)
-        .execute(&pool)
+        .bind::<Text, _>(&workspace)
+        .bind::<Text, _>(session)
+        .execute(&mut conn)
         .await
         .unwrap();
     }
 
-    sqlx::query("delete from sessions where workspace_id = $1 and session_id = 'doomed'")
-        .bind(&workspace)
-        .execute(&pool)
+    diesel::sql_query("delete from sessions where workspace_id = $1 and session_id = 'doomed'")
+        .bind::<Text, _>(&workspace)
+        .execute(&mut conn)
         .await
         .unwrap();
 
     // Everything owned by the deleted session is gone, and the sibling session
     // is untouched — the cascade follows the composite key, not just the id.
     for table in ["thread_checkpoints", "messages", "runtime_snapshots"] {
-        let surviving: Vec<String> = sqlx::query(&format!(
+        let surviving: Vec<String> = diesel::sql_query(format!(
             "select session_id from {table} where workspace_id = $1"
         ))
-        .bind(&workspace)
-        .fetch_all(&pool)
+        .bind::<Text, _>(&workspace)
+        .load::<SessionIdRow>(&mut conn)
         .await
         .unwrap()
-        .iter()
-        .map(|row| row.get(0))
+        .into_iter()
+        .map(|row| row.session_id)
         .collect();
         assert_eq!(surviving, vec!["keeper"], "{table} was not cascaded");
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_thread_cannot_belong_to_a_session_that_does_not_exist() {
     let pool = pool().await;
     let workspace = workspace_id("orphan");
 
-    let orphan = sqlx::query(
+    let orphan = diesel::sql_query(
         "insert into thread_checkpoints
             (workspace_id, session_id, thread_id, agent_name, resume_point,
              todos, suspended_at, message_count, pending_approval)
          values ($1, 'never-opened', 'never-opened', 'coda', '\"Generation\"'::jsonb,
                  '[]'::jsonb, now(), 0, false)",
     )
-    .bind(&workspace)
-    .execute(&pool)
+    .bind::<Text, _>(&workspace)
+    .execute(&mut conn(&pool).await)
     .await;
 
     assert!(
@@ -189,7 +261,7 @@ async fn a_thread_cannot_belong_to_a_session_that_does_not_exist() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_saved_thread_comes_back_whole() {
     let pool = pool().await;
     let workspace = workspace_id("round-trip");
@@ -293,31 +365,28 @@ async fn a_saved_thread_comes_back_whole() {
 
     // The columns split out of the payload carry the same values the payload does,
     // which is what makes them safe to query on.
-    let row = sqlx::query(
+    let row = diesel::sql_query(
         "select role, turn_id, origin_message_id, origin_call_id, pending_approval, message_count
            from messages
            join thread_checkpoints using (workspace_id, session_id, thread_id)
           where workspace_id = $1 and seq = 0",
     )
-    .bind(&workspace)
-    .fetch_one(&pool)
+    .bind::<Text, _>(&workspace)
+    .get_result::<SplitColumnsRow>(&mut conn(&pool).await)
     .await
     .unwrap();
-    assert_eq!(row.get::<String, _>("role"), "user");
-    assert_eq!(row.get::<uuid::Uuid, _>("turn_id"), turn.as_uuid());
+    assert_eq!(row.role, "user");
+    assert_eq!(row.turn_id, turn.as_uuid());
     assert_eq!(
-        row.get::<Option<uuid::Uuid>, _>("origin_message_id"),
+        row.origin_message_id,
         Some(opening_call.message_id.as_uuid())
     );
-    assert_eq!(
-        row.get::<Option<String>, _>("origin_call_id").as_deref(),
-        Some("call_explore")
-    );
-    assert!(row.get::<bool, _>("pending_approval"));
-    assert_eq!(row.get::<i32, _>("message_count"), 3);
+    assert_eq!(row.origin_call_id.as_deref(), Some("call_explore"));
+    assert!(row.pending_approval);
+    assert_eq!(row.message_count, 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn saving_twice_appends_only_the_new_messages() {
     let pool = pool().await;
     let workspace = workspace_id("append");
@@ -339,17 +408,14 @@ async fn saving_twice_appends_only_the_new_messages() {
 
     // `xmin` is the transaction that last wrote the row, so it changes if a row
     // is rewritten rather than left alone.
-    let versions = sqlx::query(
+    let versions = diesel::sql_query(
         "select seq, xmin::text as version from messages where workspace_id = $1 order by seq",
     )
-    .bind(&workspace)
-    .fetch_all(&pool)
+    .bind::<Text, _>(&workspace)
+    .load::<RowVersion>(&mut conn(&pool).await)
     .await
     .unwrap();
-    let first_versions: Vec<String> = versions
-        .iter()
-        .map(|row| row.get::<String, _>("version"))
-        .collect();
+    let first_versions: Vec<String> = versions.iter().map(|row| row.version.clone()).collect();
     assert_eq!(first_versions.len(), 2);
 
     let second_turn = TurnId::from(MessageId::new());
@@ -363,27 +429,24 @@ async fn saving_twice_appends_only_the_new_messages() {
         .await
         .unwrap();
 
-    let versions = sqlx::query(
+    let versions = diesel::sql_query(
         "select seq, xmin::text as version from messages where workspace_id = $1 order by seq",
     )
-    .bind(&workspace)
-    .fetch_all(&pool)
+    .bind::<Text, _>(&workspace)
+    .load::<RowVersion>(&mut conn(&pool).await)
     .await
     .unwrap();
     assert_eq!(versions.len(), 4, "the second save must add two rows");
     assert_eq!(
         versions[..2]
             .iter()
-            .map(|row| row.get::<String, _>("version"))
+            .map(|row| row.version.clone())
             .collect::<Vec<_>>(),
         first_versions,
         "the messages saved the first time must not be rewritten"
     );
     assert_eq!(
-        versions
-            .iter()
-            .map(|row| row.get::<i32, _>("seq"))
-            .collect::<Vec<_>>(),
+        versions.iter().map(|row| row.seq).collect::<Vec<_>>(),
         vec![0, 1, 2, 3],
         "seq stays the contiguous index into the message vector"
     );
@@ -395,7 +458,7 @@ async fn saving_twice_appends_only_the_new_messages() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_checkpoint_that_lost_messages_is_refused() {
     let pool = pool().await;
     let workspace = workspace_id("shrunk");
@@ -431,15 +494,16 @@ async fn a_checkpoint_that_lost_messages_is_refused() {
             .is_err_and(|err| err.contains("append-only")),
         "expected an append-only complaint, got {shrunk:?}"
     );
-    let stored: i64 = sqlx::query_scalar("select count(*) from messages where workspace_id = $1")
-        .bind(&workspace)
-        .fetch_one(&pool)
+    let stored = diesel::sql_query("select count(*) from messages where workspace_id = $1")
+        .bind::<Text, _>(&workspace)
+        .get_result::<CountRow>(&mut conn(&pool).await)
         .await
-        .unwrap();
+        .unwrap()
+        .count;
     assert_eq!(stored, 2, "the refused save must not have changed anything");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_assistant_message_keeps_its_reasoning_continuation() {
     let pool = pool().await;
     let workspace = workspace_id("continuation");
@@ -505,7 +569,7 @@ async fn an_assistant_message_keeps_its_reasoning_continuation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn one_submission_is_recoverable_across_every_thread_it_reached() {
     let pool = pool().await;
     let workspace = workspace_id("turn");
@@ -555,18 +619,18 @@ async fn one_submission_is_recoverable_across_every_thread_it_reached() {
 
     // One predicate collects a submission's whole fan-out — no walking `origin`
     // up the thread tree. This is what a rewind will truncate on.
-    let reached: Vec<(String, i32)> = sqlx::query(
+    let reached: Vec<(String, i32)> = diesel::sql_query(
         "select thread_id, seq from messages
           where workspace_id = $1 and session_id = 'chat' and turn_id = $2
           order by thread_id, seq",
     )
-    .bind(&workspace)
-    .bind(first.as_uuid())
-    .fetch_all(&pool)
+    .bind::<Text, _>(&workspace)
+    .bind::<diesel::sql_types::Uuid, _>(first.as_uuid())
+    .load::<ThreadSeqRow>(&mut conn(&pool).await)
     .await
     .unwrap()
-    .iter()
-    .map(|row| (row.get("thread_id"), row.get("seq")))
+    .into_iter()
+    .map(|row| (row.thread_id, row.seq))
     .collect();
 
     assert_eq!(
@@ -581,7 +645,7 @@ async fn one_submission_is_recoverable_across_every_thread_it_reached() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stateful_sub_agent_thread_grows_across_calls() {
     let pool = pool().await;
     let workspace = workspace_id("stateful");
@@ -642,7 +706,7 @@ async fn a_stateful_sub_agent_thread_grows_across_calls() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_runtime_snapshot_is_replaced_not_accumulated() {
     let pool = pool().await;
     let workspace = workspace_id("snapshot");
@@ -681,16 +745,16 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
         Some("second-thread"),
         "the latest snapshot must win"
     );
-    let rows: i64 =
-        sqlx::query_scalar("select count(*) from runtime_snapshots where workspace_id = $1")
-            .bind(&workspace)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let rows = diesel::sql_query("select count(*) from runtime_snapshots where workspace_id = $1")
+        .bind::<Text, _>(&workspace)
+        .get_result::<CountRow>(&mut conn(&pool).await)
+        .await
+        .unwrap()
+        .count;
     assert_eq!(rows, 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_session_list_leads_with_the_most_recently_active_session() {
     let pool = pool().await;
     let workspace = workspace_id("list");
@@ -748,7 +812,7 @@ async fn the_session_list_leads_with_the_most_recently_active_session() {
     assert_eq!(sessions[1].first_user_message, None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_image_only_first_turn_previews_as_a_placeholder() {
     let pool = pool().await;
     let workspace = workspace_id("images");
@@ -781,7 +845,7 @@ async fn an_image_only_first_turn_previews_as_a_placeholder() {
     assert_eq!(sessions[0].first_user_message.as_deref(), Some("[image]"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_session_list_flags_a_session_waiting_on_a_human() {
     let pool = pool().await;
     let workspace = workspace_id("approval");
@@ -823,7 +887,7 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
     assert!(sessions[0].has_pending_approval);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn reopening_a_session_keeps_the_binding_it_was_created_with() {
     let pool = pool().await;
     let workspace = workspace_id("binding");
@@ -851,7 +915,7 @@ async fn reopening_a_session_keeps_the_binding_it_was_created_with() {
     assert_eq!(reopened, test_binding());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_name_can_be_set_and_cleared_without_touching_its_binding() {
     let pool = pool().await;
     let workspace = workspace_id("rename");
@@ -904,7 +968,7 @@ async fn a_session_name_can_be_set_and_cleared_without_touching_its_binding() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn clearing_the_reasoning_effort_stores_a_json_null() {
     let pool = pool().await;
     let workspace = workspace_id("effort-null");
@@ -922,20 +986,20 @@ async fn clearing_the_reasoning_effort_stores_a_json_null() {
     assert_eq!(binding.reasoning_effort, None);
     // A missing key would deserialize the same way, but writing `null` keeps the
     // stored shape identical to what serde produces for `Option<String>`.
-    let stored: String = sqlx::query_scalar(
-        "select model_binding->'reasoning_effort' #>> '{}' is null and
-                model_binding ? 'reasoning_effort' as ok
+    let stored = diesel::sql_query(
+        "select (model_binding->'reasoning_effort' #>> '{}' is null and
+                 model_binding ? 'reasoning_effort') as ok
            from sessions where workspace_id = $1",
     )
-    .bind(&workspace)
-    .fetch_one(&pool)
+    .bind::<Text, _>(&workspace)
+    .get_result::<BoolRow>(&mut conn(&pool).await)
     .await
-    .map(|ok: bool| ok.to_string())
-    .unwrap();
-    assert_eq!(stored, "true");
+    .unwrap()
+    .ok;
+    assert!(stored);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_effort_update_for_a_different_model_is_rejected() {
     let pool = pool().await;
     let workspace = workspace_id("mismatch");
@@ -968,7 +1032,7 @@ async fn an_effort_update_for_a_different_model_is_rejected() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn renaming_does_not_create_a_missing_session() {
     let pool = pool().await;
     let workspace = workspace_id("rename-missing");
@@ -981,7 +1045,7 @@ async fn renaming_does_not_create_a_missing_session() {
     assert!(storage.list_sessions().await.unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_deleted_session_leaves_the_list_and_is_reopenable() {
     let pool = pool().await;
     let workspace = workspace_id("delete");

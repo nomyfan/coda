@@ -27,20 +27,27 @@ axum = { version = "0.8", features = ["ws"] }
 brush-parser = "0.4.0"
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { workspace = true }
-jiff-sqlx = { version = "0.1", default-features = false, features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = [
-  "runtime-tokio",
-  "tls-rustls-ring",
-  "postgres",
-  # `macros` is here only for `sqlx::migrate!`, which embeds the migration files
-  # at compile time. The query macros (which would need a live database to
-  # build) are deliberately unused; every statement is built with the runtime
-  # API instead, so a checkout compiles without PostgreSQL.
-  "macros",
-  "json",
+# `postgres_backend`, not `postgres`: the latter pulls `pq-sys` and links libpq.
+# diesel-async talks to PostgreSQL through tokio-postgres, so the C library is
+# only ever needed by `diesel print-schema`, never by a build of this crate.
+diesel = { version = "2.3", default-features = false, features = [
+  "postgres_backend",
+  "serde_json",
   "uuid",
-  "migrate",
 ] }
+# Timestamps stay on jiff end to end; this supplies the `Timestamptz` codec that
+# the orphan rule keeps out of jiff itself. Its `postgres` feature is the same
+# libpq-free `diesel/postgres_backend` this crate already uses.
+jiff-diesel = { version = "0.1", default-features = false, features = ["postgres"] }
+diesel-async = { version = "0.9", default-features = false, features = [
+  "postgres",
+  "deadpool",
+  # Supplies `AsyncMigrationHarness`, which runs the embedded migrations over an
+  # async connection. It uses `block_in_place`, so callers need a multi-threaded
+  # runtime — the server has one; tests have to ask for it.
+  "migrations",
+] }
+diesel_migrations = "2.3"
 
 [dev-dependencies]
 tempfile = "3"
@@ -50,6 +57,9 @@ tempfile = "3"
 # machine without PostgreSQL (the CI matrix includes macOS runners, which have
 # none). The `storage-pg` CI job turns it on. Merely putting the tests under
 # `tests/` would not be enough: `cargo test` builds and runs every target there.
+#
+# Note the tests must run on a multi-threaded runtime (`#[tokio::test(flavor =
+# "multi_thread")]`): applying migrations goes through `block_in_place`.
 [features]
 pg-tests = []
 

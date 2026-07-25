@@ -11,6 +11,7 @@ use coda_agent::{
 };
 use coda_core::llm::{LLMProviderConfig, Message, Modality};
 use coda_openai::OpenAICompatible;
+use coda_server::storage::DbPool;
 use coda_server::{
     WorkspaceKnowledge,
     agents::{
@@ -40,7 +41,6 @@ use futures::stream::BoxStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sqlx::PgPool;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
@@ -1502,7 +1502,7 @@ fn resolve_agent_model_selections(
 async fn build_workspace(
     workspace: WorkspaceConfig,
     providers: &HashMap<String, Arc<ProviderHandle>>,
-    pool: &PgPool,
+    pool: &DbPool,
     shutdown: &CancellationToken,
 ) -> Result<WorkspaceState, String> {
     let workspace_dir = workspace.path.canonicalize().map_err(|e| {

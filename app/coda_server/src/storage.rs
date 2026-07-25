@@ -1,32 +1,73 @@
+use crate::jsonb::Json;
+use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints};
 use coda_agent::HistoryEntry;
 use coda_agent::agent::ReplyTarget;
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
 use coda_tools::TodoItem;
-// Brings `to_sqlx()` on jiff timestamps into scope; see `CheckpointRow`.
-use jiff_sqlx::ToSqlx;
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::types::Json;
+use diesel::prelude::*;
+use diesel::sql_types::{Array, Jsonb, Text};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::{Object, Pool};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 
+// `jsonb_set(target, path, new_value)`. Declaring it here is what keeps
+// `WorkspaceStorage::update_reasoning_effort` a single compare-and-set statement
+// instead of a read-modify-write: the call is type-checked like any built-in, so
+// the argument order and types cannot drift.
+diesel::define_sql_function! {
+    fn jsonb_set(target: Jsonb, path: Array<Text>, new_value: Jsonb) -> Jsonb;
+}
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+/// Serializes migration runs across processes.
+///
+/// Unlike sqlx's migrator, `diesel_migrations` takes no lock of its own, so two
+/// starts racing each other run `create table` concurrently and one loses with a
+/// `pg_type_typname_nsp_index` unique violation. Any stable number works; this
+/// one is arbitrary and only has to stay put. The lock is session-scoped, so
+/// closing the connection releases it even if applying the migrations fails.
+const MIGRATION_LOCK: i64 = 0x0C0D_A5E5_5104_1BEF;
+
+/// The process-wide connection pool.
+pub type DbPool = Pool<AsyncPgConnection>;
+
 /// Connect to PostgreSQL and bring the schema up to date.
 ///
-/// Migrations are embedded in the binary and run on every start, so deploying
-/// is all it takes to create or update the schema. The error deliberately omits
-/// the URL, which carries the password.
-pub async fn connect(database_url: &str) -> Result<PgPool, String> {
-    let pool = PgPoolOptions::new()
-        .connect(database_url)
+/// Migrations are embedded in the binary and run on every start, so deploying is
+/// all it takes to create or update the schema. They go over their own one-off
+/// connection rather than one borrowed from the pool: applying them blocks the
+/// thread (diesel's migration machinery is synchronous, and the harness bridges
+/// it with `block_in_place`), which is not something to do while holding a
+/// pooled connection. The errors deliberately omit the URL, which carries the
+/// password.
+pub async fn connect(database_url: &str) -> Result<DbPool, String> {
+    let mut conn = AsyncPgConnection::establish(database_url)
         .await
         .map_err(|err| format!("failed to connect to the database: {err}"))?;
-    sqlx::migrate!()
-        .run(&pool)
+    diesel::sql_query("select pg_advisory_lock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(MIGRATION_LOCK)
+        .execute(&mut conn)
         .await
+        .map_err(|err| format!("failed to take the migration lock: {err}"))?;
+    let mut harness = diesel_async::AsyncMigrationHarness::new(conn);
+    harness
+        .run_pending_migrations(MIGRATIONS)
         .map_err(|err| format!("failed to apply database migrations: {err}"))?;
-    Ok(pool)
+    // Dropping the connection releases the lock.
+    drop(harness.into_inner());
+
+    Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        database_url,
+    ))
+    .build()
+    .map_err(|err| format!("failed to build the database pool: {err}"))
 }
 
 /// Session-list preview shown for a session whose first user turn carried only
@@ -57,10 +98,20 @@ pub fn validate_session_id(session_id: &str) -> Result<(), String> {
 ///
 /// Every table is keyed on `(workspace_id, session_id)`, so scoping to a
 /// workspace is a bind parameter rather than a directory.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkspaceStorage {
-    pool: PgPool,
+    pool: DbPool,
     workspace_id: String,
+}
+
+// `AsyncPgConnection` is not `Debug`, so neither is the pool wrapping it. What a
+// reader wants from these anyway is which rows the handle is scoped to.
+impl std::fmt::Debug for WorkspaceStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceStorage")
+            .field("workspace_id", &self.workspace_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -115,15 +166,6 @@ pub struct SessionSummary {
     pub has_pending_approval: bool,
 }
 
-#[derive(sqlx::FromRow)]
-struct SessionSummaryRow {
-    session_id: String,
-    name: Option<String>,
-    updated_at_ms: i64,
-    has_pending_approval: bool,
-    first_user_message: Option<Json<Message>>,
-}
-
 fn normalize_session_name(
     requested_name: Option<&str>,
 ) -> Result<Option<String>, RenameSessionError> {
@@ -165,11 +207,18 @@ fn session_preview(message: &Message) -> Option<String> {
 }
 
 impl WorkspaceStorage {
-    pub fn new(pool: PgPool, workspace_id: impl Into<String>) -> Self {
+    pub fn new(pool: DbPool, workspace_id: impl Into<String>) -> Self {
         Self {
             pool,
             workspace_id: workspace_id.into(),
         }
+    }
+
+    async fn conn(&self) -> Result<Object<AsyncPgConnection>, String> {
+        self.pool
+            .get()
+            .await
+            .map_err(|err| format!("failed to acquire a database connection: {err}"))
     }
 
     /// Create the durable identity record for a newly opened session, and return
@@ -182,33 +231,38 @@ impl WorkspaceStorage {
         requested_binding: SessionModelBinding,
     ) -> Result<SessionModelBinding, SessionMetadataError> {
         validate_session_id(session_id).map_err(SessionMetadataError::InvalidSessionId)?;
-        sqlx::query(
-            "insert into sessions (workspace_id, session_id, model_binding)
-             values ($1, $2, $3)
-             on conflict (workspace_id, session_id) do nothing",
-        )
-        .bind(&self.workspace_id)
-        .bind(session_id)
-        .bind(Json(&requested_binding))
-        .execute(&self.pool)
-        .await
-        .map_err(|err| {
-            SessionMetadataError::Persistence(format!("failed to open session {session_id}: {err}"))
-        })?;
+        let mut conn = self
+            .conn()
+            .await
+            .map_err(SessionMetadataError::Persistence)?;
 
-        sqlx::query_scalar::<_, Json<SessionModelBinding>>(
-            "select model_binding from sessions where workspace_id = $1 and session_id = $2",
-        )
-        .bind(&self.workspace_id)
-        .bind(session_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|binding| binding.0)
-        .map_err(|err| {
-            SessionMetadataError::Persistence(format!(
-                "failed to read the binding of session {session_id}: {err}"
+        diesel::insert_into(sessions::table)
+            .values((
+                sessions::workspace_id.eq(&self.workspace_id),
+                sessions::session_id.eq(session_id),
+                sessions::model_binding.eq(Json(requested_binding)),
             ))
-        })
+            .on_conflict((sessions::workspace_id, sessions::session_id))
+            .do_nothing()
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                SessionMetadataError::Persistence(format!(
+                    "failed to open session {session_id}: {err}"
+                ))
+            })?;
+
+        sessions::table
+            .find((&self.workspace_id, session_id))
+            .select(sessions::model_binding)
+            .first::<Json<SessionModelBinding>>(&mut conn)
+            .await
+            .map(Json::into_inner)
+            .map_err(|err| {
+                SessionMetadataError::Persistence(format!(
+                    "failed to read the binding of session {session_id}: {err}"
+                ))
+            })
     }
 
     pub async fn rename_session(
@@ -218,26 +272,26 @@ impl WorkspaceStorage {
     ) -> Result<Option<String>, RenameSessionError> {
         validate_session_id(session_id).map_err(RenameSessionError::InvalidSessionId)?;
         let name = normalize_session_name(requested_name)?;
-        let renamed = sqlx::query(
-            "update sessions set name = $3 where workspace_id = $1 and session_id = $2",
-        )
-        .bind(&self.workspace_id)
-        .bind(session_id)
-        .bind(name.as_deref())
-        .execute(&self.pool)
-        .await
-        .map_err(|err| {
-            RenameSessionError::Persistence(format!("failed to rename session {session_id}: {err}"))
-        })?;
-        if renamed.rows_affected() == 0 {
+        let mut conn = self.conn().await.map_err(RenameSessionError::Persistence)?;
+
+        let renamed = diesel::update(sessions::table.find((&self.workspace_id, session_id)))
+            .set(sessions::name.eq(name.as_deref()))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                RenameSessionError::Persistence(format!(
+                    "failed to rename session {session_id}: {err}"
+                ))
+            })?;
+        if renamed == 0 {
             return Err(RenameSessionError::SessionNotFound);
         }
         Ok(name)
     }
 
     /// Change a session's reasoning effort, but only while it is still on the
-    /// model the caller thinks it is. The `where` clause is the compare-and-set:
-    /// no row updated means either the session is gone or its binding moved on.
+    /// model the caller thinks it is. The `filter` is the compare-and-set: no row
+    /// updated means either the session is gone or its binding moved on.
     pub async fn update_reasoning_effort(
         &self,
         session_id: &str,
@@ -249,21 +303,34 @@ impl WorkspaceStorage {
         let effort = reasoning_effort
             .map(|effort| serde_json::Value::String(effort.to_string()))
             .unwrap_or(serde_json::Value::Null);
-        let updated = sqlx::query_scalar::<_, Json<SessionModelBinding>>(
-            "update sessions
-                set model_binding = jsonb_set(model_binding, '{reasoning_effort}', $5)
-              where workspace_id = $1 and session_id = $2
-                and model_binding->>'provider_id' = $3
-                and model_binding->>'model_id' = $4
-             returning model_binding",
+        let mut conn = self
+            .conn()
+            .await
+            .map_err(SessionMetadataError::Persistence)?;
+
+        let updated = diesel::update(
+            sessions::table
+                .find((&self.workspace_id, session_id))
+                .filter(
+                    sessions::model_binding
+                        .retrieve_as_text("provider_id")
+                        .eq(expected_provider_id)
+                        .and(
+                            sessions::model_binding
+                                .retrieve_as_text("model_id")
+                                .eq(expected_model_id),
+                        ),
+                ),
         )
-        .bind(&self.workspace_id)
-        .bind(session_id)
-        .bind(expected_provider_id)
-        .bind(expected_model_id)
-        .bind(Json(effort))
-        .fetch_optional(&self.pool)
+        .set(sessions::model_binding.eq(jsonb_set(
+            sessions::model_binding,
+            vec!["reasoning_effort"],
+            Json(effort),
+        )))
+        .returning(sessions::model_binding)
+        .get_result::<Json<SessionModelBinding>>(&mut conn)
         .await
+        .optional()
         .map_err(|err| {
             SessionMetadataError::Persistence(format!(
                 "failed to update the reasoning effort of session {session_id}: {err}"
@@ -271,7 +338,7 @@ impl WorkspaceStorage {
         })?;
 
         match updated {
-            Some(binding) => Ok(binding.0),
+            Some(binding) => Ok(binding.into_inner()),
             None if self.session_exists(session_id).await? => {
                 Err(SessionMetadataError::BindingMismatch)
             }
@@ -280,12 +347,14 @@ impl WorkspaceStorage {
     }
 
     async fn session_exists(&self, session_id: &str) -> Result<bool, SessionMetadataError> {
-        sqlx::query_scalar::<_, bool>(
-            "select exists(select 1 from sessions where workspace_id = $1 and session_id = $2)",
-        )
-        .bind(&self.workspace_id)
-        .bind(session_id)
-        .fetch_one(&self.pool)
+        let mut conn = self
+            .conn()
+            .await
+            .map_err(SessionMetadataError::Persistence)?;
+        diesel::select(diesel::dsl::exists(
+            sessions::table.find((&self.workspace_id, session_id)),
+        ))
+        .get_result(&mut conn)
         .await
         .map_err(|err| {
             SessionMetadataError::Persistence(format!(
@@ -303,53 +372,81 @@ impl WorkspaceStorage {
     /// runtime snapshot go with it through `on delete cascade`.
     pub async fn delete_session(&self, session_id: &str) -> Result<(), String> {
         validate_session_id(session_id)?;
-        sqlx::query("delete from sessions where workspace_id = $1 and session_id = $2")
-            .bind(&self.workspace_id)
-            .bind(session_id)
-            .execute(&self.pool)
+        let mut conn = self.conn().await?;
+        diesel::delete(sessions::table.find((&self.workspace_id, session_id)))
+            .execute(&mut conn)
             .await
             .map(|_| ())
             .map_err(|err| format!("failed to delete session {session_id}: {err}"))
     }
 
     /// The workspace's sessions, most recently active first.
+    ///
+    /// The two derived columns stay in the query rather than becoming N+1 reads:
+    /// `has_pending_approval` is an `exists` over the session's threads, and
+    /// `first_user_message` is a correlated scalar subquery for the opening
+    /// message of the root thread (whose `thread_id` is the session id). The
+    /// epoch conversion is deliberately *not* pushed into SQL — selecting the
+    /// `timestamptz` and converting in Rust keeps the whole query inside the
+    /// checked DSL instead of dropping to a raw `extract(...)` fragment.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, String> {
-        sqlx::query_as::<_, SessionSummaryRow>(
-            "select s.session_id,
-                    s.name,
-                    (extract(epoch from s.updated_at) * 1000)::int8 as updated_at_ms,
-                    exists(select 1 from thread_checkpoints t
-                            where t.workspace_id = s.workspace_id
-                              and t.session_id = s.session_id
-                              and t.pending_approval) as has_pending_approval,
-                    (select m.payload from messages m
-                      where m.workspace_id = s.workspace_id
-                        and m.session_id = s.session_id
-                        and m.thread_id = s.session_id
-                        and m.role = 'user'
-                      order by m.seq
-                      limit 1) as first_user_message
-               from sessions s
-              where s.workspace_id = $1
-              order by s.updated_at desc, s.session_id asc",
-        )
-        .bind(&self.workspace_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| format!("failed to list sessions: {err}"))
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| SessionSummary {
-                    session_id: row.session_id,
-                    name: row.name,
-                    updated_at_ms: row.updated_at_ms as u64,
-                    first_user_message: row
-                        .first_user_message
-                        .and_then(|message| session_preview(&message.0)),
-                    has_pending_approval: row.has_pending_approval,
-                })
-                .collect()
-        })
+        let mut conn = self.conn().await?;
+        let first_user_message = messages::table
+            .filter(
+                messages::workspace_id
+                    .eq(sessions::workspace_id)
+                    .and(messages::session_id.eq(sessions::session_id))
+                    .and(messages::thread_id.eq(sessions::session_id))
+                    .and(messages::role.eq("user")),
+            )
+            .order(messages::seq)
+            .select(messages::payload)
+            .limit(1)
+            .single_value();
+        let has_pending_approval = diesel::dsl::exists(
+            thread_checkpoints::table.filter(
+                thread_checkpoints::workspace_id
+                    .eq(sessions::workspace_id)
+                    .and(thread_checkpoints::session_id.eq(sessions::session_id))
+                    .and(thread_checkpoints::pending_approval),
+            ),
+        );
+
+        let rows = sessions::table
+            .filter(sessions::workspace_id.eq(&self.workspace_id))
+            .select((
+                sessions::session_id,
+                sessions::name,
+                sessions::updated_at,
+                has_pending_approval,
+                first_user_message,
+            ))
+            .order((sessions::updated_at.desc(), sessions::session_id.asc()))
+            .load::<(
+                String,
+                Option<String>,
+                jiff_diesel::Timestamp,
+                bool,
+                Option<Json<Message>>,
+            )>(&mut conn)
+            .await
+            .map_err(|err| format!("failed to list sessions: {err}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_id, name, updated_at, has_pending_approval, first_user_message)| {
+                    SessionSummary {
+                        session_id,
+                        name,
+                        updated_at_ms: updated_at.to_jiff().as_millisecond().max(0) as u64,
+                        first_user_message: first_user_message
+                            .and_then(|message| session_preview(&message.0)),
+                        has_pending_approval,
+                    }
+                },
+            )
+            .collect())
     }
 }
 
@@ -360,35 +457,20 @@ impl WorkspaceStorage {
 /// starting point is the thread's own `message_count`: it is both "how many
 /// messages are already stored" and "the next free `seq`", which holds because
 /// `seq` is exactly the index into the checkpoint's message vector.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgSessionStorage {
-    pool: PgPool,
+    pool: DbPool,
     workspace_id: String,
     session_id: String,
 }
 
-/// A thread's state, minus its conversation.
-#[derive(sqlx::FromRow)]
-struct CheckpointRow {
-    agent_name: String,
-    parent_thread_id: Option<String>,
-    derivation_key: Option<String>,
-    reply_target: Option<Json<ReplyTarget>>,
-    resume_point: Json<StoredResumePoint>,
-    todos: Json<Vec<TodoItem>>,
-    /// The orphan rule keeps sqlx's traits off `jiff::Timestamp`, so timestamps
-    /// cross the SQL boundary through jiff-sqlx's wrapper — `to_sqlx()` on the
-    /// way in, `to_jiff()` on the way out. Both directions go through
-    /// microseconds, PostgreSQL's own resolution, so what comes back is exactly
-    /// what was written, truncated once on the way in rather than rounded by the
-    /// server.
-    suspended_at: jiff_sqlx::Timestamp,
-}
-
-#[derive(sqlx::FromRow)]
-struct MessageRow {
-    turn_id: uuid::Uuid,
-    payload: Json<Message>,
+impl std::fmt::Debug for PgSessionStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgSessionStorage")
+            .field("workspace_id", &self.workspace_id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The identity and role columns of a message row.
@@ -419,9 +501,23 @@ fn awaits_approval(resume_point: &StoredResumePoint) -> bool {
     )
 }
 
+/// A checkpoint save that failed on its own terms rather than on the database's,
+/// carried through diesel's transaction plumbing (which insists on an error type
+/// it can build from `diesel::result::Error`).
+enum SaveError {
+    Db(diesel::result::Error),
+    Rejected(String),
+}
+
+impl From<diesel::result::Error> for SaveError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Db(err)
+    }
+}
+
 impl PgSessionStorage {
     pub fn new(
-        pool: PgPool,
+        pool: DbPool,
         workspace_id: impl Into<String>,
         session_id: impl Into<String>,
     ) -> Self {
@@ -432,178 +528,188 @@ impl PgSessionStorage {
         }
     }
 
+    async fn conn(&self) -> Result<Object<AsyncPgConnection>, String> {
+        self.pool
+            .get()
+            .await
+            .map_err(|err| format!("failed to acquire a database connection: {err}"))
+    }
+
     /// Append the thread's new messages and overwrite its state, atomically.
     async fn write_checkpoint(
         &self,
         thread_id: &str,
         checkpoint: StoredCheckpoint,
     ) -> Result<(), String> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|err| format!("failed to open a transaction for {thread_id}: {err}"))?;
+        let mut conn = self.conn().await?;
+        conn.transaction(async |conn| {
+            let stored_count: Option<i32> = thread_checkpoints::table
+                .find((&self.workspace_id, &self.session_id, thread_id))
+                .select(thread_checkpoints::message_count)
+                .first(conn)
+                .await
+                .optional()?;
+            let stored_count = stored_count.unwrap_or(0) as usize;
 
-        let stored_count: Option<i32> = sqlx::query_scalar(
-            "select message_count from thread_checkpoints
-              where workspace_id = $1 and session_id = $2 and thread_id = $3",
-        )
-        .bind(&self.workspace_id)
-        .bind(&self.session_id)
-        .bind(thread_id)
-        .fetch_optional(&mut *tx)
+            // History is append-only, which is what makes appending the tail
+            // equivalent to rewriting the thread. A shorter checkpoint means
+            // someone rewrote history without resetting the count, and appending
+            // from the old count would drop messages silently.
+            if checkpoint.messages.len() < stored_count {
+                return Err(SaveError::Rejected(format!(
+                    "thread {thread_id} has {stored_count} stored messages but the checkpoint \
+                     carries {}; message history is append-only",
+                    checkpoint.messages.len()
+                )));
+            }
+
+            for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
+                let (message_id, role) =
+                    message_row_identity(&entry.message).map_err(SaveError::Rejected)?;
+                let origin = match &entry.message {
+                    Message::User(message) => message.origin.as_ref(),
+                    _ => None,
+                };
+                diesel::insert_into(messages::table)
+                    .values((
+                        messages::workspace_id.eq(&self.workspace_id),
+                        messages::session_id.eq(&self.session_id),
+                        messages::thread_id.eq(thread_id),
+                        messages::seq.eq((stored_count + offset) as i32),
+                        messages::message_id.eq(message_id.as_uuid()),
+                        messages::turn_id.eq(entry.turn_id.as_uuid()),
+                        messages::role.eq(role),
+                        messages::origin_message_id
+                            .eq(origin.map(|origin| origin.message_id.as_uuid())),
+                        messages::origin_call_id.eq(origin.map(|origin| origin.call_id.as_str())),
+                        messages::payload.eq(Json(&entry.message)),
+                    ))
+                    .execute(conn)
+                    .await?;
+            }
+
+            let state = (
+                thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
+                thread_checkpoints::parent_thread_id.eq(&checkpoint.parent_thread_id),
+                thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
+                thread_checkpoints::reply_target.eq(checkpoint.reply_target.as_ref().map(Json)),
+                thread_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
+                thread_checkpoints::todos.eq(Json(&checkpoint.todos)),
+                thread_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
+                thread_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
+                thread_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
+            );
+            diesel::insert_into(thread_checkpoints::table)
+                .values((
+                    thread_checkpoints::workspace_id.eq(&self.workspace_id),
+                    thread_checkpoints::session_id.eq(&self.session_id),
+                    thread_checkpoints::thread_id.eq(thread_id),
+                    state.clone(),
+                ))
+                .on_conflict((
+                    thread_checkpoints::workspace_id,
+                    thread_checkpoints::session_id,
+                    thread_checkpoints::thread_id,
+                ))
+                .do_update()
+                .set(state)
+                .execute(conn)
+                .await?;
+
+            touch(conn, &self.workspace_id, &self.session_id).await?;
+            Ok(())
+        })
         .await
-        .map_err(|err| format!("failed to read the message count of {thread_id}: {err}"))?;
-        let stored_count = stored_count.unwrap_or(0) as usize;
-
-        // History is append-only, which is what makes appending the tail
-        // equivalent to rewriting the thread. A shorter checkpoint means someone
-        // rewrote history without resetting the count, and appending from the old
-        // count would drop messages silently.
-        if checkpoint.messages.len() < stored_count {
-            return Err(format!(
-                "thread {thread_id} has {stored_count} stored messages but the checkpoint carries \
-                 {}; message history is append-only",
-                checkpoint.messages.len()
-            ));
-        }
-
-        for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
-            let (message_id, role) = message_row_identity(&entry.message)?;
-            let origin = match &entry.message {
-                Message::User(message) => message.origin.as_ref(),
-                _ => None,
-            };
-            sqlx::query(
-                "insert into messages
-                    (workspace_id, session_id, thread_id, seq, message_id, turn_id, role,
-                     origin_message_id, origin_call_id, payload)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            )
-            .bind(&self.workspace_id)
-            .bind(&self.session_id)
-            .bind(thread_id)
-            .bind((stored_count + offset) as i32)
-            .bind(message_id.as_uuid())
-            .bind(entry.turn_id.as_uuid())
-            .bind(role)
-            .bind(origin.map(|origin| origin.message_id.as_uuid()))
-            .bind(origin.map(|origin| origin.call_id.as_str()))
-            .bind(Json(&entry.message))
-            .execute(&mut *tx)
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to append message {} of {thread_id}: {err}",
-                    stored_count + offset
-                )
-            })?;
-        }
-
-        sqlx::query(
-            "insert into thread_checkpoints
-                (workspace_id, session_id, thread_id, agent_name, parent_thread_id,
-                 derivation_key, reply_target, resume_point, todos, suspended_at,
-                 message_count, pending_approval)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-             on conflict (workspace_id, session_id, thread_id) do update set
-                agent_name = excluded.agent_name,
-                parent_thread_id = excluded.parent_thread_id,
-                derivation_key = excluded.derivation_key,
-                reply_target = excluded.reply_target,
-                resume_point = excluded.resume_point,
-                todos = excluded.todos,
-                suspended_at = excluded.suspended_at,
-                message_count = excluded.message_count,
-                pending_approval = excluded.pending_approval",
-        )
-        .bind(&self.workspace_id)
-        .bind(&self.session_id)
-        .bind(thread_id)
-        .bind(&checkpoint.agent_name)
-        .bind(&checkpoint.parent_thread_id)
-        .bind(&checkpoint.derivation_key)
-        .bind(checkpoint.reply_target.as_ref().map(Json))
-        .bind(Json(&checkpoint.resume_point))
-        .bind(Json(&checkpoint.todos))
-        .bind(checkpoint.suspended_at.to_sqlx())
-        .bind(checkpoint.messages.len() as i32)
-        .bind(awaits_approval(&checkpoint.resume_point))
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| format!("failed to save the state of {thread_id}: {err}"))?;
-
-        self.touch(&mut tx).await?;
-        tx.commit()
-            .await
-            .map_err(|err| format!("failed to commit the checkpoint of {thread_id}: {err}"))
+        .map_err(|err| match err {
+            SaveError::Rejected(message) => message,
+            SaveError::Db(err) => format!("failed to save the checkpoint of {thread_id}: {err}"),
+        })
     }
 
     async fn read_checkpoint(&self, thread_id: &str) -> Result<Option<StoredCheckpoint>, String> {
-        let Some(state) = sqlx::query_as::<_, CheckpointRow>(
-            "select agent_name, parent_thread_id, derivation_key, reply_target, resume_point,
-                    todos, suspended_at
-               from thread_checkpoints
-              where workspace_id = $1 and session_id = $2 and thread_id = $3",
-        )
-        .bind(&self.workspace_id)
-        .bind(&self.session_id)
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?
+        let mut conn = self.conn().await?;
+        let state = thread_checkpoints::table
+            .find((&self.workspace_id, &self.session_id, thread_id))
+            .select((
+                thread_checkpoints::agent_name,
+                thread_checkpoints::parent_thread_id,
+                thread_checkpoints::derivation_key,
+                thread_checkpoints::reply_target,
+                thread_checkpoints::resume_point,
+                thread_checkpoints::todos,
+                thread_checkpoints::suspended_at,
+            ))
+            .first::<(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<Json<ReplyTarget>>,
+                Json<StoredResumePoint>,
+                Json<Vec<TodoItem>>,
+                jiff_diesel::Timestamp,
+            )>(&mut conn)
+            .await
+            .optional()
+            .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?;
+        let Some((
+            agent_name,
+            parent_thread_id,
+            derivation_key,
+            reply_target,
+            resume_point,
+            todos,
+            suspended_at,
+        )) = state
         else {
             return Ok(None);
         };
 
-        let messages = sqlx::query_as::<_, MessageRow>(
-            "select turn_id, payload from messages
-              where workspace_id = $1 and session_id = $2 and thread_id = $3
-              order by seq",
-        )
-        .bind(&self.workspace_id)
-        .bind(&self.session_id)
-        .bind(thread_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
-        .into_iter()
-        .map(|row| HistoryEntry {
-            turn_id: TurnId::from(MessageId::from(row.turn_id)),
-            message: row.payload.0,
-        })
-        .collect();
+        let messages = messages::table
+            .filter(
+                messages::workspace_id
+                    .eq(&self.workspace_id)
+                    .and(messages::session_id.eq(&self.session_id))
+                    .and(messages::thread_id.eq(thread_id)),
+            )
+            .order(messages::seq)
+            .select((messages::turn_id, messages::payload))
+            .load::<(uuid::Uuid, Json<Message>)>(&mut conn)
+            .await
+            .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
+            .into_iter()
+            .map(|(turn_id, payload)| HistoryEntry {
+                turn_id: TurnId::from(MessageId::from(turn_id)),
+                message: payload.0,
+            })
+            .collect();
 
         Ok(Some(StoredCheckpoint {
             thread_id: thread_id.to_string(),
-            agent_name: state.agent_name,
-            parent_thread_id: state.parent_thread_id,
-            derivation_key: state.derivation_key,
-            reply_target: state.reply_target.map(|target| target.0),
+            agent_name,
+            parent_thread_id,
+            derivation_key,
+            reply_target: reply_target.map(Json::into_inner),
             messages,
-            todos: state.todos.0,
-            resume_point: state.resume_point.0,
-            suspended_at: state.suspended_at.to_jiff(),
+            todos: todos.into_inner(),
+            resume_point: resume_point.into_inner(),
+            suspended_at: suspended_at.to_jiff(),
         }))
     }
+}
 
-    /// Record that the session changed, so the session list orders by it.
-    async fn touch(&self, tx: &mut sqlx::PgTransaction<'_>) -> Result<(), String> {
-        sqlx::query(
-            "update sessions set updated_at = now() where workspace_id = $1 and session_id = $2",
-        )
-        .bind(&self.workspace_id)
-        .bind(&self.session_id)
-        .execute(&mut **tx)
+/// Record that the session changed, so the session list orders by it. Free
+/// function rather than a method so it can run inside a transaction closure,
+/// which already holds the connection.
+async fn touch(
+    conn: &mut AsyncPgConnection,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(sessions::table.find((workspace_id, session_id)))
+        .set(sessions::updated_at.eq(diesel::dsl::now))
+        .execute(conn)
         .await
         .map(|_| ())
-        .map_err(|err| {
-            format!(
-                "failed to mark session {} as updated: {err}",
-                self.session_id
-            )
-        })
-    }
 }
 
 impl SessionStorage for PgSessionStorage {
@@ -629,26 +735,26 @@ impl SessionStorage for PgSessionStorage {
         snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            let mut tx =
-                self.pool.begin().await.map_err(|err| {
-                    format!("failed to open a transaction for the snapshot: {err}")
-                })?;
-            sqlx::query(
-                "insert into runtime_snapshots (workspace_id, session_id, snapshot)
-                 values ($1, $2, $3)
-                 on conflict (workspace_id, session_id) do update set
-                    snapshot = excluded.snapshot",
-            )
-            .bind(&self.workspace_id)
-            .bind(&self.session_id)
-            .bind(Json(&snapshot))
-            .execute(&mut *tx)
+            let mut conn = self.conn().await?;
+            conn.transaction(async |conn| {
+                diesel::insert_into(runtime_snapshots::table)
+                    .values((
+                        runtime_snapshots::workspace_id.eq(&self.workspace_id),
+                        runtime_snapshots::session_id.eq(&self.session_id),
+                        runtime_snapshots::snapshot.eq(Json(&snapshot)),
+                    ))
+                    .on_conflict((
+                        runtime_snapshots::workspace_id,
+                        runtime_snapshots::session_id,
+                    ))
+                    .do_update()
+                    .set(runtime_snapshots::snapshot.eq(Json(&snapshot)))
+                    .execute(conn)
+                    .await?;
+                touch(conn, &self.workspace_id, &self.session_id).await
+            })
             .await
-            .map_err(|err| format!("failed to save the runtime snapshot: {err}"))?;
-            self.touch(&mut tx).await?;
-            tx.commit()
-                .await
-                .map_err(|err| format!("failed to commit the runtime snapshot: {err}"))
+            .map_err(|err| format!("failed to save the runtime snapshot: {err}"))
         })
     }
 
@@ -658,19 +764,19 @@ impl SessionStorage for PgSessionStorage {
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
     {
         Box::pin(async move {
-            sqlx::query_scalar::<_, Json<StoredRuntimeSnapshot>>(
-                "select snapshot from runtime_snapshots
-                  where workspace_id = $1 and session_id = $2",
-            )
-            .bind(&self.workspace_id)
-            .bind(&self.session_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(|snapshot| snapshot.map(|snapshot| snapshot.0))
-            .map_err(|err| format!("failed to load the runtime snapshot: {err}"))
+            let mut conn = self.conn().await?;
+            runtime_snapshots::table
+                .find((&self.workspace_id, &self.session_id))
+                .select(runtime_snapshots::snapshot)
+                .first::<Json<StoredRuntimeSnapshot>>(&mut conn)
+                .await
+                .optional()
+                .map(|snapshot| snapshot.map(Json::into_inner))
+                .map_err(|err| format!("failed to load the runtime snapshot: {err}"))
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
