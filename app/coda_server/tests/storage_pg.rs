@@ -10,6 +10,16 @@
 //! `(workspace_id, session_id)` and `WorkspaceStorage` is workspace-scoped, so
 //! tests never see each other's rows and can run in parallel without cleanup.
 
+use coda_agent::HistoryEntry;
+use coda_agent::agent::ReplyTarget;
+use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use coda_agent::runtime::SessionStorage;
+use coda_core::llm::{
+    AssistantMessage, Message, MessageId, MessageOrigin, ReasoningContinuation, ToolCall,
+    ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
+};
+use coda_server::storage::PgSessionStorage;
+use coda_tools::TodoItem;
 use sqlx::{PgPool, Row};
 
 /// A fresh pool per test. A sqlx pool is tied to the runtime that created it and
@@ -29,6 +39,58 @@ async fn pool() -> PgPool {
 
 fn workspace_id(test: &str) -> String {
     format!("{test}-{}", uuid::Uuid::new_v4())
+}
+
+/// The session row everything else hangs off. `WorkspaceStorage` writes it when
+/// a session is first opened; these tests exercise the per-session storage on
+/// its own, so they seed it directly.
+async fn seed_session(pool: &PgPool, workspace: &str, session: &str) {
+    sqlx::query(
+        "insert into sessions (workspace_id, session_id, model_binding)
+         values ($1, $2, '{\"provider_id\":\"p\",\"model_id\":\"m\",\"reasoning_effort\":null}')",
+    )
+    .bind(workspace)
+    .bind(session)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A thread state with nothing interesting in it, so a test can show only the
+/// fields it is about.
+fn checkpoint(thread_id: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint {
+    StoredCheckpoint {
+        thread_id: thread_id.to_string(),
+        agent_name: "coda".to_string(),
+        parent_thread_id: None,
+        derivation_key: None,
+        reply_target: None,
+        messages,
+        todos: vec![],
+        resume_point: StoredResumePoint::Generation,
+        suspended_at: jiff::Timestamp::default(),
+    }
+}
+
+fn entry(turn_id: TurnId, message: Message) -> HistoryEntry {
+    HistoryEntry { turn_id, message }
+}
+
+/// A plain assistant reply, so tests that only need "something the agent said"
+/// don't spell out ten fields of timing and reasoning state.
+fn assistant(content: &str) -> Message {
+    Message::Assistant(AssistantMessage {
+        message_id: MessageId::new(),
+        content: content.to_string(),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
+        reasoning_continuation: None,
+        reasoning_ended_at: None,
+        aborted: false,
+        started_at: jiff::Timestamp::default(),
+        ended_at: jiff::Timestamp::default(),
+    })
 }
 
 #[tokio::test]
@@ -121,4 +183,505 @@ async fn a_thread_cannot_belong_to_a_session_that_does_not_exist() {
         orphan.is_err(),
         "the foreign key must reject a checkpoint with no session row"
     );
+}
+
+#[tokio::test]
+async fn a_saved_thread_comes_back_whole() {
+    let pool = pool().await;
+    let workspace = workspace_id("round-trip");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    let opening_call = MessageOrigin {
+        message_id: MessageId::new(),
+        call_id: "call_explore".to_string(),
+    };
+    // Sub-microsecond digits: PostgreSQL stores microseconds, so the write
+    // truncates there. Every consumer reads this at millisecond granularity.
+    let suspended_at = jiff::Timestamp::now();
+    let saved = StoredCheckpoint {
+        agent_name: "explore".to_string(),
+        parent_thread_id: Some("chat".to_string()),
+        derivation_key: Some(opening_call.derivation_key()),
+        reply_target: Some(ReplyTarget {
+            envelope_id: "env-1".to_string(),
+            sender_name: "coda".to_string(),
+            sender_thread_id: "chat".to_string(),
+            call_id: "call_explore".to_string(),
+        }),
+        todos: vec![TodoItem {
+            title: "read the schema".to_string(),
+            done: true,
+        }],
+        resume_point: StoredResumePoint::PendingApproval {
+            parent_message_id: MessageId::new(),
+            pending_approval_calls: vec![ToolCall {
+                id: "call_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: Some(r#"{"command":"ls"}"#.to_string()),
+            }],
+            pending_calls: vec![],
+        },
+        suspended_at,
+        ..checkpoint(
+            "explore-thread",
+            vec![
+                entry(
+                    turn,
+                    Message::User(UserMessage::from_subagent_call(
+                        MessageId::new(),
+                        "look into the schema",
+                        opening_call.clone(),
+                    )),
+                ),
+                entry(turn, assistant("on it")),
+                entry(
+                    turn,
+                    Message::Tool(ToolMessage::new(
+                        "call_shell",
+                        "shell",
+                        ToolOutput::Ok("migrations/".to_string()),
+                        ToolCallOutcome::Approved,
+                        None,
+                    )),
+                ),
+            ],
+        )
+    };
+
+    storage
+        .save_checkpoint("explore-thread".to_string(), saved.clone())
+        .await
+        .unwrap();
+    let loaded = storage
+        .load_checkpoint("explore-thread")
+        .await
+        .unwrap()
+        .expect("the checkpoint was just saved");
+
+    assert_eq!(loaded.thread_id, "explore-thread");
+    assert_eq!(loaded.agent_name, "explore");
+    assert_eq!(loaded.parent_thread_id.as_deref(), Some("chat"));
+    assert_eq!(
+        loaded.derivation_key,
+        Some(opening_call.derivation_key()),
+        "the derivation key is what lets a fork rebuild this thread's id"
+    );
+    assert_eq!(
+        loaded.reply_target.map(|target| target.envelope_id),
+        Some("env-1".to_string())
+    );
+    assert_eq!(loaded.todos.len(), 1);
+    assert!(matches!(
+        loaded.resume_point,
+        StoredResumePoint::PendingApproval { .. }
+    ));
+    assert_eq!(
+        loaded.suspended_at,
+        jiff::Timestamp::from_microsecond(suspended_at.as_microsecond()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&saved.messages).unwrap(),
+        "the conversation must survive the row split byte for byte"
+    );
+
+    // The columns split out of the payload carry the same values the payload does,
+    // which is what makes them safe to query on.
+    let row = sqlx::query(
+        "select role, turn_id, origin_message_id, origin_call_id, pending_approval, message_count
+           from messages
+           join thread_checkpoints using (workspace_id, session_id, thread_id)
+          where workspace_id = $1 and seq = 0",
+    )
+    .bind(&workspace)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("role"), "user");
+    assert_eq!(row.get::<uuid::Uuid, _>("turn_id"), turn.as_uuid());
+    assert_eq!(
+        row.get::<Option<uuid::Uuid>, _>("origin_message_id"),
+        Some(opening_call.message_id.as_uuid())
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("origin_call_id").as_deref(),
+        Some("call_explore")
+    );
+    assert!(row.get::<bool, _>("pending_approval"));
+    assert_eq!(row.get::<i32, _>("message_count"), 3);
+}
+
+#[tokio::test]
+async fn saving_twice_appends_only_the_new_messages() {
+    let pool = pool().await;
+    let workspace = workspace_id("append");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let first_turn = TurnId::from(MessageId::new());
+    let mut messages = vec![
+        entry(
+            first_turn,
+            Message::User(UserMessage::text(MessageId::new(), "hello")),
+        ),
+        entry(first_turn, assistant("hi")),
+    ];
+    storage
+        .save_checkpoint("chat".to_string(), checkpoint("chat", messages.clone()))
+        .await
+        .unwrap();
+
+    // `xmin` is the transaction that last wrote the row, so it changes if a row
+    // is rewritten rather than left alone.
+    let versions = sqlx::query(
+        "select seq, xmin::text as version from messages where workspace_id = $1 order by seq",
+    )
+    .bind(&workspace)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let first_versions: Vec<String> = versions
+        .iter()
+        .map(|row| row.get::<String, _>("version"))
+        .collect();
+    assert_eq!(first_versions.len(), 2);
+
+    let second_turn = TurnId::from(MessageId::new());
+    messages.push(entry(
+        second_turn,
+        Message::User(UserMessage::text(MessageId::new(), "and now?")),
+    ));
+    messages.push(entry(second_turn, assistant("now this")));
+    storage
+        .save_checkpoint("chat".to_string(), checkpoint("chat", messages.clone()))
+        .await
+        .unwrap();
+
+    let versions = sqlx::query(
+        "select seq, xmin::text as version from messages where workspace_id = $1 order by seq",
+    )
+    .bind(&workspace)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(versions.len(), 4, "the second save must add two rows");
+    assert_eq!(
+        versions[..2]
+            .iter()
+            .map(|row| row.get::<String, _>("version"))
+            .collect::<Vec<_>>(),
+        first_versions,
+        "the messages saved the first time must not be rewritten"
+    );
+    assert_eq!(
+        versions
+            .iter()
+            .map(|row| row.get::<i32, _>("seq"))
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "seq stays the contiguous index into the message vector"
+    );
+
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_that_lost_messages_is_refused() {
+    let pool = pool().await;
+    let workspace = workspace_id("shrunk");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    let messages = vec![
+        entry(
+            turn,
+            Message::User(UserMessage::text(MessageId::new(), "hello")),
+        ),
+        entry(turn, assistant("hi")),
+    ];
+    storage
+        .save_checkpoint("chat".to_string(), checkpoint("chat", messages.clone()))
+        .await
+        .unwrap();
+
+    // Appending "everything past the stored count" is only equivalent to
+    // rewriting the thread while history is append-only. A shorter history means
+    // that stopped being true, and continuing would drop messages silently.
+    let shrunk = storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint("chat", messages[..1].to_vec()),
+        )
+        .await;
+
+    assert!(
+        shrunk
+            .as_ref()
+            .is_err_and(|err| err.contains("append-only")),
+        "expected an append-only complaint, got {shrunk:?}"
+    );
+    let stored: i64 = sqlx::query_scalar("select count(*) from messages where workspace_id = $1")
+        .bind(&workspace)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "the refused save must not have changed anything");
+}
+
+#[tokio::test]
+async fn an_assistant_message_keeps_its_reasoning_continuation() {
+    let pool = pool().await;
+    let workspace = workspace_id("continuation");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let now = jiff::Timestamp::now();
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![entry(
+                    turn,
+                    Message::Assistant(AssistantMessage {
+                        message_id: MessageId::new(),
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "call_weather".to_string(),
+                            name: "lookup_weather".to_string(),
+                            arguments: Some(r#"{"city":"Singapore"}"#.to_string()),
+                        }],
+                        usage: None,
+                        reasoning_content: Some("Need current weather.".to_string()),
+                        reasoning_continuation: Some(
+                            ReasoningContinuation::try_new(
+                                "openrouter.reasoning_details.v1",
+                                serde_json::json!([
+                                    {"type": "reasoning.text", "text": "Need current weather."},
+                                    {"type": "reasoning.encrypted", "data": "opaque"}
+                                ]),
+                            )
+                            .unwrap(),
+                        ),
+                        reasoning_ended_at: Some(now),
+                        aborted: false,
+                        started_at: now,
+                        ended_at: now,
+                    }),
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    let Message::Assistant(message) = &loaded.messages[0].message else {
+        panic!("expected an assistant message");
+    };
+    let continuation = message
+        .reasoning_continuation
+        .as_ref()
+        .expect("reasoning continuation was not restored");
+    assert_eq!(continuation.format(), "openrouter.reasoning_details.v1");
+    assert_eq!(
+        continuation.payload_for("openrouter.reasoning_details.v1"),
+        Some(&serde_json::json!([
+            {"type": "reasoning.text", "text": "Need current weather."},
+            {"type": "reasoning.encrypted", "data": "opaque"}
+        ])),
+        "the opaque provider payload must survive verbatim"
+    );
+}
+
+#[tokio::test]
+async fn one_submission_is_recoverable_across_every_thread_it_reached() {
+    let pool = pool().await;
+    let workspace = workspace_id("turn");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let first = TurnId::from(MessageId::new());
+    let second = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "explore")),
+                    ),
+                    entry(first, assistant("delegating")),
+                    entry(
+                        second,
+                        Message::User(UserMessage::text(MessageId::new(), "anything else?")),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    // The sub-agent's own thread, carrying the same turn as the submission that
+    // reached it.
+    storage
+        .save_checkpoint(
+            "explore-thread".to_string(),
+            checkpoint(
+                "explore-thread",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "look around")),
+                    ),
+                    entry(first, assistant("found it")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    // One predicate collects a submission's whole fan-out — no walking `origin`
+    // up the thread tree. This is what a rewind will truncate on.
+    let reached: Vec<(String, i32)> = sqlx::query(
+        "select thread_id, seq from messages
+          where workspace_id = $1 and session_id = 'chat' and turn_id = $2
+          order by thread_id, seq",
+    )
+    .bind(&workspace)
+    .bind(first.as_uuid())
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| (row.get("thread_id"), row.get("seq")))
+    .collect();
+
+    assert_eq!(
+        reached,
+        vec![
+            ("chat".to_string(), 0),
+            ("chat".to_string(), 1),
+            ("explore-thread".to_string(), 0),
+            ("explore-thread".to_string(), 1),
+        ],
+        "the turn must find both threads, and only the first submission's messages"
+    );
+}
+
+#[tokio::test]
+async fn a_stateful_sub_agent_thread_grows_across_calls() {
+    let pool = pool().await;
+    let workspace = workspace_id("stateful");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    // A stateful sub-agent keeps one thread id across invocations, so its second
+    // call appends to the history the first one left behind.
+    let first_call = TurnId::from(MessageId::new());
+    let mut history = vec![
+        entry(
+            first_call,
+            Message::User(UserMessage::text(MessageId::new(), "first question")),
+        ),
+        entry(first_call, assistant("first answer")),
+    ];
+    storage
+        .save_checkpoint(
+            "explore-thread".to_string(),
+            checkpoint("explore-thread", history.clone()),
+        )
+        .await
+        .unwrap();
+
+    let second_call = TurnId::from(MessageId::new());
+    history.push(entry(
+        second_call,
+        Message::User(UserMessage::text(MessageId::new(), "second question")),
+    ));
+    history.push(entry(second_call, assistant("second answer")));
+    storage
+        .save_checkpoint(
+            "explore-thread".to_string(),
+            checkpoint("explore-thread", history.clone()),
+        )
+        .await
+        .unwrap();
+
+    let loaded = storage
+        .load_checkpoint("explore-thread")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.messages.len(), 4);
+    assert_eq!(
+        loaded
+            .messages
+            .iter()
+            .map(|entry| entry.turn_id.to_string())
+            .collect::<Vec<_>>(),
+        vec![
+            first_call.to_string(),
+            first_call.to_string(),
+            second_call.to_string(),
+            second_call.to_string(),
+        ],
+        "each call's messages stay tagged with the submission that caused them"
+    );
+}
+
+#[tokio::test]
+async fn the_runtime_snapshot_is_replaced_not_accumulated() {
+    let pool = pool().await;
+    let workspace = workspace_id("snapshot");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    assert!(
+        storage
+            .load_session_snapshot("chat")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    for thread in ["first-thread", "second-thread"] {
+        storage
+            .save_session_snapshot(
+                "chat".to_string(),
+                StoredRuntimeSnapshot {
+                    drained_envelopes: Default::default(),
+                    agent_drained_envelopes: Default::default(),
+                    active_threads: [("explore".to_string(), thread.to_string())].into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let loaded = storage
+        .load_session_snapshot("chat")
+        .await
+        .unwrap()
+        .expect("a snapshot was saved");
+    assert_eq!(
+        loaded.active_threads.get("explore").map(String::as_str),
+        Some("second-thread"),
+        "the latest snapshot must win"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from runtime_snapshots where workspace_id = $1")
+            .bind(&workspace)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1);
 }

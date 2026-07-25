@@ -1,8 +1,12 @@
+use coda_agent::HistoryEntry;
+use coda_agent::agent::ReplyTarget;
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
-use coda_core::llm::Message;
+use coda_core::llm::{Message, MessageId, TurnId};
+use coda_tools::TodoItem;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Json;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
@@ -542,6 +546,333 @@ impl SessionStorage for JsonFileStorage {
             serde_json::from_slice(&payload)
                 .map(Some)
                 .map_err(|err| format!("failed to parse snapshot {}: {err}", path.display()))
+        })
+    }
+}
+
+/// Persistence for one session, backed by PostgreSQL.
+///
+/// Messages are rows, so saving a checkpoint appends only what the thread has
+/// gained since the last save instead of rewriting its whole history. The
+/// starting point is the thread's own `message_count`: it is both "how many
+/// messages are already stored" and "the next free `seq`", which holds because
+/// `seq` is exactly the index into the checkpoint's message vector.
+#[derive(Clone, Debug)]
+pub struct PgSessionStorage {
+    pool: PgPool,
+    workspace_id: String,
+    session_id: String,
+}
+
+/// A thread's state, minus its conversation.
+#[derive(sqlx::FromRow)]
+struct CheckpointRow {
+    agent_name: String,
+    parent_thread_id: Option<String>,
+    derivation_key: Option<String>,
+    reply_target: Option<Json<ReplyTarget>>,
+    resume_point: Json<StoredResumePoint>,
+    todos: Json<Vec<TodoItem>>,
+    suspended_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MessageRow {
+    turn_id: uuid::Uuid,
+    payload: Json<Message>,
+}
+
+/// The identity and role columns of a message row.
+///
+/// A `System` message never reaches a checkpoint: the system prompt is inserted
+/// on a clone when a request is built, and `restore_history` drops it. So there
+/// is no row shape for one, and hitting this means the invariant broke upstream —
+/// worth a failed save rather than a minted id nobody can trace.
+fn message_row_identity(message: &Message) -> Result<(MessageId, &'static str), String> {
+    Ok(match message {
+        Message::User(message) => (message.message_id, "user"),
+        Message::Assistant(message) => (message.message_id, "assistant"),
+        Message::Tool(message) => (message.message_id, "tool"),
+        Message::System(_) => {
+            return Err("cannot persist a system message: the system prompt is not history".into());
+        }
+    })
+}
+
+/// Whether a thread in this state is waiting on a human.
+fn awaits_approval(resume_point: &StoredResumePoint) -> bool {
+    matches!(
+        resume_point,
+        StoredResumePoint::PendingApproval {
+            pending_approval_calls,
+            ..
+        } if !pending_approval_calls.is_empty()
+    )
+}
+
+/// jiff timestamps cross the SQL boundary as chrono values, which is what sqlx
+/// binds to `timestamptz`. Both directions go through microseconds — PostgreSQL's
+/// own resolution — so the value that comes back is exactly the one written,
+/// truncated once on the way in rather than rounded by the server.
+fn sql_timestamp(timestamp: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(timestamp.as_microsecond())
+        .expect("jiff's timestamp range is a subset of chrono's")
+}
+
+fn jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Result<jiff::Timestamp, String> {
+    jiff::Timestamp::from_microsecond(timestamp.timestamp_micros())
+        .map_err(|err| format!("stored timestamp is out of range: {err}"))
+}
+
+impl PgSessionStorage {
+    pub fn new(
+        pool: PgPool,
+        workspace_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            pool,
+            workspace_id: workspace_id.into(),
+            session_id: session_id.into(),
+        }
+    }
+
+    /// Append the thread's new messages and overwrite its state, atomically.
+    async fn write_checkpoint(
+        &self,
+        thread_id: &str,
+        checkpoint: StoredCheckpoint,
+    ) -> Result<(), String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| format!("failed to open a transaction for {thread_id}: {err}"))?;
+
+        let stored_count: Option<i32> = sqlx::query_scalar(
+            "select message_count from thread_checkpoints
+              where workspace_id = $1 and session_id = $2 and thread_id = $3",
+        )
+        .bind(&self.workspace_id)
+        .bind(&self.session_id)
+        .bind(thread_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| format!("failed to read the message count of {thread_id}: {err}"))?;
+        let stored_count = stored_count.unwrap_or(0) as usize;
+
+        // History is append-only, which is what makes appending the tail
+        // equivalent to rewriting the thread. A shorter checkpoint means someone
+        // rewrote history without resetting the count, and appending from the old
+        // count would drop messages silently.
+        if checkpoint.messages.len() < stored_count {
+            return Err(format!(
+                "thread {thread_id} has {stored_count} stored messages but the checkpoint carries \
+                 {}; message history is append-only",
+                checkpoint.messages.len()
+            ));
+        }
+
+        for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
+            let (message_id, role) = message_row_identity(&entry.message)?;
+            let origin = match &entry.message {
+                Message::User(message) => message.origin.as_ref(),
+                _ => None,
+            };
+            sqlx::query(
+                "insert into messages
+                    (workspace_id, session_id, thread_id, seq, message_id, turn_id, role,
+                     origin_message_id, origin_call_id, payload)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(&self.workspace_id)
+            .bind(&self.session_id)
+            .bind(thread_id)
+            .bind((stored_count + offset) as i32)
+            .bind(message_id.as_uuid())
+            .bind(entry.turn_id.as_uuid())
+            .bind(role)
+            .bind(origin.map(|origin| origin.message_id.as_uuid()))
+            .bind(origin.map(|origin| origin.call_id.as_str()))
+            .bind(Json(&entry.message))
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to append message {} of {thread_id}: {err}",
+                    stored_count + offset
+                )
+            })?;
+        }
+
+        sqlx::query(
+            "insert into thread_checkpoints
+                (workspace_id, session_id, thread_id, agent_name, parent_thread_id,
+                 derivation_key, reply_target, resume_point, todos, suspended_at,
+                 message_count, pending_approval)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             on conflict (workspace_id, session_id, thread_id) do update set
+                agent_name = excluded.agent_name,
+                parent_thread_id = excluded.parent_thread_id,
+                derivation_key = excluded.derivation_key,
+                reply_target = excluded.reply_target,
+                resume_point = excluded.resume_point,
+                todos = excluded.todos,
+                suspended_at = excluded.suspended_at,
+                message_count = excluded.message_count,
+                pending_approval = excluded.pending_approval",
+        )
+        .bind(&self.workspace_id)
+        .bind(&self.session_id)
+        .bind(thread_id)
+        .bind(&checkpoint.agent_name)
+        .bind(&checkpoint.parent_thread_id)
+        .bind(&checkpoint.derivation_key)
+        .bind(checkpoint.reply_target.as_ref().map(Json))
+        .bind(Json(&checkpoint.resume_point))
+        .bind(Json(&checkpoint.todos))
+        .bind(sql_timestamp(checkpoint.suspended_at))
+        .bind(checkpoint.messages.len() as i32)
+        .bind(awaits_approval(&checkpoint.resume_point))
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| format!("failed to save the state of {thread_id}: {err}"))?;
+
+        self.touch(&mut tx).await?;
+        tx.commit()
+            .await
+            .map_err(|err| format!("failed to commit the checkpoint of {thread_id}: {err}"))
+    }
+
+    async fn read_checkpoint(&self, thread_id: &str) -> Result<Option<StoredCheckpoint>, String> {
+        let Some(state) = sqlx::query_as::<_, CheckpointRow>(
+            "select agent_name, parent_thread_id, derivation_key, reply_target, resume_point,
+                    todos, suspended_at
+               from thread_checkpoints
+              where workspace_id = $1 and session_id = $2 and thread_id = $3",
+        )
+        .bind(&self.workspace_id)
+        .bind(&self.session_id)
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?
+        else {
+            return Ok(None);
+        };
+
+        let messages = sqlx::query_as::<_, MessageRow>(
+            "select turn_id, payload from messages
+              where workspace_id = $1 and session_id = $2 and thread_id = $3
+              order by seq",
+        )
+        .bind(&self.workspace_id)
+        .bind(&self.session_id)
+        .bind(thread_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
+        .into_iter()
+        .map(|row| HistoryEntry {
+            turn_id: TurnId::from(MessageId::from(row.turn_id)),
+            message: row.payload.0,
+        })
+        .collect();
+
+        Ok(Some(StoredCheckpoint {
+            thread_id: thread_id.to_string(),
+            agent_name: state.agent_name,
+            parent_thread_id: state.parent_thread_id,
+            derivation_key: state.derivation_key,
+            reply_target: state.reply_target.map(|target| target.0),
+            messages,
+            todos: state.todos.0,
+            resume_point: state.resume_point.0,
+            suspended_at: jiff_timestamp(state.suspended_at)?,
+        }))
+    }
+
+    /// Record that the session changed, so the session list orders by it.
+    async fn touch(&self, tx: &mut sqlx::PgTransaction<'_>) -> Result<(), String> {
+        sqlx::query(
+            "update sessions set updated_at = now() where workspace_id = $1 and session_id = $2",
+        )
+        .bind(&self.workspace_id)
+        .bind(&self.session_id)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed to mark session {} as updated: {err}",
+                self.session_id
+            )
+        })
+    }
+}
+
+impl SessionStorage for PgSessionStorage {
+    fn save_checkpoint(
+        &self,
+        thread_id: String,
+        checkpoint: StoredCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move { self.write_checkpoint(&thread_id, checkpoint).await })
+    }
+
+    fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
+        let thread_id = thread_id.to_string();
+        Box::pin(async move { self.read_checkpoint(&thread_id).await })
+    }
+
+    fn save_session_snapshot(
+        &self,
+        _session_id: String,
+        snapshot: StoredRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut tx =
+                self.pool.begin().await.map_err(|err| {
+                    format!("failed to open a transaction for the snapshot: {err}")
+                })?;
+            sqlx::query(
+                "insert into runtime_snapshots (workspace_id, session_id, snapshot)
+                 values ($1, $2, $3)
+                 on conflict (workspace_id, session_id) do update set
+                    snapshot = excluded.snapshot",
+            )
+            .bind(&self.workspace_id)
+            .bind(&self.session_id)
+            .bind(Json(&snapshot))
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| format!("failed to save the runtime snapshot: {err}"))?;
+            self.touch(&mut tx).await?;
+            tx.commit()
+                .await
+                .map_err(|err| format!("failed to commit the runtime snapshot: {err}"))
+        })
+    }
+
+    fn load_session_snapshot(
+        &self,
+        _session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StoredRuntimeSnapshot>, String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, Json<StoredRuntimeSnapshot>>(
+                "select snapshot from runtime_snapshots
+                  where workspace_id = $1 and session_id = $2",
+            )
+            .bind(&self.workspace_id)
+            .bind(&self.session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.0))
+            .map_err(|err| format!("failed to load the runtime snapshot: {err}"))
         })
     }
 }

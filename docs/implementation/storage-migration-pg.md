@@ -171,9 +171,11 @@ runtime_snapshots(workspace_id, session_id,
       - Purpose: 固化数据模型与删除语义
       - Verification: 迁移在空库跑通；`DELETE FROM sessions` 级联清掉 messages/thread_checkpoints/runtime_snapshots，无孤儿
       - 落地：`app/coda_server/migrations/20260725000000_sessions.sql`（`sqlx::migrate!` 编译期内嵌）。测试 `deleting_a_session_takes_its_threads_messages_and_snapshot_with_it` 建两个会话各带 checkpoint/message/snapshot，删其一后断言三张表只剩另一个会话的行（反向验证：把 DELETE 的 session_id 打错 → 断言以 "thread_checkpoints was not cascaded" 失败）；`a_thread_cannot_belong_to_a_session_that_does_not_exist` 反向确认外键真的存在，不只是"删对了"
-- [ ] [core logic] PG session 存储实现 `SessionStorage`：事务内增量追加 + 线程状态记录 upsert；load 拼行重建
+- [x] [core logic] PG session 存储实现 `SessionStorage`：事务内增量追加 + 线程状态记录 upsert；load 拼行重建
       - Purpose: 核心行为可单测
       - Verification: save→load round-trip 等价（含每行 `turn_id` / `origin_*`）；连续两次 save 只新增尾部行（`message_count` 生效）；平移 `checkpoint_round_trips_reasoning_continuation`；按 `turn_id` 跨线程查回一次提交的全部消息
+      - 落地：`PgSessionStorage`（`storage.rs`）。7 个测试：`a_saved_thread_comes_back_whole`（每个字段 + 拆出来的 `turn_id`/`origin_*`/`pending_approval`/`message_count` 列与 payload 一致）、`saving_twice_appends_only_the_new_messages`、`a_checkpoint_that_lost_messages_is_refused`（append-only 断言）、`an_assistant_message_keeps_its_reasoning_continuation`、`one_submission_is_recoverable_across_every_thread_it_reached`、`a_stateful_sub_agent_thread_grows_across_calls`、`the_runtime_snapshot_is_replaced_not_accumulated`
+      - 「只追加尾部」怎么证：用 `xmin`（最后写这行的事务号）当探针。把实现改成"每次 save 重写全部行"（`on conflict do update`）后，前两行的 `xmin` 变化 → 断言以 "the messages saved the first time must not be rewritten" 失败。这正是本次迁移要消掉的写放大，所以这条断言是有牙的。另一次反向验证：把 `turn_id` 换成随机 uuid → 4 个测试同时失败
 - [ ] [core logic] PG `WorkspaceStorage`：list / initialize / rename / effort / delete 的 SQL 版
       - Purpose: 覆盖元数据与列表
       - Verification: 平移 `storage.rs` 现有单测（list 排序、pending_approval 标记、image-only 预览、改名/effort）到 PG 后端
