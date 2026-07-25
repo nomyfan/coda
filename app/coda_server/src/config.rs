@@ -91,10 +91,17 @@ impl Default for RelayConfig {
     }
 }
 
+/// Where sessions are persisted. Required: PostgreSQL is the only backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
+    pub database: DatabaseConfig,
     pub relay: RelayConfig,
 }
 
@@ -110,12 +117,28 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
 
     let providers = parse_providers(&doc)?;
     let workspaces = parse_workspaces(&doc, base_dir)?;
+    let database = parse_database(&doc)?;
     let relay = parse_relay(&doc)?;
 
     Ok(ServerConfig {
         providers,
         workspaces,
+        database,
         relay,
+    })
+}
+
+fn parse_database(doc: &toml_edit::DocumentMut) -> Result<DatabaseConfig, ConfigError> {
+    let table = doc
+        .get("database")
+        .and_then(|item| item.as_table())
+        .ok_or_else(|| {
+            ConfigError::Parse(
+                "missing [database] table: set `url` to a PostgreSQL connection string".to_string(),
+            )
+        })?;
+    Ok(DatabaseConfig {
+        url: expand_env(&require_str(table, "url", "database")?)?,
     })
 }
 
@@ -918,6 +941,13 @@ mod tests {
         );
     }
 
+    /// Every config needs a database, so fixtures that are not about the
+    /// database still have to carry one.
+    const DATABASE: &str = r#"
+[database]
+url = "postgres://localhost/coda"
+"#;
+
     const PROVIDERS: &str = r#"
 [[providers]]
 id = "deepseek"
@@ -933,7 +963,7 @@ models = [
     fn parse_server_config_resolves_workspaces() {
         let config = parse_server_config(
             &format!(
-                r#"{PROVIDERS}
+                r#"{PROVIDERS}{DATABASE}
 [[workspaces]]
 id = "coda"
 path = "projects/coda"
@@ -990,6 +1020,9 @@ path = "/tmp/scratch"
         let _env = EnvVarGuard::set("CODA_TEST_KEY", "secret-from-env");
         let config = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "deepseek"
 api_key = "${CODA_TEST_KEY}"
@@ -1014,9 +1047,53 @@ path = "/tmp/coda"
     }
 
     #[test]
+    fn parse_server_config_expands_env_database_url() {
+        let _env = EnvVarGuard::set("CODA_TEST_DATABASE_URL", "postgres://user:pw@db:5432/coda");
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}
+[database]
+url = "${{CODA_TEST_DATABASE_URL}}"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+        assert_eq!(config.database.url, "postgres://user:pw@db:5432/coda");
+    }
+
+    #[test]
+    fn parse_server_config_requires_a_database() {
+        // PostgreSQL is the only backend, so there is nothing sensible to fall
+        // back to — starting without it would only fail later, per session.
+        let err = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Parse(message) if message.contains("[database]")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_server_config_accepts_arbitrary_reasoning_efforts() {
         let config = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "deepseek"
 api_key = "sk-test"
@@ -1042,6 +1119,9 @@ path = "/tmp/coda"
     fn parse_server_config_parses_default_reasoning_effort() {
         let config = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "deepseek"
 api_key = "sk-test"
@@ -1067,6 +1147,9 @@ path = "/tmp/coda"
     fn parse_server_config_rejects_invalid_default_reasoning_effort() {
         let err = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "deepseek"
 api_key = "sk-test"
@@ -1092,6 +1175,9 @@ path = "/tmp/coda"
     fn parse_server_config_parses_input_modalities() {
         let config = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "openai"
 api_key = "sk-test"
@@ -1127,6 +1213,9 @@ path = "/tmp/coda"
     fn parse_server_config_rejects_unknown_input_modality() {
         let err = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "openai"
 api_key = "sk-test"
@@ -1149,6 +1238,9 @@ path = "/tmp/coda"
     fn parse_server_config_requires_context_window() {
         let err = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "deepseek"
 api_key = "sk-test"
@@ -1175,6 +1267,9 @@ path = "/tmp/coda"
     fn parse_server_config_accepts_openrouter_and_optional_completion_limit() {
         let config = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "openrouter"
 kind = "openrouter"
@@ -1205,6 +1300,9 @@ path = "/tmp/coda"
     fn parse_server_config_rejects_unknown_provider_kind() {
         let error = parse_server_config(
             r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "gateway"
 kind = "other"
@@ -1228,6 +1326,9 @@ path = "/tmp/coda"
         for value in ["0", "-1", "1001", "\"large\""] {
             let config = format!(
                 r#"
+[database]
+url = "postgres://localhost/coda"
+
 [[providers]]
 id = "openrouter"
 kind = "openrouter"
@@ -1251,7 +1352,7 @@ path = "/tmp/coda"
     fn parse_server_config_rejects_duplicate_ids() {
         let err = parse_server_config(
             &format!(
-                r#"{PROVIDERS}
+                r#"{PROVIDERS}{DATABASE}
 [[workspaces]]
 id = "coda"
 path = "/tmp/a"
@@ -1272,7 +1373,7 @@ path = "/tmp/b"
     fn parse_server_config_defaults_relay_limits() {
         let config = parse_server_config(
             &format!(
-                r#"{PROVIDERS}
+                r#"{PROVIDERS}{DATABASE}
 [[workspaces]]
 id = "coda"
 path = "/tmp/coda"
@@ -1289,7 +1390,7 @@ path = "/tmp/coda"
     fn parse_server_config_overrides_relay_limits() {
         let config = parse_server_config(
             &format!(
-                r#"{PROVIDERS}
+                r#"{PROVIDERS}{DATABASE}
 [[workspaces]]
 id = "coda"
 path = "/tmp/coda"
@@ -1316,7 +1417,7 @@ max_message_tier_events = 50
     fn parse_server_config_rejects_non_positive_relay_limit() {
         let err = parse_server_config(
             &format!(
-                r#"{PROVIDERS}
+                r#"{PROVIDERS}{DATABASE}
 [[workspaces]]
 id = "coda"
 path = "/tmp/coda"

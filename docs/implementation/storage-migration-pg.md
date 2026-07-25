@@ -176,12 +176,17 @@ runtime_snapshots(workspace_id, session_id,
       - Verification: save→load round-trip 等价（含每行 `turn_id` / `origin_*`）；连续两次 save 只新增尾部行（`message_count` 生效）；平移 `checkpoint_round_trips_reasoning_continuation`；按 `turn_id` 跨线程查回一次提交的全部消息
       - 落地：`PgSessionStorage`（`storage.rs`）。7 个测试：`a_saved_thread_comes_back_whole`（每个字段 + 拆出来的 `turn_id`/`origin_*`/`pending_approval`/`message_count` 列与 payload 一致）、`saving_twice_appends_only_the_new_messages`、`a_checkpoint_that_lost_messages_is_refused`（append-only 断言）、`an_assistant_message_keeps_its_reasoning_continuation`、`one_submission_is_recoverable_across_every_thread_it_reached`、`a_stateful_sub_agent_thread_grows_across_calls`、`the_runtime_snapshot_is_replaced_not_accumulated`
       - 「只追加尾部」怎么证：用 `xmin`（最后写这行的事务号）当探针。把实现改成"每次 save 重写全部行"（`on conflict do update`）后，前两行的 `xmin` 变化 → 断言以 "the messages saved the first time must not be rewritten" 失败。这正是本次迁移要消掉的写放大，所以这条断言是有牙的。另一次反向验证：把 `turn_id` 换成随机 uuid → 4 个测试同时失败
-- [ ] [core logic] PG `WorkspaceStorage`：list / initialize / rename / effort / delete 的 SQL 版
+- [x] [core logic] PG `WorkspaceStorage`：list / initialize / rename / effort / delete 的 SQL 版
       - Purpose: 覆盖元数据与列表
       - Verification: 平移 `storage.rs` 现有单测（list 排序、pending_approval 标记、image-only 预览、改名/effort）到 PG 后端
-- [ ] [integration] `[database]` 配置 + 进程级 `PgPool` + 迁移随启动；`bin/server.rs` 装配换 PG，移除 `JsonFileStorage`
+      - 落地：9 个测试搬到 `tests/storage_pg.rs`（`the_session_list_leads_with_the_most_recently_active_session`、`an_image_only_first_turn_previews_as_a_placeholder`、`the_session_list_flags_a_session_waiting_on_a_human`、`reopening_a_session_keeps_the_binding_it_was_created_with`、`a_session_name_can_be_set_and_cleared_without_touching_its_binding`、`clearing_the_reasoning_effort_stores_a_json_null`、`an_effort_update_for_a_different_model_is_rejected`、`renaming_does_not_create_a_missing_session`、`a_deleted_session_leaves_the_list_and_is_reopenable`）。留在内联的是两个 `validate_session_id_*` 和名字规范化——纯字符串逻辑，普通 `cargo test` 仍覆盖
+      - 三个旧测试删掉而不是平移，因为它们测的状态在 PG 下不存在：`failed_atomic_metadata_write_preserves_the_previous_file`（靠改目录权限模拟半写，事务已经保证）、`list_sessions_skips_missing_or_invalid_metadata`（`name` 是列、`model_binding` 是 `not null`，"元数据坏了"不再是可表示的状态）、`delete_session_rejects_traversal_without_touching_filesystem`（没有文件系统可穿越；拒绝集本身仍有内联测试）
+      - `has_pending_approval` 的判据从"root 线程 + snapshot 里 `active_threads` 列出的线程"变成"该会话任意线程"。`active_threads` 按 agent 名索引，一个 agent 名只记一条线程，所以旧判据依赖"同名 agent 不会有第二条活跃线程"这个隐含前提；新判据是一条 `exists` 子查询，不依赖任何前提，也更简单
+- [x] [integration] `[database]` 配置 + 进程级 `PgPool` + 迁移随启动；`bin/server.rs` 装配换 PG，移除 `JsonFileStorage`
       - Purpose: 真实路径打通
       - Verification: 起服务→开会话→发 task→重开会话，历史一致；`list_workspaces` 返回正确会话列表
+      - 落地：`[database].url` 必填（缺了直接启动失败，有 `parse_server_config_requires_a_database` 覆盖），支持 `${VAR}`；`main` 先 `storage::connect`（连接 + 跑迁移）再逐个 workspace 建 `WorkspaceStorage::new(pool.clone(), &workspace.id)`。`JsonFileStorage` 及 `atomic-write-file` 相关写法全部删除
+      - 真实路径怎么验的：一次性脚本起真 server（配置指向一个本地 stub 的 OpenAI 兼容端点，避免真实 API 调用），走 `list_workspaces` → `open_session` → `task` → 断连 → 新连接 `open_session`，确认历史（user + assistant 两条）从库里读回、`list_workspaces` 里该会话的预览是首个 user 消息。脚本是验证工具，不进仓库
 - [ ] [ci] 给 `.github/workflows/ci.yml` 增设第三个 job `storage-pg`（现有两个是 `rust` 矩阵和 `web`）
       - `runs-on: ubuntu-latest` + `services.postgres`（`postgres:17`，带 `pg_isready` 健康检查），注入 `DATABASE_URL`
       - 存储集成测试放独立测试目标 `app/coda_server/tests/storage_pg.rs`，并用 **Cargo `required-features` 把它挡在默认构建之外**（`[features] pg-tests = []` + `[[test]] name = "storage_pg" required-features = ["pg-tests"]`）。注意：仅仅"放到 `tests/` 下"是**不够**的——`cargo test` 会编译并运行 `tests/` 下所有目标；靠 `required-features` 才能让未开 feature 时该目标根本不编译

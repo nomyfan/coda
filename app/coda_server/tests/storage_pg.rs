@@ -18,7 +18,10 @@ use coda_core::llm::{
     AssistantMessage, Message, MessageId, MessageOrigin, ReasoningContinuation, ToolCall,
     ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
-use coda_server::storage::PgSessionStorage;
+use coda_server::storage::{
+    PgSessionStorage, RenameSessionError, SessionMetadataError, SessionModelBinding,
+    WorkspaceStorage,
+};
 use coda_tools::TodoItem;
 use sqlx::{PgPool, Row};
 
@@ -41,19 +44,20 @@ fn workspace_id(test: &str) -> String {
     format!("{test}-{}", uuid::Uuid::new_v4())
 }
 
-/// The session row everything else hangs off. `WorkspaceStorage` writes it when
-/// a session is first opened; these tests exercise the per-session storage on
-/// its own, so they seed it directly.
+fn test_binding() -> SessionModelBinding {
+    SessionModelBinding {
+        provider_id: "openrouter".to_string(),
+        model_id: "x-ai/grok-4.5".to_string(),
+        reasoning_effort: Some("high".to_string()),
+    }
+}
+
+/// The session row everything else hangs off, written the way production does.
 async fn seed_session(pool: &PgPool, workspace: &str, session: &str) {
-    sqlx::query(
-        "insert into sessions (workspace_id, session_id, model_binding)
-         values ($1, $2, '{\"provider_id\":\"p\",\"model_id\":\"m\",\"reasoning_effort\":null}')",
-    )
-    .bind(workspace)
-    .bind(session)
-    .execute(pool)
-    .await
-    .unwrap();
+    WorkspaceStorage::new(pool.clone(), workspace)
+        .initialize_session(session, test_binding())
+        .await
+        .unwrap();
 }
 
 /// A thread state with nothing interesting in it, so a test can show only the
@@ -684,4 +688,341 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
             .await
             .unwrap();
     assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn the_session_list_leads_with_the_most_recently_active_session() {
+    let pool = pool().await;
+    let workspace = workspace_id("list");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("idle", test_binding())
+        .await
+        .unwrap();
+    // `updated_at_ms` has millisecond resolution, so give the two sessions
+    // distinguishable activity instead of relying on how fast the test runs.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    storage
+        .initialize_session("active", test_binding())
+        .await
+        .unwrap();
+
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .session("active")
+        .save_checkpoint(
+            "active".to_string(),
+            checkpoint(
+                "active",
+                vec![
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "recent session")),
+                    ),
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "a later turn")),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let sessions = storage.list_sessions().await.unwrap();
+
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["active", "idle"]
+    );
+    assert!(sessions[0].updated_at_ms > sessions[1].updated_at_ms);
+    assert_eq!(
+        sessions[0].first_user_message.as_deref(),
+        Some("recent session"),
+        "the preview is the session's first user turn, not its latest"
+    );
+    assert!(!sessions[0].has_pending_approval);
+    assert_eq!(sessions[1].first_user_message, None);
+}
+
+#[tokio::test]
+async fn an_image_only_first_turn_previews_as_a_placeholder() {
+    let pool = pool().await;
+    let workspace = workspace_id("images");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("images", test_binding())
+        .await
+        .unwrap();
+
+    storage
+        .session("images")
+        .save_checkpoint(
+            "images".to_string(),
+            checkpoint(
+                "images",
+                vec![entry(
+                    TurnId::from(MessageId::new()),
+                    Message::User(UserMessage::with_images(
+                        MessageId::new(),
+                        "",
+                        &["data:image/png;base64,AAAA".to_string()],
+                    )),
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let sessions = storage.list_sessions().await.unwrap();
+    assert_eq!(sessions[0].first_user_message.as_deref(), Some("[image]"));
+}
+
+#[tokio::test]
+async fn the_session_list_flags_a_session_waiting_on_a_human() {
+    let pool = pool().await;
+    let workspace = workspace_id("approval");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("review", test_binding())
+        .await
+        .unwrap();
+    let session = storage.session("review");
+
+    session
+        .save_checkpoint("review".to_string(), checkpoint("review", vec![]))
+        .await
+        .unwrap();
+    // The thread that is actually waiting is a sub-agent's, not the root's. Any
+    // thread of the session counts, so the flag doesn't depend on which thread
+    // happens to be suspended.
+    session
+        .save_checkpoint(
+            "explore-thread".to_string(),
+            StoredCheckpoint {
+                resume_point: StoredResumePoint::PendingApproval {
+                    parent_message_id: MessageId::new(),
+                    pending_approval_calls: vec![ToolCall {
+                        id: "call_shell".to_string(),
+                        name: "shell".to_string(),
+                        arguments: Some(r#"{"command":"cargo test"}"#.to_string()),
+                    }],
+                    pending_calls: vec![],
+                },
+                ..checkpoint("explore-thread", vec![])
+            },
+        )
+        .await
+        .unwrap();
+
+    let sessions = storage.list_sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions[0].has_pending_approval);
+}
+
+#[tokio::test]
+async fn reopening_a_session_keeps_the_binding_it_was_created_with() {
+    let pool = pool().await;
+    let workspace = workspace_id("binding");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+
+    let created = storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+    assert_eq!(created, test_binding());
+
+    // A browser that now prefers a different model must not silently move an
+    // existing session onto it.
+    let reopened = storage
+        .initialize_session(
+            "session-1",
+            SessionModelBinding {
+                provider_id: "other".to_string(),
+                model_id: "different".to_string(),
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened, test_binding());
+}
+
+#[tokio::test]
+async fn a_session_name_can_be_set_and_cleared_without_touching_its_binding() {
+    let pool = pool().await;
+    let workspace = workspace_id("rename");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .rename_session("session-1", Some("  Investigation  "))
+            .await
+            .unwrap(),
+        Some("Investigation".to_string())
+    );
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0].name.as_deref(),
+        Some("Investigation")
+    );
+
+    let binding = storage
+        .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", Some("low"))
+        .await
+        .unwrap();
+    assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0].name.as_deref(),
+        Some("Investigation"),
+        "changing the effort must not disturb the name"
+    );
+
+    assert_eq!(
+        storage
+            .rename_session("session-1", Some(" "))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(storage.list_sessions().await.unwrap()[0].name, None);
+    assert_eq!(
+        storage
+            .initialize_session("session-1", test_binding())
+            .await
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("low"),
+        "clearing the name must not disturb the effort"
+    );
+}
+
+#[tokio::test]
+async fn clearing_the_reasoning_effort_stores_a_json_null() {
+    let pool = pool().await;
+    let workspace = workspace_id("effort-null");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+
+    let binding = storage
+        .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", None)
+        .await
+        .unwrap();
+
+    assert_eq!(binding.reasoning_effort, None);
+    // A missing key would deserialize the same way, but writing `null` keeps the
+    // stored shape identical to what serde produces for `Option<String>`.
+    let stored: String = sqlx::query_scalar(
+        "select model_binding->'reasoning_effort' #>> '{}' is null and
+                model_binding ? 'reasoning_effort' as ok
+           from sessions where workspace_id = $1",
+    )
+    .bind(&workspace)
+    .fetch_one(&pool)
+    .await
+    .map(|ok: bool| ok.to_string())
+    .unwrap();
+    assert_eq!(stored, "true");
+}
+
+#[tokio::test]
+async fn an_effort_update_for_a_different_model_is_rejected() {
+    let pool = pool().await;
+    let workspace = workspace_id("mismatch");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .update_reasoning_effort("session-1", "openrouter", "moonshotai/kimi-k3", Some("low"))
+            .await,
+        Err(SessionMetadataError::BindingMismatch)
+    );
+    assert_eq!(
+        storage
+            .update_reasoning_effort("missing", "openrouter", "x-ai/grok-4.5", Some("low"))
+            .await,
+        Err(SessionMetadataError::SessionNotFound),
+        "a mismatch and a missing session are different answers"
+    );
+    assert_eq!(
+        storage
+            .initialize_session("session-1", test_binding())
+            .await
+            .unwrap(),
+        test_binding(),
+        "a rejected update must leave the binding alone"
+    );
+}
+
+#[tokio::test]
+async fn renaming_does_not_create_a_missing_session() {
+    let pool = pool().await;
+    let workspace = workspace_id("rename-missing");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+
+    assert_eq!(
+        storage.rename_session("missing", Some("name")).await,
+        Err(RenameSessionError::SessionNotFound)
+    );
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_deleted_session_leaves_the_list_and_is_reopenable() {
+    let pool = pool().await;
+    let workspace = workspace_id("delete");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("doomed", test_binding())
+        .await
+        .unwrap();
+    storage
+        .session("doomed")
+        .save_checkpoint(
+            "doomed".to_string(),
+            checkpoint(
+                "doomed",
+                vec![entry(
+                    TurnId::from(MessageId::new()),
+                    Message::User(UserMessage::text(MessageId::new(), "hello")),
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+
+    storage.delete_session("doomed").await.unwrap();
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+    // Deleting an already-deleted session is not an error: the old backend
+    // treated a missing directory the same way.
+    storage.delete_session("doomed").await.unwrap();
+
+    // The id is free again, and nothing of the old session is left behind.
+    storage
+        .initialize_session("doomed", test_binding())
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .session("doomed")
+            .load_checkpoint("doomed")
+            .await
+            .unwrap()
+            .map(|checkpoint| checkpoint.messages.len()),
+        None
+    );
 }

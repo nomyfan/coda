@@ -40,6 +40,7 @@ use futures::stream::BoxStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sqlx::PgPool;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
@@ -431,7 +432,7 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
                 .map(|session| SessionSummaryWire {
                     id: session.session_id,
                     name: session.name,
-                    updated_at_ms: session.updated_at_ms,
+                    updated_at_ms: Some(session.updated_at_ms),
                     first_user_message: session.first_user_message,
                     has_pending_approval: session.has_pending_approval,
                 })
@@ -798,7 +799,7 @@ async fn dispatch_request(
                 .providers
                 .get(&requested_provider_id)
                 .expect("resolved provider selection exists");
-            let initialized = match workspace
+            let binding = match workspace
                 .storage
                 .initialize_session(
                     &params.session_id,
@@ -810,7 +811,7 @@ async fn dispatch_request(
                 )
                 .await
             {
-                Ok(initialized) => initialized,
+                Ok(binding) => binding,
                 Err(err) => {
                     return (
                         id,
@@ -823,12 +824,10 @@ async fn dispatch_request(
                         .into();
                 }
             };
-            let provider_id = initialized.metadata.binding.selection_key();
-            let Some(reasoning_effort) = normalize_provider_selection(
-                app,
-                &provider_id,
-                initialized.metadata.binding.reasoning_effort,
-            ) else {
+            let provider_id = binding.selection_key();
+            let Some(reasoning_effort) =
+                normalize_provider_selection(app, &provider_id, binding.reasoning_effort)
+            else {
                 return (
                     id,
                     RpcError::with_detail(
@@ -1503,6 +1502,7 @@ fn resolve_agent_model_selections(
 async fn build_workspace(
     workspace: WorkspaceConfig,
     providers: &HashMap<String, Arc<ProviderHandle>>,
+    pool: &PgPool,
     shutdown: &CancellationToken,
 ) -> Result<WorkspaceState, String> {
     let workspace_dir = workspace.path.canonicalize().map_err(|e| {
@@ -1520,8 +1520,7 @@ async fn build_workspace(
         .unwrap_or_else(|| coda_server::SYSTEM_PROMPT.to_string());
     let root_base = SharedSystemPrompt::new(base_prompt);
 
-    let checkpoint_dir = workspace_dir.join(".coda").join("sessions");
-    let storage = WorkspaceStorage::new(checkpoint_dir);
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace.id);
 
     let mcp_servers = coda_server::mcp::load_mcp_servers(&workspace_dir)
         .await
@@ -1702,10 +1701,19 @@ async fn main() {
         })
         .collect();
 
+    // One pool for the whole process; the schema is brought up to date here, so
+    // deploying the binary is all it takes to create or migrate it.
+    let pool = coda_server::storage::connect(&server_config.database.url)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+
     let mut workspaces = HashMap::new();
     for workspace in server_config.workspaces {
         let id = workspace.id.clone();
-        let state = build_workspace(workspace, &providers, &shutdown)
+        let state = build_workspace(workspace, &providers, &pool, &shutdown)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("error loading workspace '{id}': {e}");
