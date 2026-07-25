@@ -488,7 +488,7 @@ async fn task_settles_then_reattach_shows_folded_history() {
             }
         )
         .await,
-        CommandOutcome::Ok
+        CommandOutcome::TaskAccepted { .. }
     ));
     next_matching(&mut events1, is_settling_llm_end).await;
 
@@ -517,6 +517,9 @@ async fn task_settles_then_reattach_shows_folded_history() {
 /// the session, once here) and only agrees because the id is minted before
 /// either copy; assistant and tool messages are built once and ride the event
 /// pipeline here while the driver writes the same object to history.
+///
+/// The user message has a third consumer — the id returned to the client that
+/// sent the task — so that one is checked against both copies too.
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_checkpoint_agree_on_every_message_id() {
     // The "approval" script calls a tool and then answers, so one turn produces
@@ -531,15 +534,19 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
         .await
         .expect("attach");
     let mut events = attach.events;
-    hub.command(
-        key(),
-        1,
-        SessionCommand::Task {
-            task: "go".into(),
-            images: vec![],
-        },
-    )
-    .await;
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    let CommandOutcome::TaskAccepted { message_id: acked } = outcome else {
+        panic!("a task against a live session is accepted");
+    };
     next_matching(&mut events, is_settling_llm_end).await;
 
     // Read the snapshot the way a reconnecting client would.
@@ -569,6 +576,8 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
             .collect::<Vec<_>>(),
         vec!["user", "assistant", "tool", "assistant"]
     );
+    // The id handed back to the client is the same one both copies carry.
+    assert_eq!(ids_by_role(&persisted)[0], ("user", acked));
 }
 
 /// Each message's role and id, in order — what two copies of one history must
@@ -1184,7 +1193,7 @@ async fn set_model_while_turn_running_is_rejected() {
             },
         )
         .await,
-        CommandOutcome::Ok
+        CommandOutcome::TaskAccepted { .. }
     ));
 
     assert!(matches!(

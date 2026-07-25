@@ -217,6 +217,18 @@ export type RpcRequests = {
   add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
   delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
   rename_session: RpcRequest<SessionRef & { name: string | null }, { name: string | null }>;
+  /** Start a turn. A request rather than a notification so the server can
+   * answer with the id it minted for the user message, letting the client key
+   * that message the same way the server does. */
+  task: RpcRequest<
+    {
+      workspace_id: string;
+      session_id: string;
+      task: string;
+      images?: string[];
+    },
+    { message_id: string }
+  >;
 };
 
 /**
@@ -224,12 +236,6 @@ export type RpcRequests = {
  * is the `Notif` schema the typed `RpcClient` keys `notify(...)` on.
  */
 export type RpcNotifications = {
-  task: {
-    workspace_id: string;
-    session_id: string;
-    task: string;
-    images?: string[];
-  };
   resume: {
     workspace_id: string;
     session_id: string;

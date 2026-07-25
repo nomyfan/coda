@@ -89,6 +89,10 @@ pub struct AttachSession {
 pub enum CommandOutcome {
     /// The command was accepted (or was a benign no-op).
     Ok,
+    /// A `Task` was accepted, carrying the id minted for the user message it
+    /// became. The request dispatcher answers the client with it so the client
+    /// and the server name that message the same way.
+    TaskAccepted { message_id: MessageId },
     /// The command was not applied: stale connection, invalid state, or the
     /// session did not accept it (e.g. runtime channel closed). Logged;
     /// nothing to send. For a `SetModel`, the request dispatcher reads this as
@@ -673,7 +677,7 @@ impl SessionHub {
         // ToolCallEnd) and starts a fresh turn, so advertising them to a later
         // attach would offer a resume for work that no longer exists.
         live.pending_approvals.clear();
-        CommandOutcome::Ok
+        CommandOutcome::TaskAccepted { message_id }
     }
 
     async fn handle_resume(

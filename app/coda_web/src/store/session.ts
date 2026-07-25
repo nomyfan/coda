@@ -1263,13 +1263,16 @@ function addAllowResultActivity(
   });
 }
 
+/** Render the user's message immediately, returning the id of the entry created
+ * so the caller can reconcile it once the server answers with the real one. */
 function appendUserMessage(
   store: CodaStore,
   server: string,
   key: SessionKey,
   content: string,
   images?: string[],
-) {
+): string {
+  const entryId = newId("user");
   updateState(store, (state) => {
     const current = state.servers[server];
     const session = draftSession(state, server, key);
@@ -1287,7 +1290,7 @@ function appendUserMessage(
     session.running = true;
     session.firstUserMessage = firstUserMessage;
     session.entries.push({
-      id: newId("user"),
+      id: entryId,
       kind: "user",
       content,
       images: images && images.length > 0 ? images : undefined,
@@ -1300,6 +1303,71 @@ function appendUserMessage(
       firstUserMessage,
     );
   });
+  return entryId;
+}
+
+/** Re-key an optimistic user entry onto the id the server minted for it, so
+ * both sides name that message identically. */
+function adoptServerMessageId(server: string, key: SessionKey, entryId: string, messageId: string) {
+  updateState(codaStore, (state) => {
+    const entry = draftSession(state, server, key)?.entries.find((e) => e.id === entryId);
+    if (entry) {
+      entry.id = messageId;
+    }
+  });
+}
+
+/** Undo an optimistic user entry whose task never started. The session's title
+ * and non-draft flag are left as they are — a later catalog refresh corrects
+ * them, and unwinding them here would clobber a session that has other turns. */
+function discardOptimisticTask(server: string, key: SessionKey, entryId: string) {
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.entries = session.entries.filter((e) => e.id !== entryId);
+    session.running = false;
+  });
+}
+
+/** Start a turn: show the user's message right away, then reconcile it with the
+ * id the server minted. Rendering first costs a round trip of staleness on the
+ * entry's key but avoids stalling the user's own message behind the ack.
+ * Returns whether the turn started. */
+async function startTurn(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  text: string,
+  images: string[],
+): Promise<boolean> {
+  const key = sessionKey(workspaceId, sessionId);
+  const entryId = appendUserMessage(codaStore, server, key, text, images);
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    discardOptimisticTask(server, key, entryId);
+    return false;
+  }
+  try {
+    const { message_id } = await rpc.request("task", {
+      workspace_id: workspaceId,
+      session_id: sessionId,
+      task: text,
+      images: images.length > 0 ? images : undefined,
+    });
+    adoptServerMessageId(server, key, entryId, message_id);
+    return true;
+  } catch (err) {
+    discardOptimisticTask(server, key, entryId);
+    addSessionActivity(server, workspaceId, sessionId, {
+      tone: "danger",
+      label: "task rejected",
+      detail: isServerError(err) ? err.message : "Connection lost before the task started",
+    });
+    return false;
+  }
 }
 
 function setDraftResolution(
@@ -1896,24 +1964,19 @@ export async function sendTask(task: string, images: string[] = []) {
   if (!active || active.session.deleting) {
     return;
   }
-  // A draft/new session must be live before its first task, or a fire-and-forget
-  // task would be dropped server-side while the UI already showed it running
+  // A draft/new session must be live before its first task, or the task would
+  // come back `SESSION_NOT_LIVE` while the UI already showed it running
   // (Decision 10).
   if (active.session.draft && !(await requestOpenAndApply(active.server, active.session))) {
     return;
   }
-  // Append the optimistic user message only if the task frame actually left the
-  // client (a dead socket returns `false`).
-  if (
-    notify(active.server, "task", {
-      workspace_id: active.session.workspaceId,
-      session_id: active.session.sessionId,
-      task: text,
-      images: images.length > 0 ? images : undefined,
-    })
-  ) {
-    appendUserMessage(codaStore, active.server, active.session.key, text, images);
-  }
+  await startTurn(
+    active.server,
+    active.session.workspaceId,
+    active.session.sessionId,
+    text,
+    images,
+  );
 }
 
 export async function sendTaskToNewSession(
@@ -1951,16 +2014,7 @@ export async function sendTaskToNewSession(
   if (!(await requestOpenAndApply(server, session))) {
     return;
   }
-  if (
-    notify(server, "task", {
-      workspace_id: workspace,
-      session_id: sessionId,
-      task: text,
-      images: images.length > 0 ? images : undefined,
-    })
-  ) {
-    appendUserMessage(codaStore, server, key, text, images);
-  }
+  await startTurn(server, workspace, sessionId, text, images);
 }
 
 export function abort() {

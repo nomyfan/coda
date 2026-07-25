@@ -1,6 +1,6 @@
 use crate::config::{ToolApprovalConfig, extract_shell_command};
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
-use coda_core::llm::{AssistantMessage, Message, Modality, ToolCall, ToolMessage};
+use coda_core::llm::{AssistantMessage, Message, MessageId, Modality, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -261,6 +261,15 @@ pub struct ModelSelection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionName {
     pub name: Option<String>,
+}
+
+/// Result of `task`: the id the server minted for the user message the task
+/// became. `task` is a request rather than a notification precisely so this id
+/// can come back — the client renders the message optimistically and then keys
+/// it on this id, so both sides name the same message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAccepted {
+    pub message_id: MessageId,
 }
 
 /// Result of `open_session`, and the payload of an unsolicited `snapshot`

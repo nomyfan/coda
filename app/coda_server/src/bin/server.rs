@@ -31,8 +31,8 @@ use coda_server::{
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
         PendingApprovalWire, ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams,
-        SessionName, SessionRef, SessionSummaryWire, SetModelParams, Snapshot, TaskParams,
-        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        SessionName, SessionRef, SessionSummaryWire, SetModelParams, Snapshot, TaskAccepted,
+        TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -1061,6 +1061,13 @@ async fn dispatch_request(
             )
                 .into()
         }
+        "task" => {
+            let params: TaskParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            handle_task(app, conn_id, id, params).await
+        }
         "rename_session" => {
             let params: RenameSessionParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1131,13 +1138,6 @@ async fn dispatch_notification<T: Transport>(
     params: Value,
 ) -> bool {
     match method {
-        "task" => match parse_params::<TaskParams>(params) {
-            Ok(params) => handle_task(transport, app, conn_id, params).await,
-            Err(err) => {
-                warn!("ignoring malformed task notification: {}", err.message);
-                true
-            }
-        },
         "resume" => match parse_params::<ResumeParams>(params) {
             Ok(params) => handle_resume(transport, app, conn_id, params).await,
             Err(err) => {
@@ -1186,40 +1186,68 @@ async fn dispatch_notification<T: Transport>(
     }
 }
 
-/// Start a new turn. Rejects image input when the active model doesn't accept it
-/// (the frontend disables it, so reaching here is a UI bypass — surface an error
-/// event rather than silently dropping the attachments).
-async fn handle_task<T: Transport>(
-    transport: &T,
+/// Start a new turn, answering with the id minted for its user message.
+///
+/// This is the trust boundary for message identity: the id is always minted
+/// server-side and a client-supplied one would never be honoured, so nothing
+/// downstream has to re-check it.
+///
+/// Rejects image input when the active model doesn't accept it — the frontend
+/// disables it, so reaching here is a UI bypass, and answering the request with
+/// an error beats silently dropping the attachments.
+async fn handle_task(
     app: &Arc<AppState>,
     conn_id: ConnId,
+    id: RpcId,
     params: TaskParams,
-) -> bool {
-    let key = (params.workspace_id.clone(), params.session_id.clone());
+) -> RpcOutgoing {
+    let key = (params.workspace_id, params.session_id);
     let accepts_images = match app.relay.provider_of(key.clone()).await {
         Some(provider_id) => app
             .providers
             .get(&provider_id)
             .is_some_and(|handle| handle.input_modalities.contains(&Modality::Image)),
-        None => return true, // no live/pending session for this key
+        // No live or pending session for this key.
+        None => {
+            return (
+                id,
+                RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
+            )
+                .into();
+        }
     };
     if !accepts_images && !params.images.is_empty() {
-        let event = WireEvent::Error {
-            agent_name: String::new(),
-            thread_id: params.session_id.clone(),
-            message: "the selected model does not accept image input".to_string(),
-        };
-        return send_event(transport, params.workspace_id, params.session_id, event).await;
+        return (
+            id,
+            RpcError::new(
+                rpc::INVALID_PARAMS,
+                "the selected model does not accept image input",
+            ),
+        )
+            .into();
     }
     let images = sanitize_task_images(params.images);
     let task = params.task.trim().to_string();
     if task.is_empty() && images.is_empty() {
-        return true;
+        return (
+            id,
+            RpcError::new(rpc::INVALID_PARAMS, "task must have text or images"),
+        )
+            .into();
     }
-    app.relay
+    match app
+        .relay
         .command(key, conn_id, SessionCommand::Task { task, images })
-        .await;
-    true
+        .await
+    {
+        CommandOutcome::TaskAccepted { message_id } => (id, &TaskAccepted { message_id }).into(),
+        // Residual `Ignored` — a stale connection, or the session is not live.
+        _ => (
+            id,
+            RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
+        )
+            .into(),
+    }
 }
 
 /// Answer a suspended tool call. Any follow-up (more pending approvals, an open

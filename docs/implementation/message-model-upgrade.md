@@ -215,10 +215,11 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 
 ## Implementation Roadmap
 
-- [ ] [risk validation] 打通 root user 消息三路 ID 一致
+- [x] [risk validation] 打通 root user 消息三路 ID 一致
       - `task` 改 request；`hub::handle_task` 铸造 `MessageId`，经 `Session::send` → `EnvelopeBody::Task` 传到 driver；hub snapshot 副本用同一 ID；ack 回前端
       - Purpose: 先证伪最大风险——两条构造路径 + ack 产出同一 ID
       - Verification: 集成测试发一条 task，断言 snapshot user `message_id` == 持久化 checkpoint == ack 返回值
+      - 落地：ack 经新增的 `CommandOutcome::TaskAccepted { message_id }` 从 hub 传回 `dispatch_request`，答以 `TaskAccepted { message_id }`。三方断言在 `hub_tests::snapshot_and_checkpoint_agree_on_every_message_id` 里；ack 那一方单独反向验证过（只让 hub 返回另铸的 id，断言即失败）。**最大风险已排除**
 - [ ] [core types] `MessageId` / `MessageOrigin` / `TurnId` + 三个变体的字段 + `UserMessage::origin`；`HistoryEntry` 与 `AgentState.messages` / `StoredCheckpoint.messages` / `restore_history` 换型
       - Purpose: 落地数据模型
       - Verification: `cargo build`（含 `MemoryStorage`、测试 stub 随之编过）；序列化 round-trip 单测
@@ -244,4 +245,5 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 
 ## Deviations from Design
 
-- **步骤 1–3 的落地顺序做了拆分**（仅顺序，接口/数据模型/取舍均按原设计）。改 `UserMessage` 构造签名会一次性打断全部调用点，所以第一批落地的是"身份类型 + 三个变体的 `message_id` + 各铸造点 + root user 的 id 在 hub 单点铸造并经 `Task` envelope 传到 driver"，即完整的第 3 步加第 1、2 步的一部分。**第 1 步暂未勾选**：它的验收要求三方一致（snapshot / checkpoint / ack），目前已验证前两方，ack 随 `task` 改 request 时补齐。**第 2 步暂未勾选**：`MessageOrigin` / `TurnId` / `HistoryEntry` 推迟到各自有值可携带的步骤（origin 传播、turn 盖章）再引入，避免先落一批没有写入方的死字段。
+- **步骤 1–3 的落地顺序做了拆分**（仅顺序，接口/数据模型/取舍均按原设计）。改 `UserMessage` 构造签名会一次性打断全部调用点，所以先落"身份类型 + 三个变体的 `message_id` + 各铸造点 + root user 的 id 在 hub 单点铸造并经 `Task` envelope 传到 driver"（第 3 步 + 第 1、2 步的一部分），再落 `task` 改 request 与 ack（补齐第 1 步）。**第 2 步暂未勾选**：`MessageOrigin` / `TurnId` / `HistoryEntry` 推迟到各自有值可携带的步骤（origin 传播、turn 盖章）再引入，避免先落一批没有写入方的死字段。
+- **`task` 改成 request 后，两条原本静默/走事件的失败路径改为直接答以 RPC 错误**：模型不接受图片时原先推一条 `WireEvent::Error` 到事件流，现在答 `INVALID_PARAMS`；空任务与"会话不 live"原先静默丢弃，现在分别答 `INVALID_PARAMS` 与 `SESSION_NOT_LIVE`。设计只说了"`task` 由 notification 改为 request"，没交代这两条；改成请求的直接应答更贴合 request 语义（错误与发起它的请求相关联），但前端呈现随之从 transcript 里的错误事件变成一条 danger 活动记录。
