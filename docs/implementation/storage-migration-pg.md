@@ -185,9 +185,10 @@ runtime_snapshots(workspace_id, session_id,
 - [x] [integration] `[database]` 配置 + 进程级 `PgPool` + 迁移随启动；`bin/server.rs` 装配换 PG，移除 `JsonFileStorage`
       - Purpose: 真实路径打通
       - Verification: 起服务→开会话→发 task→重开会话，历史一致；`list_workspaces` 返回正确会话列表
-      - 落地：`[database].url` 必填（缺了直接启动失败，有 `parse_server_config_requires_a_database` 覆盖），支持 `${VAR}`；`main` 先 `storage::connect`（连接 + 跑迁移）再逐个 workspace 建 `WorkspaceStorage::new(pool.clone(), &workspace.id)`。`JsonFileStorage` 及 `atomic-write-file` 相关写法全部删除
+      - 落地：`[database].url` 必填（缺了直接启动失败，有 `parse_server_config_requires_a_database` 覆盖），支持 `${VAR}`；`main` 先 `storage::connect`（连接 + 跑迁移）再逐个 workspace 建 `WorkspaceStorage::new(pool.clone(), &workspace.id)`。`JsonFileStorage` 整块删除，随之不再需要的 `atomic-write-file` 依赖也一起摘掉
       - 真实路径怎么验的：一次性脚本起真 server（配置指向一个本地 stub 的 OpenAI 兼容端点，避免真实 API 调用），走 `list_workspaces` → `open_session` → `task` → 断连 → 新连接 `open_session`，确认历史（user + assistant 两条）从库里读回、`list_workspaces` 里该会话的预览是首个 user 消息。脚本是验证工具，不进仓库
-- [ ] [ci] 给 `.github/workflows/ci.yml` 增设第三个 job `storage-pg`（现有两个是 `rust` 矩阵和 `web`）
+- [x] [ci] 给 `.github/workflows/ci.yml` 增设第三个 job `storage-pg`（现有两个是 `rust` 矩阵和 `web`）
+      - 落地已验证：`DATABASE_URL` 指向不存在的实例 → 退出码 101（不是 0）；完全不设 `DATABASE_URL` → 同样 101，且报错就是那句"必须指向一个一次性数据库"；不加 `--features pg-tests` 时 `cargo test -p coda_server --no-run` 的产物里没有 `storage_pg` 这个目标
       - `runs-on: ubuntu-latest` + `services.postgres`（`postgres:17`，带 `pg_isready` 健康检查），注入 `DATABASE_URL`
       - 存储集成测试放独立测试目标 `app/coda_server/tests/storage_pg.rs`，并用 **Cargo `required-features` 把它挡在默认构建之外**（`[features] pg-tests = []` + `[[test]] name = "storage_pg" required-features = ["pg-tests"]`）。注意：仅仅"放到 `tests/` 下"是**不够**的——`cargo test` 会编译并运行 `tests/` 下所有目标；靠 `required-features` 才能让未开 feature 时该目标根本不编译
       - 该 job 显式开启：`cargo test -p coda_server --features pg-tests --test storage_pg`
@@ -197,3 +198,13 @@ runtime_snapshots(workspace_id, session_id,
       - 连接池：**每个测试各建一个池**，而不是靠 static 全局共享一个。sqlx 的池绑定在创建它的 tokio runtime 上，而 `#[tokio::test]` 每个测试各有一个 runtime——共享池在第一个测试的 runtime 关闭后就开始 `PoolTimedOut`（实测踩到）。连接按需建立、迁移取 PG advisory lock，所以每测试一个池的代价只是一条连接加一次版本检查
       - 测试搬家：`storage.rs` 现有那批临时目录测试（列表排序、`pending_approval`、image-only 预览、改名、effort）都要从内联 `#[cfg(test)]` 搬到 `tests/storage_pg.rs`——内联测试属于 lib 的 unittest target，管不了 `required-features`。`WorkspaceStorage::new` / `validate_session_id` 均为 `pub`，搬出去无可见性问题；两个 `validate_session_id_*` 是纯字符串校验、不碰 DB，**留在内联**，让普通 `cargo test` 仍覆盖它们
       - 已知副作用：macOS 本地跑 `cargo test` 不再覆盖存储路径，需自行起 PG（**用专门的空库如 `coda_test`，不要指向真实数据库**——迁移随启动自动执行，测试还会写入和删除）并设 `DATABASE_URL`。`coda_agent` 侧不受影响（用 `MemoryStorage`）
+
+## Deviations from Design
+
+- **没有 `Db` 类型。** 设计的 Components 里列了一个进程级 `Db`（持池 + 跑迁移 + 派发 workspace 存储）。实际落地是 `storage::connect(url) -> PgPool`（连接 + 迁移）加 `WorkspaceStorage::new(pool, workspace_id)`——`PgPool` 本身就是那个进程级句柄，`Db` 只会是个转发壳。少一个类型，语义不变。
+- **`initialize_session` 直接返回 `SessionModelBinding`**，不再返回 `InitializedSession { metadata: SessionMetadata, created }`。storage 之外没有任何地方读 `name` 和 `created`；而在 PG 下要报 `created` 还得专门把 `on conflict do nothing` 的影响行数传出来。设计说的"同一公开方法集"仍然成立，方法没增没减。
+- **`SessionFile` 改名 `SessionSummary`，`updated_at_ms` 从 `Option<u64>` 变 `u64`。** 旧类型的 `Option` 表达的是"文件 mtime 可能读不到"；`sessions.updated_at` 是 `not null default now()`，"不知道最后活跃时间"这个状态不存在了。线上 wire 类型 `SessionSummaryWire` 保持 `Option<u64>` 不动，协议和前端零改。
+- **用 sqlx 的运行时 API，不用 `query!` 宏。** 宏要在编译期连库（或维护一份 `.sqlx` 离线缓存），会让"没有 PostgreSQL 就编译不过"，也多一份要跟 schema 同步的产物。`macros` feature 只为 `sqlx::migrate!`（编译期内嵌迁移文件）而开。
+- **`timestamptz` 只有微秒精度**，jiff 是纳秒。写入侧先 `as_microsecond()` 截断再交给 PG（而不是让 PG 去 round），读回即精确相等。受影响的只有 `thread_checkpoints.suspended_at`——消息自身的时间戳在 `payload` 里，无损；而 `suspended_at` 的所有消费方都是毫秒级（`session.rs` 的 `as_millisecond()` 和 UI 显示）。
+- **`messages.created_at` / `sessions.updated_at` 由数据库 `now()` 生成**，不从 Rust 绑。前者是"这行什么时候写的"（消息自己的时间在 payload 里），后者是列表排序用的活跃时间。`rename_session` 和 `update_reasoning_effort` 故意**不** bump `updated_at`——旧实现改元数据也不动 checkpoint 的 mtime，改名不该让会话跳到列表最前。
+- **`Message::System` 进 checkpoint 是硬错误。** `messages` 的 `message_id` 是 `not null uuid`，而 `SystemMessage` 没有 id。系统提示从不进历史（`restore_history` 过滤、组请求时插在副本上），所以这里返回 `Err` 而不是临时铸一个没人能追溯的 id。
