@@ -227,9 +227,10 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 补齐 assistant/tool 单构造点铸造
       - Verification: 单测——同一条 assistant/tool 消息经 `LLMEnd`/`ToolCallEnd` 事件到 hub snapshot 后 `message_id` 不变
       - 落地：`hub_tests::snapshot_and_checkpoint_agree_on_every_message_id`。断言一整轮（user → assistant(带 tool call) → tool → assistant）在 snapshot 与持久化 checkpoint 中的 id 序列逐条相等，一次覆盖三种变体的两条不同路径。已反向验证：只让事件副本与历史副本的 assistant id 分岔，该测试即失败（user/tool 仍相等），证明它确实盯着事件流那条路
-- [ ] [core logic] 父 ID 传播链路：`ToolExecutionState`/`PendingApproval` 及 Stored 形加 `parent_message_id`；sub-agent `ToolCall` envelope 带 `MessageOrigin`；sub-agent `handle_envelope` 据此填 `origin` 并铸造开场 user `message_id`
+- [x] [core logic] 父 ID 传播链路：`ToolExecutionState`/`PendingApproval` 及 Stored 形加 `parent_message_id`；sub-agent `ToolCall` envelope 带 `MessageOrigin`；sub-agent `handle_envelope` 据此填 `origin` 并铸造开场 user `message_id`
       - Purpose: 打通正常/审批恢复/重启三路径的 origin
       - Verification: 单测——stateful sub-agent 多次调用后每条开场 user 消息 `origin` == 对应父 `(message_id, tool_call.id)`；**审批挂起→重开会话→approve 派发**后 origin 仍正确
+      - 落地：`driver_tests::stateful_subagent_records_which_call_opened_each_invocation`（同一 turn 内连调两次 stateful sub-agent，脚本**故意复用同一个 `call_id`**，所以只有父 message_id 能区分两次调用）与 `subagent_dispatched_after_approval_restart_still_records_its_origin`（挂起→shutdown→restart→approve）。两条都反向验证过：分别把 origin 的父 id 改成新铸的、把 `StoredResumePoint::PendingApproval` 落库的父 id 改成新铸的，对应测试各自失败
 - [ ] [core logic] 修线程 ID 派生（**必须排在拓扑落库之前**，否则等于把错的派生键持久化）：stateless 改用复合键 `(父 Assistant message_id, call_id)`；`from_uuid5` 对非 UUID 父 id 稳定哈希出 namespace，去掉 nil 退化分支；同时修掉 `driver.rs:860` 那句已经不成立的注释
       - Purpose: 消掉两个现存缺陷——stateless 线程跨 turn 继承他人历史、非 UUID 会话共用 namespace
       - Verification: 单测——(a) **同一父线程在两个不同 turn 收到相同 `tool_call.id`，两次 stateless 调用得到不同 thread id、第二次历史为空**；(b) 两个不同的非 UUID session id 派生出的同名子线程 id 互不相同；(c) 父 id 是合法 UUID 时的派生结果与改动前一致（stateful 路径不回归）
@@ -246,4 +247,5 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 ## Deviations from Design
 
 - **步骤 1–3 的落地顺序做了拆分**（仅顺序，接口/数据模型/取舍均按原设计）。改 `UserMessage` 构造签名会一次性打断全部调用点，所以先落"身份类型 + 三个变体的 `message_id` + 各铸造点 + root user 的 id 在 hub 单点铸造并经 `Task` envelope 传到 driver"（第 3 步 + 第 1、2 步的一部分），再落 `task` 改 request 与 ack（补齐第 1 步）。**第 2 步暂未勾选**：`MessageOrigin` / `TurnId` / `HistoryEntry` 推迟到各自有值可携带的步骤（origin 传播、turn 盖章）再引入，避免先落一批没有写入方的死字段。
+- **`ToolCall` envelope 只带 `parent_message_id`，不带整个 `MessageOrigin`。** 设计里写的是 `ToolCall { call_id, origin: MessageOrigin, .. }`，但 `origin.call_id` 恒等于同一 envelope 上的 `call_id` —— 两个必须永远相等的字段会让读者以为它们可能不等。改为只传父 id，由收件线程用手边已有的 `call_id` 组装出 `MessageOrigin`。信息量不变，少一处可能自相矛盾的冗余。
 - **`task` 改成 request 后，两条原本静默/走事件的失败路径改为直接答以 RPC 错误**：模型不接受图片时原先推一条 `WireEvent::Error` 到事件流，现在答 `INVALID_PARAMS`；空任务与"会话不 live"原先静默丢弃，现在分别答 `INVALID_PARAMS` 与 `SESSION_NOT_LIVE`。设计只说了"`task` 由 notification 改为 request"，没交代这两条；改成请求的直接应答更贴合 request 语义（错误与发起它的请求相关联），但前端呈现随之从 transcript 里的错误事件变成一条 danger 活动记录。

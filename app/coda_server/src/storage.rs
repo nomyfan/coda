@@ -763,12 +763,12 @@ mod tests {
                         messages: vec![],
                         todos: vec![],
                         resume_point: StoredResumePoint::PendingApproval {
+                            parent_message_id: MessageId::new(),
                             pending_approval_calls: vec![coda_core::llm::ToolCall {
                                 id: format!("{thread_id}-call"),
                                 name: "shell".into(),
                                 arguments: Some(r#"{"command":"cargo test"}"#.into()),
-                            }]
-                            .into(),
+                            }],
                             pending_calls: vec![],
                         },
                         suspended_at: jiff::Timestamp::default(),

@@ -121,10 +121,31 @@ pub enum ContentPart {
     Image { url: String },
 }
 
+/// Which sub-agent invocation produced a message.
+///
+/// A composite key rather than the bare `call_id`, because a tool call id is
+/// only guaranteed unique within one assistant message — some providers number
+/// them per response. Pairing it with the parent assistant's `message_id` keeps
+/// the edge unambiguous even when a provider reuses call ids across turns, and
+/// that matters permanently: once the ambiguous form is persisted, the causal
+/// link can't be recovered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    /// The assistant message whose tool call started this.
+    pub message_id: MessageId,
+    /// Which tool call within that message.
+    pub call_id: String,
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
     pub message_id: MessageId,
+    /// Set on the message that opens a sub-agent thread's work, naming the
+    /// parent-thread call that triggered it. `None` for a root user message,
+    /// which nothing triggered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
     pub parts: Vec<ContentPart>,
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
@@ -141,8 +162,22 @@ impl UserMessage {
     pub fn text(message_id: MessageId, text: impl Into<String>) -> Self {
         Self {
             message_id,
+            origin: None,
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
+        }
+    }
+
+    /// Construct the message that opens a sub-agent thread's work, recording
+    /// which parent-thread call triggered it.
+    pub fn from_subagent_call(
+        message_id: MessageId,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+    ) -> Self {
+        Self {
+            origin: Some(origin),
+            ..Self::text(message_id, text)
         }
     }
 
@@ -162,6 +197,7 @@ impl UserMessage {
         );
         Self {
             message_id,
+            origin: None,
             parts,
             created_at: jiff::Timestamp::now(),
         }

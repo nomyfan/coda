@@ -4,8 +4,8 @@ use std::{
 };
 
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, StreamError,
-    ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, MessageOrigin,
+    StreamError, ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
 };
 use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -315,6 +315,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                 }
                 ResumePoint::PendingApproval {
+                    parent_message_id,
                     pending_approval_calls,
                     pending_calls,
                 } => {
@@ -326,6 +327,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         suspended_at,
                     };
                     resume_point = ResumePoint::PendingApproval {
+                        parent_message_id,
                         pending_approval_calls,
                         pending_calls,
                     };
@@ -506,6 +508,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution))
             }
             ResumePoint::PendingApproval {
+                parent_message_id,
                 mut pending_approval_calls,
                 mut pending_calls,
             } => {
@@ -590,6 +593,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            parent_message_id,
                             pending_replies: vec![],
                             tool_calls: pending_calls.clone(),
                         }))
@@ -600,6 +604,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             envelope
                         );
                         AgentLoopState::Done(ResumePoint::PendingApproval {
+                            parent_message_id,
                             pending_approval_calls,
                             pending_calls,
                         })
@@ -742,6 +747,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                     AgentLoopState::Done(ResumePoint::Generation)
                 } else {
+                    // Every call in this batch came from this one message; the
+                    // batch state carries its id so a sub-agent dispatched later
+                    // — possibly after an approval suspension or a restart —
+                    // can still record what triggered it.
+                    let parent_message_id = assistant_message.message_id;
                     let (pending_approval_calls, auto_calls) = {
                         match &self.config.tool_approval {
                             ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls),
@@ -752,27 +762,24 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .partition(|call| predicate(call)),
                         }
                     };
+                    let auto_calls: VecDeque<_> = auto_calls
+                        .into_iter()
+                        .map(|call| PendingToolCall {
+                            tool_call: call,
+                            outcome: ToolCallOutcome::Auto,
+                        })
+                        .collect();
                     if !pending_approval_calls.is_empty() {
                         AgentLoopState::Next(ResumePoint::PendingApproval {
+                            parent_message_id,
                             pending_approval_calls: pending_approval_calls.into(),
-                            pending_calls: auto_calls
-                                .into_iter()
-                                .map(|call| PendingToolCall {
-                                    tool_call: call,
-                                    outcome: ToolCallOutcome::Auto,
-                                })
-                                .collect(),
+                            pending_calls: auto_calls,
                         })
                     } else {
                         AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                            parent_message_id,
                             pending_replies: vec![],
-                            tool_calls: auto_calls
-                                .into_iter()
-                                .map(|call| PendingToolCall {
-                                    tool_call: call,
-                                    outcome: ToolCallOutcome::Auto,
-                                })
-                                .collect(),
+                            tool_calls: auto_calls,
                         }))
                     }
                 }
@@ -867,6 +874,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     reply_to: None,
                     body: EnvelopeBody::ToolCall {
                         call_id: tc.tool_call.id.clone(),
+                        parent_message_id: tool_execution.parent_message_id,
                         // Sub-agent tools always take {"task": "..."} — extract the string.
                         task: serde_json::from_str::<serde_json::Value>(
                             tc.tool_call.arguments.as_deref().unwrap_or("{}"),
@@ -1043,8 +1051,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 /// any.
 ///
 /// A root task carries the id minted at the request boundary. A sub-agent
-/// invocation mints its own here: this is that message's only construction
-/// point, so there is no second copy to stay in sync with.
+/// invocation mints its own here — this is that message's only construction
+/// point, so there is no second copy to stay in sync with — and records the
+/// calling thread's tool call as its origin, which is what later lets a rewind
+/// tell this invocation's messages from another invocation's in the same
+/// thread.
 fn opening_user_message(body: &EnvelopeBody) -> Option<UserMessage> {
     match body {
         EnvelopeBody::Task {
@@ -1052,9 +1063,18 @@ fn opening_user_message(body: &EnvelopeBody) -> Option<UserMessage> {
             task,
             images,
         } => Some(UserMessage::with_images(*message_id, task.clone(), images)),
-        EnvelopeBody::ToolCall { task, .. } => {
-            Some(UserMessage::text(MessageId::new(), task.clone()))
-        }
+        EnvelopeBody::ToolCall {
+            call_id,
+            parent_message_id,
+            task,
+        } => Some(UserMessage::from_subagent_call(
+            MessageId::new(),
+            task.clone(),
+            MessageOrigin {
+                message_id: *parent_message_id,
+                call_id: call_id.clone(),
+            },
+        )),
         EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => None,
     }
 }

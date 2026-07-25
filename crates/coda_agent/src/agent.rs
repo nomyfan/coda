@@ -78,6 +78,11 @@ pub struct PendingReply {
 
 #[derive(Debug, Clone)]
 pub struct ToolExecutionState {
+    /// The assistant message these calls came from. One generation produces one
+    /// batch, so the whole batch shares a parent; carrying it here (rather than
+    /// per call) keeps it available after an approval suspension or a process
+    /// restart, when the message itself is no longer in scope.
+    pub parent_message_id: MessageId,
     /// Replies waiting from stateful sub-agents.
     pub pending_replies: Vec<PendingReply>,
     pub tool_calls: VecDeque<PendingToolCall>,
@@ -95,6 +100,11 @@ pub enum ResumePoint {
     Generation,
     ToolExecution(ToolExecutionState),
     PendingApproval {
+        /// The assistant message these calls came from — see
+        /// [`ToolExecutionState::parent_message_id`]. Persisted with the
+        /// suspension so a sub-agent dispatched after the approval still knows
+        /// what triggered it, even across a process restart.
+        parent_message_id: MessageId,
         /// Tool calls waiting for approval.
         pending_approval_calls: VecDeque<ToolCall>,
         /// Tool calls to execute.
@@ -178,6 +188,11 @@ pub enum EnvelopeBody {
     /// Call agent as a tool
     ToolCall {
         call_id: String,
+        /// The assistant message in the calling thread whose tool call this is.
+        /// Paired with `call_id` it forms the [`MessageOrigin`] the receiving
+        /// thread stamps on its opening message; only the parent id travels
+        /// here, since `call_id` is already alongside it.
+        parent_message_id: MessageId,
         task: String,
     },
     /// Reply from a agent, containing the tool output.

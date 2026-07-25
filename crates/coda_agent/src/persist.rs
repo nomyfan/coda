@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use coda_core::llm::{Message, ToolCall, ToolCallOutcome};
+use coda_core::llm::{Message, MessageId, ToolCall, ToolCallOutcome};
 use coda_tools::TodoItem;
 
 use crate::agent::{
@@ -45,6 +45,7 @@ pub enum StoredResumePoint {
     Generation,
     ToolExecution(StoredToolExecutionState),
     PendingApproval {
+        parent_message_id: MessageId,
         pending_approval_calls: Vec<ToolCall>,
         pending_calls: Vec<StoredPendingToolCall>,
     },
@@ -52,6 +53,9 @@ pub enum StoredResumePoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToolExecutionState {
+    /// The assistant message this batch of calls came from, so a sub-agent
+    /// dispatched after a restart can still record what triggered it.
+    pub parent_message_id: MessageId,
     pub pending_replies: Vec<PendingReply>,
     pub tool_calls: Vec<StoredPendingToolCall>,
 }
@@ -90,6 +94,7 @@ impl From<PendingToolCall> for StoredPendingToolCall {
 impl From<ToolExecutionState> for StoredToolExecutionState {
     fn from(s: ToolExecutionState) -> Self {
         StoredToolExecutionState {
+            parent_message_id: s.parent_message_id,
             pending_replies: s.pending_replies,
             tool_calls: s.tool_calls.into_iter().map(Into::into).collect(),
         }
@@ -102,9 +107,11 @@ impl From<ResumePoint> for StoredResumePoint {
             ResumePoint::Generation => StoredResumePoint::Generation,
             ResumePoint::ToolExecution(state) => StoredResumePoint::ToolExecution(state.into()),
             ResumePoint::PendingApproval {
+                parent_message_id,
                 pending_approval_calls,
                 pending_calls,
             } => StoredResumePoint::PendingApproval {
+                parent_message_id,
                 pending_approval_calls: pending_approval_calls.into(),
                 pending_calls: pending_calls.into_iter().map(Into::into).collect(),
             },
@@ -138,6 +145,7 @@ impl From<StoredPendingToolCall> for PendingToolCall {
 impl From<StoredToolExecutionState> for ToolExecutionState {
     fn from(s: StoredToolExecutionState) -> Self {
         ToolExecutionState {
+            parent_message_id: s.parent_message_id,
             pending_replies: s.pending_replies,
             tool_calls: s.tool_calls.into_iter().map(Into::into).collect(),
         }
@@ -150,9 +158,11 @@ impl From<StoredResumePoint> for ResumePoint {
             StoredResumePoint::Generation => ResumePoint::Generation,
             StoredResumePoint::ToolExecution(state) => ResumePoint::ToolExecution(state.into()),
             StoredResumePoint::PendingApproval {
+                parent_message_id,
                 pending_approval_calls,
                 pending_calls,
             } => ResumePoint::PendingApproval {
+                parent_message_id,
                 pending_approval_calls: pending_approval_calls.into(),
                 pending_calls: pending_calls.into_iter().map(Into::into).collect(),
             },

@@ -389,6 +389,38 @@ impl LLMProvider for TestProvider {
                     })
                 }
             }
+            // Calls `explore` twice in sequence, deliberately reusing one call
+            // id. That is legal — a tool call id only has to be unique within
+            // its own assistant message — so the two invocations are only
+            // distinguishable by which assistant message issued them.
+            "twice-main" => {
+                let explore_results = request
+                    .messages
+                    .iter()
+                    .filter(
+                        |message| matches!(message, Message::Tool(tool) if tool.name == "explore"),
+                    )
+                    .count();
+                if explore_results >= 2 {
+                    Self::completed(AssistantMessage {
+                        content: "main done".into(),
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_explore".into(),
+                            name: "explore".into(),
+                            arguments: Some(r#"{"task":"inspect the crate"}"#.into()),
+                        }],
+                        ..assistant()
+                    })
+                }
+            }
+            "explore-plain" => Self::completed(AssistantMessage {
+                content: "explore done".into(),
+                ..assistant()
+            }),
             "explore-system" => {
                 let has_read_todos_result = request.messages.iter().any(
                     |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
@@ -893,6 +925,70 @@ fn explore_read_todos_specs(main_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
     (coda, vec![explore])
 }
 
+/// A root plus one `explore` sub-agent that answers without calling any tools.
+fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<AgentSpec>) {
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: main_prompt.into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "explore-plain".into(),
+        mode,
+        tools: vec![],
+        subagents: vec![],
+    };
+    (coda, vec![explore])
+}
+
+/// The `(parent message id, call id)` pair recorded on each user message that
+/// opens work in a thread, in order.
+async fn origins_in_thread(
+    storage: &MemoryStorage,
+    thread_id: &ThreadId,
+) -> Vec<Option<MessageOrigin>> {
+    storage
+        .load_checkpoint(thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("thread was checkpointed")
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user.origin.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every assistant message in a thread that issued tool calls, as
+/// `(message id, the ids of the calls it issued)`.
+async fn tool_calling_assistants(
+    storage: &MemoryStorage,
+    thread_id: &ThreadId,
+) -> Vec<(MessageId, Vec<String>)> {
+    storage
+        .load_checkpoint(thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("thread was checkpointed")
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(a) if !a.tool_calls.is_empty() => Some((
+                a.message_id,
+                a.tool_calls.iter().map(|c| c.id.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn wait_for_completion_after_explore_reply(
     harness: &mut Harness<MemoryStorage>,
     require_resume: bool,
@@ -967,6 +1063,141 @@ async fn stateless_subagent_replies_after_local_tool_execution() {
     .await;
     wait_for_completion_after_explore_reply(&mut harness, false).await;
     harness.shutdown().await;
+}
+
+/// A stateful sub-agent keeps one thread across calls, so two invocations pile
+/// their messages into the same history. What tells them apart is the origin
+/// recorded on each opening message — and it has to be the *pair*
+/// `(parent message id, call id)`, because this script reuses one call id for
+/// both invocations, which is legal.
+#[tokio::test]
+async fn stateful_subagent_records_which_call_opened_each_invocation() {
+    let (root, subagents) = explore_specs("twice-main", SubAgentMode::Stateful);
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        root,
+        subagents,
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    let done = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return msg.content;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the root agent to finish");
+    assert_eq!(done, "main done");
+    harness.shutdown().await;
+
+    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    assert_eq!(
+        parents.len(),
+        2,
+        "the root should have called explore twice"
+    );
+    // The premise of the test: the two calls are indistinguishable by call id.
+    assert_eq!(parents[0].1, parents[1].1);
+
+    // Both invocations share one thread, and each opening message points back at
+    // the assistant message that issued it.
+    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    assert_eq!(
+        origins_in_thread(&harness.storage, &explore_thread).await,
+        vec![
+            Some(MessageOrigin {
+                message_id: parents[0].0,
+                call_id: "call_explore".into(),
+            }),
+            Some(MessageOrigin {
+                message_id: parents[1].0,
+                call_id: "call_explore".into(),
+            }),
+        ]
+    );
+}
+
+/// The assistant message that issued a call is long gone by the time an approval
+/// is answered — the process may even have restarted — so its id has to be
+/// persisted with the suspension. Without that, the dispatched sub-agent could
+/// not record what triggered it.
+#[tokio::test]
+async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "explore"));
+    let (root, subagents) = explore_specs("main-system", SubAgentMode::Stateful);
+    let team = AgentTeam::new(root, subagents).expect("valid team");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build("."),
+        provider.clone(),
+        approval.clone(),
+        "inspect",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                return pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for approval suspension");
+    harness.shutdown().await;
+
+    // Captured before the restart, from the run that issued the call.
+    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    let [(parent_message_id, _)] = parents.as_slice() else {
+        panic!("expected exactly one tool-calling assistant message, got {parents:?}");
+    };
+
+    let mut harness = harness
+        .restart(
+            team.build("."),
+            provider,
+            approval,
+            HashMap::from([(
+                pending.thread_id.clone(),
+                ResumeDecision {
+                    resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+                },
+            )]),
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for completion after resume");
+    harness.shutdown().await;
+
+    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    assert_eq!(
+        origins_in_thread(&harness.storage, &explore_thread).await,
+        vec![Some(MessageOrigin {
+            message_id: *parent_message_id,
+            call_id: "call_explore".into(),
+        })]
+    );
 }
 
 #[tokio::test]
