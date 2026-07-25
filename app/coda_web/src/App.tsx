@@ -12,6 +12,7 @@ import {
   selectActiveRunning,
   selectActiveServer,
   selectActiveSessionTitle,
+  selectActiveStarting,
   selectActiveStatus,
   selectActiveUsage,
   selectActiveWorkspace,
@@ -201,6 +202,7 @@ export default function App() {
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
+  const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
@@ -392,6 +394,7 @@ export default function App() {
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
                   running={showingNewSession ? false : activeRunning}
+                  starting={showingNewSession ? false : activeStarting}
                   evicted={showingNewSession ? false : activeEvicted}
                   workspace={selectedWorkspace}
                   selectingTarget={showingNewSession}

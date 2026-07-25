@@ -91,6 +91,11 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** A draft session's opening `open_session` is in flight, ahead of its first
+   * task. `running` can't cover this window — it isn't set until the task is
+   * actually sent — so without it a second submit during the round trip would
+   * open the session and start a turn twice. */
+  starting?: boolean;
   /** A `delete_session` request is in flight (or tombstoned across a
    * disconnect). While set, `open`/`task`/`set_model`/repeat-`delete` are
    * no-ops for this key, and a reconnect re-sends the (idempotent) delete. */
@@ -1090,6 +1095,15 @@ function setSessionDeleting(store: CodaStore, server: string, key: SessionKey, d
   });
 }
 
+function setSessionStarting(store: CodaStore, server: string, key: SessionKey, starting: boolean) {
+  updateState(store, (state) => {
+    const session = state.servers[server]?.sessions[key];
+    if (session) {
+      session.starting = starting;
+    }
+  });
+}
+
 function deleteSessionState(store: CodaStore, server: string, key: SessionKey) {
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -1606,6 +1620,19 @@ async function requestOpenAndApply(
   }
 }
 
+/** Open a draft session ahead of its first task, holding `starting` for the
+ * round trip. That flag is the only thing standing between a second submit and
+ * a duplicate turn: the composer's send gate keys on `running`, which nothing
+ * sets until the task itself goes out. */
+async function openBeforeFirstTask(server: string, session: OpenedSession): Promise<boolean> {
+  setSessionStarting(codaStore, server, session.key, true);
+  try {
+    return await requestOpenAndApply(server, session);
+  } finally {
+    setSessionStarting(codaStore, server, session.key, false);
+  }
+}
+
 /** Send a `delete_session` request and settle the tombstone on its outcome:
  * success removes the session (and reconciles the returned catalog); an explicit
  * server error clears the flag; a dropped connection keeps the tombstone for the
@@ -1971,13 +1998,13 @@ export async function sendTask(task: string, images: string[] = []) {
   if (!text && images.length === 0) {
     return;
   }
-  if (!active || active.session.deleting) {
+  if (!active || active.session.deleting || active.session.starting) {
     return;
   }
   // A draft/new session must be live before its first task, or the task would
   // come back `SESSION_NOT_LIVE` while the UI already showed it running
   // (Decision 10).
-  if (active.session.draft && !(await requestOpenAndApply(active.server, active.session))) {
+  if (active.session.draft && !(await openBeforeFirstTask(active.server, active.session))) {
     return;
   }
   await startTurn(
@@ -2021,7 +2048,7 @@ export async function sendTaskToNewSession(
     return;
   }
   // Open the new session first, then send the task only if it opened.
-  if (!(await requestOpenAndApply(server, session))) {
+  if (!(await openBeforeFirstTask(server, session))) {
     return;
   }
   await startTurn(server, workspace, sessionId, text, images);
@@ -2276,6 +2303,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveStarting = (state: CodaStoreState) =>
+  activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
   activeSessionOf(state)?.evicted ?? false;
 export const selectActiveApprovals = (state: CodaStoreState) =>
