@@ -1125,6 +1125,72 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     );
 }
 
+/// Each stateless invocation must get its own thread. Deriving that thread from
+/// the call id alone breaks when a provider reuses call ids — and nothing ever
+/// deletes a thread's checkpoint, so the second invocation would load the first
+/// one's conversation instead of starting clean. This script reuses one call id
+/// across two invocations to pin that down.
+#[tokio::test]
+async fn stateless_invocations_reusing_a_call_id_get_separate_threads() {
+    let (root, subagents) = explore_specs("twice-main", SubAgentMode::Stateless);
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        root,
+        subagents,
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the root agent to finish");
+    harness.shutdown().await;
+
+    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    assert_eq!(
+        parents.len(),
+        2,
+        "the root should have called explore twice"
+    );
+    assert_eq!(parents[0].1, parents[1].1, "both calls reuse one call id");
+
+    let threads: Vec<ThreadId> = parents
+        .iter()
+        .map(|(message_id, _)| {
+            ThreadId::from_uuid5(
+                &harness.thread_id,
+                &MessageOrigin {
+                    message_id: *message_id,
+                    call_id: "call_explore".into(),
+                }
+                .derivation_key(),
+            )
+        })
+        .collect();
+    assert_ne!(threads[0], threads[1], "invocations shared a thread id");
+
+    // Each thread holds exactly its own invocation: had they collided, one
+    // thread would hold both opening messages and the other none.
+    for thread in &threads {
+        assert_eq!(
+            origins_in_thread(&harness.storage, thread).await.len(),
+            1,
+            "a stateless invocation saw another invocation's history"
+        );
+    }
+}
+
 /// The assistant message that issued a call is long gone by the time an approval
 /// is answered — the process may even have restarted — so its id has to be
 /// persisted with the suspension. Without that, the dispatched sub-agent could

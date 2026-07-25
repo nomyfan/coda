@@ -849,11 +849,19 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     continue;
                 }
 
+                let origin = MessageOrigin {
+                    message_id: tool_execution.parent_message_id,
+                    call_id: tc.tool_call.id.clone(),
+                };
                 let subagent_thread_id = if subagent.mode == SubAgentMode::Stateless {
-                    // Stateless: derive thread id from the parent thread + call id so each
-                    // invocation gets an independent session. The parent thread_id is a
-                    // valid UUID, so the uuid5 derivation never falls back to nil.
-                    ThreadId::from_uuid5(&self.thread_id, &tc.tool_call.id)
+                    // Stateless: each invocation gets its own thread, so derive
+                    // from what identifies the invocation. The call id alone
+                    // won't do — it is only unique within one assistant message,
+                    // so reusing it across turns would derive the same thread
+                    // twice and the second invocation would inherit the first
+                    // one's conversation (nothing ever deletes a thread's
+                    // checkpoint).
+                    ThreadId::from_uuid5(&self.thread_id, &origin.derivation_key())
                 } else {
                     // Stateful: stable thread id derived from the parent thread so the
                     // sub-agent session persists across calls within the same conversation.
@@ -873,8 +881,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     },
                     reply_to: None,
                     body: EnvelopeBody::ToolCall {
-                        call_id: tc.tool_call.id.clone(),
-                        parent_message_id: tool_execution.parent_message_id,
+                        call_id: origin.call_id.clone(),
+                        parent_message_id: origin.message_id,
                         // Sub-agent tools always take {"task": "..."} — extract the string.
                         task: serde_json::from_str::<serde_json::Value>(
                             tc.tool_call.arguments.as_deref().unwrap_or("{}"),

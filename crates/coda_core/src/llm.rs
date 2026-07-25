@@ -137,6 +137,15 @@ pub struct MessageOrigin {
     pub call_id: String,
 }
 
+impl MessageOrigin {
+    /// Render the pair as one name, for the places that need a single string to
+    /// identify this exact invocation — deriving a stateless sub-agent's thread
+    /// id from it, and recording that derivation afterwards.
+    pub fn derivation_key(&self) -> String {
+        format!("{}:{}", self.message_id, self.call_id)
+    }
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {

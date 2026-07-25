@@ -231,9 +231,10 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 打通正常/审批恢复/重启三路径的 origin
       - Verification: 单测——stateful sub-agent 多次调用后每条开场 user 消息 `origin` == 对应父 `(message_id, tool_call.id)`；**审批挂起→重开会话→approve 派发**后 origin 仍正确
       - 落地：`driver_tests::stateful_subagent_records_which_call_opened_each_invocation`（同一 turn 内连调两次 stateful sub-agent，脚本**故意复用同一个 `call_id`**，所以只有父 message_id 能区分两次调用）与 `subagent_dispatched_after_approval_restart_still_records_its_origin`（挂起→shutdown→restart→approve）。两条都反向验证过：分别把 origin 的父 id 改成新铸的、把 `StoredResumePoint::PendingApproval` 落库的父 id 改成新铸的，对应测试各自失败
-- [ ] [core logic] 修线程 ID 派生（**必须排在拓扑落库之前**，否则等于把错的派生键持久化）：stateless 改用复合键 `(父 Assistant message_id, call_id)`；`from_uuid5` 对非 UUID 父 id 稳定哈希出 namespace，去掉 nil 退化分支；同时修掉 `driver.rs:860` 那句已经不成立的注释
+- [x] [core logic] 修线程 ID 派生（**必须排在拓扑落库之前**，否则等于把错的派生键持久化）：stateless 改用复合键 `(父 Assistant message_id, call_id)`；`from_uuid5` 对非 UUID 父 id 稳定哈希出 namespace，去掉 nil 退化分支；同时修掉 `driver.rs:860` 那句已经不成立的注释
       - Purpose: 消掉两个现存缺陷——stateless 线程跨 turn 继承他人历史、非 UUID 会话共用 namespace
       - Verification: 单测——(a) **同一父线程在两个不同 turn 收到相同 `tool_call.id`，两次 stateless 调用得到不同 thread id、第二次历史为空**；(b) 两个不同的非 UUID session id 派生出的同名子线程 id 互不相同；(c) 父 id 是合法 UUID 时的派生结果与改动前一致（stateful 路径不回归）
+      - 落地：(a) `driver_tests::stateless_invocations_reusing_a_call_id_get_separate_threads`（复用同一 `call_id` 的两次 stateless 调用，断言 thread id 不同且各线程恰有一条开场消息）；(b)(c) `agent::thread_id_tests` 两条。复合键由 `MessageOrigin::derivation_key()` 生成。**两个缺陷都反向复现过**：退回裸 `call_id` → (a) 失败；退回 `unwrap_or(Uuid::nil())` → (b) 失败且两个不同非 UUID 会话派生出**完全相同**的子线程 id，(c) 仍通过（证明 UUID 路径无回归）
 - [ ] [core logic] 线程拓扑落库：`ToolCall` envelope 加 `derivation_key`；`StoredCheckpoint` 加 `parent_thread_id` / `derivation_key`，子线程处理 `ToolCall` 时从 envelope sender + 该字段捕获并写入
       - Purpose: 把只藏在 uuid5 推导里的父子关系变成可直接查的记录，给 fork 备料
       - Verification: 单测——含嵌套 sub-agent 的会话跑完后，能只靠 checkpoint 自顶向下重建整棵线程树（父为空的恰好一个且等于 session_id）；对每个子线程校验 `uuid5(parent_thread_id, derivation_key)` == 它自己的 `thread_id`；stateless 记的是复合键、stateful 记的是 agent 名

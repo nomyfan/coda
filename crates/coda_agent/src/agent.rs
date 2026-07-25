@@ -134,13 +134,26 @@ impl Default for ThreadId {
     }
 }
 
+/// Namespace for hashing a non-UUID thread id into a usable uuid5 namespace.
+/// Arbitrary but fixed: changing it changes every derived thread id.
+const NON_UUID_THREAD_NAMESPACE: Uuid = Uuid::from_u128(0x3f7a1c62_5be4_4d0f_9a31_c6d84b7e02f5);
+
 impl ThreadId {
     pub fn new() -> Self {
         ThreadId(Uuid::new_v4().to_string())
     }
 
+    /// Derive a child thread id from its parent and a name.
+    ///
+    /// A parent id that isn't a UUID — the root thread id is the client-supplied
+    /// session id, which is only required to be a safe string — is hashed into a
+    /// namespace rather than falling back to the nil one. Falling back would
+    /// give every such session the *same* namespace, so two sessions would
+    /// derive identical child ids and "a different parent means different
+    /// children" would silently stop holding.
     pub fn from_uuid5(namespace: &ThreadId, name: &str) -> Self {
-        let ns = Uuid::parse_str(&namespace.0).unwrap_or(Uuid::nil());
+        let ns = Uuid::parse_str(&namespace.0)
+            .unwrap_or_else(|_| Uuid::new_v5(&NON_UUID_THREAD_NAMESPACE, namespace.0.as_bytes()));
         ThreadId(Uuid::new_v5(&ns, name.as_bytes()).to_string())
     }
 }
@@ -561,6 +574,39 @@ impl SubAgents {
                 }),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod thread_id_tests {
+    use super::*;
+
+    /// The root thread id is whatever session id the client chose, and it is not
+    /// required to be a UUID — the web client falls back to a non-UUID form
+    /// whenever `crypto.randomUUID` is unavailable, which is every plain-HTTP
+    /// origin. Two such sessions must still derive distinct child threads.
+    #[test]
+    fn non_uuid_parents_derive_distinct_children() {
+        let one = ThreadId::from("session-mf3k2x".to_string());
+        let other = ThreadId::from("session-mf3k2y".to_string());
+
+        assert_ne!(
+            ThreadId::from_uuid5(&one, "explore"),
+            ThreadId::from_uuid5(&other, "explore")
+        );
+    }
+
+    /// Deriving from a parent that *is* a UUID must keep using it as the
+    /// namespace directly, so existing stateful thread ids are unaffected by the
+    /// non-UUID handling above.
+    #[test]
+    fn uuid_parent_is_used_as_the_namespace_directly() {
+        let parent = ThreadId::from("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string());
+
+        assert_eq!(
+            ThreadId::from_uuid5(&parent, "explore").as_ref(),
+            Uuid::new_v5(&Uuid::parse_str(parent.as_ref()).unwrap(), b"explore").to_string()
+        );
     }
 }
 
