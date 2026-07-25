@@ -23,6 +23,8 @@ export type CompletionUsage = {
 };
 
 export type AssistantMessage = {
+  /** Server-minted identity, stable across reconnects. */
+  message_id: string;
   content: string;
   tool_calls: ToolCall[];
   usage?: CompletionUsage | null;
@@ -45,6 +47,9 @@ export type ToolCallOutcome =
   | { Rejected: { reason?: string | null } };
 
 export type ToolMessage = {
+  /** Server-minted identity of this message. Distinct from `id`, which is the
+   * id of the tool call it answers. */
+  message_id: string;
   id: string;
   name: string;
   output: ToolOutput;
@@ -57,7 +62,12 @@ export type ToolMessage = {
 
 export type ContentPart = { type: "text"; text: string } | { type: "image"; url: string };
 
-export type UserMessage = { parts: ContentPart[]; created_at: string };
+export type UserMessage = {
+  /** Server-minted identity, stable across reconnects. */
+  message_id: string;
+  parts: ContentPart[];
+  created_at: string;
+};
 
 export type HistoryMessage =
   | { System: string }

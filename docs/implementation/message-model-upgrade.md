@@ -244,9 +244,11 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 让 turn 归属在所有线程、所有恢复路径上成立——这是 rewind 截断的地基
       - Verification: 单测——(a) sub-agent（含嵌套、stateful 多次调用）的每条消息 `turn_id` == 触发它的 root 提交；(b) 待审批时发新 task 抢占，aborted `ToolMessage` 归属**旧** turn，按新 turn 截断后父 Assistant 的 `tool_call` 仍配对齐全；(c) 审批挂起→重开会话→approve，派发出去的 `ToolCall` 仍带正确 `turn_id`
       - 落地：(a) `one_submission_tags_every_thread_it_reaches`（三层 coda→explore→probe，断言三个线程每条消息的 turn 都等于 root 提交）；(b) `preempted_calls_are_written_off_under_the_turn_they_belonged_to`，其中第二段断言直接模拟 rewind——滤掉新 turn 后，残留的每个 `tool_call` 仍有配对结果；(c) 由 `subagent_dispatched_after_approval_restart_still_records_its_origin` 覆盖同一条链路（`turn_id` 与 `parent_message_id` 一起随 resume 状态过挂起）。**(b) 反向验证过**：把 turn 推进时机改到 envelope 入口（设计明确警告的错法），该测试立刻失败
-- [ ] [integration] wire task→request 返回 message_id；前端乐观条目 reconcile；展示 key 从 `message_id` 派生
+- [x] [integration] wire task→request 返回 message_id；前端乐观条目 reconcile；展示 key 从 `message_id` 派生
       - Purpose: 打通到 UI
       - Verification: `pnpm --filter coda-web lint && test`；前端乐观渲染后收到 ack 正确 reconcile，无重复条目
+      - 落地：TS 三个消息类型加 `message_id`；`historyToEntries` 的 key 从 index 合成（`history:user:${index}`）改为从 `message_id` 派生，`index` 参数随之删除。"无重复条目"这条**靠结构保证而非测试**：`userEntryId()` 是唯一生成 user 条目 key 的地方，乐观路径与历史回放路径都走它，所以同一条消息前后必然同 key。
+      - **已知测试缺口**：没有加 store 层测试覆盖 reconcile。现有 web 测试只覆盖纯模块（`test/model-preferences.test.ts`），`session.ts` 目前没有可用的测试脚手架（需要 fake RPC + store 装配）。lint / typecheck / 现有 12 个测试全过，但 reconcile 路径只有上面的结构性论证，没有回归防护。要补的话是独立一件事。
 
 ## Deviations from Design
 

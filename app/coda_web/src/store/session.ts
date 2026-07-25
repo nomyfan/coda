@@ -290,9 +290,11 @@ function collectToolArgs(messages: HistoryMessage[]): Record<string, string | nu
   return map;
 }
 
+/** Entry ids are derived from the server's `message_id` so a message keeps the
+ * same key across a reload or reconnect. One assistant message can yield two
+ * entries (its reasoning and its answer), which the kind prefix separates. */
 function historyToEntries(
   message: HistoryMessage,
-  index: number,
   argsById: Record<string, string | null | undefined> = {},
 ): TranscriptEntry[] {
   if ("System" in message) {
@@ -308,7 +310,7 @@ function historyToEntries(
       .map((p) => (p as { type: "image"; url: string }).url);
     return [
       {
-        id: `history:user:${index}`,
+        id: userEntryId(message.User.message_id),
         kind: "user",
         content: textContent,
         images: images.length > 0 ? images : undefined,
@@ -321,7 +323,7 @@ function historyToEntries(
     const entries: TranscriptEntry[] = [];
     if (assistant.reasoning_content) {
       entries.push({
-        id: `history:reasoning:${index}`,
+        id: `reasoning:${assistant.message_id}`,
         kind: "reasoning",
         agentName: rootName,
         title: "Thinking",
@@ -332,7 +334,7 @@ function historyToEntries(
     }
     if (assistant.content) {
       entries.push({
-        id: `history:assistant:${index}`,
+        id: `assistant:${assistant.message_id}`,
         kind: "assistant",
         agentName: rootName,
         content: assistant.content,
@@ -349,7 +351,7 @@ function historyToEntries(
     return [
       toolMessageToEntry(
         message.Tool,
-        `history:tool:${index}`,
+        `tool:${message.Tool.message_id}`,
         describeTool(message.Tool.name, argumentsJson),
         message.Tool.name === "shell"
           ? extractShellCommand({
@@ -1143,7 +1145,7 @@ function applySnapshot(
 ) {
   const key = sessionKey(workspaceId, sessionId);
   const argsById = collectToolArgs(messages);
-  const mapped = messages.flatMap((message, index) => historyToEntries(message, index, argsById));
+  const mapped = messages.flatMap((message) => historyToEntries(message, argsById));
   const usage = historyUsage(messages);
   const hasHistory = messages.length > 0;
   updateState(store, (state) => {
@@ -1265,6 +1267,13 @@ function addAllowResultActivity(
 
 /** Render the user's message immediately, returning the id of the entry created
  * so the caller can reconcile it once the server answers with the real one. */
+/// The transcript key for a user message, from the id the server minted for it.
+/// Shared by the optimistic path and the replayed-history path so one message
+/// keeps one key.
+function userEntryId(messageId: string) {
+  return `user:${messageId}`;
+}
+
 function appendUserMessage(
   store: CodaStore,
   server: string,
@@ -1306,13 +1315,14 @@ function appendUserMessage(
   return entryId;
 }
 
-/** Re-key an optimistic user entry onto the id the server minted for it, so
- * both sides name that message identically. */
-function adoptServerMessageId(server: string, key: SessionKey, entryId: string, messageId: string) {
+/** Re-key an optimistic user entry onto the id derived from the server's
+ * `message_id`, so it matches the key the same message gets when replayed from
+ * history. */
+function adoptServerMessageId(server: string, key: SessionKey, entryId: string, settledId: string) {
   updateState(codaStore, (state) => {
     const entry = draftSession(state, server, key)?.entries.find((e) => e.id === entryId);
     if (entry) {
-      entry.id = messageId;
+      entry.id = settledId;
     }
   });
 }
@@ -1357,7 +1367,7 @@ async function startTurn(
       task: text,
       images: images.length > 0 ? images : undefined,
     });
-    adoptServerMessageId(server, key, entryId, message_id);
+    adoptServerMessageId(server, key, entryId, userEntryId(message_id));
     return true;
   } catch (err) {
     discardOptimisticTask(server, key, entryId);
