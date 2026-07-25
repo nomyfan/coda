@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, SystemMessage, ToolCall, ToolCallOutcome,
-    ToolDefinition, ToolMessage, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, Message, MessageId, SystemMessage, ToolCall,
+    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
@@ -165,6 +165,11 @@ pub struct Receiver {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnvelopeBody {
     Task {
+        /// Identity for the user message this task becomes, minted once at the
+        /// request boundary. The relay builds its own copy of that message for
+        /// the live snapshot, so the id has to travel with the task rather than
+        /// be minted here.
+        message_id: MessageId,
         task: String,
         /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -28,7 +28,7 @@ schemars = "1.2.1"
 jiff = { version = "0.2", features = ["serde"] }
 libc = "0.2"
 tokio-util = "0.7"
-uuid = { version = "1", features = ["v4", "v5"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [profile.release]
 opt-level = 3

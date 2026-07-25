@@ -6,7 +6,7 @@ use crate::{
 };
 use coda_core::{
     llm::{
-        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message,
+        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
         ReasoningContinuation, StreamError, ToolCall, ToolMessage,
     },
     tool::{Tool, ToolCallContext, ToolObject, ToolResult, ToolWrapper},
@@ -32,6 +32,7 @@ use tokio::{
 fn assistant() -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![],
         usage: None,
@@ -677,6 +678,7 @@ fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
         },
         reply_to: None,
         body: EnvelopeBody::Task {
+            message_id: MessageId::new(),
             task: task.into(),
             images: vec![],
         },

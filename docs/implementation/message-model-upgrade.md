@@ -222,9 +222,10 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 - [ ] [core types] `MessageId` / `MessageOrigin` / `TurnId` + 三个变体的字段 + `UserMessage::origin`；`HistoryEntry` 与 `AgentState.messages` / `StoredCheckpoint.messages` / `restore_history` 换型
       - Purpose: 落地数据模型
       - Verification: `cargo build`（含 `MemoryStorage`、测试 stub 随之编过）；序列化 round-trip 单测
-- [ ] [core logic] 铸造点：正常 assistant 在 `coda_openai` 的 `TryFrom` 铸造 id；aborted assistant（driver 668-678）与 `ToolMessage::new` 各自铸造
+- [x] [core logic] 铸造点：正常 assistant 在 `coda_openai` 的 `TryFrom` 铸造 id；aborted assistant（driver 668-678）与 `ToolMessage::new` 各自铸造
       - Purpose: 补齐 assistant/tool 单构造点铸造
       - Verification: 单测——同一条 assistant/tool 消息经 `LLMEnd`/`ToolCallEnd` 事件到 hub snapshot 后 `message_id` 不变
+      - 落地：`hub_tests::snapshot_and_checkpoint_agree_on_every_message_id`。断言一整轮（user → assistant(带 tool call) → tool → assistant）在 snapshot 与持久化 checkpoint 中的 id 序列逐条相等，一次覆盖三种变体的两条不同路径。已反向验证：只让事件副本与历史副本的 assistant id 分岔，该测试即失败（user/tool 仍相等），证明它确实盯着事件流那条路
 - [ ] [core logic] 父 ID 传播链路：`ToolExecutionState`/`PendingApproval` 及 Stored 形加 `parent_message_id`；sub-agent `ToolCall` envelope 带 `MessageOrigin`；sub-agent `handle_envelope` 据此填 `origin` 并铸造开场 user `message_id`
       - Purpose: 打通正常/审批恢复/重启三路径的 origin
       - Verification: 单测——stateful sub-agent 多次调用后每条开场 user 消息 `origin` == 对应父 `(message_id, tool_call.id)`；**审批挂起→重开会话→approve 派发**后 origin 仍正确
@@ -240,3 +241,7 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 - [ ] [integration] wire task→request 返回 message_id；前端乐观条目 reconcile；展示 key 从 `message_id` 派生
       - Purpose: 打通到 UI
       - Verification: `pnpm --filter coda-web lint && test`；前端乐观渲染后收到 ack 正确 reconcile，无重复条目
+
+## Deviations from Design
+
+- **步骤 1–3 的落地顺序做了拆分**（仅顺序，接口/数据模型/取舍均按原设计）。改 `UserMessage` 构造签名会一次性打断全部调用点，所以第一批落地的是"身份类型 + 三个变体的 `message_id` + 各铸造点 + root user 的 id 在 hub 单点铸造并经 `Task` envelope 传到 driver"，即完整的第 3 步加第 1、2 步的一部分。**第 1 步暂未勾选**：它的验收要求三方一致（snapshot / checkpoint / ack），目前已验证前两方，ack 随 `task` 改 request 时补齐。**第 2 步暂未勾选**：`MessageOrigin` / `TurnId` / `HistoryEntry` 推迟到各自有值可携带的步骤（origin 传播、turn 盖章）再引入，避免先落一批没有写入方的死字段。

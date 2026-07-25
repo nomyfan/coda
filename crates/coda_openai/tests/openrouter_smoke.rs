@@ -1,6 +1,7 @@
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, StreamError,
-    SystemMessage, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId,
+    StreamError, SystemMessage, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    UserMessage,
 };
 use coda_openai::{OpenAICompatible, ProviderKind};
 use futures::StreamExt as _;
@@ -76,6 +77,7 @@ async fn three_models_replay_reasoning_continuations_after_tool_calls() {
                 .into(),
         ));
         let user = Message::User(UserMessage::text(
+            MessageId::new(),
             "Your only valid action is to call lookup_weather exactly once with city Singapore. Do not emit a direct answer.",
         ));
         let assistant = completion_with_retry(

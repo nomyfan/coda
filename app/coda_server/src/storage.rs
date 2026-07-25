@@ -531,7 +531,9 @@ impl SessionStorage for JsonFileStorage {
 mod tests {
     use super::*;
     use coda_agent::persist::StoredResumePoint;
-    use coda_core::llm::{AssistantMessage, ReasoningContinuation, ToolCall, UserMessage};
+    use coda_core::llm::{
+        AssistantMessage, MessageId, ReasoningContinuation, ToolCall, UserMessage,
+    };
     use std::os::unix::fs::PermissionsExt as _;
 
     fn test_binding() -> SessionModelBinding {
@@ -598,7 +600,10 @@ mod tests {
                     thread_id: "active".into(),
                     agent_name: "coda".into(),
                     reply_target: None,
-                    messages: vec![Message::User(UserMessage::text("recent session"))],
+                    messages: vec![Message::User(UserMessage::text(
+                        MessageId::new(),
+                        "recent session",
+                    ))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),
@@ -636,6 +641,7 @@ mod tests {
                     agent_name: "coda".into(),
                     reply_target: None,
                     messages: vec![Message::User(UserMessage::with_images(
+                        MessageId::new(),
                         "",
                         &["data:image/png;base64,AAAA".to_string()],
                     ))],
@@ -671,6 +677,7 @@ mod tests {
                     agent_name: "coda".into(),
                     reply_target: None,
                     messages: vec![Message::Assistant(AssistantMessage {
+                        message_id: MessageId::new(),
                         content: String::new(),
                         tool_calls: vec![ToolCall {
                             id: "call_weather".into(),

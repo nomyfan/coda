@@ -1,6 +1,36 @@
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
+
+/// Stable identity of a persisted message.
+///
+/// Always minted server-side; clients only ever read it. Values are UUID v4, so
+/// they never collide in practice, but the storage constraint only requires
+/// uniqueness *within a session* — that is what lets a session fork copy its
+/// messages verbatim instead of re-minting every id and rewriting the
+/// references that point at them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageId(Uuid);
+
+impl MessageId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Opaque, provider-formatted reasoning state that must be replayed on a later
 /// request. The format tag prevents one provider dialect from interpreting
@@ -94,6 +124,7 @@ pub enum ContentPart {
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
+    pub message_id: MessageId,
     pub parts: Vec<ContentPart>,
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
@@ -102,8 +133,14 @@ pub struct UserMessage {
 
 impl UserMessage {
     /// Construct a text-only message.
-    pub fn text(text: impl Into<String>) -> Self {
+    ///
+    /// The id is passed in rather than minted here: a root user message is built
+    /// twice from the same task — once for the agent's persisted history and
+    /// once for the relay's in-memory snapshot — and both copies must carry the
+    /// same id.
+    pub fn text(message_id: MessageId, text: impl Into<String>) -> Self {
         Self {
+            message_id,
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
         }
@@ -112,7 +149,7 @@ impl UserMessage {
     /// Construct a message with optional text and zero or more image URLs
     /// (data-URIs or HTTPS URLs). An empty `text` produces a pure-image
     /// message with no text part, since some providers reject empty text parts.
-    pub fn with_images(text: impl Into<String>, images: &[String]) -> Self {
+    pub fn with_images(message_id: MessageId, text: impl Into<String>, images: &[String]) -> Self {
         let text = text.into();
         let mut parts = Vec::with_capacity(images.len() + 1);
         if !text.is_empty() {
@@ -124,6 +161,7 @@ impl UserMessage {
                 .map(|url| ContentPart::Image { url: url.clone() }),
         );
         Self {
+            message_id,
             parts,
             created_at: jiff::Timestamp::now(),
         }
@@ -149,6 +187,11 @@ impl UserMessage {
 /// A message representing a response from the AI, which may include tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    /// Minted where the message is constructed — the provider adapter for a
+    /// normal completion, the runtime for an aborted one. Each object is built
+    /// exactly once and then flows through the event pipeline unchanged, so the
+    /// id the caller sees is always the id that gets persisted.
+    pub message_id: MessageId,
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<CompletionUsage>,
@@ -273,6 +316,9 @@ pub enum ToolCallOutcome {
 /// A message representing the result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMessage {
+    pub message_id: MessageId,
+    /// The id of the tool call this message answers. Distinct from
+    /// `message_id`, which identifies this message itself.
     pub id: String,
     pub name: String,
     pub output: ToolOutput,
@@ -287,9 +333,9 @@ pub struct ToolMessage {
 }
 
 impl ToolMessage {
-    /// Construct a tool result, stamping `ended_at` at the current instant.
-    /// Pass `started_at` when execution timing is known; instantaneous results
-    /// (rejections, dispatch failures) pass `None`.
+    /// Construct a tool result, stamping `message_id` and `ended_at` at the
+    /// current instant. Pass `started_at` when execution timing is known;
+    /// instantaneous results (rejections, dispatch failures) pass `None`.
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -298,6 +344,7 @@ impl ToolMessage {
         started_at: Option<jiff::Timestamp>,
     ) -> Self {
         Self {
+            message_id: MessageId::new(),
             id: id.into(),
             name: name.into(),
             output,
@@ -422,6 +469,7 @@ mod tests {
     fn assistant_reasoning_roundtrips_and_defaults_when_absent() {
         let now = jiff::Timestamp::now();
         let message = AssistantMessage {
+            message_id: MessageId::new(),
             content: String::new(),
             tool_calls: vec![],
             usage: None,
@@ -464,6 +512,7 @@ mod tests {
 
         let now = jiff::Timestamp::now();
         let without_reasoning: AssistantMessage = serde_json::from_value(serde_json::json!({
+            "message_id": MessageId::new(),
             "content": "",
             "tool_calls": [],
             "usage": null,

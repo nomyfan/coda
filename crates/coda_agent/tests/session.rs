@@ -14,8 +14,8 @@ use coda_agent::{
     SessionEvent, SessionStreamItem, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, StreamError, ToolCall,
-    ToolOutput,
+    AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, MessageId, StreamError,
+    ToolCall, ToolOutput,
 };
 use futures::{Stream, stream};
 use serde_json::json;
@@ -63,6 +63,7 @@ fn completed(
 fn assistant() -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![],
         usage: None,
@@ -432,7 +433,10 @@ async fn should_reply_with_text_when_no_tools_needed() {
         .await
         .expect("open session");
 
-    session.send("simple hello", vec![]).await.expect("send");
+    session
+        .send(MessageId::new(), "simple hello", vec![])
+        .await
+        .expect("send");
 
     let reply = collect_until_done(&session).await;
     assert_eq!(reply, "Hello from the agent!");
@@ -466,7 +470,10 @@ async fn should_read_file_via_tool_call() {
         .expect("open session");
 
     let task = format!("read file at {}", file_path.display());
-    session.send(task, vec![]).await.expect("send");
+    session
+        .send(MessageId::new(), task, vec![])
+        .await
+        .expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -502,7 +509,10 @@ async fn should_write_and_read_back_file() {
         .expect("open session");
 
     let task = format!("write then read {}", file_path.display());
-    session.send(task, vec![]).await.expect("send");
+    session
+        .send(MessageId::new(), task, vec![])
+        .await
+        .expect("send");
 
     let reply = collect_until_done(&session).await;
     assert!(
@@ -548,7 +558,7 @@ async fn should_delegate_to_explore_subagent() {
         .expect("open session");
 
     session
-        .send("delegate to explore", vec![])
+        .send(MessageId::new(), "delegate to explore", vec![])
         .await
         .expect("send");
 
@@ -577,7 +587,7 @@ async fn should_maintain_history_across_turns() {
 
     // Turn 1
     session
-        .send("multi turn start", vec![])
+        .send(MessageId::new(), "multi turn start", vec![])
         .await
         .expect("send turn 1");
     let reply1 = collect_until_done(&session).await;
@@ -585,7 +595,7 @@ async fn should_maintain_history_across_turns() {
 
     // Turn 2
     session
-        .send("multi turn follow", vec![])
+        .send(MessageId::new(), "multi turn follow", vec![])
         .await
         .expect("send turn 2");
     let reply2 = collect_until_done(&session).await;
@@ -617,7 +627,7 @@ async fn should_resume_from_prior_checkpoint() {
         .expect("open session 1");
 
     session1
-        .send("resume test start", vec![])
+        .send(MessageId::new(), "resume test start", vec![])
         .await
         .expect("send");
     let reply1 = collect_until_done(&session1).await;
@@ -660,7 +670,7 @@ async fn should_resume_from_prior_checkpoint() {
     );
 
     session2
-        .send("resume test follow", vec![])
+        .send(MessageId::new(), "resume test follow", vec![])
         .await
         .expect("send");
     let reply2 = collect_until_done(&session2).await;
@@ -693,7 +703,7 @@ async fn should_execute_tool_after_approval_resume() {
         .expect("open session");
 
     session
-        .send("approve read_todos", vec![])
+        .send(MessageId::new(), "approve read_todos", vec![])
         .await
         .expect("send");
 
@@ -740,7 +750,7 @@ async fn should_auto_reject_when_approval_times_out() {
         .expect("open session 1");
 
     session1
-        .send("timeout approval", vec![])
+        .send(MessageId::new(), "timeout approval", vec![])
         .await
         .expect("send");
 

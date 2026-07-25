@@ -1,5 +1,5 @@
 use super::*;
-use coda_agent::runtime::MemoryStorage;
+use coda_agent::runtime::{MemoryStorage, SessionStorage};
 use coda_agent::{
     AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ToolApprovalMode,
     ToolCallResolution,
@@ -19,6 +19,7 @@ use tokio::time::{Duration, timeout};
 fn assistant(content: &str) -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        message_id: MessageId::new(),
         content: content.into(),
         tool_calls: vec![],
         usage: None,
@@ -66,7 +67,7 @@ fn chunk(agent: &str, text: &str) -> WireEvent {
 }
 
 fn user(text: &str) -> Message {
-    Message::User(UserMessage::text(text.to_string()))
+    Message::User(UserMessage::text(MessageId::new(), text.to_string()))
 }
 
 // --- EventLog ----------------------------------------------------------
@@ -504,6 +505,86 @@ async fn task_settles_then_reattach_shows_folded_history() {
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
 
     hub.shutdown_all().await;
+}
+
+/// Every message reaches the relay's snapshot by a different route than it
+/// reaches storage, and the two must agree on its id — otherwise one message
+/// has two identities and anything naming a message across a reconnect (a
+/// rewind target, a front-end key) only addresses half the system.
+///
+/// The routes differ per variant, which is why this asserts on the whole
+/// sequence rather than one message: a user message is *built twice* (once in
+/// the session, once here) and only agrees because the id is minted before
+/// either copy; assistant and tool messages are built once and ride the event
+/// pipeline here while the driver writes the same object to history.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_and_checkpoint_agree_on_every_message_id() {
+    // The "approval" script calls a tool and then answers, so one turn produces
+    // all three persisted variants: user, assistant (with tool calls), tool,
+    // assistant. `Auto` approval keeps it from suspending.
+    let opener = Arc::new(TestOpener::new("approval", ToolApprovalMode::Auto));
+    let storage = opener.storage.clone();
+    let hub = SessionHub::new(opener, RelayConfig::default());
+
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "go".into(),
+            images: vec![],
+        },
+    )
+    .await;
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    // Read the snapshot the way a reconnecting client would.
+    let snapshot = hub
+        .attach(key(), 2, "prov".into(), None, true)
+        .await
+        .expect("attach2")
+        .snapshot;
+
+    // Graceful shutdown drains the driver, which writes its checkpoint before
+    // it observes the exit signal — so the persisted history is settled here.
+    hub.shutdown_all().await;
+    let persisted = storage
+        .load_checkpoint(&key().1)
+        .await
+        .expect("load checkpoint")
+        .expect("root thread checkpoint was written")
+        .messages;
+
+    assert_eq!(ids_by_role(&snapshot.messages), ids_by_role(&persisted));
+    // Guard the assertion above against passing on two empty lists, and pin
+    // that the turn really did exercise all three variants.
+    assert_eq!(
+        ids_by_role(&persisted)
+            .iter()
+            .map(|(role, _)| *role)
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "tool", "assistant"]
+    );
+}
+
+/// Each message's role and id, in order — what two copies of one history must
+/// agree on.
+fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
+    messages
+        .iter()
+        .map(|m| match m {
+            Message::User(u) => ("user", u.message_id),
+            Message::Assistant(a) => ("assistant", a.message_id),
+            Message::Tool(t) => ("tool", t.message_id),
+            // Built fresh for each request and never persisted, so it has no id
+            // and cannot appear in either list.
+            Message::System(_) => unreachable!("a system message reached persisted history"),
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -4,8 +4,8 @@ use std::{
 };
 
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, StreamError, ToolCallOutcome,
-    ToolMessage, ToolOutput, UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, StreamError,
+    ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
 };
 use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -430,27 +430,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     ) -> AgentLoopState {
         match resume_point {
             ResumePoint::Generation => {
-                match &envelope.body {
-                    EnvelopeBody::Task { task, images } => {
-                        self.reply_target = None;
-                        self.agent
-                            .add_message(Message::User(UserMessage::with_images(
-                                task.clone(),
-                                images,
-                            )))
-                            .await
-                    }
-                    EnvelopeBody::ToolCall { task, .. } => {
-                        self.reply_target = reply_target_from_envelope(&envelope);
-                        self.agent
-                            .add_message(Message::User(UserMessage::text(task.clone())))
-                            .await
-                    }
-                    _ => {
-                        warn!("unexpected envelope {:?}", envelope);
-                        return AgentLoopState::Done(ResumePoint::Generation);
-                    }
-                }
+                let Some(user) = opening_user_message(&envelope.body) else {
+                    warn!("unexpected envelope {:?}", envelope);
+                    return AgentLoopState::Done(ResumePoint::Generation);
+                };
+                // `None` for a root task, whose sender is the user rather than
+                // a calling agent.
+                self.reply_target = reply_target_from_envelope(&envelope);
+                self.agent.add_message(Message::User(user)).await;
                 AgentLoopState::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
@@ -477,8 +464,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                         }
                         Envelope {
-                            body:
-                                EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. },
+                            body: EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. },
                             ..
                         } => {
                             // A new task/tool-call arrived while waiting for subagent replies
@@ -501,9 +487,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .await;
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
-                            self.agent
-                                .add_message(Message::User(UserMessage::text(task.clone())))
-                                .await;
+                            if let Some(user) = opening_user_message(&envelope.body) {
+                                self.agent.add_message(Message::User(user)).await;
+                            }
                             return AgentLoopState::Next(ResumePoint::Generation);
                         }
                         _ => {
@@ -524,7 +510,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 mut pending_calls,
             } => {
                 match &envelope.body {
-                    EnvelopeBody::Task { task, .. } | EnvelopeBody::ToolCall { task, .. } => {
+                    EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. } => {
                         // Stale PendingApproval state: new task or sub-agent re-invocation
                         // arrived (e.g. after abort). Write aborted ToolMessages for all
                         // pending calls so the history stays valid, then start fresh.
@@ -557,9 +543,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             .await;
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
-                        self.agent
-                            .add_message(Message::User(UserMessage::text(task.clone())))
-                            .await;
+                        if let Some(user) = opening_user_message(&envelope.body) {
+                            self.agent.add_message(Message::User(user)).await;
+                        }
                         AgentLoopState::Next(ResumePoint::Generation)
                     }
                     EnvelopeBody::Resume(decision) => {
@@ -666,6 +652,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             partial_content + "\n[Generation was interrupted by the user]"
                         };
                         let message = coda_core::llm::AssistantMessage {
+                            message_id: MessageId::new(),
                             content,
                             tool_calls: Vec::new(),
                             usage: None,
@@ -1048,6 +1035,27 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         } else {
             AgentLoopState::Next(ResumePoint::Generation)
         }
+    }
+}
+
+/// The user message that opens the work an envelope asks for, or `None` for
+/// envelopes that continue existing work (`Reply`, `Resume`) rather than start
+/// any.
+///
+/// A root task carries the id minted at the request boundary. A sub-agent
+/// invocation mints its own here: this is that message's only construction
+/// point, so there is no second copy to stay in sync with.
+fn opening_user_message(body: &EnvelopeBody) -> Option<UserMessage> {
+    match body {
+        EnvelopeBody::Task {
+            message_id,
+            task,
+            images,
+        } => Some(UserMessage::with_images(*message_id, task.clone(), images)),
+        EnvelopeBody::ToolCall { task, .. } => {
+            Some(UserMessage::text(MessageId::new(), task.clone()))
+        }
+        EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => None,
     }
 }
 

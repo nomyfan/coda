@@ -16,7 +16,7 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
-use coda_core::llm::{LLMProvider, Message};
+use coda_core::llm::{LLMProvider, Message, MessageId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -416,10 +416,15 @@ impl Session {
 
     /// Send a user task to the root agent, optionally with image attachments.
     ///
+    /// `message_id` becomes the identity of the user message this task turns
+    /// into. The caller supplies it because it also needs to label its own copy
+    /// of that message (the live snapshot) and answer the client with it.
+    ///
     /// `images` is a list of base64 data-URIs (`data:image/<fmt>;base64,<b64>`)
     /// or HTTPS URLs. Pass an empty `Vec` for text-only turns.
     pub async fn send(
         &self,
+        message_id: MessageId,
         task: impl Into<String>,
         images: Vec<String>,
     ) -> Result<(), SendCommandError> {
@@ -436,7 +441,11 @@ impl Session {
                     thread_id,
                 },
                 reply_to: None,
-                body: EnvelopeBody::Task { task, images },
+                body: EnvelopeBody::Task {
+                    message_id,
+                    task,
+                    images,
+                },
             }))
             .await
     }
