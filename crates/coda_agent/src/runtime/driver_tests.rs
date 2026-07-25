@@ -421,6 +421,28 @@ impl LLMProvider for TestProvider {
                 content: "explore done".into(),
                 ..assistant()
             }),
+            // A middle layer: calls its own sub-agent, then answers.
+            "nested-explore" => {
+                let has_probe_result = request
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Tool(tool) if tool.name == "probe"));
+                if has_probe_result {
+                    Self::completed(AssistantMessage {
+                        content: "explore done".into(),
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_probe".into(),
+                            name: "probe".into(),
+                            arguments: Some(r#"{"task":"probe deeper"}"#.into()),
+                        }],
+                        ..assistant()
+                    })
+                }
+            }
             "explore-system" => {
                 let has_read_todos_result = request.messages.iter().any(
                     |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
@@ -1123,6 +1145,103 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
             }),
         ]
     );
+}
+
+/// Thread ids are derived one-way, so the parent/child structure exists only
+/// implicitly unless it is written down. Each thread records who spawned it and
+/// the name its own id came from, which is enough to walk the tree top-down —
+/// what a fork needs, since moving a session under a new root changes every
+/// derived id beneath it.
+#[tokio::test]
+async fn every_thread_records_how_its_parent_addressed_it() {
+    // coda → explore (stateful) → probe (stateless), so the tree is two levels
+    // deep and covers both derivation kinds.
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "nested-explore".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["probe".into()],
+    };
+    let probe = AgentSpec {
+        name: "probe".into(),
+        description: String::new(),
+        system_prompt: "explore-plain".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        coda,
+        vec![explore, probe],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the root agent to finish");
+    harness.shutdown().await;
+
+    let threads = harness.storage.all_checkpoints().await;
+    assert_eq!(threads.len(), 3, "expected root + explore + probe threads");
+
+    // Exactly one thread has no parent, and it is the session's root.
+    let roots: Vec<&String> = threads
+        .iter()
+        .filter(|c| c.parent_thread_id.is_none())
+        .map(|c| &c.thread_id)
+        .collect();
+    assert_eq!(roots, vec![harness.thread_id.as_ref()]);
+
+    for checkpoint in &threads {
+        let Some(parent_thread_id) = &checkpoint.parent_thread_id else {
+            continue;
+        };
+        let derivation_key = checkpoint
+            .derivation_key
+            .as_ref()
+            .expect("a thread with a parent also records how it was derived");
+        // The recorded pair is not a note about the id — it reproduces it.
+        assert_eq!(
+            ThreadId::from_uuid5(&ThreadId::from(parent_thread_id.clone()), derivation_key)
+                .as_ref(),
+            checkpoint.thread_id,
+            "{} does not derive from its recorded parent",
+            checkpoint.agent_name
+        );
+        // A stateful thread is addressed by agent name so repeat calls land on
+        // it; a stateless one by the invocation, so they never do.
+        match checkpoint.agent_name.as_str() {
+            "explore" => assert_eq!(derivation_key, "explore"),
+            "probe" => assert!(
+                derivation_key.contains(':'),
+                "stateless key should be the (message id, call id) pair, got {derivation_key:?}"
+            ),
+            other => panic!("unexpected agent {other}"),
+        }
+    }
 }
 
 /// Each stateless invocation must get its own thread. Deriving that thread from

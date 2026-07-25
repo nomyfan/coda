@@ -206,6 +206,10 @@ pub enum EnvelopeBody {
         /// thread stamps on its opening message; only the parent id travels
         /// here, since `call_id` is already alongside it.
         parent_message_id: MessageId,
+        /// The name the caller derived the receiving thread's id from. Sent so
+        /// the receiver can record how it was addressed without re-deriving it
+        /// (which would mean knowing the caller's mode for it).
+        derivation_key: String,
         task: String,
     },
     /// Reply from a agent, containing the tool output.

@@ -26,6 +26,19 @@ use crate::runtime::AgentRuntimeSnapshot;
 pub struct StoredCheckpoint {
     pub thread_id: String,
     pub agent_name: String,
+    /// The thread that spawned this one, and the name its `thread_id` was
+    /// derived from (`uuid5(parent_thread_id, derivation_key)`). Both `None` on
+    /// the root thread, so "no parent" is what identifies the root.
+    ///
+    /// The derivation is one-way, so without recording these the parent/child
+    /// structure can only be re-guessed; a fork, which has to rebuild every
+    /// derived id under a new root, needs to walk it directly. Kept separate
+    /// from `reply_target`, which names the same parent but only for the span of
+    /// one call and is cleared as soon as the reply is sent.
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub derivation_key: Option<String>,
     #[serde(default)]
     pub reply_target: Option<ReplyTarget>,
     pub messages: Vec<Message>,

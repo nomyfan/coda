@@ -235,9 +235,10 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 消掉两个现存缺陷——stateless 线程跨 turn 继承他人历史、非 UUID 会话共用 namespace
       - Verification: 单测——(a) **同一父线程在两个不同 turn 收到相同 `tool_call.id`，两次 stateless 调用得到不同 thread id、第二次历史为空**；(b) 两个不同的非 UUID session id 派生出的同名子线程 id 互不相同；(c) 父 id 是合法 UUID 时的派生结果与改动前一致（stateful 路径不回归）
       - 落地：(a) `driver_tests::stateless_invocations_reusing_a_call_id_get_separate_threads`（复用同一 `call_id` 的两次 stateless 调用，断言 thread id 不同且各线程恰有一条开场消息）；(b)(c) `agent::thread_id_tests` 两条。复合键由 `MessageOrigin::derivation_key()` 生成。**两个缺陷都反向复现过**：退回裸 `call_id` → (a) 失败；退回 `unwrap_or(Uuid::nil())` → (b) 失败且两个不同非 UUID 会话派生出**完全相同**的子线程 id，(c) 仍通过（证明 UUID 路径无回归）
-- [ ] [core logic] 线程拓扑落库：`ToolCall` envelope 加 `derivation_key`；`StoredCheckpoint` 加 `parent_thread_id` / `derivation_key`，子线程处理 `ToolCall` 时从 envelope sender + 该字段捕获并写入
+- [x] [core logic] 线程拓扑落库：`ToolCall` envelope 加 `derivation_key`；`StoredCheckpoint` 加 `parent_thread_id` / `derivation_key`，子线程处理 `ToolCall` 时从 envelope sender + 该字段捕获并写入
       - Purpose: 把只藏在 uuid5 推导里的父子关系变成可直接查的记录，给 fork 备料
       - Verification: 单测——含嵌套 sub-agent 的会话跑完后，能只靠 checkpoint 自顶向下重建整棵线程树（父为空的恰好一个且等于 session_id）；对每个子线程校验 `uuid5(parent_thread_id, derivation_key)` == 它自己的 `thread_id`；stateless 记的是复合键、stateful 记的是 agent 名
+      - 落地：`driver_tests::every_thread_records_how_its_parent_addressed_it`，三层 `coda → explore(stateful) → probe(stateless)`，四条断言全覆盖。运行态用 `AgentLoop::origin_thread` 承载，只在收到 `ToolCall` 时写入（其他 envelope 不表态、不清除），随 checkpoint 存取。反向验证过：checkpoint 不写 `parent_thread_id` → 三个线程全都自称 root，断言失败
 - [ ] [core logic] turn 盖章 + 传播：新增 `add_user_message(turn_id, user)`（一次加锁内推进当前 turn + 追加），driver 里追加 user 消息的几处（Task / ToolCall / Resume 分支）换用它；`add_message` 从线程当前 turn 盖章；`ToolCall` envelope 带 `turn_id`；恢复时由末条 entry 反推
       - Purpose: 让 turn 归属在所有线程、所有恢复路径上成立——这是 rewind 截断的地基
       - Verification: 单测——(a) sub-agent（含嵌套、stateful 多次调用）的每条消息 `turn_id` == 触发它的 root 提交；(b) 待审批时发新 task 抢占，aborted `ToolMessage` 归属**旧** turn，按新 turn 截断后父 Assistant 的 `tool_call` 仍配对齐全；(c) 审批挂起→重开会话→approve，派发出去的 `ToolCall` 仍带正确 `turn_id`

@@ -599,6 +599,8 @@ mod tests {
                 StoredCheckpoint {
                     thread_id: "active".into(),
                     agent_name: "coda".into(),
+                    parent_thread_id: None,
+                    derivation_key: None,
                     reply_target: None,
                     messages: vec![Message::User(UserMessage::text(
                         MessageId::new(),
@@ -639,6 +641,8 @@ mod tests {
                 StoredCheckpoint {
                     thread_id: "images".into(),
                     agent_name: "coda".into(),
+                    parent_thread_id: None,
+                    derivation_key: None,
                     reply_target: None,
                     messages: vec![Message::User(UserMessage::with_images(
                         MessageId::new(),
@@ -675,6 +679,8 @@ mod tests {
                 StoredCheckpoint {
                     thread_id: "continuation".into(),
                     agent_name: "coda".into(),
+                    parent_thread_id: None,
+                    derivation_key: None,
                     reply_target: None,
                     messages: vec![Message::Assistant(AssistantMessage {
                         message_id: MessageId::new(),
@@ -759,6 +765,8 @@ mod tests {
                     StoredCheckpoint {
                         thread_id: thread_id.into(),
                         agent_name: "coda".into(),
+                        parent_thread_id: None,
+                        derivation_key: None,
                         reply_target: None,
                         messages: vec![],
                         todos: vec![],

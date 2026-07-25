@@ -122,6 +122,17 @@ pub struct MemoryStorage {
     snapshots: Arc<Mutex<HashMap<String, StoredRuntimeSnapshot>>>,
 }
 
+impl MemoryStorage {
+    /// Every checkpoint written so far, sorted by thread id. For assertions
+    /// about a session as a whole (its thread tree), where the caller cannot
+    /// name the threads up front because their ids are derived.
+    pub async fn all_checkpoints(&self) -> Vec<StoredCheckpoint> {
+        let mut checkpoints: Vec<_> = self.checkpoints.lock().await.values().cloned().collect();
+        checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+        checkpoints
+    }
+}
+
 impl SessionStorage for MemoryStorage {
     fn save_checkpoint(
         &self,
