@@ -27,7 +27,7 @@ axum = { version = "0.8", features = ["ws"] }
 brush-parser = "0.4.0"
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+jiff-sqlx = { version = "0.1", default-features = false, features = ["postgres"] }
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio",
   "tls-rustls-ring",
@@ -39,7 +39,6 @@ sqlx = { version = "0.8", default-features = false, features = [
   "macros",
   "json",
   "uuid",
-  "chrono",
   "migrate",
 ] }
 

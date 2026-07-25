@@ -4,6 +4,8 @@ use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnap
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
 use coda_tools::TodoItem;
+// Brings `to_sqlx()` on jiff timestamps into scope; see `CheckpointRow`.
+use jiff_sqlx::ToSqlx;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
@@ -374,7 +376,13 @@ struct CheckpointRow {
     reply_target: Option<Json<ReplyTarget>>,
     resume_point: Json<StoredResumePoint>,
     todos: Json<Vec<TodoItem>>,
-    suspended_at: chrono::DateTime<chrono::Utc>,
+    /// The orphan rule keeps sqlx's traits off `jiff::Timestamp`, so timestamps
+    /// cross the SQL boundary through jiff-sqlx's wrapper — `to_sqlx()` on the
+    /// way in, `to_jiff()` on the way out. Both directions go through
+    /// microseconds, PostgreSQL's own resolution, so what comes back is exactly
+    /// what was written, truncated once on the way in rather than rounded by the
+    /// server.
+    suspended_at: jiff_sqlx::Timestamp,
 }
 
 #[derive(sqlx::FromRow)]
@@ -409,20 +417,6 @@ fn awaits_approval(resume_point: &StoredResumePoint) -> bool {
             ..
         } if !pending_approval_calls.is_empty()
     )
-}
-
-/// jiff timestamps cross the SQL boundary as chrono values, which is what sqlx
-/// binds to `timestamptz`. Both directions go through microseconds — PostgreSQL's
-/// own resolution — so the value that comes back is exactly the one written,
-/// truncated once on the way in rather than rounded by the server.
-fn sql_timestamp(timestamp: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_micros(timestamp.as_microsecond())
-        .expect("jiff's timestamp range is a subset of chrono's")
-}
-
-fn jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Result<jiff::Timestamp, String> {
-    jiff::Timestamp::from_microsecond(timestamp.timestamp_micros())
-        .map_err(|err| format!("stored timestamp is out of range: {err}"))
 }
 
 impl PgSessionStorage {
@@ -532,7 +526,7 @@ impl PgSessionStorage {
         .bind(checkpoint.reply_target.as_ref().map(Json))
         .bind(Json(&checkpoint.resume_point))
         .bind(Json(&checkpoint.todos))
-        .bind(sql_timestamp(checkpoint.suspended_at))
+        .bind(checkpoint.suspended_at.to_sqlx())
         .bind(checkpoint.messages.len() as i32)
         .bind(awaits_approval(&checkpoint.resume_point))
         .execute(&mut *tx)
@@ -589,7 +583,7 @@ impl PgSessionStorage {
             messages,
             todos: state.todos.0,
             resume_point: state.resume_point.0,
-            suspended_at: jiff_timestamp(state.suspended_at)?,
+            suspended_at: state.suspended_at.to_jiff(),
         }))
     }
 
