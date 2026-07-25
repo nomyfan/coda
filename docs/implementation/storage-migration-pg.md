@@ -163,12 +163,14 @@ runtime_snapshots(workspace_id, session_id,
 
 ## Implementation Roadmap
 
-- [ ] [risk validation] spike：`.scratchpad/pg-spike/` 里用 sqlx 建最小 `messages` 表，写入/读回一条带 `reasoning_continuation` 的 `AssistantMessage` payload
+- [x] [risk validation] spike：`.scratchpad/pg-spike/` 里用 sqlx 建最小 `messages` 表，写入/读回一条带 `reasoning_continuation` 的 `AssistantMessage` payload
       - Purpose: 证伪"JSONB 无损 round-trip"与 sqlx/PG 连通性
       - Verification: round-trip 断言通过
-- [ ] [schema] 落 migrations：四张表 + 索引（`(ws,session,message_id)` 唯一、`(ws,session,thread,seq)` 主键、`(ws,session,turn_id)`）+ 复合外键 `ON DELETE CASCADE`
+      - 落地：spike 一次通过 —— `payload jsonb` 无损（含 `reasoning_continuation` 的 format + 不透明 payload）、`message_id`/`turn_id` 按 `uuid` 列绑定、`where turn_id = $1 order by seq` 跨行取回。**新发现**：`timestamptz` 只有微秒精度，而 jiff 是纳秒。因此写入侧统一走 `as_microsecond()`（截断，不让 PG 去做四舍五入），读回即精确相等——不是"约等于"。同时确认必须给 `MessageId`/`TurnId` 加 `as_uuid()` 访问器（内层 `Uuid` 原本私有）
+- [x] [schema] 落 migrations：四张表 + 索引（`(ws,session,message_id)` 唯一、`(ws,session,thread,seq)` 主键、`(ws,session,turn_id)`）+ 复合外键 `ON DELETE CASCADE`
       - Purpose: 固化数据模型与删除语义
       - Verification: 迁移在空库跑通；`DELETE FROM sessions` 级联清掉 messages/thread_checkpoints/runtime_snapshots，无孤儿
+      - 落地：`app/coda_server/migrations/20260725000000_sessions.sql`（`sqlx::migrate!` 编译期内嵌）。测试 `deleting_a_session_takes_its_threads_messages_and_snapshot_with_it` 建两个会话各带 checkpoint/message/snapshot，删其一后断言三张表只剩另一个会话的行（反向验证：把 DELETE 的 session_id 打错 → 断言以 "thread_checkpoints was not cascaded" 失败）；`a_thread_cannot_belong_to_a_session_that_does_not_exist` 反向确认外键真的存在，不只是"删对了"
 - [ ] [core logic] PG session 存储实现 `SessionStorage`：事务内增量追加 + 线程状态记录 upsert；load 拼行重建
       - Purpose: 核心行为可单测
       - Verification: save→load round-trip 等价（含每行 `turn_id` / `origin_*`）；连续两次 save 只新增尾部行（`message_count` 生效）；平移 `checkpoint_round_trips_reasoning_continuation`；按 `turn_id` 跨线程查回一次提交的全部消息
@@ -184,6 +186,7 @@ runtime_snapshots(workspace_id, session_id,
       - 该 job 显式开启：`cargo test -p coda_server --features pg-tests --test storage_pg`
       - Purpose: PG 成为唯一生产存储后端后，保证它在 CI 被真正验证。关键是"连不上 PG 就让 job 失败"，而不是"没设 `DATABASE_URL` 就跳过"——后者会让 CI 一条持久化测试都不跑却显示绿灯。测试目标内 `DATABASE_URL` 缺失应直接 panic，不得跳过
       - Verification: 该 job 拉起 PG 并跑通存储测试；把 `DATABASE_URL` 指向不存在的实例时该 job **失败**（证明没有静默跳过）；不加 `--features pg-tests` 时 `cargo test` 连这个目标都不编译（现有 `rust` 矩阵 job 含无 PG 的 macOS，因此必须如此）
-      - 测试隔离：**每个测试用一个随机 `workspace_id`**。schema 全部以 `(workspace_id, session_id)` 为键、`WorkspaceStorage` 本身就是 workspace 作用域，所以这样即可并行而互不干扰（`list_sessions` 也不会看到别的测试的行），不需要 `--test-threads=1` 或逐测试清库。迁移在测试进程里跑一次（sqlx migrator 取 PG advisory lock，并发调用亦安全）
+      - 测试隔离：**每个测试用一个随机 `workspace_id`**。schema 全部以 `(workspace_id, session_id)` 为键、`WorkspaceStorage` 本身就是 workspace 作用域，所以这样即可并行而互不干扰（`list_sessions` 也不会看到别的测试的行），不需要 `--test-threads=1` 或逐测试清库
+      - 连接池：**每个测试各建一个池**，而不是靠 static 全局共享一个。sqlx 的池绑定在创建它的 tokio runtime 上，而 `#[tokio::test]` 每个测试各有一个 runtime——共享池在第一个测试的 runtime 关闭后就开始 `PoolTimedOut`（实测踩到）。连接按需建立、迁移取 PG advisory lock，所以每测试一个池的代价只是一条连接加一次版本检查
       - 测试搬家：`storage.rs` 现有那批临时目录测试（列表排序、`pending_approval`、image-only 预览、改名、effort）都要从内联 `#[cfg(test)]` 搬到 `tests/storage_pg.rs`——内联测试属于 lib 的 unittest target，管不了 `required-features`。`WorkspaceStorage::new` / `validate_session_id` 均为 `pub`，搬出去无可见性问题；两个 `validate_session_id_*` 是纯字符串校验、不碰 DB，**留在内联**，让普通 `cargo test` 仍覆盖它们
       - 已知副作用：macOS 本地跑 `cargo test` 不再覆盖存储路径，需自行起 PG（**用专门的空库如 `coda_test`，不要指向真实数据库**——迁移随启动自动执行，测试还会写入和删除）并设 `DATABASE_URL`。`coda_agent` 侧不受影响（用 `MemoryStorage`）

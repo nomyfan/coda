@@ -1,6 +1,8 @@
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::Message;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
@@ -10,6 +12,23 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 use tokio::sync::Mutex;
+
+/// Connect to PostgreSQL and bring the schema up to date.
+///
+/// Migrations are embedded in the binary and run on every start, so deploying
+/// is all it takes to create or update the schema. The error deliberately omits
+/// the URL, which carries the password.
+pub async fn connect(database_url: &str) -> Result<PgPool, String> {
+    let pool = PgPoolOptions::new()
+        .connect(database_url)
+        .await
+        .map_err(|err| format!("failed to connect to the database: {err}"))?;
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .map_err(|err| format!("failed to apply database migrations: {err}"))?;
+    Ok(pool)
+}
 
 /// Session-list preview shown for a session whose first user turn carried only
 /// images (no text). Kept in sync with `IMAGE_ONLY_TITLE` in the web store so the

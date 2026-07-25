@@ -18,6 +18,18 @@ impl MessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// The id as a plain UUID, for storage backends that have a native uuid
+    /// column type.
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl From<Uuid> for MessageId {
+    fn from(id: Uuid) -> Self {
+        Self(id)
+    }
 }
 
 impl Default for MessageId {
@@ -129,6 +141,14 @@ pub enum ContentPart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TurnId(MessageId);
+
+impl TurnId {
+    /// The tag as a plain UUID, for storage backends that have a native uuid
+    /// column type.
+    pub fn as_uuid(&self) -> Uuid {
+        self.0.as_uuid()
+    }
+}
 
 impl From<MessageId> for TurnId {
     fn from(message_id: MessageId) -> Self {

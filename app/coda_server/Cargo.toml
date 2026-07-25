@@ -27,9 +27,37 @@ axum = { version = "0.8", features = ["ws"] }
 brush-parser = "0.4.0"
 clap = { version = "4", features = ["derive", "env"] }
 atomic-write-file = "0.3"
+uuid = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
+  "postgres",
+  # `macros` is here only for `sqlx::migrate!`, which embeds the migration files
+  # at compile time. The query macros (which would need a live database to
+  # build) are deliberately unused; every statement is built with the runtime
+  # API instead, so a checkout compiles without PostgreSQL.
+  "macros",
+  "json",
+  "uuid",
+  "chrono",
+  "migrate",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# The PostgreSQL storage tests need a live database, so they live in their own
+# test target gated behind this feature — `cargo test` must stay green on a
+# machine without PostgreSQL (the CI matrix includes macOS runners, which have
+# none). The `storage-pg` CI job turns it on. Merely putting the tests under
+# `tests/` would not be enough: `cargo test` builds and runs every target there.
+[features]
+pg-tests = []
+
+[[test]]
+name = "storage_pg"
+required-features = ["pg-tests"]
 
 [[bin]]
 name = "coda-server"
