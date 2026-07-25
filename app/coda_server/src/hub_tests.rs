@@ -564,7 +564,10 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
         .await
         .expect("load checkpoint")
         .expect("root thread checkpoint was written")
-        .messages;
+        .messages
+        .into_iter()
+        .map(|entry| entry.message)
+        .collect::<Vec<_>>();
 
     assert_eq!(ids_by_role(&snapshot.messages), ids_by_role(&persisted));
     // Guard the assertion above against passing on two empty lists, and pin

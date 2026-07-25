@@ -121,6 +121,27 @@ pub enum ContentPart {
     Image { url: String },
 }
 
+/// Identity of a turn: the id of the root user message that started it.
+///
+/// Reusing that id rather than minting a separate one keeps "what is a turn"
+/// self-evident and avoids a second ordering scheme — turns are ordered by where
+/// their user message sits in the root thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(MessageId);
+
+impl From<MessageId> for TurnId {
+    fn from(message_id: MessageId) -> Self {
+        Self(message_id)
+    }
+}
+
+impl std::fmt::Display for TurnId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Which sub-agent invocation produced a message.
 ///
 /// A composite key rather than the bare `call_id`, because a tool call id is

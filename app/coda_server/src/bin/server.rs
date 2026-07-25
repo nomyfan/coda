@@ -246,7 +246,14 @@ impl SessionOpener for AppOpener {
                 .await
                 .ok()
                 .flatten()
-                .map(|checkpoint| checkpoint.messages)
+                // Clients get the conversation; turn tags are server-side only.
+                .map(|checkpoint| {
+                    checkpoint
+                        .messages
+                        .into_iter()
+                        .map(|entry| entry.message)
+                        .collect()
+                })
                 .unwrap_or_default()
         })
     }

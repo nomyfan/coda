@@ -5,7 +5,7 @@ use std::{
 
 use coda_core::llm::{
     ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, MessageOrigin,
-    StreamError, ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
+    StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -466,14 +466,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
         match resume_point {
             ResumePoint::Generation => {
-                let Some(user) = opening_user_message(&envelope.body) else {
+                let Some((turn_id, user)) = opening_user_message(&envelope.body) else {
                     warn!("unexpected envelope {:?}", envelope);
                     return AgentLoopState::Done(ResumePoint::Generation);
                 };
                 // `None` for a root task, whose sender is the user rather than
                 // a calling agent.
                 self.reply_target = reply_target_from_envelope(&envelope);
-                self.agent.add_message(Message::User(user)).await;
+                self.agent.add_user_message(turn_id, user).await;
                 AgentLoopState::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
@@ -523,8 +523,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .await;
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
-                            if let Some(user) = opening_user_message(&envelope.body) {
-                                self.agent.add_message(Message::User(user)).await;
+                            if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
+                                self.agent.add_user_message(turn_id, user).await;
                             }
                             return AgentLoopState::Next(ResumePoint::Generation);
                         }
@@ -580,8 +580,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             .await;
                         }
                         self.reply_target = reply_target_from_envelope(&envelope);
-                        if let Some(user) = opening_user_message(&envelope.body) {
-                            self.agent.add_message(Message::User(user)).await;
+                        if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
+                            self.agent.add_user_message(turn_id, user).await;
                         }
                         AgentLoopState::Next(ResumePoint::Generation)
                     }
@@ -865,6 +865,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             concurrent_stateful_subagents(self.agent, &tool_execution.tool_calls);
         // Tracks local tool calls that have not yet completed, keyed by tool call id.
         // The timestamp records when execution began, for the result's duration.
+        // Handed to every sub-agent dispatched below so their messages group with
+        // the submission that ultimately caused them.
+        let turn_id = self.agent.current_turn().await;
         let mut pending_local: HashMap<String, (PendingToolCall, jiff::Timestamp)> = HashMap::new();
         let mut futures = futures::stream::FuturesUnordered::new();
         for tc in &tool_execution.tool_calls {
@@ -919,6 +922,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         call_id: origin.call_id.clone(),
                         parent_message_id: origin.message_id,
                         derivation_key: derivation_key.clone(),
+                        turn_id,
                         // Sub-agent tools always take {"task": "..."} — extract the string.
                         task: serde_json::from_str::<serde_json::Value>(
                             tc.tool_call.arguments.as_deref().unwrap_or("{}"),
@@ -1094,31 +1098,38 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 /// envelopes that continue existing work (`Reply`, `Resume`) rather than start
 /// any.
 ///
-/// A root task carries the id minted at the request boundary. A sub-agent
-/// invocation mints its own here — this is that message's only construction
-/// point, so there is no second copy to stay in sync with — and records the
+/// A root task carries the id minted at the request boundary, and that id also
+/// names the turn it begins. A sub-agent invocation mints its own message id
+/// here — this is that message's only construction point, so there is no second
+/// copy to stay in sync with — inherits the caller's turn, and records the
 /// calling thread's tool call as its origin, which is what later lets a rewind
-/// tell this invocation's messages from another invocation's in the same
-/// thread.
-fn opening_user_message(body: &EnvelopeBody) -> Option<UserMessage> {
+/// tell this invocation's messages from another invocation's in the same thread.
+fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, UserMessage)> {
     match body {
         EnvelopeBody::Task {
             message_id,
             task,
             images,
-        } => Some(UserMessage::with_images(*message_id, task.clone(), images)),
+        } => Some((
+            TurnId::from(*message_id),
+            UserMessage::with_images(*message_id, task.clone(), images),
+        )),
         EnvelopeBody::ToolCall {
             call_id,
             parent_message_id,
+            turn_id,
             task,
             ..
-        } => Some(UserMessage::from_subagent_call(
-            MessageId::new(),
-            task.clone(),
-            MessageOrigin {
-                message_id: *parent_message_id,
-                call_id: call_id.clone(),
-            },
+        } => Some((
+            *turn_id,
+            UserMessage::from_subagent_call(
+                MessageId::new(),
+                task.clone(),
+                MessageOrigin {
+                    message_id: *parent_message_id,
+                    call_id: call_id.clone(),
+                },
+            ),
         )),
         EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => None,
     }

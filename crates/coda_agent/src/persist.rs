@@ -9,11 +9,12 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use coda_core::llm::{Message, MessageId, ToolCall, ToolCallOutcome};
+use coda_core::llm::{MessageId, ToolCall, ToolCallOutcome};
 use coda_tools::TodoItem;
 
 use crate::agent::{
-    Envelope, PendingReply, PendingToolCall, ReplyTarget, ResumePoint, ToolExecutionState,
+    Envelope, HistoryEntry, PendingReply, PendingToolCall, ReplyTarget, ResumePoint,
+    ToolExecutionState,
 };
 use crate::runtime::AgentRuntimeSnapshot;
 
@@ -41,7 +42,7 @@ pub struct StoredCheckpoint {
     pub derivation_key: Option<String>,
     #[serde(default)]
     pub reply_target: Option<ReplyTarget>,
-    pub messages: Vec<Message>,
+    pub messages: Vec<HistoryEntry>,
     pub todos: Vec<TodoItem>,
     pub resume_point: StoredResumePoint,
     #[serde(default)]

@@ -947,6 +947,16 @@ fn explore_read_todos_specs(main_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
     (coda, vec![explore])
 }
 
+/// A checkpoint's conversation without the turn tags, for assertions that only
+/// care about the messages themselves.
+fn messages_of(checkpoint: &StoredCheckpoint) -> Vec<Message> {
+    checkpoint
+        .messages
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect()
+}
+
 /// A root plus one `explore` sub-agent that answers without calling any tools.
 fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<AgentSpec>) {
     let coda = AgentSpec {
@@ -981,7 +991,7 @@ async fn origins_in_thread(
         .expect("thread was checkpointed")
         .messages
         .iter()
-        .filter_map(|message| match message {
+        .filter_map(|entry| match &entry.message {
             Message::User(user) => Some(user.origin.clone()),
             _ => None,
         })
@@ -1001,7 +1011,7 @@ async fn tool_calling_assistants(
         .expect("thread was checkpointed")
         .messages
         .iter()
-        .filter_map(|message| match message {
+        .filter_map(|entry| match &entry.message {
             Message::Assistant(a) if !a.tool_calls.is_empty() => Some((
                 a.message_id,
                 a.tool_calls.iter().map(|c| c.id.clone()).collect(),
@@ -1145,6 +1155,206 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
             }),
         ]
     );
+}
+
+/// One submission's work fans out across threads — the root's, a stateful
+/// sub-agent's, a nested stateless one's — and a rewind has to find all of it
+/// starting from the submission alone. So every message any of those threads
+/// writes while serving one task carries that task's turn.
+#[tokio::test]
+async fn one_submission_tags_every_thread_it_reaches() {
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "nested-explore".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["probe".into()],
+    };
+    let probe = AgentSpec {
+        name: "probe".into(),
+        description: String::new(),
+        system_prompt: "explore-plain".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        coda,
+        vec![explore, probe],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the root agent to finish");
+    harness.shutdown().await;
+
+    // The turn is named by the root user message that opened it.
+    let root = harness
+        .storage
+        .load_checkpoint(harness.thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("root thread was checkpointed");
+    let expected = root
+        .messages
+        .iter()
+        .find_map(|entry| match &entry.message {
+            Message::User(user) => Some(TurnId::from(user.message_id)),
+            _ => None,
+        })
+        .expect("the root thread opens with a user message");
+
+    let threads = harness.storage.all_checkpoints().await;
+    assert_eq!(threads.len(), 3, "expected root + explore + probe threads");
+    for checkpoint in &threads {
+        assert!(!checkpoint.messages.is_empty());
+        for entry in &checkpoint.messages {
+            assert_eq!(
+                entry.turn_id, expected,
+                "{} wrote a message outside the submission's turn",
+                checkpoint.agent_name
+            );
+        }
+    }
+}
+
+/// When a new task pre-empts calls awaiting approval, the driver writes those
+/// calls off as aborted results. Those results answer the *previous* turn's
+/// assistant message, so they have to stay with the previous turn: were they
+/// tagged with the arriving one, rewinding to it would delete them and leave
+/// tool calls with no results — history a provider rejects outright. This is why
+/// the turn advances when the user message is appended rather than when the
+/// envelope arrives.
+#[tokio::test]
+async fn preempted_calls_are_written_off_under_the_turn_they_belonged_to() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build("."),
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        "phase1",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for suspension");
+
+    // A new task instead of a resume: the pending call gets discarded.
+    harness.send_task("phase1").await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the pre-empting turn to finish");
+    harness.shutdown().await;
+
+    let history = harness
+        .storage
+        .load_checkpoint(harness.thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("root thread was checkpointed")
+        .messages;
+
+    let turns: Vec<TurnId> = history
+        .iter()
+        .filter_map(|entry| match &entry.message {
+            Message::User(user) => Some(TurnId::from(user.message_id)),
+            _ => None,
+        })
+        .collect();
+    let [first_turn, second_turn] = turns.as_slice() else {
+        panic!("expected two user messages, got {}", turns.len());
+    };
+
+    let discarded = history
+        .iter()
+        .find(|entry| {
+            matches!(&entry.message, Message::Tool(tool)
+                if tool.id == "call_approve" && matches!(tool.outcome, ToolCallOutcome::Aborted))
+        })
+        .expect("the pre-empted call was written off");
+    assert_eq!(
+        discarded.turn_id, *first_turn,
+        "the write-off was attributed to the turn that pre-empted it"
+    );
+
+    // Rewind to the second turn and check the survivors are still well formed:
+    // every remaining tool call has its result.
+    let kept: Vec<&Message> = history
+        .iter()
+        .filter(|entry| entry.turn_id != *second_turn)
+        .map(|entry| &entry.message)
+        .collect();
+    let answered: HashSet<&str> = kept
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool(tool) => Some(tool.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for message in &kept {
+        if let Message::Assistant(assistant) = message {
+            for call in &assistant.tool_calls {
+                assert!(
+                    answered.contains(call.id.as_str()),
+                    "truncating the later turn left {} unanswered",
+                    call.id
+                );
+            }
+        }
+    }
+    assert!(!answered.is_empty(), "nothing survived the truncation");
 }
 
 /// Thread ids are derived one-way, so the parent/child structure exists only
@@ -1863,11 +2073,11 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     harness.shutdown().await;
     result.expect("timed out waiting for abort event");
     assert!(matches!(
-        tool_message(&checkpoint.messages, "call_slow"),
+        tool_message(&messages_of(&checkpoint), "call_slow"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
     ));
     assert!(matches!(
-        tool_message(&checkpoint.messages, "call_explore"),
+        tool_message(&messages_of(&checkpoint), "call_explore"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
     ));
 }
@@ -1940,7 +2150,7 @@ async fn abort_settles_cancel_aware_tool_with_partial_output() {
     harness.shutdown().await;
     result.expect("timed out waiting for abort event");
     assert!(matches!(
-        tool_message(&checkpoint.messages, "call_cancel"),
+        tool_message(&messages_of(&checkpoint), "call_cancel"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
             && matches!(
                 &tool.output,
@@ -2015,7 +2225,8 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
-                && let Some(Message::Assistant(message)) = checkpoint.messages.last()
+                && let Some(Message::Assistant(message)) =
+                    checkpoint.messages.last().map(|entry| &entry.message)
                 && message.aborted
             {
                 break checkpoint;
@@ -2033,7 +2244,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
         crate::persist::StoredResumePoint::Generation
     ));
     assert!(matches!(
-        checkpoint.messages.last(),
+        checkpoint.messages.last().map(|entry| &entry.message),
         Some(Message::Assistant(message))
             if message.aborted
                 && message.content.contains("partial")
@@ -2095,11 +2306,11 @@ async fn partial_stream_error_does_not_enter_history_or_checkpoint() {
         .await
         .expect("user task should remain checkpointed");
     assert!(matches!(
-        checkpoint.messages.last(),
+        checkpoint.messages.last().map(|entry| &entry.message),
         Some(Message::User(user)) if user.first_text() == Some("trigger partial error")
     ));
-    assert!(!checkpoint.messages.iter().any(|message| matches!(
-        message,
+    assert!(!checkpoint.messages.iter().any(|entry| matches!(
+        &entry.message,
         Message::Assistant(assistant)
             if assistant.content.contains("uncommitted")
                 || assistant.reasoning_content.as_deref().is_some_and(|value| value.contains("uncommitted"))
@@ -2235,7 +2446,7 @@ async fn user_task_is_checkpointed_before_turn_completes() {
         .await
         .expect("user task was not checkpointed at turn start");
     assert!(matches!(
-        checkpoint.messages.last(),
+        checkpoint.messages.last().map(|entry| &entry.message),
         Some(Message::User(user)) if user.first_text() == Some("hold this task")
     ));
     assert!(matches!(

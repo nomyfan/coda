@@ -383,7 +383,7 @@ impl JsonFileStorage {
         checkpoint
             .messages
             .into_iter()
-            .find_map(|message| match message {
+            .find_map(|entry| match entry.message {
                 Message::User(msg) => Some(msg),
                 _ => None,
             })
@@ -530,10 +530,20 @@ impl SessionStorage for JsonFileStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coda_agent::HistoryEntry;
     use coda_agent::persist::StoredResumePoint;
     use coda_core::llm::{
-        AssistantMessage, MessageId, ReasoningContinuation, ToolCall, UserMessage,
+        AssistantMessage, MessageId, ReasoningContinuation, ToolCall, TurnId, UserMessage,
     };
+
+    /// Wrap a message as a history entry. These tests exercise storage of the
+    /// conversation, not turn grouping, so each gets its own turn.
+    fn entry(message: Message) -> HistoryEntry {
+        HistoryEntry {
+            turn_id: TurnId::from(MessageId::new()),
+            message,
+        }
+    }
     use std::os::unix::fs::PermissionsExt as _;
 
     fn test_binding() -> SessionModelBinding {
@@ -602,10 +612,10 @@ mod tests {
                     parent_thread_id: None,
                     derivation_key: None,
                     reply_target: None,
-                    messages: vec![Message::User(UserMessage::text(
+                    messages: vec![entry(Message::User(UserMessage::text(
                         MessageId::new(),
                         "recent session",
-                    ))],
+                    )))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),
@@ -644,11 +654,11 @@ mod tests {
                     parent_thread_id: None,
                     derivation_key: None,
                     reply_target: None,
-                    messages: vec![Message::User(UserMessage::with_images(
+                    messages: vec![entry(Message::User(UserMessage::with_images(
                         MessageId::new(),
                         "",
                         &["data:image/png;base64,AAAA".to_string()],
-                    ))],
+                    )))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),
@@ -682,7 +692,7 @@ mod tests {
                     parent_thread_id: None,
                     derivation_key: None,
                     reply_target: None,
-                    messages: vec![Message::Assistant(AssistantMessage {
+                    messages: vec![entry(Message::Assistant(AssistantMessage {
                         message_id: MessageId::new(),
                         content: String::new(),
                         tool_calls: vec![ToolCall {
@@ -706,7 +716,7 @@ mod tests {
                         aborted: false,
                         started_at: now,
                         ended_at: now,
-                    })],
+                    }))],
                     todos: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: now,
@@ -720,7 +730,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let Message::Assistant(message) = &checkpoint.messages[0] else {
+        let Message::Assistant(message) = &checkpoint.messages[0].message else {
             panic!("expected assistant message");
         };
         let continuation = message

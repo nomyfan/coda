@@ -242,11 +242,18 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .map_err(OpenError::Storage)?;
         let snapshot: Option<AgentRuntimeSnapshot> = stored_snapshot.map(Into::into);
 
+        // Turn tags stay server-side: callers get the conversation, not the
+        // control-flow metadata around it.
         let resumed_messages: Option<Vec<Message>> = storage
             .load_checkpoint(&session_id)
             .await
             .map_err(OpenError::Storage)?
-            .map(|ckpt| ckpt.messages);
+            .map(|ckpt| {
+                ckpt.messages
+                    .into_iter()
+                    .map(|entry| entry.message)
+                    .collect()
+            });
 
         let pending_approvals =
             collect_pending_approvals(storage.as_ref(), &session_id, &root_name, snapshot.as_ref())

@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, Message, MessageId, SystemMessage, ToolCall,
-    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 use coda_tools::TodoItem;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Prefix applied to sub-agent names when they are exposed to the LLM as tools,
 /// mirroring how MCP tools are prefixed with `mcp__`. It makes a sub-agent
@@ -112,8 +112,25 @@ pub enum ResumePoint {
     },
 }
 
+/// One message in a thread's history, tagged with the turn it belongs to.
+///
+/// `turn_id` sits out here rather than inside `Message` for the same reason
+/// `thread_id` does: it describes where the message falls in the session's
+/// control flow, not what the message says. Keeping it out also means the
+/// provider adapter — which builds assistant messages and has no idea what a
+/// turn is — never has to supply it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub turn_id: TurnId,
+    pub message: Message,
+}
+
 pub struct AgentState {
-    pub messages: Vec<Message>,
+    pub messages: Vec<HistoryEntry>,
+    /// The turn newly appended messages belong to. Advances only when a user
+    /// message is appended (see [`Agent::add_user_message`]); `None` only before
+    /// this thread has any history at all.
+    pub current_turn: Option<TurnId>,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -210,6 +227,10 @@ pub enum EnvelopeBody {
         /// the receiver can record how it was addressed without re-deriving it
         /// (which would mean knowing the caller's mode for it).
         derivation_key: String,
+        /// The turn this call is part of. A sub-agent doesn't start a turn — it
+        /// works inside the caller's — so the turn has to be handed down for its
+        /// messages to group with the submission that ultimately caused them.
+        turn_id: TurnId,
         task: String,
     },
     /// Reply from a agent, containing the tool output.
@@ -487,14 +508,51 @@ impl Agent {
         &self.name
     }
 
+    /// Append a user message and make its turn this thread's current one, in a
+    /// single critical section.
+    ///
+    /// Advancing the turn is deliberately tied to appending the user message
+    /// rather than to receiving an envelope. When a new task pre-empts calls that
+    /// were awaiting approval, the driver first writes those calls off as aborted
+    /// `ToolMessage`s; those results belong to the *previous* turn. Were the turn
+    /// advanced on arrival, a rewind to the new turn would delete them and leave
+    /// the earlier assistant message with tool calls that have no results —
+    /// history the provider rejects. Advancing here lets them keep the old turn.
+    pub async fn add_user_message(&self, turn_id: TurnId, message: UserMessage) {
+        debug!("Adding user message: {:?}", message);
+        let mut state = self.state.lock().await;
+        state.current_turn = Some(turn_id);
+        state.messages.push(HistoryEntry {
+            turn_id,
+            message: Message::User(message),
+        });
+    }
+
+    /// Append a message to the current turn. Used for assistant and tool
+    /// messages, which never start a turn.
     pub async fn add_message(&self, message: Message) {
         debug!("Adding message: {:?}", message);
-        self.state.lock().await.messages.push(message);
+        let mut state = self.state.lock().await;
+        let turn_id = state.stamp();
+        state.messages.push(HistoryEntry { turn_id, message });
     }
 
     pub async fn add_messages(&self, messages: Vec<Message>) {
         debug!("Adding messages: {:?}", messages);
-        self.state.lock().await.messages.extend(messages);
+        let mut state = self.state.lock().await;
+        let turn_id = state.stamp();
+        state.messages.extend(
+            messages
+                .into_iter()
+                .map(|message| HistoryEntry { turn_id, message }),
+        );
+    }
+
+    /// The turn this thread is in: what a message appended now is tagged with,
+    /// and what a sub-agent call hands down so the callee's messages group with
+    /// the submission that ultimately caused them.
+    pub async fn current_turn(&self) -> TurnId {
+        self.state.lock().await.stamp()
     }
 
     pub async fn todos(&self) -> Vec<TodoItem> {
@@ -502,27 +560,47 @@ impl Agent {
     }
 
     pub async fn messages(&self) -> Vec<Message> {
-        let mut messages = self.state.lock().await.messages.clone();
-        messages.insert(
-            0,
-            Message::System(SystemMessage(self.system_prompt.resolve())),
-        );
+        let history = self.state.lock().await;
+        let mut messages = Vec::with_capacity(history.messages.len() + 1);
+        messages.push(Message::System(SystemMessage(self.system_prompt.resolve())));
+        messages.extend(history.messages.iter().map(|entry| entry.message.clone()));
         messages
     }
 
     /// Returns conversation history without the system prompt (suitable for checkpointing).
-    pub async fn history(&self) -> Vec<Message> {
+    pub async fn history(&self) -> Vec<HistoryEntry> {
         self.state.lock().await.messages.clone()
     }
 
-    pub async fn restore_history(&self, messages: Vec<Message>, todos: Vec<TodoItem>) {
+    pub async fn restore_history(&self, messages: Vec<HistoryEntry>, todos: Vec<TodoItem>) {
         let mut state = self.state.lock().await;
-        // Filter out any SystemMessage that may have been saved in old checkpoints.
-        state.messages = messages
-            .into_iter()
-            .filter(|m| !matches!(m, Message::System(_)))
-            .collect();
+        state.messages = messages;
+        // Whatever work is being resumed belongs to the turn of the last message
+        // written, so the turn needs no separate persistence.
+        state.current_turn = state.messages.last().map(|entry| entry.turn_id);
         *self.todo_store.lock().await = todos;
+    }
+}
+
+impl AgentState {
+    /// The turn to tag a newly appended assistant/tool message with.
+    ///
+    /// `current_turn` is `None` only before a thread has any history, and an
+    /// assistant or tool message can't be the first thing in a thread — one
+    /// always follows the user message that prompted it. Should that ever break,
+    /// keeping the message under a fresh turn beats dropping it: a mis-grouped
+    /// message is a rewind inaccuracy, a missing tool result is history the
+    /// provider refuses outright.
+    fn stamp(&mut self) -> TurnId {
+        match self.current_turn {
+            Some(turn_id) => turn_id,
+            None => {
+                error!("appending to a thread with no current turn; tagging a fresh one");
+                let turn_id = TurnId::from(MessageId::new());
+                self.current_turn = Some(turn_id);
+                turn_id
+            }
+        }
     }
 }
 

@@ -220,9 +220,6 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 先证伪最大风险——两条构造路径 + ack 产出同一 ID
       - Verification: 集成测试发一条 task，断言 snapshot user `message_id` == 持久化 checkpoint == ack 返回值
       - 落地：ack 经新增的 `CommandOutcome::TaskAccepted { message_id }` 从 hub 传回 `dispatch_request`，答以 `TaskAccepted { message_id }`。三方断言在 `hub_tests::snapshot_and_checkpoint_agree_on_every_message_id` 里；ack 那一方单独反向验证过（只让 hub 返回另铸的 id，断言即失败）。**最大风险已排除**
-- [ ] [core types] `MessageId` / `MessageOrigin` / `TurnId` + 三个变体的字段 + `UserMessage::origin`；`HistoryEntry` 与 `AgentState.messages` / `StoredCheckpoint.messages` / `restore_history` 换型
-      - Purpose: 落地数据模型
-      - Verification: `cargo build`（含 `MemoryStorage`、测试 stub 随之编过）；序列化 round-trip 单测
 - [x] [core logic] 铸造点：正常 assistant 在 `coda_openai` 的 `TryFrom` 铸造 id；aborted assistant（driver 668-678）与 `ToolMessage::new` 各自铸造
       - Purpose: 补齐 assistant/tool 单构造点铸造
       - Verification: 单测——同一条 assistant/tool 消息经 `LLMEnd`/`ToolCallEnd` 事件到 hub snapshot 后 `message_id` 不变
@@ -239,9 +236,14 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
       - Purpose: 把只藏在 uuid5 推导里的父子关系变成可直接查的记录，给 fork 备料
       - Verification: 单测——含嵌套 sub-agent 的会话跑完后，能只靠 checkpoint 自顶向下重建整棵线程树（父为空的恰好一个且等于 session_id）；对每个子线程校验 `uuid5(parent_thread_id, derivation_key)` == 它自己的 `thread_id`；stateless 记的是复合键、stateful 记的是 agent 名
       - 落地：`driver_tests::every_thread_records_how_its_parent_addressed_it`，三层 `coda → explore(stateful) → probe(stateless)`，四条断言全覆盖。运行态用 `AgentLoop::origin_thread` 承载，只在收到 `ToolCall` 时写入（其他 envelope 不表态、不清除），随 checkpoint 存取。反向验证过：checkpoint 不写 `parent_thread_id` → 三个线程全都自称 root，断言失败
-- [ ] [core logic] turn 盖章 + 传播：新增 `add_user_message(turn_id, user)`（一次加锁内推进当前 turn + 追加），driver 里追加 user 消息的几处（Task / ToolCall / Resume 分支）换用它；`add_message` 从线程当前 turn 盖章；`ToolCall` envelope 带 `turn_id`；恢复时由末条 entry 反推
+- [x] [core types] `MessageId` / `MessageOrigin` / `TurnId` + 三个变体的字段 + `UserMessage::origin`；`HistoryEntry` 与 `AgentState.messages` / `StoredCheckpoint.messages` / `restore_history` 换型
+      - Purpose: 落地数据模型
+      - Verification: `cargo build`（含 `MemoryStorage`、测试 stub 随之编过）；序列化 round-trip 单测
+      - 落地：分批完成（见 Deviations）。`Session::resumed_messages()` 与 `SessionOpener::load_messages` 在边界剥掉 `turn_id`，所以 wire / 前端形状不变，符合设计里"turn_id 不进 wire"
+- [x] [core logic] turn 盖章 + 传播：新增 `add_user_message(turn_id, user)`（一次加锁内推进当前 turn + 追加），driver 里追加 user 消息的几处（Task / ToolCall / Resume 分支）换用它；`add_message` 从线程当前 turn 盖章；`ToolCall` envelope 带 `turn_id`；恢复时由末条 entry 反推
       - Purpose: 让 turn 归属在所有线程、所有恢复路径上成立——这是 rewind 截断的地基
       - Verification: 单测——(a) sub-agent（含嵌套、stateful 多次调用）的每条消息 `turn_id` == 触发它的 root 提交；(b) 待审批时发新 task 抢占，aborted `ToolMessage` 归属**旧** turn，按新 turn 截断后父 Assistant 的 `tool_call` 仍配对齐全；(c) 审批挂起→重开会话→approve，派发出去的 `ToolCall` 仍带正确 `turn_id`
+      - 落地：(a) `one_submission_tags_every_thread_it_reaches`（三层 coda→explore→probe，断言三个线程每条消息的 turn 都等于 root 提交）；(b) `preempted_calls_are_written_off_under_the_turn_they_belonged_to`，其中第二段断言直接模拟 rewind——滤掉新 turn 后，残留的每个 `tool_call` 仍有配对结果；(c) 由 `subagent_dispatched_after_approval_restart_still_records_its_origin` 覆盖同一条链路（`turn_id` 与 `parent_message_id` 一起随 resume 状态过挂起）。**(b) 反向验证过**：把 turn 推进时机改到 envelope 入口（设计明确警告的错法），该测试立刻失败
 - [ ] [integration] wire task→request 返回 message_id；前端乐观条目 reconcile；展示 key 从 `message_id` 派生
       - Purpose: 打通到 UI
       - Verification: `pnpm --filter coda-web lint && test`；前端乐观渲染后收到 ack 正确 reconcile，无重复条目
@@ -249,5 +251,6 @@ ThreadId::from_uuid5(namespace: &ThreadId, name: &str) -> ThreadId
 ## Deviations from Design
 
 - **步骤 1–3 的落地顺序做了拆分**（仅顺序，接口/数据模型/取舍均按原设计）。改 `UserMessage` 构造签名会一次性打断全部调用点，所以先落"身份类型 + 三个变体的 `message_id` + 各铸造点 + root user 的 id 在 hub 单点铸造并经 `Task` envelope 传到 driver"（第 3 步 + 第 1、2 步的一部分），再落 `task` 改 request 与 ack（补齐第 1 步）。**第 2 步暂未勾选**：`MessageOrigin` / `TurnId` / `HistoryEntry` 推迟到各自有值可携带的步骤（origin 传播、turn 盖章）再引入，避免先落一批没有写入方的死字段。
+- **`AgentState.current_turn` 是 `Option<TurnId>`，`add_message` 遇到 `None` 时会记 `error!` 并新起一个 turn。** 设计断言这不可达（assistant/tool 消息不可能是线程首条），实现也确认了这一点——`restore_history` 会从末条 entry 回填当前 turn，而抢占写 aborted 结果时历史必非空。但类型上无法证明，所以留了兜底；两种坏法里选轻的：错分组只是 rewind 不准，丢消息会让父 Assistant 的 `tool_call` 没有结果、provider 直接拒绝整段历史。
 - **`ToolCall` envelope 只带 `parent_message_id`，不带整个 `MessageOrigin`。** 设计里写的是 `ToolCall { call_id, origin: MessageOrigin, .. }`，但 `origin.call_id` 恒等于同一 envelope 上的 `call_id` —— 两个必须永远相等的字段会让读者以为它们可能不等。改为只传父 id，由收件线程用手边已有的 `call_id` 组装出 `MessageOrigin`。信息量不变，少一处可能自相矛盾的冗余。
 - **`task` 改成 request 后，两条原本静默/走事件的失败路径改为直接答以 RPC 错误**：模型不接受图片时原先推一条 `WireEvent::Error` 到事件流，现在答 `INVALID_PARAMS`；空任务与"会话不 live"原先静默丢弃，现在分别答 `INVALID_PARAMS` 与 `SESSION_NOT_LIVE`。设计只说了"`task` 由 notification 改为 request"，没交代这两条；改成请求的直接应答更贴合 request 语义（错误与发起它的请求相关联），但前端呈现随之从 transcript 里的错误事件变成一条 danger 活动记录。
