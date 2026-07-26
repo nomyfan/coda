@@ -16,6 +16,7 @@ import {
   type ToolCallResolution,
   type ToolMessage,
   type WireEvent,
+  type WorkspaceSession,
   type WorkspaceSummary,
   callArguments,
   describeTool,
@@ -123,6 +124,11 @@ export type OpenedSession = {
     text: string;
     images: string[];
     submitting: boolean;
+    /** How many user messages sit before `target`, counted when the edit
+     * opened. A rewind's reply can be lost to a dropped connection, and this is
+     * what lets the next snapshot say whether the replacement turn started —
+     * see `reconcileEditing`. */
+    precedingUserMessages: number;
   };
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
@@ -826,18 +832,18 @@ function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, 
   });
 }
 
-/** Replace a session's title in the catalog.
+/** Overwrite fields of one session's catalog entry.
  *
- * `upsertCatalogTitled` only fills a gap the server has not answered yet, which
- * is right for an optimistic first turn but wrong after a rewind past the
- * opening message: the message the server derived its title from is the one
- * that just went away, so ours is the current answer and theirs is the stale
- * one. */
-function retitleCatalogSession(
+ * The blunt instrument the rewind paths need, because `upsertCatalogTitled`
+ * only ever *fills* a title (`?? title`). That is right for an optimistic first
+ * turn racing the server, and wrong every time a rewind is involved: the message
+ * the server derived its title from is the one that just went away, so the
+ * stored value is the stale one and refusing to overwrite it is the bug. */
+function patchCatalogSession(
   catalog: WorkspaceSummary[],
   workspaceId: string,
   sessionId: string,
-  title: string,
+  patch: Partial<WorkspaceSession>,
 ): WorkspaceSummary[] {
   return catalog.map((workspace) =>
     workspace.id !== workspaceId
@@ -845,9 +851,7 @@ function retitleCatalogSession(
       : {
           ...workspace,
           sessions: workspace.sessions.map((session) =>
-            session.id === sessionId
-              ? { ...session, first_user_message: title, updated_at_ms: Date.now() }
-              : session,
+            session.id === sessionId ? { ...session, ...patch } : session,
           ),
         },
   );
@@ -1190,6 +1194,79 @@ function selectSession(store: CodaStore, server: string, workspaceId: string, se
   });
 }
 
+/** A user message this client is showing ahead of the server's acknowledgement.
+ *
+ * Every other route to a user entry stamps the server's id on it — history
+ * replay, a rewind's own append — and events never carry user messages at all,
+ * so the missing id is exactly the "the server has not confirmed this yet"
+ * marker, with no extra state to keep in step. */
+function isPendingUserEntry(entry: TranscriptEntry): boolean {
+  return entry.kind === "user" && !entry.messageId;
+}
+
+/** Everything a snapshot decides about one session.
+ *
+ * A snapshot is authoritative even when it is empty. That is only sound because
+ * the server never serves a history that is missing a message the client
+ * legitimately holds: a live entry appends its in-flight user message to the
+ * snapshot it composes, and an entry that was released first waits out a
+ * graceful shutdown, whose persisted history already contains that message —
+ * the driver writes it on accepting the task, before generation. So an empty
+ * snapshot means the session really is empty, and treating it as "no news"
+ * would leave a rewound-away transcript on screen as if it still existed.
+ *
+ * Both halves of that premise are load-bearing and pinned server-side, in
+ * `midturn_attach_replays_chunks_and_evicts_previous` and
+ * `user_task_is_checkpointed_before_turn_completes`.
+ *
+ * What the server cannot know about is a task this client has sent but not yet
+ * heard back on. That message exists only here until the reply lands, and the
+ * event stream never carries user messages, so it is carried across explicitly
+ * — `adoptServerMessageId` drops it again if the snapshot turns out to have had
+ * it all along. */
+export function applySnapshotToSession(
+  session: OpenedSession,
+  snapshot: {
+    messages: HistoryMessage[];
+    approvals: PendingApproval[];
+    providerId: string;
+    reasoningEffort: ReasoningEffort | null;
+    turnRunning: boolean;
+  },
+): OpenedSession {
+  const argsById = collectToolArgs(snapshot.messages);
+  const pending = session.entries.filter(isPendingUserEntry);
+  return {
+    ...session,
+    draft: false,
+    providerId: snapshot.providerId,
+    reasoningEffort: snapshot.reasoningEffort,
+    usage: historyUsage(snapshot.messages),
+    // A snapshot means this client holds the session now (clearing any
+    // eviction), and `turnRunning` says whether replayed events of an in-flight
+    // turn follow.
+    approvals: snapshot.approvals,
+    // A snapshot older than the pending task says `turnRunning: false` about a
+    // turn that is about to start. Taking it at face value reopens the composer
+    // and lets a second task go out under the first one — so the pending
+    // message speaks for its own turn until the reply that created it lands.
+    running: snapshot.turnRunning || pending.length > 0,
+    evicted: false,
+    editing: reconcileEditing(session.editing, snapshot.messages),
+    entries: [
+      ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById)),
+      ...pending,
+    ],
+    drafts: {},
+    allowDrafts: {},
+    // Same reasoning for the title: on a session whose very first task is the
+    // pending one, the optimistic title is the only one there is, and nothing
+    // downstream would restore it — the reply only carries an id.
+    firstUserMessage:
+      snapshot.messages.length === 0 && pending.length === 0 ? undefined : session.firstUserMessage,
+  };
+}
+
 function applySnapshot(
   store: CodaStore,
   server: string,
@@ -1200,13 +1277,8 @@ function applySnapshot(
   providerId: string,
   reasoningEffort: ReasoningEffort | null,
   turnRunning: boolean,
-  replaceEmpty = false,
 ) {
   const key = sessionKey(workspaceId, sessionId);
-  const argsById = collectToolArgs(messages);
-  const mapped = messages.flatMap((message) => historyToEntries(message, argsById));
-  const usage = historyUsage(messages);
-  const hasHistory = messages.length > 0;
   updateState(store, (state) => {
     const current = state.servers[server];
     if (!current) {
@@ -1218,25 +1290,24 @@ function applySnapshot(
     if (!session) {
       return;
     }
-    session.draft = false;
-    session.providerId = providerId;
-    session.reasoningEffort = reasoningEffort;
-    session.usage = usage;
-    // Always reflect the server's authoritative state: a snapshot means this
-    // client holds the session now (clearing any eviction), and `turnRunning`
-    // says whether replayed events of an in-flight turn follow.
-    session.approvals = approvals;
-    session.running = turnRunning;
-    session.evicted = false;
-    session.editing = reconcileEditing(session.editing, messages);
-    if (hasHistory || replaceEmpty) {
-      session.entries = mapped;
-      session.drafts = {};
-      session.allowDrafts = {};
+    if (messages.length === 0 && !session.entries.some(isPendingUserEntry)) {
+      // The session has no opening message left for a title to come from, so
+      // the one in the list is describing something that no longer exists —
+      // and `upsertCatalogTitled` would never overwrite it. Mirrors the
+      // reducer's own condition: a pending first task still owns the title.
+      // The timestamp is deliberately left alone — an empty snapshot is not by
+      // itself evidence of a write, and plain opens produce them too.
+      current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, {
+        first_user_message: null,
+      });
     }
-    if (replaceEmpty && !hasHistory) {
-      session.firstUserMessage = undefined;
-    }
+    current.sessions[key] = applySnapshotToSession(session, {
+      messages,
+      approvals,
+      providerId,
+      reasoningEffort,
+      turnRunning,
+    });
   });
 }
 
@@ -1384,17 +1455,29 @@ export function applyRewound(
 
 /** Reconcile an edit in progress against a fresh snapshot.
  *
- * Whether a rewind's truncation committed is something only the server knows,
- * and the single fact the client can check is whether the target survived. If
- * it did, nothing was discarded and the edit stands. If it did not, the history
- * already stops at the rewind point, so the draft stays but stops naming a
- * message — and the next submit is an ordinary task, which against that history
- * produces exactly what the user asked for.
+ * A rewind's reply can be lost — the connection drops between the server
+ * committing and the client hearing about it — and this decides, from the
+ * snapshot alone, which of the three states the session ended up in:
  *
- * There is deliberately no third branch for "the reply was lost but the turn
- * did start". The id of that turn's message came back on the very reply that
- * was lost, so the client cannot recognise it; and it does not need to, because
- * a turn in flight leaves `running` set, which closes the composer. */
+ * - **Target survived.** Nothing was discarded; the edit stands untouched.
+ * - **Target gone, no message took its place.** The truncation committed but
+ *   the replacement turn did not start. The draft stays but stops naming a
+ *   message, so the next submit is an ordinary task — which against this
+ *   history is exactly the result the user asked for.
+ * - **Target gone and one more user message than preceded it.** The whole
+ *   rewind went through. The edit is done; anything left in the composer would
+ *   be a second copy of a message that has already been sent and answered.
+ *
+ * A count settles the last two because the truncation leaves precisely the
+ * messages before the target, and the only thing that can add one afterwards is
+ * the replacement turn itself — no other turn can run while a rewind holds the
+ * session. The id of that new message came back on the very reply that was
+ * lost, so counting is the only handle the client has on it.
+ *
+ * A draft that is already an orphan runs the same count, and has to: it is
+ * still one submit away from the same lost-reply window, and its baseline is
+ * still the history the truncation left behind. `target === null` simply never
+ * matches a message id, so it falls through to the count on its own. */
 export function reconcileEditing(
   editing: OpenedSession["editing"],
   messages: HistoryMessage[],
@@ -1404,13 +1487,19 @@ export function reconcileEditing(
   }
   // Whatever request this belonged to went down with the connection.
   const settled = { ...editing, submitting: false };
-  if (settled.target === null) {
+  let userMessages = 0;
+  let survived = false;
+  for (const message of messages) {
+    if (!("User" in message)) {
+      continue;
+    }
+    userMessages += 1;
+    survived ||= message.User.message_id === settled.target;
+  }
+  if (survived) {
     return settled;
   }
-  const survived = messages.some(
-    (message) => "User" in message && message.User.message_id === settled.target,
-  );
-  return survived ? settled : { ...settled, target: null };
+  return userMessages > editing.precedingUserMessages ? undefined : { ...settled, target: null };
 }
 
 /** Render the user's message immediately, returning the id of the entry created
@@ -1458,13 +1547,32 @@ function appendUserMessage(
 
 /** Re-key an optimistic user entry onto the id derived from the server's
  * `message_id`, so it matches the key the same message gets when replayed from
- * history. */
+ * history.
+ *
+ * A snapshot that landed while the task was in flight may already have carried
+ * this message — it is only kept across a snapshot because the client cannot
+ * tell yet, and the id being adopted here is what finally settles it. Two
+ * entries for one message is the worse failure, so the confirmed copy wins and
+ * the optimistic one goes. */
+export function adoptMessageId(
+  entries: TranscriptEntry[],
+  entryId: string,
+  messageId: string,
+): TranscriptEntry[] {
+  const adoptedId = userEntryId(messageId);
+  if (entries.some((entry) => entry.id === adoptedId)) {
+    return entries.filter((entry) => entry.id !== entryId);
+  }
+  return entries.map((entry) =>
+    entry.id === entryId ? { ...entry, id: adoptedId, messageId } : entry,
+  );
+}
+
 function adoptServerMessageId(server: string, key: SessionKey, entryId: string, messageId: string) {
   updateState(codaStore, (state) => {
-    const entry = draftSession(state, server, key)?.entries.find((e) => e.id === entryId);
-    if (entry) {
-      entry.id = userEntryId(messageId);
-      entry.messageId = messageId;
+    const session = draftSession(state, server, key);
+    if (session) {
+      session.entries = adoptMessageId(session.entries, entryId, messageId);
     }
   });
 }
@@ -1720,7 +1828,7 @@ function reportCatalogFetchError(server: string, err: unknown, what: string) {
 async function requestOpenAndApply(
   server: string,
   session: OpenedSession,
-  options: { takeover?: boolean; replaceEmpty?: boolean } = {},
+  options: { takeover?: boolean } = {},
 ): Promise<boolean> {
   const rpc = rpcFor(server);
   if (!rpc) {
@@ -1739,7 +1847,6 @@ async function requestOpenAndApply(
       snap.provider_id,
       snap.reasoning_effort ?? null,
       snap.turn_running ?? false,
-      options.replaceEmpty ?? false,
     );
     return true;
   } catch (err) {
@@ -1856,8 +1963,7 @@ export function connectServer(rawUrl: string) {
 
   // Server pushes (notifications) feed the existing reducers — the same reducer
   // whether a snapshot is solicited (an `open_session` result) or pushed here
-  // (a hub re-attach). The `snapshot` push preserves the reconnect-restore
-  // `replaceEmpty` parity by keying off the connect-time active session.
+  // (a hub re-attach).
   rpc.addMethod("event", (params) => {
     applyEvent(codaStore, server, params.workspace_id, params.session_id, params.event);
   });
@@ -1872,7 +1978,6 @@ export function connectServer(rawUrl: string) {
       params.provider_id,
       params.reasoning_effort ?? null,
       params.turn_running ?? false,
-      sessionToRestore?.key === sessionKey(params.workspace_id, params.session_id),
     );
   });
   rpc.addMethod("session_evicted", (params) => {
@@ -1893,7 +1998,7 @@ export function connectServer(rawUrl: string) {
       )
       .catch((err) => reportCatalogFetchError(server, err, "models"));
     if (sessionToRestore) {
-      void requestOpenAndApply(server, sessionToRestore.session, { replaceEmpty: true });
+      void requestOpenAndApply(server, sessionToRestore.session);
     }
     resendPendingDeletes(server);
   };
@@ -2197,10 +2302,11 @@ export function beginEdit(messageId: string) {
   if (session.approvals.length > 0 || session.editing?.submitting) {
     return;
   }
-  const entry = session.entries.find((item) => item.messageId === messageId);
-  if (!entry) {
+  const index = session.entries.findIndex((item) => item.messageId === messageId);
+  if (index === -1) {
     return;
   }
+  const entry = session.entries[index];
   const key = sessionKey(session.workspaceId, session.sessionId);
   updateState(codaStore, (state) => {
     const draft = draftSession(state, server, key);
@@ -2210,6 +2316,12 @@ export function beginEdit(messageId: string) {
         text: entry.content,
         images: entry.images ?? [],
         submitting: false,
+        // What the history is about to be truncated to. The session is at rest
+        // here, so every user entry already carries its server id and this
+        // matches the user-message count the server would report.
+        precedingUserMessages: session.entries
+          .slice(0, index)
+          .filter((item) => item.kind === "user").length,
       };
     }
   });
@@ -2314,16 +2426,15 @@ export async function rewindTurn(task: string, images: string[] = []) {
         text,
         images,
       });
-      if (messages.length === 0) {
-        // Nothing survived, so the edited message is the session's first — and
-        // the title the list shows has to follow it.
-        current.catalog = retitleCatalogSession(
-          current.catalog,
-          workspaceId,
-          sessionId,
-          text || IMAGE_ONLY_TITLE,
-        );
-      }
+      // A rewind is a write like any other, so the list has to reorder for it
+      // the way it does for a turn — which `appendUserMessage` gets for free
+      // and a rewind, appending its message itself, does not. And when nothing
+      // survived, the edited message is the session's first, so the title the
+      // list shows has to follow it.
+      current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, {
+        updated_at_ms: Date.now(),
+        ...(messages.length === 0 ? { first_user_message: text || IMAGE_ONLY_TITLE } : {}),
+      });
     });
   } catch (err) {
     // Only `submitting` moves. When the truncation had already committed the
