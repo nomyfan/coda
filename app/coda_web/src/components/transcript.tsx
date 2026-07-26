@@ -16,6 +16,7 @@ import {
   ListTodo,
   type LucideIcon,
   MessageSquare,
+  Pencil,
   Plug,
   Search,
   SquareTerminal,
@@ -34,10 +35,14 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { CodaMark } from "@/components/logo";
 import { Markdown } from "@/components/markdown";
 import {
+  beginEdit,
+  discardedFrom,
   selectActiveApprovalCount,
+  selectActiveEditing,
   selectActiveEntries,
   selectActiveKey,
   selectActiveRunning,
+  selectCanRewind,
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
@@ -142,6 +147,7 @@ export const Transcript = memo(function Transcript({
   const liveRunning = useCodaStore(selectActiveRunning);
   const liveApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeKey = useCodaStore(selectActiveKey);
+  const editing = useCodaStore(selectActiveEditing);
   const entries = suppressed ? NO_ENTRIES : liveEntries;
   const running = suppressed ? false : liveRunning;
   const approvalPending = !suppressed && liveApprovalCount > 0;
@@ -151,6 +157,16 @@ export const Transcript = memo(function Transcript({
   // up to read, so streaming output no longer yanks them back to the bottom.
   const stickToBottomRef = useRef(true);
   const renderItems = transcriptRenderItems(entries);
+  // Everything from the edit target on is what submitting would discard. Entries
+  // are appended in order, so one index marks the whole region — and an orphan
+  // draft (`target === null`) marks nothing, because there is nothing left to
+  // discard.
+  const discardFrom =
+    !suppressed && editing?.target ? discardedFrom(entries, editing.target) : undefined;
+  const discardedIds =
+    discardFrom === undefined
+      ? undefined
+      : new Set(entries.slice(discardFrom).map((entry) => entry.id));
   const lastEntry = entries.at(-1);
   const lastEntryContent = lastEntry?.content;
 
@@ -205,17 +221,25 @@ export const Transcript = memo(function Transcript({
           </div>
         ) : (
           <>
-            {renderItems.map((item) =>
-              item.type === "entry" ? (
-                <TranscriptItem key={item.entry.id} entry={item.entry} />
-              ) : (
-                <AssistantTurnBubble
-                  key={item.id}
-                  entries={item.entries}
-                  approvalPending={approvalPending}
-                />
-              ),
-            )}
+            {renderItems.map((item) => {
+              const anchor = item.type === "entry" ? item.entry.id : item.entries[0]?.id;
+              const discarded = Boolean(anchor && discardedIds?.has(anchor));
+              return (
+                <div
+                  key={item.type === "entry" ? item.entry.id : item.id}
+                  className={cn(
+                    "contents",
+                    discarded && "[&>*]:opacity-40 [&>*]:transition-opacity",
+                  )}
+                >
+                  {item.type === "entry" ? (
+                    <TranscriptItem entry={item.entry} />
+                  ) : (
+                    <AssistantTurnBubble entries={item.entries} approvalPending={approvalPending} />
+                  )}
+                </div>
+              );
+            })}
             {/* Optimistic loading bubble: the turn is running but the backend
              * hasn't streamed its first event yet, so no assistant turn exists
              * to carry the shimmer. Shown from send until the first chunk/tool. */}
@@ -389,10 +413,13 @@ function MessageActions({
   content,
   label,
   align,
+  onEdit,
 }: {
   content: string;
   label: string;
   align: "start" | "end";
+  /** Present only on a user message the session is currently able to rewind to. */
+  onEdit?: () => void;
 }) {
   return (
     <div
@@ -401,6 +428,18 @@ function MessageActions({
         align === "end" ? "justify-end" : "justify-start",
       )}
     >
+      {onEdit ? (
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-7 text-muted-foreground hover:text-foreground"
+          title="Edit and rewind to here"
+          aria-label="Edit and rewind to here"
+          onClick={onEdit}
+        >
+          <Pencil className="size-4" />
+        </Button>
+      ) : null}
       <CopyContentButton content={content} label={label} />
     </div>
   );
@@ -809,6 +848,8 @@ function disclosureTitle(entry: TranscriptEntry) {
 
 function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const canRewind = useCodaStore(selectCanRewind);
+  const messageId = entry.messageId;
   const getImageLayoutId = (index: number) => imageLightboxLayoutId(index, entry.images?.[index]);
 
   return (
@@ -845,7 +886,12 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
         </div>
         <div className="flex items-center justify-end gap-1">
           <EntryTiming entry={entry} className={cn("px-1", HOVER_REVEAL)} />
-          <MessageActions content={entry.content} label="message" align="end" />
+          <MessageActions
+            content={entry.content}
+            label="message"
+            align="end"
+            onEdit={canRewind && messageId ? () => beginEdit(messageId) : undefined}
+          />
         </div>
         {lightboxIndex !== null && entry.images && (
           <ImageLightbox

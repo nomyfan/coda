@@ -27,13 +27,15 @@ use coda_server::{
     },
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
-    storage::{RenameSessionError, SessionModelBinding, WorkspaceStorage, validate_session_id},
+    storage::{
+        RenameSessionError, RewindError, SessionModelBinding, WorkspaceStorage, validate_session_id,
+    },
     transport::{Transport, WebSocketTransport},
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
         PendingApprovalWire, ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams,
-        SessionName, SessionRef, SessionSummaryWire, SetModelParams, Snapshot, TaskAccepted,
-        TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        RewindAccepted, RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
+        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -256,6 +258,19 @@ impl SessionOpener for AppOpener {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    fn rewind<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        target: coda_core::llm::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self.workspaces.get(&key.0).ok_or_else(|| {
+                RewindError::Persistence(format!("unknown workspace '{}'", key.0))
+            })?;
+            workspace.storage.session(&key.1).rewind_to(target).await
         })
     }
 
@@ -1074,6 +1089,13 @@ async fn dispatch_request(
             };
             handle_task(app, conn_id, id, params).await
         }
+        "rewind" => {
+            let params: RewindParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            handle_rewind(app, conn_id, id, params).await
+        }
         "rename_session" => {
             let params: RenameSessionParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1208,45 +1230,145 @@ async fn handle_task(
     params: TaskParams,
 ) -> RpcOutgoing {
     let key = (params.workspace_id, params.session_id);
-    let accepts_images = match app.relay.provider_of(key.clone()).await {
-        Some(provider_id) => app
-            .providers
-            .get(&provider_id)
-            .is_some_and(|handle| handle.input_modalities.contains(&Modality::Image)),
-        // No live or pending session for this key.
-        None => {
-            return (
-                id,
-                RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
-            )
-                .into();
-        }
+    let (task, images) = match accept_turn_input(app, &key, params.task, params.images).await {
+        Ok(accepted) => accepted,
+        Err(err) => return (id, err).into(),
     };
-    if !accepts_images && !params.images.is_empty() {
-        return (
-            id,
-            RpcError::new(
-                rpc::INVALID_PARAMS,
-                "the selected model does not accept image input",
-            ),
-        )
-            .into();
-    }
-    let images = sanitize_task_images(params.images);
-    let task = params.task.trim().to_string();
-    if task.is_empty() && images.is_empty() {
-        return (
-            id,
-            RpcError::new(rpc::INVALID_PARAMS, "task must have text or images"),
-        )
-            .into();
-    }
     match app
         .relay
         .command(key, conn_id, SessionCommand::Task { task, images })
         .await
     {
         CommandOutcome::TaskAccepted { message_id } => (id, &TaskAccepted { message_id }).into(),
+        // Residual `Ignored` — a stale connection, or the session is not live.
+        _ => (
+            id,
+            RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
+        )
+            .into(),
+    }
+}
+
+/// Vet the text and attachments a client is starting a turn with, and return
+/// them sanitized.
+///
+/// Shared by `task` and `rewind` so an edited message is held to exactly the
+/// same rules as an original one — the point of a rewind is that what follows it
+/// is an ordinary turn.
+async fn accept_turn_input(
+    app: &Arc<AppState>,
+    key: &SessionKey,
+    task: String,
+    images: Vec<String>,
+) -> Result<(String, Vec<String>), RpcError> {
+    let accepts_images = match app.relay.provider_of(key.clone()).await {
+        Some(provider_id) => app
+            .providers
+            .get(&provider_id)
+            .is_some_and(|handle| handle.input_modalities.contains(&Modality::Image)),
+        // No live or pending session for this key.
+        None => return Err(RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live")),
+    };
+    if !accepts_images && !images.is_empty() {
+        return Err(RpcError::new(
+            rpc::INVALID_PARAMS,
+            "the selected model does not accept image input",
+        ));
+    }
+    let images = sanitize_task_images(images);
+    let task = task.trim().to_string();
+    if task.is_empty() && images.is_empty() {
+        return Err(RpcError::new(
+            rpc::INVALID_PARAMS,
+            "task must have text or images",
+        ));
+    }
+    Ok((task, images))
+}
+
+/// Discard a message and everything after it, then start a turn from the edited
+/// text.
+///
+/// The client supplies one identity — `message_id` — and it is checked against
+/// the session's own root thread before anything is discarded, so a stale or
+/// forged target can only ever be refused.
+///
+/// A `REWIND_FAILED` here does not say whether the truncation committed, and the
+/// client does not have to guess: when it did, the hub has already pushed
+/// `Closed`, and the re-attach that follows carries the authoritative history.
+async fn handle_rewind(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    id: RpcId,
+    params: RewindParams,
+) -> RpcOutgoing {
+    let key = (params.workspace_id, params.session_id);
+    let (task, images) = match accept_turn_input(app, &key, params.task, params.images).await {
+        Ok(accepted) => accepted,
+        Err(err) => return (id, err).into(),
+    };
+    match app
+        .relay
+        .command(
+            key,
+            conn_id,
+            SessionCommand::Rewind {
+                target: params.message_id,
+                task,
+                images,
+            },
+        )
+        .await
+    {
+        CommandOutcome::Rewound {
+            message_id,
+            messages,
+        } => (
+            id,
+            &RewindAccepted {
+                message_id,
+                messages,
+            },
+        )
+            .into(),
+        CommandOutcome::NotIdle => (
+            id,
+            RpcError::new(
+                rpc::SESSION_NOT_IDLE,
+                "the session must finish or abort its current turn first",
+            ),
+        )
+            .into(),
+        CommandOutcome::RewindTargetNotFound => (
+            id,
+            RpcError::new(
+                rpc::REWIND_TARGET_NOT_FOUND,
+                "no such message in this session",
+            ),
+        )
+            .into(),
+        CommandOutcome::RewindNotStarted => (
+            id,
+            RpcError::new(
+                rpc::REWIND_FAILED,
+                "the session was rewound but its next turn could not be started",
+            ),
+        )
+            .into(),
+        CommandOutcome::PersistenceFailed(detail) => (
+            id,
+            RpcError::with_detail(rpc::REWIND_FAILED, "failed to rewind the session", detail),
+        )
+            .into(),
+        CommandOutcome::OpenFailed(err) => (
+            id,
+            RpcError::with_detail(
+                rpc::OPEN_FAILED,
+                "failed to reopen session",
+                err.to_string(),
+            ),
+        )
+            .into(),
         // Residual `Ignored` — a stale connection, or the session is not live.
         _ => (
             id,

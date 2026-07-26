@@ -62,13 +62,21 @@ pub const NOT_OWNER: i32 = -32002;
 pub const SESSION_NOT_LIVE: i32 = -32003;
 pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
 pub const MODEL_LOCKED: i32 = -32005;
+/// A rewind against a session that still has work in flight or parked.
+pub const SESSION_NOT_IDLE: i32 = -32006;
 pub const UNKNOWN_WORKSPACE: i32 = -32010;
 pub const INVALID_SESSION_ID: i32 = -32011;
 pub const INVALID_MODEL_SELECTION: i32 = -32012;
 pub const SESSION_NOT_FOUND: i32 = -32013;
+/// A rewind naming a message that is not a user message of that session's root
+/// thread — including one a previous rewind already discarded.
+pub const REWIND_TARGET_NOT_FOUND: i32 = -32014;
 pub const OPEN_FAILED: i32 = -32020;
 pub const DELETE_FAILED: i32 = -32021;
 pub const RENAME_FAILED: i32 = -32022;
+/// A rewind that did not complete. When the truncation had already committed,
+/// the client is also sent a `Closed` push and re-attaches to resync.
+pub const REWIND_FAILED: i32 = -32023;
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
 
 impl RpcError {

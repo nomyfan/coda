@@ -1,9 +1,15 @@
-import { CircleStop, CornerDownLeft, ImagePlus, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import type { ConnectionStatus, ProviderInfo, ReasoningEffort, UsageRecord } from "@/store/session";
+import type {
+  ConnectionStatus,
+  OpenedSession,
+  ProviderInfo,
+  ReasoningEffort,
+  UsageRecord,
+} from "@/store/session";
 import { ModelSelector } from "@/components/model-selector";
 import { ContextUsage } from "@/components/context-usage";
 import {
@@ -39,9 +45,11 @@ export const Composer = memo(function Composer({
   sessionHasImages,
   serverUrl,
   workspaceId,
+  editing,
   onSetModel,
   onSend,
   onAbort,
+  onCancelEdit,
 }: {
   status: ConnectionStatus;
   running: boolean;
@@ -65,12 +73,20 @@ export const Composer = memo(function Composer({
   sessionHasImages: boolean;
   serverUrl: string;
   workspaceId: string;
+  /** A historical message pulled back in to be rewritten. The parent remounts
+   * this component whenever it changes, so these are read once as the initial
+   * draft and owned locally from then on — except while `submitting`, when the
+   * store's copy is the one that survives a remount and the local draft is
+   * frozen to match. `target === null` means the rewind already happened and
+   * this is now an ordinary draft. */
+  editing?: NonNullable<OpenedSession["editing"]>;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
+  onCancelEdit: () => void;
 }) {
-  const [task, setTask] = useState("");
-  const [images, setImages] = useState<string[]>([]);
+  const [task, setTask] = useState(editing?.text ?? "");
+  const [images, setImages] = useState<string[]>(editing?.images ?? []);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const layoutGroupId = useId();
   const getImageLayoutId = useCallback(
@@ -81,20 +97,33 @@ export const Composer = memo(function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const connected = status === "connected";
+  // A submit in flight owns the draft: `editing.text`/`images` were frozen when
+  // the request went out, and a reconnect can remount us from them at any
+  // moment. Anything typed past that point would vanish without trace, so the
+  // draft goes read-only until the request settles.
+  const frozen = evicted || editing?.submitting === true;
+  // Reading a file is asynchronous, so a paste or drop begun a moment before
+  // the submit finishes after it — with `frozen` captured as it was at the
+  // start. The guards below open the door; this is what checks it is still open
+  // by the time the file is ready.
+  const frozenRef = useRef(frozen);
+  frozenRef.current = frozen;
   const acceptsImages =
     Boolean(providerId) &&
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
-  const canAddImages = acceptsImages && !evicted && images.length < MAX_IMAGES;
+  const canAddImages = acceptsImages && !frozen && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
   const requireImageModel = images.length > 0 || sessionHasImages;
+  const rewriting = editing?.target != null;
   const canSend =
     connected &&
     Boolean(workspace) &&
     !running &&
     !starting &&
     !evicted &&
+    !editing?.submitting &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
@@ -117,7 +146,7 @@ export const Composer = memo(function Composer({
       const dataUris = results
         .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled")
         .map((r) => r.value);
-      if (dataUris.length === 0) return;
+      if (dataUris.length === 0 || frozenRef.current) return;
       setImages((prev) => [...prev, ...dataUris].slice(0, MAX_IMAGES));
     },
     [images.length],
@@ -129,7 +158,7 @@ export const Composer = memo(function Composer({
 
   const handlePaste = useCallback(
     (event: React.ClipboardEvent) => {
-      if (!acceptsImages || evicted) return;
+      if (!acceptsImages || frozen) return;
       const files = Array.from(event.clipboardData.items)
         .filter((item) => item.kind === "file" && ACCEPTED_TYPES.has(item.type))
         .map((item) => item.getAsFile())
@@ -139,24 +168,30 @@ export const Composer = memo(function Composer({
         void addFiles(files);
       }
     },
-    [acceptsImages, evicted, addFiles],
+    [acceptsImages, frozen, addFiles],
   );
 
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
       setDragOver(false);
-      if (!acceptsImages || evicted) return;
+      if (!acceptsImages || frozen) return;
       void addFiles(event.dataTransfer.files);
     },
-    [acceptsImages, evicted, addFiles],
+    [acceptsImages, frozen, addFiles],
   );
 
   function submit() {
     if (!canSend) return;
     onSend(task.trim(), images);
-    setTask("");
-    setImages([]);
+    // While editing, clearing is the parent's job: dropping `editing` changes
+    // our key and remounts us empty. Clearing here too would wipe the draft on
+    // a *failed* submit — the one case where the user needs it back, since the
+    // message it named may already be gone.
+    if (!editing) {
+      setTask("");
+      setImages([]);
+    }
   }
 
   return (
@@ -171,7 +206,7 @@ export const Composer = memo(function Composer({
         <div
           className="relative mx-auto max-w-4xl"
           onDragOver={(e) => {
-            if (acceptsImages && !evicted) {
+            if (acceptsImages && !frozen) {
               e.preventDefault();
               setDragOver(true);
             }
@@ -179,6 +214,26 @@ export const Composer = memo(function Composer({
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
         >
+          {editing && (
+            <div className="mb-1.5 flex items-center gap-2 rounded-md border border-primary/40 bg-primary/5 px-2.5 py-1.5 text-xs">
+              <Pencil className="size-3.5 shrink-0 text-primary" />
+              <span className="min-w-0 flex-1 text-muted-foreground">
+                {rewriting
+                  ? "Editing an earlier message — sending discards everything after it."
+                  : "That message is already gone; sending starts a new turn from here."}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                type="button"
+                className="h-6 px-2"
+                disabled={editing.submitting}
+                onClick={onCancelEdit}
+              >
+                Cancel
+              </Button>
+            </div>
+          )}
           {images.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-2">
               {images.map((src, index) => (
@@ -201,6 +256,7 @@ export const Composer = memo(function Composer({
                   <button
                     type="button"
                     className="absolute -right-1.5 -top-1.5 flex size-4 items-center justify-center rounded-full bg-muted text-muted-foreground opacity-0 transition-opacity hover:bg-foreground hover:text-background group-hover:opacity-100"
+                    disabled={frozen}
                     title="Remove image"
                     aria-label={`Remove attachment ${index + 1}`}
                     onClick={() => removeImage(index)}
@@ -219,9 +275,13 @@ export const Composer = memo(function Composer({
                 event.preventDefault();
                 submit();
               }
+              if (event.key === "Escape" && editing && !editing.submitting) {
+                event.preventDefault();
+                onCancelEdit();
+              }
             }}
             onPaste={handlePaste}
-            disabled={evicted}
+            disabled={frozen}
             placeholder={
               evicted
                 ? "Session opened in another window — take over to continue"

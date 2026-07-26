@@ -28,6 +28,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::config::RelayConfig;
+use crate::storage::RewindError;
 use crate::wire::WireEvent;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
@@ -45,6 +46,14 @@ pub enum SessionCommand {
         agent_name: String,
         thread_id: String,
         decision: ResumeDecision,
+    },
+    /// Discard `target` and everything after it, then start a fresh turn from
+    /// the edited text. One command rather than two so no other command can
+    /// land between the truncation and the turn that replaces it.
+    Rewind {
+        target: MessageId,
+        task: String,
+        images: Vec<String>,
     },
     Abort,
     SetModel {
@@ -102,6 +111,22 @@ pub enum CommandOutcome {
     /// A `Resume` against an approvals-gated open that still needs more
     /// decisions; the client should be shown these approvals.
     StillPending(Vec<PendingApproval>),
+    /// A `Rewind` succeeded: the history that survived it, and the id minted
+    /// for the edited message that now follows it.
+    Rewound {
+        message_id: MessageId,
+        messages: Vec<Message>,
+    },
+    /// A `Rewind` refused because the session is not at rest — a turn is in
+    /// flight, or something is waiting on a human. Nothing was discarded.
+    NotIdle,
+    /// A `Rewind` naming a message that is not a user message of this session's
+    /// root thread. Nothing was discarded.
+    RewindTargetNotFound,
+    /// A `Rewind` whose truncation committed but whose replacement turn never
+    /// started. The runtime is gone and the client has been told to re-attach,
+    /// which is what puts it back in step with the truncated history.
+    RewindNotStarted,
     /// A `SetModel` was applied.
     ModelChanged {
         provider_id: String,
@@ -143,6 +168,19 @@ pub trait SessionOpener: Send + Sync + 'static {
         &'a self,
         key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>>;
+
+    /// Discard `target` and everything the session produced from it onward,
+    /// returning the root thread's remaining conversation.
+    ///
+    /// The caller must have stopped the session's runtime first; this cannot
+    /// check that. Fails without changing anything when `target` is not a user
+    /// message of the session's root thread, or when the session still has work
+    /// parked somewhere.
+    fn rewind<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        target: MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>>;
 
     /// Persist an effort update after a replacement runtime has been built but
     /// before it becomes live.
@@ -680,6 +718,127 @@ impl SessionHub {
         CommandOutcome::TaskAccepted { message_id }
     }
 
+    /// Give up on an entry that can no longer serve: tell the attached client so
+    /// it re-attaches (the connection layer does that transparently) and drop
+    /// the slot so the next open starts from the persisted state. Used for the
+    /// failures a rewind can hit *after* its truncation has committed — the
+    /// client's view is stale from that moment on, and a fresh attach is the
+    /// same route a crash would have forced anyway.
+    fn abandon(entries: &Entries, key: &SessionKey, state: &mut EntryState) {
+        if let Some(attachment) = state.attached.take() {
+            let _ = attachment.tx.send(RelayEvent::Closed);
+        }
+        let phase = std::mem::replace(&mut state.phase, EntryPhase::Released);
+        entries.lock().expect("entries mutex poisoned").remove(key);
+        if let EntryPhase::Live(live) = phase {
+            tokio::spawn(async move {
+                live.session.shutdown(Shutdown::abort()).await;
+            });
+        }
+    }
+
+    /// Discard the target message and everything after it, then start the
+    /// replacement turn.
+    ///
+    /// Runs entirely under the entry lock: the idle check, the shutdown, the
+    /// truncation, the rebuild and the new task have to be one step, or a
+    /// command landing in the middle would drive a session that is halfway
+    /// through being replaced.
+    async fn handle_rewind(
+        &self,
+        entry: &Arc<SessionEntry>,
+        state: &mut EntryState,
+        key: &SessionKey,
+        target: MessageId,
+        task: String,
+        images: Vec<String>,
+    ) -> CommandOutcome {
+        let (provider_id, reasoning_effort, generation, previous_snapshot) = {
+            let EntryPhase::Live(live) = &mut state.phase else {
+                return CommandOutcome::Ignored;
+            };
+            if live.turn_running || !live.pending_approvals.is_empty() {
+                warn!(workspace_id = %key.0, session_id = %key.1, "ignoring rewind while the session is busy");
+                return CommandOutcome::NotIdle;
+            }
+            // Stop the runtime before touching the persisted state. "The turn
+            // settled" is not the same as "no agent is still writing": a
+            // sub-agent replies to its caller *before* saving its own
+            // checkpoint, so the root turn can finish while a checkpoint write
+            // is still on its way — and that write carries the history from
+            // before the truncation, which against a lowered message count
+            // reads as ordinary growth. A completed graceful shutdown is the
+            // only barrier in the system that rules this out.
+            live.session.shutdown(Shutdown::graceful_unbounded()).await;
+            (
+                live.provider_id.clone(),
+                live.reasoning_effort.clone(),
+                live.generation + 1,
+                std::mem::take(&mut live.snapshot),
+            )
+        };
+
+        let truncated = self.opener.rewind(key, target).await;
+
+        // The runtime is gone either way, so it has to be rebuilt before the
+        // entry can serve anything again — including on the failure path, where
+        // the session is otherwise untouched and should carry on as before.
+        let session = match self
+            .opener
+            .open(key, &provider_id, reasoning_effort.clone(), HashMap::new())
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                Self::abandon(&self.entries, key, state);
+                return CommandOutcome::OpenFailed(err);
+            }
+        };
+        let mut replacement =
+            self.make_live(entry, session, provider_id, reasoning_effort, generation);
+
+        let messages = match truncated {
+            Ok(messages) => {
+                replacement.snapshot = messages.clone();
+                messages
+            }
+            Err(err) => {
+                // The truncation is all-or-nothing, so the history the entry
+                // was serving is still current.
+                replacement.snapshot = previous_snapshot;
+                state.phase = EntryPhase::Live(replacement);
+                warn!(workspace_id = %key.0, session_id = %key.1, "rewind rejected: {err}");
+                return match err {
+                    RewindError::TargetNotFound => CommandOutcome::RewindTargetNotFound,
+                    RewindError::ThreadBusy { .. } => CommandOutcome::NotIdle,
+                    RewindError::HistoryNotContiguous { .. } | RewindError::Persistence(_) => {
+                        CommandOutcome::PersistenceFailed(err.to_string())
+                    }
+                };
+            }
+        };
+        state.phase = EntryPhase::Live(replacement);
+
+        // From here the truncation is committed, so any failure leaves the
+        // client looking at messages that no longer exist. Rather than invent a
+        // second recovery route, fall into the one a crash would have forced.
+        match Self::handle_task(state, key, task, images).await {
+            CommandOutcome::TaskAccepted { message_id } => CommandOutcome::Rewound {
+                message_id,
+                messages,
+            },
+            _ => {
+                error!(
+                    workspace_id = %key.0,
+                    session_id = %key.1,
+                    "rewind truncated the session but its replacement turn could not start"
+                );
+                Self::abandon(&self.entries, key, state);
+                CommandOutcome::RewindNotStarted
+            }
+        }
+    }
+
     async fn handle_resume(
         &self,
         entry: &Arc<SessionEntry>,
@@ -939,6 +1098,14 @@ impl SessionRelay for SessionHub {
                     decision,
                 } => {
                     self.handle_resume(&entry, state, &key, agent_name, thread_id, decision)
+                        .await
+                }
+                SessionCommand::Rewind {
+                    target,
+                    task,
+                    images,
+                } => {
+                    self.handle_rewind(&entry, state, &key, target, task, images)
                         .await
                 }
                 SessionCommand::Abort => {

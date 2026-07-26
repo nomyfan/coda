@@ -173,6 +173,22 @@ pub struct TaskParams {
     pub images: Vec<String>,
 }
 
+/// `rewind` params — discard `message_id` and everything the session produced
+/// from it onward, then start a fresh turn from the edited text.
+///
+/// `task`/`images` carry the edited message and go through exactly the same
+/// checks as [`TaskParams`]. `message_id` is the only identity the client
+/// supplies; it must name a user message of this session's root thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub message_id: MessageId,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+}
+
 /// `resume` params — answer a suspended tool call. `agent_name`/`thread_id` come
 /// from the [`PendingApprovalWire`] carried by a `Suspended` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +286,20 @@ pub struct SessionName {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAccepted {
     pub message_id: MessageId,
+}
+
+/// Result of `rewind`: the id minted for the edited message, and the history
+/// that survived the truncation — *without* that message.
+///
+/// The client rebuilds its transcript from `messages` and then appends the
+/// edited message itself, keyed on `message_id`. It has to append it: the event
+/// stream never carries user messages, so a client that only applied `messages`
+/// would show the following assistant output hanging off the old history with
+/// nothing to explain it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindAccepted {
+    pub message_id: MessageId,
+    pub messages: Vec<Message>,
 }
 
 /// Result of `open_session`, and the payload of an unsolicited `snapshot`
@@ -455,6 +485,33 @@ mod tests {
         let back: SessionName =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert_eq!(back.name.as_deref(), Some("Investigation"));
+    }
+
+    #[test]
+    fn rewind_params_and_result_roundtrip() {
+        // `images` is omitted when empty, exactly as `task` does it — an edited
+        // message travels on the same shape as an original one.
+        let params = RewindParams {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+            message_id: MessageId::new(),
+            task: "ask it differently".into(),
+            images: vec![],
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(!json.contains("images"));
+        let back: RewindParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message_id, params.message_id);
+        assert_eq!(back.task, "ask it differently");
+
+        let result = RewindAccepted {
+            message_id: MessageId::new(),
+            messages: vec![],
+        };
+        let back: RewindAccepted =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(back.message_id, result.message_id);
+        assert!(back.messages.is_empty());
     }
 
     #[test]

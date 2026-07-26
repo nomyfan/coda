@@ -1,7 +1,8 @@
 use super::*;
+use coda_agent::persist::StoredRuntimeSnapshot;
 use coda_agent::runtime::{MemoryStorage, SessionStorage};
 use coda_agent::{
-    AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ToolApprovalMode,
+    AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ThreadId, ToolApprovalMode,
     ToolCallResolution,
 };
 use coda_core::llm::{
@@ -295,6 +296,31 @@ impl LLMProvider for TestProvider {
                     Self::completed(msg)
                 }
             }
+            // One call out to the `explore` sub-agent, then an answer. The
+            // replacement turn a rewind starts says "different" and is answered
+            // straight away, so the sub-agent's thread is only ever written by
+            // the turn being discarded — which is what lets a test read that
+            // thread afterwards and know whose messages it is looking at.
+            "delegate" => {
+                let replacement = request.messages.iter().any(
+                    |m| matches!(m, Message::User(user) if user.first_text() == Some("different")),
+                );
+                let answered = request
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool(_)));
+                if replacement || answered {
+                    Self::completed(assistant("done"))
+                } else {
+                    let mut msg = assistant("");
+                    msg.tool_calls = vec![ToolCall {
+                        id: "call_explore".into(),
+                        name: "explore".into(),
+                        arguments: Some(r#"{"task":"look"}"#.into()),
+                    }];
+                    Self::completed(msg)
+                }
+            }
             "approval" => {
                 let has_result = request
                     .messages
@@ -317,12 +343,78 @@ impl LLMProvider for TestProvider {
     }
 }
 
+/// `MemoryStorage` with a deliberate stall on one thread's checkpoint writes.
+///
+/// A sub-agent replies to its caller *before* saving its own checkpoint, so a
+/// root turn can settle while a sub-agent's write is still on its way. That
+/// window is real but short; widening it on purpose is what makes it testable
+/// instead of something a test would only hit by luck.
+#[derive(Clone, Default)]
+struct SlowStorage {
+    inner: MemoryStorage,
+    stall: Option<(String, Duration)>,
+}
+
+impl SessionStorage for SlowStorage {
+    fn save_checkpoint(
+        &self,
+        thread_id: String,
+        checkpoint: coda_agent::persist::StoredCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            if let Some((slow_thread, delay)) = &self.stall
+                && slow_thread == &thread_id
+            {
+                tokio::time::sleep(*delay).await;
+            }
+            self.inner.save_checkpoint(thread_id, checkpoint).await
+        })
+    }
+
+    fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<coda_agent::persist::StoredCheckpoint>, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.load_checkpoint(thread_id)
+    }
+
+    fn save_session_snapshot(
+        &self,
+        session_id: String,
+        snapshot: coda_agent::persist::StoredRuntimeSnapshot,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        self.inner.save_session_snapshot(session_id, snapshot)
+    }
+
+    fn load_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<coda_agent::persist::StoredRuntimeSnapshot>, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.load_session_snapshot(session_id)
+    }
+}
+
 struct TestOpener {
-    storage: MemoryStorage,
+    storage: SlowStorage,
     provider: TestProvider,
     team: AgentTeam,
     approval: ToolApprovalMode,
     fail_effort_update: bool,
+    /// Fail the rebuild a rewind performs after its truncation has committed.
+    fail_open_after_rewind: bool,
+    rewound: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TestOpener {
@@ -333,28 +425,75 @@ impl TestOpener {
             } else {
                 vec![]
             };
+        Self::with_team(
+            AgentTeam::new(
+                AgentSpec {
+                    name: "coda".into(),
+                    description: String::new(),
+                    system_prompt: system_prompt.into(),
+                    mode: SubAgentMode::Stateful,
+                    tools,
+                    subagents: vec![],
+                },
+                vec![],
+            )
+            .expect("valid team"),
+            approval,
+            SlowStorage::default(),
+        )
+    }
+
+    /// A root that delegates one call to a stateful `explore` sub-agent, so the
+    /// session spans two threads. `stall` delays `explore`'s checkpoint writes.
+    fn delegating(explore_prompt: &str, stall: Option<Duration>) -> Self {
         let team = AgentTeam::new(
             AgentSpec {
                 name: "coda".into(),
                 description: String::new(),
-                system_prompt: system_prompt.into(),
+                system_prompt: "delegate".into(),
                 mode: SubAgentMode::Stateful,
-                tools,
-                subagents: vec![],
+                tools: vec![],
+                subagents: vec!["explore".into()],
             },
-            vec![],
+            vec![AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: explore_prompt.into(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec![],
+            }],
         )
         .expect("valid team");
+        Self::with_team(
+            team,
+            ToolApprovalMode::Auto,
+            SlowStorage {
+                inner: MemoryStorage::default(),
+                stall: stall.map(|delay| (explore_thread().as_ref().to_string(), delay)),
+            },
+        )
+    }
+
+    fn with_team(team: AgentTeam, approval: ToolApprovalMode, storage: SlowStorage) -> Self {
         Self {
-            storage: MemoryStorage::default(),
+            storage,
             provider: TestProvider {
                 gate: Arc::new(Notify::new()),
             },
             team,
             approval,
             fail_effort_update: false,
+            fail_open_after_rewind: false,
+            rewound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
+}
+
+/// The thread the `explore` sub-agent runs in: stateful, so it is derived once
+/// from the root thread (whose id is the session id) and stays put.
+fn explore_thread() -> ThreadId {
+    ThreadId::from_uuid5(&ThreadId::from(key().1), "explore")
 }
 
 impl SessionOpener for TestOpener {
@@ -366,7 +505,11 @@ impl SessionOpener for TestOpener {
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
-            Session::builder()
+            let after_rewind = self.rewound.load(std::sync::atomic::Ordering::SeqCst);
+            if after_rewind && self.fail_open_after_rewind {
+                return Err(OpenError::Storage("injected rebuild failure".into()));
+            }
+            let session = Session::builder()
                 .storage(self.storage.clone())
                 .team(&self.team, ".")
                 .run_config(RunConfig {
@@ -385,7 +528,8 @@ impl SessionOpener for TestOpener {
                 .session_id(key.1.clone())
                 .resume_decisions(decisions)
                 .open()
-                .await
+                .await?;
+            Ok(session)
         })
     }
 
@@ -394,6 +538,66 @@ impl SessionOpener for TestOpener {
         _key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>> {
         Box::pin(async { vec![] })
+    }
+
+    /// A stand-in for the SQL one: same predicate (drop every turn the root
+    /// thread carries from the target on, in every thread), same snapshot
+    /// clearing. It does not drop emptied thread records — `MemoryStorage`
+    /// cannot delete — which is fine here, because what these tests are about is
+    /// *when* the truncation runs relative to the agents, not how it is spelled.
+    fn rewind<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        target: MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.rewound
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let root = self
+                .storage
+                .load_checkpoint(&key.1)
+                .await
+                .map_err(RewindError::Persistence)?
+                .ok_or(RewindError::TargetNotFound)?;
+            let cut = root
+                .messages
+                .iter()
+                .position(|entry| {
+                    matches!(&entry.message, Message::User(user) if user.message_id == target)
+                })
+                .ok_or(RewindError::TargetNotFound)?;
+            let discarded: HashSet<uuid::Uuid> = root.messages[cut..]
+                .iter()
+                .map(|entry| entry.turn_id.as_uuid())
+                .collect();
+
+            for mut checkpoint in self.storage.inner.all_checkpoints().await {
+                checkpoint
+                    .messages
+                    .retain(|entry| !discarded.contains(&entry.turn_id.as_uuid()));
+                let thread_id = checkpoint.thread_id.clone();
+                self.storage
+                    .save_checkpoint(thread_id, checkpoint)
+                    .await
+                    .map_err(RewindError::Persistence)?;
+            }
+            self.storage
+                .save_session_snapshot(
+                    key.1.clone(),
+                    StoredRuntimeSnapshot {
+                        drained_envelopes: HashMap::new(),
+                        agent_drained_envelopes: HashMap::new(),
+                        active_threads: HashMap::new(),
+                    },
+                )
+                .await
+                .map_err(RewindError::Persistence)?;
+
+            Ok(root.messages[..cut]
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect())
+        })
     }
 
     fn update_reasoning_effort<'a>(
@@ -452,6 +656,31 @@ fn is_settling_llm_end(event: &RelayEvent) -> bool {
         RelayEvent::Event(e)
             if matches!(&**e, WireEvent::LlmEnd { message, .. } if message.tool_calls.is_empty())
     )
+}
+
+/// Wait until the forwarder has folded the settled turn.
+///
+/// A client is handed the settling event *before* the forwarder updates the
+/// entry it came from, so a test that acts the moment that event arrives can
+/// beat the hub to its own bookkeeping and see a session that is still marked
+/// as running.
+async fn wait_idle(hub: &SessionHub) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = hub.get_entry(&key()) {
+                let idle = {
+                    let guard = entry.inner.clone().lock_owned().await;
+                    matches!(&guard.phase, EntryPhase::Live(live) if !live.turn_running)
+                };
+                if idle {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session did not settle");
 }
 
 async fn wait_released(hub: &SessionHub) {
@@ -1242,4 +1471,335 @@ async fn set_model_on_unattached_connection_is_ignored() {
     ));
 
     hub.shutdown_all().await;
+}
+
+// --- rewind ------------------------------------------------------------
+
+/// Start a session and run one turn, returning the hub, the event stream, and
+/// the id of the user message that turn began with — the thing a rewind names.
+async fn session_with_one_turn(
+    opener: Arc<TestOpener>,
+) -> (SessionHub, BoxStream<'static, RelayEvent>, MessageId) {
+    let hub = SessionHub::new(opener, RelayConfig::default());
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+    let CommandOutcome::TaskAccepted { message_id } = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            },
+        )
+        .await
+    else {
+        panic!("a task against a live session is accepted");
+    };
+    next_matching(&mut events, is_settling_llm_end).await;
+    wait_idle(&hub).await;
+    (hub, events, message_id)
+}
+
+async fn stored_messages(storage: &SlowStorage, thread_id: &str) -> Vec<Message> {
+    storage
+        .load_checkpoint(thread_id)
+        .await
+        .expect("load checkpoint")
+        .map(|checkpoint| {
+            checkpoint
+                .messages
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The window this whole design is shaped around: a sub-agent replies to its
+/// caller *before* saving its own checkpoint, so the root turn can settle — and
+/// the hub can call itself idle — while that write is still in flight. Truncate
+/// then, and the late write puts the discarded tail straight back, because
+/// against a lowered message count it reads as ordinary growth.
+///
+/// Stopping the runtime first is the only barrier that rules this out. Drop the
+/// `shutdown` from `handle_rewind` and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved() {
+    let opener = Arc::new(TestOpener::delegating(
+        "reply",
+        Some(Duration::from_millis(300)),
+    ));
+    let storage = opener.storage.clone();
+    let (hub, mut events, first_turn) = session_with_one_turn(opener).await;
+
+    // The root turn has settled, so the hub considers the session idle — but
+    // `explore` is still inside its stalled checkpoint write.
+    assert!(
+        stored_messages(&storage, explore_thread().as_ref())
+            .await
+            .is_empty(),
+        "the sub-agent's write must still be in flight for this test to mean anything"
+    );
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                target: first_turn,
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::Rewound { .. }));
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    // Outlast the stall before looking. Without the barrier the truncation runs
+    // first and the stalled write lands *after* it — but the replacement turn
+    // finishes in microseconds, so an assertion taken straight after it would
+    // read the sub-agent's thread while the damaging write is still asleep and
+    // see the empty history it expects for entirely the wrong reason.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        stored_messages(&storage, explore_thread().as_ref())
+            .await
+            .is_empty(),
+        "the sub-agent's late checkpoint must not restore the turn that was discarded"
+    );
+}
+
+/// The truncation and the turn that replaces it are one step, and the client is
+/// told what survived so it does not have to work that out for itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_replaces_the_discarded_turn_and_reports_what_survived() {
+    let opener = Arc::new(TestOpener::new("reply", ToolApprovalMode::Auto));
+    let (hub, mut events, _first_turn) = session_with_one_turn(opener).await;
+
+    // A second turn, so the rewind has something to keep as well as something
+    // to discard.
+    let CommandOutcome::TaskAccepted {
+        message_id: second_turn,
+    } = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "and then this".into(),
+                images: vec![],
+            },
+        )
+        .await
+    else {
+        panic!("a task against a live session is accepted");
+    };
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                target: second_turn,
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    let CommandOutcome::Rewound {
+        message_id,
+        messages,
+    } = outcome
+    else {
+        panic!("expected the rewind to succeed");
+    };
+    assert_ne!(
+        message_id, second_turn,
+        "the edited message is a new message, not a rewrite of the discarded one"
+    );
+    assert_eq!(
+        messages.len(),
+        2,
+        "only the first turn survives: its user message and the answer to it"
+    );
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    // What an attaching client sees is the surviving history plus the edited
+    // message — the same thing the command reported.
+    let snapshot = hub
+        .attach(key(), 2, "prov".into(), None, true)
+        .await
+        .expect("re-attach")
+        .snapshot;
+    let texts: Vec<String> = snapshot
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user.first_text().unwrap_or_default().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["go".to_string(), "different".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_is_refused_while_a_turn_is_in_flight() {
+    let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let CommandOutcome::TaskAccepted { message_id } = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            },
+        )
+        .await
+    else {
+        panic!("a task against a live session is accepted");
+    };
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                target: message_id,
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::NotIdle));
+
+    // The turn was never disturbed: releasing the gate still finishes it.
+    gate.notify_one();
+    let mut events = attach.events;
+    next_matching(&mut events, is_settling_llm_end).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_is_refused_while_a_call_waits_on_a_human() {
+    let (hub, _gate) = hub_with("approval", ToolApprovalMode::Manual);
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+    let CommandOutcome::TaskAccepted { message_id } = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            },
+        )
+        .await
+    else {
+        panic!("a task against a live session is accepted");
+    };
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e) if matches!(&**e, WireEvent::Suspended { .. }))
+    })
+    .await;
+
+    // The turn has settled — suspension settles it — so `turn_running` alone
+    // would let this through. The pending approval is what must not.
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                target: message_id,
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::NotIdle));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_rewind_leaves_the_session_exactly_as_it_was() {
+    let opener = Arc::new(TestOpener::new("reply", ToolApprovalMode::Auto));
+    let (hub, _events, _) = session_with_one_turn(opener).await;
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                // An id that names nothing: the truncation never runs.
+                target: MessageId::new(),
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::RewindTargetNotFound));
+
+    // The entry still serves the history it had, and still takes work. A
+    // re-attach hands back a fresh stream (the old one is retired with the
+    // channel it was registered on), so carry on with that.
+    let refreshed = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("still attached");
+    let mut events = refreshed.events;
+    assert_eq!(refreshed.snapshot.messages.len(), 2);
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "carry on".into(),
+                images: vec![],
+            },
+        )
+        .await,
+        CommandOutcome::TaskAccepted { .. }
+    ));
+    next_matching(&mut events, is_settling_llm_end).await;
+}
+
+/// Once the truncation has committed, the client's view is stale no matter what
+/// goes wrong next. Both remaining failures therefore end the same way — the
+/// runtime is dropped and the client is told to re-attach — rather than each
+/// inventing its own way back. That is the route a crash would have forced
+/// anyway, so it is the only recovery path there is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_fresh_attach() {
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    opener.fail_open_after_rewind = true;
+    let (hub, mut events, first_turn) = session_with_one_turn(Arc::new(opener)).await;
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Rewind {
+                target: first_turn,
+                task: "different".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(outcome, CommandOutcome::OpenFailed(_)));
+    assert!(matches!(
+        next_matching(&mut events, |event| matches!(event, RelayEvent::Closed)).await,
+        RelayEvent::Closed
+    ));
+    assert!(
+        hub.get_entry(&key()).is_none(),
+        "the slot must be free so the next attach reads the truncated state"
+    );
 }
