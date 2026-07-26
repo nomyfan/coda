@@ -17,6 +17,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Tracks the `diesel` crate the server builds against.
+  DIESEL_CLI_VERSION: 2.3.11
 
 jobs:
   rust:
@@ -91,6 +93,25 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ubuntu-latest-cargo
+
+      - name: Setup cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.21.1
+
+      - name: Install diesel_cli
+        run: cargo binstall --no-confirm "diesel_cli@$DIESEL_CLI_VERSION"
+
+      # Its own empty database: migrating the storage-test one would say nothing
+      # about what a fresh deployment gets. `diesel setup`/`database reset` are
+      # avoided — they scaffold an untracked `diesel_initial_setup` migration
+      # into the checkout.
+      - name: Check schema.rs matches the migrations
+        working-directory: app/coda_server
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/coda_schema_check
+        run: |
+          psql postgres://postgres:postgres@localhost:5432/postgres \
+            -v ON_ERROR_STOP=1 -c 'create database coda_schema_check;'
+          diesel migration run --locked-schema
 
       # No `DATABASE_URL` makes this fail rather than skip: a suite that skips
       # itself would leave persistence untested while the job still went green.

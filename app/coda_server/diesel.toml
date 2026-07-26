@@ -5,6 +5,10 @@
 # migrated database, so the schema and the migrations cannot drift apart. Only
 # `diesel_cli` reads this file, and only it needs libpq — a build of this crate
 # does not (diesel-async speaks to PostgreSQL through tokio-postgres).
+#
+# CI re-runs the migrations against an empty database with `--locked-schema`,
+# which reads this same setting and fails if the result would differ from the
+# committed `src/schema.rs`.
 [print_schema]
 file = "src/schema.rs"
 
