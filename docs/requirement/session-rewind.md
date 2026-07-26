@@ -40,10 +40,12 @@ Rewind 功能让用户可以选中某条历史 user message，编辑后确认，
 - 前端的 `TranscriptEntry` 使用合成 ID（`history:user:${index}`），rewind 后 index 会变化，需要完整重建 entries。
 - **仅闲置状态可 rewind**：不只是"没有 turn 在跑"，还要求没有线程挂在待审批或待工具回复上。在数据层这等价于"每个线程的 `resume_point` 都是 `Generation`"（turn 正常跑完就是这个值，`driver.rs:756/827`）。这样带引用的恢复点（`PendingApproval` 存着待审批的 tool call、`ToolExecution` 存着待回复的调用）根本不可能指向被丢弃的 turn——不需要写清理逻辑，rewind 前断言该前置条件即可（`resume_point` 是 JSONB 列，一条查询可验）。
 - 截断消息之后，已写入消息的计数必须一并重置，否则后续保存会从错误位置追加（详见 `../implementation/storage-migration-pg.md` 的 Risks）。
-- 会变空的线程要有处置。成因只有一种：该子线程的**第一次调用发生在 rewind 点及之后**，于是它的消息被全部丢弃。两类分开处理：
-  - stateless 线程 id 由 `(父 Assistant message_id, call_id)` 一次性派生，而那条父 Assistant 消息也被删了——再没有任何东西能算出这个 id，空行是纯垃圾，**直接删**。
-  - stateful 线程 id 由 `uuid5(父线程, agent 名)` 稳定派生，同一个 agent 下次被调用还是这个 id，**留空行**即可接着用。
-- `todos` **不回滚**（已定）：它是按线程整存的一份清单、没有 turn 归属，回滚成本高；而它本质是 agent 的工作草稿而非对话事实，错位可接受，agent 下一轮会自行重写。
+- 会变空的线程要有处置：**剩余消息数为 0 的线程记录一律删除**，不区分 stateless / stateful，root 线程也一样（rewind 到第一条消息时 root 就会变空）。
+  - **不需要区分的原因**：stateless 线程 id 由 `(父 Assistant message_id, call_id)` 派生，一个线程恰好对应一次调用、于是恰好属于一个 turn（它派生出的整棵子树继承同一个 turn），所以它只有"整条丢弃"和"一条不碰"两种命运，永远不会被部分截断。能带着剩余消息活下来的必然是在多个 turn 里被调用过的线程。真正的判据只有一个：**剩下几条消息**。
+  - 剩 0 条时，对 stateless 是**必须删**——父 Assistant 消息已随之删除，再没有任何东西能算出这个 id，空行是永久垃圾；对 stateful / root 是**删与留等价**——"没有 checkpoint"与"有一份空 checkpoint"在 driver 里走同一段代码，而稳定派生保证下次调用仍是同一个 id。
+  - 换来的不变量：**没有消息的线程不存在**。
+- `todos` **不回滚**：它是按线程整存的一份清单、没有 turn 归属，回滚成本高；而它本质是 agent 的工作草稿而非对话事实，错位可接受，agent 下一轮会自行重写。
+  - **唯一例外**：整条线程被删掉时（其全部消息都在丢弃范围内），该线程的 todos 随之消失。对 root 而言这只发生在 rewind 到第一条消息时——那意味着整段对话都被丢弃，留着一份来自被抹掉对话的清单反而更奇怪。
 
 ## Success Criteria
 
