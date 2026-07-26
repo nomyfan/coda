@@ -20,7 +20,7 @@ use coda_core::llm::{
 };
 use coda_server::storage::DbPool;
 use coda_server::storage::{
-    PgSessionStorage, RenameSessionError, SessionMetadataError, SessionModelBinding,
+    PgSessionStorage, RenameSessionError, RewindError, SessionMetadataError, SessionModelBinding,
     WorkspaceStorage,
 };
 use coda_tools::TodoItem;
@@ -1088,5 +1088,474 @@ async fn a_deleted_session_leaves_the_list_and_is_reopenable() {
             .unwrap()
             .map(|checkpoint| checkpoint.messages.len()),
         None
+    );
+}
+
+// --- rewind ------------------------------------------------------------------
+
+#[derive(QueryableByName)]
+struct ThreadCountRow {
+    #[diesel(sql_type = Text)]
+    thread_id: String,
+    #[diesel(sql_type = Integer)]
+    message_count: i32,
+}
+
+/// A three-thread session spanning two turns, built the way the runtime builds
+/// one: a root thread, a stateful sub-agent called in both turns, and a
+/// stateless sub-agent called only in the second. Returns the two turns and the
+/// root user message that opened each.
+async fn seed_two_turn_session(
+    pool: &DbPool,
+    workspace: &str,
+) -> (TurnId, TurnId, MessageId, MessageId) {
+    seed_session(pool, workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), workspace, "chat");
+
+    let first_root = MessageId::new();
+    let second_root = MessageId::new();
+    let first = TurnId::from(first_root);
+    let second = TurnId::from(second_root);
+
+    // The assistant message each turn's sub-agent calls hang off; a stateless
+    // thread's id is derived from it, which is why it cannot outlive it.
+    let first_caller = MessageId::new();
+    let second_caller = MessageId::new();
+
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(first_root, "start here")),
+                    ),
+                    entry(first, assistant("asking explore")),
+                    entry(
+                        second,
+                        Message::User(UserMessage::text(second_root, "now do this instead")),
+                    ),
+                    entry(second, assistant("asking explore and probe")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Stateful: one thread, reached by both turns.
+    let explore_first = MessageOrigin {
+        message_id: first_caller,
+        call_id: "call_explore_1".to_string(),
+    };
+    let explore_second = MessageOrigin {
+        message_id: second_caller,
+        call_id: "call_explore_2".to_string(),
+    };
+    storage
+        .save_checkpoint(
+            "explore-thread".to_string(),
+            StoredCheckpoint {
+                agent_name: "explore".to_string(),
+                parent_thread_id: Some("chat".to_string()),
+                derivation_key: Some("explore".to_string()),
+                ..checkpoint(
+                    "explore-thread",
+                    vec![
+                        entry(
+                            first,
+                            Message::User(UserMessage::from_subagent_call(
+                                MessageId::new(),
+                                "look at the schema",
+                                explore_first,
+                            )),
+                        ),
+                        entry(first, assistant("four tables")),
+                        entry(
+                            second,
+                            Message::User(UserMessage::from_subagent_call(
+                                MessageId::new(),
+                                "look again",
+                                explore_second,
+                            )),
+                        ),
+                        entry(second, assistant("still four")),
+                    ],
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+    // Stateless: its own thread, reached only by the second turn.
+    let probe_call = MessageOrigin {
+        message_id: second_caller,
+        call_id: "call_probe".to_string(),
+    };
+    storage
+        .save_checkpoint(
+            "probe-thread".to_string(),
+            StoredCheckpoint {
+                agent_name: "probe".to_string(),
+                parent_thread_id: Some("chat".to_string()),
+                derivation_key: Some(probe_call.derivation_key()),
+                ..checkpoint(
+                    "probe-thread",
+                    vec![
+                        entry(
+                            second,
+                            Message::User(UserMessage::from_subagent_call(
+                                MessageId::new(),
+                                "check the index",
+                                probe_call,
+                            )),
+                        ),
+                        entry(second, assistant("it is used")),
+                    ],
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+    storage
+        .save_session_snapshot(
+            "chat".to_string(),
+            StoredRuntimeSnapshot {
+                drained_envelopes: Default::default(),
+                agent_drained_envelopes: Default::default(),
+                active_threads: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    (first, second, first_root, second_root)
+}
+
+async fn thread_ids_and_seqs(pool: &DbPool, workspace: &str) -> Vec<(String, i32)> {
+    diesel::sql_query(
+        "select thread_id, seq from messages where workspace_id = $1 order by thread_id, seq",
+    )
+    .bind::<Text, _>(workspace)
+    .load::<ThreadSeqRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.thread_id, row.seq))
+    .collect()
+}
+
+async fn thread_counts(pool: &DbPool, workspace: &str) -> Vec<(String, i32)> {
+    diesel::sql_query(
+        "select thread_id, message_count from thread_checkpoints
+          where workspace_id = $1 order by thread_id",
+    )
+    .bind::<Text, _>(workspace)
+    .load::<ThreadCountRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.thread_id, row.message_count))
+    .collect()
+}
+
+async fn row_count(pool: &DbPool, table: &str, workspace: &str) -> i64 {
+    diesel::sql_query(format!(
+        "select count(*) as count from {table} where workspace_id = $1"
+    ))
+    .bind::<Text, _>(workspace)
+    .get_result::<CountRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .count
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_drops_the_discarded_turn_from_every_thread_it_reached() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-across-threads");
+    let (_, _, _, second_root) = seed_two_turn_session(&pool, &workspace).await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let remaining = storage.rewind_to(second_root).await.unwrap();
+
+    // What comes back is the root thread's conversation, which is what the
+    // client renders — the sub-agent threads are truncated but never shown.
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        matches!(&remaining[0], Message::User(user) if user.first_text() == Some("start here")),
+        "the surviving history must start at the first turn"
+    );
+
+    // The second turn is gone from every thread it reached, and only from those:
+    // the stateful thread keeps the turn that came before it, the stateless
+    // thread had nothing else and its row goes.
+    assert_eq!(
+        thread_ids_and_seqs(&pool, &workspace).await,
+        vec![
+            ("chat".to_string(), 0),
+            ("chat".to_string(), 1),
+            ("explore-thread".to_string(), 0),
+            ("explore-thread".to_string(), 1),
+        ]
+    );
+    assert_eq!(
+        thread_counts(&pool, &workspace).await,
+        vec![("chat".to_string(), 2), ("explore-thread".to_string(), 2)],
+        "an emptied thread is removed and the survivors' watermarks come down"
+    );
+    assert_eq!(
+        row_count(&pool, "runtime_snapshots", &workspace).await,
+        0,
+        "queued envelopes belong to the discarded turn; keeping them would replay it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewound_thread_keeps_growing_from_where_it_was_cut() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-watermark");
+    let (first, _, _, second_root) = seed_two_turn_session(&pool, &workspace).await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let remaining = storage.rewind_to(second_root).await.unwrap();
+
+    // The turn a rewind starts writes into the thread it just shortened. If the
+    // watermark stayed where it was, this append would land past the end of the
+    // history and be silently dropped.
+    let replacement = MessageId::new();
+    let mut history: Vec<HistoryEntry> = remaining
+        .into_iter()
+        .map(|message| entry(first, message))
+        .collect();
+    let replacement_turn = TurnId::from(replacement);
+    history.push(entry(
+        replacement_turn,
+        Message::User(UserMessage::text(replacement, "try this instead")),
+    ));
+    history.push(entry(replacement_turn, assistant("done")));
+    storage
+        .save_checkpoint("chat".to_string(), checkpoint("chat", history))
+        .await
+        .unwrap();
+
+    let reloaded = storage
+        .load_checkpoint("chat")
+        .await
+        .unwrap()
+        .expect("the root thread was just saved");
+    let texts: Vec<String> = reloaded
+        .messages
+        .iter()
+        .map(|entry| match &entry.message {
+            Message::User(user) => user.first_text().unwrap_or_default().to_string(),
+            Message::Assistant(assistant) => assistant.content.clone(),
+            other => panic!("unexpected message {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["start here", "asking explore", "try this instead", "done"],
+        "the replacement turn must follow the surviving history exactly once"
+    );
+    assert_eq!(
+        thread_ids_and_seqs(&pool, &workspace)
+            .await
+            .into_iter()
+            .filter(|(thread_id, _)| thread_id == "chat")
+            .map(|(_, seq)| seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "seq stays a contiguous run so later loads keep their order"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewinding_to_the_opening_message_leaves_no_session_state_behind() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-to-start");
+    let (_, _, first_root, _) = seed_two_turn_session(&pool, &workspace).await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    assert!(storage.rewind_to(first_root).await.unwrap().is_empty());
+
+    // Every thread is emptied, so every thread record goes with it — including
+    // the root's. The session itself survives and reopens as a blank one.
+    assert_eq!(row_count(&pool, "messages", &workspace).await, 0);
+    assert_eq!(row_count(&pool, "thread_checkpoints", &workspace).await, 0);
+    assert_eq!(row_count(&pool, "sessions", &workspace).await, 1);
+    assert!(storage.load_checkpoint("chat").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-busy");
+    let (_, _, _, second_root) = seed_two_turn_session(&pool, &workspace).await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+    let before = thread_ids_and_seqs(&pool, &workspace).await;
+
+    // A sub-agent waiting on an approval, which the `pending_approval` column
+    // would flag — and one waiting on a tool result, which it would not. Both
+    // must block a rewind, which is why the check reads `resume_point` itself.
+    for (parked, flagged) in [
+        (
+            StoredResumePoint::PendingApproval {
+                parent_message_id: MessageId::new(),
+                pending_approval_calls: vec![ToolCall {
+                    id: "call_shell".to_string(),
+                    name: "shell".to_string(),
+                    arguments: None,
+                }],
+                pending_calls: vec![],
+            },
+            true,
+        ),
+        (
+            StoredResumePoint::ToolExecution(coda_agent::persist::StoredToolExecutionState {
+                parent_message_id: MessageId::new(),
+                pending_replies: vec![],
+                tool_calls: vec![],
+            }),
+            false,
+        ),
+    ] {
+        // Both columns move together, exactly as `save_checkpoint` writes them —
+        // so the second case really is a thread the `pending_approval` flag does
+        // not mark, rather than one whose fixture merely forgot to set it.
+        diesel::sql_query(
+            "update thread_checkpoints set resume_point = $2, pending_approval = $3
+              where workspace_id = $1 and thread_id = 'explore-thread'",
+        )
+        .bind::<Text, _>(&workspace)
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::to_value(&parked).unwrap())
+        .bind::<Bool, _>(flagged)
+        .execute(&mut conn(&pool).await)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.rewind_to(second_root).await.unwrap_err(),
+            RewindError::ThreadBusy {
+                thread_id: "explore-thread".to_string()
+            }
+        );
+        assert_eq!(
+            thread_ids_and_seqs(&pool, &workspace).await,
+            before,
+            "a refused rewind must not have deleted anything"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_user_message_of_the_root_thread_can_be_rewound_to() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-target");
+    let (_, _, _, _) = seed_two_turn_session(&pool, &workspace).await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+    let before = thread_ids_and_seqs(&pool, &workspace).await;
+
+    let root = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    let assistant_id = match &root.messages[1].message {
+        Message::Assistant(message) => message.message_id,
+        other => panic!("expected an assistant message, got {other:?}"),
+    };
+    let sub = storage
+        .load_checkpoint("explore-thread")
+        .await
+        .unwrap()
+        .unwrap();
+    let sub_user_id = match &sub.messages[0].message {
+        Message::User(message) => message.message_id,
+        other => panic!("expected a user message, got {other:?}"),
+    };
+
+    // An assistant message of the root thread, a user message of a sub-agent
+    // thread, and an id from nowhere: each names something real (or plausible)
+    // that still is not a rewind target.
+    for target in [assistant_id, sub_user_id, MessageId::new()] {
+        assert_eq!(
+            storage.rewind_to(target).await.unwrap_err(),
+            RewindError::TargetNotFound
+        );
+    }
+    assert_eq!(thread_ids_and_seqs(&pool, &workspace).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-gap");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let first = TurnId::from(MessageId::new());
+    let second_root = MessageId::new();
+    let second = TurnId::from(second_root);
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "first")),
+                    ),
+                    entry(first, assistant("ok")),
+                    entry(
+                        second,
+                        Message::User(UserMessage::text(second_root, "second")),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    // A sub-agent thread whose turns are *not* in contiguous blocks. Production
+    // cannot produce this — envelopes are handled one at a time and in order —
+    // so it is written directly; the point is that if that ever stopped holding,
+    // the truncation would punch a hole rather than take a tail.
+    let mut conn = conn(&pool).await;
+    diesel::sql_query(
+        "insert into thread_checkpoints
+            (workspace_id, session_id, thread_id, agent_name, resume_point,
+             todos, suspended_at, message_count, pending_approval)
+         values ($1, 'chat', 'interleaved', 'explore', '\"Generation\"'::jsonb,
+                 '[]'::jsonb, now(), 3, false)",
+    )
+    .bind::<Text, _>(&workspace)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    for (seq, turn) in [(0, first), (1, second), (2, first)] {
+        diesel::sql_query(
+            "insert into messages
+                (workspace_id, session_id, thread_id, seq, message_id, turn_id, role, payload)
+             values ($1, 'chat', 'interleaved', $2, gen_random_uuid(), $3, 'assistant', '{}'::jsonb)",
+        )
+        .bind::<Text, _>(&workspace)
+        .bind::<Integer, _>(seq)
+        .bind::<diesel::sql_types::Uuid, _>(turn.as_uuid())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    let before = thread_ids_and_seqs(&pool, &workspace).await;
+
+    assert_eq!(
+        storage.rewind_to(second_root).await.unwrap_err(),
+        RewindError::HistoryNotContiguous {
+            thread_id: "interleaved".to_string()
+        }
+    );
+    assert_eq!(
+        thread_ids_and_seqs(&pool, &workspace).await,
+        before,
+        "the whole transaction rolls back, including the root thread's deletions"
     );
 }

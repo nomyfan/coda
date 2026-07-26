@@ -341,10 +341,13 @@ Composer 的三条规则：
 
 ## Implementation Roadmap
 
-- [ ] [risk validation] `PgSessionStorage::rewind_to` + `tests/storage_pg.rs`
+- [x] [risk validation] `PgSessionStorage::rewind_to` + `tests/storage_pg.rs`
       - Purpose: 先把最贵的持久化语义钉死——它是其余所有步骤的地基
       - 覆盖：跨 root + stateful 子线程 + stateless 子线程的一次截断；存活线程 `seq` 连续且 `message_count` 相符；首次调用的 stateless / stateful 空线程行都被删除；rewind 到第一条消息时 root 行也被删除且会话仍可重开；`runtime_snapshots` 行被清空；`resume_point != Generation` 时整体拒绝；目标不是 root user 消息时拒绝；seq 有洞时以 `HistoryNotContiguous` 回滚
       - Verification: 上述断言全绿；**反向验证**——去掉 `message_count` 重置那一句，"rewind 后再存一次 checkpoint"的测试必须失败
+      - 落地：`RewindError` + `PgSessionStorage::rewind_to`（`storage.rs`），事务步骤与设计一一对应。6 个测试：`a_rewind_drops_the_discarded_turn_from_every_thread_it_reached`（三线程两轮次，断言剩余 `(thread, seq)` 全集、两条存活线程的 `message_count`、快照行被清）、`a_rewound_thread_keeps_growing_from_where_it_was_cut`、`rewinding_to_the_opening_message_leaves_no_session_state_behind`、`a_rewind_is_refused_while_any_thread_is_mid_turn`、`only_a_user_message_of_the_root_thread_can_be_rewound_to`、`a_truncation_that_would_leave_a_gap_is_rolled_back`
+      - **三条反向验证都跑过**：(1) 把 `message_count` 重置改成自赋值 → 上述第 1、2 条测试同时失败（第 2 条的失败正是设计预测的"追加被静默丢弃"）；(2) 删掉 `runtime_snapshots` 的删除 → 第 1 条失败；(3) 把闲置判据从 `resume_point != Generation` 换成 `pending_approval` 列 → 第 4 条**只在 `ToolExecution` 那次迭代**失败，精确复现 Finding 3。为让第 (3) 条成立，该测试的 fixture 改成 `resume_point` 与 `pending_approval` 两列同写（`save_checkpoint` 就是这么写的），否则两次迭代都会失败、证明不了缺口在哪
+      - 偏差：无
 - [ ] [risk validation] 停机屏障与快照清空的时序测试（`hub_tests.rs`）
       - Purpose: 证伪 Finding 1 与 Finding 2 —— 它们是整个方案形状的依据
       - 覆盖三个**不同**的窗口：(a) 正常完成后子线程 checkpoint 尚未落库；(b) root 已 `Aborted`、子 agent 尚未发出 `Reply`（这条 Reply 会进 `drained_envelopes`）；(c) 一次旧 abort 的迟到 `Reply` 跨过后续一整个 turn 才被取走

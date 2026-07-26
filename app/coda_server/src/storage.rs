@@ -13,6 +13,7 @@ use diesel_async::pooled_connection::deadpool::{Object, Pool};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use jiff_diesel::ToDiesel;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -515,6 +516,52 @@ impl From<diesel::result::Error> for SaveError {
     }
 }
 
+/// Why a rewind changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewindError {
+    /// No such message, or it is not a user message of this session's root
+    /// thread. The only identity a client supplies, so this is also what a
+    /// forged or stale target lands on.
+    TargetNotFound,
+    /// A thread is not parked at a plain generation boundary, so the session
+    /// still has work in flight and its persisted state is not a resting point.
+    ThreadBusy {
+        thread_id: String,
+    },
+    /// A surviving thread's messages are no longer `[0, count)`. Truncation only
+    /// ever removes a tail, so this means that invariant broke upstream; the
+    /// transaction is rolled back rather than leaving a history with a hole in
+    /// it, which every later save would then append past.
+    HistoryNotContiguous {
+        thread_id: String,
+    },
+    Persistence(String),
+}
+
+impl std::fmt::Display for RewindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetNotFound => write!(f, "no such user message in this session"),
+            Self::ThreadBusy { thread_id } => {
+                write!(f, "thread {thread_id} is still mid-turn")
+            }
+            Self::HistoryNotContiguous { thread_id } => write!(
+                f,
+                "thread {thread_id} would be left with a gap in its history"
+            ),
+            Self::Persistence(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RewindError {}
+
+impl From<diesel::result::Error> for RewindError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Persistence(format!("failed to rewind the session: {err}"))
+    }
+}
+
 impl PgSessionStorage {
     pub fn new(
         pool: DbPool,
@@ -694,6 +741,180 @@ impl PgSessionStorage {
             resume_point: resume_point.into_inner(),
             suspended_at: suspended_at.to_jiff(),
         }))
+    }
+
+    /// Discard `target` and everything the session produced from it onward, then
+    /// report the root thread's remaining conversation.
+    ///
+    /// Rejects — changing nothing — when `target` is not a user message of this
+    /// session's root thread, or when any of the session's threads is not parked
+    /// at a plain generation boundary.
+    ///
+    /// The caller must have stopped the session's runtime first. This cannot
+    /// check that, and it matters: an agent that is still flushing a checkpoint
+    /// would write back the very tail this removes, and against a lowered
+    /// `message_count` that write looks like ordinary growth.
+    pub async fn rewind_to(&self, target: MessageId) -> Result<Vec<Message>, RewindError> {
+        let mut conn = self.conn().await.map_err(RewindError::Persistence)?;
+        conn.transaction(async |conn| {
+            // The root thread's id is the session id, so "a user message of this
+            // session's root thread" is the whole check the one client-supplied
+            // identity has to pass.
+            let target_seq: i32 = messages::table
+                .filter(
+                    messages::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(messages::session_id.eq(&self.session_id))
+                        .and(messages::thread_id.eq(&self.session_id))
+                        .and(messages::message_id.eq(target.as_uuid()))
+                        .and(messages::role.eq("user")),
+                )
+                .select(messages::seq)
+                .first(conn)
+                .await
+                .optional()?
+                .ok_or(RewindError::TargetNotFound)?;
+
+            // Every thread sitting at `Generation` is what makes the rest of this
+            // safe: nothing is waiting on a tool result, an approval or a
+            // sub-agent reply, so no queued envelope has anyone expecting it and
+            // the runtime snapshot below can go.
+            let busy: Option<String> = thread_checkpoints::table
+                .filter(
+                    thread_checkpoints::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(thread_checkpoints::session_id.eq(&self.session_id))
+                        .and(
+                            thread_checkpoints::resume_point
+                                .ne(Json(StoredResumePoint::Generation)),
+                        ),
+                )
+                .select(thread_checkpoints::thread_id)
+                .first(conn)
+                .await
+                .optional()?;
+            if let Some(thread_id) = busy {
+                return Err(RewindError::ThreadBusy { thread_id });
+            }
+
+            // A turn is named by the root user message that opened it, and one
+            // submission tags every message it causes in every thread. So the
+            // turns to drop are the ones the root thread carries from the target
+            // on, and dropping them is a single predicate over the whole session
+            // — no walking the call graph.
+            let discarded: Vec<uuid::Uuid> = messages::table
+                .filter(
+                    messages::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(messages::session_id.eq(&self.session_id))
+                        .and(messages::thread_id.eq(&self.session_id))
+                        .and(messages::seq.ge(target_seq)),
+                )
+                .select(messages::turn_id)
+                .distinct()
+                .load(conn)
+                .await?;
+            diesel::delete(
+                messages::table.filter(
+                    messages::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(messages::session_id.eq(&self.session_id))
+                        .and(messages::turn_id.eq_any(discarded)),
+                ),
+            )
+            .execute(conn)
+            .await?;
+
+            // `message_count` is the watermark every later append starts from, so
+            // it has to come down with the messages it counted.
+            let remaining: HashMap<String, (i64, Option<i32>)> = messages::table
+                .filter(
+                    messages::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(messages::session_id.eq(&self.session_id)),
+                )
+                .group_by(messages::thread_id)
+                .select((
+                    messages::thread_id,
+                    diesel::dsl::count_star(),
+                    diesel::dsl::max(messages::seq),
+                ))
+                .load::<(String, i64, Option<i32>)>(conn)
+                .await?
+                .into_iter()
+                .map(|(thread_id, count, max_seq)| (thread_id, (count, max_seq)))
+                .collect();
+
+            let threads: Vec<String> = thread_checkpoints::table
+                .filter(
+                    thread_checkpoints::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(thread_checkpoints::session_id.eq(&self.session_id)),
+                )
+                .select(thread_checkpoints::thread_id)
+                .load(conn)
+                .await?;
+            for thread_id in threads {
+                let Some(&(count, max_seq)) = remaining.get(&thread_id) else {
+                    // A thread with nothing left has nothing to resume from and
+                    // nothing to say. For a stateless thread this is the only
+                    // correct outcome — its id was derived from the assistant
+                    // message that called it, which is now gone, so nothing could
+                    // ever address the row again — and for a stateful one it is
+                    // indistinguishable from keeping an empty row, since a
+                    // missing checkpoint and an empty one restore the same state.
+                    diesel::delete(thread_checkpoints::table.find((
+                        &self.workspace_id,
+                        &self.session_id,
+                        &thread_id,
+                    )))
+                    .execute(conn)
+                    .await?;
+                    continue;
+                };
+                // Turns accumulate in order within a thread, so what was removed
+                // is always a tail and the rest still runs `0..count`. Checking it
+                // here turns a broken invariant into a rolled-back transaction
+                // instead of a history with a hole that every later save appends
+                // past.
+                if max_seq.map(|max_seq| i64::from(max_seq) + 1) != Some(count) {
+                    return Err(RewindError::HistoryNotContiguous { thread_id });
+                }
+                diesel::update(thread_checkpoints::table.find((
+                    &self.workspace_id,
+                    &self.session_id,
+                    &thread_id,
+                )))
+                .set(thread_checkpoints::message_count.eq(count as i32))
+                .execute(conn)
+                .await?;
+            }
+
+            // Whatever the runtime had queued belongs to a turn that just went
+            // away, and the `Generation` check above proved nobody is waiting on
+            // it. Keeping the row would replay it into the rebuilt runtime.
+            diesel::delete(runtime_snapshots::table.find((&self.workspace_id, &self.session_id)))
+                .execute(conn)
+                .await?;
+
+            touch(conn, &self.workspace_id, &self.session_id).await?;
+
+            Ok(messages::table
+                .filter(
+                    messages::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(messages::session_id.eq(&self.session_id))
+                        .and(messages::thread_id.eq(&self.session_id)),
+                )
+                .order(messages::seq)
+                .select(messages::payload)
+                .load::<Json<Message>>(conn)
+                .await?
+                .into_iter()
+                .map(Json::into_inner)
+                .collect())
+        })
+        .await
     }
 }
 
