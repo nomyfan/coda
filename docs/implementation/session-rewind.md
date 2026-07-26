@@ -348,13 +348,18 @@ Composer 的三条规则：
       - 落地：`RewindError` + `PgSessionStorage::rewind_to`（`storage.rs`），事务步骤与设计一一对应。6 个测试：`a_rewind_drops_the_discarded_turn_from_every_thread_it_reached`（三线程两轮次，断言剩余 `(thread, seq)` 全集、两条存活线程的 `message_count`、快照行被清）、`a_rewound_thread_keeps_growing_from_where_it_was_cut`、`rewinding_to_the_opening_message_leaves_no_session_state_behind`、`a_rewind_is_refused_while_any_thread_is_mid_turn`、`only_a_user_message_of_the_root_thread_can_be_rewound_to`、`a_truncation_that_would_leave_a_gap_is_rolled_back`
       - **三条反向验证都跑过**：(1) 把 `message_count` 重置改成自赋值 → 上述第 1、2 条测试同时失败（第 2 条的失败正是设计预测的"追加被静默丢弃"）；(2) 删掉 `runtime_snapshots` 的删除 → 第 1 条失败；(3) 把闲置判据从 `resume_point != Generation` 换成 `pending_approval` 列 → 第 4 条**只在 `ToolExecution` 那次迭代**失败，精确复现 Finding 3。为让第 (3) 条成立，该测试的 fixture 改成 `resume_point` 与 `pending_approval` 两列同写（`save_checkpoint` 就是这么写的），否则两次迭代都会失败、证明不了缺口在哪
       - 偏差：无
-- [ ] [risk validation] 停机屏障与快照清空的时序测试（`hub_tests.rs`）
-      - Purpose: 证伪 Finding 1 与 Finding 2 —— 它们是整个方案形状的依据
-      - 覆盖三个**不同**的窗口：(a) 正常完成后子线程 checkpoint 尚未落库；(b) root 已 `Aborted`、子 agent 尚未发出 `Reply`（这条 Reply 会进 `drained_envelopes`）；(c) 一次旧 abort 的迟到 `Reply` 跨过后续一整个 turn 才被取走
-      - Verification: 三条都得到正确结果；**去掉 `shutdown` 后 (a) 失败，去掉快照清空后 (b) 失败**；(c) 是安全性论证的守卫——它证明依据是 `Generation` 断言而不是时序
-- [ ] [core logic] `SessionCommand::Rewind` / `CommandOutcome` / `SessionOpener::rewind` / `SessionHub::handle_rewind`
-      - Purpose: 把闲置校验、停机、截断、重建、提交串成一个持锁的步骤
-      - Verification: hub 测试——turn 在跑时拒绝；有待审批时拒绝；成功后 `live.snapshot` 等于截断结果且新 turn 已起；截断失败后会话完好如初（快照未变、仍能正常发 task）；**截断成功但重建失败**时答 `OpenFailed`、attach 方收到 `Closed`、entry 被移除；**截断成功但 `send` 失败**时答 `RewindNotStarted`、attach 方**必定**收到 `Closed`、entry 被移除——这条断言的重点是"不依赖偶然断线"：注入 `AgentNotFound`（运行时活得好好的那种失败），确认 `Closed` 仍然发出
+- [x] [risk validation + core logic] 停机屏障、`SessionCommand::Rewind` / `CommandOutcome` / `SessionOpener::rewind` / `SessionHub::handle_rewind`（`hub.rs` + `hub_tests.rs`）
+      - **顺序偏差**：设计把时序测试排在实现之前，但那条测试要驱动 `handle_rewind` 才存在，两步无法真正分开，合成一个 phase 落地
+      - Purpose: 把闲置校验、停机、截断、重建、提交串成一个持锁的步骤，并证伪 Finding 1
+      - 落地：6 个测试——`a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved`（核心）、`a_rewind_replaces_the_discarded_turn_and_reports_what_survived`、`a_rewind_is_refused_while_a_turn_is_in_flight`、`a_rewind_is_refused_while_a_call_waits_on_a_human`、`a_refused_rewind_leaves_the_session_exactly_as_it_was`、`a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_fresh_attach`
+      - **屏障反向验证通过**：去掉 `handle_rewind` 里的 `shutdown`，核心测试以"the sub-agent's late checkpoint must not restore the turn that was discarded"失败。测试用 `SlowStorage` 把 `explore` 线程的 checkpoint 写入延迟 300ms，人为把 Finding 1 描述的窗口拉宽到可测
+      - **该测试第一版是假通过的**（第一次反向验证没能让它失败）：替换轮次瞬时完成，最终断言跑在延迟写入落地**之前**，于是两种实现都读到空历史。加上"睡过延迟窗口再断言"才真正有牙。记在这里是因为这类"因为错误的原因而通过"的测试，看起来和真测试一模一样
+      - 另一个测试基建修正：`session_with_one_turn` 结尾要 `wait_idle`。客户端拿到结算事件**早于** forwarder 更新 entry，直接发命令会撞上 `turn_running` 仍为真
+
+**本阶段推翻的两条设计判断（均由读码/实测得出，设计正文尚未回改）：**
+
+- **`CommandOutcome::RewindNotStarted` 实际上不可从外部构造，因此没有测试。** 设计里"截断成功但 `send` 失败"被当作一条真实故障路径，reviewer 也据此要求断言。但 `AgentRuntime::send_message` 会**先**检查 exit barrier：运行时一旦停止，envelope 被缓冲进 `drained_envelopes` 并返回 `Ok`，而不是报错（`runtime.rs:330-352`）；而 `AgentNotFound` 要求根 agent 未注册，`team.build()` 保证不会发生。所以注入这个故障的尝试失败了（会得到 `TaskAccepted`），测试已删除。分支保留为防御性代码，其恢复路径（`abandon`）由重建失败那条测试覆盖——两条失败共用同一段代码，这正是"只有一套恢复机制"的收益
+- **Finding 2 的场景比设计写的窄得多。** 设计称"abort 后 root 已 `Aborted`、hub 认定 idle，子 agent 的迟到 `Reply` 会进快照"。实测追踪：root 在等子 agent 回复时是**空闲等 envelope**，`Abort` 走 `continue` 分支、**不发** `Aborted` 事件，所以 hub 根本不会认定 idle；随后 explore 的 `Reply` 会被还活着的 root 正常消费（`Generation` 下是 warn + no-op），turn 照常结束。envelope 真正滞留到落库，需要"运行时先于 root 取走它而停止"——rewind 自己的 `shutdown` 正好制造这个条件（barrier 竖起后 `send_message` 转为缓冲），或 `run_agent` 退出时把 inbox 里的残余 drain 进 `agent_drained_envelopes`。**结论不变**（快照必须清），但**必要性**的论证要换成这一条，而**安全性**仍由 `Generation` 断言给出。原计划的 (b)(c) 两个 hub 时序测试因此删除：能确定性构造的那个场景需要一个会挂起的本地工具，hub 测试基建里没有，代价不成比例。快照被清空这件事本身由 `storage_pg` 的核心测试覆盖并已反向验证
 - [ ] [integration] `rewind` RPC：wire 类型、三个错误码、dispatcher 分支（复用 `sanitize_task_images` 与非空校验）
       - Purpose: 打通到协议边界
       - Verification: `cargo clippy` + `cargo test`；参数畸形 / 目标不存在 / 非 live 各自答出正确的码

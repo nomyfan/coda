@@ -27,7 +27,9 @@ use coda_server::{
     },
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
-    storage::{RenameSessionError, SessionModelBinding, WorkspaceStorage, validate_session_id},
+    storage::{
+        RenameSessionError, RewindError, SessionModelBinding, WorkspaceStorage, validate_session_id,
+    },
     transport::{Transport, WebSocketTransport},
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
@@ -256,6 +258,19 @@ impl SessionOpener for AppOpener {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    fn rewind<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        target: coda_core::llm::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self.workspaces.get(&key.0).ok_or_else(|| {
+                RewindError::Persistence(format!("unknown workspace '{}'", key.0))
+            })?;
+            workspace.storage.session(&key.1).rewind_to(target).await
         })
     }
 
