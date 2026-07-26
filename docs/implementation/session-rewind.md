@@ -360,9 +360,11 @@ Composer 的三条规则：
 
 - **`CommandOutcome::RewindNotStarted` 实际上不可从外部构造，因此没有测试。** 设计里"截断成功但 `send` 失败"被当作一条真实故障路径，reviewer 也据此要求断言。但 `AgentRuntime::send_message` 会**先**检查 exit barrier：运行时一旦停止，envelope 被缓冲进 `drained_envelopes` 并返回 `Ok`，而不是报错（`runtime.rs:330-352`）；而 `AgentNotFound` 要求根 agent 未注册，`team.build()` 保证不会发生。所以注入这个故障的尝试失败了（会得到 `TaskAccepted`），测试已删除。分支保留为防御性代码，其恢复路径（`abandon`）由重建失败那条测试覆盖——两条失败共用同一段代码，这正是"只有一套恢复机制"的收益
 - **Finding 2 的场景比设计写的窄得多。** 设计称"abort 后 root 已 `Aborted`、hub 认定 idle，子 agent 的迟到 `Reply` 会进快照"。实测追踪：root 在等子 agent 回复时是**空闲等 envelope**，`Abort` 走 `continue` 分支、**不发** `Aborted` 事件，所以 hub 根本不会认定 idle；随后 explore 的 `Reply` 会被还活着的 root 正常消费（`Generation` 下是 warn + no-op），turn 照常结束。envelope 真正滞留到落库，需要"运行时先于 root 取走它而停止"——rewind 自己的 `shutdown` 正好制造这个条件（barrier 竖起后 `send_message` 转为缓冲），或 `run_agent` 退出时把 inbox 里的残余 drain 进 `agent_drained_envelopes`。**结论不变**（快照必须清），但**必要性**的论证要换成这一条，而**安全性**仍由 `Generation` 断言给出。原计划的 (b)(c) 两个 hub 时序测试因此删除：能确定性构造的那个场景需要一个会挂起的本地工具，hub 测试基建里没有，代价不成比例。快照被清空这件事本身由 `storage_pg` 的核心测试覆盖并已反向验证
-- [ ] [integration] `rewind` RPC：wire 类型、三个错误码、dispatcher 分支（复用 `sanitize_task_images` 与非空校验）
+- [x] [integration] `rewind` RPC：wire 类型、三个错误码、dispatcher 分支（复用 `sanitize_task_images` 与非空校验）
       - Purpose: 打通到协议边界
       - Verification: `cargo clippy` + `cargo test`；参数畸形 / 目标不存在 / 非 live 各自答出正确的码
+      - 落地：`RewindParams` / `RewindAccepted`（`wire.rs`），`SESSION_NOT_IDLE` / `REWIND_TARGET_NOT_FOUND` / `REWIND_FAILED` 三个码按既有分块编号，`handle_rewind` dispatcher 分支。设计只说"复用校验"，实现把 `handle_task` 里那段文本 + 图片校验**提取成 `accept_turn_input`** 由两条路径共用——设计承诺"编辑后的消息与原消息走同一条规则"，抄一遍做不到这个保证，提取出来才做得到
+      - `RewindAccepted` 的 doc 里写明了"客户端必须自己补那条编辑后的消息"，因为事件流不携带 user 消息——这是下一步最容易漏的一点
 - [ ] [web] store：`editing` 状态机（`target` 可空 + `submitting`）、`beginEdit` / `cancelEdit` / `rewindTurn`、纯函数 `discardedFrom` / `applyRewound` / `reconcileEditing`、`TranscriptEntry.messageId`
       - Purpose: 让 rewind 后的前端状态由服务端结果重建，并把"截断已提交但新 turn 没起来"变成状态机里一个有类型的正常位置
       - Verification: `applyRewound` 单测——entries 顺序与新条目的 id/内容/图片、`usage` 重算、`running`、`editing` 被清、`messages` 为空时标题改写；`reconcileEditing` 单测——目标仍在则原样保留、目标消失则 `target` 降级为 `null` 且草稿留存、`submitting` 一律清；`rewindTurn` 单测——提交前把当前输入写回 `editing`；rewind 失败只清 `submitting` 且不动 `target`（这是与 `reconcileEditing` 可交换的前提，值得单独断言）；**`target` 为 `null` 时转调 `startTurn`，成功后 `editing` 被清、失败后草稿留存**；`submitting` 期间的二次提交被丢弃；两次更新（RPC 失败答复 / 重连对账）**任意顺序**到达都收敛到同一状态；`discardedFrom` 单测；`pnpm --filter coda-web lint && test`
