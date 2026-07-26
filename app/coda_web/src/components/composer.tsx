@@ -1,4 +1,4 @@
-import { CircleStop, CornerDownLeft, ImagePlus, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -39,9 +39,11 @@ export const Composer = memo(function Composer({
   sessionHasImages,
   serverUrl,
   workspaceId,
+  editing,
   onSetModel,
   onSend,
   onAbort,
+  onCancelEdit,
 }: {
   status: ConnectionStatus;
   running: boolean;
@@ -65,12 +67,18 @@ export const Composer = memo(function Composer({
   sessionHasImages: boolean;
   serverUrl: string;
   workspaceId: string;
+  /** A historical message pulled back in to be rewritten. The parent remounts
+   * this component whenever it changes, so these are read once as the initial
+   * draft and owned locally from then on. `target === null` means the rewind
+   * already happened and this is now an ordinary draft. */
+  editing?: { target: string | null; text: string; images: string[]; submitting: boolean };
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
+  onCancelEdit: () => void;
 }) {
-  const [task, setTask] = useState("");
-  const [images, setImages] = useState<string[]>([]);
+  const [task, setTask] = useState(editing?.text ?? "");
+  const [images, setImages] = useState<string[]>(editing?.images ?? []);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const layoutGroupId = useId();
   const getImageLayoutId = useCallback(
@@ -89,12 +97,14 @@ export const Composer = memo(function Composer({
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
   const requireImageModel = images.length > 0 || sessionHasImages;
+  const rewriting = editing?.target != null;
   const canSend =
     connected &&
     Boolean(workspace) &&
     !running &&
     !starting &&
     !evicted &&
+    !editing?.submitting &&
     !imagesBlockSend &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
@@ -155,8 +165,14 @@ export const Composer = memo(function Composer({
   function submit() {
     if (!canSend) return;
     onSend(task.trim(), images);
-    setTask("");
-    setImages([]);
+    // While editing, clearing is the parent's job: dropping `editing` changes
+    // our key and remounts us empty. Clearing here too would wipe the draft on
+    // a *failed* submit — the one case where the user needs it back, since the
+    // message it named may already be gone.
+    if (!editing) {
+      setTask("");
+      setImages([]);
+    }
   }
 
   return (
@@ -179,6 +195,26 @@ export const Composer = memo(function Composer({
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
         >
+          {editing && (
+            <div className="mb-1.5 flex items-center gap-2 rounded-md border border-primary/40 bg-primary/5 px-2.5 py-1.5 text-xs">
+              <Pencil className="size-3.5 shrink-0 text-primary" />
+              <span className="min-w-0 flex-1 text-muted-foreground">
+                {rewriting
+                  ? "Editing an earlier message — sending discards everything after it."
+                  : "That message is already gone; sending starts a new turn from here."}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                type="button"
+                className="h-6 px-2"
+                disabled={editing.submitting}
+                onClick={onCancelEdit}
+              >
+                Cancel
+              </Button>
+            </div>
+          )}
           {images.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-2">
               {images.map((src, index) => (
@@ -218,6 +254,10 @@ export const Composer = memo(function Composer({
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 submit();
+              }
+              if (event.key === "Escape" && editing && !editing.submitting) {
+                event.preventDefault();
+                onCancelEdit();
               }
             }}
             onPaste={handlePaste}

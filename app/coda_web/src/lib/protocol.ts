@@ -146,13 +146,22 @@ export const RpcCode = {
   MODEL_SWITCH_WHILE_RUNNING: -32004,
   /** `set_model`: an opened session cannot change provider/model. */
   MODEL_LOCKED: -32005,
+  /** `rewind`: a turn is in flight, or a call is waiting on a human. */
+  SESSION_NOT_IDLE: -32006,
   UNKNOWN_WORKSPACE: -32010,
   INVALID_SESSION_ID: -32011,
   INVALID_MODEL_SELECTION: -32012,
   SESSION_NOT_FOUND: -32013,
+  /** `rewind`: the target is not a user message of this session's root thread —
+   * including one an earlier rewind already discarded. */
+  REWIND_TARGET_NOT_FOUND: -32014,
   OPEN_FAILED: -32020,
   DELETE_FAILED: -32021,
   RENAME_FAILED: -32022,
+  /** `rewind`: it did not complete. This does not say whether the truncation
+   * committed — when it did, a `Closed` push follows and the re-attach carries
+   * the authoritative history. */
+  REWIND_FAILED: -32023,
   ALLOW_PATTERN_FAILED: -32030,
 } as const;
 
@@ -238,6 +247,20 @@ export type RpcRequests = {
       images?: string[];
     },
     { message_id: string }
+  >;
+  /** Discard `message_id` and everything the session produced from it onward,
+   * then start a turn from the edited text. Answers with the id minted for that
+   * text and the history that survived — *without* it, since the event stream
+   * never carries user messages and the client appends that one itself. */
+  rewind: RpcRequest<
+    {
+      workspace_id: string;
+      session_id: string;
+      message_id: string;
+      task: string;
+      images?: string[];
+    },
+    { message_id: string; messages: HistoryMessage[] }
   >;
 };
 

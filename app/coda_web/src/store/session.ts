@@ -43,6 +43,10 @@ export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | 
 export type TranscriptEntry = {
   id: string;
   kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
+  /** The server's id for a user message. Only user entries have one, and only
+   * once the server has acknowledged them — which is exactly the condition for
+   * being able to rewind to it. */
+  messageId?: string;
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -107,6 +111,19 @@ export type OpenedSession = {
   draft?: boolean;
   /** First user task, used as the session list title before the server persists it. */
   firstUserMessage?: string;
+  /** A historical message pulled back into the composer to be rewritten.
+   *
+   * `target` is the message a submit would rewind to; `null` means the
+   * truncation already happened but the turn that should have replaced it did
+   * not start, so this is now just a draft and the next submit is an ordinary
+   * task. `text`/`images` are authoritative, not a seed: they are rewritten
+   * from the composer on every submit so the draft survives a remount. */
+  editing?: {
+    target: string | null;
+    text: string;
+    images: string[];
+    submitting: boolean;
+  };
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
@@ -316,6 +333,7 @@ function historyToEntries(
     return [
       {
         id: userEntryId(message.User.message_id),
+        messageId: message.User.message_id,
         kind: "user",
         content: textContent,
         images: images.length > 0 ? images : undefined,
@@ -808,6 +826,33 @@ function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, 
   });
 }
 
+/** Replace a session's title in the catalog.
+ *
+ * `upsertCatalogTitled` only fills a gap the server has not answered yet, which
+ * is right for an optimistic first turn but wrong after a rewind past the
+ * opening message: the message the server derived its title from is the one
+ * that just went away, so ours is the current answer and theirs is the stale
+ * one. */
+function retitleCatalogSession(
+  catalog: WorkspaceSummary[],
+  workspaceId: string,
+  sessionId: string,
+  title: string,
+): WorkspaceSummary[] {
+  return catalog.map((workspace) =>
+    workspace.id !== workspaceId
+      ? workspace
+      : {
+          ...workspace,
+          sessions: workspace.sessions.map((session) =>
+            session.id === sessionId
+              ? { ...session, first_user_message: title, updated_at_ms: Date.now() }
+              : session,
+          ),
+        },
+  );
+}
+
 /** Insert (or title) a session in the catalog so the list shows its name right away. */
 function upsertCatalogTitled(
   catalog: WorkspaceSummary[],
@@ -1183,6 +1228,7 @@ function applySnapshot(
     session.approvals = approvals;
     session.running = turnRunning;
     session.evicted = false;
+    session.editing = reconcileEditing(session.editing, messages);
     if (hasHistory || replaceEmpty) {
       session.entries = mapped;
       session.drafts = {};
@@ -1286,6 +1332,87 @@ function userEntryId(messageId: string) {
   return `user:${messageId}`;
 }
 
+/** Where a rewind would cut: the index of the entry for `messageId`, or
+ * `undefined` when the transcript no longer holds it. Entries are appended in
+ * order, so everything from that index on is what the rewind discards. */
+export function discardedFrom(entries: TranscriptEntry[], messageId: string): number | undefined {
+  const index = entries.findIndex((entry) => entry.messageId === messageId);
+  return index === -1 ? undefined : index;
+}
+
+/** The whole state transition a successful rewind performs.
+ *
+ * The edited message is appended here rather than waited for: the event stream
+ * never carries user messages, so a client that applied only the surviving
+ * history would show the assistant's reply hanging off the old conversation
+ * with nothing to explain it. Usage is recomputed for the same reason a
+ * snapshot recomputes it — the figure shown is the last assistant message's
+ * running total, and the discarded ones have to stop counting. */
+export function applyRewound(
+  session: OpenedSession,
+  payload: { messages: HistoryMessage[]; messageId: string; text: string; images: string[] },
+): OpenedSession {
+  const argsById = collectToolArgs(payload.messages);
+  const entries = payload.messages.flatMap((message) => historyToEntries(message, argsById));
+  entries.push({
+    id: userEntryId(payload.messageId),
+    messageId: payload.messageId,
+    kind: "user",
+    content: payload.text,
+    images: payload.images.length > 0 ? payload.images : undefined,
+    startedAt: new Date().toISOString(),
+  });
+  return {
+    ...session,
+    entries,
+    usage: historyUsage(payload.messages),
+    approvals: [],
+    drafts: {},
+    allowDrafts: {},
+    pendingCallInfo: {},
+    running: true,
+    // Cleared only here and in `rewindTurn`'s orphan branch — that is what takes
+    // the composer out of edit mode, and emptying it is a side effect of the
+    // remount that follows.
+    editing: undefined,
+    // Rewinding past the opening message makes the edited text the session's
+    // first, which is the title the session list shows.
+    firstUserMessage:
+      payload.messages.length === 0 ? payload.text || IMAGE_ONLY_TITLE : session.firstUserMessage,
+  };
+}
+
+/** Reconcile an edit in progress against a fresh snapshot.
+ *
+ * Whether a rewind's truncation committed is something only the server knows,
+ * and the single fact the client can check is whether the target survived. If
+ * it did, nothing was discarded and the edit stands. If it did not, the history
+ * already stops at the rewind point, so the draft stays but stops naming a
+ * message — and the next submit is an ordinary task, which against that history
+ * produces exactly what the user asked for.
+ *
+ * There is deliberately no third branch for "the reply was lost but the turn
+ * did start". The id of that turn's message came back on the very reply that
+ * was lost, so the client cannot recognise it; and it does not need to, because
+ * a turn in flight leaves `running` set, which closes the composer. */
+export function reconcileEditing(
+  editing: OpenedSession["editing"],
+  messages: HistoryMessage[],
+): OpenedSession["editing"] {
+  if (!editing) {
+    return undefined;
+  }
+  // Whatever request this belonged to went down with the connection.
+  const settled = { ...editing, submitting: false };
+  if (settled.target === null) {
+    return settled;
+  }
+  const survived = messages.some(
+    (message) => "User" in message && message.User.message_id === settled.target,
+  );
+  return survived ? settled : { ...settled, target: null };
+}
+
 /** Render the user's message immediately, returning the id of the entry created
  * so the caller can reconcile it once the server answers with the real one. */
 function appendUserMessage(
@@ -1332,11 +1459,12 @@ function appendUserMessage(
 /** Re-key an optimistic user entry onto the id derived from the server's
  * `message_id`, so it matches the key the same message gets when replayed from
  * history. */
-function adoptServerMessageId(server: string, key: SessionKey, entryId: string, settledId: string) {
+function adoptServerMessageId(server: string, key: SessionKey, entryId: string, messageId: string) {
   updateState(codaStore, (state) => {
     const entry = draftSession(state, server, key)?.entries.find((e) => e.id === entryId);
     if (entry) {
-      entry.id = settledId;
+      entry.id = userEntryId(messageId);
+      entry.messageId = messageId;
     }
   });
 }
@@ -1381,7 +1509,7 @@ async function startTurn(
       task: text,
       images: images.length > 0 ? images : undefined,
     });
-    adoptServerMessageId(server, key, entryId, userEntryId(message_id));
+    adoptServerMessageId(server, key, entryId, message_id);
     return true;
   } catch (err) {
     discardOptimisticTask(server, key, entryId);
@@ -2054,6 +2182,168 @@ export async function sendTaskToNewSession(
   await startTurn(server, workspace, sessionId, text, images);
 }
 
+/** Pull a historical message back into the composer to be rewritten. Only from
+ * a session at rest: a rewind discards messages, and everything the session has
+ * in flight is downstream of what would go. */
+export function beginEdit(messageId: string) {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  const { server, session } = active;
+  if (session.running || session.starting || session.evicted || session.deleting) {
+    return;
+  }
+  if (session.approvals.length > 0 || session.editing?.submitting) {
+    return;
+  }
+  const entry = session.entries.find((item) => item.messageId === messageId);
+  if (!entry) {
+    return;
+  }
+  const key = sessionKey(session.workspaceId, session.sessionId);
+  updateState(codaStore, (state) => {
+    const draft = draftSession(state, server, key);
+    if (draft) {
+      draft.editing = {
+        target: messageId,
+        text: entry.content,
+        images: entry.images ?? [],
+        submitting: false,
+      };
+    }
+  });
+}
+
+export function cancelEdit() {
+  const active = currentActive();
+  if (!active || active.session.editing?.submitting) {
+    return;
+  }
+  const { server, session } = active;
+  const key = sessionKey(session.workspaceId, session.sessionId);
+  updateState(codaStore, (state) => {
+    const draft = draftSession(state, server, key);
+    if (draft) {
+      draft.editing = undefined;
+    }
+  });
+}
+
+/** Submit whatever is in the composer while an edit is open.
+ *
+ * Owns the whole lifecycle for both branches, because clearing `editing` is the
+ * only thing that takes the composer out of edit mode and nothing else knows to
+ * do it: `applyRewound` covers the rewind branch, and the orphan branch has to
+ * clear it here — `startTurn` has never heard of edit mode. Miss either and the
+ * message goes out while its text stays in the box, ready to be sent again. */
+export async function rewindTurn(task: string, images: string[] = []) {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  const { server, session } = active;
+  const editing = session.editing;
+  if (!editing || editing.submitting) {
+    return;
+  }
+  const text = task.trim();
+  if (!text && images.length === 0) {
+    return;
+  }
+  const { workspaceId, sessionId } = session;
+  const key = sessionKey(workspaceId, sessionId);
+  // Write the input back before sending. From here `editing` holds the draft,
+  // not the seed it started as, so the composer can be remounted — by the
+  // orphan downgrade below, or by anything else — and come back with what the
+  // user actually typed.
+  updateState(codaStore, (state) => {
+    const draft = draftSession(state, server, key);
+    if (draft?.editing) {
+      draft.editing.text = text;
+      draft.editing.images = images;
+      draft.editing.submitting = true;
+    }
+  });
+
+  if (editing.target === null) {
+    // The history already stops at the rewind point, so this is a plain turn.
+    const started = await startTurn(server, workspaceId, sessionId, text, images);
+    updateState(codaStore, (state) => {
+      const draft = draftSession(state, server, key);
+      if (!draft?.editing) {
+        return;
+      }
+      if (started) {
+        draft.editing = undefined;
+      } else {
+        draft.editing.submitting = false;
+      }
+    });
+    return;
+  }
+
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    updateState(codaStore, (state) => {
+      const draft = draftSession(state, server, key);
+      if (draft?.editing) {
+        draft.editing.submitting = false;
+      }
+    });
+    return;
+  }
+  try {
+    const { message_id, messages } = await rpc.request("rewind", {
+      workspace_id: workspaceId,
+      session_id: sessionId,
+      message_id: editing.target,
+      task: text,
+      images: images.length > 0 ? images : undefined,
+    });
+    updateState(codaStore, (state) => {
+      const current = state.servers[server];
+      const draft = draftSession(state, server, key);
+      if (!current || !draft) {
+        return;
+      }
+      current.sessions[key] = applyRewound(draft, {
+        messages,
+        messageId: message_id,
+        text,
+        images,
+      });
+      if (messages.length === 0) {
+        // Nothing survived, so the edited message is the session's first — and
+        // the title the list shows has to follow it.
+        current.catalog = retitleCatalogSession(
+          current.catalog,
+          workspaceId,
+          sessionId,
+          text || IMAGE_ONLY_TITLE,
+        );
+      }
+    });
+  } catch (err) {
+    // Only `submitting` moves. When the truncation had already committed the
+    // server also pushes `Closed`, and the re-attach that follows runs
+    // `reconcileEditing`; the two updates arrive in either order and commute
+    // precisely because this one leaves `target` alone.
+    updateState(codaStore, (state) => {
+      const draft = draftSession(state, server, key);
+      if (draft?.editing) {
+        draft.editing.submitting = false;
+      }
+    });
+    addSessionActivity(server, workspaceId, sessionId, {
+      tone: "danger",
+      label: "rewind rejected",
+      detail: isServerError(err) ? err.message : "Connection lost before the session was rewound",
+    });
+  }
+}
+
 export function abort() {
   const active = currentActive();
   if (active) {
@@ -2341,6 +2631,23 @@ export const selectActiveProviderId = (state: CodaStoreState) => activeSessionOf
 export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
 const EMPTY_USAGE: UsageRecord[] = [];
+export const selectActiveEditing = (state: CodaStoreState) => activeSessionOf(state)?.editing;
+/** Whether a message can be pulled back in to be rewritten. Mirrors the
+ * server's own precondition, so the entry point is only offered when the
+ * request would actually be accepted. */
+export const selectCanRewind = (state: CodaStoreState): boolean => {
+  const session = activeSessionOf(state);
+  return (
+    !!session &&
+    selectActiveStatus(state) === "connected" &&
+    !session.running &&
+    !session.starting &&
+    !session.evicted &&
+    !session.deleting &&
+    session.approvals.length === 0 &&
+    !session.editing?.submitting
+  );
+};
 export const selectActiveUsage = (state: CodaStoreState) =>
   activeSessionOf(state)?.usage ?? EMPTY_USAGE;
 

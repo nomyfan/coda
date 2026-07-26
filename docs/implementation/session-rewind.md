@@ -365,9 +365,13 @@ Composer 的三条规则：
       - Verification: `cargo clippy` + `cargo test`；参数畸形 / 目标不存在 / 非 live 各自答出正确的码
       - 落地：`RewindParams` / `RewindAccepted`（`wire.rs`），`SESSION_NOT_IDLE` / `REWIND_TARGET_NOT_FOUND` / `REWIND_FAILED` 三个码按既有分块编号，`handle_rewind` dispatcher 分支。设计只说"复用校验"，实现把 `handle_task` 里那段文本 + 图片校验**提取成 `accept_turn_input`** 由两条路径共用——设计承诺"编辑后的消息与原消息走同一条规则"，抄一遍做不到这个保证，提取出来才做得到
       - `RewindAccepted` 的 doc 里写明了"客户端必须自己补那条编辑后的消息"，因为事件流不携带 user 消息——这是下一步最容易漏的一点
-- [ ] [web] store：`editing` 状态机（`target` 可空 + `submitting`）、`beginEdit` / `cancelEdit` / `rewindTurn`、纯函数 `discardedFrom` / `applyRewound` / `reconcileEditing`、`TranscriptEntry.messageId`
+- [x] [web] store：`editing` 状态机（`target` 可空 + `submitting`）、`beginEdit` / `cancelEdit` / `rewindTurn`、纯函数 `discardedFrom` / `applyRewound` / `reconcileEditing`、`TranscriptEntry.messageId`
       - Purpose: 让 rewind 后的前端状态由服务端结果重建，并把"截断已提交但新 turn 没起来"变成状态机里一个有类型的正常位置
       - Verification: `applyRewound` 单测——entries 顺序与新条目的 id/内容/图片、`usage` 重算、`running`、`editing` 被清、`messages` 为空时标题改写；`reconcileEditing` 单测——目标仍在则原样保留、目标消失则 `target` 降级为 `null` 且草稿留存、`submitting` 一律清；`rewindTurn` 单测——提交前把当前输入写回 `editing`；rewind 失败只清 `submitting` 且不动 `target`（这是与 `reconcileEditing` 可交换的前提，值得单独断言）；**`target` 为 `null` 时转调 `startTurn`，成功后 `editing` 被清、失败后草稿留存**；`submitting` 期间的二次提交被丢弃；两次更新（RPC 失败答复 / 重连对账）**任意顺序**到达都收敛到同一状态；`discardedFrom` 单测；`pnpm --filter coda-web lint && test`
-- [ ] [web] UI：user 气泡的编辑入口（闲置且非 `submitting` 时可用）、编辑期间待丢弃区段标灰（仅 `target != null`）、composer 编辑横幅 + 取消（Esc）+ keyed 重挂载 + **编辑模式提交后不清空本地状态**
+- [x] [web] UI：user 气泡的编辑入口（闲置且非 `submitting` 时可用）、编辑期间待丢弃区段标灰（仅 `target != null`）、composer 编辑横幅 + 取消（Esc）+ keyed 重挂载 + **编辑模式提交后不清空本地状态**
       - Purpose: 让"提交即确认"在界面上自明，并让失败后的重试是零操作成本的
       - Verification: 手工走一遍——编辑一条带图片的中段消息，确认图片被带回 composer 且可逐张删除；确认待丢弃区段可见；提交后 transcript 从该点重建并立刻开跑；取消后一切复原；**构造一次截断后失败（在 opener 里注入重建失败），确认重连后历史停在回退点、输入框内容仍在、且此时按发送走的是普通 `task` 并得到正确结果**；请求在途期间连按两次发送只产生一个请求
+
+      - 落地（两个 web 步骤）：`test/rewind.test.ts` 6 条覆盖三个纯函数。**反向验证**：删掉 `applyRewound` 里追加编辑后消息的那几行，两条测试立刻失败（`['first','ok']` 少了 `'rewritten'`）——这正是 reviewer 指出的那个失败模式
+      - **实测发现并修掉的一个 bug**：`upsertCatalogTitled` 用的是 `first_user_message ?? title`，只填空缺、从不覆盖。这对乐观首轮是对的（别覆盖服务端标题），但 rewind 到首条消息时首消息真的变了，服务端那份才是过期的——侧边栏会一直显示被删掉的旧标题。新增 `retitleCatalogSession` 明确表达"这次我们的答案才是权威的"
+      - **端到端验证**（本地 stub 的 OpenAI 兼容端点 + `coda_test` 库，没有调用真实模型、没有碰真实数据库）：两轮会话 → 编辑第一条 → 目标及其之后全部变灰、横幅提示后果 → 改写提交 → 旧的两轮消失、新 turn 立即执行；**刷新后侧边栏标题由服务端从数据库重新派生为改写后的内容，冷打开会话只剩改写后的那一轮**——这是截断真的落库、而不只是前端隐藏的独立证据。取消路径也验过（横幅、变灰、草稿全部复原）。控制台与服务端日志无错误

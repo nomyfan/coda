@@ -9,6 +9,7 @@ import {
   selectActiveProviderId,
   selectActiveProviders,
   selectActiveReasoningEffort,
+  selectActiveEditing,
   selectActiveRunning,
   selectActiveServer,
   selectActiveSessionTitle,
@@ -17,6 +18,8 @@ import {
   selectActiveUsage,
   selectActiveWorkspace,
   selectServerSummaries,
+  cancelEdit,
+  rewindTurn,
   sendTask,
   sendTaskToNewSession,
   setModel,
@@ -202,6 +205,7 @@ export default function App() {
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
+  const activeEditing = useCodaStore(selectActiveEditing);
   const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
   const activeProviders = useCodaStore(selectActiveProviders);
@@ -338,9 +342,15 @@ export default function App() {
         clearNewSessionTarget();
         return;
       }
+      // While a message is being rewritten the composer is that message's
+      // editor, so its submit rewinds instead of appending.
+      if (activeEditing) {
+        rewindTurn(task, images);
+        return;
+      }
       sendTask(task, images);
     },
-    [selectedNewSessionModel],
+    [selectedNewSessionModel, activeEditing],
   );
 
   const handleSetNewSessionModel = useCallback(
@@ -390,6 +400,10 @@ export default function App() {
               )}
               {showComposer ? (
                 <Composer
+                  // Remounting on every change of edit target is what seeds the
+                  // draft without a sync effect: entering an edit loads that
+                  // message, leaving one empties the box.
+                  key={activeEditing ? `edit:${activeEditing.target ?? "orphan"}` : "new"}
                   status={
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
@@ -413,9 +427,11 @@ export default function App() {
                   sessionHasImages={showingNewSession ? false : activeHasImages}
                   serverUrl={selectedServerUrl}
                   workspaceId={selectedWorkspace ?? ""}
+                  editing={showingNewSession ? undefined : activeEditing}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
                   onSend={handleSend}
                   onAbort={abort}
+                  onCancelEdit={cancelEdit}
                 />
               ) : null}
             </div>
