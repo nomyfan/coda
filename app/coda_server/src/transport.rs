@@ -7,6 +7,12 @@
 //! classification lives there, not here (this layer must not silently drop a bad
 //! frame the way a typed decode would). Today the wire is WebSocket; a future
 //! Unix-domain-socket transport can plug in by implementing this trait.
+//!
+//! Keepalive is deliberately *not* part of the trait: it is a property of one
+//! particular wire rather than of the abstraction (a Unix socket has no such
+//! concept). [`WebSocketTransport`] drives its own heartbeat from inside `recv`
+//! instead, so neither the `rpc` layer nor the connection loop ever sees a
+//! control frame.
 
 use crate::rpc::RpcOutgoing;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
@@ -16,7 +22,18 @@ use serde::Serialize;
 use std::fmt::Debug;
 use std::future::Future;
 use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::warn;
+
+/// How often an idle connection emits a Ping. Proxies and load balancers drop
+/// idle WebSockets after a minute or so, and a connection whose turn has
+/// finished carries no traffic at all until the user acts again.
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+
+/// How long the peer may go completely silent before the connection is treated
+/// as dead. Three periods, so one dropped Pong doesn't tear down a healthy
+/// connection.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A bidirectional, text-framed channel to the peer.
 ///
@@ -26,6 +43,10 @@ pub trait Transport {
     /// The next inbound frame's raw text, or `None` once the connection is
     /// closed. Non-data frames (ping/pong/binary) are skipped internally;
     /// malformed *content* is handed up verbatim for the `rpc` layer to classify.
+    ///
+    /// `None` means "this connection is over": the peer closed it, it errored,
+    /// or the transport gave up on a peer that stopped answering. Callers treat
+    /// all three alike, so the distinction is not surfaced.
     fn recv(&self) -> impl Future<Output = Option<String>> + Send;
 
     /// Send a built envelope. Returns `false` once the frame cannot be delivered
@@ -33,34 +54,100 @@ pub trait Transport {
     fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send;
 }
 
+/// Everything `recv` touches, behind one lock: the read half plus the heartbeat
+/// state it drives.
+struct Reader {
+    stream: SplitStream<WebSocket>,
+    /// Fires every [`HEARTBEAT_PERIOD`]. It is held here rather than created
+    /// inside `recv` because the caller's `select!` drops the `recv` future
+    /// whenever another branch wins; a per-call timer would restart from zero
+    /// each time and, on a connection with steady event traffic, never fire.
+    ticker: Interval,
+    /// When the peer last proved it was alive. *Any* inbound frame counts — a
+    /// Pong, but equally a request the client sent on its own.
+    last_seen: Instant,
+}
+
 /// [`Transport`] over an axum WebSocket (server side). The split halves are each
 /// behind their own mutex so reads and writes proceed independently.
 pub struct WebSocketTransport {
     sink: Mutex<SplitSink<WebSocket, AxumMessage>>,
-    stream: Mutex<SplitStream<WebSocket>>,
+    reader: Mutex<Reader>,
 }
 
 impl WebSocketTransport {
     pub fn new(socket: WebSocket) -> Self {
         let (sink, stream) = socket.split();
+        // `interval` fires its first tick immediately, which would ping a
+        // connection that just opened; start one period out instead. `Delay`
+        // keeps missed ticks from piling up into a burst if `recv` goes
+        // unpolled while the caller handles a slow frame.
+        let mut ticker = interval_at(Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             sink: Mutex::new(sink),
-            stream: Mutex::new(stream),
+            reader: Mutex::new(Reader {
+                stream,
+                ticker,
+                last_seen: Instant::now(),
+            }),
+        }
+    }
+
+    /// Send a protocol-level Ping. Fire-and-forget: the Pong comes back through
+    /// `recv` (browsers answer automatically, with no client-side code), and
+    /// nothing here waits for it. `false` means the frame could not be delivered
+    /// and the caller should tear down, same as [`Transport::send`].
+    async fn ping(&self) -> bool {
+        let mut sink = self.sink.lock().await;
+        match sink.send(AxumMessage::Ping(Default::default())).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("websocket ping error: {e:?}");
+                false
+            }
         }
     }
 }
 
 impl Transport for WebSocketTransport {
     async fn recv(&self) -> Option<String> {
-        let mut stream = self.stream.lock().await;
+        let mut reader = self.reader.lock().await;
+        let Reader {
+            stream,
+            ticker,
+            last_seen,
+        } = &mut *reader;
         loop {
-            match stream.next().await {
-                Some(Ok(AxumMessage::Text(text))) => return Some(text.to_string()),
-                Some(Ok(AxumMessage::Close(_))) | None => return None,
-                Some(Ok(_)) => {} // ping/pong/binary: ignore
-                Some(Err(e)) => {
-                    warn!("websocket read error: {e}");
-                    return None;
+            tokio::select! {
+                frame = stream.next() => match frame {
+                    Some(Ok(AxumMessage::Text(text))) => {
+                        *last_seen = Instant::now();
+                        return Some(text.to_string());
+                    }
+                    Some(Ok(AxumMessage::Close(_))) | None => return None,
+                    // ping/pong/binary carry nothing to hand up, but they do
+                    // prove the peer is there. An *inbound* Ping is answered
+                    // with a Pong by the underlying tungstenite stream when it
+                    // is polled, not by anything here.
+                    Some(Ok(_)) => *last_seen = Instant::now(),
+                    Some(Err(e)) => {
+                        warn!("websocket read error: {e}");
+                        return None;
+                    }
+                },
+                _ = ticker.tick() => {
+                    if last_seen.elapsed() > HEARTBEAT_TIMEOUT {
+                        warn!("websocket heartbeat timed out; closing connection");
+                        return None;
+                    }
+                    // Takes the sink lock while holding the reader lock. That
+                    // order is only ever reader → sink (`send` takes the sink
+                    // on its own), so it cannot deadlock; a concurrent `send`
+                    // merely stalls this ping, and the next read with it.
+                    if !self.ping().await {
+                        return None;
+                    }
                 }
             }
         }
