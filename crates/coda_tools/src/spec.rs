@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
+use crate::locks::KeyedLock;
 use crate::todo::TodoItem;
 use crate::{
     EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
@@ -15,14 +16,22 @@ use crate::{
 #[derive(Clone)]
 pub struct BuildContext {
     pub workspace_dir: String,
+    /// Per-agent: each agent keeps its own todo list.
     pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
+    /// The opposite of `todo_store`: shared by *every* agent and session in the
+    /// process, or the file tools serialize against registries nobody else
+    /// consults and exclude nothing. Defaults to [`shared_file_locks`].
+    pub file_locks: Arc<KeyedLock<String>>,
 }
 
 impl BuildContext {
+    /// A standalone context: its own todo list, and — on purpose — the
+    /// process-wide file lock registry.
     pub fn new(workspace_dir: impl Into<String>) -> Self {
         BuildContext {
             workspace_dir: workspace_dir.into(),
             todo_store: Arc::new(Mutex::new(Vec::new())),
+            file_locks: crate::locks::shared_file_locks(),
         }
     }
 }
@@ -69,8 +78,10 @@ impl ToolSpec for WriteFileToolSpec {
     fn name(&self) -> &str {
         "write_file"
     }
-    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(WriteFileTool::new()))
+    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(WriteFileTool::new(
+            ctx.file_locks.clone(),
+        )))
     }
 }
 
@@ -80,8 +91,8 @@ impl ToolSpec for EditFileToolSpec {
     fn name(&self) -> &str {
         "edit_file"
     }
-    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(EditFileTool::new()))
+    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(EditFileTool::new(ctx.file_locks.clone())))
     }
 }
 

@@ -787,7 +787,7 @@ where
     ) -> Self {
         let agents = AgentTeam::new(root, subagents)
             .expect("valid team")
-            .build(".");
+            .build(".", coda_tools::shared_file_locks());
         Self::start_agents(storage, agents, provider, approval, initial_task).await
     }
 
@@ -910,7 +910,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         vec![],
     )
     .expect("valid team")
-    .build(".");
+    .build(".", coda_tools::shared_file_locks());
 
     let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
@@ -1264,7 +1264,7 @@ async fn preempted_calls_are_written_off_under_the_turn_they_belonged_to() {
     .expect("valid team");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build("."),
+        team.build(".", coda_tools::shared_file_locks()),
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
         "phase1",
@@ -1532,7 +1532,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     let team = AgentTeam::new(root, subagents).expect("valid team");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build("."),
+        team.build(".", coda_tools::shared_file_locks()),
         provider.clone(),
         approval.clone(),
         "inspect",
@@ -1559,7 +1559,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
 
     let mut harness = harness
         .restart(
-            team.build("."),
+            team.build(".", coda_tools::shared_file_locks()),
             provider,
             approval,
             HashMap::from([(
@@ -1601,7 +1601,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let (root, subagents) = explore_read_todos_specs("main-system");
     let team = AgentTeam::new(root, subagents).expect("valid team");
-    let agents1 = team.build(".");
+    let agents1 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1641,7 +1641,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
             resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         },
     );
-    let agents2 = team.build(".");
+    let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
         .restart(agents2, provider, approval, decisions)
         .await;
@@ -1698,7 +1698,7 @@ async fn pending_approval_supports_mixed_resolutions() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1747,7 +1747,7 @@ async fn pending_approval_supports_mixed_resolutions() {
         result.expect("timed out waiting for suspension")
     };
     harness.shutdown().await;
-    let agents2 = team.build(".");
+    let agents2 = team.build(".", coda_tools::shared_file_locks());
     harness = harness
         .restart(agents2, provider, approval, decisions_map)
         .await;
@@ -1794,7 +1794,7 @@ async fn reject_pending_approval_via_restart() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1841,7 +1841,7 @@ async fn reject_pending_approval_via_restart() {
                 .collect(),
         },
     );
-    let agents2 = team.build(".");
+    let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
         .restart(agents2, provider, approval, reject_decisions)
         .await;
@@ -1882,7 +1882,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".");
+    let agents1 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -1906,7 +1906,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     };
     harness.shutdown().await;
 
-    let agents2 = team.build(".");
+    let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
         .restart(agents2, provider, approval, HashMap::new())
         .await;
@@ -1946,7 +1946,7 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build("."),
+        team.build(".", coda_tools::shared_file_locks()),
         provider.clone(),
         approval.clone(),
         "inspect todos",
@@ -1973,7 +1973,12 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     )]
     .into();
     let mut harness = harness
-        .restart(team.build("."), provider, approval, decisions)
+        .restart(
+            team.build(".", coda_tools::shared_file_locks()),
+            provider,
+            approval,
+            decisions,
+        )
         .await;
 
     timeout(Duration::from_secs(2), async {
@@ -2476,7 +2481,7 @@ async fn new_task_while_suspended_emits_tool_call_end_for_discarded_calls() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents = team.build(".");
+    let agents = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,
@@ -2548,7 +2553,7 @@ async fn in_process_resume_after_suspension() {
     let provider = TestProvider::default();
     let approval =
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
-    let agents = team.build(".");
+    let agents = team.build(".", coda_tools::shared_file_locks());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,

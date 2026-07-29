@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_tools::{BuildContext, TodoItem, ToolSpec};
+use coda_tools::{BuildContext, KeyedLock, TodoItem, ToolSpec};
 
 use crate::agent::{
     Agent, AgentState, SUBAGENT_TOOL_PREFIX, SubAgentMode, SubAgentTool, SystemPrompt,
@@ -208,7 +208,16 @@ impl AgentTeam {
     /// the resulting flat map, so building never recurses. Infallible — the team
     /// was validated at construction. Call once per session: the returned agents
     /// carry independent state.
-    pub fn build(&self, default_workspace: &str) -> HashMap<String, Agent> {
+    ///
+    /// `file_locks` is the deliberate exception to "independent state": the
+    /// same registry must reach every call in the process, or concurrent
+    /// `edit_file`s from sibling agents or from two sessions over one workspace
+    /// clobber each other.
+    pub fn build(
+        &self,
+        default_workspace: &str,
+        file_locks: Arc<KeyedLock<String>>,
+    ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
 
@@ -228,6 +237,7 @@ impl AgentTeam {
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 todo_store: todo_store.clone(),
+                file_locks: file_locks.clone(),
             };
 
             let mut agent = Agent {
@@ -332,7 +342,7 @@ mod tests {
             .unwrap()
             .with_agent_workspaces(HashMap::from([("sub".to_string(), "/sub".to_string())]));
 
-        team.build("/root");
+        team.build("/root", coda_tools::shared_file_locks());
 
         let mut got = seen.lock().unwrap().clone();
         got.sort();

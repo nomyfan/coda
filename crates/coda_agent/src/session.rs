@@ -17,6 +17,7 @@ use crate::{
     ToolCallResolution,
 };
 use coda_core::llm::{LLMProvider, Message, MessageId};
+use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,6 +158,7 @@ pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
     run_config: Option<RunConfig<P>>,
     session_id: Option<String>,
     resume_decisions: HashMap<String, ResumeDecision>,
+    file_locks: Option<Arc<KeyedLock<String>>>,
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
@@ -167,6 +169,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
             run_config: None,
             session_id: None,
             resume_decisions: HashMap::new(),
+            file_locks: None,
         }
     }
 }
@@ -192,6 +195,15 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
 
     pub fn run_config(mut self, config: RunConfig<P>) -> Self {
         self.run_config = Some(config);
+        self
+    }
+
+    /// Registry the file tools serialize writes on. Defaults to the
+    /// process-wide [`coda_tools::shared_file_locks`], which is what keeps two
+    /// sessions over one workspace from clobbering each other's edits. Override
+    /// only to isolate sessions on purpose — tests, mainly.
+    pub fn file_locks(mut self, locks: Arc<KeyedLock<String>>) -> Self {
+        self.file_locks = Some(locks);
         self
     }
 
@@ -225,7 +237,11 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .ok_or(OpenError::MissingField("run_config"))?;
 
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
-        let agents = team.build(&workspace_dir);
+        let file_locks = self
+            .file_locks
+            .take()
+            .unwrap_or_else(coda_tools::shared_file_locks);
+        let agents = team.build(&workspace_dir, file_locks);
         let root_name = team.root().name.to_string();
 
         let session_id = self

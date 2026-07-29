@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 
+use crate::locks::KeyedLock;
 use crate::process::{CommandOutcome, run_command};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -13,6 +15,48 @@ use tracing::debug;
 /// multi-megabyte lockfiles fit comfortably; anything bigger is better served
 /// by grep/shell than by reading it whole into memory (and into the context).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// The key the mutating fs tools serialize on. Tool calls run concurrently —
+/// several per assistant message, and in parallel across sub-agents and
+/// sessions — and `edit_file` is a read-modify-write, so without exclusion one
+/// of two edits to a file is silently lost. Canonicalizing makes two calls that
+/// name the file by different routes collide; hard links to one inode still
+/// don't (keying on `(dev, ino)` would fix that, but a file yet to be created
+/// has none).
+///
+/// Writer-to-writer only: the lock is in-process and advisory, and edits
+/// truncate in place, so a reader that skips it (`read_file`, `grep`, a
+/// concurrent `shell` command, the server's knowledge poller) can still catch a
+/// file mid-write. Judged not worth a temp-file-and-rename, which would cost
+/// write permission on the directory and break hard links.
+async fn resolve_lock_key(path: &Path) -> ToolResult<String> {
+    let (parent, name) = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => (parent, name),
+        _ => {
+            return Err(ToolError::InvalidParameters(
+                "file_path does not name a file".to_string(),
+            ));
+        }
+    };
+    let resolved = match tokio::fs::canonicalize(path).await {
+        Ok(canonical) => canonical,
+        // A file yet to be created still needs a stable key; its parent, which
+        // does exist, gives one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => tokio::fs::canonicalize(parent)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to resolve parent directory: {}", e))
+            })?
+            .join(name),
+        Err(e) => {
+            return Err(ToolError::ExecutionError(format!(
+                "Failed to resolve path: {}",
+                e
+            )));
+        }
+    };
+    Ok(resolved.to_string_lossy().into_owned())
+}
 
 /// Open `path` and verify, from the opened handle, that it is a regular file
 /// — not a symlink (of the final path component), directory, or other special
@@ -162,6 +206,7 @@ impl Tool for ReadFileTool {
 
 pub struct WriteFileTool {
     schema: Schema,
+    locks: Arc<KeyedLock<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -173,11 +218,10 @@ pub struct WriteFileToolParams {
 }
 
 impl WriteFileTool {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(locks: Arc<KeyedLock<String>>) -> Self {
         let schema = schemars::schema_for!(WriteFileToolParams);
         debug!("WriteFileTool schema: {:?}", schema);
-        WriteFileTool { schema }
+        WriteFileTool { schema, locks }
     }
 }
 
@@ -203,6 +247,7 @@ impl Tool for WriteFileTool {
         params: Self::Parameters,
         _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
+        let locks = self.locks.clone();
         async move {
             let path = Path::new(&params.file_path);
             if !path.is_absolute() {
@@ -226,6 +271,11 @@ impl Tool for WriteFileTool {
                     ToolError::ExecutionError(format!("Failed to create parent directories: {}", e))
                 })?;
             }
+
+            // `create_new` already makes creation exclusive; the lock covers the
+            // gap after it, where the file exists but is still empty or half
+            // written and an `edit_file` must not see it.
+            let _guard = locks.lock(resolve_lock_key(path).await?).await;
 
             // O_CREAT|O_EXCL fails atomically on any existing path, including
             // symlinks (even dangling ones), closing the check-then-write race.
@@ -265,6 +315,7 @@ impl Tool for WriteFileTool {
 
 pub struct EditFileTool {
     schema: Schema,
+    locks: Arc<KeyedLock<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -284,11 +335,10 @@ pub struct EditFileToolParams {
 }
 
 impl EditFileTool {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new(locks: Arc<KeyedLock<String>>) -> Self {
         let schema = schemars::schema_for!(EditFileToolParams);
         debug!("EditFileTool schema: {:?}", schema);
-        EditFileTool { schema }
+        EditFileTool { schema, locks }
     }
 }
 
@@ -314,6 +364,7 @@ impl Tool for EditFileTool {
         params: Self::Parameters,
         _ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
+        let locks = self.locks.clone();
         async move {
             let path = Path::new(&params.file_path);
             if !path.is_absolute() {
@@ -333,6 +384,11 @@ impl Tool for EditFileTool {
                     "old_string and new_string are identical; nothing to change".to_string(),
                 ));
             }
+
+            // Held across the whole read-modify-write: anything narrower lets a
+            // second edit read the same original and write back a version that
+            // never saw the first edit.
+            let _guard = locks.lock(resolve_lock_key(path).await?).await;
 
             let mut file = open_regular_file(path, true).await?;
             let buf = read_capped(&mut file).await?;
@@ -480,11 +536,147 @@ impl Tool for ListDirectoryTool {
 mod tests {
     use super::*;
 
+    /// A registry per test: none of these exercise sharing, and isolation keeps
+    /// them from queueing behind each other.
+    fn test_locks() -> Arc<KeyedLock<String>> {
+        Arc::new(KeyedLock::new())
+    }
+
     fn tmp_file(name: &str, content: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("coda_edit_test_{}_{}", std::process::id(), name));
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    /// Two edits to one file, dispatched together the way the runtime
+    /// dispatches a batch of tool calls. Unlocked, both read the original and
+    /// the second write drops the first edit — silently, since both calls
+    /// report success.
+    #[tokio::test]
+    async fn concurrent_edits_to_one_file_both_land() {
+        let path = tmp_file("concurrent_small", "alpha\nbeta\n");
+        let file_path = path.to_str().unwrap().to_string();
+        let tool = EditFileTool::new(test_locks());
+
+        let first = tool.execute(
+            EditFileToolParams {
+                file_path: file_path.clone(),
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let second = tool.execute(
+            EditFileToolParams {
+                file_path,
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "ALPHA\nBETA\n");
+    }
+
+    /// The same race on a file big enough that the writer yields mid-write,
+    /// when an in-place truncate leaves the file empty or half written.
+    #[tokio::test]
+    async fn concurrent_edits_to_one_large_file_both_land() {
+        let mut body = String::from("HEAD\n");
+        for i in 0..200_000 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        body.push_str("TAIL\n");
+        let path = tmp_file("concurrent_large", &body);
+        let file_path = path.to_str().unwrap().to_string();
+        let tool = EditFileTool::new(test_locks());
+
+        let first = tool.execute(
+            EditFileToolParams {
+                file_path: file_path.clone(),
+                old_string: "HEAD".to_string(),
+                new_string: "HEAD-EDITED".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let second = tool.execute(
+            EditFileToolParams {
+                file_path,
+                old_string: "TAIL".to_string(),
+                new_string: "TAIL-EDITED".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content.len(), body.len() + "-EDITED".len() * 2);
+        assert!(content.starts_with("HEAD-EDITED\n"));
+        assert!(content.ends_with("TAIL-EDITED\n"));
+    }
+
+    /// Sub-agents get their own tool instances; only the shared registry makes
+    /// their edits exclude each other.
+    #[tokio::test]
+    async fn separate_tool_instances_sharing_a_registry_exclude_each_other() {
+        let path = tmp_file("concurrent_instances", "alpha\nbeta\n");
+        let file_path = path.to_str().unwrap().to_string();
+        let locks = test_locks();
+
+        let first = EditFileTool::new(locks.clone()).execute(
+            EditFileToolParams {
+                file_path: file_path.clone(),
+                old_string: "alpha".to_string(),
+                new_string: "ALPHA".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let second = EditFileTool::new(locks).execute(
+            EditFileToolParams {
+                file_path,
+                old_string: "beta".to_string(),
+                new_string: "BETA".to_string(),
+                replace_all: None,
+            },
+            ToolCallContext::default(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "ALPHA\nBETA\n");
+    }
+
+    /// Two spellings of one path must map to one key, or they lock different
+    /// entries and race anyway.
+    #[tokio::test]
+    async fn lock_key_is_path_shape_independent() {
+        let path = tmp_file("lock_key", "x\n");
+        let indirect = path.parent().unwrap().join("..").join(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .map(std::path::PathBuf::from)
+                .unwrap()
+                .join(path.file_name().unwrap()),
+        );
+        let direct_key = resolve_lock_key(&path).await.unwrap();
+        let indirect_key = resolve_lock_key(&indirect).await.unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(direct_key, indirect_key);
     }
 
     /// The cancellation context must reach the child-process runner: a token
@@ -507,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn edit_replaces_unique_match() {
         let path = tmp_file("unique", "hello world\nfoo bar\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let result = tool
             .execute(
                 EditFileToolParams {
@@ -531,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn edit_errors_when_not_found() {
         let path = tmp_file("notfound", "hello world\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -551,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn edit_errors_on_ambiguous_match() {
         let path = tmp_file("ambiguous", "x\nx\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -571,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn edit_replace_all() {
         let path = tmp_file("all", "x\nx\nx\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let result = tool
             .execute(
                 EditFileToolParams {
@@ -592,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn edit_errors_on_identical_strings() {
         let path = tmp_file("identical", "x\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -611,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_requires_absolute_path() {
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -644,7 +836,7 @@ mod tests {
     async fn write_refuses_huge_file() {
         let path = tmp_path("huge_write");
         std::fs::remove_file(&path).ok();
-        let tool = WriteFileTool::new();
+        let tool = WriteFileTool::new(test_locks());
         let err = tool
             .execute(
                 WriteFileToolParams {
@@ -681,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn edit_refuses_huge_file() {
         let path = tmp_huge_file("huge_edit");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -722,7 +914,7 @@ mod tests {
     async fn edit_refuses_invalid_utf8() {
         let path = tmp_path("non_utf8_edit");
         std::fs::write(&path, b"before \xFF\xFE after\n").unwrap();
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -744,7 +936,7 @@ mod tests {
     async fn write_creates_new_file() {
         let path = tmp_path("write_new");
         std::fs::remove_file(&path).ok();
-        let tool = WriteFileTool::new();
+        let tool = WriteFileTool::new(test_locks());
         tool.execute(
             WriteFileToolParams {
                 file_path: path.to_str().unwrap().to_string(),
@@ -761,7 +953,7 @@ mod tests {
     #[tokio::test]
     async fn write_refuses_existing_file() {
         let path = tmp_file("write_existing", "original\n");
-        let tool = WriteFileTool::new();
+        let tool = WriteFileTool::new(test_locks());
         let err = tool
             .execute(
                 WriteFileToolParams {
@@ -783,7 +975,7 @@ mod tests {
         let link = tmp_path("symlink_write_link");
         std::fs::remove_file(&link).ok();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let tool = WriteFileTool::new();
+        let tool = WriteFileTool::new(test_locks());
         let err = tool
             .execute(
                 WriteFileToolParams {
@@ -846,7 +1038,7 @@ mod tests {
         let link = tmp_path("symlink_edit_link");
         std::fs::remove_file(&link).ok();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
@@ -868,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn edit_errors_on_empty_old_string() {
         let path = tmp_file("empty_old", "hello\n");
-        let tool = EditFileTool::new();
+        let tool = EditFileTool::new(test_locks());
         let err = tool
             .execute(
                 EditFileToolParams {
