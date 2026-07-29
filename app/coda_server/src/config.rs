@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use coda_agent::ToolApprovalMode;
 use coda_core::llm::{Modality, ToolCall};
@@ -91,6 +92,39 @@ impl Default for RelayConfig {
     }
 }
 
+/// How the WebSocket transport keeps an otherwise idle connection alive.
+///
+/// Only the interval is configurable. The silence budget is derived from it
+/// rather than being its own knob, so the two cannot be set into a combination
+/// that tears down every healthy connection (a timeout below the interval would
+/// fire before the first Pong could ever arrive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatConfig {
+    /// How often an idle connection emits a Ping. Tune it below the idle
+    /// timeout of whatever proxy or load balancer fronts the server.
+    pub interval: Duration,
+}
+
+impl HeartbeatConfig {
+    /// How many intervals of total silence mark the peer as gone. Three, so a
+    /// single dropped Pong doesn't tear down a healthy connection.
+    const TIMEOUT_INTERVALS: u32 = 3;
+
+    /// How long the peer may go completely silent before the connection is
+    /// treated as dead.
+    pub fn timeout(&self) -> Duration {
+        self.interval * Self::TIMEOUT_INTERVALS
+    }
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Where sessions are persisted. Required: PostgreSQL is the only backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseConfig {
@@ -103,6 +137,7 @@ pub struct ServerConfig {
     pub workspaces: Vec<WorkspaceConfig>,
     pub database: DatabaseConfig,
     pub relay: RelayConfig,
+    pub heartbeat: HeartbeatConfig,
 }
 
 pub fn load_server_config(path: &Path) -> Result<ServerConfig, ConfigError> {
@@ -119,12 +154,14 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let workspaces = parse_workspaces(&doc, base_dir)?;
     let database = parse_database(&doc)?;
     let relay = parse_relay(&doc)?;
+    let heartbeat = parse_heartbeat(&doc)?;
 
     Ok(ServerConfig {
         providers,
         workspaces,
         database,
         relay,
+        heartbeat,
     })
 }
 
@@ -156,6 +193,20 @@ fn parse_relay(doc: &toml_edit::DocumentMut) -> Result<RelayConfig, ConfigError>
         relay.max_message_tier_events = positive_usize(value, "relay.max_message_tier_events")?;
     }
     Ok(relay)
+}
+
+/// Parse the optional `[heartbeat]` table, falling back to
+/// `HeartbeatConfig::default()` when it (or its field) is absent.
+fn parse_heartbeat(doc: &toml_edit::DocumentMut) -> Result<HeartbeatConfig, ConfigError> {
+    let mut heartbeat = HeartbeatConfig::default();
+    let Some(table) = doc.get("heartbeat") else {
+        return Ok(heartbeat);
+    };
+    if let Some(value) = table.get("interval_secs") {
+        let secs = positive_usize(value, "heartbeat.interval_secs")?;
+        heartbeat.interval = Duration::from_secs(secs as u64);
+    }
+    Ok(heartbeat)
 }
 
 fn positive_usize(value: &toml_edit::Item, field: &str) -> Result<usize, ConfigError> {
@@ -1433,6 +1484,70 @@ max_log_events = 0
         assert!(
             err.to_string()
                 .contains("relay.max_log_events must be a positive integer")
+        );
+    }
+
+    #[test]
+    fn parse_server_config_defaults_heartbeat() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.heartbeat, HeartbeatConfig::default());
+        assert_eq!(config.heartbeat.interval, Duration::from_secs(30));
+        assert_eq!(config.heartbeat.timeout(), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn parse_server_config_overrides_heartbeat_interval() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[heartbeat]
+interval_secs = 10
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.heartbeat.interval, Duration::from_secs(10));
+        // The silence budget tracks the interval instead of being its own knob.
+        assert_eq!(config.heartbeat.timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_server_config_rejects_non_positive_heartbeat_interval() {
+        let err = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[heartbeat]
+interval_secs = 0
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("heartbeat.interval_secs must be a positive integer")
         );
     }
 

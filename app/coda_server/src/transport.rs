@@ -14,6 +14,7 @@
 //! instead, so neither the `rpc` layer nor the connection loop ever sees a
 //! control frame.
 
+use crate::config::HeartbeatConfig;
 use crate::rpc::RpcOutgoing;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
 use futures::stream::{SplitSink, SplitStream};
@@ -21,19 +22,10 @@ use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::fmt::Debug;
 use std::future::Future;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant, Interval, MissedTickBehavior, interval_at};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::warn;
-
-/// How often an idle connection emits a Ping. Proxies and load balancers drop
-/// idle WebSockets after a minute or so, and a connection whose turn has
-/// finished carries no traffic at all until the user acts again.
-const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
-
-/// How long the peer may go completely silent before the connection is treated
-/// as dead. Three periods, so one dropped Pong doesn't tear down a healthy
-/// connection.
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A bidirectional, text-framed channel to the peer.
 ///
@@ -58,14 +50,16 @@ pub trait Transport {
 /// state it drives.
 struct Reader {
     stream: SplitStream<WebSocket>,
-    /// Fires every [`HEARTBEAT_PERIOD`]. It is held here rather than created
-    /// inside `recv` because the caller's `select!` drops the `recv` future
-    /// whenever another branch wins; a per-call timer would restart from zero
-    /// each time and, on a connection with steady event traffic, never fire.
+    /// Fires every `HeartbeatConfig::interval`. It is held here rather than
+    /// created inside `recv` because the caller's `select!` drops the `recv`
+    /// future whenever another branch wins; a per-call timer would restart from
+    /// zero each time and, on a connection with steady event traffic, never fire.
     ticker: Interval,
     /// When the peer last proved it was alive. *Any* inbound frame counts — a
     /// Pong, but equally a request the client sent on its own.
     last_seen: Instant,
+    /// How long `last_seen` may go stale before the peer is declared gone.
+    timeout: Duration,
 }
 
 /// [`Transport`] over an axum WebSocket (server side). The split halves are each
@@ -76,13 +70,13 @@ pub struct WebSocketTransport {
 }
 
 impl WebSocketTransport {
-    pub fn new(socket: WebSocket) -> Self {
+    pub fn new(socket: WebSocket, heartbeat: HeartbeatConfig) -> Self {
         let (sink, stream) = socket.split();
         // `interval` fires its first tick immediately, which would ping a
-        // connection that just opened; start one period out instead. `Delay`
+        // connection that just opened; start one interval out instead. `Delay`
         // keeps missed ticks from piling up into a burst if `recv` goes
         // unpolled while the caller handles a slow frame.
-        let mut ticker = interval_at(Instant::now() + HEARTBEAT_PERIOD, HEARTBEAT_PERIOD);
+        let mut ticker = interval_at(Instant::now() + heartbeat.interval, heartbeat.interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             sink: Mutex::new(sink),
@@ -90,6 +84,7 @@ impl WebSocketTransport {
                 stream,
                 ticker,
                 last_seen: Instant::now(),
+                timeout: heartbeat.timeout(),
             }),
         }
     }
@@ -117,6 +112,7 @@ impl Transport for WebSocketTransport {
             stream,
             ticker,
             last_seen,
+            timeout,
         } = &mut *reader;
         loop {
             tokio::select! {
@@ -137,7 +133,7 @@ impl Transport for WebSocketTransport {
                     }
                 },
                 _ = ticker.tick() => {
-                    if last_seen.elapsed() > HEARTBEAT_TIMEOUT {
+                    if last_seen.elapsed() > *timeout {
                         warn!("websocket heartbeat timed out; closing connection");
                         return None;
                     }
