@@ -20,7 +20,7 @@ use coda_server::{
     },
     ask_user::AskUserToolSpec,
     build_available_skills, build_workspace_custom_instructions,
-    config::{HeartbeatConfig, ToolApprovalConfig, WorkspaceConfig, load_server_config},
+    config::{KeepaliveConfig, ToolApprovalConfig, WorkspaceConfig, load_server_config},
     hub::{
         AttachError, AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub,
         SessionKey, SessionOpener, SessionRelay,
@@ -87,7 +87,7 @@ struct AppState {
     /// connection that opened them. See `coda_server::hub`.
     relay: Arc<dyn SessionRelay>,
     /// Keepalive tuning handed to each new connection's transport.
-    heartbeat: HeartbeatConfig,
+    keepalive: KeepaliveConfig,
 }
 
 /// A constructed provider model entry. `model_id` is the API model name sent in
@@ -1534,7 +1534,7 @@ async fn connection_ws_handler(
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
         info!("connection opened");
-        let transport = WebSocketTransport::new(socket, state.heartbeat);
+        let transport = WebSocketTransport::new(socket, state.keepalive);
         run_connection(transport, state).await;
         info!("connection closed");
     })
@@ -1863,7 +1863,7 @@ async fn main() {
         shutdown: shutdown.clone(),
         workspaces,
         relay,
-        heartbeat: server_config.heartbeat,
+        keepalive: server_config.keepalive,
     });
 
     // On a shutdown signal, cancel the token: this both ends `axum::serve`'s

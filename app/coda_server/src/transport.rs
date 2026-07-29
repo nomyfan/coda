@@ -13,7 +13,7 @@
 //! [`WebSocketTransport`] pings from inside `recv` instead, so no caller ever
 //! sees a control frame.
 
-use crate::config::HeartbeatConfig;
+use crate::config::KeepaliveConfig;
 use crate::rpc::RpcOutgoing;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
 use futures::stream::{SplitSink, SplitStream};
@@ -40,14 +40,15 @@ pub trait Transport {
     fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send;
 }
 
-/// Everything `recv` touches, behind one lock: the read half and its ping timer.
+/// Everything `recv` touches, behind one lock: the read half and its keepalive
+/// timer.
 struct Reader {
     stream: SplitStream<WebSocket>,
     /// Held here rather than created inside `recv` because the caller's
     /// `select!` drops the `recv` future whenever another branch wins; a
     /// per-call timer would restart from zero each time and, on a connection
     /// with steady event traffic, never fire.
-    ticker: Interval,
+    keepalive: Interval,
 }
 
 /// [`Transport`] over an axum WebSocket (server side). The split halves are each
@@ -58,15 +59,15 @@ pub struct WebSocketTransport {
 }
 
 impl WebSocketTransport {
-    pub fn new(socket: WebSocket, heartbeat: HeartbeatConfig) -> Self {
+    pub fn new(socket: WebSocket, config: KeepaliveConfig) -> Self {
         let (sink, stream) = socket.split();
         // `interval` fires its first tick immediately, which would ping a
         // connection that just opened; start one interval out instead.
-        let mut ticker = interval_at(Instant::now() + heartbeat.interval, heartbeat.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut keepalive = interval_at(Instant::now() + config.interval, config.interval);
+        keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             sink: Mutex::new(sink),
-            reader: Mutex::new(Reader { stream, ticker }),
+            reader: Mutex::new(Reader { stream, keepalive }),
         }
     }
 
@@ -88,7 +89,7 @@ impl WebSocketTransport {
 impl Transport for WebSocketTransport {
     async fn recv(&self) -> Option<String> {
         let mut reader = self.reader.lock().await;
-        let Reader { stream, ticker } = &mut *reader;
+        let Reader { stream, keepalive } = &mut *reader;
         loop {
             tokio::select! {
                 frame = stream.next() => match frame {
@@ -105,7 +106,7 @@ impl Transport for WebSocketTransport {
                 // Takes the sink lock while holding the reader lock. The order
                 // is only ever reader → sink (`send` takes the sink on its
                 // own), so it cannot deadlock.
-                _ = ticker.tick() => if !self.ping().await {
+                _ = keepalive.tick() => if !self.ping().await {
                     return None;
                 },
             }
