@@ -7,7 +7,13 @@
 //! classification lives there, not here (this layer must not silently drop a bad
 //! frame the way a typed decode would). Today the wire is WebSocket; a future
 //! Unix-domain-socket transport can plug in by implementing this trait.
+//!
+//! Keepalive is deliberately *not* part of the trait: it belongs to one wire
+//! rather than to the abstraction (a Unix socket has no such concept).
+//! [`WebSocketTransport`] pings from inside `recv` instead, so no caller ever
+//! sees a control frame.
 
+use crate::config::KeepaliveConfig;
 use crate::rpc::RpcOutgoing;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
 use futures::stream::{SplitSink, SplitStream};
@@ -16,6 +22,7 @@ use serde::Serialize;
 use std::fmt::Debug;
 use std::future::Future;
 use tokio::sync::Mutex;
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::warn;
 
 /// A bidirectional, text-framed channel to the peer.
@@ -33,35 +40,75 @@ pub trait Transport {
     fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send;
 }
 
+/// Everything `recv` touches, behind one lock: the read half and its keepalive
+/// timer.
+struct Reader {
+    stream: SplitStream<WebSocket>,
+    /// Held here rather than created inside `recv` because the caller's
+    /// `select!` drops the `recv` future whenever another branch wins; a
+    /// per-call timer would restart from zero each time and, on a connection
+    /// with steady event traffic, never fire.
+    keepalive: Interval,
+}
+
 /// [`Transport`] over an axum WebSocket (server side). The split halves are each
 /// behind their own mutex so reads and writes proceed independently.
 pub struct WebSocketTransport {
     sink: Mutex<SplitSink<WebSocket, AxumMessage>>,
-    stream: Mutex<SplitStream<WebSocket>>,
+    reader: Mutex<Reader>,
 }
 
 impl WebSocketTransport {
-    pub fn new(socket: WebSocket) -> Self {
+    pub fn new(socket: WebSocket, config: KeepaliveConfig) -> Self {
         let (sink, stream) = socket.split();
+        // `interval` fires its first tick immediately, which would ping a
+        // connection that just opened; start one interval out instead.
+        let mut keepalive = interval_at(Instant::now() + config.interval, config.interval);
+        keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             sink: Mutex::new(sink),
-            stream: Mutex::new(stream),
+            reader: Mutex::new(Reader { stream, keepalive }),
+        }
+    }
+
+    /// Send a protocol-level Ping. Fire-and-forget — nothing waits for the Pong,
+    /// which browsers send on their own. `false` means the frame could not be
+    /// delivered and the caller should tear down, same as [`Transport::send`].
+    async fn ping(&self) -> bool {
+        let mut sink = self.sink.lock().await;
+        match sink.send(AxumMessage::Ping(Default::default())).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("websocket ping error: {e:?}");
+                false
+            }
         }
     }
 }
 
 impl Transport for WebSocketTransport {
     async fn recv(&self) -> Option<String> {
-        let mut stream = self.stream.lock().await;
+        let mut reader = self.reader.lock().await;
+        let Reader { stream, keepalive } = &mut *reader;
         loop {
-            match stream.next().await {
-                Some(Ok(AxumMessage::Text(text))) => return Some(text.to_string()),
-                Some(Ok(AxumMessage::Close(_))) | None => return None,
-                Some(Ok(_)) => {} // ping/pong/binary: ignore
-                Some(Err(e)) => {
-                    warn!("websocket read error: {e}");
+            tokio::select! {
+                frame = stream.next() => match frame {
+                    Some(Ok(AxumMessage::Text(text))) => return Some(text.to_string()),
+                    Some(Ok(AxumMessage::Close(_))) | None => return None,
+                    // ping/pong/binary: ignore. An inbound Ping is answered by
+                    // the underlying tungstenite stream, not by anything here.
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        warn!("websocket read error: {e}");
+                        return None;
+                    }
+                },
+                // Takes the sink lock while holding the reader lock. The order
+                // is only ever reader → sink (`send` takes the sink on its
+                // own), so it cannot deadlock.
+                _ = keepalive.tick() => if !self.ping().await {
                     return None;
-                }
+                },
             }
         }
     }

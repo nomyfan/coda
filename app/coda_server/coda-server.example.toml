@@ -51,3 +51,10 @@ path = "/path/to/coda"
 [[workspaces]]
 id = "scratch"
 path = "/path/to/scratch"
+
+# --- Keepalive ---------------------------------------------------------------
+# Optional. How often an idle connection is pinged to keep a proxy from cutting
+# it; set it below that proxy's idle timeout.
+
+# [keepalive]
+# interval_secs = 30

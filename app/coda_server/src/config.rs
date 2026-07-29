@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use coda_agent::ToolApprovalMode;
 use coda_core::llm::{Modality, ToolCall};
@@ -91,6 +92,22 @@ impl Default for RelayConfig {
     }
 }
 
+/// How the WebSocket transport keeps an otherwise idle connection alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveConfig {
+    /// How often an idle connection emits a Ping. Tune it below the idle
+    /// timeout of whatever proxy or load balancer fronts the server.
+    pub interval: Duration,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Where sessions are persisted. Required: PostgreSQL is the only backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseConfig {
@@ -103,6 +120,7 @@ pub struct ServerConfig {
     pub workspaces: Vec<WorkspaceConfig>,
     pub database: DatabaseConfig,
     pub relay: RelayConfig,
+    pub keepalive: KeepaliveConfig,
 }
 
 pub fn load_server_config(path: &Path) -> Result<ServerConfig, ConfigError> {
@@ -119,12 +137,14 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let workspaces = parse_workspaces(&doc, base_dir)?;
     let database = parse_database(&doc)?;
     let relay = parse_relay(&doc)?;
+    let keepalive = parse_keepalive(&doc)?;
 
     Ok(ServerConfig {
         providers,
         workspaces,
         database,
         relay,
+        keepalive,
     })
 }
 
@@ -156,6 +176,20 @@ fn parse_relay(doc: &toml_edit::DocumentMut) -> Result<RelayConfig, ConfigError>
         relay.max_message_tier_events = positive_usize(value, "relay.max_message_tier_events")?;
     }
     Ok(relay)
+}
+
+/// Parse the optional `[keepalive]` table, falling back to
+/// `KeepaliveConfig::default()` when it (or its field) is absent.
+fn parse_keepalive(doc: &toml_edit::DocumentMut) -> Result<KeepaliveConfig, ConfigError> {
+    let mut keepalive = KeepaliveConfig::default();
+    let Some(table) = doc.get("keepalive") else {
+        return Ok(keepalive);
+    };
+    if let Some(value) = table.get("interval_secs") {
+        let secs = positive_usize(value, "keepalive.interval_secs")?;
+        keepalive.interval = Duration::from_secs(secs as u64);
+    }
+    Ok(keepalive)
 }
 
 fn positive_usize(value: &toml_edit::Item, field: &str) -> Result<usize, ConfigError> {
@@ -1433,6 +1467,67 @@ max_log_events = 0
         assert!(
             err.to_string()
                 .contains("relay.max_log_events must be a positive integer")
+        );
+    }
+
+    #[test]
+    fn parse_server_config_defaults_keepalive() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.keepalive, KeepaliveConfig::default());
+        assert_eq!(config.keepalive.interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_server_config_overrides_keepalive_interval() {
+        let config = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[keepalive]
+interval_secs = 10
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap();
+
+        assert_eq!(config.keepalive.interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_server_config_rejects_non_positive_keepalive_interval() {
+        let err = parse_server_config(
+            &format!(
+                r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+
+[keepalive]
+interval_secs = 0
+"#
+            ),
+            Path::new("/srv"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("keepalive.interval_secs must be a positive integer")
         );
     }
 
