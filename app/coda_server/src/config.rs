@@ -93,28 +93,11 @@ impl Default for RelayConfig {
 }
 
 /// How the WebSocket transport keeps an otherwise idle connection alive.
-///
-/// Only the interval is configurable. The silence budget is derived from it
-/// rather than being its own knob, so the two cannot be set into a combination
-/// that tears down every healthy connection (a timeout below the interval would
-/// fire before the first Pong could ever arrive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatConfig {
     /// How often an idle connection emits a Ping. Tune it below the idle
     /// timeout of whatever proxy or load balancer fronts the server.
     pub interval: Duration,
-}
-
-impl HeartbeatConfig {
-    /// How many intervals of total silence mark the peer as gone. Three, so a
-    /// single dropped Pong doesn't tear down a healthy connection.
-    const TIMEOUT_INTERVALS: u32 = 3;
-
-    /// How long the peer may go completely silent before the connection is
-    /// treated as dead.
-    pub fn timeout(&self) -> Duration {
-        self.interval * Self::TIMEOUT_INTERVALS
-    }
 }
 
 impl Default for HeartbeatConfig {
@@ -1503,7 +1486,6 @@ path = "/tmp/coda"
 
         assert_eq!(config.heartbeat, HeartbeatConfig::default());
         assert_eq!(config.heartbeat.interval, Duration::from_secs(30));
-        assert_eq!(config.heartbeat.timeout(), Duration::from_secs(90));
     }
 
     #[test]
@@ -1524,8 +1506,6 @@ interval_secs = 10
         .unwrap();
 
         assert_eq!(config.heartbeat.interval, Duration::from_secs(10));
-        // The silence budget tracks the interval instead of being its own knob.
-        assert_eq!(config.heartbeat.timeout(), Duration::from_secs(30));
     }
 
     #[test]

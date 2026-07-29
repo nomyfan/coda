@@ -59,13 +59,8 @@ id = "demo"
 path = "workspace"
 
 # --- Heartbeat ---------------------------------------------------------------
-# Optional. How often an idle WebSocket connection sends a protocol-level Ping,
-# so a proxy or load balancer in front of the server doesn't cut it while the
-# user sits between turns. Set it below that proxy's idle timeout. A peer that
-# goes silent for three intervals is treated as gone and the connection is torn
-# down (the session itself survives — it lives in the server, not the
-# connection, and a running turn keeps going until the client reconnects).
-# Browsers reply to Pings on their own, so this needs nothing from the client.
+# Optional. How often an idle connection is pinged to keep a proxy from cutting
+# it; set it below that proxy's idle timeout.
 
 # [heartbeat]
 # interval_secs = 30
