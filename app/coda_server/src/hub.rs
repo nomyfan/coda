@@ -276,8 +276,8 @@ pub trait SessionRelay: Send + Sync {
         conn_id: ConnId,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
-    /// Copy `source` under a new session id, keeping the turn `cut` belongs to
-    /// and every turn before it (`None` copies everything stored).
+    /// Copy `source` under a new session id, keeping the turns before the user
+    /// message named by `cut` (`None` copies everything stored).
     ///
     /// The source is left untouched, so unlike `delete` this needs no
     /// latest-wins check: any connection may fork any session. It is refused

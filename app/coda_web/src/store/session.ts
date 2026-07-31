@@ -129,10 +129,9 @@ export type OpenedSession = {
      * see `reconcileEditing`. */
     precedingUserMessages: number;
   };
-  /** The prompt a fork branched away from, handed to this copy so its composer
-   * opens with it. Read once, when the composer mounts, and cleared on send —
-   * so unlike `editing` it is a seed and the composer owns it from there. */
-  seed?: { text: string; images: string[] };
+  /** The prompt a fork branched away from, kept as this session's composer
+   * draft until it is sent. */
+  forkDraft?: { text: string; images: string[] };
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
@@ -1540,9 +1539,7 @@ function appendUserMessage(
     session.draft = false;
     session.running = true;
     session.firstUserMessage = firstUserMessage;
-    // The seeded prompt has become a message; leaving it would repopulate the
-    // composer the next time this session is opened.
-    delete session.seed;
+    delete session.forkDraft;
     session.entries.push({
       id: entryId,
       kind: "user",
@@ -2235,9 +2232,9 @@ function setForking(key: string, inFlight: boolean) {
 
 /**
  * Copy a session into a new one and switch to it. `cutMessageId` names the user
- * message to branch away from — the copy keeps the turns before it — and `seed`
- * is that message, handed to the copy's composer. Omitting both copies
- * everything stored.
+ * message to branch away from — the copy keeps the turns before it — and
+ * `forkDraft` is that message, handed to the copy's composer. Omitting both
+ * copies everything stored.
  *
  * Throws on failure, with the reason as its message — a fork that mints nothing
  * has to say so where the user clicked, since nothing renders the activity log.
@@ -2250,7 +2247,7 @@ export async function forkSession(
   workspaceId: string,
   sessionId: string,
   cutMessageId?: string,
-  seed?: { text: string; images: string[] },
+  forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const key = forkKey(server, workspaceId, sessionId);
   if (codaStore.getState().forking[key]) {
@@ -2270,12 +2267,12 @@ export async function forkSession(
     const forked = await retryWhileNotReady(() => rpc.request("fork_session", params));
     setCatalog(codaStore, server, forked.workspaces, true);
     openSession(server, workspaceId, forked.session_id);
-    if (seed) {
+    if (forkDraft) {
       const copyKey = sessionKey(workspaceId, forked.session_id);
       updateState(codaStore, (state) => {
         const copy = draftSession(state, server, copyKey);
         if (copy) {
-          copy.seed = seed;
+          copy.forkDraft = forkDraft;
         }
       });
     }
@@ -2308,7 +2305,7 @@ export const selectActiveForkKey = (state: CodaStoreState) => {
 /** Fork the active session — the transcript's entry point. */
 export async function forkActiveSession(
   cutMessageId?: string,
-  seed?: { text: string; images: string[] },
+  forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const active = currentActive();
   // A draft was never opened on the server, so there is nothing to copy.
@@ -2316,7 +2313,18 @@ export async function forkActiveSession(
     return;
   }
   const { workspaceId, sessionId } = active.session;
-  await forkSession(active.server, workspaceId, sessionId, cutMessageId, seed);
+  await forkSession(active.server, workspaceId, sessionId, cutMessageId, forkDraft);
+}
+
+/** Persist edits to a fork's prefilled prompt so switching sessions does not
+ * restore the original seed over the user's draft. */
+export function updateForkDraft(server: string, key: SessionKey, text: string, images: string[]) {
+  updateState(codaStore, (state) => {
+    const draft = draftSession(state, server, key);
+    if (draft?.forkDraft) {
+      draft.forkDraft = { text, images };
+    }
+  });
 }
 
 export function openSession(server: string, workspaceId: string, sessionId: string) {
@@ -2880,7 +2888,7 @@ export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
 const EMPTY_USAGE: UsageRecord[] = [];
 export const selectActiveEditing = (state: CodaStoreState) => activeSessionOf(state)?.editing;
-export const selectActiveSeed = (state: CodaStoreState) => activeSessionOf(state)?.seed;
+export const selectActiveForkDraft = (state: CodaStoreState) => activeSessionOf(state)?.forkDraft;
 /** Whether a message can be pulled back in to be rewritten. Mirrors the
  * server's own precondition, so the entry point is only offered when the
  * request would actually be accepted. */

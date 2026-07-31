@@ -1,6 +1,6 @@
 import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
-import { memo, useCallback, useId, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import type {
@@ -46,7 +46,8 @@ export const Composer = memo(function Composer({
   serverUrl,
   workspaceId,
   editing,
-  seed,
+  forkDraft,
+  onForkDraftChange,
   onSetModel,
   onSend,
   onAbort,
@@ -81,16 +82,17 @@ export const Composer = memo(function Composer({
    * frozen to match. `target === null` means the rewind already happened and
    * this is now an ordinary draft. */
   editing?: NonNullable<OpenedSession["editing"]>;
-  /** The prompt a fork branched away from, for the copy it landed in. Read once
-   * at mount, like `editing` — the composer owns the draft from there. */
-  seed?: NonNullable<OpenedSession["seed"]>;
+  /** The prompt a fork branched away from, persisted with the copy while the
+   * composer owns it. */
+  forkDraft?: NonNullable<OpenedSession["forkDraft"]>;
+  onForkDraftChange: (text: string, images: string[]) => void;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
   onCancelEdit: () => void;
 }) {
-  const [task, setTask] = useState(editing?.text ?? seed?.text ?? "");
-  const [images, setImages] = useState<string[]>(editing?.images ?? seed?.images ?? []);
+  const [task, setTask] = useState(editing?.text ?? forkDraft?.text ?? "");
+  const [images, setImages] = useState<string[]>(editing?.images ?? forkDraft?.images ?? []);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const layoutGroupId = useId();
   const getImageLayoutId = useCallback(
@@ -99,6 +101,13 @@ export const Composer = memo(function Composer({
   );
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasForkDraft = forkDraft !== undefined;
+
+  useEffect(() => {
+    if (hasForkDraft) {
+      onForkDraftChange(task, images);
+    }
+  }, [hasForkDraft, images, onForkDraftChange, task]);
 
   const connected = status === "connected";
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when

@@ -5,8 +5,10 @@ import {
   applySnapshotToSession,
   codaStore,
   forkSession,
+  openSession,
   retryWhileNotReady,
   selectForking,
+  updateForkDraft,
   forkKey,
   type OpenedSession,
 } from "../src/store/session.ts";
@@ -124,7 +126,7 @@ test("a second fork of the same session while one is in flight is dropped", asyn
 
 // The cut is the turn to branch *away* from, so its prompt is not in the copy —
 // it goes to the composer instead, for the user to rewrite or resend.
-test("the message a fork cuts at lands in the copy's composer", async () => {
+test("the message a fork cuts at becomes the copy's composer draft", async () => {
   const server = "ws://seeded";
   codaStore.setState((state) => {
     state.servers[server] = {
@@ -135,6 +137,7 @@ test("the message a fork cuts at lands in the copy's composer", async () => {
       sessions: {},
     };
     state.rpcMap[server] = {
+      notify: () => true,
       request: (method: string) =>
         method === "fork_session"
           ? Promise.resolve({ session_id: "s2", name: null, workspaces: [] })
@@ -145,9 +148,17 @@ test("the message a fork cuts at lands in the copy's composer", async () => {
 
   await forkSession(server, "ws", "s1", "m-cut", { text: "try it this way", images: ["img"] });
 
-  expect(codaStore.getState().servers[server]?.sessions["ws/s2"]?.seed).toEqual({
+  expect(codaStore.getState().servers[server]?.sessions["ws/s2"]?.forkDraft).toEqual({
     text: "try it this way",
     images: ["img"],
+  });
+
+  updateForkDraft(server, "ws/s2", "edited after the fork", ["new-img"]);
+  openSession(server, "ws", "somewhere-else");
+  openSession(server, "ws", "s2");
+  expect(codaStore.getState().servers[server]?.sessions["ws/s2"]?.forkDraft).toEqual({
+    text: "edited after the fork",
+    images: ["new-img"],
   });
 
   codaStore.setState((state) => {
