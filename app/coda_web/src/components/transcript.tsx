@@ -13,6 +13,7 @@ import {
   FileText,
   FolderTree,
   ListChecks,
+  GitBranch,
   ListTodo,
   type LucideIcon,
   MessageSquare,
@@ -37,12 +38,15 @@ import { Markdown } from "@/components/markdown";
 import {
   beginEdit,
   discardedFrom,
+  forkActiveSession,
   selectActiveApprovalCount,
   selectActiveEditing,
   selectActiveEntries,
+  selectActiveForkKey,
   selectActiveKey,
   selectActiveRunning,
   selectCanRewind,
+  selectForking,
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
@@ -69,7 +73,15 @@ function isSubAgentEntry(entry: TranscriptEntry) {
 
 type TranscriptRenderItem =
   | { type: "entry"; entry: TranscriptEntry }
-  | { type: "turn"; id: string; entries: TranscriptEntry[] };
+  | {
+      type: "turn";
+      id: string;
+      entries: TranscriptEntry[];
+      /** The message that opened this turn. A fork's cut names a turn rather
+       * than a message, and this is the one part of a turn that is always
+       * there — a reply the model never got to write is not. */
+      openedBy?: string;
+    };
 
 function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -84,6 +96,47 @@ function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   return -1;
 }
 
+/** How a turn ended, rather than more work inside it. An abort emits both: the
+ * marker, and then the error the interrupted run returns. */
+function isTurnEndNotice(entry: TranscriptEntry) {
+  return entry.kind === "error" || (entry.kind === "system" && entry.status === "aborted");
+}
+
+/**
+ * Where a turn's answer sits, or -1 when the turn has none to lift out of the
+ * process list.
+ *
+ * Anything after the reply means the turn went on past it — except these
+ * notices, which land *after* the partial reply an interrupted model did
+ * produce. Letting them hide it would bury the reply in the process list along
+ * with its copy and fork actions, and only until a reload: they are events
+ * rather than messages, so they never come back with the history.
+ */
+export function finalAssistantIndexOf(entries: TranscriptEntry[]) {
+  const index = findFinalAssistantIndex(entries);
+  if (index < 0) {
+    return -1;
+  }
+  return entries.slice(index + 1).every(isTurnEndNotice) ? index : -1;
+}
+
+/**
+ * The cut a turn offers when it finished without a reply to hang actions off —
+ * an interrupt during tool calls ends on a tool result instead. The turn is
+ * still whole, so `openedBy` names it just as well.
+ *
+ * `settled` cannot be read off the entries: an abort leaves a marker, but only
+ * as a live event. If every tool happened to finish cleanly before the cancel
+ * landed, the stored turn is indistinguishable from one still in flight.
+ */
+export function interruptedTurnCut(
+  entries: TranscriptEntry[],
+  openedBy: string | undefined,
+  settled: boolean,
+) {
+  return settled && finalAssistantIndexOf(entries) < 0 ? openedBy : undefined;
+}
+
 /** Entries rendered as collapsed disclosure rows inside an assistant turn. */
 function hasDisclosureWork(entries: TranscriptEntry[]) {
   return entries.some(
@@ -95,22 +148,25 @@ function hasDisclosureWork(entries: TranscriptEntry[]) {
   );
 }
 
-function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
+function turnGroup(entries: TranscriptEntry[], openedBy?: string): TranscriptRenderItem {
   return {
     type: "turn",
     id: `turn:${entries[0]?.id ?? "empty"}`,
     entries,
+    openedBy,
   };
 }
 
-function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
+export function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
   const items: TranscriptRenderItem[] = [];
   let index = 0;
+  let openedBy: string | undefined;
 
   while (index < entries.length) {
     const entry = entries[index];
     if (entry.kind === "user") {
       items.push({ type: "entry", entry });
+      openedBy = entry.messageId;
       index += 1;
       continue;
     }
@@ -126,7 +182,7 @@ function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem
       continue;
     }
 
-    items.push(turnGroup(segment));
+    items.push(turnGroup(segment, openedBy));
   }
 
   return items;
@@ -221,7 +277,7 @@ export const Transcript = memo(function Transcript({
           </div>
         ) : (
           <>
-            {renderItems.map((item) => {
+            {renderItems.map((item, index) => {
               const anchor = item.type === "entry" ? item.entry.id : item.entries[0]?.id;
               const discarded = Boolean(anchor && discardedIds?.has(anchor));
               return (
@@ -235,7 +291,14 @@ export const Transcript = memo(function Transcript({
                   {item.type === "entry" ? (
                     <TranscriptItem entry={item.entry} />
                   ) : (
-                    <AssistantTurnBubble entries={item.entries} approvalPending={approvalPending} />
+                    <AssistantTurnBubble
+                      entries={item.entries}
+                      approvalPending={approvalPending}
+                      openedBy={item.openedBy}
+                      // Only the last turn can still be going; whatever is
+                      // behind it is over however it ended.
+                      settled={index < renderItems.length - 1 || !(running || approvalPending)}
+                    />
                   )}
                 </div>
               );
@@ -414,12 +477,17 @@ function MessageActions({
   label,
   align,
   onEdit,
+  forkFrom,
 }: {
-  content: string;
+  /** Absent on a turn an abort ended with no reply — there is nothing to copy,
+   * but the turn is still somewhere to fork from. */
+  content?: string;
   label: string;
   align: "start" | "end";
   /** Present only on a user message the session is currently able to rewind to. */
   onEdit?: () => void;
+  /** The cut id, on a final assistant reply the server has acknowledged. */
+  forkFrom?: string;
 }) {
   return (
     <div
@@ -440,9 +508,47 @@ function MessageActions({
           <Pencil className="size-4" />
         </Button>
       ) : null}
-      <CopyContentButton content={content} label={label} />
+      {forkFrom ? <ForkButton cutMessageId={forkFrom} /> : null}
+      {content === undefined ? null : <CopyContentButton content={content} label={label} />}
     </div>
   );
+}
+
+/** Disabled while a fork of this session is in flight — from *any* entry, since
+ * the session has one per reply plus the sidebar's and the server mints a new id
+ * per request. A success navigates to the copy, so only the failure has anything
+ * left to say here. */
+function ForkButton({ cutMessageId }: { cutMessageId: string }) {
+  const key = useCodaStore(selectActiveForkKey);
+  const forking = useCodaStore(selectForking(key ?? ""));
+  const [error, setError] = useState<string>();
+  return (
+    <>
+      <Button
+        size="icon"
+        variant="ghost"
+        disabled={forking}
+        className="size-7 text-muted-foreground hover:text-foreground"
+        title="Branch a new session from here"
+        aria-label="Branch a new session from here"
+        onClick={() => {
+          setError(undefined);
+          forkActiveSession(cutMessageId).catch((err: unknown) =>
+            setError(err instanceof Error ? err.message : "Fork failed"),
+          );
+        }}
+      >
+        <GitBranch className="size-4" />
+      </Button>
+      {error ? <span className="px-1 text-xs text-destructive">{error}</span> : null}
+    </>
+  );
+}
+
+/** The cut id a final root reply can be forked from, if the server has
+ * acknowledged it — a streamed entry only learns its id when the turn ends. */
+function forkableCut(entry?: TranscriptEntry) {
+  return entry?.isFinalResponse ? entry.messageId : undefined;
 }
 
 /** A process step: either a plain entry or a grouped sub-agent invocation. */
@@ -694,16 +800,22 @@ function PendingTurnBubble() {
 function AssistantTurnBubble({
   entries,
   approvalPending,
+  openedBy,
+  settled,
 }: {
   entries: TranscriptEntry[];
   approvalPending: boolean;
+  openedBy?: string;
+  /** Whether this turn is over. Nothing in the turn itself can say — see
+   * [`interruptedTurnCut`] — so it comes from the caller, which knows whether
+   * this is the last turn and whether the session is still going. */
+  settled: boolean;
 }) {
-  const lastIndex = findFinalAssistantIndex(entries);
-  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const finalAssistantIndex = finalAssistantIndexOf(entries);
   const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
   const completedFinalAssistant = finalAssistant?.isFinalResponse ? finalAssistant : undefined;
-  const processComplete =
-    completedFinalAssistant !== undefined || entries.some((entry) => entry.status === "aborted");
+  const processComplete = completedFinalAssistant !== undefined || settled;
+  const forkFromTurn = interruptedTurnCut(entries, openedBy, settled);
   const intermediateEntries =
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
@@ -766,9 +878,16 @@ function AssistantTurnBubble({
       </article>
       {finalAssistant ? (
         <div className="flex items-center gap-1">
-          <MessageActions content={finalAssistant.content} label="response" align="start" />
+          <MessageActions
+            content={finalAssistant.content}
+            label="response"
+            align="start"
+            forkFrom={forkableCut(finalAssistant)}
+          />
           <EntryTiming entry={finalAssistant} mode="end" className={cn("px-1", HOVER_REVEAL)} />
         </div>
+      ) : forkFromTurn ? (
+        <MessageActions label="response" align="start" forkFrom={forkFromTurn} />
       ) : null}
     </div>
   );
@@ -983,7 +1102,12 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
           <Markdown>{entry.content}</Markdown>
         </article>
         <div className="flex items-center gap-1">
-          <MessageActions content={entry.content} label="response" align="start" />
+          <MessageActions
+            content={entry.content}
+            label="response"
+            align="start"
+            forkFrom={forkableCut(entry)}
+          />
           <EntryTiming entry={entry} mode="end" className={cn("px-1", HOVER_REVEAL)} />
         </div>
       </div>

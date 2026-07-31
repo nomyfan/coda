@@ -214,6 +214,27 @@ pub struct DeleteSessionParams {
     pub session_id: String,
 }
 
+/// `fork_session` params. `cut_message_id` names any message of the source's
+/// root thread, and the copy keeps that message's whole turn plus every turn
+/// before it; omitting it copies everything stored. The new session id is minted
+/// by the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkSessionParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub cut_message_id: Option<MessageId>,
+}
+
+/// Result of `fork_session`: the session that was minted, plus a refreshed
+/// catalog so the list shows it without a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkAccepted {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub workspaces: Vec<WorkspaceSummaryWire>,
+}
+
 /// `rename_session` params. `null` or a blank name clears the custom name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameSessionParams {
@@ -485,6 +506,35 @@ mod tests {
         let back: SessionName =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert_eq!(back.name.as_deref(), Some("Investigation"));
+    }
+
+    #[test]
+    fn fork_params_default_to_a_full_copy() {
+        // The list entry sends no cut at all, so an absent `cut_message_id` has
+        // to mean "copy everything" rather than failing to parse.
+        let params: ForkSessionParams =
+            serde_json::from_str(r#"{"workspace_id":"coda","session_id":"s1"}"#).unwrap();
+        assert_eq!(params.cut_message_id, None);
+
+        let cut = MessageId::new();
+        let params = ForkSessionParams {
+            workspace_id: "coda".into(),
+            session_id: "s1".into(),
+            cut_message_id: Some(cut),
+        };
+        let back: ForkSessionParams =
+            serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(back.cut_message_id, Some(cut));
+
+        let result = ForkAccepted {
+            session_id: "s2".into(),
+            name: None,
+            workspaces: vec![],
+        };
+        let back: ForkAccepted =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(back.session_id, "s2");
+        assert_eq!(back.name, None);
     }
 
     #[test]

@@ -146,13 +146,22 @@ fork_session { workspace_id, session_id, cut_message_id? }
 
 **保留集合怎么算出来**（`cut` 为 `Some` 时；`None` 时跳过，保留全部）：
 
-1. 用 `cut_message_id` 在 **root thread**（`thread_id = 源 session_id`）上查它的 `seq`，同时校验 `role = 'assistant'`、且 payload 里 `tool_calls` 为空。查不到即 `CutNotFound`——这一条查询就是切点的全部校验。
+1. 用 `cut_message_id` 在 **root thread**（`thread_id = 源 session_id`）上查它的 `seq` 与 payload。查不到即 `CutNotFound`——「在 root thread 上」就是切点合法性的全部校验，不限 role（理由见下方第 3 步后的说明）；payload 只用来判断它是不是所在 turn 的终点，决定要不要做落库校验（见「切点查得到 ⟹ …」一段）。
 2. 取 root thread 上 `seq ≤ cut_seq` 的所有 **distinct `turn_id`**，即为保留的 turn 集合。`turn_id` 是 UUID、本身无序，「这个 turn 及之前」只能由 root thread 的 `seq` 顺序回答，所以这一步绕不开。
 3. 复制 `turn_id ∈ 该集合` 的消息，**不带线程条件**——这正是 sub-agent 线程里属于这些 turn 的消息被一并捞出的原因。
 
 这是 rewind 的镜像（storage.rs:800-812 取 `seq ≥ target_seq` 的 turn 集合来删）。第 3 步按整个 turn 复制，所以**即使切点不是所在 turn 的最后一条消息，该 turn 的全部消息也会完整保留**——「切点必须是 turn 终点」因此只是 UI 挑按钮位置的选择，不是正确性依赖。
 
-**切点查得到 ⟹ 它之前的 root 前缀已全部落库。** 这是第 1 步顺带给出的保证，也是 `cut: Some` 不需要全量落库校验的依据：checkpoint 写入是一个事务，消息从 `stored_count` 起按 `seq` 连续 append 并同步更新 `message_count`（storage.rs:613-660），所以 `seq = k` 的行可见就意味着承载它的那次事务已提交，`0..k` 一个不缺。反过来，若对 `cut: Some` 也比对整份 snapshot 的长度，一个尚未落库的第 5 轮会把「从第 3 轮 fork」也一并挡掉——那与需求里「从更早的点 fork 完全无关」直接冲突。
+正因如此，**切点就是「一个 turn 的名字」**，root thread 上属于该 turn 的任何一条消息都能当这个名字。副本落在 turn 边界上，而空闲会话的每个 turn 都是完整的（每个 tool call 都有结果，被 abort 掉的那些也写了 aborted 结果），所以边界处模型都能接着往下走。这一条是「工具执行中被 abort 的 turn 也能 fork」的依据：那种 turn 没有最终回复，只能靠开启它的那条 user 消息来命名。
+
+**切点查得到 ⟹ 它之前的 root 前缀已全部落库。** checkpoint 写入是一个事务，消息从 `stored_count` 起按 `seq` 连续 append 并同步更新 `message_count`（storage.rs:613-660），所以 `seq = k` 的行可见就意味着承载它的那次事务已提交，`0..k` 一个不缺。
+
+**但「前缀已落库」不等于「切点所在的 turn 已落库」。** 这两件事只有当切点是 turn 的终点时才重合：**只有无工具调用的 assistant 回复**是终点，它和整个 turn 写在同一次 checkpoint 里，所以看得见它就等于看得见整个 turn。开启 turn 的那条 user 消息不是——driver 在 turn 一开始就单独为它写一次 checkpoint（driver.rs:292-295，目的是让中途崩溃/重连的快照里已经有 prompt），此后直到 turn 结束才写第二次。而 abort 事件**先于**那次收尾写入settle 掉这个 turn（hub 的 `event_settles_turn` 让 `turn_running` 立刻落下），于是存在一个窗口：会话在 hub 眼里已空闲、checkpoint 停在 `Generation`、库里却只有这个 turn 的开头。此时按 user 消息切会静默复制出一个「只有问题没有过程」的会话。
+
+所以落库校验按切点分两种：
+
+- **切点是 turn 终点** → 不做全量校验。这正是设计的原意：若一并比对 snapshot 长度，一个尚未落库的第 5 轮会把「从第 3 轮 fork」也挡掉，与需求里「从更早的点 fork 完全无关」冲突。
+- **切点不是 turn 终点，或 `cut: None`** → 源会话 live 时必须比对 `root_messages`，不够就 `Lagging`（可重试）。这类切点自身证明不了什么，只能靠调用方手里的历史长度。
 
 **thread_id 重映射**是复制的第一步，其余写入都依赖它：
 
@@ -194,28 +203,52 @@ old_root (= 源 session_id)          ->  新 session_id
 - **保留 turn 集合在每个线程上未必是前缀。** 若某个线程的 turn 不按顺序累积，复制出的 `seq` 就有洞，而后续每次保存都会从错误的水位往后追加。对策是照搬 rewind 的 `max_seq + 1 == count` 校验（storage.rs:879），把破掉的不变量变成回滚而非坏数据；并在 pg-tests 里用一个带 stateful sub-agent、跨多个 turn 的会话直接验证。
 - **已知限制：数据库短暂落后于界面。** 根因是运行时先发事件、后写数据库（见 Assumptions）。fork 从数据库读，于是有三种表现，其中前两种已挡住、第三种接受：
   1. 切点还没落库 → `CutNotFound`，可重试。
-  2. `cut: None` 时 root 最新一轮还没落库（会静默漏掉一轮）→ 由 `expected_root_messages` 校验挡下，返回 `Lagging`，可重试。`cut: Some` 不做这个校验，理由见 Data Model：切点可见即证明其 root 前缀完整，而比对全量会把「从早轮 fork」被无关的最新轮次误挡。
+  2. 保留的最新一轮还没落库（会静默漏掉内容）→ 由 `root_messages` 校验挡下，返回 `Lagging`，可重试。**只有切点本身是 turn 终点时才跳过这个校验**（理由见 Data Model：终点可见即证明整轮完整，而对它比对全量会把「从早轮 fork」被无关的最新轮次误挡）；`cut: None` 与非终点切点都要校验。
   3. 某个线程的收尾 checkpoint 还没落库、而它此前存的是 `ToolExecution` → storage 报 `ThreadBusy`。源会话 live 且已过 idle 检查时，这归入可重试；只有没有 live entry 的源会话报 `ThreadBusy` 才是真的停在非生成边界。
   4. **某个 sub-agent 的收尾存档还在路上，而它此前存的是 `Generation` → 新会话里那条线程少最后一段，且不报错。** 挡不住：hub 的内存 snapshot 只 fold root 的事件（hub.rs:369），它不知道 sub-agent 应该有多少条，没有可比对的期望值。
 
   第 4 种**通常**集中在最新轮次，但这不是运行时保证：`save_checkpoint` 是在 sub-agent 自己的 task 里 await 的，拦不住已经拿到 Reply 的 root 继续往下跑，所以数据库严重卡顿时，第 3 轮 sub-agent 的存档完全可能拖到第 5 轮仍未完成——那时从第 3 轮 fork 一样会缺它的末段。换句话说，**任何仍有 checkpoint 在途的保留轮次都可能受影响**，只是越早的轮次越不可能。**这是一个明知的正确性缺口，不是被论证掉的风险**——需求文档的 Known Limitations 第一条已相应写明，fork 不声称是精确副本。根治办法是让存档早于对外可见的 settle 信号，那是独立的后续工作；做完之后这里的四种补偿都可以拿掉。
-- **重复提交产生多个副本**（服务端 mint id 的代价）。前端在请求在途时禁用入口即可，不做服务端去重。注意这与上一条的重试相互作用：只有 `ForkOutcome::Retryable`（即上面第 1、2、3 种，全都发生在写入之前）才重试，`Failed` 与 `NotIdle` 一律不重试。
+- **重复提交产生多个副本**（服务端 mint id 的代价）。前端在请求在途时禁用入口即可，不做服务端去重。**「入口」是按源会话算的**，不是按按钮：一个会话在每条最终回复上都有一个入口，会话列表里还有一个，所以在途标记必须放在 store 里（`CodaState.forking`，键为 `forkKey`），由 `forkSession` 自己置位与清除，而不是各按钮自管本地 state。注意这与上一条的重试相互作用：只有 `ForkOutcome::Retryable`（即上面第 1、2、3 种，全都发生在写入之前）才重试，`Failed` 与 `NotIdle` 一律不重试。
 - **大会话复制的耗时**在事务与 entry lock 内。消息走 `INSERT ... SELECT` 已经把最大的一块留在库内，预期可接受；若日后成为问题，再考虑把复制挪出锁外并改用乐观校验。
 
 ## Implementation Roadmap
 
-- [ ] [风险验证] thread_id 重映射 + `WorkspaceStorage::fork_session` + pg-tests：一个带 stateful sub-agent、跨 3 个 turn 的会话，切在第 2 个 turn 的最终回复上
+- [x] [风险验证] thread_id 重映射 + `WorkspaceStorage::fork_session` + pg-tests：一个带 stateful sub-agent、跨 3 个 turn 的会话，切在第 2 个 turn 的最终回复上
       Purpose: 同时验证两个地基假设——重映射无遗漏，且保留集合在每个线程上都是前缀
       Verification: `cargo test -p coda_server --features pg-tests --test storage_pg`；断言新会话中不含任何源 thread_id 的字面残留（含 jsonb 内）、子线程 id 等于按新 root 重新派生的值、每线程 `seq` 为 `0..count`、`message_count` 与实际条数相符、源会话逐行未变
-- [ ] [存储] 补齐错误路径与隔离级别：切点非法、线程未停在 `Generation`、id 冲突、`cut: None` 全量，事务改 `repeatable_read()`
+- [x] [存储] 补齐错误路径与隔离级别：切点非法、线程未停在 `Generation`、id 冲突、`cut: None` 全量，事务改 `repeatable_read()`
       Purpose: 把切点这个唯一的客户端输入锁死在一条查询里，并让分批复制看同一个快照
       Verification: 每种 `ForkError` 一个用例，且都断言源会话与数据库无残留
-- [ ] [hub] `SessionOpener::fork` + `SessionHub::fork`，闸门走 `lock_entry_for_attach`，摘除临时 entry 前立 `Released` 墓碑，live 时传 `expected_root_messages`
+- [x] [hub] `SessionOpener::fork` + `SessionHub::fork`，闸门走 `lock_entry_for_attach`，摘除临时 entry 前立 `Released` 墓碑，live 时传 `expected_root_messages`
       Purpose: 让「源会话在跑」与「源会话没打开」两条路都走对，不被并发 attach 插队，也不留下孤儿 runtime
       Verification: `hub_tests.rs` 覆盖 entry 不存在 / Live 且 idle / Live 且 turn_running / 有 pending approval；外加三个竞态用例——(a) fork 在 storage 调用处暂停时并发 attach + task，断言后者进不了复制窗口；(b) 让 attach 在 fork 摘除 entry **之前**完成 `Arc` clone、**之后**才拿到 entry lock，断言它看到墓碑后回 map 重取，而不是在孤儿 entry 上开 runtime；(c) **排队任务窗口**——连发两条 task，让测试确定性地停在第一条 settle 之后、第二条 `LlmStart` 之前，断言 fork 返回 `NotIdle` 而非复制出一份被排队任务写坏的副本。再加三个落库校验用例：`cut: None` 且内存 snapshot 比库里长时返回 `Lagging`；**同样状态下 `cut: Some` 指向已落库的早轮时照常成功**；live 源会话报 `ThreadBusy` 时归为 `Retryable`、无 live entry 时归为 `Failed`
-- [ ] [RPC] `fork_session` 方法、wire 类型与目录刷新，`CutNotFound` / `Lagging` 映射成同一个可重试错误码
+- [x] [RPC] `fork_session` 方法、wire 类型与目录刷新，`CutNotFound` / `Lagging` 映射成同一个可重试错误码
       Purpose: 打通协议边界，并把「数据库还没追上」这一瞬表达成前端能处理的形态
       Verification: wire 类型 roundtrip 测试；`cargo clippy` + `cargo test`
-- [ ] [Web] assistant 最终回复上的 fork 按钮 + 会话列表入口 + 切到新会话 + 重试
+- [x] [Web] assistant 最终回复上的 fork 按钮 + 会话列表入口 + 切到新会话 + 重试
       Purpose: 暴露到真实交互，并兜住保存时序带来的偶发失败
       Verification: `pnpm --filter coda-web lint` + `test`；用例覆盖「fork 后目录含新会话且当前会话切过去」、「首次可重试错误后自动重试一次即成功」、「请求在途时入口禁用」、「非可重试错误不重试」
+
+## Deviations from Design
+
+- `fork_session` 的签名从 `(source_id, cut, expected_root_messages)` 变成
+  `(source_id, cut: ForkCut, source: ForkSource)`。`expected_root_messages` 移进
+  `ForkSource::Live { root_messages }` —— 设计里「`cut: Some` 时必须传 `None`」原本
+  只是注释约定，现在由类型保证；同时「源是活的还是冷的」在整条链路上只有这一个编码。
+- 多了一个 `ForkError::SourceNotFound`：设计没提源会话不存在的情况，而 `session_id`
+  来自客户端，`cut: None` 时会静默建出一个空会话。
+- 多了一个 `ForkError::OrphanThread`：检查点的父不在映射表里时回滚，对应 Data Model
+  里「父不在映射表里即为不变量已破」那句。
+- 多了一个 `ForkError::SourceNotIdle`，映射到 `ForkOutcome::NotIdle`：设计只让存储层
+  查检查点，但检查点证明不了冷会话是空闲的 —— 排在上一个 turn 后面的任务会随
+  `runtime_snapshots` 活过关闭，而它留下的检查点都是 `Generation`，下次 `Session::open`
+  又会把这活捡回来。所以冷路径额外查一次运行时快照。这个检查**只在冷路径做**：
+  那一行只在 agent 退出时重写，会话活着的时候它描述的是上次关闭，不是现在。
+- Web 端 fork 入口没走「hub 借来的 entry」那条路的额外提示；`ForkOutcome::Retryable`
+  与 `CutNotFound` / `Lagging` 一起映射到 `FORK_NOT_READY`，前端只重试这一个码。
+- 切点放宽成 root thread 上的**任意**消息，不再要求「无工具调用的 assistant 回复」。
+  设计里那个限制自己就写明「只是 UI 挑按钮位置的选择，不是正确性依赖」（见 Data Model），
+  而它挡掉了一个真实场景：工具执行中被 abort 的 turn 没有最终回复，按原限制就只能整份
+  复制。前端因此给 turn 分组带上开启它的 user 消息 id（`openedBy`），这类 turn 用它当切点。
+  代价是 `cut: Some` 的落库校验不再能一刀切地省掉——只有 turn 终点的切点能省，其余走
+  `Lagging`，理由见 Data Model 里「但「前缀已落库」不等于……」一段。

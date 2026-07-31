@@ -44,9 +44,9 @@ export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | 
 export type TranscriptEntry = {
   id: string;
   kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
-  /** The server's id for a user message. Only user entries have one, and only
-   * once the server has acknowledged them — which is exactly the condition for
-   * being able to rewind to it. */
+  /** The server's id for this message, once the server has acknowledged it.
+   * On a user entry that is the condition for rewinding to it; on a final
+   * assistant reply, for forking from it. */
   messageId?: string;
   agentName?: string;
   threadId?: string;
@@ -162,6 +162,11 @@ type CodaState = {
   activeServer?: string;
   /** The active session within `activeServer`. */
   activeKey?: SessionKey;
+  /** Sessions with a fork in flight, by `forkKey`. Shared rather than local to
+   * a button because one session has many fork entries — one per reply, plus
+   * the sidebar — and the server mints a new id per request, so a second click
+   * anywhere leaves a second copy behind. */
+  forking: Record<string, true>;
 };
 
 type SessionRuntimeState = {
@@ -231,6 +236,7 @@ function blankServer(url: string): ServerState {
 const initialState: CodaState = {
   servers: {},
   order: [],
+  forking: {},
 };
 
 function initialStoreState(): CodaStoreState {
@@ -365,6 +371,7 @@ function historyToEntries(
       entries.push({
         id: `assistant:${assistant.message_id}`,
         kind: "assistant",
+        messageId: assistant.message_id,
         agentName: rootName,
         content: assistant.content,
         status: assistant.aborted ? "aborted" : undefined,
@@ -615,6 +622,9 @@ function finishAssistant(
   const isFinalResponse = event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
+      // Only now does the streamed entry learn its id, which is what lets a
+      // fork name it as a cut.
+      messageId: event.message.message_id,
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
       startedAt: event.message.started_at,
@@ -629,6 +639,7 @@ function finishAssistant(
         {
           id: newId("assistant"),
           kind: "assistant",
+          messageId: event.message.message_id,
           agentName: event.agent_name,
           threadId: event.thread_id,
           content: event.message.content,
@@ -2180,6 +2191,113 @@ function closeActiveSession(nextServer?: string, nextKey?: SessionKey) {
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
   });
+}
+
+/**
+ * Send a fork, retrying once if the server says the database has not caught up.
+ *
+ * The runtime emits events before it writes them, so a reply can be on screen a
+ * moment before it is stored. That failure happens before anything is written,
+ * which is what makes one retry safe; every other failure propagates, since the
+ * server has no request de-duplication and a blind retry could mint a second
+ * copy.
+ */
+export async function retryWhileNotReady<T>(send: () => Promise<T>): Promise<T> {
+  try {
+    return await send();
+  } catch (err) {
+    if (!isServerError(err) || err.code !== RpcCode.FORK_NOT_READY) {
+      throw err;
+    }
+    return await send();
+  }
+}
+
+/** Identifies the *source* session of a fork, which is what the in-flight flag
+ * is scoped to — forking two different sessions at once is fine. */
+export function forkKey(server: string, workspaceId: string, sessionId: string) {
+  return `${server}|${sessionKey(workspaceId, sessionId)}`;
+}
+
+function setForking(key: string, inFlight: boolean) {
+  updateState(codaStore, (state) => {
+    if (inFlight) {
+      state.forking[key] = true;
+    } else {
+      delete state.forking[key];
+    }
+  });
+}
+
+/**
+ * Copy a session into a new one and switch to it. `cutMessageId` names the
+ * message whose turn to branch from; omitting it copies everything stored.
+ *
+ * Throws on failure, with the reason as its message — a fork that mints nothing
+ * has to say so where the user clicked, since nothing renders the activity log.
+ * A second call while one is in flight for the same source is dropped rather
+ * than queued: the server mints an id per request, so it would leave a spare
+ * copy behind.
+ */
+export async function forkSession(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  cutMessageId?: string,
+): Promise<void> {
+  const key = forkKey(server, workspaceId, sessionId);
+  if (codaStore.getState().forking[key]) {
+    return;
+  }
+  const params = {
+    workspace_id: workspaceId,
+    session_id: sessionId,
+    ...(cutMessageId ? { cut_message_id: cutMessageId } : {}),
+  };
+  setForking(key, true);
+  try {
+    const rpc = rpcFor(server);
+    if (!rpc) {
+      throw new Error("Connection closed");
+    }
+    const forked = await retryWhileNotReady(() => rpc.request("fork_session", params));
+    setCatalog(codaStore, server, forked.workspaces, true);
+    openSession(server, workspaceId, forked.session_id);
+  } catch (err) {
+    const detail = isServerError(err) ? err.message : "Connection lost before the fork started";
+    addSessionActivity(server, workspaceId, sessionId, {
+      tone: "danger",
+      label: "fork failed",
+      detail,
+    });
+    throw new Error(detail);
+  } finally {
+    setForking(key, false);
+  }
+}
+
+/** Whether a fork is in flight for `key`, so every entry into it can go quiet
+ * together rather than each tracking its own click. */
+export const selectForking = (key: string) => (state: CodaStoreState) =>
+  Boolean(state.forking[key]);
+
+/** The active session's fork key, for the transcript's entries. */
+export const selectActiveForkKey = (state: CodaStoreState) => {
+  const session = activeSessionOf(state);
+  return session && state.activeServer && !session.draft
+    ? forkKey(state.activeServer, session.workspaceId, session.sessionId)
+    : undefined;
+};
+
+/** Fork the active session — the transcript's entry point. */
+export async function forkActiveSession(cutMessageId?: string): Promise<void> {
+  const active = currentActive();
+  // A draft was never opened on the server, so there is nothing to copy.
+  if (!active || active.session.draft) {
+    return;
+  }
+  const { workspaceId, sessionId } = active.session;
+  await forkSession(active.server, workspaceId, sessionId, cutMessageId);
 }
 
 export function openSession(server: string, workspaceId: string, sessionId: string) {

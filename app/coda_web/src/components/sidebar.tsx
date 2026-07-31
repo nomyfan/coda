@@ -2,6 +2,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  GitBranch,
   LoaderCircle,
   MoreHorizontal,
   PanelLeft,
@@ -39,11 +40,14 @@ import {
   connectServer,
   deleteSession,
   disconnectServer,
+  forkKey,
+  forkSession,
   removeServer,
   renameServer,
   renameSession,
   selectActiveKey,
   selectActiveServer,
+  selectForking,
   selectServers,
   useCodaShallow,
   useCodaStore,
@@ -177,6 +181,7 @@ const ServerGroup = memo(function ServerGroup({
   onOpenSession,
   onNewSession,
   onDeleteSession,
+  onForkSession,
 }: {
   server: ServerState;
   activeServer?: string;
@@ -185,6 +190,7 @@ const ServerGroup = memo(function ServerGroup({
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
   onDeleteSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
+  onForkSession: (serverUrl: string, workspaceId: string, sessionId: string) => Promise<void>;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -312,6 +318,7 @@ const ServerGroup = memo(function ServerGroup({
                 onOpenSession={onOpenSession}
                 onNewSession={onNewSession}
                 onDeleteSession={onDeleteSession}
+                onForkSession={onForkSession}
               />
             ))
           ) : (
@@ -335,6 +342,7 @@ function SessionRow({
   disabled,
   onOpen,
   onDelete,
+  onFork,
 }: {
   serverUrl: string;
   workspaceId: string;
@@ -345,11 +353,14 @@ function SessionRow({
   disabled: boolean;
   onOpen: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onDelete: (serverUrl: string, workspaceId: string, sessionId: string) => void;
+  onFork: (serverUrl: string, workspaceId: string, sessionId: string) => Promise<void>;
 }) {
   const [mode, setMode] = useState<"idle" | "renaming" | "deleting">("idle");
   const [nameDraft, setNameDraft] = useState(session.name ?? "");
   const [renamePending, setRenamePending] = useState(false);
   const [renameError, setRenameError] = useState<string>();
+  const forkPending = useCodaStore(selectForking(forkKey(serverUrl, workspaceId, session.id)));
+  const [forkError, setForkError] = useState<string>();
 
   function startRenaming() {
     setNameDraft(session.name ?? "");
@@ -424,77 +435,98 @@ function SessionRow({
   }
 
   return (
-    <div className="group flex items-center gap-1 pr-1">
-      <Button
-        variant={isActive ? "secondary" : "ghost"}
-        className="h-auto min-w-0 flex-1 justify-start gap-2 px-2 py-1 text-left"
-        disabled={disabled}
-        onClick={() => onOpen(serverUrl, workspaceId, session.id)}
-      >
-        {awaitingApproval ? (
-          <span
-            className="flex size-4 shrink-0 items-center justify-center"
-            title="Awaiting approval"
-          >
-            <StatusDot tone="busy" motion="ping" />
-          </span>
-        ) : running ? (
-          <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
-            <StatusDot tone="busy" motion="breathe" />
-          </span>
-        ) : null}
-        <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
-      </Button>
-      {mode === "deleting" ? (
-        <>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0 text-destructive"
-            onClick={() => {
-              setMode("idle");
-              onDelete(serverUrl, workspaceId, session.id);
-            }}
-            title="Confirm delete"
-          >
-            <Check className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-6 shrink-0"
-            onClick={() => setMode("idle")}
-            title="Cancel"
-          >
-            <X className="size-4" />
-          </Button>
-        </>
-      ) : (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
+    <div className="pr-1">
+      <div className="group flex items-center gap-1">
+        <Button
+          variant={isActive ? "secondary" : "ghost"}
+          className="h-auto min-w-0 flex-1 justify-start gap-2 px-2 py-1 text-left"
+          disabled={disabled}
+          onClick={() => onOpen(serverUrl, workspaceId, session.id)}
+        >
+          {awaitingApproval ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              title="Awaiting approval"
+            >
+              <StatusDot tone="busy" motion="ping" />
+            </span>
+          ) : running ? (
+            <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
+              <StatusDot tone="busy" motion="breathe" />
+            </span>
+          ) : null}
+          <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
+        </Button>
+        {mode === "deleting" ? (
+          <>
             <Button
               variant="ghost"
               size="icon"
-              className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 max-lg:opacity-100"
-              disabled={disabled}
-              title="Session actions"
+              className="size-6 shrink-0 text-destructive"
+              onClick={() => {
+                setMode("idle");
+                onDelete(serverUrl, workspaceId, session.id);
+              }}
+              title="Confirm delete"
             >
-              <MoreHorizontal className="size-4" />
+              <Check className="size-4" />
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={startRenaming}>
-              <Pencil />
-              Rename
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onClick={() => setMode("deleting")}>
-              <Trash />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 shrink-0"
+              onClick={() => setMode("idle")}
+              title="Cancel"
+            >
+              <X className="size-4" />
+            </Button>
+          </>
+        ) : (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 max-lg:opacity-100"
+                disabled={disabled}
+                title="Session actions"
+              >
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={startRenaming}>
+                <Pencil />
+                Rename
+              </DropdownMenuItem>
+              {/* The copy can take seconds and the menu closes on click, so
+                without this the user reopens it, clicks again, and gets a
+                second copy — the server mints a new id per request. The flag is
+                the store's, so the transcript's entries go quiet with it. */}
+              <DropdownMenuItem
+                disabled={forkPending}
+                onClick={() => {
+                  setForkError(undefined);
+                  onFork(serverUrl, workspaceId, session.id).catch((error: unknown) =>
+                    setForkError(error instanceof Error ? error.message : "Could not fork session"),
+                  );
+                }}
+              >
+                {forkPending ? <LoaderCircle className="animate-spin" /> : <GitBranch />}
+                Fork
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onClick={() => setMode("deleting")}>
+                <Trash />
+                Delete
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+      {/* The menu is long gone by the time a fork fails, so the row is what is
+          left to say the copy was never made. */}
+      {forkError ? <p className="px-2 text-xs text-destructive">{forkError}</p> : null}
     </div>
   );
 }
@@ -511,6 +543,7 @@ function WorkspaceNode({
   onOpenSession,
   onNewSession,
   onDeleteSession,
+  onForkSession,
 }: {
   serverUrl: string;
   workspace: WorkspaceSummary;
@@ -523,6 +556,7 @@ function WorkspaceNode({
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
   onDeleteSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
+  onForkSession: (serverUrl: string, workspaceId: string, sessionId: string) => Promise<void>;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const sessions = [...workspace.sessions].sort(
@@ -581,6 +615,7 @@ function WorkspaceNode({
                 disabled={status !== "connected"}
                 onOpen={onOpenSession}
                 onDelete={onDeleteSession}
+                onFork={onForkSession}
               />
             );
           })}
@@ -808,6 +843,7 @@ export function Sidebar({
                     onOpenSession={openSession}
                     onNewSession={newSession}
                     onDeleteSession={deleteSession}
+                    onForkSession={forkSession}
                   />
                 ))}
               </>

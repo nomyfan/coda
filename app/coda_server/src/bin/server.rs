@@ -11,7 +11,7 @@ use coda_agent::{
 };
 use coda_core::llm::{LLMProviderConfig, Message, Modality};
 use coda_openai::OpenAICompatible;
-use coda_server::storage::DbPool;
+use coda_server::storage::{DbPool, ForkCut, ForkError, ForkSource, ForkedSession};
 use coda_server::{
     WorkspaceKnowledge,
     agents::{
@@ -22,8 +22,8 @@ use coda_server::{
     build_available_skills, build_workspace_custom_instructions,
     config::{KeepaliveConfig, ToolApprovalConfig, WorkspaceConfig, load_server_config},
     hub::{
-        AttachError, AttachSession, CommandOutcome, ConnId, RelayEvent, SessionCommand, SessionHub,
-        SessionKey, SessionOpener, SessionRelay,
+        AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
+        SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
     },
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
@@ -32,10 +32,11 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, DeleteSessionParams, EventParams, ModelSelection, OpenSessionParams,
-        PendingApprovalWire, ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams,
-        RewindAccepted, RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
-        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        AddAllowPatternParams, DeleteSessionParams, EventParams, ForkAccepted, ForkSessionParams,
+        ModelSelection, OpenSessionParams, PendingApprovalWire, ProviderCatalog, ProviderInfoWire,
+        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
+        SessionSummaryWire, SetModelParams, Snapshot, TaskAccepted, TaskParams, WireEvent,
+        WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -273,6 +274,21 @@ impl SessionOpener for AppOpener {
                 RewindError::Persistence(format!("unknown workspace '{}'", key.0))
             })?;
             workspace.storage.session(&key.1).rewind_to(target).await
+        })
+    }
+
+    fn fork<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        cut: ForkCut,
+        source: ForkSource,
+    ) -> Pin<Box<dyn Future<Output = Result<ForkedSession, ForkError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| ForkError::Persistence(format!("unknown workspace '{}'", key.0)))?;
+            workspace.storage.fork_session(&key.1, cut, source).await
         })
     }
 
@@ -1083,6 +1099,65 @@ async fn dispatch_request(
                 },
             )
                 .into()
+        }
+        "fork_session" => {
+            let params: ForkSessionParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            if let Err(err) = validate_session_id(&params.session_id) {
+                return (
+                    id,
+                    RpcError::with_detail(rpc::INVALID_SESSION_ID, "invalid session id", err),
+                )
+                    .into();
+            }
+            if !app.workspaces.contains_key(&params.workspace_id) {
+                return (
+                    id,
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                )
+                    .into();
+            }
+            let key = (params.workspace_id, params.session_id);
+            match app.relay.fork(key, params.cut_message_id).await {
+                ForkOutcome::Forked(forked) => (
+                    id,
+                    &ForkAccepted {
+                        session_id: forked.session_id,
+                        name: forked.name,
+                        workspaces: workspace_catalog(app).await,
+                    },
+                )
+                    .into(),
+                ForkOutcome::NotIdle => (
+                    id,
+                    RpcError::new(rpc::SESSION_NOT_IDLE, "the session is not idle"),
+                )
+                    .into(),
+                ForkOutcome::Retryable(detail) => (
+                    id,
+                    RpcError::with_detail(
+                        rpc::FORK_NOT_READY,
+                        "the session is still being saved",
+                        detail,
+                    ),
+                )
+                    .into(),
+                ForkOutcome::Failed(err) => (
+                    id,
+                    RpcError::with_detail(
+                        rpc::FORK_FAILED,
+                        "failed to fork session",
+                        err.to_string(),
+                    ),
+                )
+                    .into(),
+            }
         }
         "task" => {
             let params: TaskParams = match parse_params(params) {
