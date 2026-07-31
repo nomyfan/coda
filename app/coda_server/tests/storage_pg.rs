@@ -10,18 +10,19 @@
 //! `(workspace_id, session_id)` and `WorkspaceStorage` is workspace-scoped, so
 //! tests never see each other's rows and can run in parallel without cleanup.
 
-use coda_agent::HistoryEntry;
-use coda_agent::agent::ReplyTarget;
+use coda_agent::ThreadId;
+use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
+use coda_agent::{Envelope, HistoryEntry, Sender};
 use coda_core::llm::{
     AssistantMessage, Message, MessageId, MessageOrigin, ReasoningContinuation, ToolCall,
     ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_server::storage::DbPool;
 use coda_server::storage::{
-    PgSessionStorage, RenameSessionError, RewindError, SessionMetadataError, SessionModelBinding,
-    WorkspaceStorage,
+    ForkCut, ForkError, ForkSource, PgSessionStorage, RenameSessionError, RewindError,
+    SessionMetadataError, SessionModelBinding, WorkspaceStorage,
 };
 use coda_tools::TodoItem;
 use diesel::prelude::*;
@@ -150,6 +151,16 @@ fn entry(turn_id: TurnId, message: Message) -> HistoryEntry {
     HistoryEntry { turn_id, message }
 }
 
+/// The id a message carries, so a test can name it as a fork's cut later.
+fn id_of(message: &Message) -> MessageId {
+    match message {
+        Message::User(message) => message.message_id,
+        Message::Assistant(message) => message.message_id,
+        Message::Tool(message) => message.message_id,
+        Message::System(_) => unreachable!("system messages are not history"),
+    }
+}
+
 /// A plain assistant reply, so tests that only need "something the agent said"
 /// don't spell out ten fields of timing and reasoning state.
 fn assistant(content: &str) -> Message {
@@ -164,6 +175,25 @@ fn assistant(content: &str) -> Message {
         aborted: false,
         started_at: jiff::Timestamp::default(),
         ended_at: jiff::Timestamp::default(),
+    })
+}
+
+/// A task that reached the agent's inbox but not its history — what a snapshot
+/// holds when the process stops between the two.
+fn queued_task(thread_id: &str, task: &str) -> Envelope {
+    Envelope::with_id(|id| Envelope {
+        id,
+        from: Sender::User,
+        to: Receiver {
+            name: "coda".to_string(),
+            thread_id: ThreadId::from(thread_id.to_string()),
+        },
+        reply_to: None,
+        body: EnvelopeBody::Task {
+            message_id: MessageId::new(),
+            task: task.to_string(),
+            images: vec![],
+        },
     })
 }
 
@@ -1558,4 +1588,629 @@ async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
         before,
         "the whole transaction rolls back, including the root thread's deletions"
     );
+}
+
+/// The workspace's session ids, ordered.
+async fn sessions_in(pool: &DbPool, workspace: &str) -> Vec<String> {
+    diesel::sql_query("select session_id from sessions where workspace_id = $1 order by session_id")
+        .bind::<Text, _>(workspace)
+        .load::<SessionIdRow>(&mut conn(pool).await)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect()
+}
+
+/// Every thread of one session with its message count, ordered by id.
+async fn threads_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(String, i32)> {
+    diesel::sql_query(
+        "select thread_id, message_count from thread_checkpoints
+          where workspace_id = $1 and session_id = $2 order by thread_id",
+    )
+    .bind::<Text, _>(workspace)
+    .bind::<Text, _>(session)
+    .load::<ThreadCountRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.thread_id, row.message_count))
+    .collect()
+}
+
+/// One session's messages as `(thread_id, seq)`, ordered.
+async fn messages_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(String, i32)> {
+    diesel::sql_query(
+        "select thread_id, seq from messages
+          where workspace_id = $1 and session_id = $2 order by thread_id, seq",
+    )
+    .bind::<Text, _>(workspace)
+    .bind::<Text, _>(session)
+    .load::<ThreadSeqRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.thread_id, row.seq))
+    .collect()
+}
+
+/// Rows of `session` that mention `needle` anywhere, jsonb included. Casting the
+/// whole row to text is what makes this catch a thread id hiding in a column the
+/// fork does not know about yet.
+async fn rows_mentioning(pool: &DbPool, workspace: &str, session: &str, needle: &str) -> i64 {
+    diesel::sql_query(
+        "select (select count(*) from messages m
+                  where m.workspace_id = $1 and m.session_id = $2
+                    and m::text like '%' || $3 || '%')
+              + (select count(*) from thread_checkpoints t
+                  where t.workspace_id = $1 and t.session_id = $2
+                    and t::text like '%' || $3 || '%') as count",
+    )
+    .bind::<Text, _>(workspace)
+    .bind::<Text, _>(session)
+    .bind::<Text, _>(needle)
+    .get_result::<CountRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .count
+}
+
+/// A session with a stateful sub-agent across three turns, forked at the second.
+///
+/// This is the design's load-bearing pair: thread ids are rebuilt under the new
+/// root, and the retained turns leave every thread a contiguous prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-remap");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+
+    let (first, second, third) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    // The turn to branch away from: everything before it is kept, it and the
+    // rest are not.
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "q3"));
+    let cut = id_of(&branch_point);
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "q1")),
+                    ),
+                    entry(first, assistant("a1")),
+                    entry(
+                        second,
+                        Message::User(UserMessage::text(MessageId::new(), "q2")),
+                    ),
+                    entry(second, assistant("delegating")),
+                    entry(second, assistant("the answer worth branching from")),
+                    entry(third, branch_point),
+                    entry(third, assistant("a3")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    // The sub-agent keeps one thread across both calls, so the fork has to cut
+    // its history too — by turn, not by its own seq.
+    storage
+        .save_checkpoint(
+            explore.as_ref().to_string(),
+            StoredCheckpoint {
+                thread_id: explore.as_ref().to_string(),
+                agent_name: "explore".to_string(),
+                parent_thread_id: Some("source-session".to_string()),
+                derivation_key: Some("explore".to_string()),
+                reply_target: None,
+                messages: vec![
+                    entry(
+                        second,
+                        Message::User(UserMessage::text(MessageId::new(), "look")),
+                    ),
+                    entry(second, assistant("found")),
+                    entry(
+                        third,
+                        Message::User(UserMessage::text(MessageId::new(), "again")),
+                    ),
+                    entry(third, assistant("found again")),
+                ],
+                todos: vec![],
+                resume_point: StoredResumePoint::Generation,
+                suspended_at: jiff::Timestamp::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let forked = WorkspaceStorage::new(pool.clone(), &workspace)
+        .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+        .await
+        .unwrap();
+
+    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let mut expected = vec![
+        (forked.session_id.clone(), 5),
+        (new_explore.as_ref().to_string(), 2),
+    ];
+    expected.sort();
+    assert_eq!(
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        expected,
+        "the root thread takes the new session id and the child is re-derived from it"
+    );
+
+    let mut expected_messages: Vec<(String, i32)> = (0..5)
+        .map(|seq| (forked.session_id.clone(), seq))
+        .chain((0..2).map(|seq| (new_explore.as_ref().to_string(), seq)))
+        .collect();
+    expected_messages.sort();
+    assert_eq!(
+        messages_of(&pool, &workspace, &forked.session_id).await,
+        expected_messages,
+        "each thread keeps a contiguous prefix, so `message_count` stays the next free seq"
+    );
+
+    assert_eq!(
+        rows_mentioning(&pool, &workspace, &forked.session_id, "source-session").await,
+        0,
+        "no row of the fork may still name the source session"
+    );
+    assert_eq!(
+        rows_mentioning(&pool, &workspace, &forked.session_id, explore.as_ref()).await,
+        0,
+        "nor the source's derived thread id, jsonb included"
+    );
+
+    assert_eq!(
+        messages_of(&pool, &workspace, "source-session").await.len(),
+        11,
+        "the source is only read"
+    );
+}
+
+/// The cut names the turn to branch *away* from, so only the message that opens
+/// one will do — rewind's rule exactly. Everything else lands on the same error,
+/// because the database cannot tell a forged cut from one that simply has not
+/// been stored yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-cut");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+
+    let (kept, dropped) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let reply = assistant("what the first turn answered");
+    let sub_reply = assistant("what the sub-agent said");
+    let branch_point = Message::User(UserMessage::text(
+        MessageId::new(),
+        "and now something else",
+    ));
+    let (cut, reply_cut, sub_agent_cut) = (id_of(&branch_point), id_of(&reply), id_of(&sub_reply));
+
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        kept,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(kept, reply),
+                    entry(dropped, branch_point),
+                    entry(dropped, assistant("the answer being branched away from")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    storage
+        .save_checkpoint(
+            explore.as_ref().to_string(),
+            StoredCheckpoint {
+                thread_id: explore.as_ref().to_string(),
+                agent_name: "explore".to_string(),
+                parent_thread_id: Some("source-session".to_string()),
+                derivation_key: Some("explore".to_string()),
+                messages: vec![entry(kept, sub_reply)],
+                ..checkpoint(explore.as_ref(), vec![])
+            },
+        )
+        .await
+        .unwrap();
+
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    let forked = storage
+        .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+        .await
+        .expect("the message that opened a turn");
+    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let mut expected = vec![
+        (forked.session_id.clone(), 2),
+        (new_explore.as_ref().to_string(), 1),
+    ];
+    expected.sort();
+    assert_eq!(
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        expected,
+        "the cut's own turn is dropped, on every thread it reached"
+    );
+
+    for (cut, why) in [
+        (reply_cut, "an assistant reply does not open a turn"),
+        (
+            sub_agent_cut,
+            "a sub-agent's message is not on the root thread",
+        ),
+        (MessageId::new(), "no such message at all"),
+    ] {
+        assert_eq!(
+            storage
+                .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+                .await,
+            Err(ForkError::CutNotFound),
+            "{why}"
+        );
+    }
+    assert_eq!(
+        sessions_in(&pool, &workspace).await.len(),
+        2,
+        "the source plus the one accepted copy; a refused fork mints nothing"
+    );
+}
+
+/// A thread parked anywhere but a plain generation boundary means the session is
+/// mid-flight, and its stored state is not something to copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_a_session_with_work_in_flight_changes_nothing() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-busy");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+
+    let turn = TurnId::from(MessageId::new());
+    // A valid cut, so what the fork trips over is the resting point and not the
+    // cut lookup.
+    let prompt = Message::User(UserMessage::text(MessageId::new(), "q"));
+    let cut = id_of(&prompt);
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            StoredCheckpoint {
+                resume_point: StoredResumePoint::PendingApproval {
+                    parent_message_id: MessageId::new(),
+                    pending_approval_calls: vec![ToolCall {
+                        id: "call_shell".to_string(),
+                        name: "shell".to_string(),
+                        arguments: Some(r#"{"command":"rm -rf /"}"#.to_string()),
+                    }],
+                    pending_calls: vec![],
+                },
+                ..checkpoint(
+                    "source-session",
+                    vec![entry(turn, prompt), entry(turn, assistant("answered"))],
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    assert_eq!(
+        storage
+            .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+            .await,
+        Err(ForkError::ThreadBusy {
+            thread_id: "source-session".to_string()
+        })
+    );
+    assert_eq!(
+        storage
+            .fork_session("source-session", ForkCut::All, ForkSource::Cold)
+            .await,
+        Err(ForkError::ThreadBusy {
+            thread_id: "source-session".to_string()
+        }),
+        "a full copy is held to the same resting point"
+    );
+    assert_eq!(
+        sessions_in(&pool, &workspace).await,
+        vec!["source-session".to_string()]
+    );
+}
+
+/// The state a turn leaves behind the moment it starts: the driver checkpoints
+/// the prompt on its own so a crash mid-turn still has it, and writes nothing
+/// else until the turn ends. An abort settles the turn — clearing the relay's
+/// `turn_running` — one event before that final write lands, so a fork can
+/// arrive to find a turn that is all prefix and no body.
+///
+/// Cutting at the prompt is exactly what makes that harmless: the half-written
+/// turn is the one turn the copy leaves behind, and seeing the prompt at all
+/// proves everything before it committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_ignores_the_half_written_turn_it_opens() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-half-turn");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+
+    let (done, started) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let prompt = Message::User(UserMessage::text(MessageId::new(), "run the thing"));
+    let cut = id_of(&prompt);
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        done,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(done, assistant("a")),
+                    entry(started, prompt),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    let forked = storage
+        .fork_session(
+            "source-session",
+            ForkCut::At(cut),
+            // The relay has the tool call and its aborted result too; the
+            // database has neither yet.
+            ForkSource::Live { root_messages: 5 },
+        )
+        .await
+        .expect("what has not landed is in the turn being branched away from");
+    assert_eq!(
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        vec![(forked.session_id.clone(), 2)],
+        "only the turn that finished comes across"
+    );
+}
+
+/// Checkpoints alone don't prove a cold session is at rest: a task queued behind
+/// the last turn survives shutdown in the runtime snapshot while every
+/// checkpoint reads `Generation`, and the next open picks it back up.
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_a_cold_session_with_queued_work_changes_nothing() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-queued");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+
+    let (first, second) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
+    let cut = id_of(&branch_point);
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(first, assistant("answered")),
+                    entry(second, branch_point),
+                    entry(second, assistant("answered again")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    storage
+        .save_session_snapshot(
+            "source-session".to_string(),
+            StoredRuntimeSnapshot {
+                drained_envelopes: Default::default(),
+                agent_drained_envelopes: [(
+                    "coda".to_string(),
+                    vec![queued_task("source-session", "and one more thing")],
+                )]
+                .into(),
+                active_threads: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    assert_eq!(
+        storage
+            .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+            .await,
+        Err(ForkError::SourceNotIdle {
+            thread_id: "source-session".to_string()
+        })
+    );
+    assert_eq!(
+        sessions_in(&pool, &workspace).await,
+        vec!["source-session".to_string()],
+        "a refused fork mints nothing"
+    );
+
+    // The same row means nothing while a runtime is attached: it is only
+    // rewritten when an agent exits, so it describes the last shutdown, not now.
+    storage
+        .fork_session(
+            "source-session",
+            ForkCut::At(cut),
+            ForkSource::Live { root_messages: 4 },
+        )
+        .await
+        .expect("a live source is judged by its checkpoints alone");
+}
+
+/// A full copy has no cut to anchor it, so it needs the caller's own count to
+/// tell "everything" from "everything stored so far".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_copy_refuses_while_the_newest_turn_is_still_landing() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-lag");
+    seed_session(&pool, &workspace, "source-session").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
+
+    let (first, second) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
+    let cut = id_of(&branch_point);
+    storage
+        .save_checkpoint(
+            "source-session".to_string(),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        first,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(first, assistant("stored")),
+                    entry(second, branch_point),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    assert_eq!(
+        storage
+            .fork_session(
+                "source-session",
+                ForkCut::All,
+                ForkSource::Live { root_messages: 5 }
+            )
+            .await,
+        Err(ForkError::Lagging {
+            expected: 5,
+            found: 3
+        }),
+        "the caller has two more messages than the database does"
+    );
+
+    // The same lag must not block a cut: what has not landed yet belongs to the
+    // turn the cut branches away from, which was never going to be copied.
+    let forked = storage
+        .fork_session(
+            "source-session",
+            ForkCut::At(cut),
+            ForkSource::Live { root_messages: 5 },
+        )
+        .await
+        .expect("a cut is unaffected by a turn still in flight");
+    assert_eq!(
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        vec![(forked.session_id.clone(), 2)]
+    );
+}
+
+/// What a fork carries over from the source besides its messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_inherits_the_name_binding_and_todos() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-inherit");
+    seed_session(&pool, &workspace, "source-session").await;
+    let workspace_storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    workspace_storage
+        .rename_session("source-session", Some("worth branching"))
+        .await
+        .unwrap();
+
+    let turn = TurnId::from(MessageId::new());
+    PgSessionStorage::new(pool.clone(), &workspace, "source-session")
+        .save_checkpoint(
+            "source-session".to_string(),
+            StoredCheckpoint {
+                todos: vec![TodoItem {
+                    title: "ship the fork".to_string(),
+                    done: false,
+                }],
+                ..checkpoint(
+                    "source-session",
+                    vec![
+                        entry(
+                            turn,
+                            Message::User(UserMessage::text(MessageId::new(), "q")),
+                        ),
+                        entry(turn, assistant("a")),
+                    ],
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+    let forked = workspace_storage
+        .fork_session("source-session", ForkCut::All, ForkSource::Cold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        forked.name.as_deref(),
+        Some("worth branching"),
+        "the name is copied as-is; no prefix is added"
+    );
+    let copied_checkpoint = PgSessionStorage::new(pool.clone(), &workspace, &forked.session_id)
+        .load_checkpoint(&forked.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        copied_checkpoint.todos.len(),
+        1,
+        "todos come over at their latest value, matching what a rewind leaves behind"
+    );
+    assert_eq!(copied_checkpoint.todos[0].title, "ship the fork");
+
+    let summaries = workspace_storage.list_sessions().await.unwrap();
+    assert_eq!(
+        summaries[0].session_id, forked.session_id,
+        "the copy is the most recently touched session"
+    );
+    assert_eq!(summaries[0].name.as_deref(), Some("worth branching"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_a_session_that_does_not_exist_is_refused() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-missing");
+
+    assert_eq!(
+        WorkspaceStorage::new(pool.clone(), &workspace)
+            .fork_session("never-existed", ForkCut::All, ForkSource::Cold)
+            .await,
+        Err(ForkError::SourceNotFound)
+    );
+    assert!(sessions_in(&pool, &workspace).await.is_empty());
 }

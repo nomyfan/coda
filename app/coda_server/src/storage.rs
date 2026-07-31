@@ -1,11 +1,13 @@
 use crate::jsonb::Json;
 use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints};
 use coda_agent::HistoryEntry;
+use coda_agent::ThreadId;
 use coda_agent::agent::ReplyTarget;
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
 use coda_tools::TodoItem;
+use diesel::expression::IntoSql;
 use diesel::prelude::*;
 use diesel::sql_types::{Array, Jsonb, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -381,6 +383,282 @@ impl WorkspaceStorage {
             .map_err(|err| format!("failed to delete session {session_id}: {err}"))
     }
 
+    /// Copy a session under a freshly minted id, keeping the turns before `cut`.
+    /// The source is only read.
+    ///
+    /// All or nothing, and under one snapshot: the copy runs a statement per
+    /// thread, and REPEATABLE READ is what stops those statements from seeing
+    /// the source grow between them.
+    pub async fn fork_session(
+        &self,
+        source_id: &str,
+        cut: ForkCut,
+        source: ForkSource,
+    ) -> Result<ForkedSession, ForkError> {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn().await.map_err(ForkError::Persistence)?;
+
+        conn.build_transaction()
+            .repeatable_read()
+            .run(async |conn| {
+                let (name, model_binding) = sessions::table
+                    .find((&self.workspace_id, source_id))
+                    .select((sessions::name, sessions::model_binding))
+                    .first::<(Option<String>, Json<SessionModelBinding>)>(conn)
+                    .await
+                    .optional()?
+                    .ok_or(ForkError::SourceNotFound)?;
+
+                // Every thread parked at `Generation` is what makes the source a
+                // resting point: nothing is waiting on a tool result, an approval
+                // or a sub-agent reply.
+                let busy: Option<String> = thread_checkpoints::table
+                    .filter(
+                        thread_checkpoints::workspace_id
+                            .eq(&self.workspace_id)
+                            .and(thread_checkpoints::session_id.eq(source_id))
+                            .and(
+                                thread_checkpoints::resume_point
+                                    .ne(Json(StoredResumePoint::Generation)),
+                            ),
+                    )
+                    .select(thread_checkpoints::thread_id)
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if let Some(thread_id) = busy {
+                    return Err(ForkError::ThreadBusy { thread_id });
+                }
+
+                // Checkpoints alone don't prove a cold source is at rest: a task
+                // queued behind the last turn outlives shutdown in the runtime
+                // snapshot, and `Session::open` replays it, while every
+                // checkpoint still reads `Generation`.
+                if source == ForkSource::Cold
+                    && let Some(Json(snapshot)) = runtime_snapshots::table
+                        .find((&self.workspace_id, source_id))
+                        .select(runtime_snapshots::snapshot)
+                        .first::<Json<StoredRuntimeSnapshot>>(conn)
+                        .await
+                        .optional()?
+                    && let Some(thread_id) = queued_work(&snapshot)
+                {
+                    return Err(ForkError::SourceNotIdle { thread_id });
+                }
+
+                let keep = self.retained_turns(conn, source_id, &cut, source).await?;
+
+                let checkpoints = thread_checkpoints::table
+                    .filter(
+                        thread_checkpoints::workspace_id
+                            .eq(&self.workspace_id)
+                            .and(thread_checkpoints::session_id.eq(source_id)),
+                    )
+                    .select((
+                        thread_checkpoints::thread_id,
+                        thread_checkpoints::agent_name,
+                        thread_checkpoints::parent_thread_id,
+                        thread_checkpoints::derivation_key,
+                        thread_checkpoints::reply_target,
+                        thread_checkpoints::resume_point,
+                        thread_checkpoints::todos,
+                        thread_checkpoints::suspended_at,
+                    ))
+                    .load::<StoredThreadRow>(conn)
+                    .await?;
+                let thread_ids = remap_thread_ids(&checkpoints, source_id, &new_id)?;
+
+                // How much of each thread survives the cut. Retained turns are
+                // always a prefix, so `max_seq + 1 == count` must hold; checking
+                // it turns a broken invariant into a rollback instead of a copy
+                // whose history has a hole every later save would append past.
+                let retained: HashMap<String, (i64, Option<i32>)> = messages::table
+                    .filter(
+                        messages::workspace_id
+                            .eq(&self.workspace_id)
+                            .and(messages::session_id.eq(source_id))
+                            .and(messages::turn_id.eq_any(&keep)),
+                    )
+                    .group_by(messages::thread_id)
+                    .select((
+                        messages::thread_id,
+                        diesel::dsl::count_star(),
+                        diesel::dsl::max(messages::seq),
+                    ))
+                    .load::<(String, i64, Option<i32>)>(conn)
+                    .await?
+                    .into_iter()
+                    .map(|(thread_id, count, max_seq)| (thread_id, (count, max_seq)))
+                    .collect();
+
+                // Strict insert: `do_nothing` on a collision would pour this
+                // session's messages into whatever already holds that id.
+                diesel::insert_into(sessions::table)
+                    .values((
+                        sessions::workspace_id.eq(&self.workspace_id),
+                        sessions::session_id.eq(&new_id),
+                        sessions::name.eq(&name),
+                        sessions::model_binding.eq(model_binding),
+                    ))
+                    .execute(conn)
+                    .await?;
+
+                for checkpoint in &checkpoints {
+                    let Some(&(count, max_seq)) = retained.get(&checkpoint.thread_id) else {
+                        // Nothing left of this thread: a missing checkpoint and an
+                        // empty one restore the same state, and a stateless
+                        // thread's id could never be addressed again anyway.
+                        continue;
+                    };
+                    if max_seq.map(|max_seq| i64::from(max_seq) + 1) != Some(count) {
+                        return Err(ForkError::HistoryNotContiguous {
+                            thread_id: checkpoint.thread_id.clone(),
+                        });
+                    }
+                    let new_thread_id = &thread_ids[&checkpoint.thread_id];
+
+                    // Payloads stay inside the database — some carry inline
+                    // base64 images.
+                    diesel::insert_into(messages::table)
+                        .values(
+                            messages::table
+                                .filter(
+                                    messages::workspace_id
+                                        .eq(&self.workspace_id)
+                                        .and(messages::session_id.eq(source_id))
+                                        .and(messages::thread_id.eq(&checkpoint.thread_id))
+                                        .and(messages::turn_id.eq_any(&keep)),
+                                )
+                                .select((
+                                    messages::workspace_id,
+                                    new_id.as_str().into_sql::<Text>(),
+                                    new_thread_id.as_str().into_sql::<Text>(),
+                                    messages::seq,
+                                    messages::message_id,
+                                    messages::turn_id,
+                                    messages::role,
+                                    messages::origin_message_id,
+                                    messages::origin_call_id,
+                                    messages::payload,
+                                )),
+                        )
+                        .into_columns((
+                            messages::workspace_id,
+                            messages::session_id,
+                            messages::thread_id,
+                            messages::seq,
+                            messages::message_id,
+                            messages::turn_id,
+                            messages::role,
+                            messages::origin_message_id,
+                            messages::origin_call_id,
+                            messages::payload,
+                        ))
+                        .execute(conn)
+                        .await?;
+
+                    let reply_target = checkpoint.reply_target.clone().map(|Json(mut target)| {
+                        if let Some(mapped) = thread_ids.get(&target.sender_thread_id) {
+                            target.sender_thread_id = mapped.clone();
+                        }
+                        Json(target)
+                    });
+                    diesel::insert_into(thread_checkpoints::table)
+                        .values((
+                            thread_checkpoints::workspace_id.eq(&self.workspace_id),
+                            thread_checkpoints::session_id.eq(&new_id),
+                            thread_checkpoints::thread_id.eq(new_thread_id),
+                            thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
+                            thread_checkpoints::parent_thread_id.eq(checkpoint
+                                .parent_thread_id
+                                .as_ref()
+                                .map(|parent| &thread_ids[parent])),
+                            thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
+                            thread_checkpoints::reply_target.eq(reply_target),
+                            thread_checkpoints::resume_point.eq(&checkpoint.resume_point),
+                            thread_checkpoints::todos.eq(&checkpoint.todos),
+                            thread_checkpoints::suspended_at.eq(checkpoint.suspended_at),
+                            thread_checkpoints::message_count.eq(count as i32),
+                            thread_checkpoints::pending_approval
+                                .eq(awaits_approval(&checkpoint.resume_point.0)),
+                        ))
+                        .execute(conn)
+                        .await?;
+                }
+
+                Ok(ForkedSession {
+                    session_id: new_id.clone(),
+                    name,
+                })
+            })
+            .await
+    }
+
+    /// The turns a fork keeps, as a single predicate over every thread.
+    ///
+    /// `turn_id` is a UUID and carries no order of its own, so "the turns before
+    /// this one" can only be answered by the root thread's `seq`.
+    ///
+    /// This is rewind's mirror: rewind drops the turns from a user message on
+    /// (`seq >= target`), a fork keeps the ones before it.
+    async fn retained_turns(
+        &self,
+        conn: &mut AsyncPgConnection,
+        source_id: &str,
+        cut: &ForkCut,
+        source: ForkSource,
+    ) -> Result<Vec<uuid::Uuid>, ForkError> {
+        let root_thread = messages::table.filter(
+            messages::workspace_id
+                .eq(&self.workspace_id)
+                .and(messages::session_id.eq(source_id))
+                .and(messages::thread_id.eq(source_id)),
+        );
+        let cut_seq = match cut {
+            ForkCut::At(target) => Some(
+                root_thread
+                    .filter(
+                        messages::message_id
+                            .eq(target.as_uuid())
+                            .and(messages::role.eq("user")),
+                    )
+                    .select(messages::seq)
+                    .first::<i32>(conn)
+                    .await
+                    .optional()?
+                    .ok_or(ForkError::CutNotFound)?,
+            ),
+            // A full copy has no cut to anchor it, so the runtime's own history
+            // length is what tells "everything" from "everything stored so far".
+            ForkCut::All => {
+                if let ForkSource::Live { root_messages } = source {
+                    let stored: i64 = root_thread.count().get_result(conn).await?;
+                    if (stored as usize) < root_messages {
+                        return Err(ForkError::Lagging {
+                            expected: root_messages,
+                            found: stored as usize,
+                        });
+                    }
+                }
+                None
+            }
+        };
+
+        // No such check for a cut, because the turn it opens is the one turn a
+        // fork does *not* keep. A message at `seq = k` is only visible once the
+        // transaction that appended it committed, and that transaction wrote
+        // `0..k` contiguously — so seeing the cut proves everything kept is
+        // stored, however far behind the rest of the session may be.
+        let mut turns = root_thread
+            .select(messages::turn_id)
+            .distinct()
+            .into_boxed();
+        if let Some(cut_seq) = cut_seq {
+            turns = turns.filter(messages::seq.lt(cut_seq));
+        }
+        Ok(turns.load(conn).await?)
+    }
+
     /// The workspace's sessions, most recently active first.
     ///
     /// The two derived columns stay in the query rather than becoming N+1 reads:
@@ -560,6 +838,180 @@ impl From<diesel::result::Error> for RewindError {
     fn from(err: diesel::result::Error) -> Self {
         Self::Persistence(format!("failed to rewind the session: {err}"))
     }
+}
+
+/// Where a fork cuts the source session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkCut {
+    /// Keep the turns before the one this user message opens. Naming a turn by
+    /// the message that opened it is what a rewind does too, and it keeps the
+    /// copy clear of the one turn that might still be being written.
+    At(MessageId),
+    /// Keep everything stored.
+    All,
+}
+
+/// Whether a runtime is attached to the source while the copy runs.
+///
+/// The single answer to that question, because two checks need it and storage
+/// cannot see it for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkSource {
+    /// Attached and at rest. `root_messages` is the runtime's root history
+    /// length; a shorter database means the newest turn has not landed yet.
+    Live { root_messages: usize },
+    /// Nothing attached, so the stored state is the whole truth — including a
+    /// runtime snapshot, which is only rewritten when an agent exits and
+    /// therefore speaks for the source only here.
+    Cold,
+}
+
+/// A session minted by a fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkedSession {
+    pub session_id: String,
+    pub name: Option<String>,
+}
+
+/// Why a fork produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkError {
+    /// No such session in this workspace.
+    SourceNotFound,
+    /// No such user message on the source's root thread. Also covers a cut that
+    /// simply has not been persisted yet — indistinguishable here, so the caller
+    /// decides whether to retry.
+    CutNotFound,
+    /// A thread is not parked at a plain generation boundary. Whether that is
+    /// permanent or just a checkpoint still in flight depends on whether the
+    /// source is live, which only the caller knows.
+    ThreadBusy {
+        thread_id: String,
+    },
+    /// A cold source's runtime snapshot still holds work the next open would
+    /// resume. The same source would be refused as busy while live.
+    SourceNotIdle {
+        thread_id: String,
+    },
+    /// The stored root history is shorter than the caller's, so the newest turn
+    /// has not landed yet.
+    Lagging {
+        expected: usize,
+        found: usize,
+    },
+    /// A thread's retained messages are not `[0, count)`. Retained turns are
+    /// always a prefix, so this means that invariant broke upstream.
+    HistoryNotContiguous {
+        thread_id: String,
+    },
+    /// A checkpoint's parent was never mapped, so the thread graph is not rooted
+    /// at the session.
+    OrphanThread {
+        thread_id: String,
+    },
+    Persistence(String),
+}
+
+impl std::fmt::Display for ForkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceNotFound => write!(f, "no such session"),
+            Self::CutNotFound => write!(f, "no such user message in this session"),
+            Self::ThreadBusy { thread_id } => write!(f, "thread {thread_id} is still mid-turn"),
+            Self::SourceNotIdle { thread_id } => {
+                write!(f, "thread {thread_id} has work queued from a previous run")
+            }
+            Self::Lagging { expected, found } => write!(
+                f,
+                "the session's newest turn is not stored yet ({found} of {expected} messages)"
+            ),
+            Self::HistoryNotContiguous { thread_id } => {
+                write!(f, "thread {thread_id} would be copied with a gap")
+            }
+            Self::OrphanThread { thread_id } => {
+                write!(f, "thread {thread_id} has no reachable parent")
+            }
+            Self::Persistence(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ForkError {}
+
+impl From<diesel::result::Error> for ForkError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Persistence(format!("failed to fork the session: {err}"))
+    }
+}
+
+/// A source session's checkpoint row, as a fork reads it.
+#[derive(Queryable)]
+struct StoredThreadRow {
+    thread_id: String,
+    agent_name: String,
+    parent_thread_id: Option<String>,
+    derivation_key: Option<String>,
+    reply_target: Option<Json<ReplyTarget>>,
+    resume_point: Json<StoredResumePoint>,
+    todos: Json<Vec<TodoItem>>,
+    suspended_at: jiff_diesel::Timestamp,
+}
+
+/// The first thread a persisted snapshot would put back to work on the next
+/// open, if any — matching what `Session::open` treats as a resuming session.
+fn queued_work(snapshot: &StoredRuntimeSnapshot) -> Option<String> {
+    if let Some(thread_id) = snapshot.active_threads.values().next() {
+        return Some(thread_id.clone());
+    }
+    snapshot
+        .agent_drained_envelopes
+        .values()
+        .chain(snapshot.drained_envelopes.values())
+        .flatten()
+        .next()
+        .map(|envelope| envelope.to.thread_id.as_ref().to_string())
+}
+
+/// Rebuild every thread id under `new_root`.
+///
+/// Thread ids are derived, not free: the root thread's id *is* the session id,
+/// and each child is `uuid5(parent_thread_id, derivation_key)`. Keeping the old
+/// ones would leave the new session unable to find its own root history, and
+/// would make a stateful sub-agent miss its thread the next time it is called.
+fn remap_thread_ids(
+    threads: &[StoredThreadRow],
+    old_root: &str,
+    new_root: &str,
+) -> Result<HashMap<String, String>, ForkError> {
+    let mut mapped = HashMap::from([(old_root.to_string(), new_root.to_string())]);
+    let mut pending: Vec<&StoredThreadRow> = threads
+        .iter()
+        .filter(|thread| thread.thread_id != old_root)
+        .collect();
+
+    // Parents before children. The graph is shallow, so rescanning beats
+    // building an index.
+    while !pending.is_empty() {
+        let unresolved = pending.len();
+        pending.retain(|thread| {
+            let (Some(parent), Some(key)) = (&thread.parent_thread_id, &thread.derivation_key)
+            else {
+                return true;
+            };
+            let Some(new_parent) = mapped.get(parent).cloned() else {
+                return true;
+            };
+            let derived = ThreadId::from_uuid5(&ThreadId::from(new_parent), key);
+            mapped.insert(thread.thread_id.clone(), derived.as_ref().to_string());
+            false
+        });
+        if pending.len() == unresolved {
+            return Err(ForkError::OrphanThread {
+                thread_id: pending[0].thread_id.clone(),
+            });
+        }
+    }
+    Ok(mapped)
 }
 
 impl PgSessionStorage {

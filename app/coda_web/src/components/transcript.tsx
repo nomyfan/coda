@@ -13,6 +13,7 @@ import {
   FileText,
   FolderTree,
   ListChecks,
+  GitBranch,
   ListTodo,
   type LucideIcon,
   MessageSquare,
@@ -37,12 +38,15 @@ import { Markdown } from "@/components/markdown";
 import {
   beginEdit,
   discardedFrom,
+  forkActiveSession,
   selectActiveApprovalCount,
   selectActiveEditing,
   selectActiveEntries,
+  selectActiveForkKey,
   selectActiveKey,
   selectActiveRunning,
   selectCanRewind,
+  selectForking,
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
@@ -84,6 +88,30 @@ function findFinalAssistantIndex(entries: TranscriptEntry[]) {
   return -1;
 }
 
+/** How a turn ended, rather than more work inside it. An abort emits both: the
+ * marker, and then the error the interrupted run returns. */
+function isTurnEndNotice(entry: TranscriptEntry) {
+  return entry.kind === "error" || (entry.kind === "system" && entry.status === "aborted");
+}
+
+/**
+ * Where a turn's answer sits, or -1 when the turn has none to lift out of the
+ * process list.
+ *
+ * Anything after the reply means the turn went on past it — except these
+ * notices, which land *after* the partial reply an interrupted model did
+ * produce. Letting them hide it would bury the reply in the process list along
+ * with its copy and fork actions, and only until a reload: they are events
+ * rather than messages, so they never come back with the history.
+ */
+export function finalAssistantIndexOf(entries: TranscriptEntry[]) {
+  const index = findFinalAssistantIndex(entries);
+  if (index < 0) {
+    return -1;
+  }
+  return entries.slice(index + 1).every(isTurnEndNotice) ? index : -1;
+}
+
 /** Entries rendered as collapsed disclosure rows inside an assistant turn. */
 function hasDisclosureWork(entries: TranscriptEntry[]) {
   return entries.some(
@@ -103,7 +131,7 @@ function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
   };
 }
 
-function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
+export function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
   const items: TranscriptRenderItem[] = [];
   let index = 0;
 
@@ -169,6 +197,9 @@ export const Transcript = memo(function Transcript({
       : new Set(entries.slice(discardFrom).map((entry) => entry.id));
   const lastEntry = entries.at(-1);
   const lastEntryContent = lastEntry?.content;
+  // A fork keeps the turns *before* the message it cuts at, so the opening one
+  // has nothing to keep — that copy would just be an empty session.
+  const firstUserId = entries.find((entry) => entry.kind === "user")?.id;
 
   function handleScroll() {
     const el = scrollRef.current;
@@ -221,7 +252,7 @@ export const Transcript = memo(function Transcript({
           </div>
         ) : (
           <>
-            {renderItems.map((item) => {
+            {renderItems.map((item, index) => {
               const anchor = item.type === "entry" ? item.entry.id : item.entries[0]?.id;
               const discarded = Boolean(anchor && discardedIds?.has(anchor));
               return (
@@ -233,9 +264,15 @@ export const Transcript = memo(function Transcript({
                   )}
                 >
                   {item.type === "entry" ? (
-                    <TranscriptItem entry={item.entry} />
+                    <TranscriptItem entry={item.entry} forkable={item.entry.id !== firstUserId} />
                   ) : (
-                    <AssistantTurnBubble entries={item.entries} approvalPending={approvalPending} />
+                    <AssistantTurnBubble
+                      entries={item.entries}
+                      approvalPending={approvalPending}
+                      // Only the last turn can still be going; whatever is
+                      // behind it is over however it ended.
+                      settled={index < renderItems.length - 1 || !(running || approvalPending)}
+                    />
                   )}
                 </div>
               );
@@ -414,12 +451,16 @@ function MessageActions({
   label,
   align,
   onEdit,
+  forkFrom,
 }: {
   content: string;
   label: string;
   align: "start" | "end";
   /** Present only on a user message the session is currently able to rewind to. */
   onEdit?: () => void;
+  /** The message to branch from, on a user message that has turns before it and
+   * an id the server has acknowledged. */
+  forkFrom?: TranscriptEntry;
 }) {
   return (
     <div
@@ -440,8 +481,41 @@ function MessageActions({
           <Pencil className="size-4" />
         </Button>
       ) : null}
+      {forkFrom ? <ForkButton entry={forkFrom} /> : null}
       <CopyContentButton content={content} label={label} />
     </div>
+  );
+}
+
+/** Disabled while a fork of this session is in flight — from *any* entry, since
+ * the session has one per eligible user message plus the sidebar's and the
+ * server mints a new id per request. A success navigates to the copy, so only
+ * the failure has anything left to say here. */
+function ForkButton({ entry }: { entry: TranscriptEntry }) {
+  const key = useCodaStore(selectActiveForkKey);
+  const forking = useCodaStore(selectForking(key ?? ""));
+  const [error, setError] = useState<string>();
+  return (
+    <>
+      <Button
+        size="icon"
+        variant="ghost"
+        disabled={forking}
+        className="size-7 text-muted-foreground hover:text-foreground"
+        title="Branch a copy from before this message"
+        aria-label="Branch a copy from before this message"
+        onClick={() => {
+          setError(undefined);
+          forkActiveSession(entry.messageId!, {
+            text: entry.content,
+            images: entry.images ?? [],
+          }).catch((err: unknown) => setError(err instanceof Error ? err.message : "Fork failed"));
+        }}
+      >
+        <GitBranch className="size-4" />
+      </Button>
+      {error ? <span className="px-1 text-xs text-destructive">{error}</span> : null}
+    </>
   );
 }
 
@@ -694,16 +768,21 @@ function PendingTurnBubble() {
 function AssistantTurnBubble({
   entries,
   approvalPending,
+  settled,
 }: {
   entries: TranscriptEntry[];
   approvalPending: boolean;
+  /** Whether this turn is over, which nothing in the turn itself can say: an
+   * abort leaves a marker, but only as a live event, and if every tool happened
+   * to finish cleanly before the cancel landed the stored turn is
+   * indistinguishable from one still in flight. So it comes from the caller,
+   * which knows whether this is the last turn and whether the session is going. */
+  settled: boolean;
 }) {
-  const lastIndex = findFinalAssistantIndex(entries);
-  const finalAssistantIndex = lastIndex === entries.length - 1 ? lastIndex : -1;
+  const finalAssistantIndex = finalAssistantIndexOf(entries);
   const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
   const completedFinalAssistant = finalAssistant?.isFinalResponse ? finalAssistant : undefined;
-  const processComplete =
-    completedFinalAssistant !== undefined || entries.some((entry) => entry.status === "aborted");
+  const processComplete = completedFinalAssistant !== undefined || settled;
   const intermediateEntries =
     finalAssistantIndex >= 0
       ? entries.filter((_, index) => index !== finalAssistantIndex)
@@ -846,7 +925,7 @@ function disclosureTitle(entry: TranscriptEntry) {
   return entryTitle(entry);
 }
 
-function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
+function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkable: boolean }) {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const canRewind = useCodaStore(selectCanRewind);
   const messageId = entry.messageId;
@@ -891,6 +970,7 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
             label="message"
             align="end"
             onEdit={canRewind && messageId ? () => beginEdit(messageId) : undefined}
+            forkFrom={forkable && messageId ? entry : undefined}
           />
         </div>
         {lightboxIndex !== null && entry.images && (
@@ -906,11 +986,11 @@ function UserMessageBubble({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
-function TranscriptItem({ entry }: { entry: TranscriptEntry }) {
+function TranscriptItem({ entry, forkable }: { entry: TranscriptEntry; forkable?: boolean }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
   if (entry.kind === "user") {
-    return <UserMessageBubble entry={entry} />;
+    return <UserMessageBubble entry={entry} forkable={forkable === true} />;
   }
 
   const tone =

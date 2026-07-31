@@ -415,6 +415,13 @@ struct TestOpener {
     /// Fail the rebuild a rewind performs after its truncation has committed.
     fail_open_after_rewind: bool,
     rewound: Arc<std::sync::atomic::AtomicBool>,
+    /// The cuts `fork` was asked for, in order, with what the gate said about
+    /// the source.
+    forks: Arc<std::sync::Mutex<Vec<(ForkCut, ForkSource)>>>,
+    /// Holds `fork` inside the storage call until released, so a test can drive
+    /// another command while the copy is in flight.
+    fork_gate: Option<Arc<Notify>>,
+    fork_error: Option<ForkError>,
 }
 
 impl TestOpener {
@@ -486,6 +493,9 @@ impl TestOpener {
             fail_effort_update: false,
             fail_open_after_rewind: false,
             rewound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fork_gate: None,
+            fork_error: None,
         }
     }
 }
@@ -600,6 +610,33 @@ impl SessionOpener for TestOpener {
         })
     }
 
+    /// A stand-in for the SQL one. These tests are about the gate around the
+    /// copy — idleness, the attach race, the borrowed entry — not about how the
+    /// copy itself is spelled, which `storage_pg` covers.
+    fn fork<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        cut: ForkCut,
+        source: ForkSource,
+    ) -> Pin<Box<dyn Future<Output = Result<ForkedSession, ForkError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.forks
+                .lock()
+                .expect("forks mutex poisoned")
+                .push((cut, source));
+            if let Some(gate) = &self.fork_gate {
+                gate.notified().await;
+            }
+            match &self.fork_error {
+                Some(err) => Err(err.clone()),
+                None => Ok(ForkedSession {
+                    session_id: "forked-session".to_string(),
+                    name: None,
+                }),
+            }
+        })
+    }
+
     fn update_reasoning_effort<'a>(
         &'a self,
         _key: &'a SessionKey,
@@ -631,6 +668,28 @@ fn hub_with_failing_metadata(system_prompt: &str) -> SessionHub {
 
 fn key() -> SessionKey {
     ("ws".to_string(), "s1".to_string())
+}
+
+/// A hub whose opener stays reachable, for tests that assert on what the opener
+/// was asked for or that need to open its gates.
+fn hub_and_opener(opener: TestOpener) -> (Arc<SessionHub>, Arc<TestOpener>) {
+    let opener = Arc::new(opener);
+    (
+        Arc::new(SessionHub::new(opener.clone(), RelayConfig::default())),
+        opener,
+    )
+}
+
+/// Reach into the live state. Some of the windows these tests are about are
+/// opened by the runtime for a few microseconds, which is not something the
+/// public surface can hold still.
+async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState) -> R) -> R {
+    let entry = hub.get_entry(&key()).expect("a live entry");
+    let mut guard = entry.inner.clone().lock_owned().await;
+    let EntryPhase::Live(live) = &mut guard.phase else {
+        panic!("the entry is not live");
+    };
+    f(live)
 }
 
 /// Await the next `RelayEvent` matching `pred`, skipping others.
@@ -1802,4 +1861,210 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
         hub.get_entry(&key()).is_none(),
         "the slot must be free so the next attach reads the truncated state"
     );
+}
+
+/// A task sent during a running turn queues rather than being refused, and a
+/// settling turn only pops its own message. So `turn_running` going false does
+/// not mean the session is idle — there may be a task the runtime has not
+/// reached yet, and a fork landing there would copy a session that is about to
+/// grow.
+#[tokio::test]
+async fn forking_is_refused_while_a_task_is_queued_behind_the_current_turn() {
+    let (hub, opener) = hub_and_opener(TestOpener::new("hold", ToolApprovalMode::Auto));
+    let _attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    for task in ["first", "second"] {
+        let outcome = hub
+            .command(
+                key(),
+                1,
+                SessionCommand::Task {
+                    task: task.into(),
+                    images: vec![],
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, CommandOutcome::TaskAccepted { .. }),
+            "a task sent during a running turn queues instead of being refused"
+        );
+    }
+    assert_eq!(
+        with_live(&hub, |live| live.unsettled_user_messages.len()).await,
+        2,
+        "both submissions are waiting to settle"
+    );
+
+    // The window the forwarder opens between one turn settling and the next
+    // one's first event: the flag is already down, the queue is not empty.
+    with_live(&hub, |live| live.turn_running = false).await;
+
+    assert!(
+        matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle),
+        "a queued task makes the session busy even with the flag down"
+    );
+    assert!(
+        opener.forks.lock().unwrap().is_empty(),
+        "a refused fork never reaches storage"
+    );
+}
+
+/// Nothing live means the stored state is the whole truth, so there is no
+/// in-memory length to check it against — and the entry the gate borrowed must
+/// not be left behind.
+#[tokio::test]
+async fn forking_a_session_nobody_opened_leaves_no_entry_behind() {
+    let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
+
+    let outcome = hub.fork(key(), None).await;
+
+    assert!(matches!(outcome, ForkOutcome::Forked(_)));
+    assert_eq!(
+        opener.forks.lock().unwrap().as_slice(),
+        [(ForkCut::All, ForkSource::Cold)]
+    );
+    assert!(
+        hub.get_entry(&key()).is_none(),
+        "the borrowed entry is removed, not left as an empty shell"
+    );
+}
+
+/// A full copy of a live session carries the length the client is looking at, so
+/// storage can tell "everything" from "everything stored so far".
+#[tokio::test]
+async fn forking_a_live_session_carries_its_in_memory_length() {
+    let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "go".into(),
+            images: vec![],
+        },
+    )
+    .await;
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(event) if matches!(**event, WireEvent::LlmEnd { .. }))
+    })
+    .await;
+
+    let outcome = hub.fork(key(), None).await;
+
+    assert!(matches!(outcome, ForkOutcome::Forked(_)));
+    assert_eq!(
+        opener.forks.lock().unwrap().as_slice(),
+        [(ForkCut::All, ForkSource::Live { root_messages: 2 })],
+        "the settled user message and reply are what the client can see"
+    );
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "a session that was already live stays live"
+    );
+}
+
+/// The gate's cleanup races attach: an attach can clone the borrowed entry out
+/// of the map and then block on its mutex, so removing the entry without a
+/// tombstone would let it open a runtime nothing can look up again.
+#[tokio::test]
+async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    let fork_gate = Arc::new(Notify::new());
+    opener.fork_gate = Some(fork_gate.clone());
+    let (hub, opener) = hub_and_opener(opener);
+
+    let forking = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.fork(key(), None).await }
+    });
+    // Wait until the fork is inside storage, holding the entry it created.
+    while opener.forks.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let attaching = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.attach(key(), 1, "prov".into(), None, false).await }
+    });
+    // Let the attach reach the map and block on the mutex, so it is holding the
+    // very entry the fork is about to drop.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    fork_gate.notify_waiters();
+    assert!(matches!(
+        forking.await.expect("fork task"),
+        ForkOutcome::Forked(_)
+    ));
+    let attached = attaching
+        .await
+        .expect("attach task")
+        .expect("the attach survives the entry it waited on being removed");
+    drop(attached);
+
+    // The proof it landed on a live slot the hub can find: a command routes.
+    assert!(
+        matches!(
+            hub.command(
+                key(),
+                1,
+                SessionCommand::Task {
+                    task: "go".into(),
+                    images: vec![],
+                },
+            )
+            .await,
+            CommandOutcome::TaskAccepted { .. }
+        ),
+        "the attach owns an entry that is still in the map"
+    );
+}
+
+/// `ThreadBusy` means different things depending on who is asking. With a
+/// runtime attached the session was just checked to be idle, so a thread parked
+/// mid-turn in the database is a checkpoint still in flight — retry. With no
+/// runtime, the stored state is all there is and it really is parked.
+#[tokio::test]
+async fn a_busy_thread_is_retryable_only_while_the_source_is_live() {
+    let busy = ForkError::ThreadBusy {
+        thread_id: "s1".into(),
+    };
+
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    opener.fork_error = Some(busy.clone());
+    let (cold_hub, _) = hub_and_opener(opener);
+    assert!(
+        matches!(cold_hub.fork(key(), None).await, ForkOutcome::Failed(_)),
+        "nothing live: the stored state is the whole truth"
+    );
+
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    opener.fork_error = Some(busy);
+    let (live_hub, _) = hub_and_opener(opener);
+    let _attach = live_hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    assert!(
+        matches!(live_hub.fork(key(), None).await, ForkOutcome::Retryable(_)),
+        "live and idle: the database is only lagging"
+    );
+}
+
+/// Storage's own idle check is the cold twin of the gate's, so it has to come
+/// back to the client as the same refusal a live session would have produced.
+#[tokio::test]
+async fn a_cold_source_holding_queued_work_refuses_like_a_busy_one() {
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    opener.fork_error = Some(ForkError::SourceNotIdle {
+        thread_id: "s1".into(),
+    });
+    let (hub, _) = hub_and_opener(opener);
+
+    assert!(matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle));
 }

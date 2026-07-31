@@ -28,7 +28,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::config::RelayConfig;
-use crate::storage::RewindError;
+use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError};
 use crate::wire::WireEvent;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
@@ -148,6 +148,18 @@ pub enum CommandOutcome {
     OpenFailed(OpenError),
 }
 
+/// Result of [`SessionRelay::fork`].
+pub enum ForkOutcome {
+    Forked(ForkedSession),
+    /// The source is not at rest — a turn is in flight, something is waiting on
+    /// a human, or a task is queued behind the current one.
+    NotIdle,
+    /// The database has not caught up with what the client is looking at yet.
+    /// Nothing was written, so the client can simply retry.
+    Retryable(String),
+    Failed(ForkError),
+}
+
 /// Builds sessions for the relay. Injected at construction: configuration is
 /// available on every instance, so commands never need to carry build logic.
 pub trait SessionOpener: Send + Sync + 'static {
@@ -181,6 +193,16 @@ pub trait SessionOpener: Send + Sync + 'static {
         key: &'a SessionKey,
         target: MessageId,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>>;
+
+    /// Copy `key` under a freshly minted session id. A cut keeps the turns
+    /// before the user message it names; an uncut copy keeps everything stored.
+    /// The source is only read.
+    fn fork<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        cut: ForkCut,
+        source: ForkSource,
+    ) -> Pin<Box<dyn Future<Output = Result<ForkedSession, ForkError>> + Send + 'a>>;
 
     /// Persist an effort update after a replacement runtime has been built but
     /// before it becomes live.
@@ -253,6 +275,18 @@ pub trait SessionRelay: Send + Sync {
         key: SessionKey,
         conn_id: ConnId,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    /// Copy `source` under a new session id, keeping the turns before the user
+    /// message named by `cut` (`None` copies everything stored).
+    ///
+    /// The source is left untouched, so unlike `delete` this needs no
+    /// latest-wins check: any connection may fork any session. It is refused
+    /// only when the source is not at rest.
+    fn fork<'a>(
+        &'a self,
+        source: SessionKey,
+        cut: Option<MessageId>,
+    ) -> Pin<Box<dyn Future<Output = ForkOutcome> + Send + 'a>>;
 
     /// The provider a live (or pending) session was opened with.
     fn provider_of<'a>(
@@ -458,6 +492,15 @@ enum EntryPhase {
     Released,
 }
 
+/// What a source session's live state says about forking it.
+enum ForkGate {
+    /// At rest; carries the in-memory history length to check the copy against.
+    Ready(usize),
+    /// Nothing live — the stored state is all there is.
+    Cold,
+    Busy,
+}
+
 struct EntryState {
     phase: EntryPhase,
     /// The single attached client — the latest-wins slot.
@@ -622,6 +665,31 @@ impl SessionHub {
             entry.inner.lock().await.phase = EntryPhase::Released;
             let _ = done_tx.send(true);
             info!(workspace_id = %entry.key.0, session_id = %entry.key.1, "session released");
+        }
+    }
+
+    /// Give back the entry a fork took the gate on.
+    ///
+    /// When the fork created it, the slot has to go — but a tombstone comes
+    /// first: an attach may already hold this `Arc` and be blocked on the mutex,
+    /// and seeing `Released` sends it back to the map for a fresh slot instead of
+    /// opening a runtime on an entry nothing can look up.
+    fn leave_fork_gate(
+        entries: &Entries,
+        entry: &Arc<SessionEntry>,
+        state: &mut EntryState,
+        borrowed: bool,
+    ) {
+        if !borrowed {
+            return;
+        }
+        state.phase = EntryPhase::Released;
+        let mut map = entries.lock().expect("entries mutex poisoned");
+        if map
+            .get(&entry.key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            map.remove(&entry.key);
         }
     }
 
@@ -1219,6 +1287,80 @@ impl SessionRelay for SessionHub {
             // Inline: the caller deletes persisted state right after.
             release.await;
             true
+        })
+    }
+
+    fn fork<'a>(
+        &'a self,
+        source: SessionKey,
+        cut: Option<MessageId>,
+    ) -> Pin<Box<dyn Future<Output = ForkOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            // Take the same gate as attach rather than checking for an entry and
+            // proceeding without one: between "no entry" and the copy, an attach
+            // could insert one, open a runtime and start a turn.
+            let (entry, mut guard) = self.lock_entry_for_attach(&source).await;
+            let borrowed = matches!(guard.phase, EntryPhase::Uninitialized);
+
+            let gate = match &guard.phase {
+                EntryPhase::Live(live) => {
+                    // `turn_running` alone does not mean idle: tasks may queue
+                    // behind a running turn, and a settled turn clears the flag
+                    // before the next one's first event sets it again.
+                    if live.turn_running
+                        || !live.pending_approvals.is_empty()
+                        || !live.unsettled_user_messages.is_empty()
+                    {
+                        ForkGate::Busy
+                    } else {
+                        ForkGate::Ready(live.snapshot.len())
+                    }
+                }
+                EntryPhase::Pending(_) => ForkGate::Busy,
+                _ => ForkGate::Cold,
+            };
+
+            let source_state = match gate {
+                // A full copy has no cut to anchor it, so the live history's
+                // length is what tells "everything" from "everything stored so
+                // far". Without a runtime there is nothing to compare against —
+                // but then the stored snapshot is worth checking instead.
+                ForkGate::Ready(root_messages) => ForkSource::Live { root_messages },
+                ForkGate::Cold => ForkSource::Cold,
+                ForkGate::Busy => {
+                    Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
+                    return ForkOutcome::NotIdle;
+                }
+            };
+            let cut = match cut {
+                Some(cut) => ForkCut::At(cut),
+                None => ForkCut::All,
+            };
+
+            let forked = self.opener.fork(&source, cut, source_state).await;
+            Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
+
+            match forked {
+                Ok(forked) => ForkOutcome::Forked(forked),
+                // These three all mean the same thing from the client's side —
+                // the database has not caught up — and none of them wrote
+                // anything, so retrying is safe. `ThreadBusy` only counts as lag
+                // while the source is live; without a runtime the stored state is
+                // all there is, and it really is parked mid-turn.
+                Err(err @ (ForkError::CutNotFound | ForkError::Lagging { .. })) => {
+                    ForkOutcome::Retryable(err.to_string())
+                }
+                Err(err @ ForkError::ThreadBusy { .. }) if !borrowed => {
+                    ForkOutcome::Retryable(err.to_string())
+                }
+                // The cold twin of the gate's own busy check, so the same source
+                // is refused the same way whether or not it happens to be open.
+                Err(ForkError::SourceNotIdle { .. }) => ForkOutcome::NotIdle,
+                Err(err) => {
+                    warn!(workspace_id = %source.0, session_id = %source.1, "fork rejected: {err}");
+                    ForkOutcome::Failed(err)
+                }
+            }
         })
     }
 

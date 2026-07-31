@@ -10,6 +10,8 @@ import {
   selectActiveProviders,
   selectActiveReasoningEffort,
   selectActiveEditing,
+  selectActiveForkDraft,
+  selectActiveKey,
   selectActiveRunning,
   selectActiveServer,
   selectActiveSessionTitle,
@@ -24,6 +26,7 @@ import {
   sendTaskToNewSession,
   setModel,
   takeOverActiveSession,
+  updateForkDraft,
   useCodaBootstrap,
   useCodaStore,
   type ReasoningEffort,
@@ -206,6 +209,8 @@ export default function App() {
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
   const activeEditing = useCodaStore(selectActiveEditing);
+  const activeForkDraft = useCodaStore(selectActiveForkDraft);
+  const activeKey = useCodaStore(selectActiveKey);
   const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
   const activeProviders = useCodaStore(selectActiveProviders);
@@ -214,6 +219,15 @@ export default function App() {
   const activeSessionTitle = useCodaStore(selectActiveSessionTitle);
   const activeUsage = useCodaStore(selectActiveUsage);
   const activeHasImages = useCodaStore(selectActiveHasImages);
+
+  const handleForkDraftChange = useCallback(
+    (text: string, images: string[]) => {
+      if (activeServer && activeKey) {
+        updateForkDraft(activeServer, activeKey, text, images);
+      }
+    },
+    [activeKey, activeServer],
+  );
 
   const newSessionTarget = useNewSessionStore((state) => state.target);
   const [newSessionModel, setNewSessionModel] = useState<{
@@ -400,10 +414,16 @@ export default function App() {
               )}
               {showComposer ? (
                 <Composer
-                  // Remounting on every change of edit target is what seeds the
-                  // draft without a sync effect: entering an edit loads that
-                  // message, leaving one empties the box.
-                  key={activeEditing ? `edit:${activeEditing.target ?? "orphan"}` : "new"}
+                  // Remounting on every change of edit target loads that
+                  // message without a sync effect. A fork draft is keyed by its
+                  // session so returning to it restores that session's text.
+                  key={
+                    activeEditing
+                      ? `edit:${activeEditing.target ?? "orphan"}`
+                      : activeForkDraft
+                        ? `fork-draft:${activeKey}`
+                        : "new"
+                  }
                   status={
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
@@ -428,6 +448,8 @@ export default function App() {
                   serverUrl={selectedServerUrl}
                   workspaceId={selectedWorkspace ?? ""}
                   editing={showingNewSession ? undefined : activeEditing}
+                  forkDraft={showingNewSession ? undefined : activeForkDraft}
+                  onForkDraftChange={handleForkDraftChange}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
                   onSend={handleSend}
                   onAbort={abort}
