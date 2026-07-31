@@ -214,10 +214,9 @@ pub struct DeleteSessionParams {
     pub session_id: String,
 }
 
-/// `fork_session` params. `cut_message_id` names any message of the source's
-/// root thread, and the copy keeps that message's whole turn plus every turn
-/// before it; omitting it copies everything stored. The new session id is minted
-/// by the server.
+/// `fork_session` params. `cut_message_id` names a user message of the source's
+/// root thread, and the copy keeps the turns before the one it opened; omitting
+/// it copies everything stored. The new session id is minted by the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkSessionParams {
     pub workspace_id: String,

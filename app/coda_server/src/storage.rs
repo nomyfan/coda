@@ -383,8 +383,8 @@ impl WorkspaceStorage {
             .map_err(|err| format!("failed to delete session {session_id}: {err}"))
     }
 
-    /// Copy a session under a freshly minted id, keeping the turns at or before
-    /// `cut`. The source is only read.
+    /// Copy a session under a freshly minted id, keeping the turns before `cut`.
+    /// The source is only read.
     ///
     /// All or nothing, and under one snapshot: the copy runs a statement per
     /// thread, and REPEATABLE READ is what stops those statements from seeing
@@ -596,8 +596,11 @@ impl WorkspaceStorage {
 
     /// The turns a fork keeps, as a single predicate over every thread.
     ///
-    /// `turn_id` is a UUID and carries no order of its own, so "this turn and
-    /// everything before it" can only be answered by the root thread's `seq`.
+    /// `turn_id` is a UUID and carries no order of its own, so "the turns before
+    /// this one" can only be answered by the root thread's `seq`.
+    ///
+    /// This is rewind's mirror: rewind drops the turns from a user message on
+    /// (`seq >= target`), a fork keeps the ones before it.
     async fn retained_turns(
         &self,
         conn: &mut AsyncPgConnection,
@@ -611,46 +614,47 @@ impl WorkspaceStorage {
                 .and(messages::session_id.eq(source_id))
                 .and(messages::thread_id.eq(source_id)),
         );
-        // Any message of the root thread will do as a cut, because what it picks
-        // out is a whole turn, and a turn is only ever copied entire.
-        let (cut_seq, cut_proves_the_turn_stored) = match cut {
-            ForkCut::At(target) => {
-                let (seq, Json(message)) = root_thread
-                    .filter(messages::message_id.eq(target.as_uuid()))
-                    .select((messages::seq, messages::payload))
-                    .first::<(i32, Json<Message>)>(conn)
+        let cut_seq = match cut {
+            ForkCut::At(target) => Some(
+                root_thread
+                    .filter(
+                        messages::message_id
+                            .eq(target.as_uuid())
+                            .and(messages::role.eq("user")),
+                    )
+                    .select(messages::seq)
+                    .first::<i32>(conn)
                     .await
                     .optional()?
-                    .ok_or(ForkError::CutNotFound)?;
-                (Some(seq), ends_its_turn(&message))
+                    .ok_or(ForkError::CutNotFound)?,
+            ),
+            // A full copy has no cut to anchor it, so the runtime's own history
+            // length is what tells "everything" from "everything stored so far".
+            ForkCut::All => {
+                if let ForkSource::Live { root_messages } = source {
+                    let stored: i64 = root_thread.count().get_result(conn).await?;
+                    if (stored as usize) < root_messages {
+                        return Err(ForkError::Lagging {
+                            expected: root_messages,
+                            found: stored as usize,
+                        });
+                    }
+                }
+                None
             }
-            ForkCut::All => (None, false),
         };
 
-        // A reply that ends a turn is written in the same checkpoint as the rest
-        // of it, so seeing it proves the turn is stored whole. Nothing else does:
-        // the message that *opens* a turn goes in a checkpoint of its own, one
-        // turn-start earlier, so a running turn's prompt is already on disk if
-        // the process stops — and a full copy has no anchor at all. Those need
-        // the caller's own history length to tell "everything" from "everything
-        // stored so far", or a fork lands between the turn settling and its
-        // checkpoint and quietly copies half of it.
-        if !cut_proves_the_turn_stored && let ForkSource::Live { root_messages } = source {
-            let stored: i64 = root_thread.count().get_result(conn).await?;
-            if (stored as usize) < root_messages {
-                return Err(ForkError::Lagging {
-                    expected: root_messages,
-                    found: stored as usize,
-                });
-            }
-        }
-
+        // No such check for a cut, because the turn it opens is the one turn a
+        // fork does *not* keep. A message at `seq = k` is only visible once the
+        // transaction that appended it committed, and that transaction wrote
+        // `0..k` contiguously — so seeing the cut proves everything kept is
+        // stored, however far behind the rest of the session may be.
         let mut turns = root_thread
             .select(messages::turn_id)
             .distinct()
             .into_boxed();
         if let Some(cut_seq) = cut_seq {
-            turns = turns.filter(messages::seq.le(cut_seq));
+            turns = turns.filter(messages::seq.lt(cut_seq));
         }
         Ok(turns.load(conn).await?)
     }
@@ -839,8 +843,9 @@ impl From<diesel::result::Error> for RewindError {
 /// Where a fork cuts the source session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkCut {
-    /// Keep the turn this message belongs to, and every turn before it. Any
-    /// message of the source's root thread names its turn.
+    /// Keep the turns before the one this user message opens. Naming a turn by
+    /// the message that opened it is what a rewind does too, and it keeps the
+    /// copy clear of the one turn that might still be being written.
     At(MessageId),
     /// Keep everything stored.
     All,
@@ -873,7 +878,7 @@ pub struct ForkedSession {
 pub enum ForkError {
     /// No such session in this workspace.
     SourceNotFound,
-    /// No such message on the source's root thread. Also covers a cut that
+    /// No such user message on the source's root thread. Also covers a cut that
     /// simply has not been persisted yet — indistinguishable here, so the caller
     /// decides whether to retry.
     CutNotFound,
@@ -911,7 +916,7 @@ impl std::fmt::Display for ForkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SourceNotFound => write!(f, "no such session"),
-            Self::CutNotFound => write!(f, "no such message in this session"),
+            Self::CutNotFound => write!(f, "no such user message in this session"),
             Self::ThreadBusy { thread_id } => write!(f, "thread {thread_id} is still mid-turn"),
             Self::SourceNotIdle { thread_id } => {
                 write!(f, "thread {thread_id} has work queued from a previous run")
@@ -950,13 +955,6 @@ struct StoredThreadRow {
     resume_point: Json<StoredResumePoint>,
     todos: Json<Vec<TodoItem>>,
     suspended_at: jiff_diesel::Timestamp,
-}
-
-/// Whether a message is the last thing its turn writes — only a reply that asks
-/// for nothing more, since after it the turn is over. A reply the user
-/// interrupted counts: it too carries no tool calls.
-fn ends_its_turn(message: &Message) -> bool {
-    matches!(message, Message::Assistant(reply) if reply.tool_calls.is_empty())
 }
 
 /// The first thread a persisted snapshot would put back to work on the next

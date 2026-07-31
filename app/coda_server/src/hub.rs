@@ -194,8 +194,9 @@ pub trait SessionOpener: Send + Sync + 'static {
         target: MessageId,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Message>, RewindError>> + Send + 'a>>;
 
-    /// Copy `key` under a freshly minted session id, keeping the turns at or
-    /// before `cut`. The source is only read.
+    /// Copy `key` under a freshly minted session id. A cut keeps the turns
+    /// before the user message it names; an uncut copy keeps everything stored.
+    /// The source is only read.
     fn fork<'a>(
         &'a self,
         key: &'a SessionKey,

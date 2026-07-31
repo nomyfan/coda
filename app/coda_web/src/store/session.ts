@@ -45,8 +45,7 @@ export type TranscriptEntry = {
   id: string;
   kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
   /** The server's id for this message, once the server has acknowledged it.
-   * On a user entry that is the condition for rewinding to it; on a final
-   * assistant reply, for forking from it. */
+   * On a user entry that is the condition for rewinding or forking from it. */
   messageId?: string;
   agentName?: string;
   threadId?: string;
@@ -130,6 +129,10 @@ export type OpenedSession = {
      * see `reconcileEditing`. */
     precedingUserMessages: number;
   };
+  /** The prompt a fork branched away from, handed to this copy so its composer
+   * opens with it. Read once, when the composer mounts, and cleared on send —
+   * so unlike `editing` it is a seed and the composer owns it from there. */
+  seed?: { text: string; images: string[] };
   /** Provider this session currently uses; set from the server snapshot. */
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
@@ -163,9 +166,9 @@ type CodaState = {
   /** The active session within `activeServer`. */
   activeKey?: SessionKey;
   /** Sessions with a fork in flight, by `forkKey`. Shared rather than local to
-   * a button because one session has many fork entries — one per reply, plus
-   * the sidebar — and the server mints a new id per request, so a second click
-   * anywhere leaves a second copy behind. */
+   * a button because one session has many fork entries — one per eligible user
+   * message, plus the sidebar — and the server mints a new id per request, so a
+   * second click anywhere leaves a second copy behind. */
   forking: Record<string, true>;
 };
 
@@ -622,8 +625,6 @@ function finishAssistant(
   const isFinalResponse = event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.thread_id, {
-      // Only now does the streamed entry learn its id, which is what lets a
-      // fork name it as a cut.
       messageId: event.message.message_id,
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
@@ -1539,6 +1540,9 @@ function appendUserMessage(
     session.draft = false;
     session.running = true;
     session.firstUserMessage = firstUserMessage;
+    // The seeded prompt has become a message; leaving it would repopulate the
+    // composer the next time this session is opened.
+    delete session.seed;
     session.entries.push({
       id: entryId,
       kind: "user",
@@ -2230,8 +2234,10 @@ function setForking(key: string, inFlight: boolean) {
 }
 
 /**
- * Copy a session into a new one and switch to it. `cutMessageId` names the
- * message whose turn to branch from; omitting it copies everything stored.
+ * Copy a session into a new one and switch to it. `cutMessageId` names the user
+ * message to branch away from — the copy keeps the turns before it — and `seed`
+ * is that message, handed to the copy's composer. Omitting both copies
+ * everything stored.
  *
  * Throws on failure, with the reason as its message — a fork that mints nothing
  * has to say so where the user clicked, since nothing renders the activity log.
@@ -2244,6 +2250,7 @@ export async function forkSession(
   workspaceId: string,
   sessionId: string,
   cutMessageId?: string,
+  seed?: { text: string; images: string[] },
 ): Promise<void> {
   const key = forkKey(server, workspaceId, sessionId);
   if (codaStore.getState().forking[key]) {
@@ -2263,6 +2270,15 @@ export async function forkSession(
     const forked = await retryWhileNotReady(() => rpc.request("fork_session", params));
     setCatalog(codaStore, server, forked.workspaces, true);
     openSession(server, workspaceId, forked.session_id);
+    if (seed) {
+      const copyKey = sessionKey(workspaceId, forked.session_id);
+      updateState(codaStore, (state) => {
+        const copy = draftSession(state, server, copyKey);
+        if (copy) {
+          copy.seed = seed;
+        }
+      });
+    }
   } catch (err) {
     const detail = isServerError(err) ? err.message : "Connection lost before the fork started";
     addSessionActivity(server, workspaceId, sessionId, {
@@ -2290,14 +2306,17 @@ export const selectActiveForkKey = (state: CodaStoreState) => {
 };
 
 /** Fork the active session — the transcript's entry point. */
-export async function forkActiveSession(cutMessageId?: string): Promise<void> {
+export async function forkActiveSession(
+  cutMessageId?: string,
+  seed?: { text: string; images: string[] },
+): Promise<void> {
   const active = currentActive();
   // A draft was never opened on the server, so there is nothing to copy.
   if (!active || active.session.draft) {
     return;
   }
   const { workspaceId, sessionId } = active.session;
-  await forkSession(active.server, workspaceId, sessionId, cutMessageId);
+  await forkSession(active.server, workspaceId, sessionId, cutMessageId, seed);
 }
 
 export function openSession(server: string, workspaceId: string, sessionId: string) {
@@ -2861,6 +2880,7 @@ export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
 const EMPTY_USAGE: UsageRecord[] = [];
 export const selectActiveEditing = (state: CodaStoreState) => activeSessionOf(state)?.editing;
+export const selectActiveSeed = (state: CodaStoreState) => activeSessionOf(state)?.seed;
 /** Whether a message can be pulled back in to be rewritten. Mirrors the
  * server's own precondition, so the entry point is only offered when the
  * request would actually be accepted. */

@@ -46,6 +46,7 @@ export const Composer = memo(function Composer({
   serverUrl,
   workspaceId,
   editing,
+  seed,
   onSetModel,
   onSend,
   onAbort,
@@ -80,13 +81,16 @@ export const Composer = memo(function Composer({
    * frozen to match. `target === null` means the rewind already happened and
    * this is now an ordinary draft. */
   editing?: NonNullable<OpenedSession["editing"]>;
+  /** The prompt a fork branched away from, for the copy it landed in. Read once
+   * at mount, like `editing` — the composer owns the draft from there. */
+  seed?: NonNullable<OpenedSession["seed"]>;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
   onCancelEdit: () => void;
 }) {
-  const [task, setTask] = useState(editing?.text ?? "");
-  const [images, setImages] = useState<string[]>(editing?.images ?? []);
+  const [task, setTask] = useState(editing?.text ?? seed?.text ?? "");
+  const [images, setImages] = useState<string[]>(editing?.images ?? seed?.images ?? []);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const layoutGroupId = useId();
   const getImageLayoutId = useCallback(

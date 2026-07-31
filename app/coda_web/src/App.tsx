@@ -10,6 +10,8 @@ import {
   selectActiveProviders,
   selectActiveReasoningEffort,
   selectActiveEditing,
+  selectActiveKey,
+  selectActiveSeed,
   selectActiveRunning,
   selectActiveServer,
   selectActiveSessionTitle,
@@ -206,6 +208,8 @@ export default function App() {
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
   const activeEditing = useCodaStore(selectActiveEditing);
+  const activeSeed = useCodaStore(selectActiveSeed);
+  const activeKey = useCodaStore(selectActiveKey);
   const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
   const activeProviders = useCodaStore(selectActiveProviders);
@@ -402,8 +406,15 @@ export default function App() {
                 <Composer
                   // Remounting on every change of edit target is what seeds the
                   // draft without a sync effect: entering an edit loads that
-                  // message, leaving one empties the box.
-                  key={activeEditing ? `edit:${activeEditing.target ?? "orphan"}` : "new"}
+                  // message, leaving one empties the box. A fork lands in a
+                  // different session, so its seed rides the same mechanism.
+                  key={
+                    activeEditing
+                      ? `edit:${activeEditing.target ?? "orphan"}`
+                      : activeSeed
+                        ? `seed:${activeKey}`
+                        : "new"
+                  }
                   status={
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
@@ -428,6 +439,7 @@ export default function App() {
                   serverUrl={selectedServerUrl}
                   workspaceId={selectedWorkspace ?? ""}
                   editing={showingNewSession ? undefined : activeEditing}
+                  seed={showingNewSession ? undefined : activeSeed}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
                   onSend={handleSend}
                   onAbort={abort}

@@ -1672,8 +1672,10 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
         TurnId::from(MessageId::new()),
         TurnId::from(MessageId::new()),
     );
-    let cut_reply = assistant("the answer worth branching from");
-    let cut = id_of(&cut_reply);
+    // The turn to branch away from: everything before it is kept, it and the
+    // rest are not.
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "q3"));
+    let cut = id_of(&branch_point);
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -1690,11 +1692,8 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
                         Message::User(UserMessage::text(MessageId::new(), "q2")),
                     ),
                     entry(second, assistant("delegating")),
-                    entry(second, cut_reply),
-                    entry(
-                        third,
-                        Message::User(UserMessage::text(MessageId::new(), "q3")),
-                    ),
+                    entry(second, assistant("the answer worth branching from")),
+                    entry(third, branch_point),
                     entry(third, assistant("a3")),
                 ],
             ),
@@ -1779,45 +1778,29 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
     );
 }
 
-/// A cut names a turn, so every message of one is an equally good way to name
-/// it — which is what lets a turn an abort left without a final reply be forked
-/// from at all. What is still refused is a cut the root thread never held; both
-/// rejections land on the same error, because the database cannot tell a forged
-/// cut from one that simply has not been stored yet.
+/// The cut names the turn to branch *away* from, so only the message that opens
+/// one will do — rewind's rule exactly. Everything else lands on the same error,
+/// because the database cannot tell a forged cut from one that simply has not
+/// been stored yet.
 #[tokio::test(flavor = "multi_thread")]
-async fn any_root_message_of_a_turn_names_that_turn() {
+async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
     let pool = pool().await;
     let workspace = workspace_id("fork-cut");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
     let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
 
-    let turn = TurnId::from(MessageId::new());
-    let question = Message::User(UserMessage::text(MessageId::new(), "q"));
-    let delegating = Message::Assistant(AssistantMessage {
-        message_id: MessageId::new(),
-        content: "delegating".to_string(),
-        tool_calls: vec![ToolCall {
-            id: "call_explore".to_string(),
-            name: "agent__explore".to_string(),
-            arguments: None,
-        }],
-        usage: None,
-        reasoning_content: None,
-        reasoning_continuation: None,
-        reasoning_ended_at: None,
-        aborted: false,
-        started_at: jiff::Timestamp::default(),
-        ended_at: jiff::Timestamp::default(),
-    });
-    let sub_reply = assistant("what the sub-agent said");
-    let final_reply = assistant("final");
-    let (user_cut, mid_turn_cut, reply_cut, sub_agent_cut) = (
-        id_of(&question),
-        id_of(&delegating),
-        id_of(&final_reply),
-        id_of(&sub_reply),
+    let (kept, dropped) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
     );
+    let reply = assistant("what the first turn answered");
+    let sub_reply = assistant("what the sub-agent said");
+    let branch_point = Message::User(UserMessage::text(
+        MessageId::new(),
+        "and now something else",
+    ));
+    let (cut, reply_cut, sub_agent_cut) = (id_of(&branch_point), id_of(&reply), id_of(&sub_reply));
 
     storage
         .save_checkpoint(
@@ -1825,9 +1808,13 @@ async fn any_root_message_of_a_turn_names_that_turn() {
             checkpoint(
                 "source-session",
                 vec![
-                    entry(turn, question),
-                    entry(turn, delegating),
-                    entry(turn, final_reply),
+                    entry(
+                        kept,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(kept, reply),
+                    entry(dropped, branch_point),
+                    entry(dropped, assistant("the answer being branched away from")),
                 ],
             ),
         )
@@ -1841,7 +1828,7 @@ async fn any_root_message_of_a_turn_names_that_turn() {
                 agent_name: "explore".to_string(),
                 parent_thread_id: Some("source-session".to_string()),
                 derivation_key: Some("explore".to_string()),
-                messages: vec![entry(turn, sub_reply)],
+                messages: vec![entry(kept, sub_reply)],
                 ..checkpoint(explore.as_ref(), vec![])
             },
         )
@@ -1849,33 +1836,27 @@ async fn any_root_message_of_a_turn_names_that_turn() {
         .unwrap();
 
     let storage = WorkspaceStorage::new(pool.clone(), &workspace);
-    for (cut, which) in [
-        (user_cut, "the message that opened the turn"),
-        (mid_turn_cut, "the reply that made the tool call"),
-        (reply_cut, "the reply that ended the turn"),
-    ] {
-        let forked = storage
-            .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
-            .await
-            .expect(which);
-        let new_explore =
-            ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
-        let mut expected = vec![
-            (forked.session_id.clone(), 3),
-            (new_explore.as_ref().to_string(), 1),
-        ];
-        expected.sort();
-        assert_eq!(
-            threads_of(&pool, &workspace, &forked.session_id).await,
-            expected,
-            "cutting at {which} keeps the same whole turn"
-        );
-    }
+    let forked = storage
+        .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
+        .await
+        .expect("the message that opened a turn");
+    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let mut expected = vec![
+        (forked.session_id.clone(), 2),
+        (new_explore.as_ref().to_string(), 1),
+    ];
+    expected.sort();
+    assert_eq!(
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        expected,
+        "the cut's own turn is dropped, on every thread it reached"
+    );
 
     for (cut, why) in [
+        (reply_cut, "an assistant reply does not open a turn"),
         (
             sub_agent_cut,
-            "a sub-agent's reply is not on the root thread",
+            "a sub-agent's message is not on the root thread",
         ),
         (MessageId::new(), "no such message at all"),
     ] {
@@ -1889,8 +1870,8 @@ async fn any_root_message_of_a_turn_names_that_turn() {
     }
     assert_eq!(
         sessions_in(&pool, &workspace).await.len(),
-        4,
-        "the source plus one copy per accepted cut; a refused fork mints nothing"
+        2,
+        "the source plus the one accepted copy; a refused fork mints nothing"
     );
 }
 
@@ -1904,8 +1885,10 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
 
     let turn = TurnId::from(MessageId::new());
-    let reply = assistant("answered");
-    let cut = id_of(&reply);
+    // A valid cut, so what the fork trips over is the resting point and not the
+    // cut lookup.
+    let prompt = Message::User(UserMessage::text(MessageId::new(), "q"));
+    let cut = id_of(&prompt);
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -1921,13 +1904,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
                 },
                 ..checkpoint(
                     "source-session",
-                    vec![
-                        entry(
-                            turn,
-                            Message::User(UserMessage::text(MessageId::new(), "q")),
-                        ),
-                        entry(turn, reply),
-                    ],
+                    vec![entry(turn, prompt), entry(turn, assistant("answered"))],
                 )
             },
         )
@@ -1961,46 +1938,58 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
 /// The state a turn leaves behind the moment it starts: the driver checkpoints
 /// the prompt on its own so a crash mid-turn still has it, and writes nothing
 /// else until the turn ends. An abort settles the turn — clearing the relay's
-/// `turn_running` — one event before that final write lands, so a fork aimed at
-/// the opening message arrives to find a turn that is all prefix and no body.
+/// `turn_running` — one event before that final write lands, so a fork can
+/// arrive to find a turn that is all prefix and no body.
+///
+/// Cutting at the prompt is exactly what makes that harmless: the half-written
+/// turn is the one turn the copy leaves behind, and seeing the prompt at all
+/// proves everything before it committed.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cut_at_a_turn_that_is_still_being_written_is_refused() {
+async fn a_cut_ignores_the_half_written_turn_it_opens() {
     let pool = pool().await;
     let workspace = workspace_id("fork-half-turn");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
 
-    let turn = TurnId::from(MessageId::new());
+    let (done, started) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
     let prompt = Message::User(UserMessage::text(MessageId::new(), "run the thing"));
     let cut = id_of(&prompt);
     storage
         .save_checkpoint(
             "source-session".to_string(),
-            checkpoint("source-session", vec![entry(turn, prompt)]),
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        done,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(done, assistant("a")),
+                    entry(started, prompt),
+                ],
+            ),
         )
         .await
         .unwrap();
 
     let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    let forked = storage
+        .fork_session(
+            "source-session",
+            ForkCut::At(cut),
+            // The relay has the tool call and its aborted result too; the
+            // database has neither yet.
+            ForkSource::Live { root_messages: 5 },
+        )
+        .await
+        .expect("what has not landed is in the turn being branched away from");
     assert_eq!(
-        storage
-            .fork_session(
-                "source-session",
-                ForkCut::At(cut),
-                // The relay saw the prompt, the tool call and its aborted result.
-                ForkSource::Live { root_messages: 3 },
-            )
-            .await,
-        Err(ForkError::Lagging {
-            expected: 3,
-            found: 1
-        }),
-        "the opening message says nothing about the rest of its turn"
-    );
-    assert_eq!(
-        sessions_in(&pool, &workspace).await,
-        vec!["source-session".to_string()],
-        "a refused fork mints nothing"
+        threads_of(&pool, &workspace, &forked.session_id).await,
+        vec![(forked.session_id.clone(), 2)],
+        "only the turn that finished comes across"
     );
 }
 
@@ -2014,9 +2003,12 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
 
-    let turn = TurnId::from(MessageId::new());
-    let reply = assistant("answered");
-    let cut = id_of(&reply);
+    let (first, second) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
+    let cut = id_of(&branch_point);
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -2024,10 +2016,12 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
                 "source-session",
                 vec![
                     entry(
-                        turn,
+                        first,
                         Message::User(UserMessage::text(MessageId::new(), "q")),
                     ),
-                    entry(turn, reply),
+                    entry(first, assistant("answered")),
+                    entry(second, branch_point),
+                    entry(second, assistant("answered again")),
                 ],
             ),
         )
@@ -2070,7 +2064,7 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
         .fork_session(
             "source-session",
             ForkCut::At(cut),
-            ForkSource::Live { root_messages: 2 },
+            ForkSource::Live { root_messages: 4 },
         )
         .await
         .expect("a live source is judged by its checkpoints alone");
@@ -2085,9 +2079,12 @@ async fn a_full_copy_refuses_while_the_newest_turn_is_still_landing() {
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
 
-    let turn = TurnId::from(MessageId::new());
-    let reply = assistant("stored");
-    let cut = id_of(&reply);
+    let (first, second) = (
+        TurnId::from(MessageId::new()),
+        TurnId::from(MessageId::new()),
+    );
+    let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
+    let cut = id_of(&branch_point);
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -2095,10 +2092,11 @@ async fn a_full_copy_refuses_while_the_newest_turn_is_still_landing() {
                 "source-session",
                 vec![
                     entry(
-                        turn,
+                        first,
                         Message::User(UserMessage::text(MessageId::new(), "q")),
                     ),
-                    entry(turn, reply),
+                    entry(first, assistant("stored")),
+                    entry(second, branch_point),
                 ],
             ),
         )
@@ -2111,26 +2109,26 @@ async fn a_full_copy_refuses_while_the_newest_turn_is_still_landing() {
             .fork_session(
                 "source-session",
                 ForkCut::All,
-                ForkSource::Live { root_messages: 4 }
+                ForkSource::Live { root_messages: 5 }
             )
             .await,
         Err(ForkError::Lagging {
-            expected: 4,
-            found: 2
+            expected: 5,
+            found: 3
         }),
         "the caller has two more messages than the database does"
     );
 
-    // The same lag must not block a cut that is already stored: what has not
-    // landed yet is a later turn, which the fork was not going to copy anyway.
+    // The same lag must not block a cut: what has not landed yet belongs to the
+    // turn the cut branches away from, which was never going to be copied.
     let forked = storage
         .fork_session(
             "source-session",
             ForkCut::At(cut),
-            ForkSource::Live { root_messages: 4 },
+            ForkSource::Live { root_messages: 5 },
         )
         .await
-        .expect("an earlier cut is unaffected by a turn still in flight");
+        .expect("a cut is unaffected by a turn still in flight");
     assert_eq!(
         threads_of(&pool, &workspace, &forked.session_id).await,
         vec![(forked.session_id.clone(), 2)]

@@ -163,8 +163,8 @@ export const RpcCode = {
    * the authoritative history. */
   REWIND_FAILED: -32023,
   FORK_FAILED: -32024,
-  /** `fork_session`: the cut, or the newest turn, is not stored yet. Nothing was
-   * written, so retrying is safe. */
+  /** `fork_session`: the cut user message, or the newest turn of a full copy,
+   * is not stored yet. Nothing was written, so retrying is safe. */
   FORK_NOT_READY: -32025,
   ALLOW_PATTERN_FAILED: -32030,
 } as const;
@@ -240,10 +240,10 @@ export type RpcRequests = {
   add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
   delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
   rename_session: RpcRequest<SessionRef & { name: string | null }, { name: string | null }>;
-  /** Copy the session at `cut_message_id` — an assistant reply with no tool
-   * calls — keeping that turn and every turn before it. Omitting the cut copies
-   * everything stored. The source is untouched; the server mints the new id and
-   * answers with a refreshed catalog. */
+  /** Copy the session at `cut_message_id` — a root-thread user message — keeping
+   * the turns before the one it opened. Omitting the cut copies everything
+   * stored. The source is untouched; the server mints the new id and answers
+   * with a refreshed catalog. */
   fork_session: RpcRequest<
     SessionRef & { cut_message_id?: string },
     { session_id: string; name: string | null } & WorkspaceCatalog

@@ -46,9 +46,20 @@ function assistantMessage(id: string, content: string, toolCalls: unknown[] = []
   } as HistoryMessage;
 }
 
-test("a restored final reply carries the id a fork cuts at", () => {
+function userMessage(id: string, text: string): HistoryMessage {
+  return {
+    User: {
+      message_id: id,
+      parts: [{ type: "text", text }],
+      created_at: "2026-07-31T00:00:00Z",
+    },
+  } as HistoryMessage;
+}
+
+test("a restored user message carries the id a fork cuts at", () => {
   const after = applySnapshotToSession(session(), {
     messages: [
+      userMessage("m-user", "try this"),
       assistantMessage("m1", "mid-turn", [{ id: "call_1", name: "shell", arguments: "{}" }]),
       assistantMessage("m2", "the final answer"),
     ],
@@ -58,11 +69,10 @@ test("a restored final reply carries the id a fork cuts at", () => {
     turnRunning: false,
   });
 
-  const assistants = after.entries.filter((entry) => entry.kind === "assistant");
-  expect(assistants.map((entry) => [entry.messageId, entry.isFinalResponse])).toEqual([
-    ["m1", false],
-    ["m2", true],
-  ]);
+  expect(after.entries.find((entry) => entry.kind === "user")).toMatchObject({
+    messageId: "m-user",
+    content: "try this",
+  });
 });
 
 test("a fork retries once when the database has not caught up", async () => {
@@ -79,9 +89,9 @@ test("a fork retries once when the database has not caught up", async () => {
   expect(attempts).toBe(2);
 });
 
-// A session has a fork entry on every reply plus one in the sidebar, and the
-// server mints a new id per request — so the guard has to be one flag for the
-// source session, not one per button.
+// A session has a fork entry on every eligible user message plus one in the
+// sidebar, and the server mints a new id per request — so the guard has to be
+// one flag for the source session, not one per button.
 test("a second fork of the same session while one is in flight is dropped", async () => {
   const server = "ws://server";
   const key = forkKey(server, "ws", "s1");
@@ -109,6 +119,40 @@ test("a second fork of the same session while one is in flight is dropped", asyn
 
   codaStore.setState((state) => {
     delete state.rpcMap[server];
+  });
+});
+
+// The cut is the turn to branch *away* from, so its prompt is not in the copy —
+// it goes to the composer instead, for the user to rewrite or resend.
+test("the message a fork cuts at lands in the copy's composer", async () => {
+  const server = "ws://seeded";
+  codaStore.setState((state) => {
+    state.servers[server] = {
+      url: server,
+      status: "connected",
+      catalog: [],
+      providers: [],
+      sessions: {},
+    };
+    state.rpcMap[server] = {
+      request: (method: string) =>
+        method === "fork_session"
+          ? Promise.resolve({ session_id: "s2", name: null, workspaces: [] })
+          : // `open_session` follows; leaving it pending keeps the test off the wire.
+            new Promise(() => {}),
+    } as never;
+  });
+
+  await forkSession(server, "ws", "s1", "m-cut", { text: "try it this way", images: ["img"] });
+
+  expect(codaStore.getState().servers[server]?.sessions["ws/s2"]?.seed).toEqual({
+    text: "try it this way",
+    images: ["img"],
+  });
+
+  codaStore.setState((state) => {
+    delete state.rpcMap[server];
+    delete state.servers[server];
   });
 });
 
