@@ -64,7 +64,13 @@ export type TranscriptEntry = {
   /** RFC 3339 timestamps for display: message time and elapsed duration. */
   startedAt?: string | null;
   endedAt?: string | null;
+  /** On a tool entry: when the message that asked for this call was generated.
+   * Never displayed. A round producing neither prose nor reasoning leaves no
+   * entry of its own, so this is the turn's only record of that time. */
+  generation?: GenerationSpan;
 };
+
+export type GenerationSpan = { startedAt: string; endedAt: string };
 
 export type ActivityEntry = {
   id: string;
@@ -90,6 +96,11 @@ export type OpenedSession = {
   /** Suspended calls' original arguments, keyed by call id, kept around only
    * until `tool_start`/`tool_end` resolves each one (see `finishToolEntry`). */
   pendingCallInfo: Record<string, ToolCall>;
+  /** When the message behind each unanswered call was generated, keyed by call
+   * id. Kept here rather than derived per render because a call outlives the
+   * message that asked for it: a snapshot can carry the assistant message while
+   * its `tool_end` is still to come over the live stream. */
+  generationSpans: Record<string, GenerationSpan>;
   drafts: Record<string, Record<string, ToolCallResolution>>;
   /** Per-call "always allow" patterns staged for an approval; sent to the
    * server only on submit, so the intent stays cancelable until then. */
@@ -217,6 +228,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     activity: [],
     approvals: [],
     pendingCallInfo: {},
+    generationSpans: {},
     drafts: {},
     allowDrafts: {},
     running: false,
@@ -326,12 +338,35 @@ function collectToolArgs(messages: HistoryMessage[]): Record<string, string | nu
   return map;
 }
 
+/** Map every call in this history back to the generation that asked for it.
+ *
+ * Every round, not just the ones that left no entry behind: the duration math
+ * unions these spans, so a redundant copy costs nothing and skipping it would
+ * cost a special case. */
+function collectGenerationSpans(messages: HistoryMessage[]): Record<string, GenerationSpan> {
+  const map: Record<string, GenerationSpan> = {};
+  for (const message of messages) {
+    if (!("Assistant" in message)) {
+      continue;
+    }
+    const span = {
+      startedAt: message.Assistant.started_at,
+      endedAt: message.Assistant.ended_at,
+    };
+    for (const call of message.Assistant.tool_calls) {
+      map[call.id] = span;
+    }
+  }
+  return map;
+}
+
 /** Entry ids are derived from the server's `message_id` so a message keeps the
  * same key across a reload or reconnect. One assistant message can yield two
  * entries (its reasoning and its answer), which the kind prefix separates. */
 function historyToEntries(
   message: HistoryMessage,
-  argsById: Record<string, string | null | undefined> = {},
+  argsById: Record<string, string | null | undefined>,
+  spansById: Record<string, GenerationSpan>,
 ): TranscriptEntry[] {
   if ("System" in message) {
     return [];
@@ -398,6 +433,7 @@ function historyToEntries(
               arguments: argumentsJson,
             })
           : undefined,
+        spansById[message.Tool.id],
       ),
     ];
   }
@@ -418,6 +454,7 @@ function toolMessageToEntry(
   id = newId("tool-result"),
   detail?: string,
   command?: string,
+  generation?: GenerationSpan,
 ): TranscriptEntry {
   return {
     id,
@@ -430,6 +467,7 @@ function toolMessageToEntry(
     status: outcomeText(message.outcome),
     startedAt: message.started_at,
     endedAt: message.ended_at,
+    generation,
   };
 }
 
@@ -462,16 +500,45 @@ function withoutPendingCallInfo(
   return next;
 }
 
+function withGenerationSpans(
+  session: OpenedSession,
+  calls: ToolCall[],
+  span: GenerationSpan,
+): OpenedSession["generationSpans"] {
+  if (calls.length === 0) {
+    return session.generationSpans;
+  }
+  const next = { ...session.generationSpans };
+  for (const call of calls) {
+    next[call.id] = span;
+  }
+  return next;
+}
+
+function withoutGenerationSpan(
+  session: OpenedSession,
+  callId: string,
+): OpenedSession["generationSpans"] {
+  if (!(callId in session.generationSpans)) {
+    return session.generationSpans;
+  }
+  const next = { ...session.generationSpans };
+  delete next[callId];
+  return next;
+}
+
 function finishToolEntry(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "tool_end" }>,
 ): OpenedSession {
+  const generation = session.generationSpans[event.message.id];
   const index = session.entries.findIndex((entry) => entry.callId === event.message.id);
   if (index < 0) {
     const call = session.pendingCallInfo[event.message.id];
     return {
       ...session,
       pendingCallInfo: withoutPendingCallInfo(session, event.message.id),
+      generationSpans: withoutGenerationSpan(session, event.message.id),
       entries: [
         ...session.entries,
         toolMessageToEntry(
@@ -479,6 +546,7 @@ function finishToolEntry(
           undefined,
           call ? describeTool(call.name, call.arguments) : undefined,
           call?.name === "shell" ? extractShellCommand(call) : undefined,
+          generation,
         ),
       ],
     };
@@ -492,11 +560,16 @@ function finishToolEntry(
       entries[index].id,
       entries[index].detail,
       entries[index].command,
+      generation,
     ),
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
-  return { ...session, entries };
+  return {
+    ...session,
+    entries,
+    generationSpans: withoutGenerationSpan(session, event.message.id),
+  };
 }
 
 function addOrUpdateAssistantChunk(
@@ -665,7 +738,7 @@ function upsertApproval(approvals: PendingApproval[], approval: PendingApproval)
   return [...approvals, approval];
 }
 
-function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
+export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
   switch (event.type) {
     case "llm_start":
       return {
@@ -710,6 +783,13 @@ function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSession {
           },
         ),
         running: turnComplete ? false : session.running,
+        // Recorded here rather than at `tool_start` because a call that suspends
+        // for approval and is then rejected never starts at all, and this is the
+        // only point that sees the generation's own timing.
+        generationSpans: withGenerationSpans(session, event.message.tool_calls, {
+          startedAt: event.message.started_at,
+          endedAt: event.message.ended_at,
+        }),
       };
       return event.message.usage
         ? {
@@ -1246,9 +1326,13 @@ export function applySnapshotToSession(
   },
 ): OpenedSession {
   const argsById = collectToolArgs(snapshot.messages);
+  const spansById = collectGenerationSpans(snapshot.messages);
   const pending = session.entries.filter(isPendingUserEntry);
   return {
     ...session,
+    // Rebuilt, not merged: the snapshot is the whole history, so a span it
+    // doesn't account for belongs to a call that no longer exists.
+    generationSpans: spansById,
     draft: false,
     providerId: snapshot.providerId,
     reasoningEffort: snapshot.reasoningEffort,
@@ -1265,7 +1349,7 @@ export function applySnapshotToSession(
     evicted: false,
     editing: reconcileEditing(session.editing, snapshot.messages),
     entries: [
-      ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById)),
+      ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById, spansById)),
       ...pending,
     ],
     drafts: {},
@@ -1435,7 +1519,10 @@ export function applyRewound(
   payload: { messages: HistoryMessage[]; messageId: string; text: string; images: string[] },
 ): OpenedSession {
   const argsById = collectToolArgs(payload.messages);
-  const entries = payload.messages.flatMap((message) => historyToEntries(message, argsById));
+  const spansById = collectGenerationSpans(payload.messages);
+  const entries = payload.messages.flatMap((message) =>
+    historyToEntries(message, argsById, spansById),
+  );
   entries.push({
     id: userEntryId(payload.messageId),
     messageId: payload.messageId,
@@ -1452,6 +1539,7 @@ export function applyRewound(
     drafts: {},
     allowDrafts: {},
     pendingCallInfo: {},
+    generationSpans: spansById,
     running: true,
     // Cleared only here and in `rewindTurn`'s orphan branch — that is what takes
     // the composer out of edit mode, and emptying it is a side effect of the

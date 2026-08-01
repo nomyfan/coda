@@ -47,9 +47,25 @@ export function formatClockTime(iso: string | null | undefined): string | undefi
   return `${date.getFullYear()}/${monthDay} ${time}`;
 }
 
+/** Human-readable elapsed milliseconds: `850ms`, `3.2s`, or `1m 5s`. */
+export function formatElapsed(ms: number): string {
+  const elapsed = Math.max(0, ms);
+  if (elapsed < 1000) {
+    return `${Math.round(elapsed)}ms`;
+  }
+  const totalSeconds = Math.round(elapsed / 1000);
+  if (totalSeconds >= 60) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainder = totalSeconds % 60;
+    return `${minutes}m ${remainder}s`;
+  }
+  const seconds = elapsed / 1000;
+  return `${seconds.toFixed(1)}s`;
+}
+
 /**
- * Human-readable elapsed time between two RFC 3339 timestamps: `850ms`, `3.2s`,
- * or `1m 5s`. Returns `undefined` when either bound is missing or invalid.
+ * Human-readable elapsed time between two RFC 3339 timestamps.
+ * Returns `undefined` when either bound is missing or invalid.
  */
 export function formatDuration(
   start: string | null | undefined,
@@ -60,16 +76,5 @@ export function formatDuration(
   if (from === undefined || to === undefined) {
     return undefined;
   }
-  const ms = Math.max(0, to - from);
-  if (ms < 1000) {
-    return `${Math.round(ms)}ms`;
-  }
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds >= 60) {
-    const minutes = Math.floor(totalSeconds / 60);
-    const remainder = totalSeconds % 60;
-    return `${minutes}m ${remainder}s`;
-  }
-  const seconds = ms / 1000;
-  return `${seconds.toFixed(1)}s`;
+  return formatElapsed(to - from);
 }

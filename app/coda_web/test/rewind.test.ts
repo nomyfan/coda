@@ -48,6 +48,7 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
     activity: [],
     approvals: [],
     pendingCallInfo: {},
+    generationSpans: {},
     drafts: {},
     allowDrafts: {},
     running: false,

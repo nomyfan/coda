@@ -56,7 +56,7 @@ import {
   SUBAGENT_TOOL_PREFIX,
   toolDisplayName,
 } from "@/lib/protocol";
-import { cn, formatClockTime, formatDuration } from "@/lib/utils";
+import { cn, formatClockTime, formatDuration, formatElapsed } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
 
@@ -622,37 +622,57 @@ function processStepText(stepCount: number) {
   return `${stepCount} ${stepCount === 1 ? "step" : "steps"}`;
 }
 
-function processDuration(entries: TranscriptEntry[], finalAssistant?: TranscriptEntry) {
-  let startedAt: string | undefined;
-  let startedMs: number | undefined;
-  let endedAt: string | undefined;
-  let endedMs: number | undefined;
+type Span = { start: number; end: number };
 
-  for (const entry of finalAssistant ? [...entries, finalAssistant] : entries) {
-    const entryStartedAt = entry.startedAt;
-    const entryStartedMs = entryStartedAt ? Date.parse(entryStartedAt) : NaN;
-    if (
-      entryStartedAt &&
-      !Number.isNaN(entryStartedMs) &&
-      (startedMs === undefined || entryStartedMs < startedMs)
-    ) {
-      startedMs = entryStartedMs;
-      startedAt = entryStartedAt;
-    }
+function parseSpan(from: string | null | undefined, to: string | null | undefined) {
+  const start = from ? Date.parse(from) : NaN;
+  const end = to ? Date.parse(to) : NaN;
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    return undefined;
+  }
+  return { start, end: Math.max(start, end) };
+}
 
-    const entryEndedAt = entry.endedAt;
-    const entryEndedMs = entryEndedAt ? Date.parse(entryEndedAt) : NaN;
-    if (
-      entryEndedAt &&
-      !Number.isNaN(entryEndedMs) &&
-      (endedMs === undefined || entryEndedMs > endedMs)
-    ) {
-      endedMs = entryEndedMs;
-      endedAt = entryEndedAt;
-    }
+/** Every stretch of time an entry accounts for: its own, and the generation
+ * behind it that may have left no entry of its own. */
+function entrySpans(entry: TranscriptEntry): Span[] {
+  const spans = [
+    parseSpan(entry.startedAt, entry.endedAt),
+    parseSpan(entry.generation?.startedAt, entry.generation?.endedAt),
+  ];
+  return spans.filter((span) => span !== undefined);
+}
+
+/**
+ * How long the turn was actually working: the *union* of its entries' spans.
+ *
+ * Not a sum, because tool calls run concurrently and would count one stretch of
+ * time many times over. Not the span from first start to last end, because the
+ * turn also sits idle — waiting for a human to approve a call is not work, and
+ * no entry covers that gap.
+ *
+ * Approval waits *inside* a sub-agent do still count: the parent's `agent__*`
+ * entry spans the whole invocation, suspension included, and there is nothing
+ * finer to fall back on once history drops the sub-agent's own steps.
+ */
+export function processWorkMs(entries: TranscriptEntry[]): number | undefined {
+  const spans = entries.flatMap(entrySpans).sort((a, b) => a.start - b.start);
+  if (spans.length === 0) {
+    return undefined;
   }
 
-  return formatDuration(startedAt, endedAt);
+  let total = 0;
+  let { start: mergedStart, end: mergedEnd } = spans[0];
+  for (const span of spans.slice(1)) {
+    if (span.start <= mergedEnd) {
+      mergedEnd = Math.max(mergedEnd, span.end);
+      continue;
+    }
+    total += mergedEnd - mergedStart;
+    mergedStart = span.start;
+    mergedEnd = span.end;
+  }
+  return total + (mergedEnd - mergedStart);
 }
 
 function processEntrySummary(entry: TranscriptEntry | undefined) {
@@ -794,10 +814,13 @@ function AssistantTurnBubble({
     ? { title: "Approval required" }
     : processEntrySummary(activeProcessEntry);
   const stepText = processStepText(processItems.length);
-  const duration = processDuration(intermediateEntries, completedFinalAssistant);
+  // The process only: writing the answer is the turn's product, not work spent
+  // getting there. Its reasoning entry stays in — only the prose drops out.
+  const workMs = processWorkMs(intermediateEntries);
+  const duration = workMs === undefined ? undefined : formatElapsed(workMs);
   const processTitle = processComplete
     ? duration
-      ? `Worked over ${duration} with ${stepText}`
+      ? `Worked for ${duration} with ${stepText}`
       : `Worked with ${stepText}`
     : activeSummary.title;
 
