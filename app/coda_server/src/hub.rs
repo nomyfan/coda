@@ -1617,5 +1617,5 @@ async fn run_forwarder(
 }
 
 #[cfg(test)]
-#[path = "hub_tests.rs"]
+#[path = "hub_tests/mod.rs"]
 mod tests;

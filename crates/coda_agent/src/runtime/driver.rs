@@ -1185,5 +1185,5 @@ fn concurrent_stateful_subagents(
 }
 
 #[cfg(test)]
-#[path = "driver_tests.rs"]
+#[path = "driver_tests/mod.rs"]
 mod tests;
