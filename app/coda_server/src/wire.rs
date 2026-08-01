@@ -61,6 +61,15 @@ pub enum WireEvent {
         thread_id: String,
         message: String,
     },
+    /// This turn's content could not be written to the database. Deliberately
+    /// not a turn-ending event: the client must not show the turn as finished,
+    /// because what is on screen is not what is stored.
+    #[serde(rename = "persist_failed")]
+    PersistFailed {
+        agent_name: String,
+        thread_id: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +140,11 @@ impl WireEvent {
                 target: target.into(),
             },
             AgentEvent::Error(message) => WireEvent::Error {
+                agent_name,
+                thread_id,
+                message,
+            },
+            AgentEvent::PersistFailed(message) => WireEvent::PersistFailed {
                 agent_name,
                 thread_id,
                 message,

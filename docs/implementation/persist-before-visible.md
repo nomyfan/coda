@@ -145,22 +145,30 @@ AgentEvent::PersistFailed(String)
 
 ## Implementation Roadmap
 
-- [ ] [风险验证] 给 `driver_tests/fixtures.rs` 的 `TestStorage` 加两个开关：卡住写入、让写入失败。写一个带 sub-agent 的用例，卡住 sub-agent 的写，断言调用方的结束事件没有提前出现
+- [x] [风险验证] 给 `driver_tests/fixtures.rs` 的 `TestStorage` 加两个开关：卡住写入、让写入失败。写一个带 sub-agent 的用例，卡住 sub-agent 的写，断言调用方的结束事件没有提前出现
       Purpose: 验穿「存档早于回话」这条边——本文档的全部价值都在它上面
       Verification: 卡住时无结束事件；放开后才出现，且顺序正确
 
-- [ ] [核心] 引入 `TurnEnd` 与 `persist_and_announce`，把 `run` 里三处 checkpoint 写入（`:293` / `:298` / `:369`）全部收编，并把 `LLMEnd`(终局) / `Aborted` / `Error` / `Suspended` 的发出和 sub-agent 的 `Reply` 投递从各 handler 收归它，按「写 → 发本线程结束事件 → 投递 Reply」兑现
+- [x] [核心] 引入 `TurnEnd` 与 `persist_and_announce`，把 `run` 里三处 checkpoint 写入（`:293` / `:298` / `:369`）全部收编，并把 `LLMEnd`(终局) / `Aborted` / `Error` / `Suspended` 的发出和 sub-agent 的 `Reply` 投递从各 handler 收归它，按「写 → 发本线程结束事件 → 投递 Reply」兑现
       Purpose: 把「先存档再对外」落成一处结构性规矩，顺带把每轮结束信号收敛成一个
       Verification: 上一步的用例转绿；新增用例断言 sub-agent 的结束事件严格早于其 `Reply` 触发的下游事件；`abort.rs` / `approval.rs` / `subagent_origin.rs` 不回归；中止时不再同时出现 `Aborted` 和 `Error`；代码里 `save_checkpoint` 除 helper 外无其他调用点
 
-- [ ] [核心] `save_checkpoint` 改为返回 `Result`；helper 在 `Err` 时发恰好一次 `AgentEvent::PersistFailed` 并立刻停轮（不调 LLM、不跑工具、不发结束事件、不投递结果）
+- [x] [核心] `save_checkpoint` 改为返回 `Result`；helper 在 `Err` 时发恰好一次 `AgentEvent::PersistFailed` 并立刻停轮（不调 LLM、不跑工具、不发结束事件、不投递结果）
       Purpose: 让写失败无法伪装成成功；收进 helper 之后，「还没有 `TurnEnd`」不再是一种需要特判的状态
       Verification: 四个用例，三个写入点各一条加一条重复性断言——(a) `:293` 入场写用户消息失败，断言这一轮压根没调 LLM、没跑工具；(b) `:298` `handle_envelope` 提前返回时写失败；(c) `:369` 收场写失败，断言既无结束事件也无 `Reply`；(d) 三条路径都断言 `PersistFailed` 恰好一次，不重复
 
-- [ ] [集成] `WireEvent::PersistFailed` + `event_settles_turn` 返回 false；hub 转发器收到它先转给客户端、再走 `force_resync`
+- [x] [集成] `WireEvent::PersistFailed` + `event_settles_turn` 返回 false；hub 转发器收到它先转给客户端、再走 `force_resync`
       Purpose: 给写失败一条不卡死会话的出路
       Verification: hub 用例断言会话被 drain 并从持久状态重建，客户端先收到错误事件
 
-- [ ] [集成] web：`protocol.ts` 加联合成员、reducer 加分支，失败原因写进会话级横幅字段（在 `entries` 之外，靠 `applySnapshotToSession` 的 `...session` 展开活过重连）；用户手动关闭或该会话之后有一轮正常结束时清除
+- [x] [集成] web：`protocol.ts` 加联合成员、reducer 加分支，失败原因写进会话级横幅字段（在 `entries` 之外，靠 `applySnapshotToSession` 的 `...session` 展开活过重连）；用户手动关闭或该会话之后有一轮正常结束时清除
       Purpose: 让用户真的看见错误，而不是被紧随其后的重连快照擦掉
       Verification: 前端集成测试走完 `PersistFailed → Closed → snapshot`，断言横幅在重连后仍在；另一个用例断言下一轮正常结束后横幅消失
+
+## Deviations from Design
+
+- **第一步和第二步是一起验收的。** 第一步的 Verification（「卡住时无结束事件；放开后才出现」）描述的是修好之后的行为，所以第一步交付时那个用例是**红**的——红本身就是风险验证的结论：卡住 `explore` 的写之后，根 agent 在 0.00s 内就结束了整轮，竞态确定性复现，不靠时序碰运气。第二步落地后转绿。
+- **`AgentLoopState::Done` 里的 `TurnEnd` 装了箱。** 不装的话这个枚举涨到 648 字节，clippy 的 `large_enum_variant` 会报——在 async fn 里它还会撑大 future。设计里没提，属于实现细节。
+- **一个既有 hub 用例的前提被本次改动消掉了，屏障改用另一个窗口守。** `a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved` 断言的是「根轮次 settle 时 sub-agent 还没存完」，而这正是本次要消除的窗口。已改名为 `a_rewind_cannot_race_a_sub_agents_checkpoint_write` 并把断言反过来：settle 时那份 checkpoint 必须已经在库里。它原来还兼职守着 `handle_rewind` 开头那次 shutdown，反转之后守不住了——所以另加了 `a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind`：**顶替**（用户在 sub-agent 写到一半时发下一条消息）仍会让根轮次不等它就 settle，那道屏障眼下正是靠这个窗口在挡事。已实测去掉 `shutdown` 后新用例会挂。这个窗口本身归 [`turn-cancellation.md`](../design/turn-cancellation.md) 关掉。
+- **前端 `turnComplete` 顺带补齐了 `!aborted`。** 服务端的 `event_settles_turn` 一直排除 aborted 的 `LLMEnd`，前端没有——中止生成时那条部分消息会被当成一轮正常结束。原本只影响 `running`，但横幅要靠「下一轮正常结束」来清除，不修就会被中止误清。
+- **前端横幅没有在浏览器里跑过。** 触发它需要一个会拒绝写入的数据库，preview 里造不出来。验证靠 reducer 单测（5 条，覆盖不结束轮次、活过重连、下一轮正常结束时清除、sub-agent 结束不算、中止不算）加 `tsc --noEmit` 和 oxlint。

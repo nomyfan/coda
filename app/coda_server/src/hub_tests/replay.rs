@@ -483,3 +483,54 @@ async fn lagged_stream_drains_session_and_closes_client() {
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
 }
+
+/// A checkpoint the database refuses leaves the in-memory view describing a
+/// turn nothing can back. The client is told why, then sent back to the
+/// persisted state — the same route a lagged stream takes. What it finds there
+/// is the turn's prompt without its answer, which is the truth: the answer was
+/// never stored, so it never happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
+    let opener = Arc::new(TestOpener::new("reply", ToolApprovalMode::Auto));
+    let storage = opener.storage.clone();
+    let hub = SessionHub::new(opener, RelayConfig::default());
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+
+    // The opening write of the prompt goes through; the one that would make the
+    // turn's answer durable does not.
+    storage.fail_checkpoints_after(1).await;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "go".into(),
+            images: vec![],
+        },
+    )
+    .await;
+
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e) if matches!(&**e, WireEvent::PersistFailed { .. }))
+    })
+    .await;
+    next_matching(&mut events, |event| matches!(event, RelayEvent::Closed)).await;
+    wait_released(&hub).await;
+
+    let attach2 = hub
+        .attach(key(), 2, "prov".into(), None, false)
+        .await
+        .expect("re-attach");
+    assert!(!attach2.snapshot.turn_running);
+    assert!(
+        matches!(
+            attach2.snapshot.messages.as_slice(),
+            [Message::User(user)] if user.first_text() == Some("go")
+        ),
+        "expected the prompt alone, got {:?}",
+        attach2.snapshot.messages
+    );
+}

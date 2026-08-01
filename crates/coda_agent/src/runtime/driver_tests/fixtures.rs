@@ -43,10 +43,16 @@ pub(super) fn assistant() -> AssistantMessage {
     }
 }
 
+/// The agent whose checkpoint writes are parked, and the gate that frees them.
+type HeldWrites = Arc<Mutex<Option<(String, Arc<Notify>)>>>;
+
 #[derive(Clone, Default)]
 pub(super) struct TestStorage {
     checkpoints: Arc<Mutex<HashMap<String, StoredCheckpoint>>>,
     snapshots: Arc<Mutex<HashMap<String, StoredRuntimeSnapshot>>>,
+    held: HeldWrites,
+    /// Writes still allowed through before every later one fails.
+    budget: Arc<Mutex<Option<usize>>>,
 }
 
 impl TestStorage {
@@ -57,6 +63,39 @@ impl TestStorage {
             .get(thread_id.as_ref())
             .cloned()
     }
+
+    /// Let the next `writes` checkpoint writes through, then fail every one
+    /// after that — which is how a test aims a failure at one specific write
+    /// point rather than at whichever write happens to come first.
+    pub(super) async fn fail_checkpoints_after(&self, writes: usize) {
+        *self.budget.lock().await = Some(writes);
+    }
+
+    /// Park `agent_name`'s checkpoint writes until the returned gate is
+    /// released. Lets a test prove that whoever is supposed to wait for a
+    /// write really does wait for it, instead of racing a fast one.
+    pub(super) async fn hold_checkpoints_of(&self, agent_name: &str) -> WriteGate {
+        let open = Arc::new(Notify::new());
+        *self.held.lock().await = Some((agent_name.to_string(), open.clone()));
+        WriteGate {
+            held: self.held.clone(),
+            open,
+        }
+    }
+}
+
+/// Checkpoint writes parked by [`TestStorage::hold_checkpoints_of`].
+pub(super) struct WriteGate {
+    held: HeldWrites,
+    open: Arc<Notify>,
+}
+
+impl WriteGate {
+    /// Let the parked write land, and stop holding later ones.
+    pub(super) async fn release(&self) {
+        self.held.lock().await.take();
+        self.open.notify_one();
+    }
 }
 
 impl SessionStorage for TestStorage {
@@ -66,6 +105,27 @@ impl SessionStorage for TestStorage {
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
+            let spent = {
+                let mut budget = self.budget.lock().await;
+                match budget.as_mut() {
+                    Some(0) => true,
+                    Some(remaining) => {
+                        *remaining -= 1;
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if spent {
+                return Err("storage is unavailable".to_string());
+            }
+            let open = match &*self.held.lock().await {
+                Some((agent, open)) if *agent == checkpoint.agent_name => Some(open.clone()),
+                _ => None,
+            };
+            if let Some(open) = open {
+                open.notified().await;
+            }
             self.checkpoints.lock().await.insert(thread_id, checkpoint);
             Ok(())
         })
@@ -417,6 +477,11 @@ impl LLMProvider for TestProvider {
             }
             "explore-plain" => Self::completed(AssistantMessage {
                 content: "explore done".into(),
+                ..assistant()
+            }),
+            // A root that answers straight away — no tools, no sub-agents.
+            "plain-main" => Self::completed(AssistantMessage {
+                content: "main done".into(),
                 ..assistant()
             }),
             // A middle layer: calls its own sub-agent, then answers.

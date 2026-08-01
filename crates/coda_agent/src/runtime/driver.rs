@@ -4,8 +4,8 @@ use std::{
 };
 
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId, MessageOrigin,
-    StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
+    MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -208,7 +208,27 @@ pub(crate) async fn run_agent(
 
 enum AgentLoopState {
     Next(ResumePoint),
-    Done(ResumePoint),
+    Done(ResumePoint, Box<TurnEnd>),
+}
+
+/// What a turn owes the outside world once its state is durable. Handlers
+/// describe it; [`AgentLoop::persist_and_announce`] is the only place that
+/// carries it out, and only after the checkpoint write succeeds.
+#[derive(Default)]
+struct TurnEnd {
+    /// The event that announces this turn is over. `None` when the run exits
+    /// without announcing anything — an unexpected envelope, say.
+    event: Option<AgentEvent>,
+    /// The result handed back to the caller. Sub-agents only; a root agent has
+    /// nobody to answer.
+    reply: Option<Envelope>,
+}
+
+/// How a single call to the model finished.
+enum GenerationOutcome {
+    Completed(Box<AssistantMessage>),
+    Aborted,
+    Failed(String),
 }
 
 /// What the agent turn produced, distinguishing suspension from normal
@@ -289,13 +309,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     // (reconnect, crash) already contains it; the event stream
                     // never carries user messages. Restricted to root user tasks
                     // to avoid extra writes on sub-agent ToolCall envelopes.
-                    if is_user_task {
-                        self.save_checkpoint(resume_point.clone(), suspended_at)
-                            .await;
+                    if is_user_task
+                        && !self
+                            .persist_and_announce(
+                                resume_point.clone(),
+                                suspended_at,
+                                TurnEnd::default(),
+                            )
+                            .await
+                    {
+                        return Ok(TurnOutcome::Completed);
                     }
                 }
-                AgentLoopState::Done(rp) => {
-                    self.save_checkpoint(rp, suspended_at).await;
+                AgentLoopState::Done(rp, owed) => {
+                    self.persist_and_announce(rp, suspended_at, *owed).await;
                     return Ok(TurnOutcome::Completed);
                 }
             }
@@ -303,6 +330,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 
         let mut exit_acquired = false;
         let mut suspended = false;
+        let mut owed = TurnEnd::default();
         loop {
             if self.runtime.exit_barrier.is_exiting() {
                 exit_acquired = true;
@@ -316,8 +344,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         resume_point = rp;
                     }
                     AgentLoopState::Next(rp) => resume_point = rp,
-                    AgentLoopState::Done(rp) => {
+                    AgentLoopState::Done(rp, end) => {
                         resume_point = rp;
+                        owed = *end;
                         break;
                     }
                 },
@@ -328,8 +357,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             break;
                         }
                         AgentLoopState::Next(rp) => resume_point = rp,
-                        AgentLoopState::Done(rp) => {
+                        AgentLoopState::Done(rp, end) => {
                             resume_point = rp;
+                            owed = *end;
                             break;
                         }
                     }
@@ -353,30 +383,75 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     };
                     if has_pending {
                         suspended = true;
-                        self.runtime
-                            .emit_event(
-                                self.agent.name.clone(),
-                                self.thread_id.clone(),
-                                AgentEvent::Suspended(pending),
-                            )
-                            .await;
+                        owed.event = Some(AgentEvent::Suspended(pending));
                     }
                     break;
                 }
             }
         }
 
-        self.save_checkpoint(resume_point, suspended_at).await;
+        let persisted = self
+            .persist_and_announce(resume_point, suspended_at, owed)
+            .await;
         Ok(if exit_acquired {
             TurnOutcome::ExitAcquired
-        } else if suspended {
+        } else if suspended && persisted {
             TurnOutcome::Suspended
         } else {
+            // A failed write never announced the suspension, so nothing will
+            // ever arrive to resume it; going idle beats parking forever.
             TurnOutcome::Completed
         })
     }
 
-    async fn save_checkpoint(&self, resume_point: ResumePoint, suspended_at: jiff::Timestamp) {
+    /// Make this thread's state durable, then hand out what the turn owes the
+    /// outside world. Every checkpoint write in `run` goes through here, so the
+    /// ordering holds by construction rather than by each call site remembering
+    /// it — and an empty `owed` is an ordinary input, not a special case.
+    ///
+    /// Returns `false` when the write failed, in which case nothing was
+    /// announced and the turn stops where it stands.
+    async fn persist_and_announce(
+        &self,
+        resume_point: ResumePoint,
+        suspended_at: jiff::Timestamp,
+        owed: TurnEnd,
+    ) -> bool {
+        if let Err(err) = self.save_checkpoint(resume_point, suspended_at).await {
+            error!(
+                "Failed to save checkpoint for thread {}: {}",
+                self.thread_id.as_ref(),
+                err
+            );
+            self.runtime
+                .emit_event(
+                    self.agent.name.clone(),
+                    self.thread_id.clone(),
+                    AgentEvent::PersistFailed(err),
+                )
+                .await;
+            return false;
+        }
+        if let Some(event) = owed.event {
+            self.runtime
+                .emit_event(self.agent.name.clone(), self.thread_id.clone(), event)
+                .await;
+        }
+        // Last, always: the reply is what lets the caller move on, so anything
+        // this thread wants seen must already be out before it goes.
+        if let Some(reply) = owed.reply
+            && let Err(err) = self.runtime.send_message(reply).await
+        {
+            error!("Failed to send reply: {}", err);
+        }
+        true
+    }
+
+    async fn save_checkpoint(
+        &self,
+        resume_point: ResumePoint,
+        suspended_at: jiff::Timestamp,
+    ) -> Result<(), String> {
         let stored = StoredCheckpoint {
             thread_id: self.thread_id.as_ref().to_string(),
             agent_name: self.agent.name.to_string(),
@@ -394,18 +469,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             resume_point: resume_point.into(),
             suspended_at,
         };
-        if let Err(err) = self
-            .runtime
+        self.runtime
             .session_storage
             .save_checkpoint(self.thread_id.as_ref().to_string(), stored)
             .await
-        {
-            error!(
-                "Failed to save checkpoint for thread {}: {}",
-                self.thread_id.as_ref(),
-                err
-            );
-        }
     }
 
     /// Record a settled local tool call. A call that observed cancellation
@@ -468,7 +535,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             ResumePoint::Generation => {
                 let Some((turn_id, user)) = opening_user_message(&envelope.body) else {
                     warn!("unexpected envelope {:?}", envelope);
-                    return AgentLoopState::Done(ResumePoint::Generation);
+                    return AgentLoopState::Done(ResumePoint::Generation, Box::default());
                 };
                 // `None` for a root task, whose sender is the user rather than
                 // a calling agent.
@@ -530,9 +597,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         }
                         _ => {
                             warn!("expect a reply envelope but got a {:?}", envelope);
-                            return AgentLoopState::Done(ResumePoint::ToolExecution(
-                                tool_execution,
-                            ));
+                            return AgentLoopState::Done(
+                                ResumePoint::ToolExecution(tool_execution),
+                                Box::default(),
+                            );
                         }
                     }
                 }
@@ -637,11 +705,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             "unexpected envelope while suspended for approval: {:?}",
                             envelope
                         );
-                        AgentLoopState::Done(ResumePoint::PendingApproval {
-                            parent_message_id,
-                            pending_approval_calls,
-                            pending_calls,
-                        })
+                        AgentLoopState::Done(
+                            ResumePoint::PendingApproval {
+                                parent_message_id,
+                                pending_approval_calls,
+                                pending_calls,
+                            },
+                            Box::default(),
+                        )
                     }
                 }
             }
@@ -675,7 +746,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let mut partial_content = String::new();
         let mut partial_reasoning = String::new();
         let mut reasoning_ended_at: Option<jiff::Timestamp> = None;
-        let llm_result = loop {
+        let outcome = loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
@@ -705,9 +776,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         self.agent.add_message(Message::Assistant(message.clone())).await;
                         self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::LLMEnd(message)).await;
                     }
-                    self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::Aborted(AbortedTarget::Generation)).await;
-                    // TODO: returning Err here may cause a downstream Error event in addition to Aborted(Generation). Consider a distinct abort result.
-                    break Err("Aborted by user".to_string());
+                    break GenerationOutcome::Aborted;
                 }
                 event = llm_stream.next() => {
                     match event {
@@ -722,9 +791,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             partial_reasoning.push_str(&chunk);
                             self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
-                        Some(Ok(LLMStreamEvent::Completed(message))) => break Ok(*message),
-                        Some(Err(err)) => break Err(err.to_string()),
-                        None => break Err(StreamError::InvalidResponse(
+                        Some(Ok(LLMStreamEvent::Completed(message))) => break GenerationOutcome::Completed(message),
+                        Some(Err(err)) => break GenerationOutcome::Failed(err.to_string()),
+                        None => break GenerationOutcome::Failed(StreamError::InvalidResponse(
                             "LLM stream ended without Completed event".to_string(),
                         )
                         .to_string()),
@@ -732,128 +801,127 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 }
             }
         };
-        match llm_result {
-            Ok(mut assistant_message) => {
-                let ended_at = jiff::Timestamp::now();
-                if assistant_message.reasoning_content.is_some() {
-                    assistant_message.reasoning_ended_at =
-                        Some(reasoning_ended_at.unwrap_or(ended_at));
-                }
-                assistant_message.started_at = started_at;
-                assistant_message.ended_at = ended_at;
-                self.agent
-                    .add_message(Message::Assistant(assistant_message.clone()))
-                    .await;
-                self.runtime
-                    .emit_event(
-                        self.agent.name.clone(),
-                        thread_id.clone(),
-                        AgentEvent::LLMEnd(assistant_message.clone()),
-                    )
-                    .await;
-
-                if assistant_message.tool_calls.is_empty() {
-                    if let Some(reply_target) = self.reply_target.take() {
-                        let err = self
-                            .runtime
-                            .send_message(Envelope::with_id(|id| Envelope {
-                                id,
-                                from: Sender::Agent {
-                                    name: self.agent.name.clone(),
-                                    thread_id: thread_id.clone(),
-                                },
-                                to: Receiver {
-                                    name: reply_target.sender_name.clone(),
-                                    thread_id: ThreadId::from(
-                                        reply_target.sender_thread_id.clone(),
-                                    ),
-                                },
-                                reply_to: Some(reply_target.envelope_id.clone()),
-                                body: EnvelopeBody::Reply {
-                                    call_id: reply_target.call_id.clone(),
-                                    output: ToolOutput::Ok(assistant_message.content.clone()),
-                                },
-                            }))
-                            .await;
-                        if let Err(err) = err {
-                            error!("Failed to send LLM reply: {}", err);
-                        }
-                    }
-                    AgentLoopState::Done(ResumePoint::Generation)
-                } else {
-                    // Every call in this batch came from this one message; the
-                    // batch state carries its id so a sub-agent dispatched later
-                    // — possibly after an approval suspension or a restart —
-                    // can still record what triggered it.
-                    let parent_message_id = assistant_message.message_id;
-                    let (pending_approval_calls, auto_calls) = {
-                        match &self.config.tool_approval {
-                            ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls),
-                            ToolApprovalMode::Manual => (assistant_message.tool_calls, vec![]),
-                            ToolApprovalMode::RequireWhen(predicate) => assistant_message
-                                .tool_calls
-                                .into_iter()
-                                .partition(|call| predicate(call)),
-                        }
-                    };
-                    let auto_calls: VecDeque<_> = auto_calls
-                        .into_iter()
-                        .map(|call| PendingToolCall {
-                            tool_call: call,
-                            outcome: ToolCallOutcome::Auto,
-                        })
-                        .collect();
-                    if !pending_approval_calls.is_empty() {
-                        AgentLoopState::Next(ResumePoint::PendingApproval {
-                            parent_message_id,
-                            pending_approval_calls: pending_approval_calls.into(),
-                            pending_calls: auto_calls,
-                        })
-                    } else {
-                        AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
-                            parent_message_id,
-                            pending_replies: vec![],
-                            tool_calls: auto_calls,
-                        }))
-                    }
-                }
+        let mut assistant_message = match outcome {
+            GenerationOutcome::Completed(message) => *message,
+            GenerationOutcome::Aborted => {
+                let target = self.reply_target.take();
+                return AgentLoopState::Done(
+                    ResumePoint::Generation,
+                    Box::new(self.turn_end(
+                        target,
+                        Some(AgentEvent::Aborted(AbortedTarget::Generation)),
+                        ToolOutput::Err("Aborted by user".to_string()),
+                    )),
+                );
             }
-            Err(err) => {
+            GenerationOutcome::Failed(err) => {
                 error!("LLM generation error: {}", err);
-                if let Some(reply_target) = self.reply_target.take() {
-                    let ret = self
-                        .runtime
-                        .send_message(Envelope::with_id(|id| Envelope {
-                            id,
-                            from: Sender::Agent {
-                                name: self.agent.name.clone(),
-                                thread_id,
-                            },
-                            to: Receiver {
-                                name: reply_target.sender_name.clone(),
-                                thread_id: ThreadId::from(reply_target.sender_thread_id.clone()),
-                            },
-                            reply_to: Some(reply_target.envelope_id.clone()),
-                            body: EnvelopeBody::Reply {
-                                call_id: reply_target.call_id.clone(),
-                                output: ToolOutput::Err(err),
-                            },
-                        }))
-                        .await;
-                    if let Err(err) = ret {
-                        error!("Failed to send LLM error reply: {}", err);
-                    }
-                } else {
-                    self.runtime
-                        .emit_event(
-                            self.agent.name.clone(),
-                            self.thread_id.clone(),
-                            AgentEvent::Error(err),
-                        )
-                        .await;
-                }
-                AgentLoopState::Done(ResumePoint::Generation)
+                let target = self.reply_target.take();
+                // A sub-agent's failure travels as its reply; only a root agent,
+                // with nobody to answer, announces it as an event.
+                let event = target.is_none().then(|| AgentEvent::Error(err.clone()));
+                return AgentLoopState::Done(
+                    ResumePoint::Generation,
+                    Box::new(self.turn_end(target, event, ToolOutput::Err(err))),
+                );
             }
+        };
+
+        let ended_at = jiff::Timestamp::now();
+        if assistant_message.reasoning_content.is_some() {
+            assistant_message.reasoning_ended_at = Some(reasoning_ended_at.unwrap_or(ended_at));
+        }
+        assistant_message.started_at = started_at;
+        assistant_message.ended_at = ended_at;
+        self.agent
+            .add_message(Message::Assistant(assistant_message.clone()))
+            .await;
+
+        if assistant_message.tool_calls.is_empty() {
+            let content = assistant_message.content.clone();
+            let target = self.reply_target.take();
+            return AgentLoopState::Done(
+                ResumePoint::Generation,
+                Box::new(self.turn_end(
+                    target,
+                    Some(AgentEvent::LLMEnd(assistant_message)),
+                    ToolOutput::Ok(content),
+                )),
+            );
+        }
+
+        // Mid-turn: the loop carries on from here, so this one goes out now.
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                thread_id,
+                AgentEvent::LLMEnd(assistant_message.clone()),
+            )
+            .await;
+
+        // Every call in this batch came from this one message; the batch state
+        // carries its id so a sub-agent dispatched later — possibly after an
+        // approval suspension or a restart — can still record what triggered it.
+        let parent_message_id = assistant_message.message_id;
+        let (pending_approval_calls, auto_calls) = match &self.config.tool_approval {
+            ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls),
+            ToolApprovalMode::Manual => (assistant_message.tool_calls, vec![]),
+            ToolApprovalMode::RequireWhen(predicate) => assistant_message
+                .tool_calls
+                .into_iter()
+                .partition(|call| predicate(call)),
+        };
+        let auto_calls: VecDeque<_> = auto_calls
+            .into_iter()
+            .map(|call| PendingToolCall {
+                tool_call: call,
+                outcome: ToolCallOutcome::Auto,
+            })
+            .collect();
+        if pending_approval_calls.is_empty() {
+            AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                parent_message_id,
+                pending_replies: vec![],
+                tool_calls: auto_calls,
+            }))
+        } else {
+            AgentLoopState::Next(ResumePoint::PendingApproval {
+                parent_message_id,
+                pending_approval_calls: pending_approval_calls.into(),
+                pending_calls: auto_calls,
+            })
+        }
+    }
+
+    /// Package a turn ending: what to announce, plus `output` handed back to
+    /// whoever called this thread as a tool. A root agent has no caller — its
+    /// `target` is `None` and `output` goes nowhere.
+    fn turn_end(
+        &self,
+        target: Option<ReplyTarget>,
+        event: Option<AgentEvent>,
+        output: ToolOutput,
+    ) -> TurnEnd {
+        TurnEnd {
+            event,
+            reply: target.map(|target| {
+                Envelope::with_id(|id| Envelope {
+                    id,
+                    from: Sender::Agent {
+                        name: self.agent.name.clone(),
+                        thread_id: self.thread_id.clone(),
+                    },
+                    to: Receiver {
+                        name: target.sender_name,
+                        thread_id: ThreadId::from(target.sender_thread_id),
+                    },
+                    reply_to: Some(target.envelope_id),
+                    body: EnvelopeBody::Reply {
+                        call_id: target.call_id,
+                        output,
+                    },
+                })
+            }),
         }
     }
 
@@ -1076,14 +1144,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 ))
                 .await;
             }
-            self.runtime
-                .emit_event(
-                    self.agent.name.clone(),
-                    self.thread_id.clone(),
-                    AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids)),
-                )
-                .await;
-            return AgentLoopState::Done(ResumePoint::Generation);
+            return AgentLoopState::Done(
+                ResumePoint::Generation,
+                Box::new(TurnEnd {
+                    event: Some(AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids))),
+                    // An abort leaves the caller unanswered: it synthesises the
+                    // interrupted result itself rather than waiting on a reply.
+                    reply: None,
+                }),
+            );
         }
 
         if !tool_execution.pending_replies.is_empty() {

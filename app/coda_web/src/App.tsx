@@ -3,8 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abort,
   clearActiveSession,
+  dismissPersistError,
   openSession,
   selectActiveEvicted,
+  selectActivePersistError,
   selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
@@ -213,6 +215,7 @@ export default function App() {
   const activeKey = useCodaStore(selectActiveKey);
   const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
+  const activePersistError = useCodaStore(selectActivePersistError);
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
@@ -403,6 +406,22 @@ export default function App() {
           >
             <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
             <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
+              {!showingNewSession && activePersistError ? (
+                <div className="mx-3 mb-2 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
+                  <p className="min-w-0 flex-1 text-xs text-destructive">
+                    The last turn could not be saved, so it is not part of this session. {""}
+                    <span className="text-destructive/80">{activePersistError}</span>
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 px-2 text-xs"
+                    onClick={dismissPersistError}
+                  >
+                    Dismiss
+                  </Button>
+                </div>
+              ) : null}
               {showingNewSession ? (
                 <WorkspaceTargetBar
                   servers={servers}

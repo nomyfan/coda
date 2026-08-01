@@ -280,6 +280,10 @@ pub enum AgentEvent {
     /// Emitted when the run is aborted by the user. The stream terminates after this event.
     Aborted(AbortedTarget),
     Error(String), // TODO: make this more structured
+    /// This turn's content could not be written to the database. **Not** a
+    /// turn-ending event: whoever receives it must not treat the turn as
+    /// finished, because what is on screen is not what is stored.
+    PersistFailed(String),
 }
 
 /// Produces the template-variable bindings for a turn — the `{{name}}` values

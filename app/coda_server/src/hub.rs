@@ -302,6 +302,9 @@ pub trait SessionRelay: Send + Sync {
 /// (no tool calls, not aborted — an aborted partial message is always followed
 /// by the `Aborted` marker, which is the single settle signal for that path),
 /// any suspension, or the root agent aborting/erroring.
+///
+/// `PersistFailed` is deliberately not among them: a turn whose content never
+/// reached the database has not finished, whatever the screen already shows.
 pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
     match event {
         WireEvent::LlmEnd {
@@ -1486,7 +1489,8 @@ fn spawn_event_pipeline(
 
 /// Force the entry to drain and resync from the persisted state: used when
 /// the in-memory event log can no longer be trusted (a lagged broadcast
-/// receiver) or has grown past what it may safely buffer (a runaway turn).
+/// receiver, or a checkpoint the database refused) or has grown past what it
+/// may safely buffer (a runaway turn).
 /// `graceful_unbounded` lets any turn still in flight reach its own
 /// checkpoint before the entry is removed, so the next attach reads a
 /// current, authoritative persisted state instead of the discarded in-memory
@@ -1563,6 +1567,15 @@ async fn run_forwarder(
                     let _ = attachment
                         .tx
                         .send(RelayEvent::Event(Box::new(wire.clone())));
+                }
+                if let WireEvent::PersistFailed { message, .. } = &wire {
+                    // The turn's content never reached the database, so the
+                    // in-memory view is now a claim nothing can back. Drop it
+                    // and let the client rebuild from what is actually stored —
+                    // the same route a lagged stream takes.
+                    let reason = format!("checkpoint write failed: {message}");
+                    force_resync(&entries, &entry, guard, reason).await;
+                    return;
                 }
                 if event_settles_turn(&wire, &root_name) {
                     if let Some(approval) = suspended {

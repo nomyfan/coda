@@ -142,16 +142,27 @@ impl LLMProvider for TestProvider {
     }
 }
 
-/// `MemoryStorage` with a deliberate stall on one thread's checkpoint writes.
+/// `MemoryStorage` that can be told to drag its feet on one thread's checkpoint
+/// writes, or to refuse them outright.
 ///
-/// A sub-agent replies to its caller *before* saving its own checkpoint, so a
-/// root turn can settle while a sub-agent's write is still on its way. That
-/// window is real but short; widening it on purpose is what makes it testable
-/// instead of something a test would only hit by luck.
+/// A sub-agent saves before it replies, and its caller cannot get past the call
+/// without that reply — so stalling the write stalls the whole turn. Widening
+/// that on purpose is what makes the ordering observable instead of something a
+/// test would only catch by luck.
 #[derive(Clone, Default)]
 pub(super) struct SlowStorage {
     inner: MemoryStorage,
     stall: Option<(String, Duration)>,
+    /// Writes still allowed through before every later one fails.
+    budget: Arc<tokio::sync::Mutex<Option<usize>>>,
+}
+
+impl SlowStorage {
+    /// Let the next `writes` checkpoint writes through, then fail every one
+    /// after that.
+    pub(super) async fn fail_checkpoints_after(&self, writes: usize) {
+        *self.budget.lock().await = Some(writes);
+    }
 }
 
 impl SessionStorage for SlowStorage {
@@ -161,6 +172,20 @@ impl SessionStorage for SlowStorage {
         checkpoint: coda_agent::persist::StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
+            let spent = {
+                let mut budget = self.budget.lock().await;
+                match budget.as_mut() {
+                    Some(0) => true,
+                    Some(remaining) => {
+                        *remaining -= 1;
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if spent {
+                return Err("storage is unavailable".to_string());
+            }
             if let Some((slow_thread, delay)) = &self.stall
                 && slow_thread == &thread_id
             {
@@ -277,6 +302,7 @@ impl TestOpener {
             SlowStorage {
                 inner: MemoryStorage::default(),
                 stall: stall.map(|delay| (explore_thread().as_ref().to_string(), delay)),
+                budget: Arc::default(),
             },
         )
     }

@@ -353,6 +353,16 @@ export type WireEvent =
       agent_name: string;
       thread_id: string;
       message: string;
+    }
+  /** This turn's content never reached the database. Deliberately not a
+   * turn-ending event — the turn is not finished, whatever is already on
+   * screen. The server drops the session right after, so the next snapshot
+   * shows what is actually stored. */
+  | {
+      type: "persist_failed";
+      agent_name: string;
+      thread_id: string;
+      message: string;
     };
 
 export function isOkOutput(output: ToolOutput): output is { Ok: string } {

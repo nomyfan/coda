@@ -120,6 +120,12 @@ export type OpenedSession = {
   evicted: boolean;
   /** Created locally via "new session" but not yet opened on the server. */
   draft?: boolean;
+  /** Why the server could not store the last turn. Kept outside `entries` on
+   * purpose: a persist failure drops the session, and the snapshot the client
+   * reattaches with replaces `entries` wholesale — a notice living in there
+   * would be wiped by the very resync it is reporting on. Cleared when the user
+   * dismisses it or a later turn finishes normally. */
+  persistError?: string;
   /** First user task, used as the session list title before the server persists it. */
   firstUserMessage?: string;
   /** A historical message pulled back into the composer to be rewritten.
@@ -762,7 +768,14 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
-      const turnComplete = event.agent_name === rootName && event.message.tool_calls.length === 0;
+      // An aborted partial message is not an ending either — the `aborted`
+      // event always follows it and is what actually settles that path. This
+      // mirrors the server's `event_settles_turn`; disagreeing with it would
+      // let a cancelled generation pass for a completed turn.
+      const turnComplete =
+        event.agent_name === rootName &&
+        event.message.tool_calls.length === 0 &&
+        !event.message.aborted;
       const finished = {
         ...addActivity(
           finishAssistant(
@@ -783,6 +796,9 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ),
         running: turnComplete ? false : session.running,
+        // A turn that made it all the way to a stored ending answers the
+        // outstanding "the last one wasn't saved" notice.
+        persistError: turnComplete ? undefined : session.persistError,
         // Recorded here rather than at `tool_start` because a call that suspends
         // for approval and is then rejected never starts at all, and this is the
         // only point that sees the generation's own timing.
@@ -902,6 +918,19 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         running: false,
       };
     }
+    case "persist_failed":
+      // Not a turn ending: `running` stays as it was, because the turn did not
+      // finish — it failed to be recorded. The server drops the session right
+      // after this, and the notice has to outlive that reattach, so it goes on
+      // the session rather than into the transcript.
+      return {
+        ...addActivity(session, {
+          tone: "danger",
+          label: `${event.agent_name || "server"} could not save`,
+          detail: event.message,
+        }),
+        persistError: event.message,
+      };
   }
 }
 
@@ -2708,6 +2737,21 @@ export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern
   setAllowDraftPattern(codaStore, active.server, active.session.key, approval, call, pattern);
 }
 
+/** Dismiss the "the last turn was not saved" notice. The turn stays missing —
+ * this only stops saying so. */
+export function dismissPersistError() {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, active.server, active.session.key);
+    if (session) {
+      session.persistError = undefined;
+    }
+  });
+}
+
 export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
   const active = currentActive();
   if (!active) {
@@ -2941,6 +2985,8 @@ export const selectActiveStarting = (state: CodaStoreState) =>
   activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
   activeSessionOf(state)?.evicted ?? false;
+export const selectActivePersistError = (state: CodaStoreState) =>
+  activeSessionOf(state)?.persistError;
 export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
 export const selectActiveDrafts = (state: CodaStoreState) =>
