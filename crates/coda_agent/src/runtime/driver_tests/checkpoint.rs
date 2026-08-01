@@ -4,7 +4,9 @@
 
 use super::super::*;
 use super::fixtures::*;
-use crate::{AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, runtime::MemoryStorage};
+use crate::{
+    AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, runtime::MemoryStorage,
+};
 use coda_core::llm::{Message, ToolOutput};
 use std::collections::HashMap;
 use tokio::time::{Duration, timeout};

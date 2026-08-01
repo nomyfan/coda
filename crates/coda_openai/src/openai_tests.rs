@@ -264,9 +264,7 @@ fn real_openrouter_fixtures_keep_ordered_reasoning_details() {
         let details = message
             .reasoning_continuation
             .as_ref()
-            .and_then(|continuation| {
-                continuation.payload_for(OPENROUTER_REASONING_DETAILS_FORMAT)
-            })
+            .and_then(|continuation| continuation.payload_for(OPENROUTER_REASONING_DETAILS_FORMAT))
             .and_then(serde_json::Value::as_array)
             .unwrap();
         assert_eq!(details.len(), expected_details);

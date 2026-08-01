@@ -55,8 +55,7 @@ async fn reports_nonzero_exit() {
 
 #[tokio::test]
 async fn timeout_kills_process_group() {
-    let pidfile =
-        std::env::temp_dir().join(format!("coda-shell-timeout-{}", std::process::id()));
+    let pidfile = std::env::temp_dir().join(format!("coda-shell-timeout-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
     let mut shell = tool();
@@ -172,8 +171,7 @@ async fn cancel_kills_process_group_and_reports_partial_output() {
 
 #[tokio::test]
 async fn pre_cancelled_context_never_runs_the_command() {
-    let marker =
-        std::env::temp_dir().join(format!("coda-shell-precancel-{}", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("coda-shell-precancel-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
     let ctx = ToolCallContext::default();
@@ -197,8 +195,7 @@ async fn pre_cancelled_context_never_runs_the_command() {
 
 #[tokio::test]
 async fn sentinel_spawn_failure_fails_the_call_without_running_the_command() {
-    let marker =
-        std::env::temp_dir().join(format!("coda-shell-sentinel-{}", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("coda-shell-sentinel-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
     crate::process::FAIL_SENTINEL.with(|f| f.set(true));
@@ -226,8 +223,7 @@ async fn sentinel_spawn_failure_fails_the_call_without_running_the_command() {
 
 #[tokio::test]
 async fn cancel_after_leader_exit_kills_lingering_children_and_salvages_output() {
-    let pidfile =
-        std::env::temp_dir().join(format!("coda-shell-linger-{}", std::process::id()));
+    let pidfile = std::env::temp_dir().join(format!("coda-shell-linger-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
     let ctx = ToolCallContext::default();

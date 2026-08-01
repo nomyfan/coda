@@ -3,7 +3,9 @@
 
 use super::super::*;
 use super::fixtures::*;
-use crate::{AbortedTarget, AgentEvent, AgentSpec, StoredCheckpoint, SubAgentMode, ToolApprovalMode};
+use crate::{
+    AbortedTarget, AgentEvent, AgentSpec, StoredCheckpoint, SubAgentMode, ToolApprovalMode,
+};
 use coda_core::llm::{Message, ToolCallOutcome, ToolOutput};
 use std::sync::Arc;
 use tokio::sync::Notify;

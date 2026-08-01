@@ -73,8 +73,7 @@ fn rename_session_params_and_result_roundtrip() {
     let result = SessionName {
         name: Some("Investigation".into()),
     };
-    let back: SessionName =
-        serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+    let back: SessionName = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
     assert_eq!(back.name.as_deref(), Some("Investigation"));
 }
 
@@ -222,9 +221,7 @@ fn pending_approval_wire_skips_compound_shell_calls() {
         calls: vec![ToolCall {
             id: "call_shell".into(),
             name: "shell".into(),
-            arguments: Some(
-                r##"{"command":"# Navigate\ncd /work/coda && cargo test"}"##.into(),
-            ),
+            arguments: Some(r##"{"command":"# Navigate\ncd /work/coda && cargo test"}"##.into()),
         }],
         suspended_at: jiff::Timestamp::default(),
     };
@@ -348,8 +345,7 @@ fn event_params_roundtrips() {
             content: "hi".into(),
         },
     };
-    let back: EventParams =
-        serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+    let back: EventParams = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
     assert_eq!(back.workspace_id, "coda");
     assert_eq!(back.session_id, "s1");
     assert!(matches!(

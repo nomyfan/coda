@@ -646,8 +646,8 @@ deny = ["rm -rf *"]
 
 #[test]
 fn parse_permissions_rejects_non_array_approval_required() {
-    let err = parse_permissions("[permissions.tools]\napproval_required = \"write_file\"\n")
-        .unwrap_err();
+    let err =
+        parse_permissions("[permissions.tools]\napproval_required = \"write_file\"\n").unwrap_err();
     assert!(
         err.to_string()
             .contains("permissions approval_required must be an array")
@@ -656,9 +656,8 @@ fn parse_permissions_rejects_non_array_approval_required() {
 
 #[test]
 fn parse_permissions_rejects_non_string_approval_required_item() {
-    let err =
-        parse_permissions("[permissions.tools]\napproval_required = [\"write_file\", 1]\n")
-            .unwrap_err();
+    let err = parse_permissions("[permissions.tools]\napproval_required = [\"write_file\", 1]\n")
+        .unwrap_err();
     assert!(
         err.to_string()
             .contains("permissions approval_required must be strings")
