@@ -6,6 +6,18 @@ After modifying Rust code, always run `cargo clippy` and `cargo test` as a final
 
 This project is in active development. Breaking changes to APIs, serialization formats, and persisted data are acceptable — no backward-compatibility shims needed.
 
+## Rust Test Organization
+
+Keep `#[cfg(test)] mod tests { ... }` inline only while it's small. Once it grows past a couple hundred lines, move it to a sibling `<file>_tests.rs` and declare it with `#[path]` instead of a bare `mod tests;` (so line-count tooling can tell test code from real code by filename):
+
+```rust
+#[cfg(test)]
+#[path = "hub_tests.rs"]
+mod tests;
+```
+
+If that sibling file itself grows large enough to cover several distinct categories of cases (see `app/coda_server/src/hub_tests/` and `crates/coda_agent/src/runtime/driver_tests/` for the pattern), split it further into a `<file>_tests/` directory: `mod.rs` just declares the submodules, `fixtures.rs` holds shared test doubles/helpers (visibility `pub(super)`, so sibling category modules reach them via `use super::fixtures::*;`), and each remaining file covers one coherent theme (e.g. `approval.rs`, `rewind.rs`). Point the source file's `#[path]` at `<file>_tests/mod.rs`. Each category file still needs `use super::super::*;` to reach the source module's own (private) items — that's `super::super`, not `super`, once tests live two directories down.
+
 ## Git Workflow
 
 - Use Conventional Commits format for commit messages and pull request titles.

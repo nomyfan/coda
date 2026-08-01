@@ -540,95 +540,6 @@ fn normalize_provider_selection(
     normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
 }
 
-#[cfg(test)]
-mod selection_tests {
-    use super::*;
-
-    #[test]
-    fn no_reasoning_controls_keep_none() {
-        assert_eq!(normalize_reasoning_effort(&[], None), Some(None));
-    }
-
-    #[test]
-    fn omitted_effort_uses_first_configured_level() {
-        let configured = vec!["low".to_string(), "high".to_string()];
-        assert_eq!(
-            normalize_reasoning_effort(&configured, None),
-            Some(Some("low".to_string()))
-        );
-    }
-
-    #[test]
-    fn reasoning_model_accepts_off_and_configured_levels() {
-        let configured = vec!["off".to_string(), "low".to_string(), "high".to_string()];
-        assert_eq!(
-            normalize_reasoning_effort(&configured, Some("off".to_string())),
-            Some(Some("off".to_string()))
-        );
-        assert_eq!(
-            normalize_reasoning_effort(&configured, Some("high".to_string())),
-            Some(Some("high".to_string()))
-        );
-    }
-
-    #[test]
-    fn reasoning_model_rejects_unconfigured_levels() {
-        let configured = vec!["low".to_string()];
-        assert_eq!(
-            normalize_reasoning_effort(&configured, Some("high".to_string())),
-            None
-        );
-        assert_eq!(
-            normalize_reasoning_effort(&[], Some("off".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
-        let images = (0..(MAX_TASK_IMAGES + 1))
-            .map(|index| format!("https://example.com/{index}.png"))
-            .collect();
-
-        let sanitized = sanitize_task_images(images);
-
-        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
-        assert_eq!(sanitized[0], "https://example.com/0.png");
-        assert_eq!(sanitized[4], "https://example.com/4.png");
-    }
-
-    #[test]
-    fn task_image_sanitizer_accepts_supported_data_uri_images() {
-        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
-
-        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
-    }
-
-    #[test]
-    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
-        let oversized_url = format!(
-            "https://example.com/{}",
-            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
-        );
-        let oversized_data = format!(
-            "data:image/png;base64,{}",
-            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
-        );
-        let images = vec![
-            "http://example.com/image.png".to_string(),
-            "data:text/plain;base64,AAAA".to_string(),
-            "data:image/png;base64,AAA".to_string(),
-            "data:image/png;base64,AA=A".to_string(),
-            oversized_url,
-            oversized_data,
-        ];
-
-        let sanitized = sanitize_task_images(images);
-
-        assert!(sanitized.is_empty());
-    }
-}
-
 /// The selectable models, sorted by id for a stable dashboard ordering. Each
 /// entry's `id` is `{provider_id}:{model_id}`; `model` is the display name.
 fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
@@ -1990,4 +1901,93 @@ async fn main() {
     }
 
     info!("server stopped");
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn no_reasoning_controls_keep_none() {
+        assert_eq!(normalize_reasoning_effort(&[], None), Some(None));
+    }
+
+    #[test]
+    fn omitted_effort_uses_first_configured_level() {
+        let configured = vec!["low".to_string(), "high".to_string()];
+        assert_eq!(
+            normalize_reasoning_effort(&configured, None),
+            Some(Some("low".to_string()))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_accepts_off_and_configured_levels() {
+        let configured = vec!["off".to_string(), "low".to_string(), "high".to_string()];
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some("off".to_string())),
+            Some(Some("off".to_string()))
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some("high".to_string())),
+            Some(Some("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn reasoning_model_rejects_unconfigured_levels() {
+        let configured = vec!["low".to_string()];
+        assert_eq!(
+            normalize_reasoning_effort(&configured, Some("high".to_string())),
+            None
+        );
+        assert_eq!(
+            normalize_reasoning_effort(&[], Some("off".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn task_image_sanitizer_keeps_valid_images_up_to_the_limit() {
+        let images = (0..(MAX_TASK_IMAGES + 1))
+            .map(|index| format!("https://example.com/{index}.png"))
+            .collect();
+
+        let sanitized = sanitize_task_images(images);
+
+        assert_eq!(sanitized.len(), MAX_TASK_IMAGES);
+        assert_eq!(sanitized[0], "https://example.com/0.png");
+        assert_eq!(sanitized[4], "https://example.com/4.png");
+    }
+
+    #[test]
+    fn task_image_sanitizer_accepts_supported_data_uri_images() {
+        let sanitized = sanitize_task_images(vec!["data:image/png;base64,AAAA".to_string()]);
+
+        assert_eq!(sanitized, vec!["data:image/png;base64,AAAA"]);
+    }
+
+    #[test]
+    fn task_image_sanitizer_drops_oversized_and_invalid_images() {
+        let oversized_url = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_TASK_IMAGE_URL_BYTES)
+        );
+        let oversized_data = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(((MAX_TASK_IMAGE_BYTES + 1).div_ceil(3)) * 4)
+        );
+        let images = vec![
+            "http://example.com/image.png".to_string(),
+            "data:text/plain;base64,AAAA".to_string(),
+            "data:image/png;base64,AAA".to_string(),
+            "data:image/png;base64,AA=A".to_string(),
+            oversized_url,
+            oversized_data,
+        ];
+
+        let sanitized = sanitize_task_images(images);
+
+        assert!(sanitized.is_empty());
+    }
 }
