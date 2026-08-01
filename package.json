@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "prepare": "node -e \"if(!process.env.CI)require('child_process').execSync('pnpm exec prek install',{stdio:'inherit'})\"",
-    "build:rpi": "node scripts/build-rpi.mts",
+    "build:linux": "node scripts/build-linux.mts",
+    "build:linux:arm64": "node scripts/build-linux.mts --arch arm64",
+    "build:linux:x64": "node scripts/build-linux.mts --arch x64",
     "typecheck": "tsc --noEmit",
     "test": "pnpm -r run test",
     "fmt": "oxfmt .",

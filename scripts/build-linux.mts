@@ -9,7 +9,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 
+type Arch = "arm64" | "x64";
+
 type Options = {
+  arch: Arch;
   archive: boolean;
   bin: string;
   cargoArgs: string[];
@@ -20,10 +23,15 @@ type Options = {
   target: string;
 };
 
+const archTargets: Record<Arch, string> = {
+  arm64: "aarch64-unknown-linux-gnu",
+  x64: "x86_64-unknown-linux-gnu",
+};
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 
-const defaultOptions: Options = {
+const defaultOptions: Omit<Options, "arch" | "target"> = {
   archive: true,
   bin: "coda-server",
   cargoArgs: [],
@@ -31,18 +39,18 @@ const defaultOptions: Options = {
   locked: true,
   packageName: "coda_server",
   profile: "release",
-  target: "aarch64-unknown-linux-gnu",
 };
 
 function parseArgs(argv: string[]): Options {
   const program = new Command()
-    .name("build-rpi")
-    .description("Build coda-server for Raspberry Pi 4B arm64 with cargo-zigbuild.")
+    .name("build-linux")
+    .description("Build coda-server for Linux (arm64 or x86_64) with cargo-zigbuild.")
+    .requiredOption("--arch <arch>", "target architecture: arm64 or x64")
     .option("--glibc <version>", "glibc baseline for cargo-zigbuild", defaultOptions.glibc)
     .option("--profile <name>", "cargo profile", defaultOptions.profile)
     .option("--bin <name>", "binary name", defaultOptions.bin)
     .option("--package <name>", "package name", defaultOptions.packageName)
-    .option("--target <triple>", "Rust target triple", defaultOptions.target)
+    .option("--target <triple>", "Rust target triple (overrides --arch)")
     .option("--no-locked", "skip --locked")
     .option("--no-archive", "skip tar.gz packaging")
     .argument("[cargoArgs...]", "extra arguments passed to cargo zigbuild after --")
@@ -51,27 +59,34 @@ function parseArgs(argv: string[]): Options {
       `
 
 Examples:
-  pnpm build:rpi
-  pnpm build:rpi --glibc 2.36
-  pnpm build:rpi -- --features some-feature
+  pnpm build:linux -- --arch arm64
+  pnpm build:linux -- --arch x64
+  pnpm build:linux -- --arch arm64 --glibc 2.36
+  pnpm build:linux -- --arch x64 --features some-feature
 
-Raspberry Pi glibc:
-  Run "ldd --version" on the Pi and use the version from the first line.
-  A lower baseline can run on newer Raspberry Pi OS releases.`,
+glibc baseline:
+  Run "ldd --version" on the target machine and use the version from the first line.
+  A lower baseline can run on more (older) Linux distributions.`,
     )
-    .parse(["node", "scripts/build-rpi.mts", ...argv]);
+    .parse(["node", "scripts/build-linux.mts", ...argv]);
 
   const parsed = program.opts<{
+    arch: Arch;
     archive: boolean;
     bin: string;
     glibc: string;
     locked: boolean;
     package: string;
     profile: string;
-    target: string;
+    target?: string;
   }>();
 
+  if (parsed.arch !== "arm64" && parsed.arch !== "x64") {
+    throw new Error(`Invalid --arch "${parsed.arch}": expected "arm64" or "x64".`);
+  }
+
   return {
+    arch: parsed.arch,
     archive: parsed.archive,
     bin: parsed.bin,
     cargoArgs: program.args,
@@ -79,7 +94,7 @@ Raspberry Pi glibc:
     locked: parsed.locked,
     packageName: parsed.package,
     profile: parsed.profile,
-    target: parsed.target,
+    target: parsed.target ?? archTargets[parsed.arch],
   };
 }
 
@@ -118,7 +133,7 @@ async function main(): Promise<void> {
   await run("cargo", cargoArgs);
 
   const binaryPath = await findBuiltBinary(options, zigTarget);
-  const releaseName = `coda-server-rpi4-aarch64-linux-gnu-glibc-${options.glibc}`;
+  const releaseName = buildReleaseName(options);
   const outputDir = join(repoRoot, "dist", releaseName);
   const outputBinary = join(outputDir, options.bin);
   const checksumPath = join(outputDir, "SHA256SUMS");
@@ -200,6 +215,11 @@ async function findBuiltBinary(options: Options, zigTarget: string): Promise<str
   throw new Error(
     `Built binary was not found. Checked:\n${candidates.map((path) => `  ${path}`).join("\n")}`,
   );
+}
+
+function buildReleaseName(options: Options): string {
+  const targetLabel = options.target.replace("-unknown-linux-", "-linux-");
+  return `coda-server-${targetLabel}-glibc-${options.glibc}`;
 }
 
 async function sha256(path: string): Promise<string> {
