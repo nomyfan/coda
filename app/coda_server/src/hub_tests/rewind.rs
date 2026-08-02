@@ -328,25 +328,25 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
     );
 }
 
-/// The barrier at the top of `handle_rewind`: stop the runtime before
-/// truncating anything.
+/// The same guarantee under a supersede, which is where it used to break.
 ///
-/// A sub-agent now saves before it replies, so a turn that runs to its own end
-/// cannot leave a write in flight. A turn that is *superseded* still can: the
-/// user sends the next task while `explore` is mid-write, the root writes the
-/// call off as interrupted and settles a fresh turn without ever waiting for
-/// it. Truncate in that window and the late write puts the discarded history
-/// straight back, because against a lowered message count it reads as ordinary
-/// growth.
-///
-/// Closing that window for good is the job of the turn-cancellation work
-/// (`docs/design/turn-cancellation.md`); until then this barrier is what stands
-/// in for it. Drop the `shutdown` from `handle_rewind` and this test fails.
+/// Sending the next task while `explore` is mid-write once ended the first turn
+/// on the spot: the root wrote the call off as interrupted and settled a fresh
+/// turn without ever waiting, leaving a write in flight for a rewind to race.
+/// Now the superseded turn winds up properly — it waits for the real reply, and
+/// the sub-agent sends that only once its own checkpoint is durable — so by the
+/// time anything settles there is nothing left in flight.
+fn root_answered(event: &RelayEvent) -> bool {
+    matches!(event, RelayEvent::Event(e)
+        if matches!(&**e, WireEvent::LlmEnd { agent_name, message, .. }
+            if agent_name == "coda" && message.tool_calls.is_empty()))
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind() {
+async fn a_superseded_turn_leaves_no_write_in_flight() {
     let opener = Arc::new(TestOpener::delegating(
         "reply",
-        Some(Duration::from_millis(1000)),
+        Some(Duration::from_millis(300)),
     ));
     let storage = opener.storage.clone();
     let hub = SessionHub::new(opener, RelayConfig::default());
@@ -379,8 +379,14 @@ async fn a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind() {
             if matches!(&**e, WireEvent::LlmStart { agent_name, .. } if agent_name == "explore"))
     })
     .await;
+    assert!(
+        stored_messages(&storage, explore_thread().as_ref())
+            .await
+            .is_empty(),
+        "the sub-agent's write must still be in flight for this test to mean anything"
+    );
 
-    // The next task supersedes that turn without waiting for the write.
+    // The next task supersedes that turn.
     hub.command(
         key(),
         1,
@@ -390,14 +396,17 @@ async fn a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind() {
         },
     )
     .await;
-    next_matching(&mut events, is_settling_llm_end).await;
+    // The root's own answer, not the shared helper: winding the superseded turn
+    // up means `explore` replies for real first, and its reply is a settling
+    // `LlmEnd` too — waiting on that one would run ahead of the turn.
+    next_matching(&mut events, root_answered).await;
     wait_idle(&hub).await;
 
     assert!(
-        stored_messages(&storage, explore_thread().as_ref())
+        !stored_messages(&storage, explore_thread().as_ref())
             .await
             .is_empty(),
-        "the sub-agent's write must still be in flight for this test to mean anything"
+        "a turn settled while the sub-agent it superseded was still writing"
     );
 
     let outcome = hub
@@ -412,17 +421,13 @@ async fn a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind() {
         )
         .await;
     assert!(matches!(outcome, CommandOutcome::Rewound { .. }));
-    next_matching(&mut events, is_settling_llm_end).await;
+    next_matching(&mut events, root_answered).await;
 
-    // Outlast the stall before looking: without the barrier the truncation runs
-    // first and the stalled write lands after it, but the replacement turn
-    // finishes in microseconds — an assertion taken straight after it would see
-    // the empty history it expects for entirely the wrong reason.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         stored_messages(&storage, explore_thread().as_ref())
             .await
             .is_empty(),
-        "the sub-agent's late checkpoint restored the turn that was discarded"
+        "the rewind left the superseded sub-agent's discarded history behind"
     );
 }

@@ -82,6 +82,13 @@ pub(crate) async fn run_agent(
     // still need the thread_id available if Exit fires during that wait so the
     // snapshot can record the pending thread for restart-based resume.
     let mut suspended_thread: Option<ThreadId> = None;
+    // Envelopes this agent refused because a turn was still winding up. They
+    // keep their arrival order and go back in once it has.
+    let mut deferred: VecDeque<Envelope> = VecDeque::new();
+    // Whether the thread that just ran is parked waiting on sub-agent answers.
+    // While it is, only what arrives on the wire may reach it: replaying a held
+    // submission would walk straight back into the case that deferred it.
+    let mut awaiting_replies = false;
     loop {
         // First: if we have a queued resume envelope, run with it.
         // Otherwise: if there's an active thread to continue, just run it without waiting for a new envelope.
@@ -89,6 +96,8 @@ pub(crate) async fn run_agent(
             (envelope.to.thread_id.clone(), Some(envelope))
         } else if let Some(active_thread) = active_thread.take() {
             (active_thread, None)
+        } else if let Some(envelope) = (!awaiting_replies).then(|| deferred.pop_front()).flatten() {
+            (envelope.to.thread_id.clone(), Some(envelope))
         } else {
             // Wait for the next envelope, but allow Exit to break the loop.
             let next_envelope = tokio::select! {
@@ -163,6 +172,15 @@ pub(crate) async fn run_agent(
                 match (&mut run_fut).await {
                     Ok(TurnOutcome::ExitAcquired | TurnOutcome::Completed) => {
                         active_thread = None;
+                        awaiting_replies = false;
+                    }
+                    Ok(TurnOutcome::AwaitingReplies) => {
+                        active_thread = None;
+                        awaiting_replies = true;
+                    }
+                    Ok(TurnOutcome::Deferred(envelope)) => {
+                        active_thread = None;
+                        deferred.push_back(*envelope);
                     }
                     Ok(TurnOutcome::Suspended) => {
                         // The run ended in suspension; Exit was also requested.
@@ -185,6 +203,15 @@ pub(crate) async fn run_agent(
                     }
                     Ok(TurnOutcome::Completed) => {
                         active_thread = None;
+                        awaiting_replies = false;
+                    }
+                    Ok(TurnOutcome::AwaitingReplies) => {
+                        active_thread = None;
+                        awaiting_replies = true;
+                    }
+                    Ok(TurnOutcome::Deferred(envelope)) => {
+                        active_thread = None;
+                        deferred.push_back(*envelope);
                     }
                     Ok(TurnOutcome::Suspended) => {
                         // Agent is now waiting for a Resume envelope. Move the
@@ -210,7 +237,7 @@ pub(crate) async fn run_agent(
 
     info!("Agent {} exiting", agent.name);
     // Drain all remaining envelopes and send them to runtime.
-    let mut envelopes = Vec::new();
+    let mut envelopes: Vec<Envelope> = deferred.into();
     while let Ok(envelope) = envelope_rx.try_recv() {
         envelopes.push(envelope);
     }
@@ -223,6 +250,18 @@ pub(crate) async fn run_agent(
 enum AgentLoopState {
     Next(ResumePoint),
     Done(ResumePoint, Box<TurnEnd>),
+}
+
+/// What became of an incoming envelope. Only this step can refuse one, so it
+/// gets its own outcome rather than widening [`AgentLoopState`] with a case the
+/// other steps could never produce.
+enum EnvelopeOutcome {
+    Next(ResumePoint),
+    Done(ResumePoint, Box<TurnEnd>),
+    /// Refused: this thread is still owed answers from calls it made before the
+    /// envelope arrived. It stops the turn in flight and parks; whoever holds
+    /// the envelope tries again once that turn has wound up.
+    Deferred(Box<Envelope>, ResumePoint),
 }
 
 /// Where a cancelled thread got to.
@@ -265,6 +304,13 @@ enum TurnOutcome {
     /// `suspended_thread` is restored into `active_thread` so the snapshot
     /// records the pending thread_id for restart-based resume.
     Suspended,
+    /// The turn is not over: this thread dispatched sub-agent calls and is
+    /// parked until their answers arrive. The agent goes back to its inbox, but
+    /// only replies may reach it — a new submission waits its turn.
+    AwaitingReplies,
+    /// The envelope was handed back unconsumed. It is held until the turn in
+    /// flight has wound up, then delivered again in the order it arrived.
+    Deferred(Box<Envelope>),
     /// The exit barrier was already set when the turn started or checked.
     ExitAcquired,
 }
@@ -326,7 +372,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         if let Some(envelope) = envelope {
             let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. });
             match self.handle_envelope(resume_point, envelope).await {
-                AgentLoopState::Next(rp) => {
+                EnvelopeOutcome::Next(rp) => {
                     resume_point = rp;
                     // Persist the user prompt immediately so a mid-turn snapshot
                     // (reconnect, crash) already contains it; the event stream
@@ -344,9 +390,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         return Ok(TurnOutcome::Completed);
                     }
                 }
-                AgentLoopState::Done(rp, owed) => {
+                EnvelopeOutcome::Done(rp, owed) => {
                     self.persist_and_announce(rp, suspended_at, *owed).await;
                     return Ok(TurnOutcome::Completed);
+                }
+                EnvelopeOutcome::Deferred(envelope, rp) => {
+                    // The trimmed set of outstanding calls goes to storage
+                    // before the envelope goes back, so a crash in between
+                    // leaves the same picture the caller will come back to.
+                    self.persist_and_announce(rp, suspended_at, TurnEnd::default())
+                        .await;
+                    return Ok(TurnOutcome::Deferred(envelope));
                 }
             }
         }
@@ -432,6 +486,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         // broke out to wait for sub-agent replies announces nothing at all —
         // both leave the turn on the books.
         let announced_ending = owed.event.is_some() && !suspended;
+        let awaiting_replies = matches!(
+            &resume_point,
+            ResumePoint::ToolExecution(state) if !state.pending_replies.is_empty()
+        );
         let persisted = self
             .persist_and_announce(resume_point, suspended_at, owed)
             .await;
@@ -442,9 +500,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             TurnOutcome::ExitAcquired
         } else if suspended && persisted {
             TurnOutcome::Suspended
+        } else if awaiting_replies && persisted {
+            TurnOutcome::AwaitingReplies
         } else {
-            // A failed write never announced the suspension, so nothing will
-            // ever arrive to resume it; going idle beats parking forever.
+            // A failed write never announced the suspension, and left a stale
+            // checkpoint behind for anything still to come; going idle beats
+            // parking on a picture that is no longer true.
             TurnOutcome::Completed
         })
     }
@@ -587,6 +648,29 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .collect()
     }
 
+    /// Whether the sub-agent this call went to is still working on it here.
+    ///
+    /// The thread is derived the way the dispatch derived it rather than looked
+    /// up, because a sub-agent that has not reached a write point yet owns no
+    /// checkpoint to find. `false` means the work went away with an earlier
+    /// process and no answer is ever coming.
+    fn is_being_answered(&self, parent_message_id: MessageId, pending: &PendingReply) -> bool {
+        let Some(subagent) = self.agent.subagents.get(&pending.tool_name) else {
+            return false;
+        };
+        let derivation_key = if subagent.mode == SubAgentMode::Stateless {
+            MessageOrigin {
+                message_id: parent_message_id,
+                call_id: pending.call_id.clone(),
+            }
+            .derivation_key()
+        } else {
+            subagent.name.clone()
+        };
+        self.runtime
+            .is_answering(&ThreadId::from_uuid5(&self.thread_id, &derivation_key))
+    }
+
     /// Record a call that will never run, so history holds no tool call without
     /// an answer.
     async fn write_off(&mut self, call_id: String, tool_name: String) {
@@ -649,7 +733,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         &mut self,
         resume_point: ResumePoint,
         envelope: Envelope,
-    ) -> AgentLoopState {
+    ) -> EnvelopeOutcome {
         // Only a `ToolCall` states this thread's place in the tree; other
         // envelopes say nothing about it, so they leave whatever the checkpoint
         // restored intact rather than clearing it.
@@ -660,13 +744,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             ResumePoint::Generation => {
                 let Some((turn_id, user)) = opening_user_message(&envelope.body) else {
                     warn!("unexpected envelope {:?}", envelope);
-                    return AgentLoopState::Done(ResumePoint::Generation, Box::default());
+                    return EnvelopeOutcome::Done(ResumePoint::Generation, Box::default());
                 };
                 // `None` for a root task, whose sender is the user rather than
                 // a calling agent.
                 self.reply_target = reply_target_from_envelope(&envelope);
                 self.agent.add_user_message(turn_id, user).await;
-                AgentLoopState::Next(ResumePoint::Generation)
+                EnvelopeOutcome::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
                 if !tool_execution.pending_replies.is_empty() {
@@ -680,6 +764,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 },
                             ..
                         } => {
+                            // The obligation ends here rather than at delivery:
+                            // until the answer has actually been taken, the
+                            // caller must still treat it as coming.
+                            if let Sender::Agent { thread_id, .. } = &envelope.from {
+                                self.runtime.end_call(thread_id);
+                            }
                             if let Some(pos) = tool_execution
                                 .pending_replies
                                 .iter()
@@ -707,14 +797,18 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             body: EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. },
                             ..
                         } => {
-                            // A new task/tool-call arrived while waiting for subagent replies
-                            // (stale state after abort or process restart). Write aborted
-                            // ToolMessages to keep history valid, then start fresh.
-                            warn!(
-                                "Received envelope while waiting for {} subagent reply/replies; marking as aborted",
-                                tool_execution.pending_replies.len()
-                            );
+                            // New work arrived while calls are still outstanding.
+                            // Anything whose sub-agent went away with a previous
+                            // process is written off here — nothing in this one
+                            // will ever answer it. The rest are still being
+                            // worked on and have to answer for themselves.
+                            let parent_message_id = tool_execution.parent_message_id;
+                            let mut still_answering = Vec::new();
                             for pending in tool_execution.pending_replies.drain(..) {
+                                if self.is_being_answered(parent_message_id, &pending) {
+                                    still_answering.push(pending);
+                                    continue;
+                                }
                                 self.add_tool_message(ToolMessage::new(
                                     pending.call_id,
                                     pending.tool_name,
@@ -726,15 +820,26 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 ))
                                 .await;
                             }
+                            if !still_answering.is_empty() {
+                                // Superseding takes the same route as an abort:
+                                // stop the turn in flight and let it wind up.
+                                // The new work waits until it has.
+                                tool_execution.pending_replies = still_answering;
+                                self.runtime.cancel_turn(self.agent.current_turn().await);
+                                return EnvelopeOutcome::Deferred(
+                                    Box::new(envelope),
+                                    ResumePoint::ToolExecution(tool_execution),
+                                );
+                            }
                             self.reply_target = reply_target_from_envelope(&envelope);
                             if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
                                 self.agent.add_user_message(turn_id, user).await;
                             }
-                            return AgentLoopState::Next(ResumePoint::Generation);
+                            return EnvelopeOutcome::Next(ResumePoint::Generation);
                         }
                         _ => {
                             warn!("expect a reply envelope but got a {:?}", envelope);
-                            return AgentLoopState::Done(
+                            return EnvelopeOutcome::Done(
                                 ResumePoint::ToolExecution(tool_execution),
                                 Box::default(),
                             );
@@ -742,9 +847,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     }
                 }
                 if tool_execution.pending_replies.is_empty() {
-                    return AgentLoopState::Next(ResumePoint::Generation);
+                    return EnvelopeOutcome::Next(ResumePoint::Generation);
                 }
-                AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution))
+                EnvelopeOutcome::Next(ResumePoint::ToolExecution(tool_execution))
             }
             ResumePoint::PendingApproval {
                 parent_message_id,
@@ -788,7 +893,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
                             self.agent.add_user_message(turn_id, user).await;
                         }
-                        AgentLoopState::Next(ResumePoint::Generation)
+                        EnvelopeOutcome::Next(ResumePoint::Generation)
                     }
                     EnvelopeBody::Resume(decision) => {
                         let resolution_map: HashMap<String, ToolCallResolution> =
@@ -831,7 +936,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 }
                             }
                         }
-                        AgentLoopState::Next(ResumePoint::ToolExecution(ToolExecutionState {
+                        EnvelopeOutcome::Next(ResumePoint::ToolExecution(ToolExecutionState {
                             parent_message_id,
                             pending_replies: vec![],
                             tool_calls: pending_calls.clone(),
@@ -842,7 +947,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             "unexpected envelope while suspended for approval: {:?}",
                             envelope
                         );
-                        AgentLoopState::Done(
+                        EnvelopeOutcome::Done(
                             ResumePoint::PendingApproval {
                                 parent_message_id,
                                 pending_approval_calls,

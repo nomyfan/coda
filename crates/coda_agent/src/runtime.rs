@@ -259,6 +259,15 @@ pub(crate) struct AgentRuntime {
     /// A blocking mutex on purpose: every critical section below is a handful
     /// of vector operations and none of them awaits.
     turns: Arc<std::sync::Mutex<ActiveTurns>>,
+    /// Calls dispatched to a thread that has not been answered yet, counted per
+    /// thread.
+    ///
+    /// The count spans the whole obligation — from the call going out to the
+    /// caller consuming the answer — rather than just the wait in the inbox. A
+    /// thread that already took its envelope and is now itself waiting on a
+    /// sub-agent of its own is still working, and treating it as gone is what
+    /// would make a caller write its result for it.
+    unanswered: Arc<std::sync::Mutex<HashMap<ThreadId, usize>>>,
 }
 
 impl AgentRuntime {
@@ -276,6 +285,7 @@ impl AgentRuntime {
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
             turns: Arc::new(std::sync::Mutex::new(ActiveTurns::default())),
+            unanswered: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -336,6 +346,49 @@ impl AgentRuntime {
             Some(turn) => self.is_cancelled(turn),
             None => false,
         }
+    }
+
+    /// Note that a call has gone out to `thread_id` and has not been answered.
+    fn begin_call(&self, thread_id: &ThreadId) {
+        *self
+            .unanswered
+            .lock()
+            .expect("unanswered calls")
+            .entry(thread_id.clone())
+            .or_insert(0) += 1;
+    }
+
+    /// Note that one of `thread_id`'s callers has taken its answer.
+    pub(crate) fn end_call(&self, thread_id: &ThreadId) {
+        let mut unanswered = self.unanswered.lock().expect("unanswered calls");
+        if let Some(count) = unanswered.get_mut(thread_id) {
+            *count -= 1;
+            if *count == 0 {
+                unanswered.remove(thread_id);
+            }
+        }
+    }
+
+    /// Whether this thread still owes somebody an answer in this process.
+    ///
+    /// `false` means nothing here will ever produce that answer — the work went
+    /// away with a previous process — and the caller is free to write the call
+    /// off rather than wait forever.
+    pub(crate) fn is_answering(&self, thread_id: &ThreadId) -> bool {
+        self.unanswered
+            .lock()
+            .expect("unanswered calls")
+            .contains_key(thread_id)
+    }
+
+    /// Ask a turn to stop, without touching the queue it sits in. Used when a
+    /// new submission supersedes the one in flight.
+    pub(crate) fn cancel_turn(&self, turn: TurnId) {
+        self.turns
+            .lock()
+            .expect("active turns")
+            .cancelled
+            .insert(turn);
     }
 
     /// The turn a stored thread was last working on, or `None` if it has no
@@ -507,11 +560,19 @@ impl AgentRuntime {
     /// so nothing can act on the envelope before the turn is on the books.
     pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         let opened = self.open_turn(&envelope);
+        let dispatched = matches!(envelope.body, EnvelopeBody::ToolCall { .. })
+            .then(|| envelope.to.thread_id.clone());
+        if let Some(thread_id) = &dispatched {
+            self.begin_call(thread_id);
+        }
         let sent = self.deliver(envelope).await;
-        if sent.is_err()
-            && let Some(turn) = opened
-        {
-            self.close_turn(turn);
+        if sent.is_err() {
+            if let Some(turn) = opened {
+                self.close_turn(turn);
+            }
+            if let Some(thread_id) = &dispatched {
+                self.end_call(thread_id);
+            }
         }
         sent
     }

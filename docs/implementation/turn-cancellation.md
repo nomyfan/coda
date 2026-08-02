@@ -100,13 +100,9 @@
       Purpose: 把中止接回因果边，并让它逐层可传递
       Verification: 三层树 `root → A → B` 卡住 B 的写，根在放行前不发结束事件、放行后才发且不走 `PersistFailed`；**sub-agent 等审批时不发 Resume 直接中止**，断言被推着收场并自己回话；排队的 `Task` 属于另一轮，中止后不被标记且照常开跑。两处变异验证（根改回就地合成、去掉推）各自打红对应用例
 
-- [ ] [核心] 信箱仲裁：`TurnOutcome` 区分「真结束」与「等回话」，加 `Deferred(Envelope)`；`run_agent` 加 deferred FIFO，旧轮收场前只喂 `Reply`，收场后按原序重投
-      Purpose: 给顶替协议落脚点
-      Verification: 被扣下的 `Task` 在旧轮收场后按原序重投，期间的 `Reply` 照常处理
-
-- [ ] [核心] 顶替协议：新 `Task` / `ToolCall` 到达正等回话的线程时走收场协议再开新工作；同时立起按 `ThreadId` 的差事账（派发时记、回话发出时销——不是取走信封时销，见决策 2），就地合成收窄到「该调用的孩子线程没有未了的差事」，孩子 thread_id 由父的 `ToolExecutionState` 推导
+- [x] [核心] 信箱仲裁 + 顶替协议（合并成一步，见 Deviations）：`TurnOutcome` 加 `AwaitingReplies` 与 `Deferred(Envelope)`，`run_agent` 持 deferred FIFO；`AgentRuntime` 立起按 `ThreadId` 的差事账（派发时记、**父取走回话时**销）；新 `Task`/`ToolCall` 到达正等回话的线程时，没人答的那些当场写掉，还有人答的则标记本轮、把信封退回，收场后按原序重投
       Purpose: 堵掉正常路径上的断链点，同时保留崩溃恢复的清理路径
-      Verification: 卡住 sub-agent 的写并提交下一条 `Task`，新一轮的结束事件不提前出现；挂起不审批直接发新 `Task` 也能正常收场；崩溃恢复场景（孩子无 checkpoint 也无信封）仍走就地合成不挂住；两个 pending reply 一活一死时只合成死的那个
+      Verification: 卡住 sub-agent 的写并提交下一条 `Task`，结束事件在放行前不出现、放行后旧轮先收场再跑新轮，两条用户消息按序留在历史里；崩溃恢复场景（孩子无 checkpoint 也无信封）仍就地写掉、不挂住。两处变异（判据恒假、判据恒真）各自打红其中一条
 
 - [ ] [集成] `TurnId` 进事件通道；hub 结算改成按它关联：`unsettled_user_messages` 按轮次索引，`fold_settled_turn` 按 key 删，`turn_running` 按活跃轮次判定
       Purpose: 让旧轮补发的结束事件不再吃掉新任务

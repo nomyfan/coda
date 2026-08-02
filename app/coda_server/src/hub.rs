@@ -832,14 +832,15 @@ impl SessionHub {
                 warn!(workspace_id = %key.0, session_id = %key.1, "ignoring rewind while the session is busy");
                 return CommandOutcome::NotIdle;
             }
-            // Stop the runtime before touching the persisted state. "The turn
-            // settled" is not the same as "no agent is still writing": a
-            // sub-agent replies to its caller *before* saving its own
-            // checkpoint, so the root turn can finish while a checkpoint write
-            // is still on its way — and that write carries the history from
-            // before the truncation, which against a lowered message count
-            // reads as ordinary growth. A completed graceful shutdown is the
-            // only barrier in the system that rules this out.
+            // Stop the runtime before touching the persisted state: the
+            // rebuild below opens a second runtime over the same session, and
+            // the two must not overlap on it.
+            //
+            // This used to carry a second job — "the turn settled" did not mean
+            // "no agent is still writing", because a sub-agent could reply
+            // before saving and a superseded turn never waited for the ones it
+            // cut off. Both paths now save before they answer, so that window
+            // is closed and the shutdown is here for the rebuild alone.
             live.session.shutdown(Shutdown::graceful_unbounded()).await;
             (
                 live.provider_id.clone(),
