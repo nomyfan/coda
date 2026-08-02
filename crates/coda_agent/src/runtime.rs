@@ -1,9 +1,10 @@
 mod driver;
 
+use crate::agent::EnvelopeBody;
 use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
-use coda_core::llm::LLMProvider;
-use std::collections::HashMap;
+use coda_core::llm::{LLMProvider, TurnId};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -204,6 +205,46 @@ pub struct AgentRuntimeSnapshot {
     pub active_threads: HashMap<String, String>,
 }
 
+/// Every envelope [`AgentRuntime::bootstrap`] is about to put back, in the
+/// order the agents will see them: per agent, whatever was still in its inbox
+/// before whatever arrived during the drain. Agent names are sorted only to
+/// make the walk deterministic — the order that carries meaning is the one
+/// inside a single agent's queue, since only the root's holds submissions.
+fn replayed_envelopes(snapshot: &AgentRuntimeSnapshot) -> Vec<&Envelope> {
+    let mut names: Vec<&String> = snapshot
+        .agent_drained_envelopes
+        .keys()
+        .chain(snapshot.drained_envelopes.keys())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .flat_map(|name| {
+            snapshot
+                .agent_drained_envelopes
+                .get(name)
+                .into_iter()
+                .flatten()
+                .chain(snapshot.drained_envelopes.get(name).into_iter().flatten())
+        })
+        .collect()
+}
+
+/// The turns this session has been asked to run and has not finished, oldest
+/// first, alongside the ones something has asked to stop.
+///
+/// Only a user `Task` opens a turn — a `ToolCall` carries its caller's turn id,
+/// and `Reply`/`Resume` continue work that is already registered. That is what
+/// makes one flat list both complete and correctly ordered even though each
+/// agent's inbox is queued independently: new turns only ever arrive through
+/// the root agent's inbox, so there is only one submission order to preserve.
+#[derive(Default)]
+struct ActiveTurns {
+    order: Vec<TurnId>,
+    cancelled: HashSet<TurnId>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
     session_id: String,
@@ -215,6 +256,9 @@ pub(crate) struct AgentRuntime {
     session_storage: Arc<dyn SessionStorage>,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
+    /// A blocking mutex on purpose: every critical section below is a handful
+    /// of vector operations and none of them awaits.
+    turns: Arc<std::sync::Mutex<ActiveTurns>>,
 }
 
 impl AgentRuntime {
@@ -231,6 +275,95 @@ impl AgentRuntime {
             session_storage: Arc::new(session_storage),
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
+            turns: Arc::new(std::sync::Mutex::new(ActiveTurns::default())),
+        }
+    }
+
+    /// The session's root thread, the only one whose turn endings end the turn
+    /// itself — a sub-agent thread finishes its own work many times within one.
+    pub(crate) fn is_root_thread(&self, thread_id: &ThreadId) -> bool {
+        thread_id.as_ref() == self.session_id
+    }
+
+    /// Append a turn to the active list. Idempotent, which is what lets
+    /// recovery register the same turn from several angles — and lets a runtime
+    /// snapshot that gets replayed twice still describe one turn.
+    fn register_turn(&self, turn: TurnId) -> bool {
+        let mut turns = self.turns.lock().expect("active turns");
+        if turns.order.contains(&turn) {
+            return false;
+        }
+        turns.order.push(turn);
+        true
+    }
+
+    /// Register the turn an envelope opens, before anything can act on it.
+    /// Returns the id only when a new turn was registered, so a delivery that
+    /// then fails can take back exactly what it added.
+    fn open_turn(&self, envelope: &Envelope) -> Option<TurnId> {
+        let EnvelopeBody::Task { message_id, .. } = &envelope.body else {
+            return None;
+        };
+        let turn = TurnId::from(*message_id);
+        self.register_turn(turn).then_some(turn)
+    }
+
+    /// Drop a finished turn. Idempotent — a turn that was never registered, or
+    /// was already closed, is simply absent.
+    pub(crate) fn close_turn(&self, turn: TurnId) {
+        let mut turns = self.turns.lock().expect("active turns");
+        turns.order.retain(|active| *active != turn);
+        turns.cancelled.remove(&turn);
+    }
+
+    /// The turn a stored thread was last working on, or `None` if it has no
+    /// history to name one.
+    async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
+        self.session_storage
+            .load_checkpoint(thread_id)
+            .await
+            .ok()
+            .flatten()?
+            .messages
+            .last()
+            .map(|entry| entry.turn_id)
+    }
+
+    /// Put back the turns this process is about to resume, before any agent can
+    /// see an envelope — an abort right after a restart has to find them.
+    ///
+    /// Only work that will really run counts: threads the snapshot parked
+    /// mid-turn, and envelopes about to be replayed. A turn nothing will pick up
+    /// again must stay off the list, or it would sit at the head forever and
+    /// swallow every abort aimed at the turns behind it.
+    async fn register_resumed_turns(&self, snapshot: &AgentRuntimeSnapshot) {
+        // In-flight work first: whatever was already running is older than
+        // anything queued behind it.
+        for thread_id in snapshot.active_threads.values() {
+            if let Some(turn) = self.turn_of_thread(thread_id).await {
+                self.register_turn(turn);
+            }
+        }
+        let replayed = replayed_envelopes(snapshot);
+        for envelope in &replayed {
+            match &envelope.body {
+                // A submission is queued behind the in-flight work, so it waits
+                // for the second pass.
+                EnvelopeBody::Task { .. } => {}
+                EnvelopeBody::ToolCall { turn_id, .. } => {
+                    self.register_turn(*turn_id);
+                }
+                EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => {
+                    if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
+                        self.register_turn(turn);
+                    }
+                }
+            }
+        }
+        for envelope in &replayed {
+            if let EnvelopeBody::Task { message_id, .. } = &envelope.body {
+                self.register_turn(TurnId::from(*message_id));
+            }
         }
     }
 
@@ -250,6 +383,9 @@ impl AgentRuntime {
         mut resume_decisions: HashMap<String, ResumeDecision>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.register_resumed_turns(snapshot).await;
+        }
         for (name, agent) in agents {
             info!("Bootstrap agent: {}", name);
             let runtime = self.clone();
@@ -316,7 +452,18 @@ impl AgentRuntime {
     }
 
     /// Abort the current work for this runtime.
+    ///
+    /// The turn at the head of the queue is marked before the broadcast leaves,
+    /// because which agent picks the control message up first is not something
+    /// the runtime can order — whoever gets there first must already find the
+    /// mark in place.
     pub(crate) async fn request_abort(&self) {
+        {
+            let mut turns = self.turns.lock().expect("active turns");
+            if let Some(head) = turns.order.first().copied() {
+                turns.cancelled.insert(head);
+            }
+        }
         self.broadcast_command(AgentControl::Abort).await;
     }
 
@@ -326,8 +473,20 @@ impl AgentRuntime {
         self.broadcast_command(AgentControl::Exit).await;
     }
 
-    /// Send a message to a specific agent.
+    /// Send a message to a specific agent, registering the turn it opens first
+    /// so nothing can act on the envelope before the turn is on the books.
     pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
+        let opened = self.open_turn(&envelope);
+        let sent = self.deliver(envelope).await;
+        if sent.is_err()
+            && let Some(turn) = opened
+        {
+            self.close_turn(turn);
+        }
+        sent
+    }
+
+    async fn deliver(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         if self.exit_barrier.is_exiting() {
             // During the exit draining phase, buffer incoming messages and persist
             // immediately so they survive a crash before shutdown completes.

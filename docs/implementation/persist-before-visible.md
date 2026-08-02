@@ -4,7 +4,7 @@
 
 一轮对外宣布结束时，它的内容（含 sub-agent）必须已经在数据库里。需求见 [`../requirement/persist-before-visible.md`](../requirement/persist-before-visible.md)。
 
-**这份设计只交付需求的一部分。** 设计过程中发现，要让这条保证在中止和「新任务顶替」两条路径上也成立，得先把这个系统本身就已破损的取消语义重做一遍——那是个远大于本需求的子系统，单独立项于 [`turn-cancellation.md`](../design/turn-cancellation.md)。本文档做的是它的地基，也是日常路径上收益最大的那一半。
+**这份设计只交付需求的一部分。** 设计过程中发现，要让这条保证在中止和「新任务顶替」两条路径上也成立，得先把这个系统本身就已破损的取消语义重做一遍——那是个远大于本需求的子系统，单独立项于 [`turn-cancellation.md`](turn-cancellation.md)。本文档做的是它的地基，也是日常路径上收益最大的那一半。
 
 **本文档兑现的**：一轮在**没有被中止、也没有被新任务顶替**的情况下结束时，该轮全部内容（含 sub-agent 线程）已经在数据库里；写不进去时明确报错，绝不伪装成成功。
 
@@ -20,7 +20,7 @@
 
 **Out**
 
-- 中止路径、顶替路径的因果链——全部归 [`turn-cancellation.md`](../design/turn-cancellation.md)。
+- 中止路径、顶替路径的因果链——全部归 [`turn-cancellation.md`](turn-cancellation.md)。
 - **不拆 fork 的落库校验与客户端重试。** 拆它的前提是第二部分落地。
 - 不动 hub 的结算账目（`fold_settled_turn` 的按序弹出）。改它是第二部分的事。
 - 不改数据库结构，不改 `fork` / `rewind` 的对外行为。
@@ -118,7 +118,7 @@ AgentEvent::PersistFailed(String)
 
 **两层保证，别混为一谈。** `save_checkpoint(Ok)` 是线程级事实。整轮的保证是拼出来的：一个线程只有存了档才回话，调用方只被已落库的回话唤醒，逐层递归，根 settle 那一刻整棵树都已落库。
 
-**这条链有三个断点，本文档只堵住「什么都没发生」的那种情况**：中止、新任务顶替、以及对已派发调用的就地合成，都会切断它。它们归 [`turn-cancellation.md`](../design/turn-cancellation.md)。这也正是 fork 的补偿必须留着的原因。
+**这条链有三个断点，本文档只堵住「什么都没发生」的那种情况**：中止、新任务顶替、以及对已派发调用的就地合成，都会切断它。它们归 [`turn-cancellation.md`](turn-cancellation.md)。这也正是 fork 的补偿必须留着的原因。
 
 ## Data Model
 
@@ -169,6 +169,6 @@ AgentEvent::PersistFailed(String)
 
 - **第一步和第二步是一起验收的。** 第一步的 Verification（「卡住时无结束事件；放开后才出现」）描述的是修好之后的行为，所以第一步交付时那个用例是**红**的——红本身就是风险验证的结论：卡住 `explore` 的写之后，根 agent 在 0.00s 内就结束了整轮，竞态确定性复现，不靠时序碰运气。第二步落地后转绿。
 - **`AgentLoopState::Done` 里的 `TurnEnd` 装了箱。** 不装的话这个枚举涨到 648 字节，clippy 的 `large_enum_variant` 会报——在 async fn 里它还会撑大 future。设计里没提，属于实现细节。
-- **一个既有 hub 用例的前提被本次改动消掉了，屏障改用另一个窗口守。** `a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved` 断言的是「根轮次 settle 时 sub-agent 还没存完」，而这正是本次要消除的窗口。已改名为 `a_rewind_cannot_race_a_sub_agents_checkpoint_write` 并把断言反过来：settle 时那份 checkpoint 必须已经在库里。它原来还兼职守着 `handle_rewind` 开头那次 shutdown，反转之后守不住了——所以另加了 `a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind`：**顶替**（用户在 sub-agent 写到一半时发下一条消息）仍会让根轮次不等它就 settle，那道屏障眼下正是靠这个窗口在挡事。已实测去掉 `shutdown` 后新用例会挂。这个窗口本身归 [`turn-cancellation.md`](../design/turn-cancellation.md) 关掉。
+- **一个既有 hub 用例的前提被本次改动消掉了，屏障改用另一个窗口守。** `a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved` 断言的是「根轮次 settle 时 sub-agent 还没存完」，而这正是本次要消除的窗口。已改名为 `a_rewind_cannot_race_a_sub_agents_checkpoint_write` 并把断言反过来：settle 时那份 checkpoint 必须已经在库里。它原来还兼职守着 `handle_rewind` 开头那次 shutdown，反转之后守不住了——所以另加了 `a_rewind_waits_out_a_sub_agent_a_superseded_turn_left_behind`：**顶替**（用户在 sub-agent 写到一半时发下一条消息）仍会让根轮次不等它就 settle，那道屏障眼下正是靠这个窗口在挡事。已实测去掉 `shutdown` 后新用例会挂。这个窗口本身归 [`turn-cancellation.md`](turn-cancellation.md) 关掉。
 - **前端 `turnComplete` 顺带补齐了 `!aborted`。** 服务端的 `event_settles_turn` 一直排除 aborted 的 `LLMEnd`，前端没有——中止生成时那条部分消息会被当成一轮正常结束。原本只影响 `running`，但横幅要靠「下一轮正常结束」来清除，不修就会被中止误清。
 - **前端横幅没有在浏览器里跑过。** 触发它需要一个会拒绝写入的数据库，preview 里造不出来。验证靠 reducer 单测（5 条，覆盖不结束轮次、活过重连、下一轮正常结束时清除、sub-agent 结束不算、中止不算）加 `tsc --noEmit` 和 oxlint。

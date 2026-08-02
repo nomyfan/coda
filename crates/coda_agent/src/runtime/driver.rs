@@ -390,9 +390,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
         }
 
+        // A turn is over when the root announces an ending for it. Suspension
+        // announces one too but the turn is only parked, and a thread that
+        // broke out to wait for sub-agent replies announces nothing at all —
+        // both leave the turn on the books.
+        let announced_ending = owed.event.is_some() && !suspended;
         let persisted = self
             .persist_and_announce(resume_point, suspended_at, owed)
             .await;
+        if announced_ending && persisted && self.runtime.is_root_thread(&self.thread_id) {
+            self.runtime.close_turn(self.agent.current_turn().await);
+        }
         Ok(if exit_acquired {
             TurnOutcome::ExitAcquired
         } else if suspended && persisted {

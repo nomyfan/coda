@@ -4,7 +4,7 @@
 
 这个系统的取消语义本来就是破的，只是一直被 fork 的兜底校验遮着。中止之后 sub-agent 还会继续开工并写库；新任务顶替在跑的轮次时，事件账目对不上、`unsettled_user_messages` 会永久残留（而它正是 fork 的拒绝条件之一）；挂起等审批的线程根本没有被中止叫醒的途径。
 
-这些今天就在发生。之所以现在必须处理，是因为 [`persist-before-visible.md`](../implementation/persist-before-visible.md) 建立的那条「存档早于回话」的因果链，在这三处会被切断——而拆掉 fork 兜底校验（原需求 [`../requirement/persist-before-visible.md`](../requirement/persist-before-visible.md) 的验收标志）的前提，正是这条链在所有路径上都成立。
+这些今天就在发生。之所以现在必须处理，是因为 [`persist-before-visible.md`](persist-before-visible.md) 建立的那条「存档早于回话」的因果链，在这三处会被切断——而拆掉 fork 兜底校验（原需求 [`../requirement/persist-before-visible.md`](../requirement/persist-before-visible.md) 的验收标志）的前提，正是这条链在所有路径上都成立。
 
 **依赖**：本文档建立在第一部分之上，收场协议直接复用它的 `TurnEnd` 和 `save_checkpoint -> Result`。第一部分必须先落地。
 
@@ -69,7 +69,7 @@
 
 1. **取消是按轮次的状态，不是一次性广播；标记由 runtime 在广播前装好，且既拉又推。** 「谁消费了控制消息」这个竞态因此整个消失。取消走到一个线程有两条路：它即将开工（取信封时查标记），或它停着且没有信封会来——**停着有两种**，发完 `Suspended` 停在 `suspended_thread`，以及派发完 sub-agent 后空闲、手里攥着 `pending_replies`（见 Validation Findings 第二条），两种都要能被推动。各 agent 一律不自行推断该取消哪一轮：stateless agent 的 `Agent` 实例跨线程复用，空闲时 `current_turn()` 留着的是上一轮。
 
-2. **取消沿调用树往上收，每一层都等自己的孩子，只有根 settle。** 已派发的 sub-agent 调用**不得就地合成结果**——某个中间节点一旦替孩子写了结论，链就在那里断了。就地合成只留给一种情形：**该调用对应的孩子线程，此刻在本进程里没有任何在途工作**（既没有正在跑的轮次，也没有还没被取走的信封）。孩子线程 id 从父自己的 `ToolExecutionState` 推导，不查存储——因为活着的孩子可能还没落过库。
+2. **取消沿调用树往上收，每一层都等自己的孩子，只有根 settle。** 已派发的 sub-agent 调用**不得就地合成结果**——某个中间节点一旦替孩子写了结论，链就在那里断了。就地合成只留给一种情形：**该调用对应的孩子线程，此刻在本进程里没有一份未了的差事**。「未了」是从派发那一刻算到它把回话发出去为止——**不能**只算「信封还没被取走」：三层树 `root → A → B` 里，A 早就取走了自己的信封、此刻正停着等 B，按后一种算法 A 会被判死，根就会替 A 写结论，而这恰恰是本决策要挡的那次断链。孩子线程 id 从父自己的 `ToolExecutionState` 推导，不查存储——因为活着的孩子可能还没落过库。
 
 3. **新任务顶替走同一套收场协议，并为此把信箱仲裁上提到 `run_agent`。** 用户可见语义不变（新消息照旧顶掉在跑的工作），变的是「顶掉」从就地写结论变成等真回话。`AgentLoop::run` 要能拒收信封、`TurnOutcome` 要区分「真结束」和「等回话」、`run_agent` 要持 deferred FIFO——这些不是实现细节，没有它们协议无处落地。
 
@@ -88,13 +88,13 @@
 - [x] [spike] 在 `.scratchpad/turn-recovery/` 造「两轮活着 → 重启 → 立刻中止」的场景，回答三个待决点
       结论见 `.scratchpad/turn-recovery/FINDINGS.md`，已回填进 Validation Findings、Alternatives Considered 与决策 1/2/4/5
 
-- [ ] [核心] `AgentRuntime` 加两本账：按 `ThreadId` 记在途工作（**每种信封都算**，`send_message` 投递前加、`run_agent` 取走后减），按 `TurnId` 记有序活跃轮次（**只有 `Task` 开轮**——`ToolCall` 带的是调用方的 `turn_id`，`Reply`/`Resume` 更不开）；`request_abort` 先原子地把队首轮次放进取消集合、再广播
-      Purpose: 让取消标记有可靠来源且装得够早，同时把存活判据要问的那本账立起来
-      Verification: 强制「排队信封所在 agent 先处理 Abort、根后处理」的调度顺序仍能查到标记；排在后面的轮次不被取消；`send_message` 失败不留幽灵登记；挂起期间 `Resume` 不重复开轮
+- [x] [核心] `AgentRuntime` 记有序活跃轮次（**只有 `Task` 开轮**——`ToolCall` 带的是调用方的 `turn_id`，`Reply`/`Resume` 更不开），`send_message` 投递前登记、失败回滚；关闭点是「根宣布了一个结束事件」，挂起和「停下来等回话」都不算；`request_abort` 先把队首放进取消集合、再广播
+      Purpose: 让取消标记有可靠来源且装得够早
+      Verification: 队首被标记而后面的轮次不被标记（没 bootstrap 任何 agent，广播谁都收不到，证明标记是 runtime 自己记的账而不是路过的 agent 装的）；`send_message` 失败不留幽灵登记；答完的轮次离开列表；等 sub-agent 回话期间轮次仍在列表里；`Resume` 不开第二轮。三处变异验证（去掉回滚、标记全部而非队首、放宽关闭条件）各自打红对应用例
 
-- [ ] [核心] `bootstrap` 重建登记，必须在 agent task 能看见信封**之前**完成：根 checkpoint 停在轮次中途就登记它的当前轮，回放信封按 key 幂等登记（snapshot 可能被重放第二遍，见 spike）
+- [x] [核心] `bootstrap` 在 spawn 任何 agent task **之前**重建登记，登记的是「本进程真会继续跑的工作」：`active_threads` 里停着的线程（查其 checkpoint 的当前轮）加上待回放的信封；按 `TurnId` 幂等，所以 snapshot 被重放第二遍也只算一轮。次序是在飞的工作在前、排队的 `Task` 在后
       Purpose: 重开会话后立刻中止时，取消面对的不能是空列表；重复回放也不能变成两轮
-      Verification: 关闭重开、自动恢复 sub-agent 审批后立刻中止，断言取消生效；连续两次重启不产生重复轮次
+      Verification: 关闭重开、恢复 sub-agent 审批后，断言那一轮回到列表里且中止能标到它；连续两次重启（中间不优雅退出）拿到同一份列表
 
 - [ ] [核心] 收场协议：取消既拉又推（空闲 agent 检查 `suspended_thread`，以及自己手里的 `pending_replies`）；已取消的线程记 Aborted → 等齐已派发的下游真回话 → 存档 → 发事件 → 回话；根等 `pending_replies` 收齐再发 `Aborted`
       Purpose: 把中止接回因果边，并让它逐层可传递
@@ -104,7 +104,7 @@
       Purpose: 给顶替协议落脚点
       Verification: 被扣下的 `Task` 在旧轮收场后按原序重投，期间的 `Reply` 照常处理
 
-- [ ] [核心] 顶替协议：新 `Task` / `ToolCall` 到达正等回话的线程时走收场协议再开新工作；就地合成收窄到「该调用的孩子线程在本进程没有在途工作」，孩子 thread_id 由父的 `ToolExecutionState` 推导
+- [ ] [核心] 顶替协议：新 `Task` / `ToolCall` 到达正等回话的线程时走收场协议再开新工作；同时立起按 `ThreadId` 的差事账（派发时记、回话发出时销——不是取走信封时销，见决策 2），就地合成收窄到「该调用的孩子线程没有未了的差事」，孩子 thread_id 由父的 `ToolExecutionState` 推导
       Purpose: 堵掉正常路径上的断链点，同时保留崩溃恢复的清理路径
       Verification: 卡住 sub-agent 的写并提交下一条 `Task`，新一轮的结束事件不提前出现；挂起不审批直接发新 `Task` 也能正常收场；崩溃恢复场景（孩子无 checkpoint 也无信封）仍走就地合成不挂住；两个 pending reply 一活一死时只合成死的那个
 
@@ -123,6 +123,13 @@
 - [ ] [清理] 更新 `hub.rs` 里 `LiveState::snapshot` 那段关于「checkpoint 落在 settle 之后」的注释，以及 web `retryWhileNotReady` 附近描述该竞态的文档
       Purpose: 别让注释继续描述一个已经不存在的次序
       Verification: 通读改动处，无残留描述旧次序的说明
+
+## Deviations from Design
+
+- **差事账从第一步挪到了顶替那一步，而且记法改了。** 原来写的是「`send_message` 投递前加、`run_agent` 取走后减」，实现时发现这个减法对三层树是错的（详见改写后的决策 2）：中间节点取走信封后正停着等孙子，会被判成死的。正确的记法是从派发算到回话发出。既然唯一的读者是顶替那一步的就地合成判据，就跟它一起做——第一步先立只有它自己要用的那本轮次账。
+- **没有加 `is_cancelled` / `active_turns` 访问器。** 它们的第一个生产调用方在收场协议那一步，现在加进来就是死代码，而这个仓库没有 `#[allow(dead_code)]` 的先例。测试直接读 `AgentRuntime.turns`（`driver_tests` 是 `runtime` 的后代模块，看得见私有字段），等有真正调用方时再补正经 API。
+- **恢复的判据是「谁真会继续跑」，不是「根 checkpoint 是否停在轮次中途」。** 后者看着直接，实际不可靠：中止收场之后根的 `resume_point` 同样是 `Generation`、历史末尾同样是一条 ToolMessage，和「刚答完一轮」分不开。而把一个已经结束的轮次登记回去比漏登记更糟——它会永远占着队首，把后面每一次中止都吃掉。改成只登记 `active_threads` 里停着的线程和待回放的信封；根自己那一轮不会漏，因为 spike F3 已证明子树共享同一个 `turn_id`，任何一个活着的孩子都会把它带回来。
+- **轮次的关闭点是设计里没写的。** 第一步只说了怎么开轮，没说怎么关；不关的话队首永远是第一轮，「取消队首」立刻失效。落点选在「根宣布了一个结束事件且已落库」——挂起虽然也发事件但轮次只是停着，停下来等 sub-agent 回话则什么都不宣布，两种都不关。这条正是决策 4「至多一个已开始未结束的轮次」在代码里的具体形态。
 
 ## 顺带发现，不在本文档范围内
 
