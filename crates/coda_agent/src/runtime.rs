@@ -680,16 +680,27 @@ impl AgentRuntime {
         }
     }
 
-    /// Wait for all bootstrapped agent tasks to exit.
+    /// Wait for all bootstrapped agent tasks to exit, and return whether they
+    /// managed it on their own.
     ///
-    /// Returns `false` if the timeout elapses before every agent stops.
+    /// **No agent task is running when this returns with a deadline set.** Past
+    /// the deadline the stragglers are aborted rather than waited on, because
+    /// the states that make a task outstay a shutdown — a checkpoint write that
+    /// never answers, an LLM stream that never ends — are exactly the ones no
+    /// signal reaches: neither `Exit` nor `Abort` can interrupt a future the
+    /// task is already awaiting. Callers depend on that guarantee rather than on
+    /// the return value, since reopening a session while a task is still writing
+    /// races its own read of the state.
+    ///
+    /// `None` asks for no deadline at all, and gives up the guarantee with it —
+    /// only for callers that would rather hang than cut an in-flight turn short.
     pub(crate) async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
         let mut agent_tasks = self.agent_tasks.lock().await;
         if agent_tasks.is_empty() {
             return true;
         }
 
-        let wait_for_exit = async {
+        let drain = async {
             while let Some(result) = agent_tasks.join_next().await {
                 match result {
                     Ok(agent_name) => info!("Agent {} exited", agent_name),
@@ -699,17 +710,17 @@ impl AgentRuntime {
         };
 
         let ret = match timeout_duration {
-            Some(duration) => timeout(duration, wait_for_exit).await.is_ok(),
+            Some(duration) => timeout(duration, drain).await.is_ok(),
             None => {
-                wait_for_exit.await;
+                drain.await;
                 true
             }
         };
-        // TODO: abort any remaining agents if timeout occurs and return early, instead of waiting for them to exit on their own.
-        // Root cause: graceful exit awaits each agent's current run_fut to completion, which deadlocks
-        // when an agent is stuck on a slow/hung LLM stream or external API. Session::shutdown with
-        // OnTimeout::Abort covers this at the session layer; at the runtime layer, callers must still
-        // combine request_abort + request_exit manually to guarantee termination.
+        if !ret {
+            warn!("aborting agent tasks that outstayed the shutdown deadline");
+            agent_tasks.abort_all();
+            while agent_tasks.join_next().await.is_some() {}
+        }
         if let Err(err) = self
             .session_storage
             .save_session_snapshot(

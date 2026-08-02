@@ -155,6 +155,8 @@ pub(super) struct SlowStorage {
     stall: Option<(String, Duration)>,
     /// Writes still allowed through before every later one fails.
     budget: Arc<tokio::sync::Mutex<Option<usize>>>,
+    /// A thread whose writes fail however many have gone before.
+    refused: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl SlowStorage {
@@ -162,6 +164,14 @@ impl SlowStorage {
     /// after that.
     pub(super) async fn fail_checkpoints_after(&self, writes: usize) {
         *self.budget.lock().await = Some(writes);
+    }
+
+    /// Refuse one thread's writes from now on. Unlike a write budget this does
+    /// not depend on how many writes have already happened, so a test can break
+    /// one thread while another is mid-write without the two racing for the
+    /// same count.
+    pub(super) async fn fail_checkpoints_of(&self, thread_id: &str) {
+        *self.refused.lock().await = Some(thread_id.to_string());
     }
 }
 
@@ -183,7 +193,7 @@ impl SessionStorage for SlowStorage {
                     None => false,
                 }
             };
-            if spent {
+            if spent || self.refused.lock().await.as_deref() == Some(thread_id.as_str()) {
                 return Err("storage is unavailable".to_string());
             }
             if let Some((slow_thread, delay)) = &self.stall
@@ -303,6 +313,7 @@ impl TestOpener {
                 inner: MemoryStorage::default(),
                 stall: stall.map(|delay| (explore_thread().as_ref().to_string(), delay)),
                 budget: Arc::default(),
+                refused: Arc::default(),
             },
         )
     }
@@ -361,6 +372,7 @@ impl TestOpener {
                 inner: MemoryStorage::default(),
                 stall: stall.map(|delay| (key().1.clone(), delay)),
                 budget: Arc::new(tokio::sync::Mutex::new(None)),
+                refused: Arc::default(),
             },
         )
     }

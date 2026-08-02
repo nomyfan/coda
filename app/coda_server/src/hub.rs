@@ -34,6 +34,12 @@ use crate::wire::WireEvent;
 pub type SessionKey = (String, String); // (workspace_id, session_id)
 pub type ConnId = u64;
 
+/// How long a runtime the hub has already judged broken is given to stop
+/// politely. Short on purpose: the entry has to come back either way, and
+/// whatever the runtime would still write is the state that just failed to
+/// land.
+const BROKEN_RUNTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A command a client issues against an attached session. Plain data only —
 /// see the module docs for why.
 #[derive(Debug, Clone)]
@@ -1498,14 +1504,19 @@ fn spawn_event_pipeline(
 /// the in-memory event log can no longer be trusted (a lagged broadcast
 /// receiver, or a checkpoint the database refused) or has grown past what it
 /// may safely buffer (a runaway turn).
-/// `graceful_unbounded` lets any turn still in flight reach its own
-/// checkpoint before the entry is removed, so the next attach reads a
-/// current, authoritative persisted state instead of the discarded in-memory
-/// one.
+///
+/// `mode` is the caller's read of how the runtime is doing, because that is
+/// what decides whether waiting is a good idea. A log that lagged or overflowed
+/// says nothing about the session itself, so an unbounded wait lets a healthy
+/// turn reach its own checkpoint and the next attach read a current state. A
+/// write that failed says the opposite, and a caller that waits unbounded on a
+/// runtime it just declared broken can wait forever — with the key locked
+/// behind it.
 async fn force_resync(
     entries: &Entries,
     entry: &Arc<SessionEntry>,
     mut guard: EntryGuard,
+    mode: Shutdown,
     reason: String,
 ) {
     error!(
@@ -1513,13 +1524,7 @@ async fn force_resync(
         session_id = %entry.key.1,
         "{reason}; draining session to resync from the persisted state"
     );
-    let release = SessionHub::begin_release(
-        entries,
-        entry,
-        &mut guard,
-        Shutdown::graceful_unbounded(),
-        true,
-    );
+    let release = SessionHub::begin_release(entries, entry, &mut guard, mode, true);
     drop(guard);
     release.await;
 }
@@ -1549,6 +1554,7 @@ async fn run_forwarder(
                     &entries,
                     &entry,
                     guard,
+                    Shutdown::graceful_unbounded(),
                     format!("session event stream lagged by {n}"),
                 )
                 .await;
@@ -1581,8 +1587,20 @@ async fn run_forwarder(
                     // in-memory view is now a claim nothing can back. Drop it
                     // and let the client rebuild from what is actually stored —
                     // the same route a lagged stream takes.
+                    //
+                    // On a deadline, though. One way to reach here is a turn
+                    // that gave up on a sub-agent wedged mid-write, and waiting
+                    // out an agent that is already stuck is how the entry never
+                    // comes back at all.
                     let reason = format!("checkpoint write failed: {message}");
-                    force_resync(&entries, &entry, guard, reason).await;
+                    force_resync(
+                        &entries,
+                        &entry,
+                        guard,
+                        Shutdown::graceful_then_abort(BROKEN_RUNTIME_GRACE),
+                        reason,
+                    )
+                    .await;
                     return;
                 }
                 if event_settles_turn(&wire, &root_name) {
@@ -1613,7 +1631,14 @@ async fn run_forwarder(
                     // as a lagged stream rather than grow unbounded.
                     let max = live.log.limits.max_message_tier_events;
                     let reason = format!("event log exceeded {max} buffered message-tier events");
-                    force_resync(&entries, &entry, guard, reason).await;
+                    force_resync(
+                        &entries,
+                        &entry,
+                        guard,
+                        Shutdown::graceful_unbounded(),
+                        reason,
+                    )
+                    .await;
                     return;
                 }
             }

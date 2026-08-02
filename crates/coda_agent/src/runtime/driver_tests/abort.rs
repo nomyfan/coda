@@ -494,4 +494,27 @@ async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
     })
     .await
     .expect("the root waited on the wedged sub-agent indefinitely");
+
+    // Whatever wedged the wind-up is still wedged when the session is asked to
+    // stop, and asking is not enough: neither Exit nor Abort reaches a task
+    // parked inside a write. Shutting down has to end it anyway — a caller that
+    // waits it out never gets its session back, and the key stays locked behind
+    // the release that never returned.
+    harness.runtime.cancel_in_flight().await;
+    harness.runtime.request_exit().await;
+    assert!(
+        !harness
+            .runtime
+            .wait_for_exit(Some(Duration::from_millis(300)))
+            .await,
+        "nothing was wedged, so this proves nothing about the deadline"
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            harness.runtime.wait_for_exit(None)
+        )
+        .await
+        .expect("an agent task outlived the shutdown deadline"),
+    );
 }
