@@ -385,3 +385,73 @@ async fn replaying_a_snapshot_twice_registers_one_turn() {
         .await;
     assert_eq!(active(&second.runtime), vec![queued_turn]);
 }
+
+/// Stopping the turn in flight is not a request to throw away what the user
+/// queued behind it. The later submission is its own turn, so it keeps its
+/// place and runs once the stopped one has wound up.
+#[tokio::test]
+async fn a_queued_task_survives_the_abort_of_the_one_ahead_of_it() {
+    let mut harness = Harness::start_with_spec(
+        MemoryStorage::default(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new())),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    // Wait until the first turn is genuinely generating, so the next task has
+    // to queue behind it instead of being picked up straight away.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMContentChunk(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the first turn to start generating");
+
+    let queued = user_task(&harness.thread_id);
+    let queued_turn = turn_of(&queued);
+    harness
+        .runtime
+        .send_message(queued)
+        .await
+        .expect("queue a second task");
+    assert_eq!(active(&harness.runtime).len(), 2);
+
+    harness.runtime.request_abort().await;
+    assert_eq!(cancelled(&harness.runtime).len(), 1);
+    assert!(
+        !cancelled(&harness.runtime).contains(&queued_turn),
+        "the abort reached past the turn in flight"
+    );
+
+    // The stopped turn ends, and the queued one takes over.
+    timeout(Duration::from_secs(2), async {
+        let mut stopped = false;
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::Aborted(_)) => stopped = true,
+                ("coda", AgentEvent::LLMStart(_)) if stopped => return,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the queued task never started after the abort");
+
+    assert_eq!(active(&harness.runtime), vec![queued_turn]);
+    assert!(cancelled(&harness.runtime).is_empty());
+    harness.shutdown().await;
+}

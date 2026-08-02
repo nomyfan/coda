@@ -949,9 +949,10 @@ where
     }
 
     pub(super) async fn shutdown(&self) {
-        // Abort first so any in-flight work (e.g. a subagent blocked on a hold
-        // gate) is cancelled; then request graceful exit.
-        self.runtime.request_abort().await;
+        // Cancel in-flight work first (e.g. a subagent blocked on a hold gate)
+        // so the graceful exit below has something that can finish. This is
+        // teardown, so it deliberately does not mark any turn as stopped.
+        self.runtime.cancel_in_flight().await;
         self.runtime.request_exit().await;
         assert!(
             self.runtime

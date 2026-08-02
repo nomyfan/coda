@@ -547,7 +547,7 @@ impl Session {
                     match on_timeout {
                         OnTimeout::Return => false,
                         OnTimeout::Abort => {
-                            self.inner.runtime.request_abort().await;
+                            self.inner.runtime.cancel_in_flight().await;
                             self.inner.runtime.wait_for_exit(None).await
                         }
                     }
@@ -556,7 +556,7 @@ impl Session {
                 }
             }
             Shutdown::Abort => {
-                self.inner.runtime.request_abort().await;
+                self.inner.runtime.cancel_in_flight().await;
                 self.inner.runtime.request_exit().await;
                 self.inner.runtime.wait_for_exit(None).await
             }

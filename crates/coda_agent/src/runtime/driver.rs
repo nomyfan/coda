@@ -103,7 +103,21 @@ pub(crate) async fn run_agent(
                             active_thread = suspended_thread.take();
                             break;
                         }
-                        _ => continue,
+                        Some(AgentControl::Abort) => {
+                            // Nothing is running to cancel, but this agent may
+                            // be parked on an approval for the very turn being
+                            // stopped — and no envelope is coming to wake it,
+                            // since the user answered with an abort instead of
+                            // a decision. Drive it back in so it can wind up.
+                            if let Some(parked) = suspended_thread.take() {
+                                if runtime.thread_turn_cancelled(&parked).await {
+                                    active_thread = Some(parked);
+                                } else {
+                                    suspended_thread = Some(parked);
+                                }
+                            }
+                            continue;
+                        }
                     }
                 }
                 envelope = envelope_rx.recv() => match envelope {
@@ -209,6 +223,15 @@ pub(crate) async fn run_agent(
 enum AgentLoopState {
     Next(ResumePoint),
     Done(ResumePoint, Box<TurnEnd>),
+}
+
+/// Where a cancelled thread got to.
+enum WindUp {
+    /// Still owed real replies from sub-agents it already dispatched. It parks
+    /// with them recorded, and each reply brings it back to try again.
+    Waiting(ResumePoint),
+    /// Nothing left to wait for, so this is the end of its work.
+    Ended(Box<TurnEnd>),
 }
 
 /// What a turn owes the outside world once its state is durable. Handlers
@@ -331,9 +354,23 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let mut exit_acquired = false;
         let mut suspended = false;
         let mut owed = TurnEnd::default();
+        let turn = self.agent.current_turn().await;
         loop {
             if self.runtime.exit_barrier.is_exiting() {
                 exit_acquired = true;
+                break;
+            }
+            // Checked every time round rather than once on entry: the mark can
+            // arrive while this thread is mid-turn, and a thread woken by a
+            // reply comes back through here to find it.
+            if self.runtime.is_cancelled(turn) {
+                match self.wind_up(std::mem::take(&mut resume_point)).await {
+                    WindUp::Waiting(rp) => resume_point = rp,
+                    WindUp::Ended(end) => {
+                        resume_point = ResumePoint::Generation;
+                        owed = *end;
+                    }
+                }
                 break;
             }
             let current = std::mem::take(&mut resume_point);
@@ -483,6 +520,86 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .await
     }
 
+    /// Bring a cancelled thread to a stop without inventing anything.
+    ///
+    /// Calls that never left this thread are written off here — nothing else
+    /// will ever produce a result for them. Calls already dispatched to a
+    /// sub-agent are not: that sub-agent is winding up too and will answer for
+    /// itself. Answering on its behalf is exactly the break this protocol
+    /// exists to prevent, since its own work may still be reaching storage.
+    async fn wind_up(&mut self, resume_point: ResumePoint) -> WindUp {
+        match resume_point {
+            ResumePoint::Generation => {}
+            ResumePoint::ToolExecution(mut state) => {
+                for tc in state.tool_calls.drain(..) {
+                    self.write_off(tc.tool_call.id, tc.tool_call.name).await;
+                }
+                if !state.pending_replies.is_empty() {
+                    return WindUp::Waiting(ResumePoint::ToolExecution(state));
+                }
+            }
+            ResumePoint::PendingApproval {
+                mut pending_approval_calls,
+                mut pending_calls,
+                ..
+            } => {
+                for tc in pending_approval_calls.drain(..) {
+                    self.write_off(tc.id, tc.name).await;
+                }
+                for tc in pending_calls.drain(..) {
+                    self.write_off(tc.tool_call.id, tc.tool_call.name).await;
+                }
+            }
+        }
+        let interrupted = self.interrupted_calls().await;
+        let target = self.reply_target.take();
+        WindUp::Ended(Box::new(self.turn_end(
+            target,
+            Some(AgentEvent::Aborted(if interrupted.is_empty() {
+                AbortedTarget::Generation
+            } else {
+                AbortedTarget::ToolCalls(interrupted)
+            })),
+            ToolOutput::Err("Aborted by user".to_string()),
+            true,
+        )))
+    }
+
+    /// The calls this turn ended as aborted, in history order. Read back from
+    /// history rather than tallied along the way, because a wind-up finishes in
+    /// several passes — one per reply still owed — and the marker has to name
+    /// everything the abort caught, not just what the last pass touched.
+    async fn interrupted_calls(&self) -> Vec<String> {
+        let turn = self.agent.current_turn().await;
+        self.agent
+            .history()
+            .await
+            .into_iter()
+            .filter_map(|entry| match entry.message {
+                Message::Tool(tool)
+                    if entry.turn_id == turn
+                        && matches!(tool.outcome, ToolCallOutcome::Aborted) =>
+                {
+                    Some(tool.id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Record a call that will never run, so history holds no tool call without
+    /// an answer.
+    async fn write_off(&mut self, call_id: String, tool_name: String) {
+        self.add_tool_message(ToolMessage::new(
+            call_id,
+            tool_name,
+            ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
+            ToolCallOutcome::Aborted,
+            None,
+        ))
+        .await;
+    }
+
     /// Record a settled local tool call. A call that observed cancellation
     /// keeps whatever partial output it salvaged and is marked `Aborted`;
     /// anything else keeps the outcome it started with. Returns whether the
@@ -555,7 +672,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 if !tool_execution.pending_replies.is_empty() {
                     match &envelope {
                         Envelope {
-                            body: EnvelopeBody::Reply { call_id, output },
+                            body:
+                                EnvelopeBody::Reply {
+                                    call_id,
+                                    output,
+                                    aborted,
+                                },
                             ..
                         } => {
                             if let Some(pos) = tool_execution
@@ -564,11 +686,18 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .position(|call| &call.call_id == call_id)
                             {
                                 let tc = tool_execution.pending_replies.remove(pos);
+                                // How the call was authorised, unless the
+                                // answerer says it never got to finish.
+                                let outcome = if *aborted {
+                                    ToolCallOutcome::Aborted
+                                } else {
+                                    tc.outcome
+                                };
                                 self.add_tool_message(ToolMessage::new(
                                     tc.call_id,
                                     tc.tool_name,
                                     output.clone(),
-                                    tc.outcome,
+                                    outcome,
                                     Some(tc.started_at),
                                 ))
                                 .await;
@@ -819,6 +948,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         target,
                         Some(AgentEvent::Aborted(AbortedTarget::Generation)),
                         ToolOutput::Err("Aborted by user".to_string()),
+                        true,
                     )),
                 );
             }
@@ -830,7 +960,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 let event = target.is_none().then(|| AgentEvent::Error(err.clone()));
                 return AgentLoopState::Done(
                     ResumePoint::Generation,
-                    Box::new(self.turn_end(target, event, ToolOutput::Err(err))),
+                    Box::new(self.turn_end(target, event, ToolOutput::Err(err), false)),
                 );
             }
         };
@@ -854,6 +984,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     target,
                     Some(AgentEvent::LLMEnd(assistant_message)),
                     ToolOutput::Ok(content),
+                    false,
                 )),
             );
         }
@@ -909,6 +1040,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         target: Option<ReplyTarget>,
         event: Option<AgentEvent>,
         output: ToolOutput,
+        aborted: bool,
     ) -> TurnEnd {
         TurnEnd {
             event,
@@ -927,6 +1059,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     body: EnvelopeBody::Reply {
                         call_id: target.call_id,
                         output,
+                        aborted,
                     },
                 })
             }),
@@ -1140,26 +1273,22 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 ))
                 .await;
             }
-            // Also write aborted ToolMessages for any pending subagent replies.
-            for pending in tool_execution.pending_replies.drain(..) {
-                aborted_ids.push(pending.call_id.clone());
-                self.add_tool_message(ToolMessage::new(
-                    pending.call_id,
-                    pending.tool_name,
-                    ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
-                    ToolCallOutcome::Aborted,
-                    Some(pending.started_at),
-                ))
-                .await;
+            if !tool_execution.pending_replies.is_empty() {
+                // The sub-agents already dispatched are winding up on their own
+                // and will answer for themselves. Park with those calls still
+                // outstanding; the loop comes back here on each reply, and the
+                // ending goes out once the last one lands.
+                return AgentLoopState::Next(ResumePoint::ToolExecution(tool_execution));
             }
+            let target = self.reply_target.take();
             return AgentLoopState::Done(
                 ResumePoint::Generation,
-                Box::new(TurnEnd {
-                    event: Some(AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids))),
-                    // An abort leaves the caller unanswered: it synthesises the
-                    // interrupted result itself rather than waiting on a reply.
-                    reply: None,
-                }),
+                Box::new(self.turn_end(
+                    target,
+                    Some(AgentEvent::Aborted(AbortedTarget::ToolCalls(aborted_ids))),
+                    ToolOutput::Err("Aborted by user".to_string()),
+                    true,
+                )),
             );
         }
 

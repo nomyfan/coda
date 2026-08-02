@@ -237,6 +237,10 @@ pub enum EnvelopeBody {
     Reply {
         call_id: String,
         output: ToolOutput,
+        /// Whether the answering thread was interrupted rather than finishing
+        /// its work. Only the answerer knows this, and the caller needs it to
+        /// record the call as aborted instead of merely failed.
+        aborted: bool,
     },
     Resume(ResumeDecision),
 }

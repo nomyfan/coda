@@ -316,6 +316,28 @@ impl AgentRuntime {
         turns.cancelled.remove(&turn);
     }
 
+    /// Whether this turn has been asked to stop. Agents read the mark rather
+    /// than deciding for themselves which turn an abort meant: a stateless
+    /// agent's `Agent` instance is reused across threads, so while it sits idle
+    /// its own `current_turn()` still names the previous one.
+    pub(crate) fn is_cancelled(&self, turn: TurnId) -> bool {
+        self.turns
+            .lock()
+            .expect("active turns")
+            .cancelled
+            .contains(&turn)
+    }
+
+    /// Whether the turn a parked thread belongs to has been asked to stop. Its
+    /// own agent cannot answer this — it is sitting idle with no turn in hand —
+    /// so the thread's last stored message names the turn instead.
+    pub(crate) async fn thread_turn_cancelled(&self, thread_id: &ThreadId) -> bool {
+        match self.turn_of_thread(thread_id.as_ref()).await {
+            Some(turn) => self.is_cancelled(turn),
+            None => false,
+        }
+    }
+
     /// The turn a stored thread was last working on, or `None` if it has no
     /// history to name one.
     async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
@@ -451,12 +473,20 @@ impl AgentRuntime {
         }
     }
 
-    /// Abort the current work for this runtime.
+    /// Cancel whatever is running without marking any turn.
     ///
-    /// The turn at the head of the queue is marked before the broadcast leaves,
-    /// because which agent picks the control message up first is not something
-    /// the runtime can order — whoever gets there first must already find the
-    /// mark in place.
+    /// This is teardown, not the user taking a turn back: a thread parked on an
+    /// approval stays parked, so the pending decision survives into the next
+    /// process instead of being written off on the way out.
+    pub(crate) async fn cancel_in_flight(&self) {
+        self.broadcast_command(AgentControl::Abort).await;
+    }
+
+    /// Stop the turn at the head of the queue on the user's behalf.
+    ///
+    /// It is marked before the broadcast leaves, because which agent picks the
+    /// control message up first is not something the runtime can order —
+    /// whoever gets there first must already find the mark in place.
     pub(crate) async fn request_abort(&self) {
         {
             let mut turns = self.turns.lock().expect("active turns");

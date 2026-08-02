@@ -5,6 +5,7 @@ use super::super::*;
 use super::fixtures::*;
 use crate::{
     AbortedTarget, AgentEvent, AgentSpec, StoredCheckpoint, SubAgentMode, ToolApprovalMode,
+    runtime::MemoryStorage,
 };
 use coda_core::llm::{Message, ToolCallOutcome, ToolOutput};
 use std::sync::Arc;
@@ -281,4 +282,152 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                 && message.content.contains("interrupted by the user")
                 && message.reasoning_content.as_deref() == Some("partial reasoning")
     ));
+}
+
+/// An abort travels up the call tree, not across it: each thread waits for the
+/// sub-agents it already dispatched to answer for themselves. The deepest one
+/// here cannot write, so nothing above it may declare the turn over — its work
+/// is not in storage yet, and the whole point of announcing last is that what
+/// the user sees is already saved.
+#[tokio::test]
+async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_team(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![
+            AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "nested-explore".into(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec!["probe".into()],
+            },
+            AgentSpec {
+                name: "probe".into(),
+                description: String::new(),
+                system_prompt: "explore-plain".into(),
+                mode: SubAgentMode::Stateless,
+                tools: vec![],
+                subagents: vec![],
+            },
+        ],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+    let gate = storage.hold_checkpoints_of("probe").await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::ToolCallStart(call)) = (agent_name.as_str(), event)
+                && call.name == "probe"
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the deepest call to be dispatched");
+
+    harness.runtime.request_abort().await;
+
+    // Nothing may end the turn while the bottom of the tree is still writing.
+    let premature = timeout(Duration::from_millis(300), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Aborted(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        premature.is_err(),
+        "the root announced the abort before the deepest thread was durable"
+    );
+
+    gate.release().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::Aborted(_)) => return,
+                (_, AgentEvent::PersistFailed(err)) => panic!("unexpected persist failure: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the root never announced the abort once the write landed");
+
+    assert!(
+        storage.checkpoint(&harness.thread_id).await.is_some(),
+        "the root's own state should be durable too"
+    );
+    harness.shutdown().await;
+}
+
+/// Aborting instead of answering an approval prompt is an ordinary thing to do.
+/// The parked sub-agent has no envelope coming to wake it, so the abort has to
+/// push it — and it must wind up and reply rather than sit there until the root
+/// gives up and reports a persistence failure.
+#[tokio::test]
+async fn aborting_instead_of_answering_an_approval_winds_the_subagent_up() {
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        root,
+        subagents,
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to suspend");
+
+    // No resume decision — the user stops the turn instead of answering.
+    harness.runtime.request_abort().await;
+
+    let mut subagent_wound_up = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("explore", AgentEvent::Aborted(_)) => subagent_wound_up = true,
+                ("coda", AgentEvent::Aborted(_)) => return,
+                (_, AgentEvent::PersistFailed(err)) => panic!("unexpected persist failure: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the parked sub-agent was never pushed to wind up");
+    assert!(
+        subagent_wound_up,
+        "the root ended the turn without the sub-agent answering for itself"
+    );
+
+    harness.shutdown().await;
 }

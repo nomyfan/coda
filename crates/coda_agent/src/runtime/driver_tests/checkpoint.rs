@@ -425,6 +425,7 @@ async fn an_unexpected_envelope_that_cannot_be_stored_reports_once() {
             },
             reply_to: None,
             body: EnvelopeBody::Reply {
+                aborted: false,
                 call_id: "nobody-asked".into(),
                 output: ToolOutput::Ok("stray".into()),
             },
