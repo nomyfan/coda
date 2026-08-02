@@ -431,3 +431,67 @@ async fn aborting_instead_of_answering_an_approval_winds_the_subagent_up() {
 
     harness.shutdown().await;
 }
+
+/// A sub-agent that never answers must not keep the root waiting forever. What
+/// the root says when it gives up matters as much as that it does: the turn's
+/// content never reached storage, so it reports that and lets the session
+/// rebuild from what really is there. Announcing the turn stopped would be a
+/// success signal for work that was never saved.
+#[tokio::test]
+async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_team(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "explore-plain".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+    // Never released: the sub-agent is stuck saving, so it can neither finish
+    // nor answer, which is the only way a wind-up genuinely hangs.
+    let _wedged = storage.hold_checkpoints_of("explore").await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::LLMStart(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to start");
+
+    harness.runtime.request_abort().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::PersistFailed(_)) => return,
+                ("coda", AgentEvent::Aborted(_)) => {
+                    panic!("the root announced the turn stopped without its content being saved")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the root waited on the wedged sub-agent indefinitely");
+}

@@ -108,9 +108,9 @@
       Purpose: 让旧轮补发的结束事件不再吃掉新任务
       Verification: 「sub-agent 挂起 → 提交新任务 → 旧轮补发 Aborted」后，新任务那条仍在、`turn_running` 未被错误清零，之后新轮照常跑完并折叠干净；变异回按序弹出即打红
 
-- [ ] [核心] 根等待回复的上限：超时按持久化失败处理，发 `PersistFailed` 走重同步，绝不发 `Aborted`
+- [x] [核心] 根等待回复的上限：**只盖收场那段等待**（正常轮次里 sub-agent 跑多久都合法），超时发 `PersistFailed` 走重同步，绝不发 `Aborted`
       Purpose: 卡死的 sub-agent 不能钉住界面，更不能换来假的成功信号
-      Verification: sub-agent 永不回话时，根既不 settle 也不卡住
+      Verification: 让 sub-agent 卡在写库上（既答不了也存不进，收场真正挂死的唯一形态），断言根发 `PersistFailed` 而非 `Aborted`；把上限换成永不触发即打红
 
 - [ ] [清理] 删掉 `ForkError::Lagging`、`ForkSource` 的 `root_messages`、`ForkOutcome::Retryable`、`rpc::FORK_NOT_READY` 和 web 的 `retryWhileNotReady`
       Purpose: 原需求的验收标志——补偿能拆掉，说明两份文档合起来真的成立

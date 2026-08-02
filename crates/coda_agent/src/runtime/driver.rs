@@ -34,6 +34,18 @@ const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long the root waits for a cancelled turn's sub-agents to answer before
+/// giving up on them.
+///
+/// Only the wind-up wait is capped. A turn that is running normally may sit on
+/// a sub-agent for as long as that sub-agent needs; a turn that has been asked
+/// to stop should be answered within a few rounds of teardown, so silence past
+/// this point means something is wedged rather than busy.
+#[cfg(not(test))]
+const WIND_UP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const WIND_UP_LIMIT: std::time::Duration = std::time::Duration::from_millis(400);
+
 #[instrument(skip_all, fields(agent = %agent.name))]
 pub(crate) async fn run_agent(
     runtime: AgentRuntime,
@@ -85,10 +97,11 @@ pub(crate) async fn run_agent(
     // Envelopes this agent refused because a turn was still winding up. They
     // keep their arrival order and go back in once it has.
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
-    // Whether the thread that just ran is parked waiting on sub-agent answers.
-    // While it is, only what arrives on the wire may reach it: replaying a held
-    // submission would walk straight back into the case that deferred it.
-    let mut awaiting_replies = false;
+    // The thread parked waiting on sub-agent answers, and the turn it is
+    // waiting for. While one is set, only what arrives on the wire may reach
+    // this agent: replaying a held submission would walk straight back into the
+    // case that deferred it.
+    let mut awaiting_replies: Option<(ThreadId, TurnId)> = None;
     loop {
         // First: if we have a queued resume envelope, run with it.
         // Otherwise: if there's an active thread to continue, just run it without waiting for a new envelope.
@@ -96,9 +109,25 @@ pub(crate) async fn run_agent(
             (envelope.to.thread_id.clone(), Some(envelope))
         } else if let Some(active_thread) = active_thread.take() {
             (active_thread, None)
-        } else if let Some(envelope) = (!awaiting_replies).then(|| deferred.pop_front()).flatten() {
+        } else if let Some(envelope) = awaiting_replies
+            .is_none()
+            .then(|| deferred.pop_front())
+            .flatten()
+        {
             (envelope.to.thread_id.clone(), Some(envelope))
         } else {
+            // A cancelled turn should be answered within a few rounds of
+            // teardown. Past the limit the sub-agent is wedged, and the root
+            // says so rather than waiting on it — but it says *unwritten*, not
+            // *finished*: a turn whose content never landed has not ended,
+            // whatever is on screen.
+            let wind_up_limit = awaiting_replies
+                .as_ref()
+                .filter(|(thread_id, turn)| {
+                    runtime.is_root_thread(thread_id) && runtime.is_cancelled(*turn)
+                })
+                .is_some();
+
             // Wait for the next envelope, but allow Exit to break the loop.
             let next_envelope = tokio::select! {
                 biased;
@@ -136,6 +165,25 @@ pub(crate) async fn run_agent(
                     }
                     None => break,
                 },
+                _ = tokio::time::sleep(WIND_UP_LIMIT), if wind_up_limit => {
+                    let (thread_id, turn) = awaiting_replies.take().expect("a limit implies a wait");
+                    warn!(
+                        "{} gave up waiting for a cancelled turn's sub-agents to answer",
+                        agent.name
+                    );
+                    runtime
+                        .emit_event(
+                            agent.name.clone(),
+                            thread_id,
+                            turn,
+                            AgentEvent::PersistFailed(
+                                "sub-agents did not finish saving after the turn was stopped"
+                                    .to_string(),
+                            ),
+                        )
+                        .await;
+                    continue;
+                }
             };
 
             (next_envelope.to.thread_id.clone(), Some(next_envelope))
@@ -173,11 +221,10 @@ pub(crate) async fn run_agent(
                 match (&mut run_fut).await {
                     Ok(TurnOutcome::ExitAcquired | TurnOutcome::Completed) => {
                         active_thread = None;
-                        awaiting_replies = false;
+                        awaiting_replies = None;
                     }
-                    Ok(TurnOutcome::AwaitingReplies) => {
-                        active_thread = None;
-                        awaiting_replies = true;
+                    Ok(TurnOutcome::AwaitingReplies(turn)) => {
+                        awaiting_replies = active_thread.take().map(|thread| (thread, turn));
                     }
                     Ok(TurnOutcome::Deferred(envelope)) => {
                         active_thread = None;
@@ -204,11 +251,10 @@ pub(crate) async fn run_agent(
                     }
                     Ok(TurnOutcome::Completed) => {
                         active_thread = None;
-                        awaiting_replies = false;
+                        awaiting_replies = None;
                     }
-                    Ok(TurnOutcome::AwaitingReplies) => {
-                        active_thread = None;
-                        awaiting_replies = true;
+                    Ok(TurnOutcome::AwaitingReplies(turn)) => {
+                        awaiting_replies = active_thread.take().map(|thread| (thread, turn));
                     }
                     Ok(TurnOutcome::Deferred(envelope)) => {
                         active_thread = None;
@@ -307,8 +353,9 @@ enum TurnOutcome {
     Suspended,
     /// The turn is not over: this thread dispatched sub-agent calls and is
     /// parked until their answers arrive. The agent goes back to its inbox, but
-    /// only replies may reach it — a new submission waits its turn.
-    AwaitingReplies,
+    /// only replies may reach it — a new submission waits its turn. Carries the
+    /// turn so the wait can be capped once that turn has been asked to stop.
+    AwaitingReplies(TurnId),
     /// The envelope was handed back unconsumed. It is held until the turn in
     /// flight has wound up, then delivered again in the order it arrived.
     Deferred(Box<Envelope>),
@@ -508,7 +555,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         } else if suspended && persisted {
             TurnOutcome::Suspended
         } else if awaiting_replies && persisted {
-            TurnOutcome::AwaitingReplies
+            TurnOutcome::AwaitingReplies(turn)
         } else {
             // A failed write never announced the suspension, and left a stale
             // checkpoint behind for anything still to come; going idle beats
