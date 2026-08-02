@@ -112,11 +112,11 @@
       Purpose: 卡死的 sub-agent 不能钉住界面，更不能换来假的成功信号
       Verification: 让 sub-agent 卡在写库上（既答不了也存不进，收场真正挂死的唯一形态），断言根发 `PersistFailed` 而非 `Aborted`；把上限换成永不触发即打红
 
-- [ ] [清理] 删掉 `ForkError::Lagging`、`ForkSource` 的 `root_messages`、`ForkOutcome::Retryable`、`rpc::FORK_NOT_READY` 和 web 的 `retryWhileNotReady`
+- [x] [清理] 删掉 `ForkError::Lagging`、`ForkSource` 的 `root_messages`、`ForkOutcome::Retryable`、`rpc::FORK_NOT_READY` 和 web 的 `retryWhileNotReady`；`ThreadBusy` 不再按「活着=落后」区分对待，live/cold 一律 `NotIdle`
       Purpose: 原需求的验收标志——补偿能拆掉，说明两份文档合起来真的成立
-      Verification: `cargo test`、`pnpm --filter coda-web test` 全绿；fork 在「刚 settle 就 fork」「刚中止就 fork」「顶替后立刻 fork」三个时序下都一次成功
+      Verification: `cargo test`、`pnpm --filter coda-web test` 全绿；fork 在「刚 settle 就 fork」「刚中止就 fork」「顶替后立刻 fork」三个时序下各用一个干净会话，都一次成功
 
-- [ ] [清理] 更新 `hub.rs` 里 `LiveState::snapshot` 那段关于「checkpoint 落在 settle 之后」的注释，以及 web `retryWhileNotReady` 附近描述该竞态的文档
+- [x] [清理] 更新 `LiveState::snapshot`、`handle_rewind` 屏障和 fork 相关注释；web 那段随 `retryWhileNotReady` 一起删掉了
       Purpose: 别让注释继续描述一个已经不存在的次序
       Verification: 通读改动处，无残留描述旧次序的说明
 

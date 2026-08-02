@@ -79,8 +79,6 @@ pub const RENAME_FAILED: i32 = -32022;
 pub const REWIND_FAILED: i32 = -32023;
 pub const FORK_FAILED: i32 = -32024;
 /// A fork the database was not ready for: the cut, or the newest turn, has not
-/// been stored yet. Nothing was written, so the client can just retry.
-pub const FORK_NOT_READY: i32 = -32025;
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
 
 impl RpcError {

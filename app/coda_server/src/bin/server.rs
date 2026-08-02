@@ -1050,15 +1050,6 @@ async fn dispatch_request(
                     RpcError::new(rpc::SESSION_NOT_IDLE, "the session is not idle"),
                 )
                     .into(),
-                ForkOutcome::Retryable(detail) => (
-                    id,
-                    RpcError::with_detail(
-                        rpc::FORK_NOT_READY,
-                        "the session is still being saved",
-                        detail,
-                    ),
-                )
-                    .into(),
                 ForkOutcome::Failed(err) => (
                     id,
                     RpcError::with_detail(

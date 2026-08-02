@@ -1,4 +1,3 @@
-import { JSONRPCErrorException } from "json-rpc-2.0";
 import { expect, test } from "vitest";
 
 import {
@@ -6,13 +5,12 @@ import {
   codaStore,
   forkSession,
   openSession,
-  retryWhileNotReady,
   selectForking,
   updateForkDraft,
   forkKey,
   type OpenedSession,
 } from "../src/store/session.ts";
-import { RpcCode, type HistoryMessage } from "../src/lib/protocol.ts";
+import { type HistoryMessage } from "../src/lib/protocol.ts";
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
@@ -75,20 +73,6 @@ test("a restored user message carries the id a fork cuts at", () => {
     messageId: "m-user",
     content: "try this",
   });
-});
-
-test("a fork retries once when the database has not caught up", async () => {
-  let attempts = 0;
-  const forked = await retryWhileNotReady(async () => {
-    attempts += 1;
-    if (attempts === 1) {
-      throw new JSONRPCErrorException("not stored yet", RpcCode.FORK_NOT_READY);
-    }
-    return "s2";
-  });
-
-  expect(forked).toBe("s2");
-  expect(attempts).toBe(2);
 });
 
 // A session has a fork entry on every eligible user message plus one in the
@@ -165,18 +149,4 @@ test("the message a fork cuts at becomes the copy's composer draft", async () =>
     delete state.rpcMap[server];
     delete state.servers[server];
   });
-});
-
-test("a fork does not retry any other failure", async () => {
-  // The server has no request de-duplication, so retrying a failure that may
-  // have written something would mint a second copy.
-  let attempts = 0;
-  await expect(
-    retryWhileNotReady(async () => {
-      attempts += 1;
-      throw new JSONRPCErrorException("not idle", RpcCode.SESSION_NOT_IDLE);
-    }),
-  ).rejects.toThrow("not idle");
-
-  expect(attempts).toBe(1);
 });

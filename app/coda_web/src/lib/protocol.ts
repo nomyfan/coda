@@ -163,9 +163,6 @@ export const RpcCode = {
    * the authoritative history. */
   REWIND_FAILED: -32023,
   FORK_FAILED: -32024,
-  /** `fork_session`: the cut user message, or the newest turn of a full copy,
-   * is not stored yet. Nothing was written, so retrying is safe. */
-  FORK_NOT_READY: -32025,
   ALLOW_PATTERN_FAILED: -32030,
 } as const;
 

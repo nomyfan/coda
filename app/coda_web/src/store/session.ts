@@ -2311,26 +2311,6 @@ function closeActiveSession(nextServer?: string, nextKey?: SessionKey) {
   });
 }
 
-/**
- * Send a fork, retrying once if the server says the database has not caught up.
- *
- * The runtime emits events before it writes them, so a reply can be on screen a
- * moment before it is stored. That failure happens before anything is written,
- * which is what makes one retry safe; every other failure propagates, since the
- * server has no request de-duplication and a blind retry could mint a second
- * copy.
- */
-export async function retryWhileNotReady<T>(send: () => Promise<T>): Promise<T> {
-  try {
-    return await send();
-  } catch (err) {
-    if (!isServerError(err) || err.code !== RpcCode.FORK_NOT_READY) {
-      throw err;
-    }
-    return await send();
-  }
-}
-
 /** Identifies the *source* session of a fork, which is what the in-flight flag
  * is scoped to — forking two different sessions at once is fine. */
 export function forkKey(server: string, workspaceId: string, sessionId: string) {
@@ -2381,7 +2361,7 @@ export async function forkSession(
     if (!rpc) {
       throw new Error("Connection closed");
     }
-    const forked = await retryWhileNotReady(() => rpc.request("fork_session", params));
+    const forked = await rpc.request("fork_session", params);
     setCatalog(codaStore, server, forked.workspaces, true);
     openSession(server, workspaceId, forked.session_id);
     if (forkDraft) {

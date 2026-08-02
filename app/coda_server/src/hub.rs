@@ -154,9 +154,6 @@ pub enum ForkOutcome {
     /// The source is not at rest — a turn is in flight, something is waiting on
     /// a human, or a task is queued behind the current one.
     NotIdle,
-    /// The database has not caught up with what the client is looking at yet.
-    /// Nothing was written, so the client can simply retry.
-    Retryable(String),
     Failed(ForkError),
 }
 
@@ -460,10 +457,14 @@ struct LiveState {
     /// forwarder retires itself.
     generation: u64,
     turn_running: bool,
-    /// The settled conversation history, kept in memory. Authoritative for
-    /// attach snapshots: the driver's final checkpoint lands *after* the settle
-    /// event, so re-reading the persisted state mid-life would race — it is
-    /// only read when an entry is created.
+    /// The settled conversation history, kept in memory and used for attach
+    /// snapshots. Built up here rather than re-read from storage, which is why
+    /// it is only loaded when an entry is created.
+    ///
+    /// It used to be re-reading that was unsafe — the driver's final checkpoint
+    /// landed *after* the settle event, so the database was briefly behind what
+    /// had already been announced. That ordering is reversed now; what remains
+    /// is simply that this is the relay's own composed view.
     snapshot: Vec<Message>,
     /// User messages of turns that have not settled (and thus not folded) yet,
     /// oldest first, each under the turn it opened.
@@ -508,8 +509,8 @@ enum EntryPhase {
 
 /// What a source session's live state says about forking it.
 enum ForkGate {
-    /// At rest; carries the in-memory history length to check the copy against.
-    Ready(usize),
+    /// At rest.
+    Ready,
     /// Nothing live — the stored state is all there is.
     Cold,
     Busy,
@@ -1328,7 +1329,7 @@ impl SessionRelay for SessionHub {
                     {
                         ForkGate::Busy
                     } else {
-                        ForkGate::Ready(live.snapshot.len())
+                        ForkGate::Ready
                     }
                 }
                 EntryPhase::Pending(_) => ForkGate::Busy,
@@ -1336,11 +1337,7 @@ impl SessionRelay for SessionHub {
             };
 
             let source_state = match gate {
-                // A full copy has no cut to anchor it, so the live history's
-                // length is what tells "everything" from "everything stored so
-                // far". Without a runtime there is nothing to compare against —
-                // but then the stored snapshot is worth checking instead.
-                ForkGate::Ready(root_messages) => ForkSource::Live { root_messages },
+                ForkGate::Ready => ForkSource::Live,
                 ForkGate::Cold => ForkSource::Cold,
                 ForkGate::Busy => {
                     Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
@@ -1357,20 +1354,14 @@ impl SessionRelay for SessionHub {
 
             match forked {
                 Ok(forked) => ForkOutcome::Forked(forked),
-                // These three all mean the same thing from the client's side —
-                // the database has not caught up — and none of them wrote
-                // anything, so retrying is safe. `ThreadBusy` only counts as lag
-                // while the source is live; without a runtime the stored state is
-                // all there is, and it really is parked mid-turn.
-                Err(err @ (ForkError::CutNotFound | ForkError::Lagging { .. })) => {
-                    ForkOutcome::Retryable(err.to_string())
+                // A thread parked mid-turn is exactly that now, live or not: a
+                // turn is announced only once its content is stored, so there is
+                // no longer a lagging write for this to be mistaken for. Same
+                // refusal either way, and the same one the gate's own check
+                // produces.
+                Err(ForkError::ThreadBusy { .. } | ForkError::SourceNotIdle { .. }) => {
+                    ForkOutcome::NotIdle
                 }
-                Err(err @ ForkError::ThreadBusy { .. }) if !borrowed => {
-                    ForkOutcome::Retryable(err.to_string())
-                }
-                // The cold twin of the gate's own busy check, so the same source
-                // is refused the same way whether or not it happens to be open.
-                Err(ForkError::SourceNotIdle { .. }) => ForkOutcome::NotIdle,
                 Err(err) => {
                     warn!(workspace_id = %source.0, session_id = %source.1, "fork rejected: {err}");
                     ForkOutcome::Failed(err)
