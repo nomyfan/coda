@@ -6,10 +6,11 @@
 use super::super::*;
 use super::fixtures::*;
 use crate::{
-    AgentEvent, AgentSpec, SubAgentMode, ToolApprovalMode,
+    AgentEvent, AgentSpec, ResumeDecision, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     persist::StoredResumePoint,
     runtime::{MemoryStorage, SessionStorage},
 };
+use coda_core::llm::ToolCallOutcome;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
@@ -122,6 +123,75 @@ async fn a_new_task_waits_for_the_turn_it_supersedes() {
     assert_eq!(submissions, vec!["inspect", "actually, do this instead"]);
 
     harness.shutdown().await;
+}
+
+/// A restart resumes sub-agents too, and their answers are as real as any
+/// other. The ledger that says so is built from envelopes going out, so
+/// recovery — which puts them back into an agent's inbox directly — has to
+/// rebuild it, or the first superseding task writes off work this very process
+/// is running and the sub-agent's checkpoint lands afterwards.
+#[tokio::test]
+async fn a_new_task_waits_for_a_sub_agent_a_restart_resumed() {
+    let storage = TestStorage::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let team = crate::AgentTeam::new(root, subagents).expect("valid team");
+    let mut harness = Harness::start_agents(
+        storage.clone(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        approval.clone(),
+        "inspect",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                return pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to suspend");
+    harness.shutdown().await;
+
+    // Wedged from the moment it resumes, so it cannot answer during the window
+    // under test — but it is unmistakably alive, with a decision in hand.
+    let _wedged = storage.hold_checkpoints_of("explore").await;
+    let mut reopened = harness
+        .restart(
+            team.build(".", coda_tools::shared_file_locks()),
+            TestProvider::default(),
+            approval,
+            HashMap::from([(
+                pending.thread_id.clone(),
+                ResumeDecision {
+                    resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+                },
+            )]),
+        )
+        .await;
+
+    reopened.send_task("actually, do this instead").await;
+
+    let written_off = timeout(Duration::from_millis(300), async {
+        loop {
+            let (agent_name, _, event) = reopened.next_event().await;
+            if let ("coda", AgentEvent::ToolCallEnd(tool)) = (agent_name.as_str(), event)
+                && tool.name == "explore"
+                && matches!(tool.outcome, ToolCallOutcome::Aborted)
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        written_off.is_err(),
+        "the root wrote off a sub-agent this process is still running"
+    );
 }
 
 /// The other half of the same rule. After a crash the sub-agent is simply gone —

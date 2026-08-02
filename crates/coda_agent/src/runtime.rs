@@ -2,7 +2,7 @@ mod driver;
 
 use crate::agent::EnvelopeBody;
 use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
-use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
+use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, ThreadId};
 use coda_core::llm::{LLMProvider, TurnId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -396,32 +396,55 @@ impl AgentRuntime {
         self.broadcast_command(AgentControl::Abort).await;
     }
 
-    /// The turn a stored thread was last working on, or `None` if it has no
-    /// history to name one.
-    async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
+    async fn checkpoint_of(&self, thread_id: &str) -> Option<StoredCheckpoint> {
         self.session_storage
             .load_checkpoint(thread_id)
             .await
             .ok()
-            .flatten()?
+            .flatten()
+    }
+
+    /// The turn a stored thread was last working on, or `None` if it has no
+    /// history to name one.
+    async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
+        self.checkpoint_of(thread_id)
+            .await?
             .messages
             .last()
             .map(|entry| entry.turn_id)
     }
 
-    /// Put back the turns this process is about to resume, before any agent can
-    /// see an envelope — an abort right after a restart has to find them.
+    /// Put back the turns and the outstanding calls this process is about to
+    /// resume, before any agent can see an envelope — an abort right after a
+    /// restart has to find the turns, and a superseding task has to find the
+    /// calls.
     ///
     /// Only work that will really run counts: threads the snapshot parked
     /// mid-turn, and envelopes about to be replayed. A turn nothing will pick up
     /// again must stay off the list, or it would sit at the head forever and
     /// swallow every abort aimed at the turns behind it.
-    async fn register_resumed_turns(&self, snapshot: &AgentRuntimeSnapshot) {
+    ///
+    /// The call ledger is rebuilt by the rule that keeps it balanced: register
+    /// one obligation for every [`Self::end_call`] still to come. Those are a
+    /// reply already in flight, a thread whose stored checkpoint still names a
+    /// reply target, and a dispatched call its recipient has not picked up yet.
+    /// Replayed envelopes go straight into an agent's inbox rather than through
+    /// [`Self::send_message`], so this is the only place that can record them.
+    async fn register_resumed_work(&self, snapshot: &AgentRuntimeSnapshot) {
         // In-flight work first: whatever was already running is older than
         // anything queued behind it.
         for thread_id in snapshot.active_threads.values() {
-            if let Some(turn) = self.turn_of_thread(thread_id).await {
+            let Some(checkpoint) = self.checkpoint_of(thread_id).await else {
+                continue;
+            };
+            if let Some(turn) = checkpoint.messages.last().map(|entry| entry.turn_id) {
                 self.register_turn(turn);
+            }
+            // A stored reply target outlives only an unanswered call: it is
+            // taken before the checkpoint that precedes the reply, so a thread
+            // that already answered has none.
+            if checkpoint.reply_target.is_some() {
+                self.begin_call(&ThreadId::from(thread_id.clone()));
             }
         }
         let replayed = replayed_envelopes(snapshot);
@@ -432,8 +455,19 @@ impl AgentRuntime {
                 EnvelopeBody::Task { .. } => {}
                 EnvelopeBody::ToolCall { turn_id, .. } => {
                     self.register_turn(*turn_id);
+                    self.begin_call(&envelope.to.thread_id);
                 }
-                EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => {
+                EnvelopeBody::Reply { .. } => {
+                    if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
+                        self.register_turn(turn);
+                    }
+                    // An answer nobody has taken yet still settles an obligation
+                    // when its caller does take it.
+                    if let Sender::Agent { thread_id, .. } = &envelope.from {
+                        self.begin_call(thread_id);
+                    }
+                }
+                EnvelopeBody::Resume(_) => {
                     if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
                         self.register_turn(turn);
                     }
@@ -470,7 +504,7 @@ impl AgentRuntime {
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
         if let Some(snapshot) = snapshot.as_ref() {
-            self.register_resumed_turns(snapshot).await;
+            self.register_resumed_work(snapshot).await;
         }
         for (name, agent) in agents {
             info!("Bootstrap agent: {}", name);
