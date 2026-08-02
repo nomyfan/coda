@@ -5,10 +5,13 @@
 use super::super::*;
 use super::fixtures::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, runtime::MemoryStorage,
+    AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode,
+    persist::StoredResumePoint,
+    runtime::{MemoryStorage, SessionStorage},
 };
 use coda_core::llm::{Message, ToolOutput};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -433,4 +436,107 @@ async fn an_unexpected_envelope_that_cannot_be_stored_reports_once() {
     assert_eq!(persist_failures(&events), 1, "events: {events:?}");
 
     harness.shutdown().await;
+}
+
+/// `docs/design/turn-cancellation.md` reads the ordered active turns off the
+/// root's inbox, so the order tasks were submitted in has to survive being
+/// snapshotted and replayed — otherwise "cancel the turn at the head" names the
+/// wrong one after a restart.
+#[tokio::test]
+async fn tasks_queued_behind_the_exit_barrier_replay_in_order() {
+    let storage = MemoryStorage::default();
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "hold-subagent".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let team = AgentTeam::new(coda, vec![explore]).expect("valid team");
+    let harness = Harness::start_agents(
+        storage.clone(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
+        ToolApprovalMode::Auto,
+        "t1",
+    )
+    .await;
+
+    // Park the root on a sub-agent reply that never comes, so the tasks below
+    // pile up behind it instead of being consumed as they arrive.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(checkpoint) = storage
+                .load_checkpoint(harness.thread_id.as_ref())
+                .await
+                .expect("load checkpoint")
+                && matches!(checkpoint.resume_point, StoredResumePoint::ToolExecution(ref state) if !state.pending_replies.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the root never parked on a pending reply");
+
+    harness.runtime.request_exit().await;
+    // Past the barrier these are buffered into the snapshot rather than delivered.
+    harness.send_task("t2").await;
+    harness.send_task("t3").await;
+    harness
+        .runtime
+        .wait_for_exit(Some(Duration::from_secs(2)))
+        .await;
+
+    let mut harness = harness
+        .restart(
+            team.build(".", coda_tools::shared_file_locks()),
+            TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
+            ToolApprovalMode::Auto,
+            HashMap::new(),
+        )
+        .await;
+
+    let mut answered = 0;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                answered += 1;
+                if answered == 2 {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the replayed tasks to run");
+    harness.shutdown().await;
+
+    let root = storage
+        .load_checkpoint(harness.thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("root thread was checkpointed");
+    let submissions: Vec<&str> = root
+        .messages
+        .iter()
+        .filter_map(|entry| match &entry.message {
+            Message::User(user) => user.first_text(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(submissions, vec!["t1", "t2", "t3"]);
 }

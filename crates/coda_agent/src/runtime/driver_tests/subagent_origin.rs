@@ -6,6 +6,7 @@ use super::super::*;
 use super::fixtures::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, ToolCallResolution,
+    persist::StoredResumePoint,
     runtime::{MemoryStorage, SessionStorage},
 };
 use coda_core::llm::{Message, MessageId, MessageOrigin, ToolCallOutcome, ToolOutput, TurnId};
@@ -650,4 +651,107 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
             call_id: "call_explore".into(),
         })]
     );
+}
+
+/// A thread waiting on a sub-agent must be able to name that sub-agent's thread
+/// from its own state alone. It cannot look the child up: a child that is still
+/// generating has not written a checkpoint yet, as the parked root below shows.
+/// `docs/design/turn-cancellation.md` rests on this — it is how an interrupted
+/// turn tells a reply that is still coming from one whose producer is gone.
+#[tokio::test]
+async fn a_parked_thread_can_name_the_child_it_waits_on() {
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "hold-subagent".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        coda,
+        vec![explore],
+        TestProvider::with_hold_subagent(hold.clone()),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    let parked = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(checkpoint) = harness
+                .storage
+                .load_checkpoint(harness.thread_id.as_ref())
+                .await
+                .expect("load checkpoint")
+                && let StoredResumePoint::ToolExecution(state) = checkpoint.resume_point
+                && !state.pending_replies.is_empty()
+            {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the root never parked on a pending reply");
+
+    // The child is held mid-generation, so it has reached no write point at all.
+    let stored: Vec<String> = harness
+        .storage
+        .all_checkpoints()
+        .await
+        .into_iter()
+        .map(|checkpoint| checkpoint.agent_name)
+        .collect();
+    assert_eq!(stored, vec!["coda"], "the child should own no row yet");
+
+    let [pending] = parked.pending_replies.as_slice() else {
+        panic!(
+            "expected one pending reply, got {:?}",
+            parked.pending_replies
+        );
+    };
+    // Derived from what the parent already holds — nothing here reads the child.
+    let derived = ThreadId::from_uuid5(
+        &harness.thread_id,
+        &MessageOrigin {
+            message_id: parked.parent_message_id,
+            call_id: pending.call_id.clone(),
+        }
+        .derivation_key(),
+    );
+
+    hold.notify_waiters();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMEnd(msg)) = (agent_name.as_str(), event)
+                && msg.tool_calls.is_empty()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the root to finish");
+    harness.shutdown().await;
+
+    let child = harness
+        .storage
+        .all_checkpoints()
+        .await
+        .into_iter()
+        .find(|checkpoint| checkpoint.agent_name == "explore")
+        .expect("explore checkpointed once it answered");
+    assert_eq!(derived.as_ref(), child.thread_id);
 }
