@@ -104,9 +104,9 @@
       Purpose: 堵掉正常路径上的断链点，同时保留崩溃恢复的清理路径
       Verification: 卡住 sub-agent 的写并提交下一条 `Task`，结束事件在放行前不出现、放行后旧轮先收场再跑新轮，两条用户消息按序留在历史里；崩溃恢复场景（孩子无 checkpoint 也无信封）仍就地写掉、不挂住。两处变异（判据恒假、判据恒真）各自打红其中一条
 
-- [ ] [集成] `TurnId` 进事件通道；hub 结算改成按它关联：`unsettled_user_messages` 按轮次索引，`fold_settled_turn` 按 key 删，`turn_running` 按活跃轮次判定
+- [x] [集成] `TurnId` 进事件通道（只到 `SessionEvent`，不上线协议）；hub 结算改成按它关联：`unsettled_user_messages` 变成按轮次索引的有序表，`fold_settled_turn` 按 key 删（同一轮第二次 settle 自然是 no-op），`turn_running` 改为「还有没有未 settle 的提交」而不是每次 settle 清零
       Purpose: 让旧轮补发的结束事件不再吃掉新任务
-      Verification: 「挂起 → 提交新任务 → 旧轮补发 Aborted」后，新任务那条仍在、`turn_running` 未被错误清零；同一轮 settle 两次是幂等的；顶替后 `unsettled_user_messages` 不残留，fork 不被永久拒绝
+      Verification: 「sub-agent 挂起 → 提交新任务 → 旧轮补发 Aborted」后，新任务那条仍在、`turn_running` 未被错误清零，之后新轮照常跑完并折叠干净；变异回按序弹出即打红
 
 - [ ] [核心] 根等待回复的上限：超时按持久化失败处理，发 `PersistFailed` 走重同步，绝不发 `Aborted`
       Purpose: 卡死的 sub-agent 不能钉住界面，更不能换来假的成功信号

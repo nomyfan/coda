@@ -149,6 +149,7 @@ pub(crate) async fn run_agent(
             cancel: cancel.clone(),
             config: config.clone(),
             thread_id: thread_id.clone(),
+            turn: TurnId::from(MessageId::new()),
             reply_target: None,
             origin_thread: None,
         };
@@ -321,6 +322,10 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
     cancel: CancellationToken,
     config: AgentRunConfig<C>,
     thread_id: ThreadId,
+    /// The turn every event this thread emits belongs to. Refreshed whenever an
+    /// incoming envelope opens new work; events raised while cleaning up after
+    /// the previous one still carry the turn they are cleaning up.
+    turn: TurnId,
     reply_target: Option<ReplyTarget>,
     /// How this thread was addressed by whoever spawned it. Unlike
     /// `reply_target` these outlive the call that set them: they are the thread's
@@ -368,12 +373,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.origin_thread = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
             };
+        self.turn = self.agent.current_turn().await;
 
         if let Some(envelope) = envelope {
             let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. });
             match self.handle_envelope(resume_point, envelope).await {
                 EnvelopeOutcome::Next(rp) => {
                     resume_point = rp;
+                    self.turn = self.agent.current_turn().await;
                     // Persist the user prompt immediately so a mid-turn snapshot
                     // (reconnect, crash) already contains it; the event stream
                     // never carries user messages. Restricted to root user tasks
@@ -408,7 +415,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let mut exit_acquired = false;
         let mut suspended = false;
         let mut owed = TurnEnd::default();
-        let turn = self.agent.current_turn().await;
+        let turn = self.turn;
         loop {
             if self.runtime.exit_barrier.is_exiting() {
                 exit_acquired = true;
@@ -533,6 +540,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .emit_event(
                     self.agent.name.clone(),
                     self.thread_id.clone(),
+                    self.turn,
                     AgentEvent::PersistFailed(err),
                 )
                 .await;
@@ -540,7 +548,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
         if let Some(event) = owed.event {
             self.runtime
-                .emit_event(self.agent.name.clone(), self.thread_id.clone(), event)
+                .emit_event(
+                    self.agent.name.clone(),
+                    self.thread_id.clone(),
+                    self.turn,
+                    event,
+                )
                 .await;
         }
         // Last, always: the reply is what lets the caller move on, so anything
@@ -724,6 +737,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .emit_event(
                 self.agent.name.clone(),
                 self.thread_id.clone(),
+                self.turn,
                 AgentEvent::ToolCallEnd(message),
             )
             .await;
@@ -825,7 +839,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 // stop the turn in flight and let it wind up.
                                 // The new work waits until it has.
                                 tool_execution.pending_replies = still_answering;
-                                self.runtime.cancel_turn(self.agent.current_turn().await);
+                                self.runtime
+                                    .cancel_turn(self.agent.current_turn().await)
+                                    .await;
                                 return EnvelopeOutcome::Deferred(
                                     Box::new(envelope),
                                     ResumePoint::ToolExecution(tool_execution),
@@ -980,6 +996,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .emit_event(
                 self.agent.name.clone(),
                 thread_id.clone(),
+                self.turn,
                 AgentEvent::LLMStart(request.clone()),
             )
             .await;
@@ -1016,7 +1033,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             ended_at,
                         };
                         self.agent.add_message(Message::Assistant(message.clone())).await;
-                        self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), AgentEvent::LLMEnd(message)).await;
+                        self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), self.turn, AgentEvent::LLMEnd(message)).await;
                     }
                     break GenerationOutcome::Aborted;
                 }
@@ -1027,11 +1044,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 reasoning_ended_at = Some(jiff::Timestamp::now());
                             }
                             partial_content.push_str(&chunk);
-                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMContentChunk(chunk)).await;
+                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), self.turn,AgentEvent::LLMContentChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::ReasoningChunk(chunk))) => {
                             partial_reasoning.push_str(&chunk);
-                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(),AgentEvent::LLMReasoningChunk(chunk)).await;
+                            self.runtime.emit_event(self.agent.name.clone(), thread_id.clone(), self.turn,AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break GenerationOutcome::Completed(message),
                         Some(Err(err)) => break GenerationOutcome::Failed(err.to_string()),
@@ -1099,6 +1116,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .emit_event(
                 self.agent.name.clone(),
                 thread_id,
+                self.turn,
                 AgentEvent::LLMEnd(assistant_message.clone()),
             )
             .await;
@@ -1268,6 +1286,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         .emit_event(
                             self.agent.name.clone(),
                             self.thread_id.clone(),
+                            self.turn,
                             AgentEvent::ToolCallStart(tc.tool_call.clone()),
                         )
                         .await;
@@ -1284,6 +1303,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     .emit_event(
                         self.agent.name.clone(),
                         self.thread_id.clone(),
+                        self.turn,
                         AgentEvent::ToolCallStart(tc.tool_call.clone()),
                     )
                     .await;

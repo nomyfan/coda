@@ -20,7 +20,7 @@ use std::sync::Arc;
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
 };
-use coda_core::llm::{Message, MessageId, UserMessage};
+use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -405,9 +405,10 @@ impl EventLog {
 /// checkpoint history holds). The log is cleared afterwards.
 fn fold_settled_turn(
     snapshot: &mut Vec<Message>,
-    unsettled_user_messages: &mut VecDeque<Message>,
+    unsettled_user_messages: &mut Vec<(TurnId, Message)>,
     log: &mut EventLog,
     root_name: &str,
+    settled: TurnId,
 ) {
     let mut entries = log.iter().peekable();
     while let Some(WireEvent::ToolCallEnd {
@@ -422,8 +423,11 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
-    if let Some(user) = unsettled_user_messages.pop_front() {
-        snapshot.push(user);
+    if let Some(position) = unsettled_user_messages
+        .iter()
+        .position(|(turn, _)| *turn == settled)
+    {
+        snapshot.push(unsettled_user_messages.remove(position).1);
     }
     for event in entries {
         match event {
@@ -461,8 +465,15 @@ struct LiveState {
     /// event, so re-reading the persisted state mid-life would race — it is
     /// only read when an entry is created.
     snapshot: Vec<Message>,
-    /// User messages of turns that have not settled (and thus not folded) yet.
-    unsettled_user_messages: VecDeque<Message>,
+    /// User messages of turns that have not settled (and thus not folded) yet,
+    /// oldest first, each under the turn it opened.
+    ///
+    /// Keyed rather than a plain queue because turns do not settle in the order
+    /// they arrive: a suspended turn settles, the user submits the next one,
+    /// and the old turn settles a second time when it is finally wound up. Off
+    /// the front of a queue that second settle would swallow the *new* turn's
+    /// message.
+    unsettled_user_messages: Vec<(TurnId, Message)>,
     pending_approvals: Vec<PendingApproval>,
     log: EventLog,
 }
@@ -746,7 +757,7 @@ impl SessionHub {
             generation,
             turn_running,
             snapshot,
-            unsettled_user_messages: VecDeque::new(),
+            unsettled_user_messages: Vec::new(),
             pending_approvals: Vec::new(),
             log: EventLog::new(self.limits),
         }
@@ -777,10 +788,10 @@ impl SessionHub {
             return CommandOutcome::Ignored;
         }
         live.turn_running = true;
-        live.unsettled_user_messages
-            .push_back(Message::User(UserMessage::with_images(
-                message_id, task, &images,
-            )));
+        live.unsettled_user_messages.push((
+            TurnId::from(message_id),
+            Message::User(UserMessage::with_images(message_id, task, &images)),
+        ));
         // A task sent while approvals were pending supersedes them: the driver
         // writes the discarded calls as aborted ToolMessages (announced via
         // ToolCallEnd) and starts a fresh turn, so advertising them to a later
@@ -1431,7 +1442,11 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
             let mut messages = live.snapshot.clone();
-            messages.extend(live.unsettled_user_messages.iter().cloned());
+            messages.extend(
+                live.unsettled_user_messages
+                    .iter()
+                    .map(|(_, message)| message.clone()),
+            );
             Some(SnapshotPayload {
                 messages,
                 pending_approvals: live.pending_approvals.clone(),
@@ -1555,6 +1570,7 @@ async fn run_forwarder(
                     AgentEvent::Suspended(approval) => Some(approval.clone()),
                     _ => None,
                 };
+                let turn_id = event.turn_id;
                 let wire = WireEvent::from_session_event(event, &root_name);
                 // A queued task (or restart-resume) starts a turn without a
                 // command flipping the flag; the turn's first event does.
@@ -1587,8 +1603,13 @@ async fn run_forwarder(
                         &mut live.unsettled_user_messages,
                         &mut live.log,
                         &root_name,
+                        turn_id,
                     );
-                    live.turn_running = false;
+                    // Derived, not cleared: a turn settling says nothing about
+                    // the ones queued behind it. A wound-up turn settling for
+                    // the second time must not report the session idle while
+                    // its successor is running.
+                    live.turn_running = !live.unsettled_user_messages.is_empty();
                     if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
                         drop(guard);
                         release.await;

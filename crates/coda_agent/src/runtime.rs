@@ -252,7 +252,7 @@ pub(crate) struct AgentRuntime {
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     agent_tasks: Arc<Mutex<JoinSet<String>>>,
     /// Global event bus — all agents forward their events here.
-    global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
+    global_event_tx: broadcast::Sender<(String, ThreadId, TurnId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
@@ -381,14 +381,19 @@ impl AgentRuntime {
             .contains_key(thread_id)
     }
 
-    /// Ask a turn to stop, without touching the queue it sits in. Used when a
-    /// new submission supersedes the one in flight.
-    pub(crate) fn cancel_turn(&self, turn: TurnId) {
+    /// Ask a named turn to stop, without touching the queue it sits in. Used
+    /// when a new submission supersedes the one in flight.
+    ///
+    /// The broadcast matters as much as the mark: a thread parked on an
+    /// approval has no envelope coming to wake it, so without a nudge it would
+    /// sit there while the turn it belongs to waits to be wound up.
+    pub(crate) async fn cancel_turn(&self, turn: TurnId) {
         self.turns
             .lock()
             .expect("active turns")
             .cancelled
             .insert(turn);
+        self.broadcast_command(AgentControl::Abort).await;
     }
 
     /// The turn a stored thread was last working on, or `None` if it has no
@@ -442,13 +447,19 @@ impl AgentRuntime {
         }
     }
 
+    /// Publish an event, tagged with the turn it belongs to. One turn id spans
+    /// the whole sub-tree it reaches, which is what lets a consumer settle
+    /// per-turn without reconstructing who called whom.
     pub(crate) async fn emit_event(
         &self,
         agent_name: String,
         thread_id: ThreadId,
+        turn_id: TurnId,
         event: AgentEvent,
     ) {
-        let _ = self.global_event_tx.send((agent_name, thread_id, event));
+        let _ = self
+            .global_event_tx
+            .send((agent_name, thread_id, turn_id, event));
     }
 
     pub(crate) async fn bootstrap(
@@ -512,7 +523,7 @@ impl AgentRuntime {
     }
 
     /// Subscribe to events from all agents
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, AgentEvent)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)> {
         self.global_event_tx.subscribe()
     }
 

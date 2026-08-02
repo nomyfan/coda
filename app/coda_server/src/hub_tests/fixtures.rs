@@ -325,6 +325,67 @@ impl TestOpener {
     }
 }
 
+impl TestOpener {
+    /// A root that delegates to `explore`, whose own tool call needs approving.
+    /// The suspension therefore belongs to the sub-agent rather than the root —
+    /// the shape where one turn settles twice, once on the suspension and again
+    /// when it is finally wound up.
+    ///
+    /// `stall` slows the *root's* checkpoint writes, which is what keeps the
+    /// turn after the supersede from racing past an assertion about the moment
+    /// in between.
+    pub(super) fn delegating_for_approval(stall: Option<Duration>) -> Self {
+        let team = AgentTeam::new(
+            AgentSpec {
+                name: "coda".into(),
+                description: String::new(),
+                system_prompt: "delegate".into(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec!["explore".into()],
+            },
+            vec![AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "approval".into(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![Box::new(ReadTodosToolSpec)],
+                subagents: vec![],
+            }],
+        )
+        .expect("valid team");
+        Self::with_team(
+            team,
+            ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+            SlowStorage {
+                inner: MemoryStorage::default(),
+                stall: stall.map(|delay| (key().1.clone(), delay)),
+                budget: Arc::new(tokio::sync::Mutex::new(None)),
+            },
+        )
+    }
+}
+
+/// The turns whose user message the hub has not folded yet, with whether it
+/// still considers a turn to be running.
+pub(super) async fn unsettled(hub: &SessionHub) -> (Vec<String>, bool) {
+    let entry = hub.get_entry(&key()).expect("entry");
+    let guard = entry.inner.clone().lock_owned().await;
+    let EntryPhase::Live(live) = &guard.phase else {
+        panic!("session is not live");
+    };
+    (
+        live.unsettled_user_messages
+            .iter()
+            .filter_map(|(_, message)| match message {
+                Message::User(user) => user.first_text().map(str::to_string),
+                _ => None,
+            })
+            .collect(),
+        live.turn_running,
+    )
+}
+
 /// The thread the `explore` sub-agent runs in: stateful, so it is derived once
 /// from the root thread (whose id is the session id) and stays put.
 pub(super) fn explore_thread() -> ThreadId {

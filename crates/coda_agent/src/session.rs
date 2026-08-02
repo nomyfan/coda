@@ -16,7 +16,7 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
-use coda_core::llm::{LLMProvider, Message, MessageId};
+use coda_core::llm::{LLMProvider, Message, MessageId, TurnId};
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +53,10 @@ impl EventOrigin {
 pub struct SessionEvent {
     pub origin: EventOrigin,
     pub thread_id: ThreadId,
+    /// The submission this event belongs to. Shared by every agent the turn
+    /// reaches, so a consumer can settle per turn without working out the call
+    /// tree for itself.
+    pub turn_id: TurnId,
     pub kind: AgentEvent,
 }
 
@@ -400,7 +404,7 @@ struct SessionInner {
     session_id: String,
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
-    events_rx: Mutex<broadcast::Receiver<(String, ThreadId, AgentEvent)>>,
+    events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
 }
 
 /// High-level handle to a running agent session.
@@ -563,7 +567,10 @@ impl Session {
         }
     }
 
-    fn wrap_event(&self, (name, thread_id, kind): (String, ThreadId, AgentEvent)) -> SessionEvent {
+    fn wrap_event(
+        &self,
+        (name, thread_id, turn_id, kind): (String, ThreadId, TurnId, AgentEvent),
+    ) -> SessionEvent {
         let origin = if name == self.inner.root_name {
             EventOrigin::Root
         } else {
@@ -572,6 +579,7 @@ impl Session {
         SessionEvent {
             origin,
             thread_id,
+            turn_id,
             kind,
         }
     }

@@ -4,6 +4,7 @@
 use super::super::*;
 use super::fixtures::*;
 use coda_agent::{ToolApprovalMode, ToolCallResolution};
+use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn suspended_approval_survives_release_and_promotes_on_resume() {
@@ -126,4 +127,80 @@ async fn new_task_clears_superseded_pending_approvals() {
     )));
 
     hub.shutdown_all().await;
+}
+
+/// One turn can settle twice: once when a sub-agent suspends for approval, and
+/// again when the user stops answering and submits something else instead, which
+/// winds that turn up for real. Off the front of a queue, the second settle
+/// swallows the *new* turn's message and reports the session idle while the new
+/// turn is only just starting — so the accounting is keyed by turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_settles_twice_does_not_swallow_the_one_behind_it() {
+    let hub = SessionHub::new(
+        Arc::new(TestOpener::delegating_for_approval(Some(
+            Duration::from_millis(200),
+        ))),
+        RelayConfig::default(),
+    );
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "go".into(),
+            images: vec![],
+        },
+    )
+    .await;
+
+    // The sub-agent suspends, which settles the turn for the first time.
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e) if matches!(&**e, WireEvent::Suspended { .. }))
+    })
+    .await;
+
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "instead".into(),
+            images: vec![],
+        },
+    )
+    .await;
+
+    // Winding the first turn up settles it a second time.
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e)
+            if matches!(&**e, WireEvent::Aborted { agent_name, .. } if agent_name == "coda"))
+    })
+    .await;
+
+    let (pending, running) = unsettled(&hub).await;
+    assert_eq!(
+        pending,
+        vec!["instead".to_string()],
+        "the wound-up turn took the new submission's message with it"
+    );
+    assert!(running, "the session reported itself idle mid-turn");
+
+    // And the new turn still runs to its own end.
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e)
+            if matches!(&**e, WireEvent::LlmEnd { agent_name, message, .. }
+                if agent_name == "coda" && message.tool_calls.is_empty()))
+    })
+    .await;
+    wait_idle(&hub).await;
+    let (pending, running) = unsettled(&hub).await;
+    assert!(
+        pending.is_empty(),
+        "a submission was never folded: {pending:?}"
+    );
+    assert!(!running);
 }
