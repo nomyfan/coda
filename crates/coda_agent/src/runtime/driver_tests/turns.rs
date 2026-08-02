@@ -238,6 +238,79 @@ async fn resuming_an_approval_does_not_open_a_second_turn() {
     harness.shutdown().await;
 }
 
+/// A submission that arrives instead of an approval decision used to discard
+/// the parked calls and carry straight on, which ended the turn without ever
+/// ending it: nothing announced that it stopped, so nothing closed it either.
+/// It stayed at the head of the list, where every later abort would keep
+/// marking it — leaving the turn actually running unstoppable.
+#[tokio::test]
+async fn a_task_that_supersedes_an_approval_closes_the_turn_it_replaced() {
+    let mut harness = Harness::start_with_spec(
+        MemoryStorage::default(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "interrupt-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(coda_tools::ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        "phase1",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for approval suspension");
+    assert_eq!(active(&harness.runtime).len(), 1);
+
+    harness.send_task("phase1").await;
+
+    let mut stopped = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::Aborted(_)) => stopped = true,
+                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => return,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the superseding task never finished");
+    assert!(
+        stopped,
+        "the superseded approval never announced that its turn stopped"
+    );
+    assert!(
+        active(&harness.runtime).is_empty(),
+        "the superseded turn is still on the books: {:?}",
+        active(&harness.runtime)
+    );
+
+    // The point of closing it: the next abort has to reach the turn that is
+    // actually running rather than the one left at the head.
+    harness.send_task("phase1").await;
+    let running = active(&harness.runtime);
+    harness.runtime.request_abort().await;
+    assert_eq!(
+        cancelled(&harness.runtime).into_iter().collect::<Vec<_>>(),
+        running
+    );
+
+    harness.shutdown().await;
+}
+
 /// Reopening a session has to put the interrupted turn back on the books before
 /// any agent can move: the user's first act after reopening may well be to stop
 /// it, and an abort that finds an empty list marks nothing.

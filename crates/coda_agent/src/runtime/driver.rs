@@ -305,9 +305,10 @@ enum AgentLoopState {
 enum EnvelopeOutcome {
     Next(ResumePoint),
     Done(ResumePoint, Box<TurnEnd>),
-    /// Refused: this thread is still owed answers from calls it made before the
-    /// envelope arrived. It stops the turn in flight and parks; whoever holds
-    /// the envelope tries again once that turn has wound up.
+    /// Refused: the turn in flight is not finished with this thread, either
+    /// because sub-agents still owe it answers or because it is parked on an
+    /// approval nobody answered. The turn winds up first; whoever holds the
+    /// envelope tries again once it has.
     Deferred(Box<Envelope>, ResumePoint),
 }
 
@@ -449,11 +450,25 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     return Ok(TurnOutcome::Completed);
                 }
                 EnvelopeOutcome::Deferred(envelope, rp) => {
-                    // The trimmed set of outstanding calls goes to storage
-                    // before the envelope goes back, so a crash in between
-                    // leaves the same picture the caller will come back to.
-                    self.persist_and_announce(rp, suspended_at, TurnEnd::default())
-                        .await;
+                    // Deferring means the turn in flight has just been asked to
+                    // stop, so it winds up here rather than waiting to be
+                    // entered again — the envelope has to come back to a thread
+                    // that is no longer holding the old turn's work, or it would
+                    // walk into the same refusal and defer forever. Whether that
+                    // wind-up ends the turn or only parks it, the state goes to
+                    // storage before the envelope goes back, so a crash in
+                    // between leaves the same picture the caller returns to.
+                    let (rp, owed) = match self.wind_up(rp).await {
+                        WindUp::Waiting(rp) => (rp, TurnEnd::default()),
+                        WindUp::Ended(end) => (ResumePoint::Generation, *end),
+                    };
+                    let announced_ending = owed.event.is_some();
+                    if self.persist_and_announce(rp, suspended_at, owed).await
+                        && announced_ending
+                        && self.runtime.is_root_thread(&self.thread_id)
+                    {
+                        self.runtime.close_turn(self.agent.current_turn().await);
+                    }
                     return Ok(TurnOutcome::Deferred(envelope));
                 }
             }
@@ -921,42 +936,33 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             } => {
                 match &envelope.body {
                     EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. } => {
-                        // Stale PendingApproval state: new task or sub-agent re-invocation
-                        // arrived (e.g. after abort). Write aborted ToolMessages for all
-                        // pending calls so the history stays valid, then start fresh.
+                        // New work arrived for a thread parked on an approval
+                        // the user never answered. Discarding the parked calls
+                        // here and carrying straight on would end the turn
+                        // without ever ending it: nothing announces that it
+                        // stopped, and it stays on the runtime's books forever,
+                        // at the head, swallowing every later abort. So it takes
+                        // the same route as any other supersede — stop the turn
+                        // in flight, let it wind up, and try the envelope again.
+                        //
+                        // Unlike the sub-agent case there is nobody to tell: a
+                        // thread parked on an approval has dispatched nothing,
+                        // so the only work to stop is its own, and it is already
+                        // running. Marking the turn would only leave a stale
+                        // abort in this agent's own control queue for the
+                        // replayed envelope to walk into.
                         warn!(
-                            "Received envelope while suspended for approval; discarding {} pending call(s)",
+                            "Received envelope while suspended for approval; stopping the turn holding {} pending call(s)",
                             pending_approval_calls.len()
                         );
-                        for tc in pending_approval_calls.drain(..) {
-                            self.add_tool_message(ToolMessage::new(
-                                tc.id,
-                                tc.name,
-                                ToolOutput::Err(
-                                    "Tool execution was interrupted by the user".to_string(),
-                                ),
-                                ToolCallOutcome::Aborted,
-                                None,
-                            ))
-                            .await;
-                        }
-                        for tc in pending_calls.drain(..) {
-                            self.add_tool_message(ToolMessage::new(
-                                tc.tool_call.id,
-                                tc.tool_call.name,
-                                ToolOutput::Err(
-                                    "Tool execution was interrupted by the user".to_string(),
-                                ),
-                                ToolCallOutcome::Aborted,
-                                None,
-                            ))
-                            .await;
-                        }
-                        self.reply_target = reply_target_from_envelope(&envelope);
-                        if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
-                            self.agent.add_user_message(turn_id, user).await;
-                        }
-                        EnvelopeOutcome::Next(ResumePoint::Generation)
+                        EnvelopeOutcome::Deferred(
+                            Box::new(envelope),
+                            ResumePoint::PendingApproval {
+                                parent_message_id,
+                                pending_approval_calls,
+                                pending_calls,
+                            },
+                        )
                     }
                     EnvelopeBody::Resume(decision) => {
                         let resolution_map: HashMap<String, ToolCallResolution> =
