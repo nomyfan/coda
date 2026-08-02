@@ -224,10 +224,15 @@ pub(crate) async fn run_agent(
                         awaiting_replies = None;
                     }
                     Ok(TurnOutcome::AwaitingReplies(turn)) => {
-                        awaiting_replies = active_thread.take().map(|thread| (thread, turn));
-                    }
-                    Ok(TurnOutcome::Deferred(envelope)) => {
                         active_thread = None;
+                        awaiting_replies = Some((thread_id.clone(), turn));
+                    }
+                    Ok(TurnOutcome::Deferred { envelope, awaiting }) => {
+                        active_thread = None;
+                        // The queue only holds the envelope while this thread is
+                        // known to be waiting, so the wait has to be recorded
+                        // before it goes back.
+                        awaiting_replies = awaiting.map(|turn| (thread_id.clone(), turn));
                         deferred.push_back(*envelope);
                     }
                     Ok(TurnOutcome::Suspended) => {
@@ -254,10 +259,15 @@ pub(crate) async fn run_agent(
                         awaiting_replies = None;
                     }
                     Ok(TurnOutcome::AwaitingReplies(turn)) => {
-                        awaiting_replies = active_thread.take().map(|thread| (thread, turn));
-                    }
-                    Ok(TurnOutcome::Deferred(envelope)) => {
                         active_thread = None;
+                        awaiting_replies = Some((thread_id.clone(), turn));
+                    }
+                    Ok(TurnOutcome::Deferred { envelope, awaiting }) => {
+                        active_thread = None;
+                        // The queue only holds the envelope while this thread is
+                        // known to be waiting, so the wait has to be recorded
+                        // before it goes back.
+                        awaiting_replies = awaiting.map(|turn| (thread_id.clone(), turn));
                         deferred.push_back(*envelope);
                     }
                     Ok(TurnOutcome::Suspended) => {
@@ -359,7 +369,16 @@ enum TurnOutcome {
     AwaitingReplies(TurnId),
     /// The envelope was handed back unconsumed. It is held until the turn in
     /// flight has wound up, then delivered again in the order it arrived.
-    Deferred(Box<Envelope>),
+    ///
+    /// `awaiting` carries what a wind-up that could not finish would otherwise
+    /// have reported as [`Self::AwaitingReplies`]: the turn still owed answers.
+    /// Both halves have to travel together, because the envelope only stays put
+    /// while the thread is known to be waiting — otherwise the queue hands it
+    /// straight back to the refusal that returned it.
+    Deferred {
+        envelope: Box<Envelope>,
+        awaiting: Option<TurnId>,
+    },
     /// The exit barrier was already set when the turn started or checked.
     ExitAcquired,
 }
@@ -458,9 +477,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     // wind-up ends the turn or only parks it, the state goes to
                     // storage before the envelope goes back, so a crash in
                     // between leaves the same picture the caller returns to.
-                    let (rp, owed) = match self.wind_up(rp).await {
-                        WindUp::Waiting(rp) => (rp, TurnEnd::default()),
-                        WindUp::Ended(end) => (ResumePoint::Generation, *end),
+                    let turn = self.turn;
+                    let (rp, owed, awaiting) = match self.wind_up(rp).await {
+                        WindUp::Waiting(rp) => (rp, TurnEnd::default(), Some(turn)),
+                        WindUp::Ended(end) => (ResumePoint::Generation, *end, None),
                     };
                     let announced_ending = owed.event.is_some();
                     if self.persist_and_announce(rp, suspended_at, owed).await
@@ -469,7 +489,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     {
                         self.runtime.close_turn(self.agent.current_turn().await);
                     }
-                    return Ok(TurnOutcome::Deferred(envelope));
+                    return Ok(TurnOutcome::Deferred { envelope, awaiting });
                 }
             }
         }

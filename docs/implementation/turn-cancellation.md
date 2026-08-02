@@ -138,6 +138,8 @@
 - **两本账都要在重启时重建，不只是轮次账。** 决策 2 的差事账只由 `send_message` 记账，而恢复是把信封直接塞进 agent 的收件箱、绕过它的——于是重启后账是空的，第一次顶替就会把这个进程正在跑的 sub-agent 判成死的、就地写掉，它的 checkpoint 随后才落库，正是本文档要关掉的那个窗口。`register_resumed_work` 现在按一条可陈述的规则重建：**未来每一次 `end_call` 都要有一笔对应的登记**——在飞的回话、checkpoint 里还留着 `reply_target` 的线程、以及尚未被取走的派发信封，三者各算一笔。
 - **停在审批上被顶替，走的是和别处一样的收场，不是就地丢弃。** 原来那条路直接丢掉待审批的调用、接着开新轮：轮次既没宣布结束也没被关闭，于是永远卡在队首，此后每一次中止都打在它身上，真正在跑的那一轮反而停不下来。现在它和 `ToolExecution` 一样返回 `Deferred`，由收场统一写掉调用、宣布 `Aborted`、关闭轮次，然后信封重放。收场的时机也跟着挪了：`Deferred` 分支自己先 `wind_up`，而不是等下一次进入循环——否则重放的信封会原地撞回同一条拒绝路径，无限打转。
   这条路**不**标记轮次也不广播：停在审批上的线程什么都没派发出去，要收场的只有它自己，而它已经在跑了；广播反而会在自己的控制队列里留下一个过期的 abort，正好被重放的那一轮吃掉。
+- **`Deferred` 必须连「还在等谁」一起交回去。** 拒收的信封只在 `run_agent` 知道这条线程正等着回话时才留在队列里；否则下一圈立刻把它弹出来，原地撞回同一条拒绝路径。同一进程里顶替之所以没炸，是因为 `awaiting_replies` 早在上一轮派发时就设好了；**重启之后没有那一轮**——根是从 checkpoint 直接恢复出 `pending_replies` 的，`awaiting_replies` 还是 `None`，于是新任务被无限重放，子线程的 `Reply` 永远排不进来。`TurnOutcome::Deferred` 因此带上 `awaiting`，收场返回 `Waiting` 时把它一并交给 `run_agent`。
+  顺带把 `AwaitingReplies` 和 `Deferred` 记录线程的方式从 `active_thread.take()` 换成循环里的 `thread_id`：`cancel_turn` 的广播可能被自己那条 select 的控制分支吃掉并顺手清空 `active_thread`，那样等待状态就丢了。对 `Deferred` 这是死锁，对 `AwaitingReplies` 是 `WIND_UP_LIMIT` 武装不起来。后者没有专门的用例覆盖，是随手一并去掉的时序依赖。
 - **`wait_for_exit` 现在保证「返回时没有 agent 任务在跑」。** 让 agent 停下来的信号（`Exit`/`Abort`）都到不了一个已经卡在 await 里的任务，所以「等」本身不构成终止手段——实测 `Shutdown::Abort` 一样挂死。带 deadline 的等待到点后直接 `abort_all`；`graceful_unbounded` 保留「永不打断」的语义，代价是只有它可能不返回，文档里写明了只给「已判定空闲」的调用方用。`force_resync` 因此改成按原因选模式：lag / 溢出说明不了 session 有问题，继续无界等；写入失败说明的恰恰相反，再无界等下去就是把 key 永久锁在一个不会返回的 release 后面。`OnTimeout` 顺手删了——`OnTimeout::Return` 的文档承诺「让 agent 继续跑」，和新的保证直接冲突，而它一个调用方都没有。
 
 ## 顺带发现，不在本文档范围内

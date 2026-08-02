@@ -157,9 +157,9 @@ async fn a_new_task_waits_for_a_sub_agent_a_restart_resumed() {
     .expect("timed out waiting for the sub-agent to suspend");
     harness.shutdown().await;
 
-    // Wedged from the moment it resumes, so it cannot answer during the window
+    // Held from the moment it resumes, so it cannot answer during the window
     // under test — but it is unmistakably alive, with a decision in hand.
-    let _wedged = storage.hold_checkpoints_of("explore").await;
+    let gate = storage.hold_checkpoints_of("explore").await;
     let mut reopened = harness
         .restart(
             team.build(".", coda_tools::shared_file_locks()),
@@ -191,6 +191,29 @@ async fn a_new_task_waits_for_a_sub_agent_a_restart_resumed() {
     assert!(
         written_off.is_err(),
         "the root wrote off a sub-agent this process is still running"
+    );
+
+    // Waiting is only right if it ends. Once the answer can land, the old turn
+    // has to wind up on it and the new one has to run.
+    gate.release().await;
+
+    let mut wound_up = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = reopened.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::Aborted(_)) => wound_up = true,
+                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => return,
+                (_, AgentEvent::PersistFailed(err)) => panic!("unexpected persist failure: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the superseding task never ran");
+    assert!(
+        wound_up,
+        "the superseded turn never announced that it stopped"
     );
 }
 
