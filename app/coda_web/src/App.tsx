@@ -5,6 +5,7 @@ import {
   clearActiveSession,
   dismissPersistError,
   openSession,
+  selectActiveApprovalCount,
   selectActiveEvicted,
   selectActivePersistError,
   selectActiveHasImages,
@@ -210,6 +211,7 @@ export default function App() {
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
+  const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeEditing = useCodaStore(selectActiveEditing);
   const activeForkDraft = useCodaStore(selectActiveForkDraft);
   const activeKey = useCodaStore(selectActiveKey);
@@ -447,6 +449,7 @@ export default function App() {
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
                   running={showingNewSession ? false : activeRunning}
+                  approvalPending={showingNewSession ? false : activeApprovalCount > 0}
                   starting={showingNewSession ? false : activeStarting}
                   evicted={showingNewSession ? false : activeEvicted}
                   workspace={selectedWorkspace}

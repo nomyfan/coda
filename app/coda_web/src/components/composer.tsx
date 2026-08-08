@@ -34,6 +34,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  approvalPending,
   starting,
   evicted,
   workspace,
@@ -55,6 +56,8 @@ export const Composer = memo(function Composer({
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** A suspended turn is idle computationally but still owns the session. */
+  approvalPending: boolean;
   /** The session is being opened for its first task. Blocks send without
    * offering Abort — there is no turn to abort yet. An Enter landing in this
    * window returns before the draft is cleared, so the text survives for the
@@ -110,6 +113,7 @@ export const Composer = memo(function Composer({
   }, [hasForkDraft, images, onForkDraftChange, task]);
 
   const connected = status === "connected";
+  const busy = running || approvalPending;
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when
   // the request went out, and a reconnect can remount us from them at any
   // moment. Anything typed past that point would vanish without trace, so the
@@ -133,7 +137,7 @@ export const Composer = memo(function Composer({
   const canSend =
     connected &&
     Boolean(workspace) &&
-    !running &&
+    !busy &&
     !starting &&
     !evicted &&
     !editing?.submitting &&
@@ -329,7 +333,7 @@ export const Composer = memo(function Composer({
                 providers={providers}
                 providerId={providerId}
                 reasoningEffort={reasoningEffort}
-                disabled={!connected || running}
+                disabled={!connected || busy}
                 modelLocked={!selectingTarget}
                 requireImageModel={requireImageModel}
                 serverUrl={serverUrl}
@@ -352,7 +356,7 @@ export const Composer = memo(function Composer({
                 <ImagePlus className="size-4" />
               </Button>
             )}
-            {running ? (
+            {busy ? (
               <Button
                 size="icon"
                 variant="secondary"

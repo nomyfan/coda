@@ -7,47 +7,47 @@ use coda_agent::ToolApprovalMode;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
-/// A task sent during a running turn queues rather than being refused, and a
-/// settling turn only pops its own message. So `turn_running` going false does
-/// not mean the session is idle — there may be a task the runtime has not
-/// reached yet, and a fork landing there would copy a session that is about to
-/// grow.
 #[tokio::test]
-async fn forking_is_refused_while_a_task_is_queued_behind_the_current_turn() {
+async fn a_second_task_is_rejected_while_the_first_keeps_fork_busy() {
     let (hub, opener) = hub_and_opener(TestOpener::new("hold", ToolApprovalMode::Auto));
     let _attach = hub
         .attach(key(), 1, "prov".into(), None, false)
         .await
         .expect("attach");
-    for task in ["first", "second"] {
-        let outcome = hub
-            .command(
-                key(),
-                1,
-                SessionCommand::Task {
-                    task: task.into(),
-                    images: vec![],
-                },
-            )
-            .await;
-        assert!(
-            matches!(outcome, CommandOutcome::TaskAccepted { .. }),
-            "a task sent during a running turn queues instead of being refused"
-        );
-    }
+    let first = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "first".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(first, CommandOutcome::TaskAccepted { .. }));
+    let second = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "second".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(second, CommandOutcome::NotIdle));
     assert_eq!(
-        with_live(&hub, |live| live.unsettled_user_messages.len()).await,
-        2,
-        "both submissions are waiting to settle"
+        with_live(&hub, |live| usize::from(
+            live.unsettled_user_message.is_some()
+        ))
+        .await,
+        1,
+        "the rejected task must not enter the hub ledger"
     );
-
-    // The window the forwarder opens between one turn settling and the next
-    // one's first event: the flag is already down, the queue is not empty.
-    with_live(&hub, |live| live.turn_running = false).await;
 
     assert!(
         matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle),
-        "a queued task makes the session busy even with the flag down"
+        "the first task still makes the session busy"
     );
     assert!(
         opener.forks.lock().unwrap().is_empty(),
@@ -286,22 +286,6 @@ async fn forking_the_moment_an_abort_finishes_succeeds_first_time() {
             if matches!(&**e, WireEvent::Aborted { agent_name, .. } if agent_name == "coda"))
     })
     .await;
-    wait_idle(&hub).await;
-
-    assert!(matches!(
-        hub.fork(key(), None).await,
-        ForkOutcome::Forked(_)
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn forking_the_moment_a_supersede_finishes_succeeds_first_time() {
-    let (hub, mut events) = slow_sub_agent_session().await;
-    send_task(&hub, "go").await;
-    next_matching(&mut events, explore_started).await;
-
-    send_task(&hub, "instead").await;
-    next_matching(&mut events, root_answered).await;
     wait_idle(&hub).await;
 
     assert!(matches!(

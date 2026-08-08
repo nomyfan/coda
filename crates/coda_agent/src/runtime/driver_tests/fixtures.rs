@@ -53,6 +53,7 @@ pub(super) struct TestStorage {
     held: HeldWrites,
     /// Writes still allowed through before every later one fails.
     budget: Arc<Mutex<Option<usize>>>,
+    fail_loads: Arc<Mutex<bool>>,
 }
 
 impl TestStorage {
@@ -69,6 +70,10 @@ impl TestStorage {
     /// point rather than at whichever write happens to come first.
     pub(super) async fn fail_checkpoints_after(&self, writes: usize) {
         *self.budget.lock().await = Some(writes);
+    }
+
+    pub(super) async fn fail_checkpoint_loads(&self) {
+        *self.fail_loads.lock().await = true;
     }
 
     /// Park `agent_name`'s checkpoint writes until the returned gate is
@@ -137,6 +142,9 @@ impl SessionStorage for TestStorage {
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         let thread_id = thread_id.to_owned();
         Box::pin(async move {
+            if *self.fail_loads.lock().await {
+                return Err("checkpoint load is unavailable".to_string());
+            }
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
             Ok(checkpoint)
         })
@@ -785,7 +793,7 @@ fn describe_tools(messages: &[Message]) -> String {
     tools.join("|")
 }
 
-fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
+pub(super) fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
@@ -870,7 +878,8 @@ where
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
         runtime
             .bootstrap(agents, None, HashMap::new(), config)
-            .await;
+            .await
+            .expect("bootstrap");
 
         let events = runtime.subscribe();
         let harness = Self {
@@ -934,7 +943,8 @@ where
         let events = runtime.subscribe();
         runtime
             .bootstrap(agents, snapshot, resume_decisions, config)
-            .await;
+            .await
+            .expect("bootstrap");
 
         Self {
             runtime,

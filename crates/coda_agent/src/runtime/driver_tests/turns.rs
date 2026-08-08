@@ -7,7 +7,7 @@ use crate::{
     AgentEvent, AgentSpec, AgentTeam, ResumeDecision, SubAgentMode, ToolApprovalMode,
     ToolCallResolution,
     persist::StoredResumePoint,
-    runtime::{MemoryStorage, SendCommandError, SessionStorage},
+    runtime::{AgentRuntimeSnapshot, MemoryStorage, SendCommandError, SessionStorage},
 };
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
@@ -36,36 +36,42 @@ fn turn_of(envelope: &Envelope) -> TurnId {
     TurnId::from(*message_id)
 }
 
-fn active(runtime: &AgentRuntime) -> Vec<TurnId> {
-    runtime.turns.lock().expect("active turns").order.clone()
-}
-
-fn cancelled(runtime: &AgentRuntime) -> HashSet<TurnId> {
+fn active(runtime: &AgentRuntime) -> Option<TurnId> {
     runtime
-        .turns
+        .turn
         .lock()
-        .expect("active turns")
-        .cancelled
-        .clone()
+        .expect("active turn")
+        .as_ref()
+        .map(|active| active.id)
 }
 
-/// The turn to stop is the one at the head. Later submissions are separate
-/// work the user has not taken back, so an abort must leave them alone.
+fn cancelled(runtime: &AgentRuntime) -> bool {
+    runtime
+        .turn
+        .lock()
+        .expect("active turn")
+        .as_ref()
+        .is_some_and(|active| active.cancelled)
+}
+
 #[tokio::test]
-async fn an_abort_marks_the_turn_at_the_head_and_leaves_the_rest() {
+async fn a_second_task_is_rejected_and_abort_marks_the_active_turn() {
     let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
     let first = user_task(&ThreadId::from("session".to_string()));
     let second = user_task(&ThreadId::from("session".to_string()));
-    runtime.open_turn(&first);
-    runtime.open_turn(&second);
+    assert_eq!(
+        runtime.open_turn(&first).expect("open first"),
+        Some(turn_of(&first))
+    );
+    assert!(matches!(
+        runtime.send_message(second).await,
+        Err(SendCommandError::TurnAlreadyActive)
+    ));
 
-    // Nothing is bootstrapped, so the broadcast reaches nobody — which is the
-    // point: the mark is the runtime's own record, not something an agent
-    // installs on its way past.
     runtime.request_abort().await;
 
-    assert_eq!(active(&runtime), vec![turn_of(&first), turn_of(&second)]);
-    assert_eq!(cancelled(&runtime), HashSet::from([turn_of(&first)]));
+    assert_eq!(active(&runtime), Some(turn_of(&first)));
+    assert!(cancelled(&runtime));
 }
 
 /// Registering before delivering means a delivery that fails would otherwise
@@ -80,7 +86,7 @@ async fn a_delivery_that_fails_leaves_no_turn_behind() {
         .await;
 
     assert!(matches!(sent, Err(SendCommandError::AgentNotFound)));
-    assert!(active(&runtime).is_empty());
+    assert_eq!(active(&runtime), None);
 }
 
 #[tokio::test]
@@ -114,7 +120,7 @@ async fn an_answered_turn_leaves_the_active_list() {
     .await
     .expect("timed out waiting for the root to answer");
 
-    assert!(active(&harness.runtime).is_empty());
+    assert_eq!(active(&harness.runtime), None);
     harness.shutdown().await;
 }
 
@@ -169,7 +175,7 @@ async fn a_turn_waiting_on_a_subagent_stays_active() {
         .last()
         .expect("the parked thread has history")
         .turn_id;
-    assert_eq!(active(&harness.runtime), vec![turn]);
+    assert_eq!(active(&harness.runtime), Some(turn));
 }
 
 /// A `Resume` continues the turn that suspended; it must not look like a fresh
@@ -207,7 +213,7 @@ async fn resuming_an_approval_does_not_open_a_second_turn() {
     .expect("timed out waiting for approval suspension");
 
     // Suspension parks the turn; it does not end it.
-    assert_eq!(active(&harness.runtime).len(), 1);
+    assert!(active(&harness.runtime).is_some());
 
     harness
         .send_resume(
@@ -234,17 +240,12 @@ async fn resuming_an_approval_does_not_open_a_second_turn() {
     .await
     .expect("timed out waiting for completion after resume");
 
-    assert!(active(&harness.runtime).is_empty());
+    assert_eq!(active(&harness.runtime), None);
     harness.shutdown().await;
 }
 
-/// A submission that arrives instead of an approval decision used to discard
-/// the parked calls and carry straight on, which ended the turn without ever
-/// ending it: nothing announced that it stopped, so nothing closed it either.
-/// It stayed at the head of the list, where every later abort would keep
-/// marking it — leaving the turn actually running unstoppable.
 #[tokio::test]
-async fn a_task_that_supersedes_an_approval_closes_the_turn_it_replaced() {
+async fn a_task_is_rejected_while_an_approval_is_pending() {
     let mut harness = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
@@ -271,42 +272,16 @@ async fn a_task_that_supersedes_an_approval_closes_the_turn_it_replaced() {
     })
     .await
     .expect("timed out waiting for approval suspension");
-    assert_eq!(active(&harness.runtime).len(), 1);
+    let running = active(&harness.runtime).expect("approval keeps the turn active");
+    let sent = harness
+        .runtime
+        .send_message(user_task(&harness.thread_id))
+        .await;
+    assert!(matches!(sent, Err(SendCommandError::TurnAlreadyActive)));
+    assert_eq!(active(&harness.runtime), Some(running));
 
-    harness.send_task("phase1").await;
-
-    let mut stopped = false;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::Aborted(_)) => stopped = true,
-                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => return,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("the superseding task never finished");
-    assert!(
-        stopped,
-        "the superseded approval never announced that its turn stopped"
-    );
-    assert!(
-        active(&harness.runtime).is_empty(),
-        "the superseded turn is still on the books: {:?}",
-        active(&harness.runtime)
-    );
-
-    // The point of closing it: the next abort has to reach the turn that is
-    // actually running rather than the one left at the head.
-    harness.send_task("phase1").await;
-    let running = active(&harness.runtime);
     harness.runtime.request_abort().await;
-    assert_eq!(
-        cancelled(&harness.runtime).into_iter().collect::<Vec<_>>(),
-        running
-    );
+    assert!(cancelled(&harness.runtime));
 
     harness.shutdown().await;
 }
@@ -373,158 +348,43 @@ async fn a_restart_puts_the_interrupted_turn_back() {
         )
         .await;
 
-    assert_eq!(active(&reopened.runtime), vec![interrupted]);
+    assert_eq!(active(&reopened.runtime), Some(interrupted));
     reopened.runtime.request_abort().await;
-    assert_eq!(cancelled(&reopened.runtime), HashSet::from([interrupted]));
+    assert!(cancelled(&reopened.runtime));
 }
 
-/// The stored snapshot is not cleared when it is replayed, so a second crash
-/// hands the same envelopes back again. Registration keys on the turn id, so
-/// replaying describes one turn rather than accumulating duplicates.
 #[tokio::test]
-async fn replaying_a_snapshot_twice_registers_one_turn() {
-    let storage = MemoryStorage::default();
-    // A root that never finishes a generation: the recovered submission below
-    // starts its turn and leaves it open, so nothing closes underneath the
-    // assertions.
-    let team = AgentTeam::new(
-        AgentSpec {
-            name: "coda".into(),
-            description: String::new(),
-            system_prompt: "abort-generation-main".into(),
-            mode: SubAgentMode::Stateful,
-            tools: vec![],
-            subagents: vec![],
-        },
-        vec![],
-    )
-    .expect("valid team");
-    let stalls = || TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new()));
-    let mut harness = Harness::start_agents(
-        storage.clone(),
-        team.build(".", coda_tools::shared_file_locks()),
-        stalls(),
-        ToolApprovalMode::Auto,
-        "inspect",
-    )
-    .await;
+async fn repeated_recovery_evidence_registers_one_turn() {
+    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
+    let task = user_task(&ThreadId::from("session".to_string()));
+    let turn = turn_of(&task);
+    let snapshot = AgentRuntimeSnapshot {
+        drained_envelopes: HashMap::from([("coda".into(), vec![task.clone(), task])]),
+        ..Default::default()
+    };
 
-    // Wait until the opening task is genuinely off the inbox and stuck in
-    // generation. Exiting before that would drain it back into the snapshot,
-    // and this test is about one recovered turn, not two.
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            if let ("coda", AgentEvent::LLMContentChunk(_)) = (agent_name.as_str(), event) {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for the opening turn to start generating");
-
-    harness.runtime.request_exit().await;
-    // Past the barrier this is buffered into the snapshot instead of delivered.
-    let queued = user_task(&harness.thread_id);
-    let queued_turn = turn_of(&queued);
-    harness
-        .runtime
-        .send_message(queued)
+    runtime
+        .register_resumed_work(&snapshot)
         .await
-        .expect("buffered past the exit barrier");
-    harness
-        .runtime
-        .wait_for_exit(Some(Duration::from_millis(300)))
-        .await;
+        .expect("same turn is idempotent");
 
-    let first = harness
-        .restart(
-            team.build(".", coda_tools::shared_file_locks()),
-            stalls(),
-            ToolApprovalMode::Auto,
-            HashMap::new(),
-        )
-        .await;
-    assert_eq!(active(&first.runtime), vec![queued_turn]);
-
-    // No graceful exit in between, so storage still holds the same snapshot.
-    let second = first
-        .restart(
-            team.build(".", coda_tools::shared_file_locks()),
-            stalls(),
-            ToolApprovalMode::Auto,
-            HashMap::new(),
-        )
-        .await;
-    assert_eq!(active(&second.runtime), vec![queued_turn]);
+    assert_eq!(active(&runtime), Some(turn));
 }
 
-/// Stopping the turn in flight is not a request to throw away what the user
-/// queued behind it. The later submission is its own turn, so it keeps its
-/// place and runs once the stopped one has wound up.
 #[tokio::test]
-async fn a_queued_task_survives_the_abort_of_the_one_ahead_of_it() {
-    let mut harness = Harness::start_with_spec(
-        MemoryStorage::default(),
-        AgentSpec {
-            name: "coda".into(),
-            description: String::new(),
-            system_prompt: "abort-generation-main".into(),
-            mode: SubAgentMode::Stateful,
-            tools: vec![],
-            subagents: vec![],
-        },
-        TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new())),
-        ToolApprovalMode::Auto,
-        "inspect",
-    )
-    .await;
+async fn recovery_rejects_multiple_turns() {
+    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
+    let first = user_task(&ThreadId::from("session".to_string()));
+    let second = user_task(&ThreadId::from("session".to_string()));
+    let snapshot = AgentRuntimeSnapshot {
+        drained_envelopes: HashMap::from([("coda".into(), vec![first, second])]),
+        ..Default::default()
+    };
 
-    // Wait until the first turn is genuinely generating, so the next task has
-    // to queue behind it instead of being picked up straight away.
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            if let ("coda", AgentEvent::LLMContentChunk(_)) = (agent_name.as_str(), event) {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for the first turn to start generating");
-
-    let queued = user_task(&harness.thread_id);
-    let queued_turn = turn_of(&queued);
-    harness
-        .runtime
-        .send_message(queued)
+    let error = runtime
+        .register_resumed_work(&snapshot)
         .await
-        .expect("queue a second task");
-    assert_eq!(active(&harness.runtime).len(), 2);
+        .expect_err("multiple turns must not be replayed");
 
-    harness.runtime.request_abort().await;
-    assert_eq!(cancelled(&harness.runtime).len(), 1);
-    assert!(
-        !cancelled(&harness.runtime).contains(&queued_turn),
-        "the abort reached past the turn in flight"
-    );
-
-    // The stopped turn ends, and the queued one takes over.
-    timeout(Duration::from_secs(2), async {
-        let mut stopped = false;
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::Aborted(_)) => stopped = true,
-                ("coda", AgentEvent::LLMStart(_)) if stopped => return,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("the queued task never started after the abort");
-
-    assert_eq!(active(&harness.runtime), vec![queued_turn]);
-    assert!(cancelled(&harness.runtime).is_empty());
-    harness.shutdown().await;
+    assert!(error.contains("active turns"), "{error}");
 }

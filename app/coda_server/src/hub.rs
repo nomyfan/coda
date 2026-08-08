@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
+    runtime::SendCommandError,
 };
 use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
 use futures::StreamExt as _;
@@ -123,8 +124,8 @@ pub enum CommandOutcome {
         message_id: MessageId,
         messages: Vec<Message>,
     },
-    /// A `Rewind` refused because the session is not at rest — a turn is in
-    /// flight, or something is waiting on a human. Nothing was discarded.
+    /// A command refused because the session is not at rest — a turn is in
+    /// flight, or something is waiting on a human. Nothing was changed.
     NotIdle,
     /// A `Rewind` naming a message that is not a user message of this session's
     /// root thread. Nothing was discarded.
@@ -400,19 +401,19 @@ impl EventLog {
 ///
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
-/// 2. The turn's user message (front of `unsettled_user_messages`; absent for resumed
-///    turns).
+/// 2. The turn's user message (`unsettled_user_message`; absent for resumed turns).
 /// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
 ///
 /// Sub-agent events and chunk-tier events are skipped (matching what the
-/// checkpoint history holds). The log is cleared afterwards.
+/// checkpoint history holds). The log is cleared afterwards. Returns whether a
+/// different turn's user message remains unsettled.
 fn fold_settled_turn(
     snapshot: &mut Vec<Message>,
-    unsettled_user_messages: &mut Vec<(TurnId, Message)>,
+    unsettled_user_message: &mut Option<(TurnId, Message)>,
     log: &mut EventLog,
     root_name: &str,
     settled: TurnId,
-) {
+) -> bool {
     let mut entries = log.iter().peekable();
     while let Some(WireEvent::ToolCallEnd {
         agent_name,
@@ -426,11 +427,12 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
-    if let Some(position) = unsettled_user_messages
-        .iter()
-        .position(|(turn, _)| *turn == settled)
+    if unsettled_user_message
+        .as_ref()
+        .is_some_and(|(turn, _)| *turn == settled)
+        && let Some((_, message)) = unsettled_user_message.take()
     {
-        snapshot.push(unsettled_user_messages.remove(position).1);
+        snapshot.push(message);
     }
     for event in entries {
         match event {
@@ -448,6 +450,7 @@ fn fold_settled_turn(
         }
     }
     log.clear();
+    unsettled_user_message.is_some()
 }
 
 struct Attachment {
@@ -472,15 +475,9 @@ struct LiveState {
     /// had already been announced. That ordering is reversed now; what remains
     /// is simply that this is the relay's own composed view.
     snapshot: Vec<Message>,
-    /// User messages of turns that have not settled (and thus not folded) yet,
-    /// oldest first, each under the turn it opened.
-    ///
-    /// Keyed rather than a plain queue because turns do not settle in the order
-    /// they arrive: a suspended turn settles, the user submits the next one,
-    /// and the old turn settles a second time when it is finally wound up. Off
-    /// the front of a queue that second settle would swallow the *new* turn's
-    /// message.
-    unsettled_user_messages: Vec<(TurnId, Message)>,
+    /// The active turn's user message until its first settle folds it into the
+    /// snapshot. The id makes repeated settlement of that turn idempotent.
+    unsettled_user_message: Option<(TurnId, Message)>,
     pending_approvals: Vec<PendingApproval>,
     log: EventLog,
 }
@@ -764,7 +761,7 @@ impl SessionHub {
             generation,
             turn_running,
             snapshot,
-            unsettled_user_messages: Vec::new(),
+            unsettled_user_message: None,
             pending_approvals: Vec::new(),
             log: EventLog::new(self.limits),
         }
@@ -779,6 +776,12 @@ impl SessionHub {
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
+        if live.turn_running
+            || !live.pending_approvals.is_empty()
+            || live.unsettled_user_message.is_some()
+        {
+            return CommandOutcome::NotIdle;
+        }
         // This task becomes one user message that gets built twice: once inside
         // the session (its persisted history) and once here (the snapshot served
         // to attaching clients). Mint the id once so both copies — and every
@@ -791,19 +794,19 @@ impl SessionHub {
             .send(message_id, task.clone(), images.clone())
             .await
         {
-            warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
-            return CommandOutcome::Ignored;
+            return match err {
+                SendCommandError::TurnAlreadyActive => CommandOutcome::NotIdle,
+                _ => {
+                    warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
+                    CommandOutcome::Ignored
+                }
+            };
         }
         live.turn_running = true;
-        live.unsettled_user_messages.push((
+        live.unsettled_user_message = Some((
             TurnId::from(message_id),
             Message::User(UserMessage::with_images(message_id, task, &images)),
         ));
-        // A task sent while approvals were pending supersedes them: the driver
-        // writes the discarded calls as aborted ToolMessages (announced via
-        // ToolCallEnd) and starts a fresh turn, so advertising them to a later
-        // attach would offer a resume for work that no longer exists.
-        live.pending_approvals.clear();
         CommandOutcome::TaskAccepted { message_id }
     }
 
@@ -854,11 +857,10 @@ impl SessionHub {
             // rebuild below opens a second runtime over the same session, and
             // the two must not overlap on it.
             //
-            // This used to carry a second job — "the turn settled" did not mean
-            // "no agent is still writing", because a sub-agent could reply
-            // before saving and a superseded turn never waited for the ones it
-            // cut off. Both paths now save before they answer, so that window
-            // is closed and the shutdown is here for the rebuild alone.
+            // This used to carry a second job — a sub-agent could reply before
+            // saving, so "the turn settled" did not mean "no agent is still
+            // writing". Replies are now sent only after checkpointing, so the
+            // shutdown is here for the rebuild alone.
             live.session.shutdown(Shutdown::graceful_unbounded()).await;
             (
                 live.provider_id.clone(),
@@ -1326,12 +1328,9 @@ impl SessionRelay for SessionHub {
 
             let gate = match &guard.phase {
                 EntryPhase::Live(live) => {
-                    // `turn_running` alone does not mean idle: tasks may queue
-                    // behind a running turn, and a settled turn clears the flag
-                    // before the next one's first event sets it again.
                     if live.turn_running
                         || !live.pending_approvals.is_empty()
-                        || !live.unsettled_user_messages.is_empty()
+                        || live.unsettled_user_message.is_some()
                     {
                         ForkGate::Busy
                     } else {
@@ -1440,7 +1439,7 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
         EntryPhase::Live(live) => {
             let mut messages = live.snapshot.clone();
             messages.extend(
-                live.unsettled_user_messages
+                live.unsettled_user_message
                     .iter()
                     .map(|(_, message)| message.clone()),
             );
@@ -1569,8 +1568,8 @@ async fn run_forwarder(
                 };
                 let turn_id = event.turn_id;
                 let wire = WireEvent::from_session_event(event, &root_name);
-                // A queued task (or restart-resume) starts a turn without a
-                // command flipping the flag; the turn's first event does.
+                // Restart-resume starts work without a command flipping the
+                // flag; the turn's first event does.
                 if let WireEvent::LlmStart { agent_name, .. } = &wire
                     && agent_name == &root_name
                 {
@@ -1607,18 +1606,13 @@ async fn run_forwarder(
                     if let Some(approval) = suspended {
                         live.pending_approvals.push(approval);
                     }
-                    fold_settled_turn(
+                    live.turn_running = fold_settled_turn(
                         &mut live.snapshot,
-                        &mut live.unsettled_user_messages,
+                        &mut live.unsettled_user_message,
                         &mut live.log,
                         &root_name,
                         turn_id,
                     );
-                    // Derived, not cleared: a turn settling says nothing about
-                    // the ones queued behind it. A wound-up turn settling for
-                    // the second time must not report the session idle while
-                    // its successor is running.
-                    live.turn_running = !live.unsettled_user_messages.is_empty();
                     if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
                         drop(guard);
                         release.await;

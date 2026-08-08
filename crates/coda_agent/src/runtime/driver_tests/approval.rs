@@ -1,6 +1,6 @@
 //! Suspend-for-approval mechanics at the driver level: mixed resolutions,
 //! reject-via-restart, resuming across a restart vs. in-process, and
-//! surviving a pre-empting task.
+//! surviving suspension.
 
 use super::super::*;
 use super::fixtures::*;
@@ -8,7 +8,7 @@ use crate::{
     AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::MemoryStorage,
 };
-use coda_core::llm::{ToolCall, ToolCallOutcome, ToolOutput};
+use coda_core::llm::{ToolCall, ToolOutput};
 use coda_tools::ReadTodosToolSpec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -409,77 +409,6 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     })
     .await
     .expect("timed out waiting for completion after restored continuation");
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn new_task_while_suspended_emits_tool_call_end_for_discarded_calls() {
-    // A new Task while suspended for approval writes aborted ToolMessages to
-    // history (stale-envelope cleanup); each must be announced via ToolCallEnd
-    // so event consumers stay consistent with the checkpoint.
-    let team = AgentTeam::new(
-        AgentSpec {
-            name: "coda".into(),
-            description: String::new(),
-            system_prompt: "interrupt-main".into(),
-            mode: SubAgentMode::Stateful,
-            tools: vec![Box::new(ReadTodosToolSpec)],
-            subagents: vec![],
-        },
-        vec![],
-    )
-    .expect("valid team");
-    let provider = TestProvider::default();
-    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents = team.build(".", coda_tools::shared_file_locks());
-    let mut harness = Harness::start_agents(
-        MemoryStorage::default(),
-        agents,
-        provider,
-        approval,
-        "phase1",
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            if let ("coda", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for suspension");
-
-    // Send a fresh task instead of resuming: the pending call is discarded.
-    harness.send_task("phase1").await;
-
-    let result = timeout(Duration::from_secs(2), async {
-        let mut saw_discarded_call = false;
-        loop {
-            let (agent_name, _, event) = harness.next_event().await;
-            match (agent_name.as_str(), event) {
-                ("coda", AgentEvent::ToolCallEnd(tool))
-                    if tool.id == "call_approve"
-                        && matches!(tool.outcome, ToolCallOutcome::Aborted) =>
-                {
-                    saw_discarded_call = true;
-                }
-                ("coda", AgentEvent::LLMEnd(msg)) if msg.tool_calls.is_empty() => {
-                    assert_eq!(msg.content, "interrupt-flow-ok");
-                    assert!(
-                        saw_discarded_call,
-                        "no ToolCallEnd was emitted for the discarded pending call"
-                    );
-                    break;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-    result.expect("timed out waiting for turn completion after new task");
     harness.shutdown().await;
 }
 

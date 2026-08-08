@@ -1708,15 +1708,20 @@ function adoptServerMessageId(server: string, key: SessionKey, entryId: string, 
 
 /** Undo an optimistic user entry whose task never started. The session's title
  * and non-draft flag are left as they are — a later catalog refresh corrects
- * them, and unwinding them here would clobber a session that has other turns. */
-function discardOptimisticTask(server: string, key: SessionKey, entryId: string) {
+ * them, and unwinding them here could clobber newer server state. */
+function discardOptimisticTask(
+  server: string,
+  key: SessionKey,
+  entryId: string,
+  previousRunning: boolean,
+) {
   updateState(codaStore, (state) => {
     const session = draftSession(state, server, key);
     if (!session) {
       return;
     }
     session.entries = session.entries.filter((e) => e.id !== entryId);
-    session.running = false;
+    session.running = previousRunning;
   });
 }
 
@@ -1732,11 +1737,12 @@ async function startTurn(
   images: string[],
 ): Promise<boolean> {
   const key = sessionKey(workspaceId, sessionId);
+  const previousRunning = codaStore.getState().servers[server]?.sessions[key]?.running ?? false;
   const entryId = appendUserMessage(codaStore, server, key, text, images);
   const rpc = rpcFor(server);
   if (!rpc) {
     setServerStatus(codaStore, server, "error", "Connection closed");
-    discardOptimisticTask(server, key, entryId);
+    discardOptimisticTask(server, key, entryId, previousRunning);
     return false;
   }
   try {
@@ -1749,7 +1755,7 @@ async function startTurn(
     adoptServerMessageId(server, key, entryId, message_id);
     return true;
   } catch (err) {
-    discardOptimisticTask(server, key, entryId);
+    discardOptimisticTask(server, key, entryId, previousRunning);
     addSessionActivity(server, workspaceId, sessionId, {
       tone: "danger",
       label: "task rejected",
@@ -2474,6 +2480,9 @@ export async function sendTask(task: string, images: string[] = []) {
     return;
   }
   if (!active || active.session.deleting || active.session.starting) {
+    return;
+  }
+  if (active.session.running || active.session.approvals.length > 0) {
     return;
   }
   // A draft/new session must be live before its first task, or the task would

@@ -6,7 +6,6 @@ use super::fixtures::*;
 use coda_agent::ToolApprovalMode;
 use coda_agent::runtime::SessionStorage;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn task_settles_then_reattach_shows_folded_history() {
@@ -441,7 +440,7 @@ async fn failed_resume_does_not_stick_turn_running() {
             panic!("expected live entry");
         };
         assert!(!live.turn_running);
-        assert!(live.unsettled_user_messages.is_empty());
+        assert!(live.unsettled_user_message.is_none());
     }
 
     // With no stuck flag, walking away releases the entry.
@@ -483,76 +482,6 @@ async fn lagged_stream_drains_session_and_closes_client() {
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
-}
-
-/// The other shape of the same failure, and the one the resync path used to
-/// choke on: the write did not merely fail, it failed because an agent is stuck
-/// inside one. Waiting that agent out is how the entry never comes back and the
-/// key stays locked behind a release that never returned — so the resync stops
-/// waiting and drops it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_resync_forced_by_a_wedged_agent_still_gives_the_key_back() {
-    // The sub-agent's write parks for longer than the test could ever wait,
-    // which is what a wedged agent looks like from the outside.
-    let opener = Arc::new(TestOpener::delegating(
-        "reply",
-        Some(Duration::from_secs(60)),
-    ));
-    let storage = opener.storage.clone();
-    let hub = SessionHub::new(opener, RelayConfig::default());
-    let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
-        .await
-        .expect("attach");
-    let mut events = attach.events;
-
-    hub.command(
-        key(),
-        1,
-        SessionCommand::Task {
-            task: "go".into(),
-            images: vec![],
-        },
-    )
-    .await;
-    // The sub-agent has started, so it is on its way to the write that parks
-    // it — and the root is waiting on a reply that is never coming.
-    next_matching(&mut events, |event| {
-        matches!(event, RelayEvent::Event(e)
-            if matches!(&**e, WireEvent::LlmStart { agent_name, .. } if agent_name == "explore"))
-    })
-    .await;
-
-    // The root can no longer write either, so its attempt to record that it is
-    // stopping fails — the report the resync reacts to. Refusing by thread
-    // rather than by a write count keeps it from racing the sub-agent's write
-    // for the same budget.
-    storage.fail_checkpoints_of(&key().1).await;
-    hub.command(
-        key(),
-        1,
-        SessionCommand::Task {
-            task: "different".into(),
-            images: vec![],
-        },
-    )
-    .await;
-
-    next_matching(&mut events, |event| {
-        matches!(event, RelayEvent::Event(e) if matches!(&**e, WireEvent::PersistFailed { .. }))
-    })
-    .await;
-    timeout(Duration::from_secs(20), async {
-        while hub.get_entry(&key()).is_some() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the wedged sub-agent kept the entry from ever being released");
-
-    hub.attach(key(), 2, "prov".into(), None, false)
-        .await
-        .expect("the key is usable again");
 }
 
 /// A checkpoint the database refuses leaves the in-memory view describing a

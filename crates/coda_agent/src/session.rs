@@ -328,7 +328,8 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         let events_rx = runtime.subscribe();
         runtime
             .bootstrap(agents, snapshot, resume_decisions, run_config)
-            .await;
+            .await
+            .map_err(OpenError::Storage)?;
 
         Ok(Session {
             inner: Arc::new(SessionInner {
@@ -439,6 +440,8 @@ impl Session {
     /// `message_id` becomes the identity of the user message this task turns
     /// into. The caller supplies it because it also needs to label its own copy
     /// of that message (the live snapshot) and answer the client with it.
+    /// Returns [`SendCommandError::TurnAlreadyActive`] until the previous turn
+    /// has reached its final, durable ending; suspension does not release it.
     ///
     /// `images` is a list of base64 data-URIs (`data:image/<fmt>;base64,<b64>`)
     /// or HTTPS URLs. Pass an empty `Vec` for text-only turns.

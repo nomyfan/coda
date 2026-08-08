@@ -90,7 +90,7 @@ pub(crate) async fn run_agent(
         active_thread = None;
     }
     // When the agent suspends for approval, we clear `active_thread` so the
-    // outer loop waits for the next envelope (a Resume or a new Task). But we
+    // outer loop waits for a Resume envelope. But we
     // still need the thread_id available if Exit fires during that wait so the
     // snapshot can record the pending thread for restart-based resume.
     let mut suspended_thread: Option<ThreadId> = None;
@@ -99,7 +99,7 @@ pub(crate) async fn run_agent(
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
     // The thread parked waiting on sub-agent answers, and the turn it is
     // waiting for. While one is set, only what arrives on the wire may reach
-    // this agent: replaying a held submission would walk straight back into the
+    // this agent: replaying a held envelope would walk straight back into the
     // case that deferred it.
     let mut awaiting_replies: Option<(ThreadId, TurnId)> = None;
     loop {
@@ -191,13 +191,16 @@ pub(crate) async fn run_agent(
 
         let cancel = CancellationToken::new();
         active_thread = Some(thread_id.clone());
+        let turn = runtime
+            .active_turn_id()
+            .unwrap_or_else(|| TurnId::from(MessageId::new()));
         let mut agent_loop = AgentLoop {
             runtime: runtime.clone(),
             agent: &mut agent,
             cancel: cancel.clone(),
             config: config.clone(),
             thread_id: thread_id.clone(),
-            turn: TurnId::from(MessageId::new()),
+            turn,
             reply_target: None,
             origin_thread: None,
         };
@@ -364,7 +367,7 @@ enum TurnOutcome {
     Suspended,
     /// The turn is not over: this thread dispatched sub-agent calls and is
     /// parked until their answers arrive. The agent goes back to its inbox, but
-    /// only replies may reach it — a new submission waits its turn. Carries the
+    /// only replies may reach that thread while its other envelopes wait. Carries the
     /// turn so the wait can be capped once that turn has been asked to stop.
     AwaitingReplies(TurnId),
     /// The envelope was handed back unconsumed. It is held until the turn in
@@ -413,11 +416,28 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         // Load stored checkpoint and scatter its fields into the appropriate
         // locations. After this block the stored type is gone — only the
         // `resume_point` local variable carries forward.
-        let stored = self
+        let stored = match self
             .runtime
             .session_storage
             .load_checkpoint(self.thread_id.as_ref())
-            .await?;
+            .await
+        {
+            Ok(stored) => stored,
+            Err(err) => {
+                self.runtime
+                    .emit_event(
+                        self.agent.name.clone(),
+                        self.thread_id.clone(),
+                        self.turn,
+                        AgentEvent::PersistFailed(format!("failed to load checkpoint: {err}")),
+                    )
+                    .await;
+                if self.runtime.is_root_thread(&self.thread_id) {
+                    self.runtime.close_turn(self.turn);
+                }
+                return Err(err);
+            }
+        };
         let (mut resume_point, mut suspended_at): (ResumePoint, jiff::Timestamp) =
             if let Some(stored) = stored {
                 self.agent
@@ -917,9 +937,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 .await;
                             }
                             if !still_answering.is_empty() {
-                                // Superseding takes the same route as an abort:
-                                // stop the turn in flight and let it wind up.
-                                // The new work waits until it has.
+                                // A second call reached the same thread while
+                                // its first call still has live children. Stop
+                                // the turn and let those children answer before
+                                // retrying the held call. A root Task cannot
+                                // reach this branch: runtime admission rejects
+                                // it while the turn is active.
+                                debug_assert!(matches!(
+                                    &envelope.body,
+                                    EnvelopeBody::ToolCall { .. }
+                                ));
                                 tool_execution.pending_replies = still_answering;
                                 self.runtime
                                     .cancel_turn(self.agent.current_turn().await)
@@ -955,22 +982,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 mut pending_calls,
             } => {
                 match &envelope.body {
-                    EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. } => {
-                        // New work arrived for a thread parked on an approval
-                        // the user never answered. Discarding the parked calls
+                    EnvelopeBody::ToolCall { .. } => {
+                        // Another call arrived for a thread parked on an
+                        // approval. Discarding the parked calls
                         // here and carrying straight on would end the turn
                         // without ever ending it: nothing announces that it
-                        // stopped, and it stays on the runtime's books forever,
-                        // at the head, swallowing every later abort. So it takes
-                        // the same route as any other supersede — stop the turn
-                        // in flight, let it wind up, and try the envelope again.
+                        // stopped, so wind it up before retrying the envelope.
                         //
                         // Unlike the sub-agent case there is nobody to tell: a
                         // thread parked on an approval has dispatched nothing,
                         // so the only work to stop is its own, and it is already
                         // running. Marking the turn would only leave a stale
                         // abort in this agent's own control queue for the
-                        // replayed envelope to walk into.
+                        // replayed envelope to walk into. A root Task cannot
+                        // arrive here because the suspended turn still owns
+                        // the session's single active-turn slot.
                         warn!(
                             "Received envelope while suspended for approval; stopping the turn holding {} pending call(s)",
                             pending_approval_calls.len()

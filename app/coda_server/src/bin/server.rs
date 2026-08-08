@@ -1219,6 +1219,14 @@ async fn handle_task(
         .await
     {
         CommandOutcome::TaskAccepted { message_id } => (id, &TaskAccepted { message_id }).into(),
+        CommandOutcome::NotIdle => (
+            id,
+            RpcError::new(
+                rpc::SESSION_NOT_IDLE,
+                "the session already has an active turn",
+            ),
+        )
+            .into(),
         // Residual `Ignored` — a stale connection, or the session is not live.
         _ => (
             id,

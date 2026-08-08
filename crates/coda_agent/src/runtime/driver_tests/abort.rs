@@ -268,8 +268,13 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     .await
     .expect("checkpoint was not saved after generation abort");
 
-    harness.shutdown().await;
     result.expect("timed out waiting for generation abort");
+    harness
+        .runtime
+        .send_message(user_task(&harness.thread_id, "next"))
+        .await
+        .expect("a durably aborted turn releases the next task");
+    harness.shutdown().await;
     assert!(matches!(
         checkpoint.resume_point,
         crate::persist::StoredResumePoint::Generation

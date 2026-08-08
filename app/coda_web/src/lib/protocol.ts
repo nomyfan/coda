@@ -146,7 +146,7 @@ export const RpcCode = {
   MODEL_SWITCH_WHILE_RUNNING: -32004,
   /** `set_model`: an opened session cannot change provider/model. */
   MODEL_LOCKED: -32005,
-  /** `rewind`: a turn is in flight, or a call is waiting on a human. */
+  /** A command requiring an idle session found a turn in flight or awaiting approval. */
   SESSION_NOT_IDLE: -32006,
   UNKNOWN_WORKSPACE: -32010,
   INVALID_SESSION_ID: -32011,
@@ -247,7 +247,8 @@ export type RpcRequests = {
   >;
   /** Start a turn. A request rather than a notification so the server can
    * answer with the id it minted for the user message, letting the client key
-   * that message the same way the server does. */
+   * that message the same way the server does. Rejects with SESSION_NOT_IDLE
+   * while another turn is active, including one awaiting approval. */
   task: RpcRequest<
     {
       workspace_id: string;

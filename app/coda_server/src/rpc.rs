@@ -62,7 +62,7 @@ pub const NOT_OWNER: i32 = -32002;
 pub const SESSION_NOT_LIVE: i32 = -32003;
 pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
 pub const MODEL_LOCKED: i32 = -32005;
-/// A rewind against a session that still has work in flight or parked.
+/// A command requiring an idle session found work in flight or parked.
 pub const SESSION_NOT_IDLE: i32 = -32006;
 pub const UNKNOWN_WORKSPACE: i32 = -32010;
 pub const INVALID_SESSION_ID: i32 = -32011;
