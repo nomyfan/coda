@@ -6,7 +6,7 @@ use super::super::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
     StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    runtime::{AgentRuntime, AgentRuntimeSnapshot, SessionStorage},
+    runtime::{AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage},
 };
 use coda_core::{
     llm::{
@@ -847,28 +847,71 @@ where
     }
 
     /// Restart the harness from storage, injecting resume decisions for
-    /// agents that suspended in the previous run.
+    /// agents that suspended in the previous run (keyed by agent name, carrying
+    /// the thread each one is parked on — what `Session::open` derives from the
+    /// pending approvals it collected).
     pub(super) async fn restart(
         &self,
         agents: HashMap<String, Agent>,
         provider: TestProvider,
         approval: ToolApprovalMode,
-        resume_decisions: HashMap<String, ResumeDecision>,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
+    ) -> Self {
+        self.restart_with_snapshot(agents, provider, approval, resume_targets, true)
+            .await
+    }
+
+    /// Restart as if the previous process had died without any agent exiting:
+    /// the checkpoints are on disk but no runtime snapshot was ever written.
+    /// A session a fork just minted starts out in exactly this state.
+    pub(super) async fn restart_without_snapshot(
+        &self,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
+    ) -> Self {
+        self.restart_with_snapshot(agents, provider, approval, resume_targets, false)
+            .await
+    }
+
+    async fn restart_with_snapshot(
+        &self,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
+        keep_snapshot: bool,
     ) -> Self {
         let config = test_config(provider, approval);
 
         let session_id = self.thread_id.as_ref().to_string();
-        let snapshot: Option<AgentRuntimeSnapshot> = self
-            .storage
-            .load_session_snapshot(&session_id)
-            .await
-            .unwrap_or_default()
-            .map(Into::into);
+        let snapshot: Option<AgentRuntimeSnapshot> = if keep_snapshot {
+            self.storage
+                .load_session_snapshot(&session_id)
+                .await
+                .unwrap_or_default()
+                .map(Into::into)
+        } else {
+            None
+        };
+        let resume_targets = resume_targets
+            .into_iter()
+            .map(|(agent, (thread_id, decision))| {
+                (
+                    agent,
+                    ResumeTarget {
+                        thread_id: ThreadId(thread_id),
+                        decision,
+                    },
+                )
+            })
+            .collect();
 
         let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
         let events = runtime.subscribe();
         runtime
-            .bootstrap(agents, snapshot, resume_decisions, config)
+            .bootstrap(agents, snapshot, resume_targets, config)
             .await;
 
         Self {

@@ -11,7 +11,9 @@
 
 use crate::agent::{EnvelopeBody, Receiver};
 use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
-use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
+use crate::runtime::{
+    AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
+};
 use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
@@ -312,25 +314,56 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         if !uncovered.is_empty() {
             return Err(OpenError::PendingApprovalsRequired(uncovered));
         }
-        // Drop decisions that don't match any pending approval so stale entries
-        // can't mask coverage bugs by silently disappearing into bootstrap.
-        resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
+        // Address each decision to the agent whose checkpoint is parked on that
+        // thread. This — not the runtime snapshot — is what makes a resume
+        // reach its thread: the snapshot is only written when an agent exits,
+        // so it is absent for a session that was killed mid-approval and for
+        // one a fork just minted. Decisions that match no pending approval are
+        // dropped here rather than disappearing silently into bootstrap.
+        let mut resume_targets: HashMap<String, ResumeTarget> = HashMap::new();
+        for approval in &pending_approvals {
+            let Some(decision) = resume_decisions.remove(&approval.thread_id) else {
+                continue;
+            };
+            if resume_targets
+                .insert(
+                    approval.agent_name.clone(),
+                    ResumeTarget {
+                        thread_id: ThreadId::from(approval.thread_id.clone()),
+                        decision,
+                    },
+                )
+                .is_some()
+            {
+                // One agent task drives one thread at a time, so a second
+                // suspended thread for the same agent cannot be resumed in this
+                // run; it stays parked and is offered again on the next open.
+                warn!(
+                    "agent {} has more than one suspended thread; resuming only {}",
+                    approval.agent_name, approval.thread_id
+                );
+            }
+        }
+        for thread_id in resume_decisions.keys() {
+            warn!("discarding a resume decision for unsuspended thread {thread_id}");
+        }
 
-        let has_resuming_agents = snapshot.as_ref().is_some_and(|snapshot| {
-            !snapshot.active_threads.is_empty()
-                || snapshot
-                    .agent_drained_envelopes
-                    .values()
-                    .any(|v| !v.is_empty())
-                || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
-        });
+        let has_resuming_agents = !resume_targets.is_empty()
+            || snapshot.as_ref().is_some_and(|snapshot| {
+                !snapshot.active_threads.is_empty()
+                    || snapshot
+                        .agent_drained_envelopes
+                        .values()
+                        .any(|v| !v.is_empty())
+                    || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
+            });
 
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();
         runtime
-            .bootstrap(agents, snapshot, resume_decisions, run_config)
+            .bootstrap(agents, snapshot, resume_targets, run_config)
             .await;
 
         Ok(Session {

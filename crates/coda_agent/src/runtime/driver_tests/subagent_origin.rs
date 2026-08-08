@@ -620,10 +620,16 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
             provider,
             approval,
             HashMap::from([(
-                pending.thread_id.clone(),
-                ResumeDecision {
-                    resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
-                },
+                pending.agent_name.clone(),
+                (
+                    pending.thread_id.clone(),
+                    ResumeDecision {
+                        resolutions: vec![(
+                            pending.calls[0].id.clone(),
+                            ToolCallResolution::Execute,
+                        )],
+                    },
+                ),
             )]),
         )
         .await;

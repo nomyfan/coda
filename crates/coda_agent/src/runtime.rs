@@ -204,6 +204,19 @@ pub struct AgentRuntimeSnapshot {
     pub active_threads: HashMap<String, String>,
 }
 
+/// A caller's answer to one agent's pending approval, addressed to the thread
+/// that is actually parked on it.
+///
+/// The thread comes from the *checkpoint* that holds the `PendingApproval`, not
+/// from the runtime snapshot: the snapshot is written when an agent exits, so it
+/// is missing entirely for a session that was killed mid-approval or minted by a
+/// fork. Routing a decision through the snapshot dropped it on the floor in
+/// exactly those cases, leaving the thread suspended forever.
+pub(crate) struct ResumeTarget {
+    pub thread_id: ThreadId,
+    pub decision: ResumeDecision,
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
     session_id: String,
@@ -247,7 +260,7 @@ impl AgentRuntime {
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
-        mut resume_decisions: HashMap<String, ResumeDecision>,
+        mut resume_targets: HashMap<String, ResumeTarget>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) {
         for (name, agent) in agents {
@@ -256,13 +269,30 @@ impl AgentRuntime {
 
             let task_name = name.clone();
             let agent_config = config.resolve(&name);
-            let active_thread = snapshot
+            let snapshot_thread = snapshot
                 .as_ref()
                 .and_then(|s| s.active_threads.get(&name))
                 .map(|id| ThreadId(id.clone()));
-            let resume_decision = active_thread
-                .as_ref()
-                .and_then(|tid| resume_decisions.remove(tid.as_ref()));
+            // A decision names its own thread, so it does not need the snapshot
+            // to find one — and must not depend on it, since a session that
+            // never exited cleanly (crash, or a fresh fork) has no snapshot at
+            // all and the resume would be silently dropped.
+            let (active_thread, resume_decision) = match resume_targets.remove(&name) {
+                Some(target) => {
+                    if let Some(stale) = snapshot_thread
+                        .as_ref()
+                        .filter(|thread_id| *thread_id != &target.thread_id)
+                    {
+                        warn!(
+                            "resuming {name} on suspended thread {} rather than the snapshot's {}",
+                            target.thread_id.as_ref(),
+                            stale.as_ref(),
+                        );
+                    }
+                    (Some(target.thread_id), Some(target.decision))
+                }
+                None => (snapshot_thread, None),
+            };
             let init_envelopes = snapshot
                 .as_mut()
                 .map(|s| {
