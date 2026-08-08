@@ -497,7 +497,7 @@ enum EntryPhase {
     /// Freshly inserted; the creating attach initializes it under the entry
     /// lock (which is what serializes concurrent opens of the same key).
     Uninitialized,
-    Live(LiveState),
+    Live(Box<LiveState>),
     /// Approvals-gated open: no runtime yet, resume decisions being collected.
     Pending(PendingState),
     /// Shutdown in progress outside the lock; `done` flips true after the
@@ -740,7 +740,7 @@ impl SessionHub {
         provider_id: String,
         reasoning_effort: Option<String>,
         generation: u64,
-    ) -> LiveState {
+    ) -> Box<LiveState> {
         let root_name = session.root_name().to_string();
         let snapshot = session
             .resumed_messages()
@@ -754,7 +754,7 @@ impl SessionHub {
             root_name,
             generation,
         );
-        LiveState {
+        Box::new(LiveState {
             session,
             provider_id,
             reasoning_effort,
@@ -764,7 +764,7 @@ impl SessionHub {
             unsettled_user_message: None,
             pending_approvals: Vec::new(),
             log: EventLog::new(self.limits),
-        }
+        })
     }
 
     async fn handle_task(
