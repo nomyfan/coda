@@ -462,6 +462,35 @@ impl LLMProvider for TestProvider {
                     })
                 }
             }
+            // Two approval-gated calls in sequence, each in its own assistant
+            // message, so a test can answer the first batch while the second is
+            // the one actually parked.
+            "two-batch-approval" => {
+                if tool_message(&request.messages, "call_first").is_none() {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_first".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        ..assistant()
+                    })
+                } else if tool_message(&request.messages, "call_second").is_none() {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_second".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        content: "two-batch-done".into(),
+                        ..assistant()
+                    })
+                }
+            }
             "approval-main" => {
                 if tool_message(&request.messages, "call_exec").is_none() {
                     Self::completed(AssistantMessage {
