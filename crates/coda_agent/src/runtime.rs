@@ -1,4 +1,5 @@
 mod driver;
+mod turn;
 
 use crate::agent::EnvelopeBody;
 use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
@@ -14,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
+use turn::{CallLedger, TurnAlreadyActive, TurnGate};
 
 #[derive(Clone)]
 enum AgentControl {
@@ -231,15 +233,6 @@ fn replayed_envelopes(snapshot: &AgentRuntimeSnapshot) -> Vec<&Envelope> {
         .collect()
 }
 
-/// The turn this session has been asked to run and has not finished.
-///
-/// Only a user `Task` opens a turn — a `ToolCall` carries its caller's turn id,
-/// and `Reply`/`Resume` continue work that is already registered.
-struct ActiveTurn {
-    id: TurnId,
-    cancelled: bool,
-}
-
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
     session_id: String,
@@ -251,18 +244,8 @@ pub(crate) struct AgentRuntime {
     session_storage: Arc<dyn SessionStorage>,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
-    /// A blocking mutex on purpose: every critical section below is a handful
-    /// of small state updates and none of them awaits.
-    turn: Arc<std::sync::Mutex<Option<ActiveTurn>>>,
-    /// Calls dispatched to a thread that has not been answered yet, counted per
-    /// thread.
-    ///
-    /// The count spans the whole obligation — from the call going out to the
-    /// caller consuming the answer — rather than just the wait in the inbox. A
-    /// thread that already took its envelope and is now itself waiting on a
-    /// sub-agent of its own is still working, and treating it as gone is what
-    /// would make a caller write its result for it.
-    unanswered: Arc<std::sync::Mutex<HashMap<ThreadId, usize>>>,
+    turn_gate: Arc<TurnGate>,
+    calls: Arc<CallLedger>,
 }
 
 impl AgentRuntime {
@@ -279,8 +262,8 @@ impl AgentRuntime {
             session_storage: Arc::new(session_storage),
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
-            turn: Arc::new(std::sync::Mutex::new(None)),
-            unanswered: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            turn_gate: Arc::new(TurnGate::default()),
+            calls: Arc::new(CallLedger::default()),
         }
     }
 
@@ -290,115 +273,14 @@ impl AgentRuntime {
         thread_id.as_ref() == self.session_id
     }
 
-    pub(crate) fn active_turn_id(&self) -> Option<TurnId> {
-        self.turn
-            .lock()
-            .expect("active turn")
-            .as_ref()
-            .map(|active| active.id)
-    }
-
-    /// Restore one piece of evidence for an active turn. Several threads and
-    /// envelopes may name the same turn; a different id violates single-flight.
-    fn restore_turn(&self, turn: TurnId) -> Result<(), String> {
-        let mut active = self.turn.lock().expect("active turn");
-        match active.as_ref() {
-            Some(current) if current.id == turn => Ok(()),
-            Some(current) => Err(format!(
-                "runtime snapshot contains active turns {} and {}",
-                current.id, turn
-            )),
-            None => {
-                *active = Some(ActiveTurn {
-                    id: turn,
-                    cancelled: false,
-                });
-                Ok(())
-            }
-        }
-    }
-
-    /// Register the turn an envelope opens, before anything can act on it.
-    /// Returns the id only when a new turn was registered, so a delivery that
-    /// then fails can take back exactly what it added.
-    fn open_turn(&self, envelope: &Envelope) -> Result<Option<TurnId>, SendCommandError> {
-        let EnvelopeBody::Task { message_id, .. } = &envelope.body else {
-            return Ok(None);
-        };
-        let turn = TurnId::from(*message_id);
-        let mut active = self.turn.lock().expect("active turn");
-        if active.is_some() {
-            return Err(SendCommandError::TurnAlreadyActive);
-        }
-        *active = Some(ActiveTurn {
-            id: turn,
-            cancelled: false,
-        });
-        Ok(Some(turn))
-    }
-
-    /// Drop a finished turn. Idempotent — a turn that was never registered, or
-    /// was already closed, is simply absent.
-    pub(crate) fn close_turn(&self, turn: TurnId) {
-        let mut active = self.turn.lock().expect("active turn");
-        if active.as_ref().is_some_and(|current| current.id == turn) {
-            *active = None;
-        }
-    }
-
-    /// Whether this turn has been asked to stop. Agents read the mark rather
-    /// than deciding for themselves which turn an abort meant: a stateless
-    /// agent's `Agent` instance is reused across threads, so while it sits idle
-    /// its own `current_turn()` still names the previous one.
-    pub(crate) fn is_cancelled(&self, turn: TurnId) -> bool {
-        self.turn
-            .lock()
-            .expect("active turn")
-            .as_ref()
-            .is_some_and(|active| active.id == turn && active.cancelled)
-    }
-
     /// Whether the turn a parked thread belongs to has been asked to stop. Its
     /// own agent cannot answer this — it is sitting idle with no turn in hand —
     /// so the thread's last stored message names the turn instead.
     pub(crate) async fn thread_turn_cancelled(&self, thread_id: &ThreadId) -> bool {
         match self.turn_of_thread(thread_id.as_ref()).await {
-            Some(turn) => self.is_cancelled(turn),
+            Some(turn) => self.turn_gate.is_cancelled(turn),
             None => false,
         }
-    }
-
-    /// Note that a call has gone out to `thread_id` and has not been answered.
-    fn begin_call(&self, thread_id: &ThreadId) {
-        *self
-            .unanswered
-            .lock()
-            .expect("unanswered calls")
-            .entry(thread_id.clone())
-            .or_insert(0) += 1;
-    }
-
-    /// Note that one of `thread_id`'s callers has taken its answer.
-    pub(crate) fn end_call(&self, thread_id: &ThreadId) {
-        let mut unanswered = self.unanswered.lock().expect("unanswered calls");
-        if let Some(count) = unanswered.get_mut(thread_id) {
-            *count -= 1;
-            if *count == 0 {
-                unanswered.remove(thread_id);
-            }
-        }
-    }
-
-    /// Whether this thread still owes somebody an answer in this process.
-    ///
-    /// `false` means nothing here will ever produce that answer — the work went
-    /// away with a previous process — and the caller is free to write the call
-    /// off rather than wait forever.
-    pub(crate) fn is_answering(&self, thread_id: &ThreadId) -> bool {
-        self.unanswered
-            .lock()
-            .expect("unanswered calls")
-            .contains_key(thread_id)
     }
 
     /// Ask a named turn to stop when a thread receives overlapping internal
@@ -408,11 +290,7 @@ impl AgentRuntime {
     /// approval has no envelope coming to wake it, so without a nudge it would
     /// sit there while the turn it belongs to waits to be wound up.
     pub(crate) async fn cancel_turn(&self, turn: TurnId) {
-        if let Some(active) = self.turn.lock().expect("active turn").as_mut()
-            && active.id == turn
-        {
-            active.cancelled = true;
-        }
+        self.turn_gate.cancel(turn);
         self.broadcast_command(AgentControl::Abort).await;
     }
 
@@ -445,51 +323,51 @@ impl AgentRuntime {
     /// work forever.
     ///
     /// The call ledger is rebuilt by the rule that keeps it balanced: register
-    /// one obligation for every [`Self::end_call`] still to come. Those are a
+    /// one obligation for every [`CallLedger::end`] still to come. Those are a
     /// reply already in flight, a thread whose stored checkpoint still names a
     /// reply target, and a dispatched call its recipient has not picked up yet.
     /// Replayed envelopes go straight into an agent's inbox rather than through
     /// [`Self::send_message`], so this is the only place that can record them.
     async fn register_resumed_work(&self, snapshot: &AgentRuntimeSnapshot) -> Result<(), String> {
         // Active threads and replayed envelopes are independent evidence for
-        // the same turn; `restore_turn` verifies that they agree.
+        // the same turn; `TurnGate::restore` verifies that they agree.
         for thread_id in snapshot.active_threads.values() {
             let Some(checkpoint) = self.checkpoint_of(thread_id).await else {
                 continue;
             };
             if let Some(turn) = checkpoint.messages.last().map(|entry| entry.turn_id) {
-                self.restore_turn(turn)?;
+                self.turn_gate.restore(turn)?;
             }
             // A stored reply target outlives only an unanswered call: it is
             // taken before the checkpoint that precedes the reply, so a thread
             // that already answered has none.
             if checkpoint.reply_target.is_some() {
-                self.begin_call(&ThreadId::from(thread_id.clone()));
+                self.calls.begin(&ThreadId::from(thread_id.clone()));
             }
         }
         let replayed = replayed_envelopes(snapshot);
         for envelope in &replayed {
             match &envelope.body {
                 EnvelopeBody::Task { message_id, .. } => {
-                    self.restore_turn(TurnId::from(*message_id))?;
+                    self.turn_gate.restore(TurnId::from(*message_id))?;
                 }
                 EnvelopeBody::ToolCall { turn_id, .. } => {
-                    self.restore_turn(*turn_id)?;
-                    self.begin_call(&envelope.to.thread_id);
+                    self.turn_gate.restore(*turn_id)?;
+                    self.calls.begin(&envelope.to.thread_id);
                 }
                 EnvelopeBody::Reply { .. } => {
                     if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
-                        self.restore_turn(turn)?;
+                        self.turn_gate.restore(turn)?;
                     }
                     // An answer nobody has taken yet still settles an obligation
                     // when its caller does take it.
                     if let Sender::Agent { thread_id, .. } = &envelope.from {
-                        self.begin_call(thread_id);
+                        self.calls.begin(thread_id);
                     }
                 }
                 EnvelopeBody::Resume(_) => {
                     if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
-                        self.restore_turn(turn)?;
+                        self.turn_gate.restore(turn)?;
                     }
                 }
             }
@@ -526,7 +404,7 @@ impl AgentRuntime {
             info!("Bootstrap agent: {}", name);
             let runtime = self.clone();
 
-            let task_name = name.clone();
+            let agent_name = name.clone();
             let agent_config = config.resolve(&name);
             let active_thread = snapshot
                 .as_ref()
@@ -561,7 +439,7 @@ impl AgentRuntime {
                     agent_config,
                 )
                 .await;
-                task_name
+                agent_name
             });
 
             let handle = AgentHandle {
@@ -603,11 +481,7 @@ impl AgentRuntime {
     /// control message up first is not something the runtime can order —
     /// whoever gets there first must already find the mark in place.
     pub(crate) async fn request_abort(&self) {
-        {
-            if let Some(active) = self.turn.lock().expect("active turn").as_mut() {
-                active.cancelled = true;
-            }
-        }
+        self.turn_gate.cancel_active();
         self.broadcast_command(AgentControl::Abort).await;
     }
 
@@ -619,20 +493,29 @@ impl AgentRuntime {
 
     /// Send a message to a specific agent, registering the turn it opens first
     /// so nothing can act on the envelope before the turn is on the books.
+    /// A delivery that then fails takes back exactly what it added.
     pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
-        let opened = self.open_turn(&envelope)?;
+        let opened = if let EnvelopeBody::Task { message_id, .. } = &envelope.body {
+            let turn = TurnId::from(*message_id);
+            self.turn_gate
+                .open(turn)
+                .map_err(|TurnAlreadyActive| SendCommandError::TurnAlreadyActive)?;
+            Some(turn)
+        } else {
+            None
+        };
         let dispatched = matches!(envelope.body, EnvelopeBody::ToolCall { .. })
             .then(|| envelope.to.thread_id.clone());
         if let Some(thread_id) = &dispatched {
-            self.begin_call(thread_id);
+            self.calls.begin(thread_id);
         }
         let sent = self.deliver(envelope).await;
         if sent.is_err() {
             if let Some(turn) = opened {
-                self.close_turn(turn);
+                self.turn_gate.close(turn);
             }
             if let Some(thread_id) = &dispatched {
-                self.end_call(thread_id);
+                self.calls.end(thread_id);
             }
         }
         sent

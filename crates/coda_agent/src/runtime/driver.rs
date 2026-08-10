@@ -124,7 +124,7 @@ pub(crate) async fn run_agent(
             let wind_up_limit = awaiting_replies
                 .as_ref()
                 .filter(|(thread_id, turn)| {
-                    runtime.is_root_thread(thread_id) && runtime.is_cancelled(*turn)
+                    runtime.is_root_thread(thread_id) && runtime.turn_gate.is_cancelled(*turn)
                 })
                 .is_some();
 
@@ -192,7 +192,8 @@ pub(crate) async fn run_agent(
         let cancel = CancellationToken::new();
         active_thread = Some(thread_id.clone());
         let turn = runtime
-            .active_turn_id()
+            .turn_gate
+            .active_id()
             .unwrap_or_else(|| TurnId::from(MessageId::new()));
         let mut agent_loop = AgentLoop {
             runtime: runtime.clone(),
@@ -433,7 +434,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     )
                     .await;
                 if self.runtime.is_root_thread(&self.thread_id) {
-                    self.runtime.close_turn(self.turn);
+                    self.runtime.turn_gate.close(self.turn);
                 }
                 return Err(err);
             }
@@ -507,7 +508,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         && announced_ending
                         && self.runtime.is_root_thread(&self.thread_id)
                     {
-                        self.runtime.close_turn(self.agent.current_turn().await);
+                        self.runtime
+                            .turn_gate
+                            .close(self.agent.current_turn().await);
                     }
                     return Ok(TurnOutcome::Deferred { envelope, awaiting });
                 }
@@ -526,7 +529,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             // Checked every time round rather than once on entry: the mark can
             // arrive while this thread is mid-turn, and a thread woken by a
             // reply comes back through here to find it.
-            if self.runtime.is_cancelled(turn) {
+            if self.runtime.turn_gate.is_cancelled(turn) {
                 match self.wind_up(std::mem::take(&mut resume_point)).await {
                     WindUp::Waiting(rp) => resume_point = rp,
                     WindUp::Ended(end) => {
@@ -603,7 +606,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .persist_and_announce(resume_point, suspended_at, owed)
             .await;
         if announced_ending && persisted && self.runtime.is_root_thread(&self.thread_id) {
-            self.runtime.close_turn(self.agent.current_turn().await);
+            self.runtime
+                .turn_gate
+                .close(self.agent.current_turn().await);
         }
         Ok(if exit_acquired {
             TurnOutcome::ExitAcquired
@@ -783,6 +788,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             subagent.name.clone()
         };
         self.runtime
+            .calls
             .is_answering(&ThreadId::from_uuid5(&self.thread_id, &derivation_key))
     }
 
@@ -884,7 +890,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             // until the answer has actually been taken, the
                             // caller must still treat it as coming.
                             if let Sender::Agent { thread_id, .. } = &envelope.from {
-                                self.runtime.end_call(thread_id);
+                                self.runtime.calls.end(thread_id);
                             }
                             if let Some(pos) = tool_execution
                                 .pending_replies

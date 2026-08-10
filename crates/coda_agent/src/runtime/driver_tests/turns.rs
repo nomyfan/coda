@@ -37,21 +37,11 @@ fn turn_of(envelope: &Envelope) -> TurnId {
 }
 
 fn active(runtime: &AgentRuntime) -> Option<TurnId> {
-    runtime
-        .turn
-        .lock()
-        .expect("active turn")
-        .as_ref()
-        .map(|active| active.id)
+    runtime.turn_gate.active_id()
 }
 
 fn cancelled(runtime: &AgentRuntime) -> bool {
-    runtime
-        .turn
-        .lock()
-        .expect("active turn")
-        .as_ref()
-        .is_some_and(|active| active.cancelled)
+    active(runtime).is_some_and(|turn| runtime.turn_gate.is_cancelled(turn))
 }
 
 #[tokio::test]
@@ -59,10 +49,7 @@ async fn a_second_task_is_rejected_and_abort_marks_the_active_turn() {
     let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
     let first = user_task(&ThreadId::from("session".to_string()));
     let second = user_task(&ThreadId::from("session".to_string()));
-    assert_eq!(
-        runtime.open_turn(&first).expect("open first"),
-        Some(turn_of(&first))
-    );
+    runtime.turn_gate.open(turn_of(&first)).expect("open first");
     assert!(matches!(
         runtime.send_message(second).await,
         Err(SendCommandError::TurnAlreadyActive)
