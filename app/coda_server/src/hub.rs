@@ -1603,8 +1603,13 @@ async fn run_forwarder(
                     return;
                 }
                 if event_settles_turn(&wire, &root_name) {
-                    if let Some(approval) = suspended {
-                        live.pending_approvals.push(approval);
+                    match suspended {
+                        Some(approval) => live.pending_approvals.push(approval),
+                        // Any other settlement is final: the turn those
+                        // approvals belonged to is over, and a decision for
+                        // them has no thread left to wake. Kept around, they
+                        // would hold admission and fork at `NotIdle` forever.
+                        None => live.pending_approvals.clear(),
                     }
                     live.turn_running = fold_settled_turn(
                         &mut live.snapshot,

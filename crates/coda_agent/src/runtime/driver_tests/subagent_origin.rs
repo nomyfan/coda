@@ -539,8 +539,8 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
 /// A thread waiting on a sub-agent must be able to name that sub-agent's thread
 /// from its own state alone. It cannot look the child up: a child that is still
 /// generating has not written a checkpoint yet, as the parked root below shows.
-/// `docs/design/turn-cancellation.md` rests on this — it is how an interrupted
-/// turn tells a reply that is still coming from one whose producer is gone.
+/// Turn cancellation rests on this — it is how an interrupted turn tells a
+/// reply that is still coming from one whose producer is gone.
 #[tokio::test]
 async fn a_parked_thread_can_name_the_child_it_waits_on() {
     let hold = Arc::new(tokio::sync::Notify::new());

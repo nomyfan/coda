@@ -733,6 +733,18 @@ function finishAssistant(
   return session;
 }
 
+// Everything a pending approval keeps alive, reset together when the turn it
+// belongs to settles for good.
+const clearedApprovalState: Pick<
+  OpenedSession,
+  "approvals" | "pendingCallInfo" | "drafts" | "allowDrafts"
+> = {
+  approvals: [],
+  pendingCallInfo: {},
+  drafts: {},
+  allowDrafts: {},
+};
+
 function upsertApproval(approvals: PendingApproval[], approval: PendingApproval) {
   const key = approvalKey(approval);
   const index = approvals.findIndex((item) => approvalKey(item) === key);
@@ -888,6 +900,11 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ],
         running: false,
+        // The root's abort settles the turn (mirroring the server's
+        // `event_settles_turn`), and buries its pending approvals with it: a
+        // decision for them has no thread left to wake, and keeping them
+        // would hold the composer busy forever.
+        ...(event.agent_name === rootName ? clearedApprovalState : {}),
       };
     }
     case "error": {
@@ -916,6 +933,8 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ],
         running: false,
+        // A root error settles the turn like a root abort does; see above.
+        ...(event.agent_name === rootName ? clearedApprovalState : {}),
       };
     }
     case "persist_failed":

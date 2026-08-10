@@ -76,6 +76,57 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
     hub.shutdown_all().await;
 }
 
+/// Aborting a turn suspended on approval buries the approval with it. The
+/// abort's settlement must clear `pending_approvals`, or admission and fork
+/// would answer `NotIdle` forever for a session that is in fact idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_a_suspended_turn_clears_its_pending_approval() {
+    let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
+    let attach1 = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    let mut events1 = attach1.events;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "needs approval".into(),
+            images: vec![],
+        },
+    )
+    .await;
+    next_matching(
+        &mut events1,
+        |e| matches!(e, RelayEvent::Event(ev) if matches!(&**ev, WireEvent::Suspended { .. })),
+    )
+    .await;
+
+    hub.command(key(), 1, SessionCommand::Abort).await;
+    next_matching(
+        &mut events1,
+        |e| matches!(e, RelayEvent::Event(ev) if matches!(&**ev, WireEvent::Aborted { .. })),
+    )
+    .await;
+
+    let outcome = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "start over".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(
+        matches!(outcome, CommandOutcome::TaskAccepted { .. }),
+        "an aborted approval must not keep the session NotIdle"
+    );
+
+    hub.shutdown_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn new_task_is_rejected_while_an_approval_remains_pending() {
     let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
