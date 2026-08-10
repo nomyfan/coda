@@ -579,6 +579,27 @@ impl AgentRuntime {
         }
     }
 
+    /// Give the agents `duration` to exit on their own, and report whether they
+    /// did. Non-destructive by design: a straggler stays running for the caller
+    /// to cancel — dropping it here would leave the cancellation nothing to
+    /// reach, and an in-flight turn no chance to save what it had.
+    pub(crate) async fn wait_for_settle(&self, duration: Duration) -> bool {
+        let mut agent_tasks = self.agent_tasks.lock().await;
+        if agent_tasks.is_empty() {
+            return true;
+        }
+        if timeout(duration, Self::drain(&mut agent_tasks))
+            .await
+            .is_err()
+        {
+            // The stragglers still own their snapshots; the final write
+            // belongs to whoever ends them.
+            return false;
+        }
+        self.persist_snapshot(Some(duration)).await;
+        true
+    }
+
     /// Wait for all bootstrapped agent tasks to exit, and return whether they
     /// managed it on their own.
     ///
@@ -599,19 +620,12 @@ impl AgentRuntime {
             return true;
         }
 
-        let drain = async {
-            while let Some(result) = agent_tasks.join_next().await {
-                match result {
-                    Ok(agent_name) => info!("Agent {} exited", agent_name),
-                    Err(err) => warn!("Agent task failed to join: {}", err),
-                }
-            }
-        };
-
         let ret = match timeout_duration {
-            Some(duration) => timeout(duration, drain).await.is_ok(),
+            Some(duration) => timeout(duration, Self::drain(&mut agent_tasks))
+                .await
+                .is_ok(),
             None => {
-                drain.await;
+                Self::drain(&mut agent_tasks).await;
                 true
             }
         };
@@ -620,17 +634,41 @@ impl AgentRuntime {
             agent_tasks.abort_all();
             while agent_tasks.join_next().await.is_some() {}
         }
-        if let Err(err) = self
-            .session_storage
-            .save_session_snapshot(
-                self.session_id.clone(),
-                self.snapshot.lock().await.clone().into(),
-            )
-            .await
-        {
-            warn!("Failed to persist session snapshot: {}", err);
-        }
+        self.persist_snapshot(timeout_duration).await;
 
         ret
+    }
+
+    async fn drain(agent_tasks: &mut JoinSet<String>) {
+        while let Some(result) = agent_tasks.join_next().await {
+            match result {
+                Ok(agent_name) => info!("Agent {} exited", agent_name),
+                Err(err) => warn!("Agent task failed to join: {}", err),
+            }
+        }
+    }
+
+    /// Persist the accumulated snapshot as the runtime winds down. A deadline
+    /// bounds this write too: storage that stopped answering is one way the
+    /// wait ran out, and an unbounded write would pin the shutdown on the
+    /// backend it just gave up on — with the session's key locked behind it.
+    async fn persist_snapshot(&self, bound: Option<Duration>) {
+        let save = async {
+            self.session_storage
+                .save_session_snapshot(
+                    self.session_id.clone(),
+                    self.snapshot.lock().await.clone().into(),
+                )
+                .await
+        };
+        let saved = match bound {
+            Some(duration) => timeout(duration, save)
+                .await
+                .unwrap_or_else(|_| Err("the write outstayed the shutdown deadline".into())),
+            None => save.await,
+        };
+        if let Err(err) = saved {
+            warn!("Failed to persist session snapshot: {}", err);
+        }
     }
 }

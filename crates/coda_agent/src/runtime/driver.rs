@@ -212,17 +212,33 @@ pub(crate) async fn run_agent(
             biased;
             cmd = control_rx.recv() => {
                 let mut should_exit = false;
-                match cmd {
-                    Some(AgentControl::Abort) | None => {
-                        cancel.cancel();
-                        active_thread = None;
+                let mut cmd = cmd;
+                // `Exit` is followed by an `Abort` once the caller runs out of
+                // patience, and only that abort ends a turn `Exit` cannot
+                // interrupt. So keep taking signals until one cancels the run:
+                // reading a single one could spend it on a repeat `Exit`.
+                let ret = loop {
+                    let cancelled = match cmd {
+                        Some(AgentControl::Abort) | None => {
+                            cancel.cancel();
+                            true
+                        }
+                        Some(AgentControl::Exit) => {
+                            // Wait the agent loop to exit gracefully.
+                            should_exit = true;
+                            false
+                        }
+                    };
+                    if cancelled {
+                        break (&mut run_fut).await;
                     }
-                    Some(AgentControl::Exit) => {
-                        // Wait the agent loop to exit gracefully.
-                        should_exit = true;
+                    tokio::select! {
+                        biased;
+                        next = control_rx.recv() => cmd = next,
+                        ret = &mut run_fut => break ret,
                     }
-                }
-                match (&mut run_fut).await {
+                };
+                match ret {
                     Ok(TurnOutcome::ExitAcquired | TurnOutcome::Completed) => {
                         active_thread = None;
                         awaiting_replies = None;
@@ -240,9 +256,15 @@ pub(crate) async fn run_agent(
                         deferred.push_back(*envelope);
                     }
                     Ok(TurnOutcome::Suspended) => {
-                        // The run ended in suspension; Exit was also requested.
-                        // Preserve thread_id in active_thread so the snapshot
-                        // records the pending thread for restart-based resume.
+                        // Losing this thread loses the approval: a sub-agent's is
+                        // found again only through the snapshot. Exiting keeps it
+                        // in `active_thread` for the snapshot about to be taken.
+                        // Otherwise it parks — unless the abort was the user
+                        // taking the turn back, which nothing but a wind-up ends
+                        // and no envelope is coming to prompt.
+                        if !should_exit && !runtime.thread_turn_cancelled(&thread_id).await {
+                            suspended_thread = active_thread.take();
+                        }
                     }
                     Err(err) => {
                         error!("Error in agent loop: {}", err);

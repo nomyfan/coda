@@ -523,3 +523,68 @@ async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
         .expect("an agent task outlived the shutdown deadline"),
     );
 }
+
+/// The settle wait must leave the stragglers running, or the cancel-then-wait
+/// steps a graceful shutdown follows it with have nothing left to reach.
+#[tokio::test]
+async fn a_settle_wait_leaves_the_stragglers_running() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_spec(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::with_hold_generation(Arc::new(Notify::new())),
+        ToolApprovalMode::Auto,
+        "abort generation",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMContentChunk(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the generation to start");
+
+    // The generation is parked on a gate no `Exit` can reach, so this runs out.
+    harness.runtime.request_exit().await;
+    assert!(
+        !harness
+            .runtime
+            .wait_for_settle(Duration::from_millis(200))
+            .await
+    );
+
+    // What proves it survived: cancelling now still produces the aborted
+    // checkpoint. After a hard drop no task would be left to write it.
+    harness.runtime.cancel_in_flight().await;
+    assert!(
+        harness
+            .runtime
+            .wait_for_exit(Some(Duration::from_secs(2)))
+            .await,
+        "the cancelled generation never wound up"
+    );
+    let checkpoint = harness
+        .storage
+        .checkpoint(&harness.thread_id)
+        .await
+        .expect("the cancelled generation saved nothing");
+    assert!(
+        checkpoint
+            .messages
+            .iter()
+            .any(|entry| matches!(&entry.message, Message::Assistant(msg) if msg.aborted)),
+        "the aborted partial message never reached the checkpoint"
+    );
+}

@@ -540,7 +540,10 @@ impl Session {
         match mode {
             Shutdown::Graceful { timeout } => {
                 self.inner.runtime.request_exit().await;
-                if self.inner.runtime.wait_for_exit(timeout).await {
+                let Some(duration) = timeout else {
+                    return self.inner.runtime.wait_for_exit(None).await;
+                };
+                if self.inner.runtime.wait_for_settle(duration).await {
                     return true;
                 }
                 // Exiting is something an agent does between pieces of work, so

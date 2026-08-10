@@ -14,6 +14,124 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
+/// Cancellation cannot interrupt the write that records a suspension, so an
+/// abort can land while a sub-agent parks for approval and the run still ends
+/// parked. The snapshot has to keep that thread — reopening finds a sub-agent's
+/// approval only through it.
+#[tokio::test]
+async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
+    let storage = TestStorage::default();
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let team = AgentTeam::new(root, subagents).expect("valid team");
+
+    // A sub-agent has no user prompt to persist first, so its first checkpoint
+    // write is the one recording the suspension. Holding it parks the run
+    // exactly where an abort cannot turn it back.
+    let gate = storage.hold_checkpoints_of("explore").await;
+    let mut harness = Harness::start_agents(
+        storage.clone(),
+        team.build(".", coda_tools::shared_file_locks()),
+        provider.clone(),
+        approval.clone(),
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::LLMEnd(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to ask for a tool");
+
+    harness.runtime.cancel_in_flight().await;
+    gate.release().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the sub-agent never parked for approval");
+    harness.shutdown().await;
+
+    // What proves the thread survived: the next process asks again.
+    let mut harness = harness
+        .restart(
+            team.build(".", coda_tools::shared_file_locks()),
+            provider,
+            approval,
+            HashMap::new(),
+        )
+        .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the reopened session lost the sub-agent's pending approval");
+    harness.shutdown().await;
+}
+
+/// The user's abort during that same write marks the turn stopped, and nothing
+/// but a wind-up closes it. The parked thread has to be driven back in to do
+/// that — no envelope is coming — or the turn stays open and the session
+/// refuses every later task.
+#[tokio::test]
+async fn a_user_abort_while_a_subagent_suspends_still_ends_the_turn() {
+    let storage = TestStorage::default();
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let team = AgentTeam::new(root, subagents).expect("valid team");
+
+    let gate = storage.hold_checkpoints_of("explore").await;
+    let mut harness = Harness::start_agents(
+        storage.clone(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::LLMEnd(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to ask for a tool");
+
+    harness.runtime.request_abort().await;
+    gate.release().await;
+
+    timeout(Duration::from_secs(2), async {
+        while harness.runtime.turn_gate.active_id().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the stopped turn was never wound up, so the session takes no more tasks");
+
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn stateless_subagent_replies_after_approval_resume() {
     let provider = TestProvider::default();
