@@ -313,20 +313,12 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         // can't mask coverage bugs by silently disappearing into bootstrap.
         resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
 
-        let has_resuming_agents = snapshot.as_ref().is_some_and(|snapshot| {
-            !snapshot.active_threads.is_empty()
-                || snapshot
-                    .agent_drained_envelopes
-                    .values()
-                    .any(|v| !v.is_empty())
-                || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
-        });
-
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();
-        runtime
+        // Answered by bootstrap, not the snapshot: it drops what will never run.
+        let has_resuming_agents = runtime
             .bootstrap(agents, snapshot, resume_decisions, run_config)
             .await
             .map_err(OpenError::Storage)?;
@@ -420,10 +412,13 @@ impl Session {
         &self.inner.root_name
     }
 
-    /// `true` when the snapshot indicates that at least one agent has in-flight
-    /// work (active thread, or queued envelopes) and will therefore emit events
-    /// immediately after `open` — without waiting for a `send`. Callers should
-    /// enter the event loop directly instead of prompting for user input first.
+    /// `true` when at least one agent picked up in-flight work at `open` (an
+    /// active thread, or a replayed envelope) and will therefore emit events
+    /// without waiting for a `send`. Callers should enter the event loop
+    /// directly instead of prompting for user input first.
+    ///
+    /// What recovery really resumed, not what the snapshot held: a turn that
+    /// ended in another process is thrown out first.
     pub fn has_resuming_agents(&self) -> bool {
         self.inner.has_resuming_agents
     }

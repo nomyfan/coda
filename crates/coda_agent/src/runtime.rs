@@ -2,7 +2,7 @@ mod driver;
 mod turn;
 
 use crate::agent::EnvelopeBody;
-use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
+use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, ThreadId};
 use coda_core::llm::{LLMProvider, TurnId};
 use std::collections::HashMap;
@@ -233,6 +233,68 @@ fn replayed_envelopes(snapshot: &AgentRuntimeSnapshot) -> Vec<&Envelope> {
         .collect()
 }
 
+/// The turn a stored thread was last working on.
+fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
+    checkpoint.messages.last().map(|entry| entry.turn_id)
+}
+
+fn turn_awaiting(
+    checkpoints: &HashMap<String, StoredCheckpoint>,
+    thread_id: &ThreadId,
+) -> Option<TurnId> {
+    last_turn(checkpoints.get(thread_id.as_ref())?)
+}
+
+/// Throw away the replayed envelopes their recipient is no longer waiting for.
+///
+/// Nothing rewrites a snapshot until an agent exits, so a second crash hands
+/// back envelopes the first recovery already delivered. The thread drops such
+/// an answer on arrival — but only after it has restored the finished turn the
+/// answer names, leaving that turn on the books with nothing to end it.
+fn drop_stale_envelopes(
+    snapshot: &mut AgentRuntimeSnapshot,
+    checkpoints: &HashMap<String, StoredCheckpoint>,
+) {
+    for (name, envelopes) in snapshot
+        .agent_drained_envelopes
+        .iter_mut()
+        .chain(snapshot.drained_envelopes.iter_mut())
+    {
+        envelopes.retain(|envelope| {
+            let awaited = still_awaited(envelope, checkpoints);
+            if !awaited {
+                warn!("Dropping an envelope {} already took: {:?}", name, envelope);
+            }
+            awaited
+        });
+    }
+}
+
+/// Whether the thread this envelope is addressed to is still waiting for it. A
+/// thread with no checkpoint at all is not: it has no state to take an answer
+/// into.
+///
+/// Answers are matched by the envelope that carried the call out: a `call_id`
+/// is only unique within one assistant message, so an answer to an earlier
+/// invocation that reused it would pass for the one being waited on.
+fn still_awaited(envelope: &Envelope, checkpoints: &HashMap<String, StoredCheckpoint>) -> bool {
+    match (
+        &envelope.body,
+        checkpoints
+            .get(envelope.to.thread_id.as_ref())
+            .map(|checkpoint| &checkpoint.resume_point),
+    ) {
+        // These carry the work they open, so nothing has to be waiting for them.
+        (EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. }, _) => true,
+        (EnvelopeBody::Reply { .. }, Some(StoredResumePoint::ToolExecution(state))) => state
+            .pending_replies
+            .iter()
+            .any(|pending| Some(&pending.call_envelope_id) == envelope.reply_to.as_ref()),
+        (EnvelopeBody::Resume(_), Some(StoredResumePoint::PendingApproval { .. })) => true,
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
     session_id: String,
@@ -305,11 +367,52 @@ impl AgentRuntime {
     /// The turn a stored thread was last working on, or `None` if it has no
     /// history to name one.
     async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
-        self.checkpoint_of(thread_id)
-            .await?
-            .messages
-            .last()
-            .map(|entry| entry.turn_id)
+        last_turn(&self.checkpoint_of(thread_id).await?)
+    }
+
+    /// The stored checkpoints recovery has to consult, loaded once each — one
+    /// thread can be named by the active-thread map and by several envelopes at
+    /// once. Only the recipients of answers are consulted: a `Task` or
+    /// `ToolCall` is judged by what it carries, not by the state it lands in.
+    ///
+    /// A read that fails gives up the whole recovery, because every decision
+    /// below is made by reading these: guessing would either throw away an
+    /// undelivered answer or restore a turn nothing will finish.
+    async fn recovery_checkpoints(
+        &self,
+        snapshot: &AgentRuntimeSnapshot,
+    ) -> Result<HashMap<String, StoredCheckpoint>, String> {
+        let mut consulted: Vec<String> = snapshot
+            .active_threads
+            .values()
+            .cloned()
+            .chain(
+                replayed_envelopes(snapshot)
+                    .into_iter()
+                    .filter(|envelope| {
+                        matches!(
+                            envelope.body,
+                            EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_)
+                        )
+                    })
+                    .map(|envelope| envelope.to.thread_id.as_ref().to_string()),
+            )
+            .collect();
+        consulted.sort_unstable();
+        consulted.dedup();
+
+        let mut checkpoints = HashMap::with_capacity(consulted.len());
+        for thread_id in consulted {
+            let loaded = self
+                .session_storage
+                .load_checkpoint(&thread_id)
+                .await
+                .map_err(|err| format!("failed to load checkpoint for {thread_id}: {err}"))?;
+            if let Some(checkpoint) = loaded {
+                checkpoints.insert(thread_id, checkpoint);
+            }
+        }
+        Ok(checkpoints)
     }
 
     /// Put back the turn and the outstanding calls this process is about to
@@ -328,14 +431,18 @@ impl AgentRuntime {
     /// reply target, and a dispatched call its recipient has not picked up yet.
     /// Replayed envelopes go straight into an agent's inbox rather than through
     /// [`Self::send_message`], so this is the only place that can record them.
-    async fn register_resumed_work(&self, snapshot: &AgentRuntimeSnapshot) -> Result<(), String> {
+    fn register_resumed_work(
+        &self,
+        snapshot: &AgentRuntimeSnapshot,
+        checkpoints: &HashMap<String, StoredCheckpoint>,
+    ) -> Result<(), String> {
         // Active threads and replayed envelopes are independent evidence for
         // the same turn; `TurnGate::restore` verifies that they agree.
         for thread_id in snapshot.active_threads.values() {
-            let Some(checkpoint) = self.checkpoint_of(thread_id).await else {
+            let Some(checkpoint) = checkpoints.get(thread_id) else {
                 continue;
             };
-            if let Some(turn) = checkpoint.messages.last().map(|entry| entry.turn_id) {
+            if let Some(turn) = last_turn(checkpoint) {
                 self.turn_gate.restore(turn)?;
             }
             // A stored reply target outlives only an unanswered call: it is
@@ -356,7 +463,7 @@ impl AgentRuntime {
                     self.calls.begin(&envelope.to.thread_id);
                 }
                 EnvelopeBody::Reply { .. } => {
-                    if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
+                    if let Some(turn) = turn_awaiting(checkpoints, &envelope.to.thread_id) {
                         self.turn_gate.restore(turn)?;
                     }
                     // An answer nobody has taken yet still settles an obligation
@@ -366,7 +473,7 @@ impl AgentRuntime {
                     }
                 }
                 EnvelopeBody::Resume(_) => {
-                    if let Some(turn) = self.turn_of_thread(envelope.to.thread_id.as_ref()).await {
+                    if let Some(turn) = turn_awaiting(checkpoints, &envelope.to.thread_id) {
                         self.turn_gate.restore(turn)?;
                     }
                 }
@@ -390,15 +497,27 @@ impl AgentRuntime {
             .send((agent_name, thread_id, turn_id, event));
     }
 
+    /// Start the agents, putting back whatever the snapshot left mid-flight.
+    ///
+    /// Reports whether any of it will actually run — a thread to resume or an
+    /// envelope to replay. Only known here, once recovery has thrown out what
+    /// nothing will pick up again.
     pub(crate) async fn bootstrap(
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
         mut resume_decisions: HashMap<String, ResumeDecision>,
         config: RunConfig<impl LLMProvider + Clone>,
-    ) -> Result<(), String> {
-        if let Some(snapshot) = snapshot.as_ref() {
-            self.register_resumed_work(snapshot).await?;
+    ) -> Result<bool, String> {
+        let mut resuming = false;
+        if let Some(snapshot) = snapshot.as_mut() {
+            let checkpoints = self.recovery_checkpoints(snapshot).await?;
+            // Before anything reads the snapshot as evidence of live work, and
+            // before any of it reaches an inbox.
+            drop_stale_envelopes(snapshot, &checkpoints);
+            self.register_resumed_work(snapshot, &checkpoints)?;
+            resuming =
+                !snapshot.active_threads.is_empty() || !replayed_envelopes(snapshot).is_empty();
         }
         for (name, agent) in agents {
             info!("Bootstrap agent: {}", name);
@@ -448,7 +567,7 @@ impl AgentRuntime {
             };
             self.agents.lock().await.insert(name, handle);
         }
-        Ok(())
+        Ok(resuming)
     }
 
     /// Subscribe to events from all agents

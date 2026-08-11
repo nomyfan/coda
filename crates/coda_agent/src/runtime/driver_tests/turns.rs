@@ -350,9 +350,12 @@ async fn repeated_recovery_evidence_registers_one_turn() {
         ..Default::default()
     };
 
-    runtime
-        .register_resumed_work(&snapshot)
+    let checkpoints = runtime
+        .recovery_checkpoints(&snapshot)
         .await
+        .expect("load checkpoints");
+    runtime
+        .register_resumed_work(&snapshot, &checkpoints)
         .expect("same turn is idempotent");
 
     assert_eq!(active(&runtime), Some(turn));
@@ -368,9 +371,12 @@ async fn recovery_rejects_multiple_turns() {
         ..Default::default()
     };
 
-    let error = runtime
-        .register_resumed_work(&snapshot)
+    let checkpoints = runtime
+        .recovery_checkpoints(&snapshot)
         .await
+        .expect("load checkpoints");
+    let error = runtime
+        .register_resumed_work(&snapshot, &checkpoints)
         .expect_err("multiple turns must not be replayed");
 
     assert!(error.contains("active turns"), "{error}");

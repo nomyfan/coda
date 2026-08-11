@@ -68,6 +68,10 @@ pub struct ReplyTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingReply {
     pub call_id: String,
+    /// The envelope that carried this call out, which the answer names in its
+    /// `reply_to`. A `call_id` is only unique within one assistant message, so a
+    /// later turn can reuse one; this is minted per dispatch.
+    pub call_envelope_id: String,
     /// Also the name of the peer agent
     pub tool_name: String,
     pub outcome: ToolCallOutcome,

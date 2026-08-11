@@ -1391,6 +1391,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         .unwrap_or_default(),
                     },
                 });
+                let call_envelope_id = subagent_tool_call_envelope.id.clone();
                 let ret = self.runtime.send_message(subagent_tool_call_envelope).await;
                 if let Err(err) = ret {
                     error!(
@@ -1419,6 +1420,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         .await;
                     tool_execution.pending_replies.push(PendingReply {
                         call_id: tc.tool_call.id.clone(),
+                        call_envelope_id,
                         tool_name: tc.tool_call.name.clone(),
                         outcome: tc.outcome.clone(),
                         started_at: jiff::Timestamp::now(),
