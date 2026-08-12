@@ -173,10 +173,13 @@ async fn stateless_subagent_replies_after_approval_resume() {
     // Phase 2: restart with resume, verify completion.
     let mut decisions = HashMap::new();
     decisions.insert(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
     );
     let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
@@ -254,24 +257,27 @@ async fn pending_approval_supports_mixed_resolutions() {
                     assert_eq!(pending.calls.len(), 4);
                     let mut decisions = HashMap::new();
                     decisions.insert(
-                        pending.thread_id.clone(),
-                        ResumeDecision {
-                            resolutions: vec![
-                                ("call_exec".into(), ToolCallResolution::Execute),
-                                (
-                                    "call_resolved".into(),
-                                    ToolCallResolution::Resolved(ToolOutput::Ok(
-                                        "resolved-by-test".into(),
-                                    )),
-                                ),
-                                (
-                                    "call_rejected".into(),
-                                    ToolCallResolution::Rejected {
-                                        reason: Some("nope".into()),
-                                    },
-                                ),
-                            ],
-                        },
+                        pending.agent_name.clone(),
+                        (
+                            pending.thread_id.clone(),
+                            ResumeDecision {
+                                resolutions: vec![
+                                    ("call_exec".into(), ToolCallResolution::Execute),
+                                    (
+                                        "call_resolved".into(),
+                                        ToolCallResolution::Resolved(ToolOutput::Ok(
+                                            "resolved-by-test".into(),
+                                        )),
+                                    ),
+                                    (
+                                        "call_rejected".into(),
+                                        ToolCallResolution::Rejected {
+                                            reason: Some("nope".into()),
+                                        },
+                                    ),
+                                ],
+                            },
+                        ),
                     );
                     return (pending.thread_id, decisions);
                 }
@@ -359,20 +365,23 @@ async fn reject_pending_approval_via_restart() {
     let mut reject_decisions = HashMap::new();
     let reject_ids: Vec<String> = pending.calls.iter().map(|c| c.id.clone()).collect();
     reject_decisions.insert(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: reject_ids
-                .into_iter()
-                .map(|id| {
-                    (
-                        id,
-                        ToolCallResolution::Rejected {
-                            reason: Some("replaced by new task".into()),
-                        },
-                    )
-                })
-                .collect(),
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                resolutions: reject_ids
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id,
+                            ToolCallResolution::Rejected {
+                                reason: Some("replaced by new task".into()),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        ),
     );
     let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
@@ -461,6 +470,86 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     harness.shutdown().await;
 }
 
+/// The runtime snapshot is only written when an agent exits, so a process
+/// killed mid-approval — and a session a fork has just minted — comes back with
+/// checkpoints but no snapshot at all. A decision names the thread it belongs
+/// to, so it must still reach it: routing it through the snapshot's
+/// `active_threads` dropped it silently and left the thread parked forever,
+/// with every later approval swallowed the same way.
+#[tokio::test]
+async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "continuation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        provider.clone(),
+        approval.clone(),
+        "inspect todos",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for tool approval");
+    harness.shutdown().await;
+
+    let decisions = [(
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
+    )]
+    .into();
+    let mut harness = harness
+        .restart_without_snapshot(
+            team.build(".", coda_tools::shared_file_locks()),
+            provider,
+            approval,
+            decisions,
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::ToolCallEnd(tool)) = (agent_name.as_str(), event) {
+                assert_eq!(tool.name, "read_todos");
+                assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Approved),
+                    "the approved call must run, not be rejected for want of a decision"
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the approval was swallowed: nothing ran after the resume");
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let team = AgentTeam::new(
@@ -499,10 +588,13 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     harness.shutdown().await;
 
     let decisions = [(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
     )]
     .into();
     let mut harness = harness

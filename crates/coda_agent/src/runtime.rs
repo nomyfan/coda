@@ -209,6 +209,19 @@ pub struct AgentRuntimeSnapshot {
     pub active_threads: HashMap<String, String>,
 }
 
+/// A caller's answer to one agent's pending approval, addressed to the thread
+/// that is actually parked on it.
+///
+/// The thread comes from the *checkpoint* that holds the `PendingApproval`, not
+/// from the runtime snapshot: the snapshot is written when an agent exits, so it
+/// is missing entirely for a session that was killed mid-approval or minted by a
+/// fork. Routing a decision through the snapshot dropped it on the floor in
+/// exactly those cases, leaving the thread suspended forever.
+pub(crate) struct ResumeTarget {
+    pub thread_id: ThreadId,
+    pub decision: ResumeDecision,
+}
+
 /// Every envelope [`AgentRuntime::bootstrap`] is about to put back. Within an
 /// agent, inbox contents precede messages captured during the final drain;
 /// agent names are sorted to keep recovery validation deterministic.
@@ -478,6 +491,37 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Put back the turn each decision-routed resume is about to continue.
+    ///
+    /// [`Self::register_resumed_work`] sees only threads the snapshot named, and
+    /// the sessions this routing exists for — killed mid-approval, or minted by
+    /// a fork — have no snapshot naming them. Left out of the active slot, the
+    /// resumed work would run outside single-flight: a task submitted alongside
+    /// it would open a second turn, and an abort would find nothing to mark.
+    ///
+    /// Threads the snapshot did name are restored twice, which
+    /// [`TurnGate::restore`] absorbs — a second id for the same turn is the same
+    /// turn. A *different* one is the single-flight violation it reports.
+    async fn restore_resumed_turns(
+        &self,
+        resume_targets: &HashMap<String, ResumeTarget>,
+    ) -> Result<(), String> {
+        for target in resume_targets.values() {
+            let thread_id = target.thread_id.as_ref();
+            let turn = self
+                .session_storage
+                .load_checkpoint(thread_id)
+                .await
+                .map_err(|err| format!("failed to load checkpoint for {thread_id}: {err}"))?
+                .as_ref()
+                .and_then(last_turn);
+            if let Some(turn) = turn {
+                self.turn_gate.restore(turn)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Publish an event, tagged with the turn it belongs to. One turn id spans
     /// the whole sub-tree it reaches, which is what lets a consumer settle
     /// per-turn without reconstructing who called whom.
@@ -493,7 +537,8 @@ impl AgentRuntime {
             .send((agent_name, thread_id, turn_id, event));
     }
 
-    /// Start the agents, putting back whatever the snapshot left mid-flight.
+    /// Start the agents, putting back whatever the snapshot left mid-flight and
+    /// whatever the caller's resume decisions answer.
     ///
     /// Reports whether any of it will actually run — a thread to resume or an
     /// envelope to replay. Only known here, once recovery has thrown out what
@@ -502,32 +547,65 @@ impl AgentRuntime {
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
-        mut resume_decisions: HashMap<String, ResumeDecision>,
+        mut resume_targets: HashMap<String, ResumeTarget>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) -> Result<bool, String> {
-        let mut resuming = false;
+        // A checkpoint names the agent that wrote it, which the team need not
+        // still have — an agent renamed or dropped from the workspace config
+        // leaves one behind. Nothing here would ever run that decision, and
+        // restoring its turn below would fill the active slot with a turn no
+        // agent can close, so the session would refuse every later task.
+        resume_targets.retain(|name, _| {
+            let known = agents.contains_key(name);
+            if !known {
+                warn!("discarding a resume for {name}: this session has no such agent");
+            }
+            known
+        });
+        // A decision is work this process will run whether or not a snapshot
+        // vouches for it — that is the whole point of routing it by its own
+        // thread.
+        let mut resuming = !resume_targets.is_empty();
         if let Some(snapshot) = snapshot.as_mut() {
             let checkpoints = self.recovery_checkpoints(snapshot).await?;
             // Before anything reads the snapshot as evidence of live work, and
             // before any of it reaches an inbox.
             drop_stale_envelopes(snapshot, &checkpoints);
             self.register_resumed_work(snapshot, &checkpoints)?;
-            resuming =
+            resuming |=
                 !snapshot.active_threads.is_empty() || !replayed_envelopes(snapshot).is_empty();
         }
+        self.restore_resumed_turns(&resume_targets).await?;
         for (name, agent) in agents {
             info!("Bootstrap agent: {}", name);
             let runtime = self.clone();
 
             let agent_name = name.clone();
             let agent_config = config.resolve(&name);
-            let active_thread = snapshot
+            let snapshot_thread = snapshot
                 .as_ref()
                 .and_then(|s| s.active_threads.get(&name))
                 .map(|id| ThreadId(id.clone()));
-            let resume_decision = active_thread
-                .as_ref()
-                .and_then(|tid| resume_decisions.remove(tid.as_ref()));
+            // A decision names its own thread, so it does not need the snapshot
+            // to find one — and must not depend on it, since a session that
+            // never exited cleanly (crash, or a fresh fork) has no snapshot at
+            // all and the resume would be silently dropped.
+            let (active_thread, resume_decision) = match resume_targets.remove(&name) {
+                Some(target) => {
+                    if let Some(stale) = snapshot_thread
+                        .as_ref()
+                        .filter(|thread_id| *thread_id != &target.thread_id)
+                    {
+                        warn!(
+                            "resuming {name} on suspended thread {} rather than the snapshot's {}",
+                            target.thread_id.as_ref(),
+                            stale.as_ref(),
+                        );
+                    }
+                    (Some(target.thread_id), Some(target.decision))
+                }
+                None => (snapshot_thread, None),
+            };
             let init_envelopes = snapshot
                 .as_mut()
                 .map(|s| {
