@@ -1169,6 +1169,34 @@ impl PgSessionStorage {
         }))
     }
 
+    async fn read_pending_approval_checkpoints(&self) -> Result<Vec<StoredCheckpoint>, String> {
+        let thread_ids = {
+            let mut conn = self.conn().await?;
+            thread_checkpoints::table
+                .filter(
+                    thread_checkpoints::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(thread_checkpoints::session_id.eq(&self.session_id))
+                        .and(thread_checkpoints::pending_approval),
+                )
+                .order(thread_checkpoints::thread_id)
+                .select(thread_checkpoints::thread_id)
+                .load::<String>(&mut conn)
+                .await
+                .map_err(|err| format!("failed to list pending approvals: {err}"))?
+        };
+
+        let mut checkpoints = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            let checkpoint = self
+                .read_checkpoint(&thread_id)
+                .await?
+                .ok_or_else(|| format!("pending approval checkpoint {thread_id} disappeared"))?;
+            checkpoints.push(checkpoint);
+        }
+        Ok(checkpoints)
+    }
+
     /// Discard `target` and everything the session produced from it onward, then
     /// report the root thread's remaining conversation.
     ///
@@ -1374,6 +1402,13 @@ impl SessionStorage for PgSessionStorage {
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
         let thread_id = thread_id.to_string();
         Box::pin(async move { self.read_checkpoint(&thread_id).await })
+    }
+
+    fn load_pending_approval_checkpoints(
+        &self,
+        _session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredCheckpoint>, String>> + Send + '_>> {
+        Box::pin(async move { self.read_pending_approval_checkpoints().await })
     }
 
     fn save_session_snapshot(

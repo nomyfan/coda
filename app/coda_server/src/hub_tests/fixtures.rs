@@ -208,6 +208,19 @@ impl SessionStorage for SlowStorage {
         self.inner.load_checkpoint(thread_id)
     }
 
+    fn load_pending_approval_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<coda_agent::persist::StoredCheckpoint>, String>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.load_pending_approval_checkpoints(session_id)
+    }
+
     fn save_session_snapshot(
         &self,
         session_id: String,

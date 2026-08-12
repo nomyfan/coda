@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_agent::runtime::MemoryStorage;
+use coda_agent::runtime::{MemoryStorage, SessionStorage};
 use coda_agent::{
-    AgentEvent, AgentSpec, AgentTeam, ModelProfile, ResumeDecision, RunConfig, Session,
+    AgentEvent, AgentSpec, AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session,
     SessionEvent, SessionStreamItem, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
@@ -229,6 +229,41 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("session probe") {
             return completed(AssistantMessage {
                 content: "explore-done".into(),
+                ..assistant()
+            });
+        }
+
+        // 4b. Delegate to a sub-agent that itself needs tool approval.
+        if user_text.contains("delegate approval to explore") {
+            if has_results {
+                return completed(AssistantMessage {
+                    content: "subagent-approval-done".into(),
+                    ..assistant()
+                });
+            }
+            return completed(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_explore_approval".into(),
+                    name: "explore".into(),
+                    arguments: Some(r#"{"task":"subagent approval probe"}"#.into()),
+                }],
+                ..assistant()
+            });
+        }
+
+        if user_text.contains("subagent approval probe") {
+            if has_results {
+                return completed(AssistantMessage {
+                    content: "explore-approval-done".into(),
+                    ..assistant()
+                });
+            }
+            return completed(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_subagent_todos".into(),
+                    name: "read_todos".into(),
+                    arguments: Some("{}".into()),
+                }],
                 ..assistant()
             });
         }
@@ -788,6 +823,120 @@ async fn should_auto_reject_when_approval_times_out() {
     );
 
     session2
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+}
+
+#[tokio::test]
+async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
+    use coda_tools::ReadTodosToolSpec;
+
+    let source = MemoryStorage::default();
+    let cold = MemoryStorage::default();
+    let session_id = "session-subagent-approval-without-snapshot";
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "session-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: "An explore sub-agent.".into(),
+            system_prompt: "You are an exploration assistant.".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        }],
+    )
+    .expect("valid team");
+
+    let session = Session::builder()
+        .storage(source.clone())
+        .team(&team, ".")
+        .run_config(run_config(approval.clone()))
+        .session_id(session_id)
+        .open()
+        .await
+        .expect("open source session");
+    session
+        .send(MessageId::new(), "delegate approval to explore", vec![])
+        .await
+        .expect("send");
+
+    let pending = timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(SessionStreamItem::Event(SessionEvent { kind, .. })) = session.recv().await
+            else {
+                continue;
+            };
+            if let AgentEvent::Suspended(pending) = kind {
+                return pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for sub-agent approval");
+    assert_eq!(pending.agent_name, "explore");
+    session
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+
+    // A process killed before its first snapshot leaves this durable shape; so
+    // does a fresh fork after it starts work and reaches this suspension.
+    for checkpoint in source.all_checkpoints().await {
+        cold.save_checkpoint(checkpoint.thread_id.clone(), checkpoint)
+            .await
+            .expect("copy checkpoint");
+    }
+    assert!(
+        cold.load_session_snapshot(session_id)
+            .await
+            .expect("load snapshot")
+            .is_none()
+    );
+
+    let discovered = match Session::builder()
+        .storage(cold.clone())
+        .team(&team, ".")
+        .run_config(run_config(approval.clone()))
+        .session_id(session_id)
+        .open()
+        .await
+    {
+        Err(OpenError::PendingApprovalsRequired(pending)) => pending,
+        Err(err) => panic!("unexpected open error: {err}"),
+        Ok(session) => {
+            session
+                .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+                .await;
+            panic!("sub-agent approval was not discovered");
+        }
+    };
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].thread_id, pending.thread_id);
+
+    let resumed = Session::builder()
+        .storage(cold)
+        .team(&team, ".")
+        .run_config(run_config(approval))
+        .session_id(session_id)
+        .resume_decisions(HashMap::from([(
+            pending.thread_id.clone(),
+            ResumeDecision {
+                parent_message_id: pending.parent_message_id,
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        )]))
+        .open()
+        .await
+        .expect("resume sub-agent approval without a snapshot");
+    assert_eq!(collect_until_done(&resumed).await, "subagent-approval-done");
+    resumed
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
 }

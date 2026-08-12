@@ -10,7 +10,7 @@
 //! [`Session::runtime`].
 
 use crate::agent::{EnvelopeBody, Receiver};
-use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use crate::persist::{StoredResumePoint, StoredRuntimeSnapshot};
 use crate::runtime::{
     AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
 };
@@ -270,9 +270,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                     .collect()
             });
 
-        let pending_approvals =
-            collect_pending_approvals(storage.as_ref(), &session_id, &root_name, snapshot.as_ref())
-                .await?;
+        let pending_approvals = collect_pending_approvals(storage.as_ref(), &session_id).await?;
 
         let mut resume_decisions = self.resume_decisions;
 
@@ -374,52 +372,41 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     }
 }
 
-/// Walks root + snapshot-tracked agent threads, loads each checkpoint, and
-/// returns those still sitting in `PendingApproval`.
+/// Loads every checkpoint still sitting in `PendingApproval`.
 async fn collect_pending_approvals(
     storage: &dyn SessionStorage,
     session_id: &str,
-    root_name: &str,
-    snapshot: Option<&AgentRuntimeSnapshot>,
 ) -> Result<Vec<PendingApproval>, OpenError> {
-    let mut seen_thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut threads: Vec<String> = Vec::new();
-    // Root always has thread_id == session_id.
-    threads.push(session_id.to_string());
-    seen_thread_ids.insert(session_id.to_string());
-    if let Some(snap) = snapshot {
-        for (agent_name, tid) in &snap.active_threads {
-            if agent_name == root_name {
-                continue;
-            }
-            if seen_thread_ids.insert(tid.clone()) {
-                threads.push(tid.clone());
-            }
-        }
-    }
-
     let mut pending = Vec::new();
-    for tid in threads {
-        let stored: Option<StoredCheckpoint> = storage
-            .load_checkpoint(&tid)
-            .await
-            .map_err(OpenError::Storage)?;
-        if let Some(stored) = stored
-            && let StoredResumePoint::PendingApproval {
-                parent_message_id,
-                ref pending_approval_calls,
-                ..
-            } = stored.resume_point
-            && !pending_approval_calls.is_empty()
-        {
-            pending.push(PendingApproval {
-                thread_id: stored.thread_id,
-                agent_name: stored.agent_name,
-                parent_message_id,
-                calls: pending_approval_calls.clone(),
-                suspended_at: stored.suspended_at,
-            });
+    for stored in storage
+        .load_pending_approval_checkpoints(session_id)
+        .await
+        .map_err(OpenError::Storage)?
+    {
+        let StoredResumePoint::PendingApproval {
+            parent_message_id,
+            pending_approval_calls,
+            ..
+        } = stored.resume_point
+        else {
+            return Err(OpenError::Storage(format!(
+                "storage returned non-pending checkpoint {} as awaiting approval",
+                stored.thread_id
+            )));
+        };
+        if pending_approval_calls.is_empty() {
+            return Err(OpenError::Storage(format!(
+                "storage returned empty approval checkpoint {} as awaiting approval",
+                stored.thread_id
+            )));
         }
+        pending.push(PendingApproval {
+            thread_id: stored.thread_id,
+            agent_name: stored.agent_name,
+            parent_message_id,
+            calls: pending_approval_calls,
+            suspended_at: stored.suspended_at,
+        });
     }
     Ok(pending)
 }

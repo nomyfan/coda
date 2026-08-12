@@ -6,10 +6,14 @@ use super::fixtures::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, ResumeDecision, SubAgentMode, ToolApprovalMode,
     ToolCallResolution,
-    persist::StoredResumePoint,
-    runtime::{AgentRuntimeSnapshot, MemoryStorage, SendCommandError, SessionStorage},
+    agent::HistoryEntry,
+    persist::{StoredCheckpoint, StoredResumePoint},
+    runtime::{
+        AgentRuntimeSnapshot, MemoryStorage, ResumeTarget, SendCommandError, SessionStorage,
+    },
 };
-use std::sync::Arc;
+use coda_core::llm::{Message, ToolCall, UserMessage};
+use std::{collections::HashMap, sync::Arc};
 use tokio::time::{Duration, timeout};
 
 fn user_task(to: &ThreadId) -> Envelope {
@@ -428,6 +432,131 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
             .await,
         Err(SendCommandError::TurnAlreadyActive)
     ));
+}
+
+#[tokio::test]
+async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
+    let storage = MemoryStorage::default();
+    let old_thread = "old-stateless-thread";
+    let current_thread = "current-stateless-thread";
+    let old_prompt = MessageId::new();
+    let current_prompt = MessageId::new();
+    let old_turn = TurnId::from(old_prompt);
+    let current_turn = TurnId::from(current_prompt);
+    let parent_message_id = MessageId::new();
+    let call = ToolCall {
+        id: "call_read_todos".into(),
+        name: "read_todos".into(),
+        arguments: Some("{}".into()),
+    };
+
+    storage
+        .save_checkpoint(
+            old_thread.into(),
+            StoredCheckpoint {
+                thread_id: old_thread.into(),
+                agent_name: "explore".into(),
+                parent_thread_id: Some("session".into()),
+                derivation_key: Some("old-call".into()),
+                reply_target: None,
+                messages: vec![HistoryEntry {
+                    turn_id: old_turn,
+                    message: Message::User(UserMessage::text(old_prompt, "old turn")),
+                }],
+                todos: vec![],
+                resume_point: StoredResumePoint::Generation,
+                suspended_at: jiff::Timestamp::default(),
+            },
+        )
+        .await
+        .expect("save stale checkpoint");
+    storage
+        .save_checkpoint(
+            current_thread.into(),
+            StoredCheckpoint {
+                thread_id: current_thread.into(),
+                agent_name: "explore".into(),
+                parent_thread_id: Some("session".into()),
+                derivation_key: Some("current-call".into()),
+                reply_target: None,
+                messages: vec![
+                    HistoryEntry {
+                        turn_id: current_turn,
+                        message: Message::User(UserMessage::text(current_prompt, "current turn")),
+                    },
+                    HistoryEntry {
+                        turn_id: current_turn,
+                        message: Message::Assistant(AssistantMessage {
+                            message_id: parent_message_id,
+                            tool_calls: vec![call.clone()],
+                            ..assistant()
+                        }),
+                    },
+                ],
+                todos: vec![],
+                resume_point: StoredResumePoint::PendingApproval {
+                    parent_message_id,
+                    pending_approval_calls: vec![call.clone()],
+                    pending_calls: vec![],
+                },
+                suspended_at: jiff::Timestamp::now(),
+            },
+        )
+        .await
+        .expect("save current checkpoint");
+
+    let snapshot = AgentRuntimeSnapshot {
+        active_threads: HashMap::from([("explore".into(), old_thread.into())]),
+        ..Default::default()
+    };
+    let resume_targets = HashMap::from([(
+        "explore".into(),
+        ResumeTarget {
+            thread_id: ThreadId::from(current_thread.to_string()),
+            decision: ResumeDecision {
+                parent_message_id,
+                resolutions: vec![(call.id, ToolCallResolution::Execute)],
+            },
+        },
+    )]);
+    let agents = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "plain-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![Box::new(coda_tools::ReadTodosToolSpec)],
+            subagents: vec![],
+        }],
+    )
+    .expect("valid team")
+    .build(".", coda_tools::shared_file_locks());
+    let mut runtime = AgentRuntime::new(storage, "session".into());
+    runtime
+        .bootstrap(
+            agents,
+            Some(snapshot),
+            resume_targets,
+            test_config(
+                TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new())),
+                ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+            ),
+        )
+        .await
+        .expect("the authoritative resume target should replace the stale snapshot thread");
+
+    assert_eq!(active(&runtime), Some(current_turn));
+    runtime.cancel_in_flight().await;
+    runtime.request_exit().await;
+    assert!(runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
 }
 
 #[tokio::test]

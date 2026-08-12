@@ -6,7 +6,9 @@ use super::super::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
     StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    runtime::{AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage},
+    runtime::{
+        AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
+    },
 };
 use coda_core::{
     llm::{
@@ -147,6 +149,35 @@ impl SessionStorage for TestStorage {
             }
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
             Ok(checkpoint)
+        })
+    }
+
+    fn load_pending_approval_checkpoints(
+        &self,
+        _session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredCheckpoint>, String>> + Send + '_>> {
+        Box::pin(async move {
+            if *self.fail_loads.lock().await {
+                return Err("checkpoint load is unavailable".to_string());
+            }
+            let mut checkpoints: Vec<_> = self
+                .checkpoints
+                .lock()
+                .await
+                .values()
+                .filter(|checkpoint| {
+                    matches!(
+                        checkpoint.resume_point,
+                        StoredResumePoint::PendingApproval {
+                            ref pending_approval_calls,
+                            ..
+                        } if !pending_approval_calls.is_empty()
+                    )
+                })
+                .cloned()
+                .collect();
+            checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+            Ok(checkpoints)
         })
     }
 
