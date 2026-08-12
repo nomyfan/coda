@@ -1,8 +1,10 @@
 mod driver;
+mod turn;
 
-use crate::persist::{StoredCheckpoint, StoredRuntimeSnapshot};
-use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, ThreadId};
-use coda_core::llm::LLMProvider;
+use crate::agent::EnvelopeBody;
+use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, ThreadId};
+use coda_core::llm::{LLMProvider, TurnId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -13,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
+use turn::{CallLedger, TurnAlreadyActive, TurnGate};
 
 #[derive(Clone)]
 enum AgentControl {
@@ -23,6 +26,7 @@ enum AgentControl {
 
 #[derive(Debug)]
 pub enum SendCommandError {
+    TurnAlreadyActive,
     AgentNotFound,
     ChannelClosed,
 }
@@ -30,6 +34,7 @@ pub enum SendCommandError {
 impl std::fmt::Display for SendCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SendCommandError::TurnAlreadyActive => write!(f, "A turn is already active"),
             SendCommandError::AgentNotFound => write!(f, "Agent not found"),
             SendCommandError::ChannelClosed => write!(f, "Channel closed"),
         }
@@ -204,6 +209,82 @@ pub struct AgentRuntimeSnapshot {
     pub active_threads: HashMap<String, String>,
 }
 
+/// Every envelope [`AgentRuntime::bootstrap`] is about to put back. Within an
+/// agent, inbox contents precede messages captured during the final drain;
+/// agent names are sorted to keep recovery validation deterministic.
+fn replayed_envelopes(snapshot: &AgentRuntimeSnapshot) -> Vec<&Envelope> {
+    let mut names: Vec<&String> = snapshot
+        .agent_drained_envelopes
+        .keys()
+        .chain(snapshot.drained_envelopes.keys())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .flat_map(|name| {
+            snapshot
+                .agent_drained_envelopes
+                .get(name)
+                .into_iter()
+                .flatten()
+                .chain(snapshot.drained_envelopes.get(name).into_iter().flatten())
+        })
+        .collect()
+}
+
+/// The turn a stored thread was last working on.
+fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
+    checkpoint.messages.last().map(|entry| entry.turn_id)
+}
+
+/// Throw away the replayed envelopes their recipient is no longer waiting for.
+///
+/// Nothing rewrites a snapshot until an agent exits, so a second crash hands
+/// back envelopes the first recovery already delivered. The thread drops such
+/// an answer on arrival — but only after it has restored the finished turn the
+/// answer names, leaving that turn on the books with nothing to end it.
+fn drop_stale_envelopes(
+    snapshot: &mut AgentRuntimeSnapshot,
+    checkpoints: &HashMap<String, StoredCheckpoint>,
+) {
+    for (name, envelopes) in snapshot
+        .agent_drained_envelopes
+        .iter_mut()
+        .chain(snapshot.drained_envelopes.iter_mut())
+    {
+        envelopes.retain(|envelope| {
+            // Whether the thread this envelope is addressed to is still waiting for it. A
+            // thread with no checkpoint at all is not: it has no state to take an answer
+            // into.
+            //
+            // Answers are matched by the envelope that carried the call out: a `call_id`
+            // is only unique within one assistant message, so an answer to an earlier
+            // invocation that reused it would pass for the one being waited on.
+            let awaited = match (
+                &envelope.body,
+                checkpoints
+                    .get(envelope.to.thread_id.as_ref())
+                    .map(|checkpoint| &checkpoint.resume_point),
+            ) {
+                // These carry the work they open, so nothing has to be waiting for them.
+                (EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. }, _) => true,
+                (EnvelopeBody::Reply { .. }, Some(StoredResumePoint::ToolExecution(state))) => {
+                    state.pending_replies.iter().any(|pending| {
+                        Some(&pending.call_envelope_id) == envelope.reply_to.as_ref()
+                    })
+                }
+                (EnvelopeBody::Resume(_), Some(StoredResumePoint::PendingApproval { .. })) => true,
+                _ => false,
+            };
+            if !awaited {
+                warn!("Dropping an envelope {} already took: {:?}", name, envelope);
+            }
+            awaited
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentRuntime {
     session_id: String,
@@ -211,10 +292,12 @@ pub(crate) struct AgentRuntime {
     agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     agent_tasks: Arc<Mutex<JoinSet<String>>>,
     /// Global event bus — all agents forward their events here.
-    global_event_tx: broadcast::Sender<(String, ThreadId, AgentEvent)>,
+    global_event_tx: broadcast::Sender<(String, ThreadId, TurnId, AgentEvent)>,
     session_storage: Arc<dyn SessionStorage>,
     exit_barrier: ExitBarrier,
     snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
+    turn_gate: Arc<TurnGate>,
+    calls: Arc<CallLedger>,
 }
 
 impl AgentRuntime {
@@ -231,30 +314,212 @@ impl AgentRuntime {
             session_storage: Arc::new(session_storage),
             exit_barrier: ExitBarrier::default(),
             snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
+            turn_gate: Arc::new(TurnGate::default()),
+            calls: Arc::new(CallLedger::default()),
         }
     }
 
+    /// The session's root thread, the only one whose turn endings end the turn
+    /// itself — a sub-agent thread finishes its own work many times within one.
+    pub(crate) fn is_root_thread(&self, thread_id: &ThreadId) -> bool {
+        thread_id.as_ref() == self.session_id
+    }
+
+    /// Whether the turn a parked thread belongs to has been asked to stop. Its
+    /// own agent cannot answer this — it is sitting idle with no turn in hand —
+    /// so the thread's last stored message names the turn instead.
+    pub(crate) async fn thread_turn_cancelled(&self, thread_id: &ThreadId) -> bool {
+        match self.turn_of_thread(thread_id.as_ref()).await {
+            Some(turn) => self.turn_gate.is_cancelled(turn),
+            None => false,
+        }
+    }
+
+    /// Ask a named turn to stop when a thread receives overlapping internal
+    /// work it cannot safely start yet.
+    ///
+    /// The broadcast matters as much as the mark: a thread parked on an
+    /// approval has no envelope coming to wake it, so without a nudge it would
+    /// sit there while the turn it belongs to waits to be wound up.
+    pub(crate) async fn cancel_turn(&self, turn: TurnId) {
+        self.turn_gate.cancel(turn);
+        self.broadcast_command(AgentControl::Abort).await;
+    }
+
+    async fn checkpoint_of(&self, thread_id: &str) -> Option<StoredCheckpoint> {
+        self.session_storage
+            .load_checkpoint(thread_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The turn a stored thread was last working on, or `None` if it has no
+    /// history to name one.
+    async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
+        last_turn(&self.checkpoint_of(thread_id).await?)
+    }
+
+    /// The stored checkpoints recovery has to consult, loaded once each — one
+    /// thread can be named by the active-thread map and by several envelopes at
+    /// once. Only the recipients of answers are consulted: a `Task` or
+    /// `ToolCall` is judged by what it carries, not by the state it lands in.
+    ///
+    /// A read that fails gives up the whole recovery, because every decision
+    /// below is made by reading these: guessing would either throw away an
+    /// undelivered answer or restore a turn nothing will finish.
+    async fn recovery_checkpoints(
+        &self,
+        snapshot: &AgentRuntimeSnapshot,
+    ) -> Result<HashMap<String, StoredCheckpoint>, String> {
+        let mut consulted: Vec<String> = snapshot
+            .active_threads
+            .values()
+            .cloned()
+            .chain(
+                replayed_envelopes(snapshot)
+                    .into_iter()
+                    .filter(|envelope| {
+                        matches!(
+                            envelope.body,
+                            EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_)
+                        )
+                    })
+                    .map(|envelope| envelope.to.thread_id.as_ref().to_string()),
+            )
+            .collect();
+        consulted.sort_unstable();
+        consulted.dedup();
+
+        let mut checkpoints = HashMap::with_capacity(consulted.len());
+        for thread_id in consulted {
+            let loaded = self
+                .session_storage
+                .load_checkpoint(&thread_id)
+                .await
+                .map_err(|err| format!("failed to load checkpoint for {thread_id}: {err}"))?;
+            if let Some(checkpoint) = loaded {
+                checkpoints.insert(thread_id, checkpoint);
+            }
+        }
+        Ok(checkpoints)
+    }
+
+    /// Put back the turn and the outstanding calls this process is about to
+    /// resume, before any agent can see an envelope — an abort right after a
+    /// restart has to find the turn, and internal inbox arbitration has to find
+    /// the calls.
+    ///
+    /// Only work that will really run counts: threads the snapshot parked
+    /// mid-turn, and envelopes about to be replayed. A turn nothing will pick up
+    /// again must stay out of the active slot, or the session would reject new
+    /// work forever.
+    ///
+    /// The call ledger is rebuilt by the rule that keeps it balanced: register
+    /// one obligation for every [`CallLedger::end`] still to come. Those are a
+    /// reply already in flight, a thread whose stored checkpoint still names a
+    /// reply target, and a dispatched call its recipient has not picked up yet.
+    /// Replayed envelopes go straight into an agent's inbox rather than through
+    /// [`Self::send_message`], so this is the only place that can record them.
+    fn register_resumed_work(
+        &self,
+        snapshot: &AgentRuntimeSnapshot,
+        checkpoints: &HashMap<String, StoredCheckpoint>,
+    ) -> Result<(), String> {
+        // Active threads and replayed envelopes are independent evidence for
+        // the same turn; `TurnGate::restore` verifies that they agree.
+        for thread_id in snapshot.active_threads.values() {
+            let Some(checkpoint) = checkpoints.get(thread_id) else {
+                continue;
+            };
+            if let Some(turn) = last_turn(checkpoint) {
+                self.turn_gate.restore(turn)?;
+            }
+            // A stored reply target outlives only an unanswered call: it is
+            // taken before the checkpoint that precedes the reply, so a thread
+            // that already answered has none.
+            if checkpoint.reply_target.is_some() {
+                self.calls.begin(&ThreadId::from(thread_id.clone()));
+            }
+        }
+        let replayed = replayed_envelopes(snapshot);
+        for envelope in &replayed {
+            match &envelope.body {
+                EnvelopeBody::Task { message_id, .. } => {
+                    self.turn_gate.restore(TurnId::from(*message_id))?;
+                }
+                EnvelopeBody::ToolCall { turn_id, .. } => {
+                    self.turn_gate.restore(*turn_id)?;
+                    self.calls.begin(&envelope.to.thread_id);
+                }
+                EnvelopeBody::Reply { .. } => {
+                    if let Some(turn) = checkpoints
+                        .get(envelope.to.thread_id.as_ref())
+                        .and_then(last_turn)
+                    {
+                        self.turn_gate.restore(turn)?;
+                    }
+                    // An answer nobody has taken yet still settles an obligation
+                    // when its caller does take it.
+                    if let Sender::Agent { thread_id, .. } = &envelope.from {
+                        self.calls.begin(thread_id);
+                    }
+                }
+                EnvelopeBody::Resume(_) => {
+                    if let Some(turn) = checkpoints
+                        .get(envelope.to.thread_id.as_ref())
+                        .and_then(last_turn)
+                    {
+                        self.turn_gate.restore(turn)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish an event, tagged with the turn it belongs to. One turn id spans
+    /// the whole sub-tree it reaches, which is what lets a consumer settle
+    /// per-turn without reconstructing who called whom.
     pub(crate) async fn emit_event(
         &self,
         agent_name: String,
         thread_id: ThreadId,
+        turn_id: TurnId,
         event: AgentEvent,
     ) {
-        let _ = self.global_event_tx.send((agent_name, thread_id, event));
+        let _ = self
+            .global_event_tx
+            .send((agent_name, thread_id, turn_id, event));
     }
 
+    /// Start the agents, putting back whatever the snapshot left mid-flight.
+    ///
+    /// Reports whether any of it will actually run — a thread to resume or an
+    /// envelope to replay. Only known here, once recovery has thrown out what
+    /// nothing will pick up again.
     pub(crate) async fn bootstrap(
         &mut self,
         agents: HashMap<String, Agent>,
         mut snapshot: Option<AgentRuntimeSnapshot>,
         mut resume_decisions: HashMap<String, ResumeDecision>,
         config: RunConfig<impl LLMProvider + Clone>,
-    ) {
+    ) -> Result<bool, String> {
+        let mut resuming = false;
+        if let Some(snapshot) = snapshot.as_mut() {
+            let checkpoints = self.recovery_checkpoints(snapshot).await?;
+            // Before anything reads the snapshot as evidence of live work, and
+            // before any of it reaches an inbox.
+            drop_stale_envelopes(snapshot, &checkpoints);
+            self.register_resumed_work(snapshot, &checkpoints)?;
+            resuming =
+                !snapshot.active_threads.is_empty() || !replayed_envelopes(snapshot).is_empty();
+        }
         for (name, agent) in agents {
             info!("Bootstrap agent: {}", name);
             let runtime = self.clone();
 
-            let task_name = name.clone();
+            let agent_name = name.clone();
             let agent_config = config.resolve(&name);
             let active_thread = snapshot
                 .as_ref()
@@ -289,7 +554,7 @@ impl AgentRuntime {
                     agent_config,
                 )
                 .await;
-                task_name
+                agent_name
             });
 
             let handle = AgentHandle {
@@ -298,10 +563,11 @@ impl AgentRuntime {
             };
             self.agents.lock().await.insert(name, handle);
         }
+        Ok(resuming)
     }
 
     /// Subscribe to events from all agents
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, AgentEvent)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)> {
         self.global_event_tx.subscribe()
     }
 
@@ -315,8 +581,22 @@ impl AgentRuntime {
         }
     }
 
-    /// Abort the current work for this runtime.
+    /// Cancel whatever is running without marking any turn.
+    ///
+    /// This is teardown, not the user taking a turn back: a thread parked on an
+    /// approval stays parked, so the pending decision survives into the next
+    /// process instead of being written off on the way out.
+    pub(crate) async fn cancel_in_flight(&self) {
+        self.broadcast_command(AgentControl::Abort).await;
+    }
+
+    /// Stop the active turn on the user's behalf.
+    ///
+    /// It is marked before the broadcast leaves, because which agent picks the
+    /// control message up first is not something the runtime can order —
+    /// whoever gets there first must already find the mark in place.
     pub(crate) async fn request_abort(&self) {
+        self.turn_gate.cancel_active();
         self.broadcast_command(AgentControl::Abort).await;
     }
 
@@ -326,8 +606,37 @@ impl AgentRuntime {
         self.broadcast_command(AgentControl::Exit).await;
     }
 
-    /// Send a message to a specific agent.
+    /// Send a message to a specific agent, registering the turn it opens first
+    /// so nothing can act on the envelope before the turn is on the books.
+    /// A delivery that then fails takes back exactly what it added.
     pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
+        let opened = if let EnvelopeBody::Task { message_id, .. } = &envelope.body {
+            let turn = TurnId::from(*message_id);
+            self.turn_gate
+                .open(turn)
+                .map_err(|TurnAlreadyActive| SendCommandError::TurnAlreadyActive)?;
+            Some(turn)
+        } else {
+            None
+        };
+        let dispatched = matches!(envelope.body, EnvelopeBody::ToolCall { .. })
+            .then(|| envelope.to.thread_id.clone());
+        if let Some(thread_id) = &dispatched {
+            self.calls.begin(thread_id);
+        }
+        let sent = self.deliver(envelope).await;
+        if sent.is_err() {
+            if let Some(turn) = opened {
+                self.turn_gate.close(turn);
+            }
+            if let Some(thread_id) = &dispatched {
+                self.calls.end(thread_id);
+            }
+        }
+        sent
+    }
+
+    async fn deliver(&self, envelope: Envelope) -> Result<(), SendCommandError> {
         if self.exit_barrier.is_exiting() {
             // During the exit draining phase, buffer incoming messages and persist
             // immediately so they survive a crash before shutdown completes.
@@ -385,47 +694,96 @@ impl AgentRuntime {
         }
     }
 
-    /// Wait for all bootstrapped agent tasks to exit.
+    /// Give the agents `duration` to exit on their own, and report whether they
+    /// did. Non-destructive by design: a straggler stays running for the caller
+    /// to cancel — dropping it here would leave the cancellation nothing to
+    /// reach, and an in-flight turn no chance to save what it had.
+    pub(crate) async fn wait_for_settle(&self, duration: Duration) -> bool {
+        let mut agent_tasks = self.agent_tasks.lock().await;
+        if agent_tasks.is_empty() {
+            return true;
+        }
+        if timeout(duration, Self::drain(&mut agent_tasks))
+            .await
+            .is_err()
+        {
+            // The stragglers still own their snapshots; the final write
+            // belongs to whoever ends them.
+            return false;
+        }
+        self.persist_snapshot(Some(duration)).await;
+        true
+    }
+
+    /// Wait for all bootstrapped agent tasks to exit, and return whether they
+    /// managed it on their own.
     ///
-    /// Returns `false` if the timeout elapses before every agent stops.
+    /// **No agent task is running when this returns with a deadline set.** Past
+    /// the deadline the stragglers are aborted rather than waited on, because
+    /// the states that make a task outstay a shutdown — a checkpoint write that
+    /// never answers, an LLM stream that never ends — are exactly the ones no
+    /// signal reaches: neither `Exit` nor `Abort` can interrupt a future the
+    /// task is already awaiting. Callers depend on that guarantee rather than on
+    /// the return value, since reopening a session while a task is still writing
+    /// races its own read of the state.
+    ///
+    /// `None` asks for no deadline at all, and gives up the guarantee with it —
+    /// only for callers that would rather hang than cut an in-flight turn short.
     pub(crate) async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
         let mut agent_tasks = self.agent_tasks.lock().await;
         if agent_tasks.is_empty() {
             return true;
         }
 
-        let wait_for_exit = async {
-            while let Some(result) = agent_tasks.join_next().await {
-                match result {
-                    Ok(agent_name) => info!("Agent {} exited", agent_name),
-                    Err(err) => warn!("Agent task failed to join: {}", err),
-                }
-            }
-        };
-
         let ret = match timeout_duration {
-            Some(duration) => timeout(duration, wait_for_exit).await.is_ok(),
+            Some(duration) => timeout(duration, Self::drain(&mut agent_tasks))
+                .await
+                .is_ok(),
             None => {
-                wait_for_exit.await;
+                Self::drain(&mut agent_tasks).await;
                 true
             }
         };
-        // TODO: abort any remaining agents if timeout occurs and return early, instead of waiting for them to exit on their own.
-        // Root cause: graceful exit awaits each agent's current run_fut to completion, which deadlocks
-        // when an agent is stuck on a slow/hung LLM stream or external API. Session::shutdown with
-        // OnTimeout::Abort covers this at the session layer; at the runtime layer, callers must still
-        // combine request_abort + request_exit manually to guarantee termination.
-        if let Err(err) = self
-            .session_storage
-            .save_session_snapshot(
-                self.session_id.clone(),
-                self.snapshot.lock().await.clone().into(),
-            )
-            .await
-        {
-            warn!("Failed to persist session snapshot: {}", err);
+        if !ret {
+            warn!("aborting agent tasks that outstayed the shutdown deadline");
+            agent_tasks.abort_all();
+            while agent_tasks.join_next().await.is_some() {}
         }
+        self.persist_snapshot(timeout_duration).await;
 
         ret
+    }
+
+    async fn drain(agent_tasks: &mut JoinSet<String>) {
+        while let Some(result) = agent_tasks.join_next().await {
+            match result {
+                Ok(agent_name) => info!("Agent {} exited", agent_name),
+                Err(err) => warn!("Agent task failed to join: {}", err),
+            }
+        }
+    }
+
+    /// Persist the accumulated snapshot as the runtime winds down. A deadline
+    /// bounds this write too: storage that stopped answering is one way the
+    /// wait ran out, and an unbounded write would pin the shutdown on the
+    /// backend it just gave up on — with the session's key locked behind it.
+    async fn persist_snapshot(&self, bound: Option<Duration>) {
+        let save = async {
+            self.session_storage
+                .save_session_snapshot(
+                    self.session_id.clone(),
+                    self.snapshot.lock().await.clone().into(),
+                )
+                .await
+        };
+        let saved = match bound {
+            Some(duration) => timeout(duration, save)
+                .await
+                .unwrap_or_else(|_| Err("the write outstayed the shutdown deadline".into())),
+            None => save.await,
+        };
+        if let Err(err) = saved {
+            warn!("Failed to persist session snapshot: {}", err);
+        }
     }
 }

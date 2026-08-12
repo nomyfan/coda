@@ -1982,7 +1982,7 @@ async fn a_cut_ignores_the_half_written_turn_it_opens() {
             ForkCut::At(cut),
             // The relay has the tool call and its aborted result too; the
             // database has neither yet.
-            ForkSource::Live { root_messages: 5 },
+            ForkSource::Live,
         )
         .await
         .expect("what has not landed is in the turn being branched away from");
@@ -2061,78 +2061,9 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
     // The same row means nothing while a runtime is attached: it is only
     // rewritten when an agent exits, so it describes the last shutdown, not now.
     storage
-        .fork_session(
-            "source-session",
-            ForkCut::At(cut),
-            ForkSource::Live { root_messages: 4 },
-        )
+        .fork_session("source-session", ForkCut::At(cut), ForkSource::Live)
         .await
         .expect("a live source is judged by its checkpoints alone");
-}
-
-/// A full copy has no cut to anchor it, so it needs the caller's own count to
-/// tell "everything" from "everything stored so far".
-#[tokio::test(flavor = "multi_thread")]
-async fn a_full_copy_refuses_while_the_newest_turn_is_still_landing() {
-    let pool = pool().await;
-    let workspace = workspace_id("fork-lag");
-    seed_session(&pool, &workspace, "source-session").await;
-    let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
-
-    let (first, second) = (
-        TurnId::from(MessageId::new()),
-        TurnId::from(MessageId::new()),
-    );
-    let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
-    let cut = id_of(&branch_point);
-    storage
-        .save_checkpoint(
-            "source-session".to_string(),
-            checkpoint(
-                "source-session",
-                vec![
-                    entry(
-                        first,
-                        Message::User(UserMessage::text(MessageId::new(), "q")),
-                    ),
-                    entry(first, assistant("stored")),
-                    entry(second, branch_point),
-                ],
-            ),
-        )
-        .await
-        .unwrap();
-
-    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
-    assert_eq!(
-        storage
-            .fork_session(
-                "source-session",
-                ForkCut::All,
-                ForkSource::Live { root_messages: 5 }
-            )
-            .await,
-        Err(ForkError::Lagging {
-            expected: 5,
-            found: 3
-        }),
-        "the caller has two more messages than the database does"
-    );
-
-    // The same lag must not block a cut: what has not landed yet belongs to the
-    // turn the cut branches away from, which was never going to be copied.
-    let forked = storage
-        .fork_session(
-            "source-session",
-            ForkCut::At(cut),
-            ForkSource::Live { root_messages: 5 },
-        )
-        .await
-        .expect("a cut is unaffected by a turn still in flight");
-    assert_eq!(
-        threads_of(&pool, &workspace, &forked.session_id).await,
-        vec![(forked.session_id.clone(), 2)]
-    );
 }
 
 /// What a fork carries over from the source besides its messages.

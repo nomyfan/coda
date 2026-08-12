@@ -51,16 +51,14 @@ async fn stored_messages(storage: &SlowStorage, thread_id: &str) -> Vec<Message>
         .unwrap_or_default()
 }
 
-/// The window this whole design is shaped around: a sub-agent replies to its
-/// caller *before* saving its own checkpoint, so the root turn can settle — and
-/// the hub can call itself idle — while that write is still in flight. Truncate
-/// then, and the late write puts the discarded tail straight back, because
-/// against a lowered message count it reads as ordinary growth.
-///
-/// Stopping the runtime first is the only barrier that rules this out. Drop the
-/// `shutdown` from `handle_rewind` and this test fails.
+/// A rewind cannot race a sub-agent's checkpoint write, because by the time it
+/// gets a chance there is no write left in flight. A sub-agent hands its reply
+/// to the caller only once its own checkpoint is durable, and the caller cannot
+/// reach the end of the turn without that reply — so stalling the write by
+/// 300ms stalls the whole turn, rather than letting the root settle ahead of the
+/// database and leaving a late write to put discarded history back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved() {
+async fn a_rewind_cannot_race_a_sub_agents_checkpoint_write() {
     let opener = Arc::new(TestOpener::delegating(
         "reply",
         Some(Duration::from_millis(300)),
@@ -68,13 +66,13 @@ async fn a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved() {
     let storage = opener.storage.clone();
     let (hub, mut events, first_turn) = session_with_one_turn(opener).await;
 
-    // The root turn has settled, so the hub considers the session idle — but
-    // `explore` is still inside its stalled checkpoint write.
+    // The root turn has settled and the hub calls the session idle, so the
+    // stalled write must already have landed.
     assert!(
-        stored_messages(&storage, explore_thread().as_ref())
+        !stored_messages(&storage, explore_thread().as_ref())
             .await
             .is_empty(),
-        "the sub-agent's write must still be in flight for this test to mean anything"
+        "the root turn settled while the sub-agent's checkpoint was still unwritten"
     );
 
     let outcome = hub
@@ -91,17 +89,11 @@ async fn a_rewind_waits_out_a_sub_agent_that_replied_before_it_saved() {
     assert!(matches!(outcome, CommandOutcome::Rewound { .. }));
     next_matching(&mut events, is_settling_llm_end).await;
 
-    // Outlast the stall before looking. Without the barrier the truncation runs
-    // first and the stalled write lands *after* it — but the replacement turn
-    // finishes in microseconds, so an assertion taken straight after it would
-    // read the sub-agent's thread while the damaging write is still asleep and
-    // see the empty history it expects for entirely the wrong reason.
-    tokio::time::sleep(Duration::from_millis(900)).await;
     assert!(
         stored_messages(&storage, explore_thread().as_ref())
             .await
             .is_empty(),
-        "the sub-agent's late checkpoint must not restore the turn that was discarded"
+        "the rewind left the sub-agent's discarded history behind"
     );
 }
 

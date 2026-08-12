@@ -106,14 +106,15 @@ fn fold_orders_stale_cleanup_before_user() {
     // History order on a stale-envelope turn: aborted ToolMessages first,
     // then the new user prompt, then the assistant reply.
     let mut snapshot = vec![];
-    let mut users = VecDeque::from([user("new task")]);
+    let turn = TurnId::from(MessageId::new());
+    let mut users = Some((turn, user("new task")));
     let mut log = EventLog::new(RelayConfig::default());
     log.push(tool_end("coda", tool_message("stale1", "aborted")));
     log.push(tool_end("coda", tool_message("stale2", "aborted")));
     log.push(chunk("coda", "hi"));
     log.push(llm_end("coda", assistant("reply")));
 
-    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda");
+    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda", turn);
 
     assert_eq!(snapshot.len(), 4);
     assert!(matches!(&snapshot[0], Message::Tool(t) if t.id == "stale1"));
@@ -121,13 +122,14 @@ fn fold_orders_stale_cleanup_before_user() {
     assert!(matches!(&snapshot[2], Message::User(_)));
     assert!(matches!(&snapshot[3], Message::Assistant(a) if a.content == "reply"));
     assert!(log.entries.is_empty());
-    assert!(users.is_empty());
+    assert!(users.is_none());
 }
 
 #[test]
 fn fold_skips_subagent_and_chunk_events() {
     let mut snapshot = vec![];
-    let mut users = VecDeque::from([user("task")]);
+    let turn = TurnId::from(MessageId::new());
+    let mut users = Some((turn, user("task")));
     let mut log = EventLog::new(RelayConfig::default());
     log.push(chunk("coda", "x"));
     log.push(llm_end("coda", assistant("delegating")));
@@ -139,7 +141,7 @@ fn fold_skips_subagent_and_chunk_events() {
     ));
     log.push(llm_end("coda", assistant("done")));
 
-    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda");
+    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda", turn);
 
     // user, assistant(delegating), tool(agent_call), assistant(done)
     assert_eq!(snapshot.len(), 4);
@@ -151,17 +153,38 @@ fn fold_skips_subagent_and_chunk_events() {
 
 #[test]
 fn fold_tolerates_missing_user_for_resumed_turns() {
+    let turn = TurnId::from(MessageId::new());
     let mut snapshot = vec![];
-    let mut users = VecDeque::new();
+    let mut users = None;
     let mut log = EventLog::new(RelayConfig::default());
     log.push(tool_end("coda", tool_message("resolved", "ok")));
     log.push(llm_end("coda", assistant("after resume")));
 
-    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda");
+    fold_settled_turn(&mut snapshot, &mut users, &mut log, "coda", turn);
 
     assert_eq!(snapshot.len(), 2);
     assert!(matches!(&snapshot[0], Message::Tool(t) if t.id == "resolved"));
     assert!(matches!(&snapshot[1], Message::Assistant(_)));
+}
+
+#[test]
+fn settling_an_old_turn_reports_a_newer_user_message_still_unsettled() {
+    let old_turn = TurnId::from(MessageId::new());
+    let new_turn = TurnId::from(MessageId::new());
+    let mut snapshot = vec![];
+    let mut user_message = Some((new_turn, user("new task")));
+    let mut log = EventLog::new(RelayConfig::default());
+    log.push(llm_end("coda", assistant("old answer")));
+
+    let turn_running =
+        fold_settled_turn(&mut snapshot, &mut user_message, &mut log, "coda", old_turn);
+
+    assert!(turn_running);
+    assert!(matches!(user_message, Some((turn, _)) if turn == new_turn));
+    assert!(
+        matches!(snapshot.as_slice(), [Message::Assistant(message)] if message.content == "old answer")
+    );
+    assert!(log.entries.is_empty());
 }
 
 // --- event_settles_turn --------------------------------------------------

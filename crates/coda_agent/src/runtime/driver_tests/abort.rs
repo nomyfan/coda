@@ -5,6 +5,7 @@ use super::super::*;
 use super::fixtures::*;
 use crate::{
     AbortedTarget, AgentEvent, AgentSpec, StoredCheckpoint, SubAgentMode, ToolApprovalMode,
+    runtime::MemoryStorage,
 };
 use coda_core::llm::{Message, ToolCallOutcome, ToolOutput};
 use std::sync::Arc;
@@ -267,8 +268,13 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     .await
     .expect("checkpoint was not saved after generation abort");
 
-    harness.shutdown().await;
     result.expect("timed out waiting for generation abort");
+    harness
+        .runtime
+        .send_message(user_task(&harness.thread_id, "next"))
+        .await
+        .expect("a durably aborted turn releases the next task");
+    harness.shutdown().await;
     assert!(matches!(
         checkpoint.resume_point,
         crate::persist::StoredResumePoint::Generation
@@ -281,4 +287,304 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                 && message.content.contains("interrupted by the user")
                 && message.reasoning_content.as_deref() == Some("partial reasoning")
     ));
+}
+
+/// An abort travels up the call tree, not across it: each thread waits for the
+/// sub-agents it already dispatched to answer for themselves. The deepest one
+/// here cannot write, so nothing above it may declare the turn over — its work
+/// is not in storage yet, and the whole point of announcing last is that what
+/// the user sees is already saved.
+#[tokio::test]
+async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_team(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![
+            AgentSpec {
+                name: "explore".into(),
+                description: String::new(),
+                system_prompt: "nested-explore".into(),
+                mode: SubAgentMode::Stateful,
+                tools: vec![],
+                subagents: vec!["probe".into()],
+            },
+            AgentSpec {
+                name: "probe".into(),
+                description: String::new(),
+                system_prompt: "explore-plain".into(),
+                mode: SubAgentMode::Stateless,
+                tools: vec![],
+                subagents: vec![],
+            },
+        ],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+    let gate = storage.hold_checkpoints_of("probe").await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::ToolCallStart(call)) = (agent_name.as_str(), event)
+                && call.name == "probe"
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the deepest call to be dispatched");
+
+    harness.runtime.request_abort().await;
+
+    // Nothing may end the turn while the bottom of the tree is still writing.
+    let premature = timeout(Duration::from_millis(300), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Aborted(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        premature.is_err(),
+        "the root announced the abort before the deepest thread was durable"
+    );
+
+    gate.release().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::Aborted(_)) => return,
+                (_, AgentEvent::PersistFailed(err)) => panic!("unexpected persist failure: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the root never announced the abort once the write landed");
+
+    assert!(
+        storage.checkpoint(&harness.thread_id).await.is_some(),
+        "the root's own state should be durable too"
+    );
+    harness.shutdown().await;
+}
+
+/// Aborting instead of answering an approval prompt is an ordinary thing to do.
+/// The parked sub-agent has no envelope coming to wake it, so the abort has to
+/// push it — and it must wind up and reply rather than sit there until the root
+/// gives up and reports a persistence failure.
+#[tokio::test]
+async fn aborting_instead_of_answering_an_approval_winds_the_subagent_up() {
+    let (root, subagents) = explore_read_todos_specs("main-system");
+    let mut harness = Harness::start_with_team(
+        MemoryStorage::default(),
+        root,
+        subagents,
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
+        "inspect",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::Suspended(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to suspend");
+
+    // No resume decision — the user stops the turn instead of answering.
+    harness.runtime.request_abort().await;
+
+    let mut subagent_wound_up = false;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("explore", AgentEvent::Aborted(_)) => subagent_wound_up = true,
+                ("coda", AgentEvent::Aborted(_)) => return,
+                (_, AgentEvent::PersistFailed(err)) => panic!("unexpected persist failure: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the parked sub-agent was never pushed to wind up");
+    assert!(
+        subagent_wound_up,
+        "the root ended the turn without the sub-agent answering for itself"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A sub-agent that never answers must not keep the root waiting forever. What
+/// the root says when it gives up matters as much as that it does: the turn's
+/// content never reached storage, so it reports that and lets the session
+/// rebuild from what really is there. Announcing the turn stopped would be a
+/// success signal for work that was never saved.
+#[tokio::test]
+async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_team(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "explore-plain".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+    // Never released: the sub-agent is stuck saving, so it can neither finish
+    // nor answer, which is the only way a wind-up genuinely hangs.
+    let _wedged = storage.hold_checkpoints_of("explore").await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("explore", AgentEvent::LLMStart(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the sub-agent to start");
+
+    harness.runtime.request_abort().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::PersistFailed(_)) => return,
+                ("coda", AgentEvent::Aborted(_)) => {
+                    panic!("the root announced the turn stopped without its content being saved")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the root waited on the wedged sub-agent indefinitely");
+
+    // Whatever wedged the wind-up is still wedged when the session is asked to
+    // stop, and asking is not enough: neither Exit nor Abort reaches a task
+    // parked inside a write. Shutting down has to end it anyway — a caller that
+    // waits it out never gets its session back, and the key stays locked behind
+    // the release that never returned.
+    harness.runtime.cancel_in_flight().await;
+    harness.runtime.request_exit().await;
+    assert!(
+        !harness
+            .runtime
+            .wait_for_exit(Some(Duration::from_millis(300)))
+            .await,
+        "nothing was wedged, so this proves nothing about the deadline"
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            harness.runtime.wait_for_exit(None)
+        )
+        .await
+        .expect("an agent task outlived the shutdown deadline"),
+    );
+}
+
+/// The settle wait must leave the stragglers running, or the cancel-then-wait
+/// steps a graceful shutdown follows it with have nothing left to reach.
+#[tokio::test]
+async fn a_settle_wait_leaves_the_stragglers_running() {
+    let storage = TestStorage::default();
+    let mut harness = Harness::start_with_spec(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "abort-generation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::with_hold_generation(Arc::new(Notify::new())),
+        ToolApprovalMode::Auto,
+        "abort generation",
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::LLMContentChunk(_)) = (agent_name.as_str(), event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the generation to start");
+
+    // The generation is parked on a gate no `Exit` can reach, so this runs out.
+    harness.runtime.request_exit().await;
+    assert!(
+        !harness
+            .runtime
+            .wait_for_settle(Duration::from_millis(200))
+            .await
+    );
+
+    // What proves it survived: cancelling now still produces the aborted
+    // checkpoint. After a hard drop no task would be left to write it.
+    harness.runtime.cancel_in_flight().await;
+    assert!(
+        harness
+            .runtime
+            .wait_for_exit(Some(Duration::from_secs(2)))
+            .await,
+        "the cancelled generation never wound up"
+    );
+    let checkpoint = harness
+        .storage
+        .checkpoint(&harness.thread_id)
+        .await
+        .expect("the cancelled generation saved nothing");
+    assert!(
+        checkpoint
+            .messages
+            .iter()
+            .any(|entry| matches!(&entry.message, Message::Assistant(msg) if msg.aborted)),
+        "the aborted partial message never reached the checkpoint"
+    );
 }

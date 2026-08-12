@@ -16,7 +16,7 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
-use coda_core::llm::{LLMProvider, Message, MessageId};
+use coda_core::llm::{LLMProvider, Message, MessageId, TurnId};
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +53,10 @@ impl EventOrigin {
 pub struct SessionEvent {
     pub origin: EventOrigin,
     pub thread_id: ThreadId,
+    /// The submission this event belongs to. Shared by every agent the turn
+    /// reaches, so a consumer can settle per turn without working out the call
+    /// tree for itself.
+    pub turn_id: TurnId,
     pub kind: AgentEvent,
 }
 
@@ -69,49 +73,42 @@ pub enum SessionStreamItem {
     Lagged(u64),
 }
 
-/// What to do when a graceful shutdown hits its timeout.
-#[derive(Debug, Clone, Copy)]
-pub enum OnTimeout {
-    /// Return `false` from `shutdown` and leave agents running.
-    Return,
-    /// Abort all in-flight work and wait (unbounded) for full shutdown.
-    Abort,
-}
+/// How long a cancelled runtime is given to stop on its own before its tasks
+/// are dropped where they stand.
+///
+/// Cancellation is a request, and a task parked inside a write or a stream
+/// never reads it. Past this point the only thing left that ends such a task is
+/// dropping it — and something has to, because callers reopen the session the
+/// moment shutdown returns.
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
 /// Shutdown strategy for [`Session::shutdown`].
 #[derive(Debug, Clone, Copy)]
 pub enum Shutdown {
-    Graceful {
-        /// `None` waits unbounded for agents to exit (`on_timeout` never fires).
-        timeout: Option<Duration>,
-        on_timeout: OnTimeout,
-    },
+    /// Ask the agents to exit, giving them `timeout` to finish what they are
+    /// doing before they are cancelled and, failing that, dropped.
+    Graceful { timeout: Option<Duration> },
+    /// Cancel in-flight work up front rather than letting it finish.
     Abort,
 }
 
 impl Shutdown {
-    pub fn graceful(timeout: Duration) -> Self {
-        Shutdown::Graceful {
-            timeout: Some(timeout),
-            on_timeout: OnTimeout::Return,
-        }
-    }
-
     pub fn graceful_then_abort(timeout: Duration) -> Self {
         Shutdown::Graceful {
             timeout: Some(timeout),
-            on_timeout: OnTimeout::Abort,
         }
     }
 
     /// Wait unbounded for in-flight work to reach its next checkpoint and the
-    /// agents to exit; never aborts. `shutdown` returning `true` is then a
-    /// durability barrier: every agent's final checkpoint is on disk.
+    /// agents to exit; never cancels anything. `shutdown` returning `true` is
+    /// then a durability barrier: every agent's final checkpoint is on disk.
+    ///
+    /// The price of never cutting a turn short is that this alone among the
+    /// modes can fail to return at all, so it is only for callers that know
+    /// nothing is wedged — a session already judged idle, say. A caller
+    /// reacting to something being wrong wants a deadline.
     pub fn graceful_unbounded() -> Self {
-        Shutdown::Graceful {
-            timeout: None,
-            on_timeout: OnTimeout::Return,
-        }
+        Shutdown::Graceful { timeout: None }
     }
 
     pub fn abort() -> Self {
@@ -316,22 +313,15 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         // can't mask coverage bugs by silently disappearing into bootstrap.
         resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
 
-        let has_resuming_agents = snapshot.as_ref().is_some_and(|snapshot| {
-            !snapshot.active_threads.is_empty()
-                || snapshot
-                    .agent_drained_envelopes
-                    .values()
-                    .any(|v| !v.is_empty())
-                || snapshot.drained_envelopes.values().any(|v| !v.is_empty())
-        });
-
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();
-        runtime
+        // Answered by bootstrap, not the snapshot: it drops what will never run.
+        let has_resuming_agents = runtime
             .bootstrap(agents, snapshot, resume_decisions, run_config)
-            .await;
+            .await
+            .map_err(OpenError::Storage)?;
 
         Ok(Session {
             inner: Arc::new(SessionInner {
@@ -400,7 +390,7 @@ struct SessionInner {
     session_id: String,
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
-    events_rx: Mutex<broadcast::Receiver<(String, ThreadId, AgentEvent)>>,
+    events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
 }
 
 /// High-level handle to a running agent session.
@@ -422,10 +412,13 @@ impl Session {
         &self.inner.root_name
     }
 
-    /// `true` when the snapshot indicates that at least one agent has in-flight
-    /// work (active thread, or queued envelopes) and will therefore emit events
-    /// immediately after `open` — without waiting for a `send`. Callers should
-    /// enter the event loop directly instead of prompting for user input first.
+    /// `true` when at least one agent picked up in-flight work at `open` (an
+    /// active thread, or a replayed envelope) and will therefore emit events
+    /// without waiting for a `send`. Callers should enter the event loop
+    /// directly instead of prompting for user input first.
+    ///
+    /// What recovery really resumed, not what the snapshot held: a turn that
+    /// ended in another process is thrown out first.
     pub fn has_resuming_agents(&self) -> bool {
         self.inner.has_resuming_agents
     }
@@ -442,6 +435,8 @@ impl Session {
     /// `message_id` becomes the identity of the user message this task turns
     /// into. The caller supplies it because it also needs to label its own copy
     /// of that message (the live snapshot) and answer the client with it.
+    /// Returns [`SendCommandError::TurnAlreadyActive`] until the previous turn
+    /// has reached its final, durable ending; suspension does not release it.
     ///
     /// `images` is a list of base64 data-URIs (`data:image/<fmt>;base64,<b64>`)
     /// or HTTPS URLs. Pass an empty `Vec` for text-only turns.
@@ -533,37 +528,45 @@ impl Session {
         }
     }
 
-    /// Stop the session. Returns `true` when all agents exited within the
-    /// requested policy (or immediately, for `Shutdown::Abort`).
+    /// Stop the session. Returns whether the agents stopped of their own accord
+    /// within the requested policy; every mode but `graceful_unbounded` also
+    /// guarantees that none of them is still running once this returns.
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
         match mode {
-            Shutdown::Graceful {
-                timeout,
-                on_timeout,
-            } => {
+            Shutdown::Graceful { timeout } => {
                 self.inner.runtime.request_exit().await;
-                let ok = self.inner.runtime.wait_for_exit(timeout).await;
-                if !ok {
-                    match on_timeout {
-                        OnTimeout::Return => false,
-                        OnTimeout::Abort => {
-                            self.inner.runtime.request_abort().await;
-                            self.inner.runtime.wait_for_exit(None).await
-                        }
-                    }
-                } else {
-                    true
+                let Some(duration) = timeout else {
+                    return self.inner.runtime.wait_for_exit(None).await;
+                };
+                if self.inner.runtime.wait_for_settle(duration).await {
+                    return true;
                 }
+                // Exiting is something an agent does between pieces of work, so
+                // one that missed the deadline is inside a piece. Cancelling
+                // reaches the ones that are watching for it; the wait after is
+                // what ends the rest.
+                self.inner.runtime.cancel_in_flight().await;
+                self.inner
+                    .runtime
+                    .wait_for_exit(Some(TERMINATION_GRACE))
+                    .await;
+                false
             }
             Shutdown::Abort => {
-                self.inner.runtime.request_abort().await;
+                self.inner.runtime.cancel_in_flight().await;
                 self.inner.runtime.request_exit().await;
-                self.inner.runtime.wait_for_exit(None).await
+                self.inner
+                    .runtime
+                    .wait_for_exit(Some(TERMINATION_GRACE))
+                    .await
             }
         }
     }
 
-    fn wrap_event(&self, (name, thread_id, kind): (String, ThreadId, AgentEvent)) -> SessionEvent {
+    fn wrap_event(
+        &self,
+        (name, thread_id, turn_id, kind): (String, ThreadId, TurnId, AgentEvent),
+    ) -> SessionEvent {
         let origin = if name == self.inner.root_name {
             EventOrigin::Root
         } else {
@@ -572,6 +575,7 @@ impl Session {
         SessionEvent {
             origin,
             thread_id,
+            turn_id,
             kind,
         }
     }

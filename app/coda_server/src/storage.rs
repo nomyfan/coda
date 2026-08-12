@@ -446,7 +446,7 @@ impl WorkspaceStorage {
                     return Err(ForkError::SourceNotIdle { thread_id });
                 }
 
-                let keep = self.retained_turns(conn, source_id, &cut, source).await?;
+                let keep = self.retained_turns(conn, source_id, &cut).await?;
 
                 let checkpoints = thread_checkpoints::table
                     .filter(
@@ -606,7 +606,6 @@ impl WorkspaceStorage {
         conn: &mut AsyncPgConnection,
         source_id: &str,
         cut: &ForkCut,
-        source: ForkSource,
     ) -> Result<Vec<uuid::Uuid>, ForkError> {
         let root_thread = messages::table.filter(
             messages::workspace_id
@@ -628,20 +627,10 @@ impl WorkspaceStorage {
                     .optional()?
                     .ok_or(ForkError::CutNotFound)?,
             ),
-            // A full copy has no cut to anchor it, so the runtime's own history
-            // length is what tells "everything" from "everything stored so far".
-            ForkCut::All => {
-                if let ForkSource::Live { root_messages } = source {
-                    let stored: i64 = root_thread.count().get_result(conn).await?;
-                    if (stored as usize) < root_messages {
-                        return Err(ForkError::Lagging {
-                            expected: root_messages,
-                            found: stored as usize,
-                        });
-                    }
-                }
-                None
-            }
+            // A full copy has no cut to anchor it, and needs none: a turn is
+            // announced only once its content is stored, so a source the gate
+            // found at rest has nothing left in flight to wait for.
+            ForkCut::All => None,
         };
 
         // No such check for a cut, because the turn it opens is the one turn a
@@ -857,9 +846,8 @@ pub enum ForkCut {
 /// cannot see it for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkSource {
-    /// Attached and at rest. `root_messages` is the runtime's root history
-    /// length; a shorter database means the newest turn has not landed yet.
-    Live { root_messages: usize },
+    /// Attached and at rest.
+    Live,
     /// Nothing attached, so the stored state is the whole truth — including a
     /// runtime snapshot, which is only rewritten when an agent exits and
     /// therefore speaks for the source only here.
@@ -878,13 +866,9 @@ pub struct ForkedSession {
 pub enum ForkError {
     /// No such session in this workspace.
     SourceNotFound,
-    /// No such user message on the source's root thread. Also covers a cut that
-    /// simply has not been persisted yet — indistinguishable here, so the caller
-    /// decides whether to retry.
+    /// No such user message on the source's root thread.
     CutNotFound,
-    /// A thread is not parked at a plain generation boundary. Whether that is
-    /// permanent or just a checkpoint still in flight depends on whether the
-    /// source is live, which only the caller knows.
+    /// A thread is not parked at a plain generation boundary.
     ThreadBusy {
         thread_id: String,
     },
@@ -892,12 +876,6 @@ pub enum ForkError {
     /// resume. The same source would be refused as busy while live.
     SourceNotIdle {
         thread_id: String,
-    },
-    /// The stored root history is shorter than the caller's, so the newest turn
-    /// has not landed yet.
-    Lagging {
-        expected: usize,
-        found: usize,
     },
     /// A thread's retained messages are not `[0, count)`. Retained turns are
     /// always a prefix, so this means that invariant broke upstream.
@@ -921,10 +899,6 @@ impl std::fmt::Display for ForkError {
             Self::SourceNotIdle { thread_id } => {
                 write!(f, "thread {thread_id} has work queued from a previous run")
             }
-            Self::Lagging { expected, found } => write!(
-                f,
-                "the session's newest turn is not stored yet ({found} of {expected} messages)"
-            ),
             Self::HistoryNotContiguous { thread_id } => {
                 write!(f, "thread {thread_id} would be copied with a gap")
             }

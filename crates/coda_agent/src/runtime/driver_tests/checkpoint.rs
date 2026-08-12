@@ -5,10 +5,13 @@
 use super::super::*;
 use super::fixtures::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode, runtime::MemoryStorage,
+    AgentEvent, AgentSpec, AgentTeam, SubAgentMode, ToolApprovalMode,
+    persist::StoredResumePoint,
+    runtime::{MemoryStorage, SendCommandError, SessionStorage},
 };
 use coda_core::llm::{Message, ToolOutput};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -32,7 +35,8 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
     runtime
         .bootstrap(agents, None, HashMap::new(), config)
-        .await;
+        .await
+        .expect("bootstrap");
 
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
 
@@ -242,4 +246,287 @@ async fn user_task_is_checkpointed_before_turn_completes() {
     ));
 
     harness.shutdown().await;
+}
+
+/// Everything the runtime emits over a short window — for asserting about what
+/// did *not* happen as much as what did.
+async fn drain_events(harness: &mut Harness<TestStorage>) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    let _ = timeout(Duration::from_millis(200), async {
+        loop {
+            let (_, _, event) = harness.next_event().await;
+            seen.push(event);
+        }
+    })
+    .await;
+    seen
+}
+
+fn persist_failures(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::PersistFailed(_)))
+        .count()
+}
+
+/// Drive events until the root agent ends its turn.
+async fn root_turn_end(harness: &mut Harness<TestStorage>) {
+    loop {
+        let (agent_name, _, event) = harness.next_event().await;
+        if let ("coda", AgentEvent::LLMEnd(message)) = (agent_name.as_str(), event)
+            && message.tool_calls.is_empty()
+        {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_turn_cannot_end_while_a_subagent_checkpoint_is_unwritten() {
+    // A sub-agent's reply is the only thing that lets its caller carry on, so
+    // sending that reply only after the sub-agent's own checkpoint is durable
+    // is what keeps the caller from ever getting ahead of the database.
+    // Holding the write hostage is what makes the ordering observable: if the
+    // reply still escapes, the root finishes the turn while the sub-agent's
+    // history is nowhere on disk — which is exactly the copy `fork` would make.
+    let storage = TestStorage::default();
+    let gate = storage.hold_checkpoints_of("explore").await;
+
+    let mut harness = Harness::start_with_team(
+        storage.clone(),
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "main-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "explore-plain".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![],
+            subagents: vec![],
+        }],
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        "inspect",
+    )
+    .await;
+
+    assert!(
+        timeout(Duration::from_millis(200), root_turn_end(&mut harness))
+            .await
+            .is_err(),
+        "the root ended its turn while the sub-agent's checkpoint was still unwritten"
+    );
+
+    gate.release().await;
+
+    timeout(Duration::from_secs(2), root_turn_end(&mut harness))
+        .await
+        .expect("the root never finished after the sub-agent's checkpoint landed");
+
+    harness.shutdown().await;
+}
+
+/// A root agent that does one plain turn, so a test can aim a storage failure
+/// at a chosen write and watch what the turn does about it.
+async fn plain_root(storage: TestStorage, task: &str) -> Harness<TestStorage> {
+    Harness::start_with_spec(
+        storage,
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "plain-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec![],
+        },
+        TestProvider::default(),
+        ToolApprovalMode::Auto,
+        task,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_turn_that_cannot_store_its_prompt_never_starts() {
+    // The opening write is the turn's first act. If the prompt is not on disk
+    // there is nothing to hang the turn off, so calling the model would only
+    // pile content onto a turn whose beginning does not exist — and burn tokens
+    // doing it.
+    let storage = TestStorage::default();
+    storage.fail_checkpoints_after(0).await;
+    let mut harness = plain_root(storage, "go").await;
+
+    let events = drain_events(&mut harness).await;
+    assert_eq!(persist_failures(&events), 1, "events: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::LLMStart(_))),
+        "the model was called for a turn whose prompt was never stored: {events:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_root_checkpoint_load_failure_reports_and_releases_the_turn() {
+    let storage = TestStorage::default();
+    storage.fail_checkpoint_loads().await;
+    let mut harness = plain_root(storage, "go").await;
+
+    let failure = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::PersistFailed(error)) = (agent_name.as_str(), event) {
+                return error;
+            }
+        }
+    })
+    .await
+    .expect("the checkpoint load failure was not reported");
+    assert!(failure.contains("failed to load checkpoint"), "{failure}");
+    assert!(
+        timeout(Duration::from_millis(100), harness.next_event())
+            .await
+            .is_err(),
+        "one checkpoint load failure was reported more than once"
+    );
+
+    harness
+        .runtime
+        .send_message(user_task(&harness.thread_id, "try again"))
+        .await
+        .expect("the failed root loop left its turn registered");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_turn_that_cannot_store_its_result_never_announces_it() {
+    // The prompt lands, the model answers, and the closing write fails. The
+    // reply exists only in memory at that point, so announcing it would tell
+    // every reader the turn is done while the database says it never happened.
+    let storage = TestStorage::default();
+    storage.fail_checkpoints_after(1).await;
+    let mut harness = plain_root(storage, "go").await;
+
+    let events = drain_events(&mut harness).await;
+    assert_eq!(persist_failures(&events), 1, "events: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::LLMStart(_))),
+        "the turn should have got as far as calling the model: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::LLMEnd(_))),
+        "the turn announced a result it had not stored: {events:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unexpected_envelope_that_cannot_be_stored_reports_once() {
+    // The third write point: `handle_envelope` bailing out early. It shares the
+    // same helper as the other two, and this pins that it also reports the
+    // failure exactly once rather than falling through the gap where there is
+    // no turn ending to withhold.
+    let storage = TestStorage::default();
+    let mut harness = plain_root(storage.clone(), "go").await;
+    timeout(Duration::from_secs(2), root_turn_end(&mut harness))
+        .await
+        .expect("the opening turn should finish");
+
+    // Both of the opening turn's writes are spent; the next one fails.
+    storage.fail_checkpoints_after(0).await;
+    harness
+        .runtime
+        .send_message(Envelope::with_id(|id| Envelope {
+            id,
+            from: Sender::User,
+            to: Receiver {
+                name: "coda".into(),
+                thread_id: harness.thread_id.clone(),
+            },
+            reply_to: None,
+            body: EnvelopeBody::Reply {
+                aborted: false,
+                call_id: "nobody-asked".into(),
+                output: ToolOutput::Ok("stray".into()),
+            },
+        }))
+        .await
+        .expect("send stray reply");
+
+    let events = drain_events(&mut harness).await;
+    assert_eq!(persist_failures(&events), 1, "events: {events:?}");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
+    let storage = MemoryStorage::default();
+    let coda = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "main-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: vec![],
+        subagents: vec!["explore".into()],
+    };
+    let explore = AgentSpec {
+        name: "explore".into(),
+        description: String::new(),
+        system_prompt: "hold-subagent".into(),
+        mode: SubAgentMode::Stateless,
+        tools: vec![],
+        subagents: vec![],
+    };
+    let team = AgentTeam::new(coda, vec![explore]).expect("valid team");
+    let harness = Harness::start_agents(
+        storage.clone(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
+        ToolApprovalMode::Auto,
+        "t1",
+    )
+    .await;
+
+    // Park the root on a sub-agent reply that never comes, then begin exit. The
+    // drain path may persist messages, but it must not bypass single-flight.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(checkpoint) = storage
+                .load_checkpoint(harness.thread_id.as_ref())
+                .await
+                .expect("load checkpoint")
+                && matches!(checkpoint.resume_point, StoredResumePoint::ToolExecution(ref state) if !state.pending_replies.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the root never parked on a pending reply");
+
+    harness.runtime.request_exit().await;
+    let sent = harness
+        .runtime
+        .send_message(user_task(&harness.thread_id, "t2"))
+        .await;
+    assert!(matches!(sent, Err(SendCommandError::TurnAlreadyActive)));
+    harness
+        .runtime
+        .wait_for_exit(Some(Duration::from_secs(2)))
+        .await;
 }

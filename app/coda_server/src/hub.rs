@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
+    runtime::SendCommandError,
 };
-use coda_core::llm::{Message, MessageId, UserMessage};
+use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
@@ -33,6 +34,12 @@ use crate::wire::WireEvent;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
 pub type ConnId = u64;
+
+/// How long a runtime the hub has already judged broken is given to stop
+/// politely. Short on purpose: the entry has to come back either way, and
+/// whatever the runtime would still write is the state that just failed to
+/// land.
+const BROKEN_RUNTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A command a client issues against an attached session. Plain data only —
 /// see the module docs for why.
@@ -117,8 +124,8 @@ pub enum CommandOutcome {
         message_id: MessageId,
         messages: Vec<Message>,
     },
-    /// A `Rewind` refused because the session is not at rest — a turn is in
-    /// flight, or something is waiting on a human. Nothing was discarded.
+    /// A command refused because the session is not at rest — a turn is in
+    /// flight, or something is waiting on a human. Nothing was changed.
     NotIdle,
     /// A `Rewind` naming a message that is not a user message of this session's
     /// root thread. Nothing was discarded.
@@ -154,9 +161,6 @@ pub enum ForkOutcome {
     /// The source is not at rest — a turn is in flight, something is waiting on
     /// a human, or a task is queued behind the current one.
     NotIdle,
-    /// The database has not caught up with what the client is looking at yet.
-    /// Nothing was written, so the client can simply retry.
-    Retryable(String),
     Failed(ForkError),
 }
 
@@ -302,6 +306,9 @@ pub trait SessionRelay: Send + Sync {
 /// (no tool calls, not aborted — an aborted partial message is always followed
 /// by the `Aborted` marker, which is the single settle signal for that path),
 /// any suspension, or the root agent aborting/erroring.
+///
+/// `PersistFailed` is deliberately not among them: a turn whose content never
+/// reached the database has not finished, whatever the screen already shows.
 pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
     match event {
         WireEvent::LlmEnd {
@@ -394,18 +401,19 @@ impl EventLog {
 ///
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
-/// 2. The turn's user message (front of `unsettled_user_messages`; absent for resumed
-///    turns).
+/// 2. The turn's user message (`unsettled_user_message`; absent for resumed turns).
 /// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
 ///
 /// Sub-agent events and chunk-tier events are skipped (matching what the
-/// checkpoint history holds). The log is cleared afterwards.
+/// checkpoint history holds). The log is cleared afterwards. Returns whether a
+/// different turn's user message remains unsettled.
 fn fold_settled_turn(
     snapshot: &mut Vec<Message>,
-    unsettled_user_messages: &mut VecDeque<Message>,
+    unsettled_user_message: &mut Option<(TurnId, Message)>,
     log: &mut EventLog,
     root_name: &str,
-) {
+    settled: TurnId,
+) -> bool {
     let mut entries = log.iter().peekable();
     while let Some(WireEvent::ToolCallEnd {
         agent_name,
@@ -419,8 +427,12 @@ fn fold_settled_turn(
         snapshot.push(Message::Tool(message.clone()));
         entries.next();
     }
-    if let Some(user) = unsettled_user_messages.pop_front() {
-        snapshot.push(user);
+    if unsettled_user_message
+        .as_ref()
+        .is_some_and(|(turn, _)| *turn == settled)
+        && let Some((_, message)) = unsettled_user_message.take()
+    {
+        snapshot.push(message);
     }
     for event in entries {
         match event {
@@ -438,6 +450,7 @@ fn fold_settled_turn(
         }
     }
     log.clear();
+    unsettled_user_message.is_some()
 }
 
 struct Attachment {
@@ -453,13 +466,18 @@ struct LiveState {
     /// forwarder retires itself.
     generation: u64,
     turn_running: bool,
-    /// The settled conversation history, kept in memory. Authoritative for
-    /// attach snapshots: the driver's final checkpoint lands *after* the settle
-    /// event, so re-reading the persisted state mid-life would race — it is
-    /// only read when an entry is created.
+    /// The settled conversation history, kept in memory and used for attach
+    /// snapshots. Built up here rather than re-read from storage, which is why
+    /// it is only loaded when an entry is created.
+    ///
+    /// It used to be re-reading that was unsafe — the driver's final checkpoint
+    /// landed *after* the settle event, so the database was briefly behind what
+    /// had already been announced. That ordering is reversed now; what remains
+    /// is simply that this is the relay's own composed view.
     snapshot: Vec<Message>,
-    /// User messages of turns that have not settled (and thus not folded) yet.
-    unsettled_user_messages: VecDeque<Message>,
+    /// The active turn's user message until its first settle folds it into the
+    /// snapshot. The id makes repeated settlement of that turn idempotent.
+    unsettled_user_message: Option<(TurnId, Message)>,
     pending_approvals: Vec<PendingApproval>,
     log: EventLog,
 }
@@ -479,7 +497,7 @@ enum EntryPhase {
     /// Freshly inserted; the creating attach initializes it under the entry
     /// lock (which is what serializes concurrent opens of the same key).
     Uninitialized,
-    Live(LiveState),
+    Live(Box<LiveState>),
     /// Approvals-gated open: no runtime yet, resume decisions being collected.
     Pending(PendingState),
     /// Shutdown in progress outside the lock; `done` flips true after the
@@ -494,8 +512,8 @@ enum EntryPhase {
 
 /// What a source session's live state says about forking it.
 enum ForkGate {
-    /// At rest; carries the in-memory history length to check the copy against.
-    Ready(usize),
+    /// At rest.
+    Ready,
     /// Nothing live — the stored state is all there is.
     Cold,
     Busy,
@@ -722,7 +740,7 @@ impl SessionHub {
         provider_id: String,
         reasoning_effort: Option<String>,
         generation: u64,
-    ) -> LiveState {
+    ) -> Box<LiveState> {
         let root_name = session.root_name().to_string();
         let snapshot = session
             .resumed_messages()
@@ -736,17 +754,17 @@ impl SessionHub {
             root_name,
             generation,
         );
-        LiveState {
+        Box::new(LiveState {
             session,
             provider_id,
             reasoning_effort,
             generation,
             turn_running,
             snapshot,
-            unsettled_user_messages: VecDeque::new(),
+            unsettled_user_message: None,
             pending_approvals: Vec::new(),
             log: EventLog::new(self.limits),
-        }
+        })
     }
 
     async fn handle_task(
@@ -758,6 +776,12 @@ impl SessionHub {
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
+        if live.turn_running
+            || !live.pending_approvals.is_empty()
+            || live.unsettled_user_message.is_some()
+        {
+            return CommandOutcome::NotIdle;
+        }
         // This task becomes one user message that gets built twice: once inside
         // the session (its persisted history) and once here (the snapshot served
         // to attaching clients). Mint the id once so both copies — and every
@@ -770,19 +794,19 @@ impl SessionHub {
             .send(message_id, task.clone(), images.clone())
             .await
         {
-            warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
-            return CommandOutcome::Ignored;
+            return match err {
+                SendCommandError::TurnAlreadyActive => CommandOutcome::NotIdle,
+                _ => {
+                    warn!(workspace_id = %key.0, session_id = %key.1, "failed to send task: {err}");
+                    CommandOutcome::Ignored
+                }
+            };
         }
         live.turn_running = true;
-        live.unsettled_user_messages
-            .push_back(Message::User(UserMessage::with_images(
-                message_id, task, &images,
-            )));
-        // A task sent while approvals were pending supersedes them: the driver
-        // writes the discarded calls as aborted ToolMessages (announced via
-        // ToolCallEnd) and starts a fresh turn, so advertising them to a later
-        // attach would offer a resume for work that no longer exists.
-        live.pending_approvals.clear();
+        live.unsettled_user_message = Some((
+            TurnId::from(message_id),
+            Message::User(UserMessage::with_images(message_id, task, &images)),
+        ));
         CommandOutcome::TaskAccepted { message_id }
     }
 
@@ -829,14 +853,14 @@ impl SessionHub {
                 warn!(workspace_id = %key.0, session_id = %key.1, "ignoring rewind while the session is busy");
                 return CommandOutcome::NotIdle;
             }
-            // Stop the runtime before touching the persisted state. "The turn
-            // settled" is not the same as "no agent is still writing": a
-            // sub-agent replies to its caller *before* saving its own
-            // checkpoint, so the root turn can finish while a checkpoint write
-            // is still on its way — and that write carries the history from
-            // before the truncation, which against a lowered message count
-            // reads as ordinary growth. A completed graceful shutdown is the
-            // only barrier in the system that rules this out.
+            // Stop the runtime before touching the persisted state: the
+            // rebuild below opens a second runtime over the same session, and
+            // the two must not overlap on it.
+            //
+            // This used to carry a second job — a sub-agent could reply before
+            // saving, so "the turn settled" did not mean "no agent is still
+            // writing". Replies are now sent only after checkpointing, so the
+            // shutdown is here for the rebuild alone.
             live.session.shutdown(Shutdown::graceful_unbounded()).await;
             (
                 live.provider_id.clone(),
@@ -1304,16 +1328,13 @@ impl SessionRelay for SessionHub {
 
             let gate = match &guard.phase {
                 EntryPhase::Live(live) => {
-                    // `turn_running` alone does not mean idle: tasks may queue
-                    // behind a running turn, and a settled turn clears the flag
-                    // before the next one's first event sets it again.
                     if live.turn_running
                         || !live.pending_approvals.is_empty()
-                        || !live.unsettled_user_messages.is_empty()
+                        || live.unsettled_user_message.is_some()
                     {
                         ForkGate::Busy
                     } else {
-                        ForkGate::Ready(live.snapshot.len())
+                        ForkGate::Ready
                     }
                 }
                 EntryPhase::Pending(_) => ForkGate::Busy,
@@ -1321,11 +1342,7 @@ impl SessionRelay for SessionHub {
             };
 
             let source_state = match gate {
-                // A full copy has no cut to anchor it, so the live history's
-                // length is what tells "everything" from "everything stored so
-                // far". Without a runtime there is nothing to compare against —
-                // but then the stored snapshot is worth checking instead.
-                ForkGate::Ready(root_messages) => ForkSource::Live { root_messages },
+                ForkGate::Ready => ForkSource::Live,
                 ForkGate::Cold => ForkSource::Cold,
                 ForkGate::Busy => {
                     Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
@@ -1342,20 +1359,14 @@ impl SessionRelay for SessionHub {
 
             match forked {
                 Ok(forked) => ForkOutcome::Forked(forked),
-                // These three all mean the same thing from the client's side —
-                // the database has not caught up — and none of them wrote
-                // anything, so retrying is safe. `ThreadBusy` only counts as lag
-                // while the source is live; without a runtime the stored state is
-                // all there is, and it really is parked mid-turn.
-                Err(err @ (ForkError::CutNotFound | ForkError::Lagging { .. })) => {
-                    ForkOutcome::Retryable(err.to_string())
+                // A thread parked mid-turn is exactly that now, live or not: a
+                // turn is announced only once its content is stored, so there is
+                // no longer a lagging write for this to be mistaken for. Same
+                // refusal either way, and the same one the gate's own check
+                // produces.
+                Err(ForkError::ThreadBusy { .. } | ForkError::SourceNotIdle { .. }) => {
+                    ForkOutcome::NotIdle
                 }
-                Err(err @ ForkError::ThreadBusy { .. }) if !borrowed => {
-                    ForkOutcome::Retryable(err.to_string())
-                }
-                // The cold twin of the gate's own busy check, so the same source
-                // is refused the same way whether or not it happens to be open.
-                Err(ForkError::SourceNotIdle { .. }) => ForkOutcome::NotIdle,
                 Err(err) => {
                     warn!(workspace_id = %source.0, session_id = %source.1, "fork rejected: {err}");
                     ForkOutcome::Failed(err)
@@ -1427,7 +1438,11 @@ fn compose_snapshot(phase: &EntryPhase) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
             let mut messages = live.snapshot.clone();
-            messages.extend(live.unsettled_user_messages.iter().cloned());
+            messages.extend(
+                live.unsettled_user_message
+                    .iter()
+                    .map(|(_, message)| message.clone()),
+            );
             Some(SnapshotPayload {
                 messages,
                 pending_approvals: live.pending_approvals.clone(),
@@ -1486,15 +1501,21 @@ fn spawn_event_pipeline(
 
 /// Force the entry to drain and resync from the persisted state: used when
 /// the in-memory event log can no longer be trusted (a lagged broadcast
-/// receiver) or has grown past what it may safely buffer (a runaway turn).
-/// `graceful_unbounded` lets any turn still in flight reach its own
-/// checkpoint before the entry is removed, so the next attach reads a
-/// current, authoritative persisted state instead of the discarded in-memory
-/// one.
+/// receiver, or a checkpoint the database refused) or has grown past what it
+/// may safely buffer (a runaway turn).
+///
+/// `mode` is the caller's read of how the runtime is doing, because that is
+/// what decides whether waiting is a good idea. A log that lagged or overflowed
+/// says nothing about the session itself, so an unbounded wait lets a healthy
+/// turn reach its own checkpoint and the next attach read a current state. A
+/// write that failed says the opposite, and a caller that waits unbounded on a
+/// runtime it just declared broken can wait forever — with the key locked
+/// behind it.
 async fn force_resync(
     entries: &Entries,
     entry: &Arc<SessionEntry>,
     mut guard: EntryGuard,
+    mode: Shutdown,
     reason: String,
 ) {
     error!(
@@ -1502,13 +1523,7 @@ async fn force_resync(
         session_id = %entry.key.1,
         "{reason}; draining session to resync from the persisted state"
     );
-    let release = SessionHub::begin_release(
-        entries,
-        entry,
-        &mut guard,
-        Shutdown::graceful_unbounded(),
-        true,
-    );
+    let release = SessionHub::begin_release(entries, entry, &mut guard, mode, true);
     drop(guard);
     release.await;
 }
@@ -1538,6 +1553,7 @@ async fn run_forwarder(
                     &entries,
                     &entry,
                     guard,
+                    Shutdown::graceful_unbounded(),
                     format!("session event stream lagged by {n}"),
                 )
                 .await;
@@ -1550,9 +1566,10 @@ async fn run_forwarder(
                     AgentEvent::Suspended(approval) => Some(approval.clone()),
                     _ => None,
                 };
+                let turn_id = event.turn_id;
                 let wire = WireEvent::from_session_event(event, &root_name);
-                // A queued task (or restart-resume) starts a turn without a
-                // command flipping the flag; the turn's first event does.
+                // Restart-resume starts work without a command flipping the
+                // flag; the turn's first event does.
                 if let WireEvent::LlmStart { agent_name, .. } = &wire
                     && agent_name == &root_name
                 {
@@ -1564,17 +1581,43 @@ async fn run_forwarder(
                         .tx
                         .send(RelayEvent::Event(Box::new(wire.clone())));
                 }
+                if let WireEvent::PersistFailed { message, .. } = &wire {
+                    // The turn's content never reached the database, so the
+                    // in-memory view is now a claim nothing can back. Drop it
+                    // and let the client rebuild from what is actually stored —
+                    // the same route a lagged stream takes.
+                    //
+                    // On a deadline, though. One way to reach here is a turn
+                    // that gave up on a sub-agent wedged mid-write, and waiting
+                    // out an agent that is already stuck is how the entry never
+                    // comes back at all.
+                    let reason = format!("checkpoint write failed: {message}");
+                    force_resync(
+                        &entries,
+                        &entry,
+                        guard,
+                        Shutdown::graceful_then_abort(BROKEN_RUNTIME_GRACE),
+                        reason,
+                    )
+                    .await;
+                    return;
+                }
                 if event_settles_turn(&wire, &root_name) {
-                    if let Some(approval) = suspended {
-                        live.pending_approvals.push(approval);
+                    match suspended {
+                        Some(approval) => live.pending_approvals.push(approval),
+                        // Any other settlement is final: the turn those
+                        // approvals belonged to is over, and a decision for
+                        // them has no thread left to wake. Kept around, they
+                        // would hold admission and fork at `NotIdle` forever.
+                        None => live.pending_approvals.clear(),
                     }
-                    fold_settled_turn(
+                    live.turn_running = fold_settled_turn(
                         &mut live.snapshot,
-                        &mut live.unsettled_user_messages,
+                        &mut live.unsettled_user_message,
                         &mut live.log,
                         &root_name,
+                        turn_id,
                     );
-                    live.turn_running = false;
                     if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
                         drop(guard);
                         release.await;
@@ -1587,7 +1630,14 @@ async fn run_forwarder(
                     // as a lagged stream rather than grow unbounded.
                     let max = live.log.limits.max_message_tier_events;
                     let reason = format!("event log exceeded {max} buffered message-tier events");
-                    force_resync(&entries, &entry, guard, reason).await;
+                    force_resync(
+                        &entries,
+                        &entry,
+                        guard,
+                        Shutdown::graceful_unbounded(),
+                        reason,
+                    )
+                    .await;
                     return;
                 }
             }

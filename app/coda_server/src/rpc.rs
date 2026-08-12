@@ -62,7 +62,7 @@ pub const NOT_OWNER: i32 = -32002;
 pub const SESSION_NOT_LIVE: i32 = -32003;
 pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
 pub const MODEL_LOCKED: i32 = -32005;
-/// A rewind against a session that still has work in flight or parked.
+/// A command requiring an idle session found work in flight or parked.
 pub const SESSION_NOT_IDLE: i32 = -32006;
 pub const UNKNOWN_WORKSPACE: i32 = -32010;
 pub const INVALID_SESSION_ID: i32 = -32011;
@@ -79,8 +79,6 @@ pub const RENAME_FAILED: i32 = -32022;
 pub const REWIND_FAILED: i32 = -32023;
 pub const FORK_FAILED: i32 = -32024;
 /// A fork the database was not ready for: the cut, or the newest turn, has not
-/// been stored yet. Nothing was written, so the client can just retry.
-pub const FORK_NOT_READY: i32 = -32025;
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
 
 impl RpcError {

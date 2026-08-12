@@ -120,6 +120,12 @@ export type OpenedSession = {
   evicted: boolean;
   /** Created locally via "new session" but not yet opened on the server. */
   draft?: boolean;
+  /** Why the server could not store the last turn. Kept outside `entries` on
+   * purpose: a persist failure drops the session, and the snapshot the client
+   * reattaches with replaces `entries` wholesale — a notice living in there
+   * would be wiped by the very resync it is reporting on. Cleared when the user
+   * dismisses it or a later turn finishes normally. */
+  persistError?: string;
   /** First user task, used as the session list title before the server persists it. */
   firstUserMessage?: string;
   /** A historical message pulled back into the composer to be rewritten.
@@ -727,6 +733,18 @@ function finishAssistant(
   return session;
 }
 
+// Everything a pending approval keeps alive, reset together when the turn it
+// belongs to settles for good.
+const clearedApprovalState: Pick<
+  OpenedSession,
+  "approvals" | "pendingCallInfo" | "drafts" | "allowDrafts"
+> = {
+  approvals: [],
+  pendingCallInfo: {},
+  drafts: {},
+  allowDrafts: {},
+};
+
 function upsertApproval(approvals: PendingApproval[], approval: PendingApproval) {
   const key = approvalKey(approval);
   const index = approvals.findIndex((item) => approvalKey(item) === key);
@@ -762,7 +780,14 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
     case "llm_end": {
       // The turn is finished only when the root agent stops without requesting
       // more tools; otherwise more work (tools / sub-agents) is still pending.
-      const turnComplete = event.agent_name === rootName && event.message.tool_calls.length === 0;
+      // An aborted partial message is not an ending either — the `aborted`
+      // event always follows it and is what actually settles that path. This
+      // mirrors the server's `event_settles_turn`; disagreeing with it would
+      // let a cancelled generation pass for a completed turn.
+      const turnComplete =
+        event.agent_name === rootName &&
+        event.message.tool_calls.length === 0 &&
+        !event.message.aborted;
       const finished = {
         ...addActivity(
           finishAssistant(
@@ -783,6 +808,9 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ),
         running: turnComplete ? false : session.running,
+        // A turn that made it all the way to a stored ending answers the
+        // outstanding "the last one wasn't saved" notice.
+        persistError: turnComplete ? undefined : session.persistError,
         // Recorded here rather than at `tool_start` because a call that suspends
         // for approval and is then rejected never starts at all, and this is the
         // only point that sees the generation's own timing.
@@ -872,6 +900,11 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ],
         running: false,
+        // The root's abort settles the turn (mirroring the server's
+        // `event_settles_turn`), and buries its pending approvals with it: a
+        // decision for them has no thread left to wake, and keeping them
+        // would hold the composer busy forever.
+        ...(event.agent_name === rootName ? clearedApprovalState : {}),
       };
     }
     case "error": {
@@ -900,8 +933,23 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ],
         running: false,
+        // A root error settles the turn like a root abort does; see above.
+        ...(event.agent_name === rootName ? clearedApprovalState : {}),
       };
     }
+    case "persist_failed":
+      // Not a turn ending: `running` stays as it was, because the turn did not
+      // finish — it failed to be recorded. The server drops the session right
+      // after this, and the notice has to outlive that reattach, so it goes on
+      // the session rather than into the transcript.
+      return {
+        ...addActivity(session, {
+          tone: "danger",
+          label: `${event.agent_name || "server"} could not save`,
+          detail: event.message,
+        }),
+        persistError: event.message,
+      };
   }
 }
 
@@ -1679,15 +1727,20 @@ function adoptServerMessageId(server: string, key: SessionKey, entryId: string, 
 
 /** Undo an optimistic user entry whose task never started. The session's title
  * and non-draft flag are left as they are — a later catalog refresh corrects
- * them, and unwinding them here would clobber a session that has other turns. */
-function discardOptimisticTask(server: string, key: SessionKey, entryId: string) {
+ * them, and unwinding them here could clobber newer server state. */
+function discardOptimisticTask(
+  server: string,
+  key: SessionKey,
+  entryId: string,
+  previousRunning: boolean,
+) {
   updateState(codaStore, (state) => {
     const session = draftSession(state, server, key);
     if (!session) {
       return;
     }
     session.entries = session.entries.filter((e) => e.id !== entryId);
-    session.running = false;
+    session.running = previousRunning;
   });
 }
 
@@ -1703,11 +1756,12 @@ async function startTurn(
   images: string[],
 ): Promise<boolean> {
   const key = sessionKey(workspaceId, sessionId);
+  const previousRunning = codaStore.getState().servers[server]?.sessions[key]?.running ?? false;
   const entryId = appendUserMessage(codaStore, server, key, text, images);
   const rpc = rpcFor(server);
   if (!rpc) {
     setServerStatus(codaStore, server, "error", "Connection closed");
-    discardOptimisticTask(server, key, entryId);
+    discardOptimisticTask(server, key, entryId, previousRunning);
     return false;
   }
   try {
@@ -1720,7 +1774,7 @@ async function startTurn(
     adoptServerMessageId(server, key, entryId, message_id);
     return true;
   } catch (err) {
-    discardOptimisticTask(server, key, entryId);
+    discardOptimisticTask(server, key, entryId, previousRunning);
     addSessionActivity(server, workspaceId, sessionId, {
       tone: "danger",
       label: "task rejected",
@@ -2282,26 +2336,6 @@ function closeActiveSession(nextServer?: string, nextKey?: SessionKey) {
   });
 }
 
-/**
- * Send a fork, retrying once if the server says the database has not caught up.
- *
- * The runtime emits events before it writes them, so a reply can be on screen a
- * moment before it is stored. That failure happens before anything is written,
- * which is what makes one retry safe; every other failure propagates, since the
- * server has no request de-duplication and a blind retry could mint a second
- * copy.
- */
-export async function retryWhileNotReady<T>(send: () => Promise<T>): Promise<T> {
-  try {
-    return await send();
-  } catch (err) {
-    if (!isServerError(err) || err.code !== RpcCode.FORK_NOT_READY) {
-      throw err;
-    }
-    return await send();
-  }
-}
-
 /** Identifies the *source* session of a fork, which is what the in-flight flag
  * is scoped to — forking two different sessions at once is fine. */
 export function forkKey(server: string, workspaceId: string, sessionId: string) {
@@ -2352,7 +2386,7 @@ export async function forkSession(
     if (!rpc) {
       throw new Error("Connection closed");
     }
-    const forked = await retryWhileNotReady(() => rpc.request("fork_session", params));
+    const forked = await rpc.request("fork_session", params);
     setCatalog(codaStore, server, forked.workspaces, true);
     openSession(server, workspaceId, forked.session_id);
     if (forkDraft) {
@@ -2465,6 +2499,9 @@ export async function sendTask(task: string, images: string[] = []) {
     return;
   }
   if (!active || active.session.deleting || active.session.starting) {
+    return;
+  }
+  if (active.session.running || active.session.approvals.length > 0) {
     return;
   }
   // A draft/new session must be live before its first task, or the task would
@@ -2708,6 +2745,21 @@ export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern
   setAllowDraftPattern(codaStore, active.server, active.session.key, approval, call, pattern);
 }
 
+/** Dismiss the "the last turn was not saved" notice. The turn stays missing —
+ * this only stops saying so. */
+export function dismissPersistError() {
+  const active = currentActive();
+  if (!active) {
+    return;
+  }
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, active.server, active.session.key);
+    if (session) {
+      session.persistError = undefined;
+    }
+  });
+}
+
 export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
   const active = currentActive();
   if (!active) {
@@ -2941,6 +2993,8 @@ export const selectActiveStarting = (state: CodaStoreState) =>
   activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
   activeSessionOf(state)?.evicted ?? false;
+export const selectActivePersistError = (state: CodaStoreState) =>
+  activeSessionOf(state)?.persistError;
 export const selectActiveApprovals = (state: CodaStoreState) =>
   activeSessionOf(state)?.approvals ?? EMPTY_APPROVALS;
 export const selectActiveDrafts = (state: CodaStoreState) =>

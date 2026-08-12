@@ -68,6 +68,10 @@ pub struct ReplyTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingReply {
     pub call_id: String,
+    /// The envelope that carried this call out, which the answer names in its
+    /// `reply_to`. A `call_id` is only unique within one assistant message, so a
+    /// later turn can reuse one; this is minted per dispatch.
+    pub call_envelope_id: String,
     /// Also the name of the peer agent
     pub tool_name: String,
     pub outcome: ToolCallOutcome,
@@ -237,6 +241,10 @@ pub enum EnvelopeBody {
     Reply {
         call_id: String,
         output: ToolOutput,
+        /// Whether the answering thread was interrupted rather than finishing
+        /// its work. Only the answerer knows this, and the caller needs it to
+        /// record the call as aborted instead of merely failed.
+        aborted: bool,
     },
     Resume(ResumeDecision),
 }
@@ -280,6 +288,10 @@ pub enum AgentEvent {
     /// Emitted when the run is aborted by the user. The stream terminates after this event.
     Aborted(AbortedTarget),
     Error(String), // TODO: make this more structured
+    /// This turn's content could not be written to the database. **Not** a
+    /// turn-ending event: whoever receives it must not treat the turn as
+    /// finished, because what is on screen is not what is stored.
+    PersistFailed(String),
 }
 
 /// Produces the template-variable bindings for a turn — the `{{name}}` values

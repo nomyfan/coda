@@ -7,47 +7,47 @@ use coda_agent::ToolApprovalMode;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
-/// A task sent during a running turn queues rather than being refused, and a
-/// settling turn only pops its own message. So `turn_running` going false does
-/// not mean the session is idle — there may be a task the runtime has not
-/// reached yet, and a fork landing there would copy a session that is about to
-/// grow.
 #[tokio::test]
-async fn forking_is_refused_while_a_task_is_queued_behind_the_current_turn() {
+async fn a_second_task_is_rejected_while_the_first_keeps_fork_busy() {
     let (hub, opener) = hub_and_opener(TestOpener::new("hold", ToolApprovalMode::Auto));
     let _attach = hub
         .attach(key(), 1, "prov".into(), None, false)
         .await
         .expect("attach");
-    for task in ["first", "second"] {
-        let outcome = hub
-            .command(
-                key(),
-                1,
-                SessionCommand::Task {
-                    task: task.into(),
-                    images: vec![],
-                },
-            )
-            .await;
-        assert!(
-            matches!(outcome, CommandOutcome::TaskAccepted { .. }),
-            "a task sent during a running turn queues instead of being refused"
-        );
-    }
+    let first = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "first".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(first, CommandOutcome::TaskAccepted { .. }));
+    let second = hub
+        .command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "second".into(),
+                images: vec![],
+            },
+        )
+        .await;
+    assert!(matches!(second, CommandOutcome::NotIdle));
     assert_eq!(
-        with_live(&hub, |live| live.unsettled_user_messages.len()).await,
-        2,
-        "both submissions are waiting to settle"
+        with_live(&hub, |live| usize::from(
+            live.unsettled_user_message.is_some()
+        ))
+        .await,
+        1,
+        "the rejected task must not enter the hub ledger"
     );
-
-    // The window the forwarder opens between one turn settling and the next
-    // one's first event: the flag is already down, the queue is not empty.
-    with_live(&hub, |live| live.turn_running = false).await;
 
     assert!(
         matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle),
-        "a queued task makes the session busy even with the flag down"
+        "the first task still makes the session busy"
     );
     assert!(
         opener.forks.lock().unwrap().is_empty(),
@@ -75,10 +75,10 @@ async fn forking_a_session_nobody_opened_leaves_no_entry_behind() {
     );
 }
 
-/// A full copy of a live session carries the length the client is looking at, so
-/// storage can tell "everything" from "everything stored so far".
+/// A live session is forked as live, so storage judges it by its checkpoints
+/// rather than by a runtime snapshot that only describes the last shutdown.
 #[tokio::test]
-async fn forking_a_live_session_carries_its_in_memory_length() {
+async fn forking_a_live_session_reports_it_as_live() {
     let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
     let attach = hub
         .attach(key(), 1, "prov".into(), None, false)
@@ -104,8 +104,8 @@ async fn forking_a_live_session_carries_its_in_memory_length() {
     assert!(matches!(outcome, ForkOutcome::Forked(_)));
     assert_eq!(
         opener.forks.lock().unwrap().as_slice(),
-        [(ForkCut::All, ForkSource::Live { root_messages: 2 })],
-        "the settled user message and reply are what the client can see"
+        [(ForkCut::All, ForkSource::Live)],
+        "a live source is judged by its checkpoints, not by a stale snapshot"
     );
     assert!(
         hub.get_entry(&key()).is_some(),
@@ -169,12 +169,13 @@ async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
     );
 }
 
-/// `ThreadBusy` means different things depending on who is asking. With a
-/// runtime attached the session was just checked to be idle, so a thread parked
-/// mid-turn in the database is a checkpoint still in flight — retry. With no
-/// runtime, the stored state is all there is and it really is parked.
+/// `ThreadBusy` used to mean different things depending on who was asking: with
+/// a runtime attached it was read as a checkpoint still in flight and the client
+/// was told to retry. A turn is announced only once its content is stored, so
+/// there is no such write to wait for any more — a thread parked mid-turn is
+/// parked, and both callers get the same refusal.
 #[tokio::test]
-async fn a_busy_thread_is_retryable_only_while_the_source_is_live() {
+async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
     let busy = ForkError::ThreadBusy {
         thread_id: "s1".into(),
     };
@@ -182,10 +183,10 @@ async fn a_busy_thread_is_retryable_only_while_the_source_is_live() {
     let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
     opener.fork_error = Some(busy.clone());
     let (cold_hub, _) = hub_and_opener(opener);
-    assert!(
-        matches!(cold_hub.fork(key(), None).await, ForkOutcome::Failed(_)),
-        "nothing live: the stored state is the whole truth"
-    );
+    assert!(matches!(
+        cold_hub.fork(key(), None).await,
+        ForkOutcome::NotIdle
+    ));
 
     let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
     opener.fork_error = Some(busy);
@@ -194,10 +195,10 @@ async fn a_busy_thread_is_retryable_only_while_the_source_is_live() {
         .attach(key(), 1, "prov".into(), None, false)
         .await
         .expect("attach");
-    assert!(
-        matches!(live_hub.fork(key(), None).await, ForkOutcome::Retryable(_)),
-        "live and idle: the database is only lagging"
-    );
+    assert!(matches!(
+        live_hub.fork(key(), None).await,
+        ForkOutcome::NotIdle
+    ));
 }
 
 /// Storage's own idle check is the cold twin of the gate's, so it has to come
@@ -211,4 +212,84 @@ async fn a_cold_source_holding_queued_work_refuses_like_a_busy_one() {
     let (hub, _) = hub_and_opener(opener);
 
     assert!(matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle));
+}
+
+fn root_answered(event: &RelayEvent) -> bool {
+    matches!(event, RelayEvent::Event(e)
+        if matches!(&**e, WireEvent::LlmEnd { agent_name, message, .. }
+            if agent_name == "coda" && message.tool_calls.is_empty()))
+}
+
+fn explore_started(event: &RelayEvent) -> bool {
+    matches!(event, RelayEvent::Event(e)
+        if matches!(&**e, WireEvent::LlmStart { agent_name, .. } if agent_name == "explore"))
+}
+
+/// A session delegating to a sub-agent whose checkpoint write is slow: whatever
+/// settles has to have waited for it, or a copy taken straight afterwards would
+/// be read from a database that is behind.
+async fn slow_sub_agent_session() -> (SessionHub, BoxStream<'static, RelayEvent>) {
+    let hub = SessionHub::new(
+        Arc::new(TestOpener::delegating(
+            "reply",
+            Some(Duration::from_millis(400)),
+        )),
+        RelayConfig::default(),
+    );
+    let attach = hub
+        .attach(key(), 1, "prov".into(), None, false)
+        .await
+        .expect("attach");
+    (hub, attach.events)
+}
+
+async fn send_task(hub: &SessionHub, task: &str) {
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: task.into(),
+            images: vec![],
+        },
+    )
+    .await;
+}
+
+// Forking used to need a retry: the client could see a turn finish before the
+// database had it, so the copy came back "not stored yet" and the client sent it
+// again. A turn is now announced only once its content is durable, on every
+// path — so each of the three moments that used to lose that race succeeds first
+// time. One session each, because the copy is taken the instant the turn ends.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_the_moment_a_turn_ends_succeeds_first_time() {
+    let (hub, mut events) = slow_sub_agent_session().await;
+    send_task(&hub, "go").await;
+    next_matching(&mut events, root_answered).await;
+    wait_idle(&hub).await;
+
+    assert!(matches!(
+        hub.fork(key(), None).await,
+        ForkOutcome::Forked(_)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_the_moment_an_abort_finishes_succeeds_first_time() {
+    let (hub, mut events) = slow_sub_agent_session().await;
+    send_task(&hub, "go").await;
+    next_matching(&mut events, explore_started).await;
+
+    hub.command(key(), 1, SessionCommand::Abort).await;
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Event(e)
+            if matches!(&**e, WireEvent::Aborted { agent_name, .. } if agent_name == "coda"))
+    })
+    .await;
+    wait_idle(&hub).await;
+
+    assert!(matches!(
+        hub.fork(key(), None).await,
+        ForkOutcome::Forked(_)
+    ));
 }
