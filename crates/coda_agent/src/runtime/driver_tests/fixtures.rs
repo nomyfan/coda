@@ -537,21 +537,22 @@ impl LLMProvider for TestProvider {
             }
             // Two approval-gated calls in sequence, each in its own assistant
             // message, so a test can answer the first batch while the second is
-            // the one actually parked.
+            // the one actually parked. Both deliberately reuse one call id —
+            // legal, since an id only has to be unique within its own assistant
+            // message, and precisely what makes ids useless for telling the two
+            // batches apart.
             "two-batch-approval" => {
-                if tool_message(&request.messages, "call_first").is_none() {
+                let answered = request
+                    .messages
+                    .iter()
+                    .filter(
+                        |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
+                    )
+                    .count();
+                if answered < 2 {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
-                            id: "call_first".into(),
-                            name: "read_todos".into(),
-                            arguments: Some("{}".into()),
-                        }],
-                        ..assistant()
-                    })
-                } else if tool_message(&request.messages, "call_second").is_none() {
-                    Self::completed(AssistantMessage {
-                        tool_calls: vec![ToolCall {
-                            id: "call_second".into(),
+                            id: "call_1".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
                         }],
@@ -928,10 +929,12 @@ where
             .expect("send task");
     }
 
+    /// Answer a suspension exactly as a client would: addressed to the thread
+    /// that announced it, naming the batch it announced. Sending the same
+    /// `approval` twice is therefore a faithful duplicate submit.
     pub(super) async fn send_resume(
         &self,
-        agent_name: &str,
-        thread_id: &str,
+        approval: &PendingApproval,
         resolutions: Vec<(String, ToolCallResolution)>,
     ) {
         self.runtime
@@ -939,11 +942,14 @@ where
                 id,
                 from: Sender::User,
                 to: Receiver {
-                    name: agent_name.to_string(),
-                    thread_id: ThreadId::from(thread_id.to_string()),
+                    name: approval.agent_name.clone(),
+                    thread_id: ThreadId::from(approval.thread_id.clone()),
                 },
                 reply_to: None,
-                body: EnvelopeBody::Resume(crate::ResumeDecision { resolutions }),
+                body: EnvelopeBody::Resume(crate::ResumeDecision {
+                    parent_message_id: approval.parent_message_id,
+                    resolutions,
+                }),
             }))
             .await
             .expect("resume agent");

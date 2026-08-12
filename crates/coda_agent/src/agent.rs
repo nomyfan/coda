@@ -41,8 +41,16 @@ pub enum ToolCallResolution {
 }
 
 /// Caller's response to all suspended tool calls, replacing `ApprovalDecision`.
+///
+/// A call this does not name counts as rejected, so a decision applies to
+/// exactly one batch — hence `parent_message_id`, which says which.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeDecision {
+    /// The batch being answered, echoed from
+    /// [`PendingApproval::parent_message_id`]. A decision naming a batch the
+    /// thread has already run is stale and is ignored rather than applied to
+    /// whatever is parked now.
+    pub parent_message_id: MessageId,
     pub resolutions: Vec<(String, ToolCallResolution)>,
 }
 
@@ -53,6 +61,10 @@ pub struct ResumeDecision {
 pub struct PendingApproval {
     pub thread_id: String,
     pub agent_name: String,
+    /// The assistant message that asked for these calls, which is what
+    /// identifies the batch. A `call_id` cannot: it is only unique within one
+    /// assistant message, so consecutive batches routinely reuse one.
+    pub parent_message_id: MessageId,
     pub calls: Vec<ToolCall>,
     pub suspended_at: jiff::Timestamp,
 }

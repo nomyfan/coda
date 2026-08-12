@@ -34,6 +34,7 @@ fn resume_params_roundtrips() {
         agent_name: "coda".into(),
         thread_id: "t1".into(),
         decision: ResumeDecision {
+            parent_message_id: MessageId::new(),
             resolutions: vec![("call_1".into(), ToolCallResolution::Execute)],
         },
     };
@@ -185,6 +186,7 @@ fn pending_approval_wire_suggests_shell_allow_patterns() {
     let approval = PendingApproval {
         thread_id: "t1".into(),
         agent_name: "coda".into(),
+        parent_message_id: MessageId::new(),
         calls: vec![
             ToolCall {
                 id: "call_shell".into(),
@@ -218,6 +220,7 @@ fn pending_approval_wire_skips_compound_shell_calls() {
     let approval = PendingApproval {
         thread_id: "t1".into(),
         agent_name: "coda".into(),
+        parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
             id: "call_shell".into(),
             name: "shell".into(),
@@ -236,6 +239,7 @@ fn pending_approval_wire_skips_shell_calls_with_only_comments() {
     let approval = PendingApproval {
         thread_id: "t1".into(),
         agent_name: "coda".into(),
+        parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
             id: "call_shell".into(),
             name: "shell".into(),
@@ -254,6 +258,7 @@ fn pending_approval_wire_skips_unresolvable_shell_calls() {
     let approval = PendingApproval {
         thread_id: "t1".into(),
         agent_name: "coda".into(),
+        parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
             id: "call_shell".into(),
             name: "shell".into(),

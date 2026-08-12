@@ -2910,6 +2910,7 @@ export async function submitApprovals() {
           agent_name: approval.agent_name,
           thread_id: approval.thread_id,
           decision: {
+            parent_message_id: approval.parent_message_id,
             resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
           },
         })

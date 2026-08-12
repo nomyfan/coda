@@ -716,6 +716,7 @@ async fn should_execute_tool_after_approval_resume() {
             &pending.agent_name,
             &pending.thread_id,
             ResumeDecision {
+                parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
             },
         )

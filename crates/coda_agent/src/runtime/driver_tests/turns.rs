@@ -204,8 +204,7 @@ async fn resuming_an_approval_does_not_open_a_second_turn() {
 
     harness
         .send_resume(
-            &pending.agent_name,
-            &pending.thread_id,
+            &pending,
             pending
                 .calls
                 .iter()
@@ -331,6 +330,7 @@ async fn a_restart_puts_the_interrupted_turn_back() {
                 (
                     pending.thread_id.clone(),
                     ResumeDecision {
+                        parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
                             pending.calls[0].id.clone(),
                             ToolCallResolution::Execute,
@@ -409,6 +409,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
                 (
                     pending.thread_id.clone(),
                     ResumeDecision {
+                        parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
                             pending.calls[0].id.clone(),
                             ToolCallResolution::Execute,

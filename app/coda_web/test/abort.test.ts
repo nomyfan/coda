@@ -26,6 +26,7 @@ function approval(threadId: string): PendingApproval {
   return {
     thread_id: threadId,
     agent_name: "coda",
+    parent_message_id: "m-batch",
     calls: [],
     suspended_at: new Date().toISOString(),
     suggested_shell_allow_patterns: {},

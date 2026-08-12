@@ -78,6 +78,11 @@ export type HistoryMessage =
 export type PendingApproval = {
   thread_id: string;
   agent_name: string;
+  /** The assistant message that asked for these calls — the batch's identity.
+   * Echoed back in `resume` so the server can tell a stale decision (a second
+   * submit landing after the batch already ran) from a live one. A call id
+   * cannot serve here: ids are only unique within one assistant message. */
+  parent_message_id: string;
   calls: ToolCall[];
   suspended_at: string;
   suggested_shell_allow_patterns: Record<string, string>;
@@ -89,6 +94,8 @@ export type ToolCallResolution =
   | { Rejected: { reason?: string | null } };
 
 export type ResumeDecision = {
+  /** The batch being answered, from `PendingApproval.parent_message_id`. */
+  parent_message_id: string;
   resolutions: Array<[string, ToolCallResolution]>;
 };
 

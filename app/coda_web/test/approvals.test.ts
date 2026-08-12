@@ -7,6 +7,7 @@ function approval(...callIds: string[]): PendingApproval {
   return {
     thread_id: "s1",
     agent_name: "coda",
+    parent_message_id: "m-batch-1",
     calls: callIds.map((id) => ({ id, name: "ls", arguments: "{}" })),
     suspended_at: "2026-08-12T00:00:00Z",
     suggested_shell_allow_patterns: {},
@@ -78,6 +79,9 @@ test("a second submit of the same approval while one is in flight is dropped", a
   await Promise.all([first, second]);
 
   expect(resumes).toHaveLength(1);
+  // The batch the decision answers has to travel with it — without it the
+  // server cannot tell this resume from one meant for an earlier batch.
+  expect(resumes[0]).toMatchObject({ decision: { parent_message_id: "m-batch-1" } });
   expect(codaStore.getState().servers[server]?.sessions["ws/s1"]?.approvals).toEqual([]);
 
   // With the approval gone the guard is released, and nothing is left to send.

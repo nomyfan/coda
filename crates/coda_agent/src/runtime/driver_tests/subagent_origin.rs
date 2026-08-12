@@ -96,8 +96,7 @@ async fn wait_for_completion_after_explore_reply(
                     approval_resumed = true;
                     harness
                         .send_resume(
-                            &pending.agent_name,
-                            &pending.thread_id,
+                            &pending,
                             vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
                         )
                         .await;
@@ -508,6 +507,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
                 (
                     pending.thread_id.clone(),
                     ResumeDecision {
+                        parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
                             pending.calls[0].id.clone(),
                             ToolCallResolution::Execute,

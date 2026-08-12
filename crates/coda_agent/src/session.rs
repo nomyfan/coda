@@ -298,7 +298,13 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                             )
                         })
                         .collect();
-                    resume_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
+                    resume_decisions.insert(
+                        p.thread_id.clone(),
+                        ResumeDecision {
+                            parent_message_id: p.parent_message_id,
+                            resolutions,
+                        },
+                    );
                 }
             }
         }
@@ -400,6 +406,7 @@ async fn collect_pending_approvals(
             .map_err(OpenError::Storage)?;
         if let Some(stored) = stored
             && let StoredResumePoint::PendingApproval {
+                parent_message_id,
                 ref pending_approval_calls,
                 ..
             } = stored.resume_point
@@ -408,6 +415,7 @@ async fn collect_pending_approvals(
             pending.push(PendingApproval {
                 thread_id: stored.thread_id,
                 agent_name: stored.agent_name,
+                parent_message_id,
                 calls: pending_approval_calls.clone(),
                 suspended_at: stored.suspended_at,
             });

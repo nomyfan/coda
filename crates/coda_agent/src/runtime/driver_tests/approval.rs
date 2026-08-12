@@ -177,6 +177,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
         (
             pending.thread_id.clone(),
             ResumeDecision {
+                parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
             },
         ),
@@ -261,6 +262,7 @@ async fn pending_approval_supports_mixed_resolutions() {
                         (
                             pending.thread_id.clone(),
                             ResumeDecision {
+                                parent_message_id: pending.parent_message_id,
                                 resolutions: vec![
                                     ("call_exec".into(), ToolCallResolution::Execute),
                                     (
@@ -369,6 +371,7 @@ async fn reject_pending_approval_via_restart() {
         (
             pending.thread_id.clone(),
             ResumeDecision {
+                parent_message_id: pending.parent_message_id,
                 resolutions: reject_ids
                     .into_iter()
                     .map(|id| {
@@ -518,6 +521,7 @@ async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
         (
             pending.thread_id.clone(),
             ResumeDecision {
+                parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
             },
         ),
@@ -592,6 +596,7 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
         (
             pending.thread_id.clone(),
             ResumeDecision {
+                parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
             },
         ),
@@ -669,8 +674,7 @@ async fn in_process_resume_after_suspension() {
     // Resume in-process — no shutdown/restart.
     harness
         .send_resume(
-            &pending.agent_name,
-            &pending.thread_id,
+            &pending,
             vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         )
         .await;
@@ -693,6 +697,64 @@ async fn in_process_resume_after_suspension() {
         "timed out waiting for completion after in-process resume"
     );
 
+    harness.shutdown().await;
+}
+
+/// "A call the decision does not name is rejected" holds all the way to naming
+/// none of them: an empty `resolutions` for the batch that is actually parked
+/// rejects it wholesale. Only the batch id decides whether a decision applies,
+/// so this stays a legitimate way to refuse everything.
+#[tokio::test]
+async fn an_empty_decision_for_the_parked_batch_rejects_it() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "two-batch-approval".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos")),
+        "two batches",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the suspension");
+
+    harness.send_resume(&pending, vec![]).await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::ToolCallEnd(tool)) = (agent_name.as_str(), event) {
+                assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Rejected { .. }),
+                    "an unnamed call must still be rejected, got {:?}",
+                    tool.outcome
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the empty decision was ignored instead of rejecting the batch");
     harness.shutdown().await;
 }
 
@@ -736,33 +798,32 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
     let first = timeout(Duration::from_secs(2), next_suspension(&mut harness))
         .await
         .expect("timed out waiting for the first suspension");
-    assert_eq!(first.calls[0].id, "call_first");
     let first_decision = vec![(first.calls[0].id.clone(), ToolCallResolution::Execute)];
-    harness
-        .send_resume(&first.agent_name, &first.thread_id, first_decision.clone())
-        .await;
+    harness.send_resume(&first, first_decision.clone()).await;
 
     let second = timeout(Duration::from_secs(2), next_suspension(&mut harness))
         .await
         .expect("timed out waiting for the second suspension");
-    assert_eq!(second.calls[0].id, "call_second");
+    // The two batches reuse one call id, so the ids cannot tell a stale
+    // decision from a live one — which is the whole reason the batch is
+    // identified by the message that asked for it.
+    assert_eq!(second.calls[0].id, first.calls[0].id);
+    assert_ne!(second.parent_message_id, first.parent_message_id);
 
-    // The duplicate submit of the first batch, landing on the second.
-    harness
-        .send_resume(&second.agent_name, &second.thread_id, first_decision)
-        .await;
+    // The duplicate submit: the same approval answered a second time, landing
+    // on the batch the thread moved on to.
+    harness.send_resume(&first, first_decision).await;
 
     // It must be ignored, and the second batch re-announced unchanged.
     let reannounced = timeout(Duration::from_secs(2), next_suspension(&mut harness))
         .await
         .expect("the stale resume was applied instead of ignored");
-    assert_eq!(reannounced.calls[0].id, "call_second");
+    assert_eq!(reannounced.parent_message_id, second.parent_message_id);
 
     // Answering the batch that is actually parked still works.
     harness
         .send_resume(
-            &reannounced.agent_name,
-            &reannounced.thread_id,
+            &reannounced,
             vec![(reannounced.calls[0].id.clone(), ToolCallResolution::Execute)],
         )
         .await;

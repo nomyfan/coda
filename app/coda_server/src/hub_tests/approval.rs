@@ -57,6 +57,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
                 agent_name: approval.agent_name.clone(),
                 thread_id: approval.thread_id.clone(),
                 decision: ResumeDecision {
+                    parent_message_id: approval.parent_message_id,
                     resolutions: vec![(approval.calls[0].id.clone(), ToolCallResolution::Execute)],
                 },
             },
