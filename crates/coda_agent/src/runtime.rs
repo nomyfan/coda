@@ -633,6 +633,30 @@ impl AgentRuntime {
         // thread.
         let mut resuming = !resume_targets.is_empty();
         if let Some(snapshot) = snapshot.as_mut() {
+            // A renamed or removed agent may also remain in an older runtime
+            // snapshot. It cannot consume replayed envelopes, and restoring
+            // its active thread would occupy the session's turn gate forever.
+            snapshot.active_threads.retain(|name, _| {
+                let known = agents.contains_key(name);
+                if !known {
+                    warn!("discarding the active thread of unavailable agent {name}");
+                }
+                known
+            });
+            snapshot.agent_drained_envelopes.retain(|name, _| {
+                let known = agents.contains_key(name);
+                if !known {
+                    warn!("discarding queued work for unavailable agent {name}");
+                }
+                known
+            });
+            snapshot.drained_envelopes.retain(|name, _| {
+                let known = agents.contains_key(name);
+                if !known {
+                    warn!("discarding drained work for unavailable agent {name}");
+                }
+                known
+            });
             // A resume target comes from the checkpoint that is parked now;
             // the snapshot may still name an older stateless thread for that
             // agent. Do not let the stale thread occupy the turn gate before

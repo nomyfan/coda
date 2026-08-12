@@ -452,6 +452,22 @@ async fn collect_until_suspended(session: &Session) -> coda_agent::PendingApprov
     result.expect("timed out waiting for suspension")
 }
 
+async fn collect_until_any_agent_suspends(session: &Session) -> coda_agent::PendingApproval {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(SessionStreamItem::Event(SessionEvent { kind, .. })) = session.recv().await
+            else {
+                continue;
+            };
+            if let AgentEvent::Suspended(pending) = kind {
+                return pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for suspension")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -868,19 +884,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
         .await
         .expect("send");
 
-    let pending = timeout(Duration::from_secs(5), async {
-        loop {
-            let Some(SessionStreamItem::Event(SessionEvent { kind, .. })) = session.recv().await
-            else {
-                continue;
-            };
-            if let AgentEvent::Suspended(pending) = kind {
-                return pending;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for sub-agent approval");
+    let pending = collect_until_any_agent_suspends(&session).await;
     assert_eq!(pending.agent_name, "explore");
     session
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
@@ -937,6 +941,93 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
         .expect("resume sub-agent approval without a snapshot");
     assert_eq!(collect_until_done(&resumed).await, "subagent-approval-done");
     resumed
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+}
+
+#[tokio::test]
+async fn should_ignore_a_removed_agents_approval_across_reopens() {
+    use coda_tools::ReadTodosToolSpec;
+
+    let storage = MemoryStorage::default();
+    let session_id = "session-removed-agent-approval";
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let original_team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "session-system".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![],
+            subagents: vec!["explore".into()],
+        },
+        vec![AgentSpec {
+            name: "explore".into(),
+            description: "An explore sub-agent.".into(),
+            system_prompt: "You are an exploration assistant.".into(),
+            mode: SubAgentMode::Stateless,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        }],
+    )
+    .expect("valid original team");
+
+    let original = Session::builder()
+        .storage(storage.clone())
+        .team(&original_team, ".")
+        .run_config(run_config(approval.clone()))
+        .session_id(session_id)
+        .open()
+        .await
+        .expect("open original session");
+    original
+        .send(MessageId::new(), "delegate approval to explore", vec![])
+        .await
+        .expect("send");
+    let pending = collect_until_any_agent_suspends(&original).await;
+    assert_eq!(pending.agent_name, "explore");
+    original
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+
+    let current_team = solo_team(simple_spec("session-system"));
+    let reopened = Session::builder()
+        .storage(storage.clone())
+        .team(&current_team, ".")
+        .run_config(run_config(approval.clone()))
+        .session_id(session_id)
+        .open()
+        .await
+        .expect("removed agent must not require an approval decision");
+    reopened
+        .send(MessageId::new(), "simple hello", vec![])
+        .await
+        .expect("the removed agent's stale turn must not block new work");
+    assert_eq!(collect_until_done(&reopened).await, "Hello from the agent!");
+    reopened
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+
+    let still_pending = storage
+        .load_pending_approval_checkpoints(session_id)
+        .await
+        .expect("load pending approvals");
+    assert!(
+        still_pending
+            .iter()
+            .any(|checkpoint| checkpoint.agent_name == "explore"),
+        "ignoring an unavailable agent must not destroy its checkpoint"
+    );
+
+    let reopened_again = Session::builder()
+        .storage(storage)
+        .team(&current_team, ".")
+        .run_config(run_config(approval))
+        .session_id(session_id)
+        .open()
+        .await
+        .expect("the same checkpoint must not block a later reopen");
+    reopened_again
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
 }

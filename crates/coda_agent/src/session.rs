@@ -270,7 +270,18 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                     .collect()
             });
 
-        let pending_approvals = collect_pending_approvals(storage.as_ref(), &session_id).await?;
+        let mut pending_approvals =
+            collect_pending_approvals(storage.as_ref(), &session_id).await?;
+        pending_approvals.retain(|approval| {
+            let available = agents.contains_key(&approval.agent_name);
+            if !available {
+                warn!(
+                    "ignoring pending approval on thread {} for unavailable agent {}",
+                    approval.thread_id, approval.agent_name
+                );
+            }
+            available
+        });
 
         let mut resume_decisions = self.resume_decisions;
 
