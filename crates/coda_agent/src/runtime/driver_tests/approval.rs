@@ -695,3 +695,97 @@ async fn in_process_resume_after_suspension() {
 
     harness.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
+    // Submitting the same approval twice (a double-clicked button, a retry
+    // after a reconnect) sends the first batch's decision a second time. By
+    // then the thread has run those calls and suspended on the model's next
+    // batch — and every call in that batch is unnamed by the stale decision,
+    // so applying it rejected the lot and told the model the user had refused.
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "two-batch-approval".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let approval =
+        ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        approval,
+        "two batches",
+    )
+    .await;
+
+    let next_suspension = async |harness: &mut Harness<MemoryStorage>| loop {
+        let (agent_name, _, event) = harness.next_event().await;
+        if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+            return pending;
+        }
+    };
+
+    let first = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("timed out waiting for the first suspension");
+    assert_eq!(first.calls[0].id, "call_first");
+    let first_decision = vec![(first.calls[0].id.clone(), ToolCallResolution::Execute)];
+    harness
+        .send_resume(&first.agent_name, &first.thread_id, first_decision.clone())
+        .await;
+
+    let second = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("timed out waiting for the second suspension");
+    assert_eq!(second.calls[0].id, "call_second");
+
+    // The duplicate submit of the first batch, landing on the second.
+    harness
+        .send_resume(&second.agent_name, &second.thread_id, first_decision)
+        .await;
+
+    // It must be ignored, and the second batch re-announced unchanged.
+    let reannounced = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("the stale resume was applied instead of ignored");
+    assert_eq!(reannounced.calls[0].id, "call_second");
+
+    // Answering the batch that is actually parked still works.
+    harness
+        .send_resume(
+            &reannounced.agent_name,
+            &reannounced.thread_id,
+            vec![(reannounced.calls[0].id.clone(), ToolCallResolution::Execute)],
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::ToolCallEnd(tool)) => assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Approved),
+                    "{} was answered with {:?}",
+                    tool.id,
+                    tool.outcome
+                ),
+                ("coda", AgentEvent::LLMEnd(message)) if message.tool_calls.is_empty() => {
+                    assert_eq!(message.content, "two-batch-done");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the turn to finish");
+    harness.shutdown().await;
+}

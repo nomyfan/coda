@@ -1041,6 +1041,32 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     EnvelopeBody::Resume(decision) => {
                         let resolution_map: HashMap<String, ToolCallResolution> =
                             decision.resolutions.iter().cloned().collect();
+                        // A decision answers one batch of calls, and an unnamed
+                        // call counts as rejected below — so a decision meant
+                        // for an *earlier* batch would reject this one outright.
+                        // That is not hypothetical: a second submit of the same
+                        // approval (a double click, a retry after a reconnect)
+                        // arrives once this thread has run those calls and
+                        // suspended on the model's next batch. Naming none of
+                        // what is pending is what identifies such a resume; stay
+                        // suspended and re-announce instead, so the caller
+                        // resynchronizes on what is really parked here.
+                        if !pending_approval_calls.is_empty()
+                            && !pending_approval_calls
+                                .iter()
+                                .any(|call| resolution_map.contains_key(&call.id))
+                        {
+                            warn!(
+                                "ignoring a resume that answers none of the {} pending call(s); \
+                                 it belongs to an earlier batch",
+                                pending_approval_calls.len()
+                            );
+                            return EnvelopeOutcome::Next(ResumePoint::PendingApproval {
+                                parent_message_id,
+                                pending_approval_calls,
+                                pending_calls,
+                            });
+                        }
                         for tc in pending_approval_calls.drain(..) {
                             let resolution = resolution_map
                                 .get(&tc.id)

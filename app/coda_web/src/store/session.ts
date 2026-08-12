@@ -2836,6 +2836,16 @@ export function clearDraftCall(approval: PendingApproval, call: ToolCall) {
   clearDraftResolution(codaStore, active.server, active.session.key, approval, call);
 }
 
+/** Approvals whose submit is in flight, by `${server}|${sessionKey}|${approvalKey}`.
+ *
+ * A submit awaits its staged allow-pattern writes before the resume goes out,
+ * and the approval only leaves the store once it has — so a second click in
+ * that window sends the same decision twice. The duplicate lands on whatever
+ * the thread suspended on *next*, naming none of the calls parked there. Module
+ * state rather than store state: it guards one in-flight send, and the panel
+ * already goes away with the approval it submitted. */
+const submittingApprovals = new Set<string>();
+
 export async function submitApprovals() {
   const active = currentActive();
   if (!active) {
@@ -2856,49 +2866,58 @@ export async function submitApprovals() {
     if (!complete) {
       continue;
     }
-    // Persist staged "always allow" patterns for approved calls only. This is
-    // best-effort and must never block the resume: gather the writes with
-    // `allSettled` (a rejection only logs a non-fatal activity) (Decision 11).
-    const allow = session.allowDrafts[approvalId] ?? {};
-    const allowWrites: Promise<unknown>[] = [];
-    if (rpc) {
-      for (const item of approval.calls) {
-        const pattern = allow[item.id];
-        if (pattern && draft[item.id] === "Execute") {
-          allowWrites.push(
-            rpc
-              .request("add_allow_pattern", { workspace_id: session.workspaceId, pattern })
-              .then(() =>
-                addAllowResultActivity(codaStore, server, session.workspaceId, pattern, null),
-              )
-              .catch((err) =>
-                addAllowResultActivity(
-                  codaStore,
-                  server,
-                  session.workspaceId,
-                  pattern,
-                  isServerError(err) ? err.message : "connection closed",
+    const inFlight = `${server}|${session.key}|${approvalId}`;
+    if (submittingApprovals.has(inFlight)) {
+      continue;
+    }
+    submittingApprovals.add(inFlight);
+    try {
+      // Persist staged "always allow" patterns for approved calls only. This is
+      // best-effort and must never block the resume: gather the writes with
+      // `allSettled` (a rejection only logs a non-fatal activity) (Decision 11).
+      const allow = session.allowDrafts[approvalId] ?? {};
+      const allowWrites: Promise<unknown>[] = [];
+      if (rpc) {
+        for (const item of approval.calls) {
+          const pattern = allow[item.id];
+          if (pattern && draft[item.id] === "Execute") {
+            allowWrites.push(
+              rpc
+                .request("add_allow_pattern", { workspace_id: session.workspaceId, pattern })
+                .then(() =>
+                  addAllowResultActivity(codaStore, server, session.workspaceId, pattern, null),
+                )
+                .catch((err) =>
+                  addAllowResultActivity(
+                    codaStore,
+                    server,
+                    session.workspaceId,
+                    pattern,
+                    isServerError(err) ? err.message : "connection closed",
+                  ),
                 ),
-              ),
-          );
+            );
+          }
         }
       }
-    }
-    await Promise.allSettled(allowWrites);
-    // Clear the approval + allow drafts only when the resume actually left the
-    // client, so a disconnect leaves them intact for retry (Decision 11).
-    if (
-      notify(server, "resume", {
-        workspace_id: session.workspaceId,
-        session_id: session.sessionId,
-        agent_name: approval.agent_name,
-        thread_id: approval.thread_id,
-        decision: {
-          resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
-        },
-      })
-    ) {
-      clearApprovalState(codaStore, server, session.key, approval);
+      await Promise.allSettled(allowWrites);
+      // Clear the approval + allow drafts only when the resume actually left the
+      // client, so a disconnect leaves them intact for retry (Decision 11).
+      if (
+        notify(server, "resume", {
+          workspace_id: session.workspaceId,
+          session_id: session.sessionId,
+          agent_name: approval.agent_name,
+          thread_id: approval.thread_id,
+          decision: {
+            resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
+          },
+        })
+      ) {
+        clearApprovalState(codaStore, server, session.key, approval);
+      }
+    } finally {
+      submittingApprovals.delete(inFlight);
     }
   }
 }
