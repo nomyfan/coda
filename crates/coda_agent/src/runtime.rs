@@ -238,13 +238,6 @@ fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
     checkpoint.messages.last().map(|entry| entry.turn_id)
 }
 
-fn turn_awaiting(
-    checkpoints: &HashMap<String, StoredCheckpoint>,
-    thread_id: &ThreadId,
-) -> Option<TurnId> {
-    last_turn(checkpoints.get(thread_id.as_ref())?)
-}
-
 /// Throw away the replayed envelopes their recipient is no longer waiting for.
 ///
 /// Nothing rewrites a snapshot until an agent exits, so a second crash hands
@@ -261,37 +254,34 @@ fn drop_stale_envelopes(
         .chain(snapshot.drained_envelopes.iter_mut())
     {
         envelopes.retain(|envelope| {
-            let awaited = still_awaited(envelope, checkpoints);
+            // Whether the thread this envelope is addressed to is still waiting for it. A
+            // thread with no checkpoint at all is not: it has no state to take an answer
+            // into.
+            //
+            // Answers are matched by the envelope that carried the call out: a `call_id`
+            // is only unique within one assistant message, so an answer to an earlier
+            // invocation that reused it would pass for the one being waited on.
+            let awaited = match (
+                &envelope.body,
+                checkpoints
+                    .get(envelope.to.thread_id.as_ref())
+                    .map(|checkpoint| &checkpoint.resume_point),
+            ) {
+                // These carry the work they open, so nothing has to be waiting for them.
+                (EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. }, _) => true,
+                (EnvelopeBody::Reply { .. }, Some(StoredResumePoint::ToolExecution(state))) => {
+                    state.pending_replies.iter().any(|pending| {
+                        Some(&pending.call_envelope_id) == envelope.reply_to.as_ref()
+                    })
+                }
+                (EnvelopeBody::Resume(_), Some(StoredResumePoint::PendingApproval { .. })) => true,
+                _ => false,
+            };
             if !awaited {
                 warn!("Dropping an envelope {} already took: {:?}", name, envelope);
             }
             awaited
         });
-    }
-}
-
-/// Whether the thread this envelope is addressed to is still waiting for it. A
-/// thread with no checkpoint at all is not: it has no state to take an answer
-/// into.
-///
-/// Answers are matched by the envelope that carried the call out: a `call_id`
-/// is only unique within one assistant message, so an answer to an earlier
-/// invocation that reused it would pass for the one being waited on.
-fn still_awaited(envelope: &Envelope, checkpoints: &HashMap<String, StoredCheckpoint>) -> bool {
-    match (
-        &envelope.body,
-        checkpoints
-            .get(envelope.to.thread_id.as_ref())
-            .map(|checkpoint| &checkpoint.resume_point),
-    ) {
-        // These carry the work they open, so nothing has to be waiting for them.
-        (EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. }, _) => true,
-        (EnvelopeBody::Reply { .. }, Some(StoredResumePoint::ToolExecution(state))) => state
-            .pending_replies
-            .iter()
-            .any(|pending| Some(&pending.call_envelope_id) == envelope.reply_to.as_ref()),
-        (EnvelopeBody::Resume(_), Some(StoredResumePoint::PendingApproval { .. })) => true,
-        _ => false,
     }
 }
 
@@ -463,7 +453,10 @@ impl AgentRuntime {
                     self.calls.begin(&envelope.to.thread_id);
                 }
                 EnvelopeBody::Reply { .. } => {
-                    if let Some(turn) = turn_awaiting(checkpoints, &envelope.to.thread_id) {
+                    if let Some(turn) = checkpoints
+                        .get(envelope.to.thread_id.as_ref())
+                        .and_then(last_turn)
+                    {
                         self.turn_gate.restore(turn)?;
                     }
                     // An answer nobody has taken yet still settles an obligation
@@ -473,7 +466,10 @@ impl AgentRuntime {
                     }
                 }
                 EnvelopeBody::Resume(_) => {
-                    if let Some(turn) = turn_awaiting(checkpoints, &envelope.to.thread_id) {
+                    if let Some(turn) = checkpoints
+                        .get(envelope.to.thread_id.as_ref())
+                        .and_then(last_turn)
+                    {
                         self.turn_gate.restore(turn)?;
                     }
                 }
