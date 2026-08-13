@@ -24,7 +24,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ImageLightbox,
   IMAGE_LIGHTBOX_TRANSITION,
@@ -180,7 +180,10 @@ export const Transcript = memo(function Transcript({
   const running = suppressed ? false : liveRunning;
   const approvalPending = !suppressed && liveApprovalCount > 0;
   const scrollRef = useRef<HTMLElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const contentHeightRef = useRef<number | undefined>(undefined);
+  const runningRef = useRef(running);
   // While true the view follows new content; it flips off once the user scrolls
   // up to read, so streaming output no longer yanks them back to the bottom.
   const stickToBottomRef = useRef(true);
@@ -196,7 +199,6 @@ export const Transcript = memo(function Transcript({
       ? undefined
       : new Set(entries.slice(discardFrom).map((entry) => entry.id));
   const lastEntry = entries.at(-1);
-  const lastEntryContent = lastEntry?.content;
   // A fork keeps the turns *before* the message it cuts at, so the opening one
   // has nothing to keep — that copy would just be an empty session.
   const firstUserId = entries.find((entry) => entry.kind === "user")?.id;
@@ -217,6 +219,10 @@ export const Transcript = memo(function Transcript({
     stickToBottomRef.current = true;
   }, [activeKey]);
 
+  useLayoutEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+
   useEffect(() => {
     // Always snap to the bottom for the user's own just-sent message; otherwise
     // only follow if they hadn't scrolled away.
@@ -225,7 +231,31 @@ export const Transcript = memo(function Transcript({
     }
     stickToBottomRef.current = true;
     bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [activeKey, entries.length, lastEntryContent, running, lastEntry?.kind]);
+  }, [activeKey, entries.length, running, lastEntry?.kind]);
+
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content) {
+      return;
+    }
+    // Follow actual layout growth: collapsed reasoning stays free, while an
+    // expanded reasoning stream still keeps a bottom-pinned viewport moving.
+    const observer = new ResizeObserver(([entry]) => {
+      const previousHeight = contentHeightRef.current;
+      const nextHeight = entry.contentRect.height;
+      contentHeightRef.current = nextHeight;
+      if (
+        previousHeight !== undefined &&
+        previousHeight !== nextHeight &&
+        runningRef.current &&
+        stickToBottomRef.current
+      ) {
+        bottomRef.current?.scrollIntoView({ block: "end" });
+      }
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
   return (
     // `layoutScroll` lets motion account for this container's scroll offset when
@@ -237,7 +267,7 @@ export const Transcript = memo(function Transcript({
       layoutScroll
       className="scrollbar-fine fade-edge-bottom min-h-0 flex-1 overflow-y-auto bg-background px-4 py-3"
     >
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
+      <div ref={contentRef} className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (
           <div className="flex min-h-[48vh] flex-col items-center justify-center text-center">
             <CodaMark className="mb-4 size-12" />
@@ -785,96 +815,106 @@ function PendingTurnBubble() {
   );
 }
 
-function AssistantTurnBubble({
-  entries,
-  approvalPending,
-  settled,
-}: {
-  entries: TranscriptEntry[];
-  approvalPending: boolean;
-  /** Whether this turn is over, which nothing in the turn itself can say: an
-   * abort leaves a marker, but only as a live event, and if every tool happened
-   * to finish cleanly before the cancel landed the stored turn is
-   * indistinguishable from one still in flight. So it comes from the caller,
-   * which knows whether this is the last turn and whether the session is going. */
-  settled: boolean;
-}) {
-  const finalAssistantIndex = finalAssistantIndexOf(entries);
-  const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
-  const completedFinalAssistant = finalAssistant?.isFinalResponse ? finalAssistant : undefined;
-  const processComplete = completedFinalAssistant !== undefined || settled;
-  const intermediateEntries =
-    finalAssistantIndex >= 0
-      ? entries.filter((_, index) => index !== finalAssistantIndex)
-      : entries;
-  const processItems = groupProcessItems(intermediateEntries);
-  const [processOpen, setProcessOpen] = useState(false);
-  const activeProcessEntry = latestActiveProcessEntry(intermediateEntries);
-  const activeSummary = approvalPending
-    ? { title: "Approval required" }
-    : processEntrySummary(activeProcessEntry);
-  const stepText = processStepText(processItems.length);
-  // The process only: writing the answer is the turn's product, not work spent
-  // getting there. Its reasoning entry stays in — only the prose drops out.
-  const workMs = processWorkMs(intermediateEntries);
-  const duration = workMs === undefined ? undefined : formatElapsed(workMs);
-  const processTitle = processComplete
-    ? duration
-      ? `Worked for ${duration} with ${stepText}`
-      : `Worked with ${stepText}`
-    : activeSummary.title;
+function sameEntries(previous: TranscriptEntry[], next: TranscriptEntry[]) {
+  return previous.length === next.length && previous.every((entry, index) => entry === next[index]);
+}
 
-  return (
-    <div className="group/message">
-      <article className="rounded-md bg-background p-3 shadow-sm">
-        <div className="space-y-3">
-          <Collapsible open={processOpen} onOpenChange={setProcessOpen}>
-            <CollapsibleTrigger asChild>
-              <button
-                type="button"
-                className="flex w-full items-center justify-between gap-3 rounded-md py-1 text-left text-muted-foreground hover:text-foreground"
-                title={processOpen ? "Collapse process" : "Expand process"}
-              >
-                <div className="flex min-w-0 items-center gap-2">
-                  {processComplete ? (
-                    <span className="truncate text-sm font-medium">{processTitle}</span>
+const AssistantTurnBubble = memo(
+  function AssistantTurnBubble({
+    entries,
+    approvalPending,
+    settled,
+  }: {
+    entries: TranscriptEntry[];
+    approvalPending: boolean;
+    /** Whether this turn is over, which nothing in the turn itself can say: an
+     * abort leaves a marker, but only as a live event, and if every tool happened
+     * to finish cleanly before the cancel landed the stored turn is
+     * indistinguishable from one still in flight. So it comes from the caller,
+     * which knows whether this is the last turn and whether the session is going. */
+    settled: boolean;
+  }) {
+    const finalAssistantIndex = finalAssistantIndexOf(entries);
+    const finalAssistant = finalAssistantIndex >= 0 ? entries[finalAssistantIndex] : undefined;
+    const completedFinalAssistant = finalAssistant?.isFinalResponse ? finalAssistant : undefined;
+    const processComplete = completedFinalAssistant !== undefined || settled;
+    const intermediateEntries =
+      finalAssistantIndex >= 0
+        ? entries.filter((_, index) => index !== finalAssistantIndex)
+        : entries;
+    const processItems = groupProcessItems(intermediateEntries);
+    const [processOpen, setProcessOpen] = useState(false);
+    const activeProcessEntry = latestActiveProcessEntry(intermediateEntries);
+    const activeSummary = approvalPending
+      ? { title: "Approval required" }
+      : processEntrySummary(activeProcessEntry);
+    const stepText = processStepText(processItems.length);
+    // The process only: writing the answer is the turn's product, not work spent
+    // getting there. Its reasoning entry stays in — only the prose drops out.
+    const workMs = processWorkMs(intermediateEntries);
+    const duration = workMs === undefined ? undefined : formatElapsed(workMs);
+    const processTitle = processComplete
+      ? duration
+        ? `Worked for ${duration} with ${stepText}`
+        : `Worked with ${stepText}`
+      : activeSummary.title;
+
+    return (
+      <div className="group/message">
+        <article className="rounded-md bg-background p-3 shadow-sm">
+          <div className="space-y-3">
+            <Collapsible open={processOpen} onOpenChange={setProcessOpen}>
+              <CollapsibleTrigger asChild>
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between gap-3 rounded-md py-1 text-left text-muted-foreground hover:text-foreground"
+                  title={processOpen ? "Collapse process" : "Expand process"}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    {processComplete ? (
+                      <span className="truncate text-sm font-medium">{processTitle}</span>
+                    ) : (
+                      <span className="truncate text-sm font-medium text-shimmer">
+                        {activeSummary.detail ?? processTitle}
+                      </span>
+                    )}
+                  </div>
+                  {processOpen ? (
+                    <ChevronDown className="size-4 shrink-0" />
                   ) : (
-                    <span className="truncate text-sm font-medium text-shimmer">
-                      {activeSummary.detail ?? processTitle}
-                    </span>
+                    <ChevronRight className="size-4 shrink-0" />
+                  )}
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="mt-2 space-y-2 px-1">
+                  {processItems.map((item) =>
+                    item.type === "subagent" ? (
+                      <SubAgentGroup key={item.key} item={item} />
+                    ) : (
+                      <ProcessEntry key={item.entry.id} entry={item.entry} />
+                    ),
                   )}
                 </div>
-                {processOpen ? (
-                  <ChevronDown className="size-4 shrink-0" />
-                ) : (
-                  <ChevronRight className="size-4 shrink-0" />
-                )}
-              </button>
-            </CollapsibleTrigger>
-            <CollapsibleContent>
-              <div className="mt-2 space-y-2 px-1">
-                {processItems.map((item) =>
-                  item.type === "subagent" ? (
-                    <SubAgentGroup key={item.key} item={item} />
-                  ) : (
-                    <ProcessEntry key={item.entry.id} entry={item.entry} />
-                  ),
-                )}
-              </div>
-            </CollapsibleContent>
-          </Collapsible>
-          {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
-        </div>
-      </article>
-      {finalAssistant ? (
-        <div className="flex items-center gap-1">
-          <MessageActions content={finalAssistant.content} label="response" align="start" />
-          <EntryTiming entry={finalAssistant} mode="end" className={cn("px-1", HOVER_REVEAL)} />
-        </div>
-      ) : null}
-    </div>
-  );
-}
+              </CollapsibleContent>
+            </Collapsible>
+            {finalAssistant ? <Markdown>{finalAssistant.content}</Markdown> : null}
+          </div>
+        </article>
+        {finalAssistant ? (
+          <div className="flex items-center gap-1">
+            <MessageActions content={finalAssistant.content} label="response" align="start" />
+            <EntryTiming entry={finalAssistant} mode="end" className={cn("px-1", HOVER_REVEAL)} />
+          </div>
+        ) : null}
+      </div>
+    );
+  },
+  (previous, next) =>
+    previous.approvalPending === next.approvalPending &&
+    previous.settled === next.settled &&
+    sameEntries(previous.entries, next.entries),
+);
 
 function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
   const [open, setOpen] = useState(false);
@@ -1009,7 +1049,13 @@ function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkab
   );
 }
 
-function TranscriptItem({ entry, forkable }: { entry: TranscriptEntry; forkable?: boolean }) {
+const TranscriptItem = memo(function TranscriptItem({
+  entry,
+  forkable,
+}: {
+  entry: TranscriptEntry;
+  forkable?: boolean;
+}) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
   if (entry.kind === "user") {
@@ -1101,4 +1147,4 @@ function TranscriptItem({ entry, forkable }: { entry: TranscriptEntry; forkable?
       </pre>
     </article>
   );
-}
+});

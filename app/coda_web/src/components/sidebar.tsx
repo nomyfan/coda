@@ -48,12 +48,10 @@ import {
   selectActiveKey,
   selectActiveServer,
   selectForking,
-  selectServers,
-  useCodaShallow,
+  selectSessionListServers,
   useCodaStore,
   type ConnectionStatus,
-  type OpenedSession,
-  type ServerState,
+  type SessionListServer,
   type SessionKey,
   type WorkspaceSummary,
 } from "@/store/session";
@@ -76,16 +74,12 @@ function ServerStatusDot({ status }: { status: ConnectionStatus }) {
 /** Compact server entry shown in the collapsed rail: click starts a new session
  * under that server (in its first workspace). */
 const CollapsedServerButton = memo(function CollapsedServerButton({
-  url,
+  server,
   onNewSession,
 }: {
-  url: string;
+  server: SessionListServer;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
 }) {
-  const server = useCodaStore((state) => state.servers[url]);
-  if (!server) {
-    return null;
-  }
   const firstWorkspace = server.catalog[0]?.id;
   return (
     <Button
@@ -95,7 +89,7 @@ const CollapsedServerButton = memo(function CollapsedServerButton({
       // opacity even when the button is disabled (server not connected).
       className="size-6 disabled:opacity-100"
       disabled={server.status !== "connected" || !firstWorkspace}
-      onClick={() => firstWorkspace && onNewSession(url, firstWorkspace)}
+      onClick={() => firstWorkspace && onNewSession(server.url, firstWorkspace)}
       title={`New session · ${serverLabel(server)}`}
     >
       <ServerStatusDot status={server.status} />
@@ -183,7 +177,7 @@ const ServerGroup = memo(function ServerGroup({
   onDeleteSession,
   onForkSession,
 }: {
-  server: ServerState;
+  server: SessionListServer;
   activeServer?: string;
   activeKey?: SessionKey;
   newSessionTarget: NewSessionTarget | null;
@@ -552,7 +546,7 @@ function WorkspaceNode({
   activeServer?: string;
   activeKey?: SessionKey;
   isTargetWorkspace: boolean;
-  sessions: Record<SessionKey, OpenedSession>;
+  sessions: SessionListServer["sessions"];
   onOpenSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
   onNewSession: (serverUrl: string, workspaceId: string) => void;
   onDeleteSession: (serverUrl: string, workspaceId: string, sessionId: string) => void;
@@ -609,9 +603,7 @@ function WorkspaceNode({
                 session={session}
                 isActive={activeServer === serverUrl && key === activeKey}
                 running={opened?.running ?? false}
-                awaitingApproval={
-                  opened ? opened.approvals.length > 0 : session.has_pending_approval
-                }
+                awaitingApproval={opened ? opened.approvalCount > 0 : session.has_pending_approval}
                 disabled={status !== "connected"}
                 onOpen={onOpenSession}
                 onDelete={onDeleteSession}
@@ -645,7 +637,7 @@ export function Sidebar({
 }) {
   const activeServer = useCodaStore(selectActiveServer);
   const activeKey = useCodaStore(selectActiveKey);
-  const servers = useCodaShallow(selectServers);
+  const servers = useCodaStore(selectSessionListServers);
   const activeWorkspaceId = activeKey?.split("/")[0];
   const targetServer = newSessionTarget
     ? servers.find((server) => server.url === newSessionTarget.serverUrl)
@@ -811,11 +803,7 @@ export function Sidebar({
             </Button>
             {servers.length > 0 ? <Separator className="my-1 w-6" /> : null}
             {servers.map((server) => (
-              <CollapsedServerButton
-                key={server.url}
-                url={server.url}
-                onNewSession={onNewSession}
-              />
+              <CollapsedServerButton key={server.url} server={server} onNewSession={onNewSession} />
             ))}
           </div>
         ) : (

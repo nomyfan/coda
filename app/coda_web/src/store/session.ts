@@ -26,7 +26,6 @@ import {
   subAgentDisplayName,
 } from "@/lib/protocol";
 import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
-import { useShallow } from "zustand/react/shallow";
 import { sessionTitle } from "@/components/session-utils";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
 import { create, type Store } from "@/store/utils";
@@ -2942,10 +2941,83 @@ function activeSessionOf(state: CodaStoreState): OpenedSession | undefined {
   return server && state.activeKey ? server.sessions[state.activeKey] : undefined;
 }
 
-export const selectServers = (state: CodaStoreState): ServerState[] =>
-  state.order
-    .map((url) => state.servers[url])
-    .filter((server): server is ServerState => Boolean(server));
+export type SessionListSessionState = {
+  running: boolean;
+  approvalCount: number;
+};
+
+export type SessionListServer = Pick<ServerState, "url" | "alias" | "status" | "catalog"> & {
+  sessions: Record<SessionKey, SessionListSessionState>;
+};
+
+let cachedSessionListServers: SessionListServer[] = [];
+
+function sessionListServerMatches(cached: SessionListServer, server: ServerState): boolean {
+  if (
+    cached.url !== server.url ||
+    cached.alias !== server.alias ||
+    cached.status !== server.status ||
+    cached.catalog !== server.catalog
+  ) {
+    return false;
+  }
+
+  const sessionKeys = Object.keys(server.sessions) as SessionKey[];
+  if (sessionKeys.length !== Object.keys(cached.sessions).length) {
+    return false;
+  }
+  return sessionKeys.every((key) => {
+    const current = server.sessions[key];
+    const previous = cached.sessions[key];
+    return (
+      previous?.running === current.running && previous.approvalCount === current.approvals.length
+    );
+  });
+}
+
+/**
+ * The session list deliberately excludes transcripts and other live turn data.
+ * Streaming chunks can then update the active session without rebuilding the
+ * expanded sidebar tree on every token.
+ */
+export const selectSessionListServers = (state: CodaStoreState): SessionListServer[] => {
+  if (
+    state.order.length === cachedSessionListServers.length &&
+    state.order.every((url, index) => {
+      const server = state.servers[url];
+      return Boolean(server) && sessionListServerMatches(cachedSessionListServers[index], server);
+    })
+  ) {
+    return cachedSessionListServers;
+  }
+
+  const previousByUrl = new Map(cachedSessionListServers.map((server) => [server.url, server]));
+  cachedSessionListServers = state.order.flatMap((url) => {
+    const server = state.servers[url];
+    if (!server) {
+      return [];
+    }
+    const previous = previousByUrl.get(url);
+    if (previous && sessionListServerMatches(previous, server)) {
+      return [previous];
+    }
+    return [
+      {
+        url: server.url,
+        alias: server.alias,
+        status: server.status,
+        catalog: server.catalog,
+        sessions: Object.fromEntries(
+          Object.entries(server.sessions).map(([key, session]) => [
+            key,
+            { running: session.running, approvalCount: session.approvals.length },
+          ]),
+        ) as Record<SessionKey, SessionListSessionState>,
+      },
+    ];
+  });
+  return cachedSessionListServers;
+};
 
 let cachedServerSummaries: ServerSummary[] = [];
 
@@ -3073,11 +3145,6 @@ export const selectActiveUsage = (state: CodaStoreState) =>
 /** Subscribe to a slice of the store; re-renders only when that slice changes. */
 export function useCodaStore<T>(selector: (state: CodaStoreState) => T): T {
   return useStore(codaStore, selector);
-}
-
-/** Subscribe to a computed slice with shallow equality (for arrays/objects). */
-export function useCodaShallow<T>(selector: (state: CodaStoreState) => T): T {
-  return useStore(codaStore, useShallow(selector));
 }
 
 /**
