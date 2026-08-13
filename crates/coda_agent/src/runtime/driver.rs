@@ -598,6 +598,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     let pending = PendingApproval {
                         thread_id: self.thread_id.as_ref().to_string(),
                         agent_name: self.agent.name.to_string(),
+                        parent_message_id,
                         calls: pending_approval_calls.iter().cloned().collect(),
                         suspended_at,
                     };
@@ -1039,6 +1040,32 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         )
                     }
                     EnvelopeBody::Resume(decision) => {
+                        // A decision answers one batch, and a call it does not
+                        // name counts as rejected below — so one meant for an
+                        // *earlier* batch would reject this one outright. That
+                        // is not hypothetical: a second submit of the same
+                        // approval (a double click, a retry after a reconnect)
+                        // arrives once this thread has run those calls and
+                        // suspended on the model's next batch.
+                        //
+                        // The batch is identified by the assistant message that
+                        // asked for it, never by which call ids the decision
+                        // mentions: ids are only unique within one assistant
+                        // message, so consecutive batches reuse them and a
+                        // stale decision would look like a live one. Stay
+                        // suspended and re-announce, so the caller
+                        // resynchronizes on what is really parked here.
+                        if decision.parent_message_id != parent_message_id {
+                            warn!(
+                                "ignoring a resume for batch {}; this thread is parked on {}",
+                                decision.parent_message_id, parent_message_id
+                            );
+                            return EnvelopeOutcome::Next(ResumePoint::PendingApproval {
+                                parent_message_id,
+                                pending_approval_calls,
+                                pending_calls,
+                            });
+                        }
                         let resolution_map: HashMap<String, ToolCallResolution> =
                             decision.resolutions.iter().cloned().collect();
                         for tc in pending_approval_calls.drain(..) {

@@ -320,6 +320,9 @@ async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
         },
         reply_to: None,
         body: EnvelopeBody::Resume(ResumeDecision {
+            // Irrelevant here: the thread is parked on `Generation`, so the
+            // envelope is dropped before any batch is compared.
+            parent_message_id: MessageId::new(),
             resolutions: vec![],
         }),
     });

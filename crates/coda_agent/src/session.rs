@@ -10,8 +10,10 @@
 //! [`Session::runtime`].
 
 use crate::agent::{EnvelopeBody, Receiver};
-use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
-use crate::runtime::{AgentRuntime, AgentRuntimeSnapshot, SendCommandError, SessionStorage};
+use crate::persist::{StoredResumePoint, StoredRuntimeSnapshot};
+use crate::runtime::{
+    AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
+};
 use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
@@ -268,9 +270,18 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                     .collect()
             });
 
-        let pending_approvals =
-            collect_pending_approvals(storage.as_ref(), &session_id, &root_name, snapshot.as_ref())
-                .await?;
+        let mut pending_approvals =
+            collect_pending_approvals(storage.as_ref(), &session_id).await?;
+        pending_approvals.retain(|approval| {
+            let available = agents.contains_key(&approval.agent_name);
+            if !available {
+                warn!(
+                    "ignoring pending approval on thread {} for unavailable agent {}",
+                    approval.thread_id, approval.agent_name
+                );
+            }
+            available
+        });
 
         let mut resume_decisions = self.resume_decisions;
 
@@ -296,7 +307,13 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                             )
                         })
                         .collect();
-                    resume_decisions.insert(p.thread_id.clone(), ResumeDecision { resolutions });
+                    resume_decisions.insert(
+                        p.thread_id.clone(),
+                        ResumeDecision {
+                            parent_message_id: p.parent_message_id,
+                            resolutions,
+                        },
+                    );
                 }
             }
         }
@@ -309,9 +326,39 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         if !uncovered.is_empty() {
             return Err(OpenError::PendingApprovalsRequired(uncovered));
         }
-        // Drop decisions that don't match any pending approval so stale entries
-        // can't mask coverage bugs by silently disappearing into bootstrap.
-        resume_decisions.retain(|tid, _| pending_approvals.iter().any(|c| &c.thread_id == tid));
+        // Address each decision to the agent whose checkpoint is parked on that
+        // thread. This — not the runtime snapshot — is what makes a resume
+        // reach its thread: the snapshot is only written when an agent exits,
+        // so it is absent for a session that was killed mid-approval and for
+        // one a fork just minted. Decisions that match no pending approval are
+        // dropped here rather than disappearing silently into bootstrap.
+        let mut resume_targets: HashMap<String, ResumeTarget> = HashMap::new();
+        for approval in &pending_approvals {
+            let Some(decision) = resume_decisions.remove(&approval.thread_id) else {
+                continue;
+            };
+            if resume_targets
+                .insert(
+                    approval.agent_name.clone(),
+                    ResumeTarget {
+                        thread_id: ThreadId::from(approval.thread_id.clone()),
+                        decision,
+                    },
+                )
+                .is_some()
+            {
+                // One agent task drives one thread at a time, so a second
+                // suspended thread for the same agent cannot be resumed in this
+                // run; it stays parked and is offered again on the next open.
+                warn!(
+                    "agent {} has more than one suspended thread; resuming only {}",
+                    approval.agent_name, approval.thread_id
+                );
+            }
+        }
+        for thread_id in resume_decisions.keys() {
+            warn!("discarding a resume decision for unsuspended thread {thread_id}");
+        }
 
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
         // CRITICAL: subscribe before bootstrap so no events are lost between
@@ -319,7 +366,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         let events_rx = runtime.subscribe();
         // Answered by bootstrap, not the snapshot: it drops what will never run.
         let has_resuming_agents = runtime
-            .bootstrap(agents, snapshot, resume_decisions, run_config)
+            .bootstrap(agents, snapshot, resume_targets, run_config)
             .await
             .map_err(OpenError::Storage)?;
 
@@ -336,50 +383,41 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     }
 }
 
-/// Walks root + snapshot-tracked agent threads, loads each checkpoint, and
-/// returns those still sitting in `PendingApproval`.
+/// Loads every checkpoint still sitting in `PendingApproval`.
 async fn collect_pending_approvals(
     storage: &dyn SessionStorage,
     session_id: &str,
-    root_name: &str,
-    snapshot: Option<&AgentRuntimeSnapshot>,
 ) -> Result<Vec<PendingApproval>, OpenError> {
-    let mut seen_thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut threads: Vec<String> = Vec::new();
-    // Root always has thread_id == session_id.
-    threads.push(session_id.to_string());
-    seen_thread_ids.insert(session_id.to_string());
-    if let Some(snap) = snapshot {
-        for (agent_name, tid) in &snap.active_threads {
-            if agent_name == root_name {
-                continue;
-            }
-            if seen_thread_ids.insert(tid.clone()) {
-                threads.push(tid.clone());
-            }
-        }
-    }
-
     let mut pending = Vec::new();
-    for tid in threads {
-        let stored: Option<StoredCheckpoint> = storage
-            .load_checkpoint(&tid)
-            .await
-            .map_err(OpenError::Storage)?;
-        if let Some(stored) = stored
-            && let StoredResumePoint::PendingApproval {
-                ref pending_approval_calls,
-                ..
-            } = stored.resume_point
-            && !pending_approval_calls.is_empty()
-        {
-            pending.push(PendingApproval {
-                thread_id: stored.thread_id,
-                agent_name: stored.agent_name,
-                calls: pending_approval_calls.clone(),
-                suspended_at: stored.suspended_at,
-            });
+    for stored in storage
+        .load_pending_approval_checkpoints(session_id)
+        .await
+        .map_err(OpenError::Storage)?
+    {
+        let StoredResumePoint::PendingApproval {
+            parent_message_id,
+            pending_approval_calls,
+            ..
+        } = stored.resume_point
+        else {
+            return Err(OpenError::Storage(format!(
+                "storage returned non-pending checkpoint {} as awaiting approval",
+                stored.thread_id
+            )));
+        };
+        if pending_approval_calls.is_empty() {
+            return Err(OpenError::Storage(format!(
+                "storage returned empty approval checkpoint {} as awaiting approval",
+                stored.thread_id
+            )));
         }
+        pending.push(PendingApproval {
+            thread_id: stored.thread_id,
+            agent_name: stored.agent_name,
+            parent_message_id,
+            calls: pending_approval_calls,
+            suspended_at: stored.suspended_at,
+        });
     }
     Ok(pending)
 }

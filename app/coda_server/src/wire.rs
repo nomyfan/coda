@@ -407,6 +407,9 @@ pub struct SessionSummaryWire {
 pub struct PendingApprovalWire {
     pub thread_id: String,
     pub agent_name: String,
+    /// Identifies the batch; the client echoes it back in `resume` so a stale
+    /// decision can be told apart from a live one.
+    pub parent_message_id: MessageId,
     pub calls: Vec<ToolCall>,
     pub suspended_at: jiff::Timestamp,
     pub suggested_shell_allow_patterns: BTreeMap<String, String>,
@@ -424,6 +427,7 @@ impl PendingApprovalWire {
         Self {
             thread_id: approval.thread_id,
             agent_name: approval.agent_name,
+            parent_message_id: approval.parent_message_id,
             calls: approval.calls,
             suspended_at: approval.suspended_at,
             suggested_shell_allow_patterns,

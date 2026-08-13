@@ -6,7 +6,9 @@ use super::super::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
     StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
-    runtime::{AgentRuntime, AgentRuntimeSnapshot, SessionStorage},
+    runtime::{
+        AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
+    },
 };
 use coda_core::{
     llm::{
@@ -147,6 +149,35 @@ impl SessionStorage for TestStorage {
             }
             let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
             Ok(checkpoint)
+        })
+    }
+
+    fn load_pending_approval_checkpoints(
+        &self,
+        _session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredCheckpoint>, String>> + Send + '_>> {
+        Box::pin(async move {
+            if *self.fail_loads.lock().await {
+                return Err("checkpoint load is unavailable".to_string());
+            }
+            let mut checkpoints: Vec<_> = self
+                .checkpoints
+                .lock()
+                .await
+                .values()
+                .filter(|checkpoint| {
+                    matches!(
+                        checkpoint.resume_point,
+                        StoredResumePoint::PendingApproval {
+                            ref pending_approval_calls,
+                            ..
+                        } if !pending_approval_calls.is_empty()
+                    )
+                })
+                .cloned()
+                .collect();
+            checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+            Ok(checkpoints)
         })
     }
 
@@ -535,6 +566,36 @@ impl LLMProvider for TestProvider {
                     })
                 }
             }
+            // Two approval-gated calls in sequence, each in its own assistant
+            // message, so a test can answer the first batch while the second is
+            // the one actually parked. Both deliberately reuse one call id —
+            // legal, since an id only has to be unique within its own assistant
+            // message, and precisely what makes ids useless for telling the two
+            // batches apart.
+            "two-batch-approval" => {
+                let answered = request
+                    .messages
+                    .iter()
+                    .filter(
+                        |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
+                    )
+                    .count();
+                if answered < 2 {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_1".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        content: "two-batch-done".into(),
+                        ..assistant()
+                    })
+                }
+            }
             "approval-main" => {
                 if tool_message(&request.messages, "call_exec").is_none() {
                     Self::completed(AssistantMessage {
@@ -899,10 +960,12 @@ where
             .expect("send task");
     }
 
+    /// Answer a suspension exactly as a client would: addressed to the thread
+    /// that announced it, naming the batch it announced. Sending the same
+    /// `approval` twice is therefore a faithful duplicate submit.
     pub(super) async fn send_resume(
         &self,
-        agent_name: &str,
-        thread_id: &str,
+        approval: &PendingApproval,
         resolutions: Vec<(String, ToolCallResolution)>,
     ) {
         self.runtime
@@ -910,39 +973,81 @@ where
                 id,
                 from: Sender::User,
                 to: Receiver {
-                    name: agent_name.to_string(),
-                    thread_id: ThreadId::from(thread_id.to_string()),
+                    name: approval.agent_name.clone(),
+                    thread_id: ThreadId::from(approval.thread_id.clone()),
                 },
                 reply_to: None,
-                body: EnvelopeBody::Resume(crate::ResumeDecision { resolutions }),
+                body: EnvelopeBody::Resume(crate::ResumeDecision {
+                    parent_message_id: approval.parent_message_id,
+                    resolutions,
+                }),
             }))
             .await
             .expect("resume agent");
     }
 
-    /// Restart the harness from storage, injecting resume decisions for
-    /// agents that suspended in the previous run.
+    /// Restart the harness from storage, injecting resume decisions for agents
+    /// that suspended in the previous run (keyed by agent name, carrying the
+    /// thread each one is parked on — what `Session::open` derives from the
+    /// pending approvals it collected).
     pub(super) async fn restart(
         &self,
         agents: HashMap<String, Agent>,
         provider: TestProvider,
         approval: ToolApprovalMode,
-        resume_decisions: HashMap<String, ResumeDecision>,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
     ) -> Self {
-        let config = test_config(provider, approval);
-
-        let session_id = self.thread_id.as_ref().to_string();
         let snapshot: Option<AgentRuntimeSnapshot> = self
             .storage
-            .load_session_snapshot(&session_id)
+            .load_session_snapshot(self.thread_id.as_ref())
             .await
             .unwrap_or_default()
             .map(Into::into);
+        self.restart_from(agents, provider, approval, resume_targets, snapshot)
+            .await
+    }
+
+    /// Restart as if the previous process had died without any agent exiting:
+    /// the checkpoints are on disk but no runtime snapshot was ever written. A
+    /// session a fork just minted starts out in exactly this state.
+    pub(super) async fn restart_without_snapshot(
+        &self,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
+    ) -> Self {
+        self.restart_from(agents, provider, approval, resume_targets, None)
+            .await
+    }
+
+    async fn restart_from(
+        &self,
+        agents: HashMap<String, Agent>,
+        provider: TestProvider,
+        approval: ToolApprovalMode,
+        resume_targets: HashMap<String, (String, ResumeDecision)>,
+        snapshot: Option<AgentRuntimeSnapshot>,
+    ) -> Self {
+        let config = test_config(provider, approval);
+        let session_id = self.thread_id.as_ref().to_string();
+        let resume_targets = resume_targets
+            .into_iter()
+            .map(|(agent, (thread_id, decision))| {
+                (
+                    agent,
+                    ResumeTarget {
+                        thread_id: ThreadId(thread_id),
+                        decision,
+                    },
+                )
+            })
+            .collect();
 
         let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
         let events = runtime.subscribe();
         runtime
-            .bootstrap(agents, snapshot, resume_decisions, config)
+            .bootstrap(agents, snapshot, resume_targets, config)
             .await
             .expect("bootstrap");
 

@@ -426,6 +426,7 @@ async fn failed_resume_does_not_stick_turn_running() {
                 agent_name: "ghost".into(),
                 thread_id: "t-ghost".into(),
                 decision: ResumeDecision {
+                    parent_message_id: MessageId::new(),
                     resolutions: vec![],
                 },
             },

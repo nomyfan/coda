@@ -173,10 +173,14 @@ async fn stateless_subagent_replies_after_approval_resume() {
     // Phase 2: restart with resume, verify completion.
     let mut decisions = HashMap::new();
     decisions.insert(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                parent_message_id: pending.parent_message_id,
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
     );
     let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
@@ -254,24 +258,28 @@ async fn pending_approval_supports_mixed_resolutions() {
                     assert_eq!(pending.calls.len(), 4);
                     let mut decisions = HashMap::new();
                     decisions.insert(
-                        pending.thread_id.clone(),
-                        ResumeDecision {
-                            resolutions: vec![
-                                ("call_exec".into(), ToolCallResolution::Execute),
-                                (
-                                    "call_resolved".into(),
-                                    ToolCallResolution::Resolved(ToolOutput::Ok(
-                                        "resolved-by-test".into(),
-                                    )),
-                                ),
-                                (
-                                    "call_rejected".into(),
-                                    ToolCallResolution::Rejected {
-                                        reason: Some("nope".into()),
-                                    },
-                                ),
-                            ],
-                        },
+                        pending.agent_name.clone(),
+                        (
+                            pending.thread_id.clone(),
+                            ResumeDecision {
+                                parent_message_id: pending.parent_message_id,
+                                resolutions: vec![
+                                    ("call_exec".into(), ToolCallResolution::Execute),
+                                    (
+                                        "call_resolved".into(),
+                                        ToolCallResolution::Resolved(ToolOutput::Ok(
+                                            "resolved-by-test".into(),
+                                        )),
+                                    ),
+                                    (
+                                        "call_rejected".into(),
+                                        ToolCallResolution::Rejected {
+                                            reason: Some("nope".into()),
+                                        },
+                                    ),
+                                ],
+                            },
+                        ),
                     );
                     return (pending.thread_id, decisions);
                 }
@@ -359,20 +367,24 @@ async fn reject_pending_approval_via_restart() {
     let mut reject_decisions = HashMap::new();
     let reject_ids: Vec<String> = pending.calls.iter().map(|c| c.id.clone()).collect();
     reject_decisions.insert(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: reject_ids
-                .into_iter()
-                .map(|id| {
-                    (
-                        id,
-                        ToolCallResolution::Rejected {
-                            reason: Some("replaced by new task".into()),
-                        },
-                    )
-                })
-                .collect(),
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                parent_message_id: pending.parent_message_id,
+                resolutions: reject_ids
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id,
+                            ToolCallResolution::Rejected {
+                                reason: Some("replaced by new task".into()),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        ),
     );
     let agents2 = team.build(".", coda_tools::shared_file_locks());
     let mut harness = harness
@@ -461,6 +473,87 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     harness.shutdown().await;
 }
 
+/// The runtime snapshot is only written when an agent exits, so a process
+/// killed mid-approval — and a session a fork has just minted — comes back with
+/// checkpoints but no snapshot at all. A decision names the thread it belongs
+/// to, so it must still reach it: routing it through the snapshot's
+/// `active_threads` dropped it silently and left the thread parked forever,
+/// with every later approval swallowed the same way.
+#[tokio::test]
+async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "continuation-main".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let provider = TestProvider::default();
+    let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        provider.clone(),
+        approval.clone(),
+        "inspect todos",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for tool approval");
+    harness.shutdown().await;
+
+    let decisions = [(
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                parent_message_id: pending.parent_message_id,
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
+    )]
+    .into();
+    let mut harness = harness
+        .restart_without_snapshot(
+            team.build(".", coda_tools::shared_file_locks()),
+            provider,
+            approval,
+            decisions,
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::ToolCallEnd(tool)) = (agent_name.as_str(), event) {
+                assert_eq!(tool.name, "read_todos");
+                assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Approved),
+                    "the approved call must run, not be rejected for want of a decision"
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the approval was swallowed: nothing ran after the resume");
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let team = AgentTeam::new(
@@ -499,10 +592,14 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     harness.shutdown().await;
 
     let decisions = [(
-        pending.thread_id.clone(),
-        ResumeDecision {
-            resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
-        },
+        pending.agent_name.clone(),
+        (
+            pending.thread_id.clone(),
+            ResumeDecision {
+                parent_message_id: pending.parent_message_id,
+                resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
+            },
+        ),
     )]
     .into();
     let mut harness = harness
@@ -577,8 +674,7 @@ async fn in_process_resume_after_suspension() {
     // Resume in-process — no shutdown/restart.
     harness
         .send_resume(
-            &pending.agent_name,
-            &pending.thread_id,
+            &pending,
             vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
         )
         .await;
@@ -601,5 +697,156 @@ async fn in_process_resume_after_suspension() {
         "timed out waiting for completion after in-process resume"
     );
 
+    harness.shutdown().await;
+}
+
+/// "A call the decision does not name is rejected" holds all the way to naming
+/// none of them: an empty `resolutions` for the batch that is actually parked
+/// rejects it wholesale. Only the batch id decides whether a decision applies,
+/// so this stays a legitimate way to refuse everything.
+#[tokio::test]
+async fn an_empty_decision_for_the_parked_batch_rejects_it() {
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "two-batch-approval".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos")),
+        "two batches",
+    )
+    .await;
+
+    let pending = timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the suspension");
+
+    harness.send_resume(&pending, vec![]).await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if let ("coda", AgentEvent::ToolCallEnd(tool)) = (agent_name.as_str(), event) {
+                assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Rejected { .. }),
+                    "an unnamed call must still be rejected, got {:?}",
+                    tool.outcome
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the empty decision was ignored instead of rejecting the batch");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
+    // Submitting the same approval twice (a double-clicked button, a retry
+    // after a reconnect) sends the first batch's decision a second time. By
+    // then the thread has run those calls and suspended on the model's next
+    // batch — and every call in that batch is unnamed by the stale decision,
+    // so applying it rejected the lot and told the model the user had refused.
+    let team = AgentTeam::new(
+        AgentSpec {
+            name: "coda".into(),
+            description: String::new(),
+            system_prompt: "two-batch-approval".into(),
+            mode: SubAgentMode::Stateful,
+            tools: vec![Box::new(ReadTodosToolSpec)],
+            subagents: vec![],
+        },
+        vec![],
+    )
+    .expect("valid team");
+    let approval =
+        ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
+    let mut harness = Harness::start_agents(
+        MemoryStorage::default(),
+        team.build(".", coda_tools::shared_file_locks()),
+        TestProvider::default(),
+        approval,
+        "two batches",
+    )
+    .await;
+
+    let next_suspension = async |harness: &mut Harness<MemoryStorage>| loop {
+        let (agent_name, _, event) = harness.next_event().await;
+        if let ("coda", AgentEvent::Suspended(pending)) = (agent_name.as_str(), event) {
+            return pending;
+        }
+    };
+
+    let first = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("timed out waiting for the first suspension");
+    let first_decision = vec![(first.calls[0].id.clone(), ToolCallResolution::Execute)];
+    harness.send_resume(&first, first_decision.clone()).await;
+
+    let second = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("timed out waiting for the second suspension");
+    // The two batches reuse one call id, so the ids cannot tell a stale
+    // decision from a live one — which is the whole reason the batch is
+    // identified by the message that asked for it.
+    assert_eq!(second.calls[0].id, first.calls[0].id);
+    assert_ne!(second.parent_message_id, first.parent_message_id);
+
+    // The duplicate submit: the same approval answered a second time, landing
+    // on the batch the thread moved on to.
+    harness.send_resume(&first, first_decision).await;
+
+    // It must be ignored, and the second batch re-announced unchanged.
+    let reannounced = timeout(Duration::from_secs(2), next_suspension(&mut harness))
+        .await
+        .expect("the stale resume was applied instead of ignored");
+    assert_eq!(reannounced.parent_message_id, second.parent_message_id);
+
+    // Answering the batch that is actually parked still works.
+    harness
+        .send_resume(
+            &reannounced,
+            vec![(reannounced.calls[0].id.clone(), ToolCallResolution::Execute)],
+        )
+        .await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            match (agent_name.as_str(), event) {
+                ("coda", AgentEvent::ToolCallEnd(tool)) => assert!(
+                    matches!(tool.outcome, ToolCallOutcome::Approved),
+                    "{} was answered with {:?}",
+                    tool.id,
+                    tool.outcome
+                ),
+                ("coda", AgentEvent::LLMEnd(message)) if message.tool_calls.is_empty() => {
+                    assert_eq!(message.content, "two-batch-done");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the turn to finish");
     harness.shutdown().await;
 }
