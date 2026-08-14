@@ -867,7 +867,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     /// Record a call that will never run, so history holds no tool call without
     /// an answer.
     async fn write_off(&mut self, call_id: String, tool_name: String) {
-        self.add_tool_message_only(ToolMessage::new(
+        self.add_tool_message(ToolMessage::new(
             call_id,
             tool_name,
             ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
@@ -904,7 +904,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             ToolOutput::Ok(_) => call_state.take(),
             ToolOutput::Err(_) => Vec::new(),
         };
-        self.add_tool_message(
+        self.add_message_with_state(
             ToolMessage::new(
                 tc.tool_call.id,
                 tc.tool_call.name,
@@ -918,21 +918,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         aborted
     }
 
-    /// Append a tool message to history and emit the matching `ToolCallEnd`.
-    /// Every tool message written to history must go through this (or emit the
-    /// event itself): event consumers reconstruct history from the stream, so a
-    /// silent write would make their view diverge from the checkpoint.
-    /// `recorded` is whatever the call wrote through
-    /// [`ToolCallContext::state`](coda_core::tool::ToolCallContext::state); this
-    /// message is its anchor. The two are appended together, because an entry
-    /// without its anchor is state no fork or rewind can reach.
-    /// A tool message no call recorded state against: a write-off, a rejection,
-    /// a missing tool, a sub-agent's reply.
-    async fn add_tool_message_only(&mut self, message: ToolMessage) {
-        self.add_tool_message(message, Vec::new()).await
+    /// Append a tool message that recorded no state: a write-off, a rejection,
+    /// a missing tool, or a sub-agent's reply.
+    async fn add_tool_message(&mut self, message: ToolMessage) {
+        self.add_message_with_state(message, Vec::new()).await
     }
 
-    async fn add_tool_message(&mut self, message: ToolMessage, recorded: Vec<(String, Value)>) {
+    /// Append a tool message and its recorded state, then emit the matching
+    /// `ToolCallEnd`. Keeping them together ensures state never loses its
+    /// message anchor, while the event keeps consumers in sync with history.
+    async fn add_message_with_state(
+        &mut self,
+        message: ToolMessage,
+        recorded: Vec<(String, Value)>,
+    ) {
         self.agent
             .add_message_with_state(Message::Tool(message.clone()), recorded)
             .await;
@@ -1000,7 +999,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 } else {
                                     tc.outcome
                                 };
-                                self.add_tool_message_only(ToolMessage::new(
+                                self.add_tool_message(ToolMessage::new(
                                     tc.call_id,
                                     tc.tool_name,
                                     output.clone(),
@@ -1026,7 +1025,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     still_answering.push(pending);
                                     continue;
                                 }
-                                self.add_tool_message_only(ToolMessage::new(
+                                self.add_tool_message(ToolMessage::new(
                                     pending.call_id,
                                     pending.tool_name,
                                     ToolOutput::Err(
@@ -1153,7 +1152,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     });
                                 }
                                 ToolCallResolution::Resolved(output) => {
-                                    self.add_tool_message_only(ToolMessage::new(
+                                    self.add_tool_message(ToolMessage::new(
                                         tc.id,
                                         tc.name,
                                         output,
@@ -1163,7 +1162,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     .await;
                                 }
                                 ToolCallResolution::Rejected { reason } => {
-                                    self.add_tool_message_only(ToolMessage::new(
+                                    self.add_tool_message(ToolMessage::new(
                                         tc.id,
                                         tc.name,
                                         ToolOutput::Err(
@@ -1440,7 +1439,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     && concurrent_stateful.contains(&subagent.name)
                 {
                     // reject concurrent calls to stateful subagent
-                    self.add_tool_message_only(ToolMessage::new(
+                    self.add_tool_message(ToolMessage::new(
                         tc.tool_call.id.clone(),
                         tc.tool_call.name.clone(),
                         ToolOutput::Err(format!("Concurrent invocation of sub-agent '{}' is not allowed. Call it sequentially.", tc.tool_call.name)),
@@ -1503,7 +1502,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         "Failed to send tool call to subagent {}, error: {}",
                         tc.tool_call.name, err
                     );
-                    self.add_tool_message_only(ToolMessage::new(
+                    self.add_tool_message(ToolMessage::new(
                         tc.tool_call.id.clone(),
                         tc.tool_call.name.clone(),
                         ToolOutput::Err(format!(
@@ -1560,7 +1559,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 futures.push(future);
             } else {
                 // No such tool
-                self.add_tool_message_only(ToolMessage::new(
+                self.add_tool_message(ToolMessage::new(
                     tc.tool_call.id.clone(),
                     tc.tool_call.name.clone(),
                     ToolOutput::Err(format!("No such tool: {}", tc.tool_call.name)),
@@ -1625,7 +1624,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             drop(futures);
             aborted_ids.extend(pending_local.keys().cloned());
             for (id, (tc, started_at)) in pending_local {
-                self.add_tool_message_only(ToolMessage::new(
+                self.add_tool_message(ToolMessage::new(
                     id,
                     tc.tool_call.name,
                     ToolOutput::Err("Tool execution was interrupted by the user".to_string()),
