@@ -599,6 +599,54 @@ async fn an_assistant_message_keeps_its_reasoning_continuation() {
     );
 }
 
+/// A binary `read_file`, or a `shell` command that wrote raw bytes, lands a NUL
+/// in the tool result: `from_utf8_lossy` only rewrites *invalid* UTF-8, and NUL
+/// is valid. PostgreSQL used to reject the whole checkpoint over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_carrying_a_nul_byte_still_saves() {
+    let pool = pool().await;
+    let workspace = workspace_id("nul-byte");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "read the header")),
+                    ),
+                    entry(
+                        turn,
+                        Message::Tool(ToolMessage::new(
+                            "call_read",
+                            "read_file",
+                            ToolOutput::Ok("\u{0}ELF\u{0}\u{0}stripped".to_string()),
+                            ToolCallOutcome::Auto,
+                            None,
+                        )),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .expect("a NUL in a tool result must not cost the whole checkpoint");
+
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    let Message::Tool(message) = &loaded.messages[1].message else {
+        panic!("expected a tool message");
+    };
+    let ToolOutput::Ok(output) = &message.output else {
+        panic!("expected a successful tool result");
+    };
+    // Every other byte survives; the NULs come back as U+FFFD.
+    assert_eq!(output, "\u{fffd}ELF\u{fffd}\u{fffd}stripped");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn one_submission_is_recoverable_across_every_thread_it_reached() {
     let pool = pool().await;
