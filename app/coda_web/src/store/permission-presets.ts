@@ -1,0 +1,128 @@
+import {
+  DEFAULT_PERMISSION_PRESET,
+  isPermissionPreset,
+  type PermissionPreset,
+} from "@/lib/protocol";
+
+const storageKey = "coda.permissionPresets";
+
+/**
+ * How many sessions to remember per server. Every session ever opened would
+ * otherwise accumulate here forever; the oldest entries are dropped first,
+ * and a forgotten session simply reopens on the default.
+ */
+const MAX_REMEMBERED = 200;
+
+/** `{ ts }` is the LRU stamp, refreshed on every write. */
+type StoredPreset = { preset: PermissionPreset; ts: number };
+type PresetMemory = Record<string, Record<string, StoredPreset>>;
+
+/**
+ * The preset is remembered per *session*, not per workspace: switching mid-
+ * conversation is scoped to that conversation, and a new one always starts on
+ * {@link DEFAULT_PERMISSION_PRESET}. Nothing is persisted server-side, so this
+ * is the only record of what a released session was running under.
+ */
+function sessionSlot(workspaceId: string, sessionId: string) {
+  return `${workspaceId}:${sessionId}`;
+}
+
+function isStoredPreset(value: unknown): value is StoredPreset {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const stored = value as Partial<StoredPreset>;
+  return isPermissionPreset(stored.preset) && typeof stored.ts === "number";
+}
+
+function loadMemory(): PresetMemory {
+  const memory: PresetMemory = Object.create(null);
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return memory;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return memory;
+    }
+    for (const [server, storedSessions] of Object.entries(parsed)) {
+      if (!storedSessions || typeof storedSessions !== "object") {
+        continue;
+      }
+      const sessions: Record<string, StoredPreset> = Object.create(null);
+      for (const [slot, stored] of Object.entries(storedSessions)) {
+        if (isStoredPreset(stored)) {
+          sessions[slot] = stored;
+        }
+      }
+      if (Object.keys(sessions).length > 0) {
+        memory[server] = sessions;
+      }
+    }
+  } catch {
+    // ignore malformed/blocked storage
+  }
+  return memory;
+}
+
+/** Drop the least recently written entries once a server exceeds the cap. */
+function prune(sessions: Record<string, StoredPreset>) {
+  const slots = Object.keys(sessions);
+  if (slots.length <= MAX_REMEMBERED) {
+    return;
+  }
+  const oldestFirst = slots.sort((a, b) => sessions[a].ts - sessions[b].ts);
+  for (const slot of oldestFirst.slice(0, slots.length - MAX_REMEMBERED)) {
+    delete sessions[slot];
+  }
+}
+
+export function rememberSessionPreset(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  preset: PermissionPreset,
+) {
+  try {
+    const memory = loadMemory();
+    memory[server] ??= Object.create(null);
+    memory[server][sessionSlot(workspaceId, sessionId)] = { preset, ts: Date.now() };
+    prune(memory[server]);
+    window.localStorage.setItem(storageKey, JSON.stringify(memory));
+  } catch {
+    // ignore storage failures (private mode, disabled storage)
+  }
+}
+
+export function forgetSessionPreset(server: string, workspaceId: string, sessionId: string) {
+  try {
+    const memory = loadMemory();
+    const sessions = memory[server];
+    if (!sessions?.[sessionSlot(workspaceId, sessionId)]) {
+      return;
+    }
+    delete sessions[sessionSlot(workspaceId, sessionId)];
+    window.localStorage.setItem(storageKey, JSON.stringify(memory));
+  } catch {
+    // ignore storage failures
+  }
+}
+
+/**
+ * The preset to open this session on: what it was last seen running under, or
+ * the default for one this browser has never opened (a new conversation, a new
+ * device, or cleared storage).
+ *
+ * Only a seed — a session the server still has live answers with its own preset
+ * in the snapshot, and that value wins.
+ */
+export function initialSessionPreset(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+): PermissionPreset {
+  return (
+    loadMemory()[server]?.[sessionSlot(workspaceId, sessionId)]?.preset ?? DEFAULT_PERMISSION_PRESET
+  );
+}

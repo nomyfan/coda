@@ -83,9 +83,21 @@ Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first
 
 ### Workspace Approval Configuration
 
-Tool approval rules live in each workspace's `.coda/config.toml`. Regular tools matching `[permissions.tools].approval_required` patterns suspend for human approval; by default this is `["edit_file", "write_file", "ls", "grep", "glob"]`. Use `mcp__server__*` to gate every tool from one MCP server. The `ask_user` tool is always interactive and always suspends to open the web UI.
+Each session runs under a **permission preset** (`coda_server::config::PermissionPreset`), chosen in the composer. A preset is an allow-list: the tools it names run unattended and everything else suspends for human approval.
 
-Shell approvals use `[permissions.shell]` allow/deny glob lists. A `shell` call auto-approves only when every decomposed simple command matches `allow`, no simple command matches `deny`, and the command uses only statically-vetted sequencing/pipe constructs; other shell constructs suspend for approval.
+| preset | auto-approves |
+| --- | --- |
+| `explore` | `ls`, `read_file`, `glob`, `grep`, `read_todos`, `write_todos` |
+| `accept_edits` (default) | the above plus `write_file`, `edit_file` |
+| `yolo` | everything, `shell` included |
+
+Delegation (`agent__*`) is auto-approved under every preset — the sub-agent's own calls go through this same policy, so gating the hand-off too would charge two approvals for one action.
+
+The preset is per session and lives only in memory: `PermissionPresetCell` is shared between the hub entry and the approval closure inside the runtime, so `set_permission_preset` takes effect on the next tool call without a rebuild — accepted mid-turn and mid-suspension, and applying to the next call rather than to one already parked. It survives the `SetModel` rebuild and the `Pending` → `Live` promotion because it hangs off the entry, not the phase. Nothing is persisted: the attach that *opens* a session seeds the preset from the client, every later attach is told the live value in its snapshot (a client reconnecting to a running session adopts it), and the web client remembers a preset per session in `localStorage` so a released session reopens as it was.
+
+Workspace rules in `.coda/config.toml` layer on top and can only *tighten*: a tool matching `[permissions.tools].approval_required` suspends under every preset, `yolo` included (use `mcp__server__*` to cover one MCP server). It defaults to empty, since the preset now carries the baseline. The `ask_user` tool is always interactive and always suspends to open the web UI.
+
+Shell approvals use `[permissions.shell]` allow/deny glob lists. Outside `yolo`, a `shell` call auto-approves only when every decomposed simple command matches `allow`, no simple command matches `deny`, and the command uses only statically-vetted sequencing/pipe constructs; other shell constructs suspend for approval. Under `yolo` the allow-list is skipped but `deny` still bites — on the commands that decompose, which is what it can be checked against.
 
 ### Key Abstractions
 

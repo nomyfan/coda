@@ -6,11 +6,13 @@ import { Textarea } from "@/components/ui/textarea";
 import type {
   ConnectionStatus,
   OpenedSession,
+  PermissionPreset,
   ProviderInfo,
   ReasoningEffort,
   UsageRecord,
 } from "@/store/session";
 import { ModelSelector } from "@/components/model-selector";
+import { PermissionSelector } from "@/components/permission-selector";
 import { ContextUsage } from "@/components/context-usage";
 import {
   ImageLightbox,
@@ -39,6 +41,7 @@ export const Composer = memo(function Composer({
   evicted,
   workspace,
   selectingTarget,
+  permissionPreset,
   providers,
   providerId,
   reasoningEffort,
@@ -50,6 +53,7 @@ export const Composer = memo(function Composer({
   forkDraft,
   onForkDraftChange,
   onSetModel,
+  onSetPermissionPreset,
   onSend,
   onAbort,
   onCancelEdit,
@@ -69,6 +73,8 @@ export const Composer = memo(function Composer({
   workspace?: string;
   /** New-session mode: the send target is still being picked in the header. */
   selectingTarget: boolean;
+  /** How much this session may do unattended, and the control to change it. */
+  permissionPreset: PermissionPreset;
   providers: ProviderInfo[];
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
@@ -90,6 +96,7 @@ export const Composer = memo(function Composer({
   forkDraft?: NonNullable<OpenedSession["forkDraft"]>;
   onForkDraftChange: (text: string, images: string[]) => void;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
+  onSetPermissionPreset: (preset: PermissionPreset) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
   onCancelEdit: () => void;
@@ -324,61 +331,75 @@ export const Composer = memo(function Composer({
               e.target.value = "";
             }}
           />
-          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-end gap-1">
-            {showControls && contextWindow ? (
-              <ContextUsage contextWindow={contextWindow} records={usage} />
-            ) : null}
-            {showControls ? (
-              <ModelSelector
-                providers={providers}
-                providerId={providerId}
-                reasoningEffort={reasoningEffort}
-                disabled={!connected || busy}
-                modelLocked={!selectingTarget}
-                requireImageModel={requireImageModel}
-                serverUrl={serverUrl}
-                workspaceId={workspaceId}
-                onSetModel={onSetModel}
-              />
-            ) : null}
-            {acceptsImages && (
-              <Button
-                size="icon"
-                variant="ghost"
-                className="size-8 rounded-md"
-                type="button"
-                title={
-                  images.length >= MAX_IMAGES ? `Maximum ${MAX_IMAGES} images` : "Attach images"
-                }
-                disabled={!canAddImages}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <ImagePlus className="size-4" />
-              </Button>
-            )}
-            {busy ? (
-              <Button
-                size="icon"
-                variant="secondary"
-                className="size-8 rounded-md"
-                type="button"
-                onClick={onAbort}
-                disabled={!connected}
-                title="Abort"
-              >
-                <CircleStop />
-              </Button>
-            ) : (
-              <Button
-                size="icon"
-                className="size-8 rounded-md"
-                type="submit"
-                disabled={!canSend}
-                title={imagesBlockSend ? "Selected model does not support images" : "Send"}
-              >
-                <CornerDownLeft />
-              </Button>
-            )}
+          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-between gap-1">
+            <div className="flex min-w-0 items-center gap-1">
+              {showControls ? (
+                <PermissionSelector
+                  preset={permissionPreset}
+                  // Switchable whenever the session can hear it: the server
+                  // rebuilds nothing, so mid-turn and awaiting-approval are
+                  // both fine — and are exactly when the user wants it.
+                  disabled={!connected || evicted}
+                  onSetPreset={onSetPermissionPreset}
+                />
+              ) : null}
+            </div>
+            <div className="flex min-w-0 items-center gap-1">
+              {showControls && contextWindow ? (
+                <ContextUsage contextWindow={contextWindow} records={usage} />
+              ) : null}
+              {showControls ? (
+                <ModelSelector
+                  providers={providers}
+                  providerId={providerId}
+                  reasoningEffort={reasoningEffort}
+                  disabled={!connected || busy}
+                  modelLocked={!selectingTarget}
+                  requireImageModel={requireImageModel}
+                  serverUrl={serverUrl}
+                  workspaceId={workspaceId}
+                  onSetModel={onSetModel}
+                />
+              ) : null}
+              {acceptsImages && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="size-8 rounded-md"
+                  type="button"
+                  title={
+                    images.length >= MAX_IMAGES ? `Maximum ${MAX_IMAGES} images` : "Attach images"
+                  }
+                  disabled={!canAddImages}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <ImagePlus className="size-4" />
+                </Button>
+              )}
+              {busy ? (
+                <Button
+                  size="icon"
+                  variant="secondary"
+                  className="size-8 rounded-md"
+                  type="button"
+                  onClick={onAbort}
+                  disabled={!connected}
+                  title="Abort"
+                >
+                  <CircleStop />
+                </Button>
+              ) : (
+                <Button
+                  size="icon"
+                  className="size-8 rounded-md"
+                  type="submit"
+                  disabled={!canSend}
+                  title={imagesBlockSend ? "Selected model does not support images" : "Send"}
+                >
+                  <CornerDownLeft />
+                </Button>
+              )}
+            </div>
           </div>
         </div>
         {imagesBlockSend && (

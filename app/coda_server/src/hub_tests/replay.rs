@@ -11,7 +11,14 @@ use tokio::sync::mpsc;
 async fn task_settles_then_reattach_shows_folded_history() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     assert!(attach1.snapshot.messages.is_empty());
@@ -35,7 +42,14 @@ async fn task_settles_then_reattach_shows_folded_history() {
     // A second client takes over: folded history, no replay, first client
     // sees the eviction.
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2");
     assert!(!attach2.snapshot.turn_running);
@@ -70,7 +84,14 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
     let hub = SessionHub::new(opener, RelayConfig::default());
 
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events = attach.events;
@@ -91,7 +112,14 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
 
     // Read the snapshot the way a reconnecting client would.
     let snapshot = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2")
         .snapshot;
@@ -143,7 +171,14 @@ fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
 async fn midturn_attach_replays_chunks_and_evicts_previous() {
     let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -164,7 +199,14 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
         .await;
 
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2");
     // Mid-turn snapshot: the user prompt is visible, the turn is running,
@@ -202,7 +244,14 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
 async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -222,7 +271,14 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
 
     // Reopen: history comes back from the persisted checkpoint.
     let attach2 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("re-attach");
     assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -235,7 +291,14 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
 async fn disconnect_during_turn_keeps_session_until_settle() {
     let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -263,7 +326,14 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
     wait_released(&hub).await;
 
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("re-attach");
     assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -276,7 +346,14 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
 async fn burst_of_chunks_survives_replay_and_fold() {
     let (hub, _) = hub_with("burst", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -295,7 +372,14 @@ async fn burst_of_chunks_survives_replay_and_fold() {
     next_matching(&mut events1, is_settling_llm_end).await;
 
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2");
     assert_eq!(attach2.snapshot.messages.len(), 2);
@@ -311,7 +395,14 @@ async fn burst_of_chunks_survives_replay_and_fold() {
 async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
     let (hub, _) = hub_with("runaway", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -334,7 +425,14 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
     // Reopening reads the checkpoint the runtime saved once its (now
     // exit-barriered) tool execution batch finished.
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, false)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
@@ -344,7 +442,14 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
 async fn delete_evicts_attached_client_and_removes_entry() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -360,13 +465,28 @@ async fn attach_without_takeover_is_refused_while_held() {
     // unless the caller explicitly asked for a takeover.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
 
     assert!(matches!(
-        hub.attach(key(), 2, "prov".into(), None, false).await,
+        hub.attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false
+        )
+        .await,
         Err(AttachError::Busy)
     ));
     // The holder is untouched: no eviction was delivered.
@@ -376,9 +496,16 @@ async fn attach_without_takeover_is_refused_while_held() {
     ));
 
     // An explicit takeover still works and evicts the holder.
-    hub.attach(key(), 2, "prov".into(), None, true)
-        .await
-        .expect("takeover");
+    hub.attach(
+        key(),
+        2,
+        "prov".into(),
+        None,
+        PermissionPreset::default(),
+        true,
+    )
+    .await
+    .expect("takeover");
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
 
     hub.shutdown_all().await;
@@ -391,11 +518,25 @@ async fn delete_from_stale_connection_is_rejected() {
     // driving.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let _attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2 evicts conn 1");
 
@@ -414,7 +555,14 @@ async fn failed_resume_does_not_stick_turn_running() {
     // could never be released.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -458,7 +606,14 @@ async fn lagged_stream_drains_session_and_closes_client() {
     // (deliberately) hard to reproduce.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -479,7 +634,14 @@ async fn lagged_stream_drains_session_and_closes_client() {
 
     // Reopening reads the authoritative persisted checkpoint.
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
@@ -496,7 +658,14 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
     let storage = opener.storage.clone();
     let hub = SessionHub::new(opener, RelayConfig::default());
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events = attach.events;
@@ -522,7 +691,14 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
     wait_released(&hub).await;
 
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, false)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);

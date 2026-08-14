@@ -11,7 +11,14 @@ use tokio::time::Duration;
 async fn a_second_task_is_rejected_while_the_first_keeps_fork_busy() {
     let (hub, opener) = hub_and_opener(TestOpener::new("hold", ToolApprovalMode::Auto));
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let first = hub
@@ -81,7 +88,14 @@ async fn forking_a_session_nobody_opened_leaves_no_entry_behind() {
 async fn forking_a_live_session_reports_it_as_live() {
     let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events = attach.events;
@@ -134,7 +148,17 @@ async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
 
     let attaching = tokio::spawn({
         let hub = hub.clone();
-        async move { hub.attach(key(), 1, "prov".into(), None, false).await }
+        async move {
+            hub.attach(
+                key(),
+                1,
+                "prov".into(),
+                None,
+                PermissionPreset::default(),
+                false,
+            )
+            .await
+        }
     });
     // Let the attach reach the map and block on the mutex, so it is holding the
     // very entry the fork is about to drop.
@@ -192,7 +216,14 @@ async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
     opener.fork_error = Some(busy);
     let (live_hub, _) = hub_and_opener(opener);
     let _attach = live_hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     assert!(matches!(
@@ -237,7 +268,14 @@ async fn slow_sub_agent_session() -> (SessionHub, BoxStream<'static, RelayEvent>
         RelayConfig::default(),
     );
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     (hub, attach.events)

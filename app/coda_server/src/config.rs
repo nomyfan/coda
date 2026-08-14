@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use coda_agent::ToolApprovalMode;
+use coda_agent::{SUBAGENT_TOOL_PREFIX, ToolApprovalMode};
 use coda_core::llm::{Modality, ToolCall};
 use coda_openai::ProviderKind;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -522,6 +523,102 @@ fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
+/// How much a session is trusted to do without stopping to ask.
+///
+/// A preset is an **allow-list**: the tools it names run unattended and
+/// everything else suspends for human approval. That is the inverse of
+/// `[permissions.tools].approval_required`, which survives as a workspace-level
+/// *tightening* list — it can force approval for a tool the preset would have
+/// waved through, never the other way round.
+///
+/// The preset is per session and live-editable: [`PermissionPresetCell`] is what
+/// the approval closure reads, so switching takes effect on the next tool call
+/// without rebuilding the runtime — mid-turn and mid-suspension included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPreset {
+    /// Look, don't touch: inspection tools only. Anything that writes a file or
+    /// runs a command asks first.
+    Explore,
+    /// [`Self::Explore`] plus the file-editing tools. The default for a new
+    /// session.
+    #[default]
+    AcceptEdits,
+    /// Auto-approve everything, `shell` included. `ask_user` still opens the UI
+    /// (it asks a question rather than seeking permission) and the workspace's
+    /// `deny` rules still bite — see [`ToolApprovalConfig::requires_approval`].
+    Yolo,
+}
+
+/// Tools [`PermissionPreset::Explore`] runs unattended: they read the workspace
+/// (or, for the todos pair, only the agent's own scratch state) and change
+/// nothing on disk.
+const EXPLORE_TOOLS: &[&str] = &[
+    "ls",
+    "read_file",
+    "glob",
+    "grep",
+    "read_todos",
+    "write_todos",
+];
+
+/// What [`PermissionPreset::AcceptEdits`] adds on top of [`EXPLORE_TOOLS`].
+const ACCEPT_EDITS_TOOLS: &[&str] = &["write_file", "edit_file"];
+
+impl PermissionPreset {
+    /// Whether this preset lets `tool_name` run without asking. Says nothing
+    /// about the workspace's own rules — [`ToolApprovalConfig::requires_approval`]
+    /// applies those on top.
+    pub fn auto_approves(self, tool_name: &str) -> bool {
+        // Delegation is waved through at every level: handing work to a
+        // sub-agent has no effect of its own, and each tool the sub-agent then
+        // calls is checked against this same policy. Gating the `agent__*` call
+        // as well would just charge the user two approvals for one action.
+        if tool_name.starts_with(SUBAGENT_TOOL_PREFIX) {
+            return true;
+        }
+        match self {
+            Self::Yolo => true,
+            Self::AcceptEdits => {
+                EXPLORE_TOOLS.contains(&tool_name) || ACCEPT_EDITS_TOOLS.contains(&tool_name)
+            }
+            Self::Explore => EXPLORE_TOOLS.contains(&tool_name),
+        }
+    }
+}
+
+/// A session's live [`PermissionPreset`], shared between the hub entry that owns
+/// the session and the approval closure inside its runtime.
+///
+/// Cloning shares the cell, so a `set_permission_preset` writes what the next
+/// approval check reads. The hub holds it for the life of the session, which
+/// outlives any one connection: a client that reconnects to a running session is
+/// told the value in here, not the one it remembered locally.
+#[derive(Clone, Default)]
+pub struct PermissionPresetCell(Arc<Mutex<PermissionPreset>>);
+
+impl PermissionPresetCell {
+    pub fn new(preset: PermissionPreset) -> Self {
+        Self(Arc::new(Mutex::new(preset)))
+    }
+
+    pub fn get(&self) -> PermissionPreset {
+        *self.0.lock().unwrap()
+    }
+
+    pub fn set(&self, preset: PermissionPreset) {
+        *self.0.lock().unwrap() = preset;
+    }
+}
+
+impl fmt::Debug for PermissionPresetCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PermissionPresetCell")
+            .field(&self.get())
+            .finish()
+    }
+}
+
 /// Pattern-based permission rules for `shell` commands.
 ///
 /// A command is parsed into its constituent simple commands (splitting on `;`,
@@ -560,7 +657,10 @@ struct Permissions {
 }
 
 const INTERACTIVE_TOOLS: &[&str] = &["ask_user"];
-const DEFAULT_APPROVAL_REQUIRED_TOOLS: &[&str] = &["edit_file", "write_file", "ls", "grep", "glob"];
+/// Empty on purpose: the session's [`PermissionPreset`] carries the baseline
+/// policy now, and `[permissions.tools].approval_required` exists only for a
+/// workspace that wants to lock something down further than the preset does.
+const DEFAULT_APPROVAL_REQUIRED_TOOLS: &[&str] = &[];
 
 impl ToolApprovalConfig {
     /// Create a default config (empty rules → all shell calls require approval)
@@ -597,16 +697,32 @@ impl ToolApprovalConfig {
         })
     }
 
-    /// Build a `ToolApprovalMode` that checks shell commands against these rules.
+    /// Build a `ToolApprovalMode` that judges calls against these rules and the
+    /// session's live preset.
     ///
-    /// The returned closure captures the inner `Arc` so that patterns added via
-    /// [`add_allow_pattern`] take effect immediately for subsequent tool calls.
-    pub fn into_approval_mode(self) -> ToolApprovalMode {
-        ToolApprovalMode::RequireWhen(Arc::new(move |call| self.requires_approval(call)))
+    /// The returned closure captures both `Arc`s, so patterns added via
+    /// [`add_allow_pattern`] *and* a preset switched mid-session take effect
+    /// immediately for subsequent tool calls.
+    pub fn into_approval_mode(self, preset: PermissionPresetCell) -> ToolApprovalMode {
+        ToolApprovalMode::RequireWhen(Arc::new(move |call| {
+            self.requires_approval(preset.get(), call)
+        }))
     }
 
-    /// Whether `call` should be suspended for human approval.
-    pub fn requires_approval(&self, call: &ToolCall) -> bool {
+    /// Whether `call` should be suspended for human approval under `preset`.
+    ///
+    /// The order matters, and the first three rules outrank the preset — even
+    /// [`PermissionPreset::Yolo`]:
+    ///
+    /// 1. `ask_user` always opens the UI; it is a question, not a permission.
+    /// 2. `[permissions.tools].approval_required` is the workspace's own lock,
+    ///    and a preset must not be able to pick it.
+    /// 3. A `shell` command matching a `deny` glob stays denied.
+    ///
+    /// Past those, `Yolo` waves everything through; the other presets check
+    /// `shell` against the allow/deny rules and every other tool against the
+    /// preset's own list.
+    pub fn requires_approval(&self, preset: PermissionPreset, call: &ToolCall) -> bool {
         if INTERACTIVE_TOOLS.iter().any(|tool| tool == &call.name) {
             return true;
         }
@@ -618,11 +734,17 @@ impl ToolApprovalConfig {
         {
             return true;
         }
-        if call.name != "shell" {
-            return false;
+        if call.name == "shell" {
+            let command = extract_shell_command(call);
+            if preset == PermissionPreset::Yolo {
+                // Yolo skips the allow-list, not the deny-list. A command that
+                // can't be decomposed can't be checked against `deny` either,
+                // and yolo is the mode that runs it anyway.
+                return matches_deny(&command, &inner.deny);
+            }
+            return !is_auto_approved(&command, &inner.allow, &inner.deny);
         }
-        let command = extract_shell_command(call);
-        !is_auto_approved(&command, &inner.allow, &inner.deny)
+        !preset.auto_approves(&call.name)
     }
 
     /// Append a glob pattern to the allow-list, updating both in-memory state
@@ -702,6 +824,22 @@ fn default_approval_required_tools() -> Vec<String> {
 /// matches `deny`. Any construct that can't be statically reduced — a parse
 /// error, backgrounding, redirections, substitutions, compound commands, etc.
 /// — yields `false` (require approval).
+/// Whether any simple command in `command` matches a `deny` glob.
+///
+/// The deny-list is the one rule [`PermissionPreset::Yolo`] still respects, so
+/// this is deliberately the *only* question asked there: a command that fails to
+/// parse yields `false` (nothing matched), and yolo runs it. Under every other
+/// preset the same command goes through [`is_auto_approved`], where failing to
+/// parse means "ask".
+fn matches_deny(command: &str, deny: &[String]) -> bool {
+    let Some(simple_commands) = decompose(command) else {
+        return false;
+    };
+    simple_commands
+        .iter()
+        .any(|cmd| deny.iter().any(|p| wildcard_match(p, cmd)))
+}
+
 fn is_auto_approved(command: &str, allow: &[String], deny: &[String]) -> bool {
     let Some(simple_commands) = decompose(command) else {
         return false;

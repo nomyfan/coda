@@ -153,12 +153,13 @@ fn snapshot_serializes_without_type_tag() {
         pending_approvals: vec![],
         provider_id: "deepseek".into(),
         reasoning_effort: Some("high".into()),
+        permission_preset: PermissionPreset::Yolo,
         turn_running: true,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
-        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","turn_running":true}"#
+        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_preset":"yolo","turn_running":true}"#
     );
 }
 
@@ -167,6 +168,22 @@ fn snapshot_without_turn_running_defaults_to_false() {
     let json = r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
     let snapshot: Snapshot = serde_json::from_str(json).unwrap();
     assert!(!snapshot.turn_running);
+    assert_eq!(snapshot.permission_preset, PermissionPreset::AcceptEdits);
+}
+
+#[test]
+fn permission_preset_round_trips_over_the_wire() {
+    for (preset, tag) in [
+        (PermissionPreset::Explore, "\"explore\""),
+        (PermissionPreset::AcceptEdits, "\"accept_edits\""),
+        (PermissionPreset::Yolo, "\"yolo\""),
+    ] {
+        assert_eq!(serde_json::to_string(&preset).unwrap(), tag);
+        assert_eq!(
+            serde_json::from_str::<PermissionPreset>(tag).unwrap(),
+            preset
+        );
+    }
 }
 
 #[test]

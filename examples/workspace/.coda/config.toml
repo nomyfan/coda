@@ -1,10 +1,21 @@
 # Tool approval rules for this workspace.
 #
-# `approval_required` lists regular tool-name patterns that pause for approval.
-# Use `mcp__server__*` to require approval for every tool from one MCP server.
+# The baseline is the session's permission preset, picked in the composer:
+#
+#   explore       ls, read_file, glob, grep, read_todos, write_todos
+#   accept_edits  the above plus write_file, edit_file   (the default)
+#   yolo          everything, shell included
+#
+# Anything the preset does not cover pauses for approval, so this file is only
+# for tightening further.
+#
+# `approval_required` lists tool-name patterns that pause for approval under
+# *every* preset — yolo included. It defaults to empty. Use `mcp__server__*` to
+# cover every tool from one MCP server.
 # `ask_user` is always interactive and always pauses to open the UI.
 #
-# Shell commands use allow/deny globs. A command is parsed and split into its
+# Shell commands use allow/deny globs. Under yolo the allow-list is skipped and
+# only `deny` is consulted. Otherwise a command is parsed and split into its
 # simple commands (on `;`, newlines, `&&`, `||`, `|`); each is evaluated
 # independently. The whole call auto-approves only when:
 #   - every simple command matches an `allow` pattern, and
@@ -17,12 +28,9 @@
 # Patterns are globs matched against each simple command's text.
 
 [permissions.tools]
+# Kept behind a human even in yolo — this server's tools reach outside the
+# workspace, which no preset should be able to wave through.
 approval_required = [
-  "write_file",
-  "edit_file",
-  "ls",
-  "grep",
-  "glob",
   "mcp__time__*",
 ]
 

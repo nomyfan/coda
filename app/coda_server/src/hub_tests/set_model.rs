@@ -12,7 +12,14 @@ async fn set_model_to_current_selection_is_unchanged() {
     // reports as idempotent success (Decision 8).
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -36,7 +43,14 @@ async fn set_model_to_current_selection_is_unchanged() {
 async fn set_model_effort_switch_returns_model_changed() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -61,7 +75,14 @@ async fn set_model_effort_switch_returns_model_changed() {
 async fn set_model_rejects_a_different_provider_or_model() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach = hub
-        .attach(key(), 1, "prov:model-a".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov:model-a".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -85,7 +106,14 @@ async fn set_model_rejects_a_different_provider_or_model() {
 async fn failed_effort_persistence_keeps_live_selection() {
     let hub = hub_with_failing_metadata("reply");
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -103,7 +131,14 @@ async fn failed_effort_persistence_keeps_live_selection() {
             if error == "injected metadata write failure"
     ));
     let refreshed = hub
-        .attach(key(), 1, "prov".into(), Some("high".into()), false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            Some("high".into()),
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("refresh attach");
     assert_eq!(refreshed.snapshot.provider_id, "prov");
@@ -119,7 +154,14 @@ async fn set_model_while_turn_running_is_rejected() {
     // silent `Ignored` that the dispatcher would misread as SESSION_NOT_LIVE.
     let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 
@@ -162,7 +204,14 @@ async fn set_model_on_unattached_connection_is_ignored() {
     // dispatch; the request layer reads that as SESSION_NOT_LIVE.
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
 

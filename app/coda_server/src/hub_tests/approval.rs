@@ -9,7 +9,14 @@ use coda_agent::{ToolApprovalMode, ToolCallResolution};
 async fn suspended_approval_survives_release_and_promotes_on_resume() {
     let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -40,7 +47,14 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
 
     // Reopen: the checkpointed approval gates the open (Pending entry).
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("re-attach");
     assert_eq!(attach2.snapshot.pending_approvals.len(), 1);
@@ -84,7 +98,14 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
 async fn aborting_a_suspended_turn_clears_its_pending_approval() {
     let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -132,7 +153,14 @@ async fn aborting_a_suspended_turn_clears_its_pending_approval() {
 async fn new_task_is_rejected_while_an_approval_remains_pending() {
     let (hub, _) = hub_with("approval", ToolApprovalMode::Manual);
     let attach1 = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events1 = attach1.events;
@@ -164,7 +192,14 @@ async fn new_task_is_rejected_while_an_approval_remains_pending() {
     assert!(matches!(outcome, CommandOutcome::NotIdle));
 
     let attach2 = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionPreset::default(),
+            true,
+        )
         .await
         .expect("attach2");
     assert_eq!(attach2.snapshot.pending_approvals.len(), 1);

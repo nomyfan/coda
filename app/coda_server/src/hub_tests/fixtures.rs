@@ -259,6 +259,11 @@ pub(super) struct TestOpener {
     /// another command while the copy is in flight.
     pub(super) fork_gate: Option<Arc<Notify>>,
     pub(super) fork_error: Option<ForkError>,
+    /// The preset cells handed to each session this opener built, in order.
+    /// A runtime reads its posture through the cell for as long as it lives, so
+    /// a test can read one back to see what the *running* session would now
+    /// decide — which is how the live-switch path is checked without a rebuild.
+    pub(super) opened_presets: Arc<std::sync::Mutex<Vec<PermissionPresetCell>>>,
 }
 
 impl TestOpener {
@@ -334,6 +339,7 @@ impl TestOpener {
             forks: Arc::new(std::sync::Mutex::new(Vec::new())),
             fork_gate: None,
             fork_error: None,
+            opened_presets: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -350,9 +356,14 @@ impl SessionOpener for TestOpener {
         key: &'a SessionKey,
         _provider_id: &'a str,
         _reasoning_effort: Option<String>,
+        permission_preset: PermissionPresetCell,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
+            self.opened_presets
+                .lock()
+                .unwrap()
+                .push(permission_preset.clone());
             let after_rewind = self.rewound.load(std::sync::atomic::Ordering::SeqCst);
             if after_rewind && self.fail_open_after_rewind {
                 return Err(OpenError::Storage("injected rebuild failure".into()));

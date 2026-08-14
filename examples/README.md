@@ -57,7 +57,7 @@ where you launch from.
 | `docs-writer/` | A **per-agent workspace** (`workspace: ./docs`): its tool root and knowledge come from `docs/`, so its `{{workspace_available_skills}}`/`{{workspace_custom_instructions}}` resolve against `docs/`, not the root. |
 | `docs/AGENTS.md` + `docs/.coda/skills/` | A per-agent workspace carries **its own** knowledge and skills, distinct from the root's. |
 | `.coda/mcp.json` | An MCP server over **stdio** (`mcp-server-time` via `uvx`); referenced from agents as `mcp__<server>__<tool>`. An **http** server uses `{ "type": "http", "url": ... }` instead. |
-| `.coda/config.toml` | Tool approval config: `approval_required` tool-name patterns plus `shell` `allow`/`deny` globs. `ask_user` always pauses to open the UI. |
+| `.coda/config.toml` | Workspace approval rules layered on the session's permission preset: `approval_required` tool-name patterns (tightening only — they hold under `yolo` too) plus `shell` `allow`/`deny` globs. `ask_user` always pauses to open the UI. |
 | `.coda/skills/code-review/` | A **skill** — name + description frontmatter plus a body, surfaced to agents in this workspace. |
 
 ## Notes on the model
@@ -72,5 +72,8 @@ where you launch from.
   (`tools`, `subagents`, `mode`, `model`, `workspace`) needs a restart.
 - **MCP and approval are workspace-/session-wide**, not per-agent: `mcp.json`
   and `config.toml` are loaded once from the root workspace and shared.
+- **The permission preset is per session**, picked in the composer
+  (`explore` / `accept_edits` / `yolo`) and switchable at any time — including
+  mid-turn. It is the allow-list; `config.toml` can only tighten it further.
 - An **unreachable MCP server is skipped** with a warning at startup, not fatal —
   so a down server never blocks the session.
