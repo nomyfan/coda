@@ -608,14 +608,9 @@ impl Agent {
         self.state.lock().await.messages.clone()
     }
 
-    /// Put a stored thread back into this agent, replacing whatever the last
-    /// thread it ran left behind.
-    ///
-    /// The conversation is the whole of it. A tool whose state is a function of
-    /// the conversation reads that state back through
-    /// [`ToolCallContext::history`](coda_core::tool::ToolCallContext::history)
-    /// when it runs, so there is nothing else here to restore — and nothing
-    /// about any particular tool for this layer to know.
+    /// Restore a stored thread's conversation and anchored tool state, replacing
+    /// whatever thread this agent last ran. State remains opaque here; tools
+    /// interpret their own kinds through `ToolCallContext::state` when invoked.
     pub async fn restore_history(&self, messages: Vec<HistoryEntry>, entries: Vec<StateEntry>) {
         let mut state = self.state.lock().await;
         state.messages = messages;
