@@ -1,12 +1,11 @@
 use crate::jsonb::Json;
-use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints};
+use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints, thread_state};
 use coda_agent::HistoryEntry;
 use coda_agent::ThreadId;
 use coda_agent::agent::ReplyTarget;
-use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use coda_agent::persist::{StateEntry, StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
-use coda_tools::TodoItem;
 use diesel::expression::IntoSql;
 use diesel::prelude::*;
 use diesel::sql_types::{Array, Jsonb, Text};
@@ -461,7 +460,6 @@ impl WorkspaceStorage {
                         thread_checkpoints::derivation_key,
                         thread_checkpoints::reply_target,
                         thread_checkpoints::resume_point,
-                        thread_checkpoints::todos,
                         thread_checkpoints::suspended_at,
                     ))
                     .load::<StoredThreadRow>(conn)
@@ -557,6 +555,43 @@ impl WorkspaceStorage {
                         .execute(conn)
                         .await?;
 
+                    // State follows its anchor. Kept messages keep their
+                    // `message_id` under the new session, so this is a copy with
+                    // no remapping — and the cut reaches the state for free.
+                    diesel::insert_into(thread_state::table)
+                        .values(
+                            thread_state::table
+                                .inner_join(
+                                    messages::table.on(messages::workspace_id
+                                        .eq(thread_state::workspace_id)
+                                        .and(messages::session_id.eq(thread_state::session_id))
+                                        .and(messages::message_id.eq(thread_state::message_id))),
+                                )
+                                .filter(
+                                    thread_state::workspace_id
+                                        .eq(&self.workspace_id)
+                                        .and(thread_state::session_id.eq(source_id))
+                                        .and(messages::thread_id.eq(&checkpoint.thread_id))
+                                        .and(messages::turn_id.eq_any(&keep)),
+                                )
+                                .select((
+                                    thread_state::workspace_id,
+                                    new_id.as_str().into_sql::<Text>(),
+                                    thread_state::message_id,
+                                    thread_state::kind,
+                                    thread_state::value,
+                                )),
+                        )
+                        .into_columns((
+                            thread_state::workspace_id,
+                            thread_state::session_id,
+                            thread_state::message_id,
+                            thread_state::kind,
+                            thread_state::value,
+                        ))
+                        .execute(conn)
+                        .await?;
+
                     let reply_target = checkpoint.reply_target.clone().map(|Json(mut target)| {
                         if let Some(mapped) = thread_ids.get(&target.sender_thread_id) {
                             target.sender_thread_id = mapped.clone();
@@ -576,7 +611,6 @@ impl WorkspaceStorage {
                             thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
                             thread_checkpoints::reply_target.eq(reply_target),
                             thread_checkpoints::resume_point.eq(&checkpoint.resume_point),
-                            thread_checkpoints::todos.eq(&checkpoint.todos),
                             thread_checkpoints::suspended_at.eq(checkpoint.suspended_at),
                             thread_checkpoints::message_count.eq(count as i32),
                             thread_checkpoints::pending_approval
@@ -927,7 +961,6 @@ struct StoredThreadRow {
     derivation_key: Option<String>,
     reply_target: Option<Json<ReplyTarget>>,
     resume_point: Json<StoredResumePoint>,
-    todos: Json<Vec<TodoItem>>,
     suspended_at: jiff_diesel::Timestamp,
 }
 
@@ -1061,13 +1094,46 @@ impl PgSessionStorage {
                     .await?;
             }
 
+            // Anchored to messages this save is appending, so `message_count` —
+            // already the one watermark for "what is new" — governs both tables
+            // and they cannot drift apart. An entry anchored anywhere else is a
+            // write the runtime never made.
+            let appended: std::collections::HashSet<MessageId> = checkpoint.messages
+                [stored_count..]
+                .iter()
+                .filter_map(|entry| message_row_identity(&entry.message).ok())
+                .map(|(message_id, _)| message_id)
+                .collect();
+            for entry in &checkpoint.state {
+                if !appended.contains(&entry.message_id) {
+                    continue;
+                }
+                diesel::insert_into(thread_state::table)
+                    .values((
+                        thread_state::workspace_id.eq(&self.workspace_id),
+                        thread_state::session_id.eq(&self.session_id),
+                        thread_state::message_id.eq(entry.message_id.as_uuid()),
+                        thread_state::kind.eq(&entry.kind),
+                        thread_state::value.eq(Json(&entry.value)),
+                    ))
+                    .on_conflict((
+                        thread_state::workspace_id,
+                        thread_state::session_id,
+                        thread_state::message_id,
+                        thread_state::kind,
+                    ))
+                    .do_update()
+                    .set(thread_state::value.eq(Json(&entry.value)))
+                    .execute(conn)
+                    .await?;
+            }
+
             let state = (
                 thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
                 thread_checkpoints::parent_thread_id.eq(&checkpoint.parent_thread_id),
                 thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
                 thread_checkpoints::reply_target.eq(checkpoint.reply_target.as_ref().map(Json)),
                 thread_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
-                thread_checkpoints::todos.eq(Json(&checkpoint.todos)),
                 thread_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
                 thread_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
                 thread_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
@@ -1109,7 +1175,6 @@ impl PgSessionStorage {
                 thread_checkpoints::derivation_key,
                 thread_checkpoints::reply_target,
                 thread_checkpoints::resume_point,
-                thread_checkpoints::todos,
                 thread_checkpoints::suspended_at,
             ))
             .first::<(
@@ -1118,7 +1183,6 @@ impl PgSessionStorage {
                 Option<String>,
                 Option<Json<ReplyTarget>>,
                 Json<StoredResumePoint>,
-                Json<Vec<TodoItem>>,
                 jiff_diesel::Timestamp,
             )>(&mut conn)
             .await
@@ -1130,7 +1194,6 @@ impl PgSessionStorage {
             derivation_key,
             reply_target,
             resume_point,
-            todos,
             suspended_at,
         )) = state
         else {
@@ -1156,6 +1219,41 @@ impl PgSessionStorage {
             })
             .collect();
 
+        // Joined through `messages` rather than carrying a `thread_id` of its
+        // own: the anchor already names the thread, and duplicating it would put
+        // back the id remapping that anchoring on `message_id` exists to avoid.
+        let state = thread_state::table
+            .inner_join(
+                messages::table.on(messages::workspace_id
+                    .eq(thread_state::workspace_id)
+                    .and(messages::session_id.eq(thread_state::session_id))
+                    .and(messages::message_id.eq(thread_state::message_id))),
+            )
+            .filter(
+                thread_state::workspace_id
+                    .eq(&self.workspace_id)
+                    .and(thread_state::session_id.eq(&self.session_id))
+                    .and(messages::thread_id.eq(thread_id)),
+            )
+            // In thread order, so reducing the entries last-wins gives the value
+            // the thread actually ended on.
+            .order((messages::seq, thread_state::kind))
+            .select((
+                thread_state::message_id,
+                thread_state::kind,
+                thread_state::value,
+            ))
+            .load::<(uuid::Uuid, String, Json<serde_json::Value>)>(&mut conn)
+            .await
+            .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?
+            .into_iter()
+            .map(|(message_id, kind, value)| StateEntry {
+                message_id: MessageId::from(message_id),
+                kind,
+                value: value.into_inner(),
+            })
+            .collect();
+
         Ok(Some(StoredCheckpoint {
             thread_id: thread_id.to_string(),
             agent_name,
@@ -1163,7 +1261,7 @@ impl PgSessionStorage {
             derivation_key,
             reply_target: reply_target.map(Json::into_inner),
             messages,
-            todos: todos.into_inner(),
+            state,
             resume_point: resume_point.into_inner(),
             suspended_at: suspended_at.to_jiff(),
         }))

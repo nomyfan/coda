@@ -12,7 +12,7 @@
 
 use coda_agent::ThreadId;
 use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
-use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use coda_agent::persist::{StateEntry, StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_agent::{Envelope, HistoryEntry, Sender};
 use coda_core::llm::{
@@ -24,7 +24,6 @@ use coda_server::storage::{
     ForkCut, ForkError, ForkSource, PgSessionStorage, RenameSessionError, RewindError,
     SessionMetadataError, SessionModelBinding, WorkspaceStorage,
 };
-use coda_tools::TodoItem;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
 use diesel_async::AsyncPgConnection;
@@ -141,7 +140,7 @@ fn checkpoint(thread_id: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint 
         derivation_key: None,
         reply_target: None,
         messages,
-        todos: vec![],
+        state: vec![],
         resume_point: StoredResumePoint::Generation,
         suspended_at: jiff::Timestamp::default(),
     }
@@ -217,8 +216,8 @@ async fn deleting_a_session_takes_its_threads_messages_and_snapshot_with_it() {
         diesel::sql_query(
             "insert into thread_checkpoints
                 (workspace_id, session_id, thread_id, agent_name, resume_point,
-                 todos, suspended_at, message_count, pending_approval)
-             values ($1, $2, $2, 'coda', '\"Generation\"'::jsonb, '[]'::jsonb, now(), 1, false)",
+                 suspended_at, message_count, pending_approval)
+             values ($1, $2, $2, 'coda', '\"Generation\"'::jsonb, now(), 1, false)",
         )
         .bind::<Text, _>(&workspace)
         .bind::<Text, _>(session)
@@ -277,9 +276,9 @@ async fn a_thread_cannot_belong_to_a_session_that_does_not_exist() {
     let orphan = diesel::sql_query(
         "insert into thread_checkpoints
             (workspace_id, session_id, thread_id, agent_name, resume_point,
-             todos, suspended_at, message_count, pending_approval)
+             suspended_at, message_count, pending_approval)
          values ($1, 'never-opened', 'never-opened', 'coda', '\"Generation\"'::jsonb,
-                 '[]'::jsonb, now(), 0, false)",
+                 now(), 0, false)",
     )
     .bind::<Text, _>(&workspace)
     .execute(&mut conn(&pool).await)
@@ -316,10 +315,7 @@ async fn a_saved_thread_comes_back_whole() {
             sender_thread_id: "chat".to_string(),
             call_id: "call_explore".to_string(),
         }),
-        todos: vec![TodoItem {
-            title: "read the schema".to_string(),
-            done: true,
-        }],
+        state: vec![],
         resume_point: StoredResumePoint::PendingApproval {
             parent_message_id: MessageId::new(),
             pending_approval_calls: vec![ToolCall {
@@ -378,7 +374,6 @@ async fn a_saved_thread_comes_back_whole() {
         loaded.reply_target.map(|target| target.envelope_id),
         Some("env-1".to_string())
     );
-    assert_eq!(loaded.todos.len(), 1);
     assert!(matches!(
         loaded.resume_point,
         StoredResumePoint::PendingApproval { .. }
@@ -945,6 +940,7 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
         .save_checkpoint(
             "explore-thread".to_string(),
             StoredCheckpoint {
+                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![ToolCall {
@@ -1602,9 +1598,9 @@ async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
     diesel::sql_query(
         "insert into thread_checkpoints
             (workspace_id, session_id, thread_id, agent_name, resume_point,
-             todos, suspended_at, message_count, pending_approval)
+             suspended_at, message_count, pending_approval)
          values ($1, 'chat', 'interleaved', 'explore', '\"Generation\"'::jsonb,
-                 '[]'::jsonb, now(), 3, false)",
+                 now(), 3, false)",
     )
     .bind::<Text, _>(&workspace)
     .execute(&mut conn)
@@ -1772,7 +1768,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
                     ),
                     entry(third, assistant("found again")),
                 ],
-                todos: vec![],
+                state: vec![],
                 resume_point: StoredResumePoint::Generation,
                 suspended_at: jiff::Timestamp::default(),
             },
@@ -1941,6 +1937,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
         .save_checkpoint(
             "source-session".to_string(),
             StoredCheckpoint {
+                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![ToolCall {
@@ -2116,7 +2113,7 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
 
 /// What a fork carries over from the source besides its messages.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fork_inherits_the_name_binding_and_todos() {
+async fn a_fork_inherits_the_name_and_binding() {
     let pool = pool().await;
     let workspace = workspace_id("fork-inherit");
     seed_session(&pool, &workspace, "source-session").await;
@@ -2130,22 +2127,16 @@ async fn a_fork_inherits_the_name_binding_and_todos() {
     PgSessionStorage::new(pool.clone(), &workspace, "source-session")
         .save_checkpoint(
             "source-session".to_string(),
-            StoredCheckpoint {
-                todos: vec![TodoItem {
-                    title: "ship the fork".to_string(),
-                    done: false,
-                }],
-                ..checkpoint(
-                    "source-session",
-                    vec![
-                        entry(
-                            turn,
-                            Message::User(UserMessage::text(MessageId::new(), "q")),
-                        ),
-                        entry(turn, assistant("a")),
-                    ],
-                )
-            },
+            checkpoint(
+                "source-session",
+                vec![
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "q")),
+                    ),
+                    entry(turn, assistant("a")),
+                ],
+            ),
         )
         .await
         .unwrap();
@@ -2160,18 +2151,6 @@ async fn a_fork_inherits_the_name_binding_and_todos() {
         Some("worth branching"),
         "the name is copied as-is; no prefix is added"
     );
-    let copied_checkpoint = PgSessionStorage::new(pool.clone(), &workspace, &forked.session_id)
-        .load_checkpoint(&forked.session_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        copied_checkpoint.todos.len(),
-        1,
-        "todos come over at their latest value, matching what a rewind leaves behind"
-    );
-    assert_eq!(copied_checkpoint.todos[0].title, "ship the fork");
-
     let summaries = workspace_storage.list_sessions().await.unwrap();
     assert_eq!(
         summaries[0].session_id, forked.session_id,
@@ -2192,4 +2171,206 @@ async fn forking_a_session_that_does_not_exist_is_refused() {
         Err(ForkError::SourceNotFound)
     );
     assert!(sessions_in(&pool, &workspace).await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Anchored thread state
+// ---------------------------------------------------------------------------
+
+/// A tool call and its result, plus the state the call recorded — the shape the
+/// runtime produces. `kind` is opaque here on purpose: nothing in storage knows
+/// what any kind holds, which is the whole point of the mechanism.
+fn recorded(
+    turn: TurnId,
+    call_id: &str,
+    kind: &str,
+    value: serde_json::Value,
+) -> (Vec<HistoryEntry>, StateEntry) {
+    let result = ToolMessage::new(
+        call_id.to_string(),
+        "a_tool".to_string(),
+        ToolOutput::Ok("done".to_string()),
+        ToolCallOutcome::Auto,
+        None,
+    );
+    let anchor = result.message_id;
+    let call = Message::Assistant(AssistantMessage {
+        message_id: MessageId::new(),
+        content: String::new(),
+        tool_calls: vec![ToolCall {
+            id: call_id.to_string(),
+            name: "a_tool".to_string(),
+            arguments: None,
+        }],
+        usage: None,
+        reasoning_content: None,
+        reasoning_continuation: None,
+        reasoning_ended_at: None,
+        aborted: false,
+        started_at: jiff::Timestamp::default(),
+        ended_at: jiff::Timestamp::default(),
+    });
+    (
+        vec![entry(turn, call), entry(turn, Message::Tool(result))],
+        StateEntry {
+            message_id: anchor,
+            kind: kind.to_string(),
+            value,
+        },
+    )
+}
+
+/// Two turns, each recording a different value of the same kind. Returns the
+/// user message that opened the second turn — the cut a fork or a rewind takes.
+async fn seed_session_with_state(pool: &DbPool, workspace: &str) -> MessageId {
+    seed_session(pool, workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), workspace, "chat");
+
+    let first_root = MessageId::new();
+    let second_root = MessageId::new();
+    let first = TurnId::from(first_root);
+    let second = TurnId::from(second_root);
+
+    let (first_messages, first_state) = recorded(first, "c1", "plan", serde_json::json!(["a"]));
+    let mut messages = vec![entry(
+        first,
+        Message::User(UserMessage::text(first_root, "start")),
+    )];
+    messages.extend(first_messages);
+    let mut state = vec![first_state];
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            StoredCheckpoint {
+                state: state.clone(),
+                ..checkpoint("chat", messages.clone())
+            },
+        )
+        .await
+        .unwrap();
+
+    let (second_messages, second_state) =
+        recorded(second, "c1", "plan", serde_json::json!(["a", "b"]));
+    messages.push(entry(
+        second,
+        Message::User(UserMessage::text(second_root, "carry on")),
+    ));
+    messages.extend(second_messages);
+    state.push(second_state);
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            StoredCheckpoint {
+                state,
+                ..checkpoint("chat", messages)
+            },
+        )
+        .await
+        .unwrap();
+
+    second_root
+}
+
+/// The value a thread holds now: its entries reduced last-wins, which is what
+/// the runtime does on load.
+async fn current_state(
+    pool: &DbPool,
+    workspace: &str,
+    session: &str,
+    thread: &str,
+    kind: &str,
+) -> Option<serde_json::Value> {
+    PgSessionStorage::new(pool.clone(), workspace, session)
+        .load_checkpoint(thread)
+        .await
+        .unwrap()
+        .unwrap()
+        .state
+        .into_iter()
+        .filter(|entry| entry.kind == kind)
+        .next_back()
+        .map(|entry| entry.value)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_takes_anchored_state_back_with_the_turns() {
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-state");
+    let cut = seed_session_with_state(&pool, &workspace).await;
+
+    assert_eq!(
+        current_state(&pool, &workspace, "chat", "chat", "plan").await,
+        Some(serde_json::json!(["a", "b"])),
+    );
+
+    PgSessionStorage::new(pool.clone(), &workspace, "chat")
+        .rewind_to(cut)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_state(&pool, &workspace, "chat", "chat", "plan").await,
+        Some(serde_json::json!(["a"])),
+        "the second turn's value goes with the turn that recorded it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_needs_no_code_of_its_own_to_cut_state() {
+    // The anchor is a foreign key onto `messages` with `on delete cascade`, so
+    // deleting the messages is what removes the state. Rewinding to the opening
+    // message must therefore leave no state row behind at all.
+    let pool = pool().await;
+    let workspace = workspace_id("rewind-state-all");
+    seed_session_with_state(&pool, &workspace).await;
+    let first_root = PgSessionStorage::new(pool.clone(), &workspace, "chat")
+        .load_checkpoint("chat")
+        .await
+        .unwrap()
+        .unwrap()
+        .messages
+        .into_iter()
+        .next()
+        .map(|entry| match &entry.message {
+            Message::User(message) => message.message_id,
+            other => panic!("expected the opening user message, got {other:?}"),
+        })
+        .unwrap();
+
+    assert!(row_count(&pool, "thread_state", &workspace).await > 0);
+    PgSessionStorage::new(pool.clone(), &workspace, "chat")
+        .rewind_to(first_root)
+        .await
+        .unwrap();
+    assert_eq!(row_count(&pool, "thread_state", &workspace).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_inherits_the_state_its_kept_turns_recorded() {
+    let pool = pool().await;
+    let workspace = workspace_id("fork-state");
+    let cut = seed_session_with_state(&pool, &workspace).await;
+
+    let forked = WorkspaceStorage::new(pool.clone(), &workspace)
+        .fork_session("chat", ForkCut::At(cut), ForkSource::Cold)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_state(
+            &pool,
+            &workspace,
+            &forked.session_id,
+            &forked.session_id,
+            "plan"
+        )
+        .await,
+        Some(serde_json::json!(["a"])),
+        "the branch starts from what the kept turns recorded, not the source's latest"
+    );
+    assert_eq!(
+        current_state(&pool, &workspace, "chat", "chat", "plan").await,
+        Some(serde_json::json!(["a", "b"])),
+        "and the source keeps its own"
+    );
 }

@@ -600,6 +600,7 @@ name = "coda_tools"
 version = "0.1.0"
 dependencies = [
  "coda_core",
+ "jiff",
  "libc",
  "schemars",
  "serde",

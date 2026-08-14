@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use coda_core::llm::{MessageId, ToolCall, ToolCallOutcome};
-use coda_tools::TodoItem;
 
 use crate::agent::{
     Envelope, HistoryEntry, PendingReply, PendingToolCall, ReplyTarget, ResumePoint,
@@ -23,6 +22,17 @@ use crate::runtime::AgentRuntimeSnapshot;
 // ---------------------------------------------------------------------------
 
 /// On-disk representation of a single agent thread's state.
+///
+/// Everything here is one of three things: the thread's conversation, tool
+/// state anchored to it, or something that only makes sense *now* — where a
+/// suspended run picks up, who is owed a reply.
+///
+/// Nothing here is a bare current value, and nothing new should be. A fork and
+/// a rewind are both defined over turns: they choose a set of messages and keep
+/// or drop them. A field that carries its newest value regardless is a field
+/// those two will hand to a history that no longer explains it. Anything a
+/// thread accumulates therefore goes in `state`, anchored to the message that
+/// produced it, where the same cut reaches it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCheckpoint {
     pub thread_id: String,
@@ -43,10 +53,26 @@ pub struct StoredCheckpoint {
     #[serde(default)]
     pub reply_target: Option<ReplyTarget>,
     pub messages: Vec<HistoryEntry>,
-    pub todos: Vec<TodoItem>,
+    /// Tool state written by this thread, each entry anchored to the message
+    /// that records the call that wrote it, in the order the messages appear.
+    ///
+    /// Anchored rather than kept as a current value, because that is what makes
+    /// it cut with the conversation: the anchor is a `message_id`, which a fork
+    /// copies verbatim and a rewind deletes along with its message. Reduce with
+    /// last-wins per `kind` to get the value the thread holds now.
+    #[serde(default)]
+    pub state: Vec<StateEntry>,
     pub resume_point: StoredResumePoint,
     #[serde(default)]
     pub suspended_at: jiff::Timestamp,
+}
+
+/// One recorded value of one `kind`, and the message it hangs off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateEntry {
+    pub message_id: MessageId,
+    pub kind: String,
+    pub value: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------

@@ -463,7 +463,7 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                     turn_id: old_turn,
                     message: Message::User(UserMessage::text(old_prompt, "old turn")),
                 }],
-                todos: vec![],
+                state: vec![],
                 resume_point: StoredResumePoint::Generation,
                 suspended_at: jiff::Timestamp::default(),
             },
@@ -493,7 +493,7 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                         }),
                     },
                 ],
-                todos: vec![],
+                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id,
                     pending_approval_calls: vec![call.clone()],

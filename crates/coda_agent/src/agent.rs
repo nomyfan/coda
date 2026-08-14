@@ -10,7 +10,8 @@ use coda_core::llm::{
     ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
-use coda_tools::TodoItem;
+
+use crate::persist::StateEntry;
 use tracing::{debug, error};
 
 /// Prefix applied to sub-agent names when they are exposed to the LLM as tools,
@@ -141,8 +142,24 @@ pub struct HistoryEntry {
     pub message: Message,
 }
 
+/// The id a message carries, so state recorded during a call can be anchored to
+/// the message that records it. A system message has none — and never reaches a
+/// thread's history — so it can anchor nothing.
+fn message_id_of(message: &Message) -> Option<MessageId> {
+    match message {
+        Message::User(message) => Some(message.message_id),
+        Message::Assistant(message) => Some(message.message_id),
+        Message::Tool(message) => Some(message.message_id),
+        Message::System(_) => None,
+    }
+}
+
 pub struct AgentState {
     pub messages: Vec<HistoryEntry>,
+    /// Tool state this thread has recorded, anchored to the messages that
+    /// recorded it — see [`StoredCheckpoint::state`](crate::persist::StoredCheckpoint::state).
+    /// Grows in step with `messages` and is cut by the same rule.
+    pub state: Vec<StateEntry>,
     /// The turn newly appended messages belong to. Advances only when a user
     /// message is appended (see [`Agent::add_user_message`]); `None` only before
     /// this thread has any history at all.
@@ -440,7 +457,6 @@ pub struct Agent {
     pub mode: SubAgentMode,
     pub system_prompt: SystemPrompt,
     pub state: Arc<Mutex<AgentState>>,
-    pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
     pub tools: Tools,
     pub subagents: SubAgents,
 }
@@ -579,10 +595,6 @@ impl Agent {
         self.state.lock().await.stamp()
     }
 
-    pub async fn todos(&self) -> Vec<TodoItem> {
-        self.todo_store.lock().await.clone()
-    }
-
     pub async fn messages(&self) -> Vec<Message> {
         let history = self.state.lock().await;
         let mut messages = Vec::with_capacity(history.messages.len() + 1);
@@ -596,13 +608,65 @@ impl Agent {
         self.state.lock().await.messages.clone()
     }
 
-    pub async fn restore_history(&self, messages: Vec<HistoryEntry>, todos: Vec<TodoItem>) {
+    /// Put a stored thread back into this agent, replacing whatever the last
+    /// thread it ran left behind.
+    ///
+    /// The conversation is the whole of it. A tool whose state is a function of
+    /// the conversation reads that state back through
+    /// [`ToolCallContext::history`](coda_core::tool::ToolCallContext::history)
+    /// when it runs, so there is nothing else here to restore — and nothing
+    /// about any particular tool for this layer to know.
+    pub async fn restore_history(&self, messages: Vec<HistoryEntry>, entries: Vec<StateEntry>) {
         let mut state = self.state.lock().await;
         state.messages = messages;
+        state.state = entries;
         // Whatever work is being resumed belongs to the turn of the last message
         // written, so the turn needs no separate persistence.
         state.current_turn = state.messages.last().map(|entry| entry.turn_id);
-        *self.todo_store.lock().await = todos;
+    }
+
+    /// This thread's recorded state so far, reduced to one value per kind.
+    ///
+    /// Last-wins, because every entry is a complete value rather than a delta —
+    /// the property that also lets a compaction collapse a range of entries
+    /// without knowing what any kind means.
+    pub async fn state_snapshot(&self) -> HashMap<String, serde_json::Value> {
+        let state = self.state.lock().await;
+        let mut snapshot = HashMap::new();
+        for entry in &state.state {
+            snapshot.insert(entry.kind.clone(), entry.value.clone());
+        }
+        snapshot
+    }
+
+    pub async fn state_entries(&self) -> Vec<StateEntry> {
+        self.state.lock().await.state.clone()
+    }
+
+    /// Append a message together with whatever the call that produced it
+    /// recorded. One critical section, because an entry without its anchor is
+    /// state nothing can cut and an anchor without its entry silently loses a
+    /// write.
+    pub async fn add_message_with_state(
+        &self,
+        message: Message,
+        recorded: Vec<(String, serde_json::Value)>,
+    ) {
+        let anchor = message_id_of(&message);
+        let mut state = self.state.lock().await;
+        let turn_id = state.stamp();
+        state.messages.push(HistoryEntry { turn_id, message });
+        if let Some(anchor) = anchor {
+            state
+                .state
+                .extend(recorded.into_iter().map(|(kind, value)| StateEntry {
+                    message_id: anchor,
+                    kind,
+                    value,
+                }));
+        } else if !recorded.is_empty() {
+            error!("dropping state recorded against a message with no id");
+        }
     }
 }
 
