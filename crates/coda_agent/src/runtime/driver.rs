@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
     vec,
 };
+
+use serde_json::Value;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
     MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
-use coda_core::tool::{ToolCallContext, ToolError, ToolResult};
+use coda_core::tool::{ThreadState, ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -335,6 +338,52 @@ enum AgentLoopState {
     Done(ResumePoint, Box<TurnEnd>),
 }
 
+/// One tool call's window onto the thread's state.
+///
+/// `committed` is the thread as the whole batch was dispatched — shared, so
+/// sibling calls running concurrently never observe each other. `recorded` is
+/// what *this* call has written, which only it can see until the runtime anchors
+/// it to the message recording the call.
+struct CallState {
+    committed: Arc<HashMap<String, serde_json::Value>>,
+    recorded: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+impl CallState {
+    fn new(committed: Arc<HashMap<String, serde_json::Value>>) -> Self {
+        CallState {
+            committed,
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// What this call wrote, in write order, to be anchored by the caller.
+    fn take(&self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut *self.recorded.lock().expect("state mutex poisoned"))
+    }
+}
+
+impl ThreadState for CallState {
+    fn get(&self, kind: &str) -> Option<serde_json::Value> {
+        // Its own writes first: within one call, a read-modify-write must see
+        // what it just did.
+        let recorded = self.recorded.lock().expect("state mutex poisoned");
+        recorded
+            .iter()
+            .rev()
+            .find(|(recorded_kind, _)| recorded_kind == kind)
+            .map(|(_, value)| value.clone())
+            .or_else(|| self.committed.get(kind).cloned())
+    }
+
+    fn set(&self, kind: &str, value: serde_json::Value) {
+        self.recorded
+            .lock()
+            .expect("state mutex poisoned")
+            .push((kind.to_string(), value));
+    }
+}
+
 /// What became of an incoming envelope. Only this step can refuse one, so it
 /// gets its own outcome rather than widening [`AgentLoopState`] with a case the
 /// other steps could never produce.
@@ -464,7 +513,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let (mut resume_point, mut suspended_at): (ResumePoint, jiff::Timestamp) =
             if let Some(stored) = stored {
                 self.agent
-                    .restore_history(stored.messages, stored.todos)
+                    .restore_history(stored.messages, stored.state)
                     .await;
                 self.reply_target = stored.reply_target;
                 self.origin_thread = stored.parent_thread_id.zip(stored.derivation_key).map(
@@ -714,7 +763,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .map(|origin| origin.derivation_key.clone()),
             reply_target: self.reply_target.clone(),
             messages: self.agent.history().await,
-            todos: self.agent.todos().await,
+            state: self.agent.state_entries().await,
             resume_point: resume_point.into(),
             suspended_at,
         };
@@ -837,6 +886,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         tc: PendingToolCall,
         started_at: jiff::Timestamp,
         result: ToolResult<String>,
+        call_state: &CallState,
     ) -> bool {
         let (output, outcome) = match result {
             Ok(output) => (ToolOutput::Ok(output), tc.outcome),
@@ -847,23 +897,44 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             ),
         };
         let aborted = matches!(outcome, ToolCallOutcome::Aborted);
-        self.add_tool_message(ToolMessage::new(
-            tc.tool_call.id,
-            tc.tool_call.name,
-            output,
-            outcome,
-            Some(started_at),
-        ))
+        // A call that did not succeed establishes no new value, whatever it
+        // recorded on the way: `set` says "this is what it is now", and a call
+        // that failed or was cut short never got to mean that.
+        let recorded = match output {
+            ToolOutput::Ok(_) => call_state.take(),
+            ToolOutput::Err(_) => Vec::new(),
+        };
+        self.add_message_with_state(
+            ToolMessage::new(
+                tc.tool_call.id,
+                tc.tool_call.name,
+                output,
+                outcome,
+                Some(started_at),
+            ),
+            recorded,
+        )
         .await;
         aborted
     }
 
-    /// Append a tool message to history and emit the matching `ToolCallEnd`.
-    /// Every tool message written to history must go through this (or emit the
-    /// event itself): event consumers reconstruct history from the stream, so a
-    /// silent write would make their view diverge from the checkpoint.
+    /// Append a tool message that recorded no state: a write-off, a rejection,
+    /// a missing tool, or a sub-agent's reply.
     async fn add_tool_message(&mut self, message: ToolMessage) {
-        self.agent.add_message(Message::Tool(message.clone())).await;
+        self.add_message_with_state(message, Vec::new()).await
+    }
+
+    /// Append a tool message and its recorded state, then emit the matching
+    /// `ToolCallEnd`. Keeping them together ensures state never loses its
+    /// message anchor, while the event keeps consumers in sync with history.
+    async fn add_message_with_state(
+        &mut self,
+        message: ToolMessage,
+        recorded: Vec<(String, Value)>,
+    ) {
+        self.agent
+            .add_message_with_state(Message::Tool(message.clone()), recorded)
+            .await;
         self.runtime
             .emit_event(
                 self.agent.name.clone(),
@@ -1354,6 +1425,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         // Handed to every sub-agent dispatched below so their messages group with
         // the submission that ultimately caused them.
         let turn_id = self.agent.current_turn().await;
+        // One view of the thread for the whole batch, taken before any of it
+        // runs. A tool that derives its state from the conversation reads this
+        // rather than keeping a store, so it must not be able to observe its
+        // siblings landing — the batch runs concurrently and has no order to
+        // observe.
+        let committed = Arc::new(self.agent.state_snapshot().await);
         let mut pending_local: HashMap<String, (PendingToolCall, jiff::Timestamp)> = HashMap::new();
         let mut futures = futures::stream::FuturesUnordered::new();
         for tc in &tool_execution.tool_calls {
@@ -1468,14 +1545,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // A child of the turn's token: aborting the turn cancels every
                 // in-flight tool, and (later) a single tool can be cancelled
                 // without touching its siblings.
+                let call_state = Arc::new(CallState::new(committed.clone()));
                 let ctx = ToolCallContext {
                     cancel: self.cancel.child_token(),
+                    state: call_state.clone(),
                 };
                 let future = async move {
                     let output = tool
                         .execute(tc.tool_call.arguments.clone().unwrap_or_default(), ctx)
                         .await;
-                    (tc, started_at, output)
+                    (tc, started_at, output, call_state)
                 };
                 futures.push(future);
             } else {
@@ -1507,9 +1586,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break true,
-                Some((tc, started_at, result)) = futures.next() => {
+                Some((tc, started_at, result, call_state)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    self.settle_local_tool(tc, started_at, result).await;
+                    self.settle_local_tool(tc, started_at, result, &call_state).await;
                 }
             }
         };
@@ -1531,10 +1610,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 tokio::select! {
                     biased;
                     _ = &mut grace => break,
-                    Some((tc, started_at, result)) = futures.next() => {
+                    Some((tc, started_at, result, call_state)) = futures.next() => {
                         pending_local.remove(&tc.tool_call.id);
                         let id = tc.tool_call.id.clone();
-                        if self.settle_local_tool(tc, started_at, result).await {
+                        if self.settle_local_tool(tc, started_at, result, &call_state).await {
                             aborted_ids.push(id);
                         }
                     }

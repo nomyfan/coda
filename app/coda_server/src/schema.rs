@@ -45,10 +45,19 @@ diesel::table! {
         derivation_key -> Nullable<Text>,
         reply_target -> Nullable<Jsonb>,
         resume_point -> Jsonb,
-        todos -> Jsonb,
         suspended_at -> Timestamptz,
         message_count -> Int4,
         pending_approval -> Bool,
+    }
+}
+
+diesel::table! {
+    thread_state (workspace_id, session_id, message_id, kind) {
+        workspace_id -> Text,
+        session_id -> Text,
+        message_id -> Uuid,
+        kind -> Text,
+        value -> Jsonb,
     }
 }
 
@@ -57,4 +66,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     runtime_snapshots,
     sessions,
     thread_checkpoints,
+    thread_state,
 );

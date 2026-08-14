@@ -37,6 +37,19 @@ fn last_user_text(messages: &[Message]) -> &str {
         .unwrap_or("")
 }
 
+/// The most recent result of one named tool, if the thread holds one. Distinct
+/// from [`has_tool_results`]: a thread several turns in always holds *some* tool
+/// message, so a branch that must fire once per turn has to name its own.
+fn tool_result(messages: &[Message], name: &str) -> Option<String> {
+    messages.iter().rev().find_map(|message| match message {
+        Message::Tool(tool) if tool.name == name => Some(match &tool.output {
+            ToolOutput::Ok(text) => text.clone(),
+            ToolOutput::Err(err) => format!("error: {err}"),
+        }),
+        _ => None,
+    })
+}
+
 /// Returns `true` if the message list contains any `Tool` message.
 fn has_tool_results(messages: &[Message]) -> bool {
     messages.iter().any(|m| matches!(m, Message::Tool(_)))
@@ -98,6 +111,51 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         if user_text.contains("simple hello") {
             return completed(AssistantMessage {
                 content: "Hello from the agent!".into(),
+                ..assistant()
+            });
+        }
+
+        // 1b. "plan the work" → write_todos, then read them back on the next
+        //     turn, so a test can watch state travel through the runtime.
+        if user_text.contains("plan the work") {
+            // Keyed on *this* tool's result, not on any tool result: by the
+            // second turn the thread already holds tool messages from the first.
+            if tool_result(&request.messages, "write_todos").is_some() {
+                return completed(AssistantMessage {
+                    content: "planned".into(),
+                    ..assistant()
+                });
+            }
+            return completed(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_write_todos".into(),
+                    name: "write_todos".into(),
+                    arguments: Some(
+                        json!({"todos": [
+                            {"title": "parse", "done": true},
+                            {"title": "test", "done": false},
+                        ]})
+                        .to_string(),
+                    ),
+                }],
+                ..assistant()
+            });
+        }
+
+        // 1c. "what is left" → read_todos, then report what came back.
+        if user_text.contains("what is left") {
+            if let Some(listed) = tool_result(&request.messages, "read_todos") {
+                return completed(AssistantMessage {
+                    content: format!("todos: {listed}"),
+                    ..assistant()
+                });
+            }
+            return completed(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_read_todos".into(),
+                    name: "read_todos".into(),
+                    arguments: Some("{}".into()),
+                }],
                 ..assistant()
             });
         }
@@ -1028,6 +1086,72 @@ async fn should_ignore_a_removed_agents_approval_across_reopens() {
         .await
         .expect("the same checkpoint must not block a later reopen");
     reopened_again
+        .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        .await;
+}
+
+/// State a tool records must reach the checkpoint anchored to the message that
+/// recorded it, and come back on the next turn. This is the whole path —
+/// `ThreadState::set` → the call's result → `StoredCheckpoint::state` → storage
+/// → restore → `ThreadState::get` — which the unit tests either side of it
+/// cannot cover.
+#[tokio::test]
+async fn tool_state_survives_the_turn_that_recorded_it() {
+    let spec = AgentSpec {
+        name: "coda".into(),
+        description: String::new(),
+        system_prompt: "session-system".into(),
+        mode: SubAgentMode::Stateful,
+        tools: coda_tools::builtin_specs(),
+        subagents: vec![],
+    };
+    let storage = MemoryStorage::default();
+    let session = Session::builder()
+        .storage(storage.clone())
+        .session_id("todo-session")
+        .team(&solo_team(spec), ".")
+        .run_config(run_config(ToolApprovalMode::Auto))
+        .open()
+        .await
+        .expect("open session");
+
+    session
+        .send(MessageId::new(), "plan the work", vec![])
+        .await
+        .expect("send");
+    assert_eq!(collect_until_done(&session).await, "planned");
+
+    // Anchored, not stashed: the entry names the tool message that recorded it.
+    let checkpoint = storage
+        .load_checkpoint("todo-session")
+        .await
+        .expect("load")
+        .expect("a checkpoint");
+    let entry = checkpoint
+        .state
+        .iter()
+        .find(|entry| entry.kind == "todos")
+        .expect("the write was recorded");
+    assert!(
+        checkpoint.messages.iter().any(|held| matches!(
+            &held.message,
+            Message::Tool(tool) if tool.message_id == entry.message_id
+        )),
+        "the anchor must be a message this thread actually holds, or no fork or \
+         rewind can reach the state through it"
+    );
+
+    // And a later turn reads it back through the context.
+    session
+        .send(MessageId::new(), "what is left", vec![])
+        .await
+        .expect("send");
+    assert_eq!(
+        collect_until_done(&session).await,
+        "todos: 1. [x] parse\n2. [ ] test\n"
+    );
+
+    session
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
 }

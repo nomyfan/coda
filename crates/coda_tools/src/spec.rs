@@ -1,12 +1,9 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
 use crate::locks::KeyedLock;
-use crate::todo::TodoItem;
 use crate::{
     EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
     WriteFileTool, WriteTodosTool,
@@ -16,21 +13,18 @@ use crate::{
 #[derive(Clone)]
 pub struct BuildContext {
     pub workspace_dir: String,
-    /// Per-agent: each agent keeps its own todo list.
-    pub todo_store: Arc<Mutex<Vec<TodoItem>>>,
-    /// The opposite of `todo_store`: shared by *every* agent and session in the
-    /// process, or the file tools serialize against registries nobody else
-    /// consults and exclude nothing. Defaults to [`shared_file_locks`].
+    /// Shared by *every* agent and session in the process, or the file tools
+    /// serialize against registries nobody else consults and exclude nothing.
+    /// Defaults to [`shared_file_locks`].
     pub file_locks: Arc<KeyedLock<String>>,
 }
 
 impl BuildContext {
-    /// A standalone context: its own todo list, and — on purpose — the
-    /// process-wide file lock registry.
+    /// A standalone context, holding — on purpose — the process-wide file lock
+    /// registry.
     pub fn new(workspace_dir: impl Into<String>) -> Self {
         BuildContext {
             workspace_dir: workspace_dir.into(),
-            todo_store: Arc::new(Mutex::new(Vec::new())),
             file_locks: crate::locks::shared_file_locks(),
         }
     }
@@ -135,10 +129,8 @@ impl ToolSpec for ReadTodosToolSpec {
     fn name(&self) -> &str {
         "read_todos"
     }
-    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ReadTodosTool::new(
-            ctx.todo_store.clone(),
-        )))
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(ReadTodosTool::new()))
     }
 }
 
@@ -148,10 +140,8 @@ impl ToolSpec for WriteTodosToolSpec {
     fn name(&self) -> &str {
         "write_todos"
     }
-    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(WriteTodosTool::new(
-            ctx.todo_store.clone(),
-        )))
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(WriteTodosTool::new()))
     }
 }
 

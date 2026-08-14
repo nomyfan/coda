@@ -85,7 +85,7 @@ async fn store_root(
                 derivation_key: None,
                 reply_target: None,
                 messages,
-                todos: vec![],
+                state: vec![],
                 resume_point: at,
                 suspended_at: jiff::Timestamp::default(),
             },

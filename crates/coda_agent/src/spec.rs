@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_tools::{BuildContext, KeyedLock, TodoItem, ToolSpec};
+use coda_tools::{BuildContext, KeyedLock, ToolSpec};
 
 use crate::agent::{
     Agent, AgentState, SUBAGENT_TOOL_PREFIX, SubAgentMode, SubAgentTool, SystemPrompt,
@@ -223,9 +223,9 @@ impl AgentTeam {
 
         let mut agents = HashMap::new();
         for spec in all() {
-            let todo_store = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             let state = Arc::new(Mutex::new(AgentState {
                 messages: vec![],
+                state: vec![],
                 current_turn: None,
             }));
 
@@ -236,7 +236,6 @@ impl AgentTeam {
                 .unwrap_or(default_workspace);
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
-                todo_store: todo_store.clone(),
                 file_locks: file_locks.clone(),
             };
 
@@ -245,7 +244,6 @@ impl AgentTeam {
                 mode: spec.mode.clone(),
                 system_prompt: spec.system_prompt.clone(),
                 state,
-                todo_store,
                 tools: Default::default(),
                 subagents: Default::default(),
             };
