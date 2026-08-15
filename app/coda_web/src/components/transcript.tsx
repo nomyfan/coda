@@ -70,8 +70,10 @@ import { cn, formatClockTime, formatDuration, formatElapsed } from "@/lib/utils"
 
 const NO_ENTRIES: TranscriptEntry[] = [];
 
-const PatchDiff = lazy(() =>
-  import("@pierre/diffs/react").then(({ PatchDiff: Component }) => ({ default: Component })),
+const VellumPatchDiff = lazy(() =>
+  import("@/components/vellum-patch-diff").then(({ VellumPatchDiff: Component }) => ({
+    default: Component,
+  })),
 );
 
 const ROOT_AGENT = "coda";
@@ -449,6 +451,10 @@ function EntryStatus({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
+function hasFileDiffArtifacts(entry: TranscriptEntry) {
+  return entry.artifacts?.some((artifact) => artifact.type === "file_diff") ?? false;
+}
+
 function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
   const fileDiffs = entry.artifacts?.filter((artifact) => artifact.type === "file_diff") ?? [];
   const theme = useSyncExternalStore(subscribeThemeChange, () =>
@@ -475,11 +481,7 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
           className="overflow-hidden rounded-md border"
         >
           <Suspense fallback={<div className="p-3 text-sm text-muted-foreground">Loading…</div>}>
-            <PatchDiff
-              patch={artifact.patch}
-              disableWorkerPool
-              options={{ diffStyle: "unified", expandUnchanged: false, themeType: theme }}
-            />
+            <VellumPatchDiff patch={artifact.patch} theme={theme} />
           </Suspense>
         </div>
       ))}
@@ -489,6 +491,10 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
 
 function CopyContentButton({ content, label = "content" }: { content: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+
+  if (content.trim().length === 0) {
+    return null;
+  }
 
   async function copyContent() {
     await navigator.clipboard.writeText(content);
@@ -954,6 +960,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
   const [open, setOpen] = useState(false);
   const title = disclosureTitle(entry);
   const active = isEntryActive(entry);
+  const hasFileDiff = hasFileDiffArtifacts(entry);
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -992,8 +999,13 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
         </button>
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <div className="relative mt-1 max-h-64 overflow-auto rounded-md border border-border bg-muted/20 p-3">
-          {entry.kind === "tool_result" ? (
+        <div
+          className={cn(
+            "relative mt-1 max-h-64 overflow-auto rounded-md",
+            !hasFileDiff && "border border-border bg-muted/20 p-3",
+          )}
+        >
+          {entry.kind === "tool_result" && !hasFileDiff ? (
             <div className="sticky top-0 z-10 h-0">
               <div className="flex justify-end">
                 <CopyContentButton content={entry.content} label="result" />
@@ -1115,6 +1127,7 @@ const TranscriptItem = memo(function TranscriptItem({
   );
 
   if (entry.kind === "tool_result") {
+    const hasFileDiff = hasFileDiffArtifacts(entry);
     return (
       <article className={cn("rounded-md border p-3 shadow-sm", tone)}>
         <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
@@ -1145,12 +1158,19 @@ const TranscriptItem = memo(function TranscriptItem({
             </div>
           </div>
           <CollapsibleContent>
-            <div className="relative max-h-80 overflow-auto rounded-md border border-border/70 bg-background/70 p-3 md:max-h-96">
-              <div className="sticky top-0 z-10 h-0">
-                <div className="flex justify-end">
-                  <CopyContentButton content={entry.content} label="result" />
+            <div
+              className={cn(
+                "relative max-h-80 overflow-auto rounded-md md:max-h-96",
+                !hasFileDiff && "border border-border/70 bg-background/70 p-3",
+              )}
+            >
+              {!hasFileDiff ? (
+                <div className="sticky top-0 z-10 h-0">
+                  <div className="flex justify-end">
+                    <CopyContentButton content={entry.content} label="result" />
+                  </div>
                 </div>
-              </div>
+              ) : null}
               <ToolEntryContent entry={entry} />
             </div>
           </CollapsibleContent>
