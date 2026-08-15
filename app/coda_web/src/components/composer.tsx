@@ -457,7 +457,7 @@ export const Composer = memo(function Composer({
                 : "Enter to send, Shift+Enter for newline, @ for files, / for skills"
             }
             className={[
-              "min-h-[104px] pb-20 pr-3 sm:min-h-[80px] sm:pb-10",
+              "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
               dragOver ? "border-primary ring-1 ring-primary" : "",
             ]
               .filter(Boolean)
@@ -476,7 +476,7 @@ export const Composer = memo(function Composer({
               e.target.value = "";
             }}
           />
-          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-between gap-1">
+          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center gap-1">
             <div className="flex min-w-0 items-center gap-1">
               {showControls ? (
                 <PermissionSelector
@@ -489,7 +489,7 @@ export const Composer = memo(function Composer({
                 />
               ) : null}
             </div>
-            <div className="flex min-w-0 items-center gap-1">
+            <div className="ml-auto flex min-w-0 items-center gap-1">
               {showControls && contextWindow ? (
                 <ContextUsage contextWindow={contextWindow} records={usage} />
               ) : null}

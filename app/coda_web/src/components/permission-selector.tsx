@@ -77,7 +77,9 @@ export function PermissionSelector({
             .join(" ")}
         >
           <Icon className="size-3.5 shrink-0" />
-          <SelectValue placeholder="Permissions">{label}</SelectValue>
+          <SelectValue placeholder="Permissions">
+            <span className="hidden sm:inline">{label}</span>
+          </SelectValue>
         </SelectTrigger>
         <SelectContent position="popper" side="top" className="max-w-72">
           {PERMISSION_MODES.map((item) => {

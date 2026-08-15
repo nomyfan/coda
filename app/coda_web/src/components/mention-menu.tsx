@@ -1,4 +1,4 @@
-import { File, Folder, Slash, Sparkles } from "lucide-react";
+import { File, Folder } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
   BUILTIN_COMMANDS,
@@ -159,8 +159,8 @@ export function useMentionItems({
 const ITEM_ICONS = {
   file: File,
   directory: Folder,
-  skill: Sparkles,
-  command: Slash,
+  skill: undefined,
+  command: undefined,
 } as const;
 
 /**
@@ -224,7 +224,7 @@ export function MentionMenu({
               }}
               onMouseEnter={() => onHover(index)}
             >
-              <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+              {Icon ? <Icon className="size-3.5 shrink-0 text-muted-foreground" /> : null}
               <span className="shrink-0 truncate font-medium">
                 {name}
                 {item.kind === "directory" ? "/" : ""}
