@@ -591,8 +591,15 @@ impl Agent {
     /// The turn this thread is in: what a message appended now is tagged with,
     /// and what a sub-agent call hands down so the callee's messages group with
     /// the submission that ultimately caused them.
-    pub async fn current_turn(&self) -> TurnId {
-        self.state.lock().await.stamp()
+    ///
+    /// `None` while the thread has no history — a thread opened but not yet
+    /// prompted is in no turn, and asking is not an error. Callers on that path
+    /// (the driver entering a fresh thread) supply the turn they were entered
+    /// with instead. Read-only, deliberately: this used to go through
+    /// [`AgentState::stamp`], so merely *asking* on a fresh thread minted a
+    /// throwaway turn and logged its invariant break.
+    pub async fn current_turn(&self) -> Option<TurnId> {
+        self.state.lock().await.current_turn
     }
 
     pub async fn messages(&self) -> Vec<Message> {
@@ -666,7 +673,10 @@ impl Agent {
 }
 
 impl AgentState {
-    /// The turn to tag a newly appended assistant/tool message with.
+    /// The turn to tag a newly appended assistant/tool message with. Only the
+    /// append paths call this — reading the turn goes through
+    /// [`Agent::current_turn`], which reports "no turn yet" rather than minting
+    /// one, so the error below stays a report of a real invariant break.
     ///
     /// `current_turn` is `None` only before a thread has any history, and an
     /// assistant or tool message can't be the first thing in a thread — one

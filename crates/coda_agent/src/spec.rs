@@ -272,6 +272,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
+    use coda_core::llm::{MessageId, TurnId, UserMessage};
     use coda_core::tool::{ToolCallContext, ToolObject, ToolResult};
 
     use super::*;
@@ -376,5 +377,30 @@ mod tests {
             ..spec("coda")
         };
         assert!(AgentTeam::new(root, vec![spec(&max)]).is_ok());
+    }
+
+    /// A freshly built agent has run nothing, so it is in no turn — and asking
+    /// must not start one. The driver asks on entry, before the thread's first
+    /// prompt has landed; answering by minting a turn both reported an
+    /// invariant break that had not happened and left the thread stamped with
+    /// a turn no message belongs to.
+    #[tokio::test]
+    async fn a_fresh_agent_is_in_no_turn_and_asking_does_not_open_one() {
+        let agents = AgentTeam::new(spec("coda"), vec![])
+            .expect("valid team")
+            .build("/root", coda_tools::shared_file_locks());
+        let agent = &agents["coda"];
+
+        assert_eq!(agent.current_turn().await, None);
+        // Twice: the first ask must leave nothing behind for the second to find.
+        assert_eq!(agent.current_turn().await, None);
+        assert!(agent.history().await.is_empty());
+
+        let turn = TurnId::from(MessageId::new());
+        agent
+            .add_user_message(turn, UserMessage::text(MessageId::new(), "inspect"))
+            .await;
+
+        assert_eq!(agent.current_turn().await, Some(turn));
     }
 }

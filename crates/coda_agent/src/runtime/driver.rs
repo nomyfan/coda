@@ -484,6 +484,17 @@ struct OriginThread {
 }
 
 impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
+    /// The turn this thread's history places it in, falling back to the turn
+    /// the loop was entered with.
+    ///
+    /// The fallback covers exactly one case: a thread with no history at all —
+    /// newly opened, or a stateless sub-agent's `Agent` between threads — which
+    /// is in no turn of its own until its prompt is appended. Everywhere else
+    /// the history answers, and the two agree.
+    async fn thread_turn(&self) -> TurnId {
+        self.agent.current_turn().await.unwrap_or(self.turn)
+    }
+
     async fn run(&mut self, envelope: Option<Envelope>) -> Result<TurnOutcome, String> {
         // Load stored checkpoint and scatter its fields into the appropriate
         // locations. After this block the stored type is gone — only the
@@ -532,14 +543,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.origin_thread = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
             };
-        self.turn = self.agent.current_turn().await;
+        // A restored thread carries the turn its last message was written
+        // under; a fresh one carries none yet and keeps the turn this loop was
+        // entered with (the session's active turn) until its prompt lands.
+        self.turn = self.thread_turn().await;
 
         if let Some(envelope) = envelope {
             let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. });
             match self.handle_envelope(resume_point, envelope).await {
                 EnvelopeOutcome::Next(rp) => {
                     resume_point = rp;
-                    self.turn = self.agent.current_turn().await;
+                    self.turn = self.thread_turn().await;
                     // Persist the user prompt immediately so a mid-turn snapshot
                     // (reconnect, crash) already contains it; the event stream
                     // never carries user messages. Restricted to root user tasks
@@ -579,9 +593,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         && announced_ending
                         && self.runtime.is_root_thread(&self.thread_id)
                     {
-                        self.runtime
-                            .turn_gate
-                            .close(self.agent.current_turn().await);
+                        self.runtime.turn_gate.close(self.thread_turn().await);
                     }
                     return Ok(TurnOutcome::Deferred { envelope, awaiting });
                 }
@@ -678,9 +690,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             .persist_and_announce(resume_point, suspended_at, owed)
             .await;
         if announced_ending && persisted && self.runtime.is_root_thread(&self.thread_id) {
-            self.runtime
-                .turn_gate
-                .close(self.agent.current_turn().await);
+            self.runtime.turn_gate.close(self.thread_turn().await);
         }
         Ok(if exit_acquired {
             TurnOutcome::ExitAcquired
@@ -823,7 +833,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     /// several passes — one per reply still owed — and the marker has to name
     /// everything the abort caught, not just what the last pass touched.
     async fn interrupted_calls(&self) -> Vec<String> {
-        let turn = self.agent.current_turn().await;
+        let turn = self.thread_turn().await;
         self.agent
             .history()
             .await
@@ -1053,7 +1063,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 ));
                                 tool_execution.pending_replies = still_answering;
                                 self.runtime
-                                    .cancel_turn(self.agent.current_turn().await)
+                                    .cancel_turn(self.thread_turn().await)
                                     .await;
                                 return EnvelopeOutcome::Deferred(
                                     Box::new(envelope),
@@ -1428,7 +1438,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         // The timestamp records when execution began, for the result's duration.
         // Handed to every sub-agent dispatched below so their messages group with
         // the submission that ultimately caused them.
-        let turn_id = self.agent.current_turn().await;
+        let turn_id = self.thread_turn().await;
         // One view of the thread for the whole batch, taken before any of it
         // runs. A tool that derives its state from the conversation reads this
         // rather than keeping a store, so it must not be able to observe its
