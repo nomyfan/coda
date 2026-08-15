@@ -1062,9 +1062,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     EnvelopeBody::ToolCall { .. }
                                 ));
                                 tool_execution.pending_replies = still_answering;
-                                self.runtime
-                                    .cancel_turn(self.thread_turn().await)
-                                    .await;
+                                self.runtime.cancel_turn(self.thread_turn().await).await;
                                 return EnvelopeOutcome::Deferred(
                                     Box::new(envelope),
                                     ResumePoint::ToolExecution(tool_execution),
