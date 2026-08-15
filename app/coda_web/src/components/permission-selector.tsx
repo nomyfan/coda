@@ -24,7 +24,7 @@ const MODE_INFO: Record<PermissionMode, { label: string; description: string; Ic
     explore: {
       label: "Explore",
       description:
-        "Reads, searches and lists. Anything else asks — bar shell commands the workspace pre-approved.",
+        "Reads, searches and lists. Anything else asks, except shell commands the workspace pre-approved.",
       Icon: Eye,
     },
     accept_edits: {
