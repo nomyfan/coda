@@ -1346,7 +1346,16 @@ function selectSession(store: CodaStore, server: string, workspaceId: string, se
       // than per workspace: switching in one conversation must not change what
       // the next one starts on. A session still live on the server overrides
       // this the moment its snapshot lands.
-      session.permissionMode = initialSessionMode(server, workspaceId, sessionId);
+      //
+      // What the session already carries is the fallback, not the hard default:
+      // a fork was handed its parent's mode a moment ago, and storage being
+      // unavailable must not silently downgrade that to the default.
+      session.permissionMode = initialSessionMode(
+        server,
+        workspaceId,
+        sessionId,
+        session.permissionMode,
+      );
     }
   });
 }
@@ -2423,15 +2432,28 @@ export async function forkSession(
     // The copy inherits the source's posture the same way it inherits its
     // history — the fork is a continuation, and starting it on a different
     // footing than the conversation it branched from would be a surprise.
-    rememberSessionMode(
-      server,
-      workspaceId,
-      forked.session_id,
-      initialSessionMode(server, workspaceId, sessionId),
-    );
+    //
+    // Read it from the live session rather than from storage: the store holds
+    // the value the server last confirmed, and a blocked or full localStorage
+    // fails silently, which would quietly open the fork on the default. Storage
+    // is only the fallback for a source this client has not opened.
+    const source =
+      codaStore.getState().servers[server]?.sessions[sessionKey(workspaceId, sessionId)];
+    const inheritedMode =
+      source?.permissionMode ?? initialSessionMode(server, workspaceId, sessionId);
+    const copyKey = sessionKey(workspaceId, forked.session_id);
+    // Both channels, because either one alone can drop it: the store carries it
+    // into the open that follows even with storage unavailable, and storage
+    // carries it across a reload.
+    updateState(codaStore, (state) => {
+      const copy = draftSession(state, server, copyKey);
+      if (copy) {
+        copy.permissionMode = inheritedMode;
+      }
+    });
+    rememberSessionMode(server, workspaceId, forked.session_id, inheritedMode);
     openSession(server, workspaceId, forked.session_id);
     if (forkDraft) {
-      const copyKey = sessionKey(workspaceId, forked.session_id);
       updateState(codaStore, (state) => {
         const copy = draftSession(state, server, copyKey);
         if (copy) {

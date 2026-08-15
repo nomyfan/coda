@@ -23,7 +23,8 @@ const MODE_INFO: Record<PermissionMode, { label: string; description: string; Ic
   {
     explore: {
       label: "Explore",
-      description: "Read, search and list. Everything else asks first.",
+      description:
+        "Reads, searches and lists. Anything else asks — bar shell commands the workspace pre-approved.",
       Icon: Eye,
     },
     accept_edits: {
@@ -104,7 +105,9 @@ export function PermissionSelector({
             <DialogTitle>Switch to Yolo?</DialogTitle>
             <DialogDescription>
               Every tool runs without asking, including shell commands that write files, install
-              packages or reach the network. Only the workspace&rsquo;s deny rules still apply.
+              packages or reach the network. The workspace&rsquo;s deny rules are the only thing
+              still stopping a command, and they only reach commands simple enough to check &mdash;
+              a denied command written with a redirect or a substitution runs anyway.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

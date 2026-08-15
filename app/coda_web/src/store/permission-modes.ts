@@ -107,8 +107,13 @@ export function forgetSessionMode(server: string, workspaceId: string, sessionId
 
 /**
  * The mode to open this session on: what it was last seen running under, or
- * the default for one this browser has never opened (a new conversation, a new
- * device, or cleared storage).
+ * `fallback` for one this browser has no record of (a new conversation, a new
+ * device, cleared storage — or storage being unavailable altogether, which
+ * reads as "no record").
+ *
+ * `fallback` is what the caller already knows about the session, so a value
+ * held in memory is not lost to a storage failure; it defaults to
+ * {@link DEFAULT_PERMISSION_MODE} for callers that know nothing.
  *
  * Only a seed — a session the server still has live answers with its own mode
  * in the snapshot, and that value wins.
@@ -117,8 +122,7 @@ export function initialSessionMode(
   server: string,
   workspaceId: string,
   sessionId: string,
+  fallback: PermissionMode = DEFAULT_PERMISSION_MODE,
 ): PermissionMode {
-  return (
-    loadMemory()[server]?.[sessionSlot(workspaceId, sessionId)]?.mode ?? DEFAULT_PERMISSION_MODE
-  );
+  return loadMemory()[server]?.[sessionSlot(workspaceId, sessionId)]?.mode ?? fallback;
 }

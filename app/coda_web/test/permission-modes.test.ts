@@ -95,3 +95,14 @@ test("a snapshot's mode replaces the local one", () => {
 
   expect(applied.permissionMode).toBe("yolo");
 });
+
+// A fork is handed its parent's mode a moment before it is opened, and that
+// handoff must not depend on storage: `rememberSessionMode` swallows a blocked
+// or full localStorage, and reading the default back would open the fork with
+// permissions the parent never had.
+test("an unrecorded session falls back to what the caller already knows", () => {
+  expect(initialSessionMode("ws://one", "alpha", "forked", "explore")).toBe("explore");
+  // A record still wins over the caller's guess.
+  rememberSessionMode("ws://one", "alpha", "forked", "yolo");
+  expect(initialSessionMode("ws://one", "alpha", "forked", "explore")).toBe("yolo");
+});
