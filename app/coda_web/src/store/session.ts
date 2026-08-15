@@ -14,11 +14,13 @@ import {
   type RpcPushes,
   type RpcRequests,
   RpcCode,
+  type SkillInfo,
   type ToolCall,
   type ToolCallResolution,
   type ToolArtifact,
   type ToolMessage,
   type WireEvent,
+  type WorkspaceFile,
   type WorkspaceSession,
   type WorkspaceSummary,
   callArguments,
@@ -43,6 +45,8 @@ export type {
   PermissionMode,
   ProviderInfo,
   ReasoningEffort,
+  SkillInfo,
+  WorkspaceFile,
   WorkspaceSession,
   WorkspaceSummary,
 } from "@/lib/protocol";
@@ -2963,6 +2967,48 @@ export function clearDraftCall(approval: PendingApproval, call: ToolCall) {
     return;
   }
   clearDraftResolution(codaStore, active.server, active.session.key, approval, call);
+}
+
+/**
+ * Ranked workspace files for the composer's `@` picker.
+ *
+ * Nothing is cached here: the server ranks against a walk it reuses for a few
+ * seconds, so a keystroke costs a round trip rather than a re-walk, and a file
+ * created mid-conversation still turns up. Failures throw so the menu can say
+ * why it is empty instead of implying the workspace is.
+ */
+export async function fetchWorkspaceFiles(
+  server: string,
+  workspaceId: string,
+  query: string,
+): Promise<{ files: WorkspaceFile[]; truncated: boolean }> {
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    throw new Error("Connection closed");
+  }
+  try {
+    return await rpc.request("list_files", { workspace_id: workspaceId, query });
+  } catch (err) {
+    throw new Error(isServerError(err) ? err.message : "Connection closed");
+  }
+}
+
+/** The workspace's skills for the composer's `/` picker, in the order the server
+ * lists them (by name). */
+export async function fetchWorkspaceSkills(
+  server: string,
+  workspaceId: string,
+): Promise<SkillInfo[]> {
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    throw new Error("Connection closed");
+  }
+  try {
+    const catalog = await rpc.request("list_skills", { workspace_id: workspaceId });
+    return catalog.skills;
+  } catch (err) {
+    throw new Error(isServerError(err) ? err.message : "Connection closed");
+  }
 }
 
 /** Approvals whose submit is in flight, by `${server}|${sessionKey}|${approvalKey}`.

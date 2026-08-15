@@ -48,6 +48,7 @@ diesel-async = { version = "0.9", default-features = false, features = [
   "migrations",
 ] }
 diesel_migrations = "2.3"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

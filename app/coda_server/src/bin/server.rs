@@ -24,6 +24,7 @@ use coda_server::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
     },
+    files::{DEFAULT_LIMIT, FileIndex},
     hub::{
         AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
         SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
@@ -35,12 +36,13 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, DeleteSessionParams, EventParams, ForkAccepted, ForkSessionParams,
-        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
-        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
-        RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
-        SetPermissionModeParams, Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog,
-        WorkspaceSummaryWire,
+        AddAllowPatternParams, DeleteSessionParams, EventParams, FileCatalog, ForkAccepted,
+        ForkSessionParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
+        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
+        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
+        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
+        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -135,6 +137,9 @@ struct WorkspaceState {
     /// Agents absent here inherit the session's default (root) model.
     agent_models: HashMap<String, AgentModelSelection>,
     approval_config: ToolApprovalConfig,
+    /// Backs the composer's `@` picker: the workspace's files, walked on demand
+    /// and briefly cached so one query per keystroke costs one walk.
+    files: FileIndex,
 }
 
 /// A validated per-agent model override: a provider selection key plus the
@@ -395,6 +400,32 @@ async fn open_session(
         .resume_decisions(decisions)
         .open()
         .await
+}
+
+/// The workspace's skills, sorted by name. A workspace that declares none isn't
+/// an error — it simply has an empty `/` menu — but a `SKILL.md` that fails to
+/// parse is reported, since the alternative is a picker quietly missing the very
+/// skill the user is looking for.
+async fn workspace_skills(workspace_dir: String) -> Result<Vec<SkillInfoWire>, String> {
+    tokio::task::spawn_blocking(move || {
+        let skills_dir = FsPath::new(&workspace_dir).join(".coda").join("skills");
+        if !skills_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let skills = coda_skills::Skills::from_dir(&skills_dir).map_err(|err| err.to_string())?;
+        let mut skills: Vec<SkillInfoWire> = skills
+            .0
+            .into_iter()
+            .map(|skill| SkillInfoWire {
+                name: skill.properties.name,
+                description: skill.properties.description,
+            })
+            .collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(skills)
+    })
+    .await
+    .map_err(|err| format!("failed to read the skills directory: {err}"))?
 }
 
 async fn add_allow_pattern(config: ToolApprovalConfig, pattern: String) -> Result<(), String> {
@@ -730,6 +761,88 @@ async fn dispatch_request(
             },
         )
             .into(),
+        // The composer's `@` picker. A search, not a listing: the workspace can
+        // hold far more paths than a menu should ever carry, so the ranking and
+        // the cap both live server-side and the client just renders the answer.
+        "list_files" => {
+            let params: ListFilesParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return (
+                    id,
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                )
+                    .into();
+            };
+            match workspace
+                .files
+                .search(params.query.trim(), params.limit.unwrap_or(DEFAULT_LIMIT))
+                .await
+            {
+                Ok(matches) => (
+                    id,
+                    &FileCatalog {
+                        files: matches.files,
+                        truncated: matches.truncated,
+                    },
+                )
+                    .into(),
+                Err(detail) => {
+                    warn!(workspace_id = %params.workspace_id, "failed to list files: {detail}");
+                    (
+                        id,
+                        RpcError::with_detail(
+                            rpc::LIST_FILES_FAILED,
+                            "failed to list workspace files",
+                            detail,
+                        ),
+                    )
+                        .into()
+                }
+            }
+        }
+        // The composer's `/` picker. Same skills the model is told about in
+        // `<available_skills>`, read from the session workspace only — an agent
+        // rooted elsewhere has its own skills, but the composer types into the
+        // root agent's conversation.
+        "list_skills" => {
+            let params: ListSkillsParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return (
+                    id,
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                )
+                    .into();
+            };
+            match workspace_skills(workspace.workspace_str.clone()).await {
+                Ok(skills) => (id, &SkillCatalog { skills }).into(),
+                Err(detail) => {
+                    warn!(workspace_id = %params.workspace_id, "failed to list skills: {detail}");
+                    (
+                        id,
+                        RpcError::with_detail(
+                            rpc::LIST_SKILLS_FAILED,
+                            "failed to list workspace skills",
+                            detail,
+                        ),
+                    )
+                        .into()
+                }
+            }
+        }
         "open_session" => {
             let params: OpenSessionParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1770,6 +1883,7 @@ async fn build_workspace(
 
     Ok(WorkspaceState {
         id: workspace.id,
+        files: FileIndex::new(workspace_str.clone()),
         storage,
         workspace_str,
         mcp_servers,

@@ -121,6 +121,18 @@ export type WorkspaceSummary = {
   sessions: WorkspaceSession[];
 };
 
+/** One entry the composer's `@` picker can insert: a workspace-relative path. */
+export type WorkspaceFile = {
+  path: string;
+  is_dir: boolean;
+};
+
+/** A skill the workspace declares, named and described as the model sees it. */
+export type SkillInfo = {
+  name: string;
+  description: string;
+};
+
 /** Reasoning effort level — an arbitrary string configured per model. */
 export type ReasoningEffort = string;
 
@@ -200,6 +212,11 @@ export const RpcCode = {
   REWIND_FAILED: -32023,
   FORK_FAILED: -32024,
   ALLOW_PATTERN_FAILED: -32030,
+  /** `list_files`: the workspace could not be walked. */
+  LIST_FILES_FAILED: -32031,
+  /** `list_skills`: `.coda/skills` could not be read — most often one malformed
+   * `SKILL.md`, which the picker reports rather than listing one skill short. */
+  LIST_SKILLS_FAILED: -32032,
 } as const;
 
 // --- Request results / server-push payloads ----------------------------------
@@ -223,6 +240,13 @@ type Snapshot = {
 };
 
 type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
+
+/** `list_files` result: the ranked matches for one `@` query. `truncated` says
+ * matches were left out, so the menu can tell the user to keep typing instead of
+ * implying the workspace holds nothing else. */
+type FileCatalog = { files: WorkspaceFile[]; truncated: boolean };
+
+type SkillCatalog = { skills: SkillInfo[] };
 
 type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
 
@@ -253,6 +277,12 @@ type RpcRequest<Params, Result> = { params: Params; result: Result };
 export type RpcRequests = {
   list_workspaces: RpcRequest<undefined, WorkspaceCatalog>;
   list_providers: RpcRequest<undefined, ProviderCatalog>;
+  /** Search one workspace's files for the composer's `@` picker. The server
+   * ranks and caps, so this is a search rather than a listing — a workspace
+   * holds far more paths than a menu should carry. */
+  list_files: RpcRequest<{ workspace_id: string; query?: string; limit?: number }, FileCatalog>;
+  /** The workspace's skills, for the composer's `/` picker. */
+  list_skills: RpcRequest<{ workspace_id: string }, SkillCatalog>;
   open_session: RpcRequest<
     {
       workspace_id: string;

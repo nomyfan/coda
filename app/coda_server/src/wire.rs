@@ -1,4 +1,5 @@
 use crate::config::{PermissionMode, ToolApprovalConfig, extract_shell_command};
+use crate::files::FileEntry;
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{AssistantMessage, Message, MessageId, Modality, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
@@ -270,6 +271,25 @@ pub struct AddAllowPatternParams {
     pub pattern: String,
 }
 
+/// `list_files` params — the composer's `@` picker searching one workspace.
+/// `query` is the text typed after the `@` (empty right after it), and `limit`
+/// caps the menu; both have server-side defaults so a bare workspace id works.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListFilesParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `list_skills` params — the composer's `/` picker reading one workspace's
+/// `.coda/skills`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListSkillsParams {
+    pub workspace_id: String,
+}
+
 /// `set_model` params. An opened session rejects a different provider/model;
 /// the same model may update its reasoning setting while idle, applied from the
 /// next turn by reopening the runtime. `null` selects the first configured
@@ -302,6 +322,28 @@ pub struct WorkspaceCatalog {
 pub struct ProviderCatalog {
     pub providers: Vec<ProviderInfoWire>,
     pub default_provider: String,
+}
+
+/// Result of `list_files`: the ranked matches for one picker query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCatalog {
+    pub files: Vec<FileEntry>,
+    /// Matches were left out — the menu is a page, not the whole workspace, and
+    /// typing more of the query is what narrows it.
+    pub truncated: bool,
+}
+
+/// Result of `list_skills`: the workspace's skills, named and described exactly
+/// as the model sees them in `<available_skills>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCatalog {
+    pub skills: Vec<SkillInfoWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInfoWire {
+    pub name: String,
+    pub description: String,
 }
 
 /// Result of `set_model`: the selection now in effect (echoed on a real switch
