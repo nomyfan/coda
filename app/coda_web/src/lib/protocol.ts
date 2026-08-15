@@ -116,6 +116,27 @@ export type WorkspaceSummary = {
 /** Reasoning effort level — an arbitrary string configured per model. */
 export type ReasoningEffort = string;
 
+/**
+ * How much a session may do without stopping to ask. An allow-list: the tools a
+ * mode covers run unattended, everything else suspends for approval.
+ *
+ * - `explore` — inspection tools, plus shell commands pre-approved by the workspace.
+ * - `accept_edits` — plus writing files. The default for a new session.
+ * - `yolo` — everything, `shell` included. Only what outranks the mode still
+ *   stops a call: `ask_user`, the workspace's `approval_required` list, and its
+ *   shell deny-list.
+ */
+export type PermissionMode = "explore" | "accept_edits" | "yolo";
+
+export const PERMISSION_MODES: PermissionMode[] = ["explore", "accept_edits", "yolo"];
+
+/** What a session starts on, and what anything unremembered falls back to. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "accept_edits";
+
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  return PERMISSION_MODES.includes(value as PermissionMode);
+}
+
 export type Modality = "text" | "image";
 
 /**
@@ -185,6 +206,10 @@ type Snapshot = {
   pending_approvals?: PendingApproval[];
   provider_id: string;
   reasoning_effort?: ReasoningEffort | null;
+  /** The mode the session is *actually* running under. Authoritative: a
+   * client attaching to a session that is already live adopts this instead of
+   * imposing the one it remembered. */
+  permission_mode?: PermissionMode;
   /** A turn is still in flight; its events are replayed after the snapshot. */
   turn_running?: boolean;
 };
@@ -226,11 +251,22 @@ export type RpcRequests = {
       session_id: string;
       provider_id?: string;
       reasoning_effort?: ReasoningEffort | null;
+      /** The posture this client remembers for the session. Seeds a session the
+       * server is not already running; ignored (and answered with the live
+       * value) for one that is. */
+      permission_mode?: PermissionMode;
       /** Evict whoever currently holds the session; without it the server
        * rejects with `SESSION_BUSY`. */
       takeover?: boolean;
     },
     Snapshot
+  >;
+  /** Change how much the session may do unattended. Unlike `set_model` this
+   * rebuilds nothing, so it is accepted mid-turn and while approvals are
+   * pending; it applies to the next tool call, not to calls already suspended. */
+  set_permission_mode: RpcRequest<
+    { workspace_id: string; session_id: string; mode: PermissionMode },
+    { mode: PermissionMode }
   >;
   set_model: RpcRequest<
     {

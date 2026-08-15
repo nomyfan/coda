@@ -14,7 +14,14 @@ async fn session_with_one_turn(
 ) -> (SessionHub, BoxStream<'static, RelayEvent>, MessageId) {
     let hub = SessionHub::new(opener, RelayConfig::default());
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events = attach.events;
@@ -155,7 +162,14 @@ async fn a_rewind_replaces_the_discarded_turn_and_reports_what_survived() {
     // What an attaching client sees is the surviving history plus the edited
     // message — the same thing the command reported.
     let snapshot = hub
-        .attach(key(), 2, "prov".into(), None, true)
+        .attach(
+            key(),
+            2,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            true,
+        )
         .await
         .expect("re-attach")
         .snapshot;
@@ -174,7 +188,14 @@ async fn a_rewind_replaces_the_discarded_turn_and_reports_what_survived() {
 async fn a_rewind_is_refused_while_a_turn_is_in_flight() {
     let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
         .await
         .expect("attach");
     let CommandOutcome::TaskAccepted { message_id } = hub
@@ -214,7 +235,14 @@ async fn a_rewind_is_refused_while_a_turn_is_in_flight() {
 async fn a_rewind_is_refused_while_a_call_waits_on_a_human() {
     let (hub, _gate) = hub_with("approval", ToolApprovalMode::Manual);
     let attach = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
         .await
         .expect("attach");
     let mut events = attach.events;
@@ -275,7 +303,14 @@ async fn a_refused_rewind_leaves_the_session_exactly_as_it_was() {
     // re-attach hands back a fresh stream (the old one is retired with the
     // channel it was registered on), so carry on with that.
     let refreshed = hub
-        .attach(key(), 1, "prov".into(), None, false)
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
         .await
         .expect("still attached");
     let mut events = refreshed.events;

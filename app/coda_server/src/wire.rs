@@ -1,4 +1,4 @@
-use crate::config::{ToolApprovalConfig, extract_shell_command};
+use crate::config::{PermissionMode, ToolApprovalConfig, extract_shell_command};
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{AssistantMessage, Message, MessageId, Modality, ToolCall, ToolMessage};
 use serde::{Deserialize, Serialize};
@@ -164,6 +164,10 @@ impl WireEvent {
 /// default to the server's defaults when omitted. `takeover` evicts whoever
 /// currently holds the session — an explicit user decision; without it a held
 /// session is refused with the `SESSION_BUSY` error.
+///
+/// `permission_mode` is the posture the client remembers for this session. It
+/// seeds a session the server is not already running; a live one keeps its own
+/// and reports it in the [`Snapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenSessionParams {
     pub workspace_id: String,
@@ -172,6 +176,8 @@ pub struct OpenSessionParams {
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     #[serde(default)]
     pub takeover: bool,
 }
@@ -307,6 +313,22 @@ pub struct ModelSelection {
     pub reasoning_effort: Option<String>,
 }
 
+/// `set_permission_mode` params — change how much the session may do
+/// unattended. Accepted whatever the session is doing: it rebuilds nothing, and
+/// applies from the next tool call rather than to calls already suspended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPermissionModeParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub mode: PermissionMode,
+}
+
+/// Result of `set_permission_mode`: the mode now in effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionModeSelection {
+    pub mode: PermissionMode,
+}
+
 /// Result of `rename_session`: the normalized name persisted by the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionName {
@@ -342,6 +364,11 @@ pub struct RewindAccepted {
 /// with `resume` before the session resumes. `provider_id`/`reasoning_effort`
 /// are the session's current model selection. `turn_running` tells the client a
 /// turn is still in flight — its events are replayed (then streamed) right after.
+///
+/// `permission_mode` is authoritative in the same way: a client attaching to a
+/// session that is already running adopts what it finds here, which is how a
+/// reconnect (or a takeover from another device) shows the posture the session
+/// is really executing under rather than the one this browser remembered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub workspace_id: String,
@@ -352,6 +379,8 @@ pub struct Snapshot {
     pub provider_id: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     #[serde(default)]
     pub turn_running: bool,
 }

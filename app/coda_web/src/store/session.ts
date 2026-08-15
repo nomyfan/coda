@@ -6,6 +6,8 @@ import {
   type CompletionUsage,
   type HistoryMessage,
   type PendingApproval,
+  type PermissionMode,
+  DEFAULT_PERMISSION_MODE,
   type ProviderInfo,
   type ReasoningEffort,
   type RpcNotifications,
@@ -28,10 +30,16 @@ import {
 import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
 import { sessionTitle } from "@/components/session-utils";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
+import {
+  forgetSessionMode,
+  initialSessionMode,
+  rememberSessionMode,
+} from "@/store/permission-modes";
 import { create, type Store } from "@/store/utils";
 
 export type {
   CompletionUsage,
+  PermissionMode,
   ProviderInfo,
   ReasoningEffort,
   WorkspaceSession,
@@ -152,6 +160,11 @@ export type OpenedSession = {
   providerId?: string;
   /** Reasoning selection: `null` = no reasoning controls, `"none"` = thinking off. */
   reasoningEffort?: ReasoningEffort | null;
+  /** How much this session may do unattended. Seeded from what this browser
+   * remembers for *this session* (or the default for a new one), then replaced
+   * by whatever the server's snapshot reports — a session already running
+   * elsewhere keeps its own posture. */
+  permissionMode: PermissionMode;
   usage: UsageRecord[];
 };
 
@@ -238,6 +251,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     allowDrafts: {},
     running: false,
     evicted: false,
+    permissionMode: DEFAULT_PERMISSION_MODE,
     usage: [],
   };
 }
@@ -1328,6 +1342,20 @@ function selectSession(store: CodaStore, server: string, workspaceId: string, se
       const seed = initialModelSelection(current, workspaceId);
       session.providerId = seed.providerId;
       session.reasoningEffort = seed.reasoningEffort;
+      // Same story for the posture, except it is remembered per session rather
+      // than per workspace: switching in one conversation must not change what
+      // the next one starts on. A session still live on the server overrides
+      // this the moment its snapshot lands.
+      //
+      // What the session already carries is the fallback, not the hard default:
+      // a fork was handed its parent's mode a moment ago, and storage being
+      // unavailable must not silently downgrade that to the default.
+      session.permissionMode = initialSessionMode(
+        server,
+        workspaceId,
+        sessionId,
+        session.permissionMode,
+      );
     }
   });
 }
@@ -1369,6 +1397,7 @@ export function applySnapshotToSession(
     approvals: PendingApproval[];
     providerId: string;
     reasoningEffort: ReasoningEffort | null;
+    permissionMode: PermissionMode;
     turnRunning: boolean;
   },
 ): OpenedSession {
@@ -1383,6 +1412,10 @@ export function applySnapshotToSession(
     draft: false,
     providerId: snapshot.providerId,
     reasoningEffort: snapshot.reasoningEffort,
+    // The server's posture wins: attaching to a session that is still running
+    // must show what it is *actually* executing under, not what this browser
+    // remembered for it.
+    permissionMode: snapshot.permissionMode,
     usage: historyUsage(snapshot.messages),
     // A snapshot means this client holds the session now (clearing any
     // eviction), and `turnRunning` says whether replayed events of an in-flight
@@ -1418,6 +1451,7 @@ function applySnapshot(
   approvals: PendingApproval[],
   providerId: string,
   reasoningEffort: ReasoningEffort | null,
+  permissionMode: PermissionMode,
   turnRunning: boolean,
 ) {
   const key = sessionKey(workspaceId, sessionId);
@@ -1448,9 +1482,13 @@ function applySnapshot(
       approvals,
       providerId,
       reasoningEffort,
+      permissionMode,
       turnRunning,
     });
   });
+  // Self-heal the memory: whatever the session is running under is what this
+  // browser should reopen it on if the hub later closes it underneath us.
+  rememberSessionMode(server, workspaceId, sessionId, permissionMode);
 }
 
 function setSessionModel(
@@ -1892,6 +1930,7 @@ function openParams(session: OpenedSession, takeover = false) {
   return {
     workspace_id: session.workspaceId,
     session_id: session.sessionId,
+    permission_mode: session.permissionMode,
     ...(takeover ? { takeover } : {}),
     ...(session.providerId
       ? {
@@ -1999,6 +2038,7 @@ async function requestOpenAndApply(
       snap.pending_approvals ?? [],
       snap.provider_id,
       snap.reasoning_effort ?? null,
+      snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
       snap.turn_running ?? false,
     );
     return true;
@@ -2043,6 +2083,7 @@ function requestDelete(server: string, workspaceId: string, sessionId: string) {
       // drop the now-gone session.
       setCatalog(codaStore, server, catalog.workspaces, true);
       deleteSessionState(codaStore, server, key);
+      forgetSessionMode(server, workspaceId, sessionId);
     })
     .catch((err) => {
       if (isServerError(err)) {
@@ -2130,6 +2171,7 @@ export function connectServer(rawUrl: string) {
       params.pending_approvals ?? [],
       params.provider_id,
       params.reasoning_effort ?? null,
+      params.permission_mode ?? DEFAULT_PERMISSION_MODE,
       params.turn_running ?? false,
     );
   });
@@ -2387,9 +2429,31 @@ export async function forkSession(
     }
     const forked = await rpc.request("fork_session", params);
     setCatalog(codaStore, server, forked.workspaces, true);
+    // The copy inherits the source's posture the same way it inherits its
+    // history — the fork is a continuation, and starting it on a different
+    // footing than the conversation it branched from would be a surprise.
+    //
+    // Read it from the live session rather than from storage: the store holds
+    // the value the server last confirmed, and a blocked or full localStorage
+    // fails silently, which would quietly open the fork on the default. Storage
+    // is only the fallback for a source this client has not opened.
+    const source =
+      codaStore.getState().servers[server]?.sessions[sessionKey(workspaceId, sessionId)];
+    const inheritedMode =
+      source?.permissionMode ?? initialSessionMode(server, workspaceId, sessionId);
+    const copyKey = sessionKey(workspaceId, forked.session_id);
+    // Both channels, because either one alone can drop it: the store carries it
+    // into the open that follows even with storage unavailable, and storage
+    // carries it across a reload.
+    updateState(codaStore, (state) => {
+      const copy = draftSession(state, server, copyKey);
+      if (copy) {
+        copy.permissionMode = inheritedMode;
+      }
+    });
+    rememberSessionMode(server, workspaceId, forked.session_id, inheritedMode);
     openSession(server, workspaceId, forked.session_id);
     if (forkDraft) {
-      const copyKey = sessionKey(workspaceId, forked.session_id);
       updateState(codaStore, (state) => {
         const copy = draftSession(state, server, copyKey);
         if (copy) {
@@ -2525,6 +2589,7 @@ export async function sendTaskToNewSession(
   providerId?: string,
   reasoningEffort: ReasoningEffort | null = null,
   images: string[] = [],
+  permissionMode: PermissionMode = DEFAULT_PERMISSION_MODE,
 ) {
   const workspace = workspaceId.trim();
   const text = task.trim();
@@ -2545,6 +2610,8 @@ export async function sendTaskToNewSession(
   if (providerId) {
     setSessionModel(codaStore, server, key, providerId, reasoningEffort);
   }
+  setSessionMode(codaStore, server, key, permissionMode);
+  rememberSessionMode(server, workspace, sessionId, permissionMode);
   const session = codaStore.getState().servers[server]?.sessions[key];
   if (!session) {
     return;
@@ -2812,6 +2879,65 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
         });
       }
       // else: dropped connection — the reconnect restore re-syncs the model.
+    });
+}
+
+function setSessionMode(store: CodaStore, server: string, key: SessionKey, mode: PermissionMode) {
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      session.permissionMode = mode;
+    }
+  });
+}
+
+/**
+ * Change the active session's posture.
+ *
+ * Applied locally first so drafts carry the choice into `open_session` and a
+ * dropped connection can retry it while reconnecting. A live server may still
+ * reject a stale session, in which case the optimistic choice is rolled back.
+ */
+export function setPermissionMode(mode: PermissionMode) {
+  const active = currentActive();
+  if (!active || active.session.deleting || active.session.evicted) {
+    return;
+  }
+  const { server, session } = active;
+  const previousMode = session.permissionMode;
+  setSessionMode(codaStore, server, session.key, mode);
+  rememberSessionMode(server, session.workspaceId, session.sessionId, mode);
+  if (session.draft) {
+    return;
+  }
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    return;
+  }
+  rpc
+    .request("set_permission_mode", {
+      workspace_id: session.workspaceId,
+      session_id: session.sessionId,
+      mode,
+    })
+    .catch((err) => {
+      if (isServerError(err)) {
+        // Do not let an older failed request overwrite a choice made while it
+        // was in flight.
+        const current = codaStore.getState().servers[server]?.sessions[session.key];
+        if (current?.permissionMode === mode) {
+          setSessionMode(codaStore, server, session.key, previousMode);
+          rememberSessionMode(server, session.workspaceId, session.sessionId, previousMode);
+        }
+        addSessionActivity(server, session.workspaceId, session.sessionId, {
+          tone: "warning",
+          label: "permission change failed",
+          detail: err.message,
+        });
+      }
+      // else: dropped connection — the reconnect re-opens with the remembered
+      // mode, and the snapshot it answers with is what the UI then shows.
     });
 }
 
@@ -3120,6 +3246,8 @@ export const selectActiveProviders = (state: CodaStoreState): ProviderInfo[] =>
 export const selectActiveProviderId = (state: CodaStoreState) => activeSessionOf(state)?.providerId;
 export const selectActiveReasoningEffort = (state: CodaStoreState) =>
   activeSessionOf(state)?.reasoningEffort ?? null;
+export const selectActivePermissionMode = (state: CodaStoreState) =>
+  activeSessionOf(state)?.permissionMode ?? DEFAULT_PERMISSION_MODE;
 const EMPTY_USAGE: UsageRecord[] = [];
 export const selectActiveEditing = (state: CodaStoreState) => activeSessionOf(state)?.editing;
 export const selectActiveForkDraft = (state: CodaStoreState) => activeSessionOf(state)?.forkDraft;

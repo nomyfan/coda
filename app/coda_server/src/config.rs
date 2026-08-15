@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use coda_agent::ToolApprovalMode;
+use coda_agent::{SUBAGENT_TOOL_PREFIX, ToolApprovalMode};
 use coda_core::llm::{Modality, ToolCall};
 use coda_openai::ProviderKind;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -522,6 +523,109 @@ fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
     }
 }
 
+/// How much a session is trusted to do without stopping to ask.
+///
+/// A mode is an **allow-list**: the tools it names run unattended and
+/// everything else suspends for human approval. That is the inverse of
+/// `[permissions.tools].approval_required`, which survives as a workspace-level
+/// *tightening* list — it can force approval for a tool the mode would have
+/// waved through, never the other way round.
+///
+/// The mode is per session and live-editable: [`PermissionModeCell`] is what
+/// the approval closure reads, so switching takes effect on the next tool call
+/// without rebuilding the runtime — mid-turn and mid-suspension included.
+///
+/// Not to be confused with `coda_agent::ToolApprovalMode`, which sits one layer
+/// down: that is the runtime's *mechanism* (approve everything, ask about
+/// everything, or ask this closure), while this is the user's *choice*.
+/// [`ToolApprovalConfig::into_approval_mode`] is where one becomes the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Built-in inspection tools. Workspace shell rules may separately
+    /// auto-approve specific commands.
+    Explore,
+    /// [`Self::Explore`] plus the file-editing tools. The default for a new
+    /// session.
+    #[default]
+    AcceptEdits,
+    /// Auto-approve everything, `shell` included — everything, that is, that
+    /// the three rules outranking the mode leave alone: `ask_user` still opens
+    /// the UI (it asks a question rather than seeking permission), the
+    /// workspace's `approval_required` list still holds, and its shell `deny`
+    /// rules still bite. See [`ToolApprovalConfig::requires_approval`].
+    Yolo,
+}
+
+/// Tools [`PermissionMode::Explore`] runs unattended: they read the workspace
+/// (or, for the todos pair, only the agent's own scratch state) and change
+/// nothing on disk.
+const EXPLORE_TOOLS: &[&str] = &[
+    "ls",
+    "read_file",
+    "glob",
+    "grep",
+    "read_todos",
+    "write_todos",
+];
+
+/// What [`PermissionMode::AcceptEdits`] adds on top of [`EXPLORE_TOOLS`].
+const ACCEPT_EDITS_TOOLS: &[&str] = &["write_file", "edit_file"];
+
+impl PermissionMode {
+    /// Whether this mode lets `tool_name` run without asking. Says nothing
+    /// about the workspace's own rules — [`ToolApprovalConfig::requires_approval`]
+    /// applies those on top.
+    pub fn auto_approves(self, tool_name: &str) -> bool {
+        // Delegation is waved through at every level: handing work to a
+        // sub-agent has no effect of its own, and each tool the sub-agent then
+        // calls is checked against this same policy. Gating the `agent__*` call
+        // as well would just charge the user two approvals for one action.
+        if tool_name.starts_with(SUBAGENT_TOOL_PREFIX) {
+            return true;
+        }
+        match self {
+            Self::Yolo => true,
+            Self::AcceptEdits => {
+                EXPLORE_TOOLS.contains(&tool_name) || ACCEPT_EDITS_TOOLS.contains(&tool_name)
+            }
+            Self::Explore => EXPLORE_TOOLS.contains(&tool_name),
+        }
+    }
+}
+
+/// A session's live [`PermissionMode`], shared between the hub entry that owns
+/// the session and the approval closure inside its runtime.
+///
+/// Cloning shares the cell, so a `set_permission_mode` writes what the next
+/// approval check reads. The hub holds it for the life of the session, which
+/// outlives any one connection: a client that reconnects to a running session is
+/// told the value in here, not the one it remembered locally.
+#[derive(Clone, Default)]
+pub struct PermissionModeCell(Arc<Mutex<PermissionMode>>);
+
+impl PermissionModeCell {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self(Arc::new(Mutex::new(mode)))
+    }
+
+    pub fn get(&self) -> PermissionMode {
+        *self.0.lock().unwrap()
+    }
+
+    pub fn set(&self, mode: PermissionMode) {
+        *self.0.lock().unwrap() = mode;
+    }
+}
+
+impl fmt::Debug for PermissionModeCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PermissionModeCell")
+            .field(&self.get())
+            .finish()
+    }
+}
+
 /// Pattern-based permission rules for `shell` commands.
 ///
 /// A command is parsed into its constituent simple commands (splitting on `;`,
@@ -560,7 +664,10 @@ struct Permissions {
 }
 
 const INTERACTIVE_TOOLS: &[&str] = &["ask_user"];
-const DEFAULT_APPROVAL_REQUIRED_TOOLS: &[&str] = &["edit_file", "write_file", "ls", "grep", "glob"];
+/// Empty on purpose: the session's [`PermissionMode`] carries the baseline
+/// policy now, and `[permissions.tools].approval_required` exists only for a
+/// workspace that wants to lock something down further than the mode does.
+const DEFAULT_APPROVAL_REQUIRED_TOOLS: &[&str] = &[];
 
 impl ToolApprovalConfig {
     /// Create a default config (empty rules → all shell calls require approval)
@@ -597,16 +704,32 @@ impl ToolApprovalConfig {
         })
     }
 
-    /// Build a `ToolApprovalMode` that checks shell commands against these rules.
+    /// Build a `ToolApprovalMode` that judges calls against these rules and the
+    /// session's live mode.
     ///
-    /// The returned closure captures the inner `Arc` so that patterns added via
-    /// [`add_allow_pattern`] take effect immediately for subsequent tool calls.
-    pub fn into_approval_mode(self) -> ToolApprovalMode {
-        ToolApprovalMode::RequireWhen(Arc::new(move |call| self.requires_approval(call)))
+    /// The returned closure captures both `Arc`s, so patterns added via
+    /// [`add_allow_pattern`] *and* a mode switched mid-session take effect
+    /// immediately for subsequent tool calls.
+    pub fn into_approval_mode(self, mode: PermissionModeCell) -> ToolApprovalMode {
+        ToolApprovalMode::RequireWhen(Arc::new(move |call| {
+            self.requires_approval(mode.get(), call)
+        }))
     }
 
-    /// Whether `call` should be suspended for human approval.
-    pub fn requires_approval(&self, call: &ToolCall) -> bool {
+    /// Whether `call` should be suspended for human approval under `mode`.
+    ///
+    /// The order matters, and the first three rules outrank the mode — even
+    /// [`PermissionMode::Yolo`]:
+    ///
+    /// 1. `ask_user` always opens the UI; it is a question, not a permission.
+    /// 2. `[permissions.tools].approval_required` is the workspace's own lock,
+    ///    and a mode must not be able to pick it.
+    /// 3. A `shell` command matching a `deny` glob stays denied.
+    ///
+    /// Past those, `Yolo` waves everything through; the other modes check
+    /// `shell` against the allow/deny rules and every other tool against the
+    /// mode's own list.
+    pub fn requires_approval(&self, mode: PermissionMode, call: &ToolCall) -> bool {
         if INTERACTIVE_TOOLS.iter().any(|tool| tool == &call.name) {
             return true;
         }
@@ -618,11 +741,17 @@ impl ToolApprovalConfig {
         {
             return true;
         }
-        if call.name != "shell" {
-            return false;
+        if call.name == "shell" {
+            let command = extract_shell_command(call);
+            if mode == PermissionMode::Yolo {
+                // Yolo skips the allow-list, not the deny-list. A command that
+                // can't be decomposed can't be checked against `deny` either,
+                // and yolo is the mode that runs it anyway.
+                return matches_deny(&command, &inner.deny);
+            }
+            return !is_auto_approved(&command, &inner.allow, &inner.deny);
         }
-        let command = extract_shell_command(call);
-        !is_auto_approved(&command, &inner.allow, &inner.deny)
+        !mode.auto_approves(&call.name)
     }
 
     /// Append a glob pattern to the allow-list, updating both in-memory state
@@ -693,6 +822,22 @@ fn default_approval_required_tools() -> Vec<String> {
         .iter()
         .map(|tool| (*tool).to_string())
         .collect()
+}
+
+/// Whether any simple command in `command` matches a `deny` glob.
+///
+/// The deny-list is the one rule [`PermissionMode::Yolo`] still respects, so
+/// this is deliberately the *only* question asked there: a command that fails to
+/// parse yields `false` (nothing matched), and yolo runs it. Under every other
+/// mode the same command goes through [`is_auto_approved`], where failing to
+/// parse means "ask".
+fn matches_deny(command: &str, deny: &[String]) -> bool {
+    let Some(simple_commands) = decompose(command) else {
+        return false;
+    };
+    simple_commands
+        .iter()
+        .any(|cmd| deny.iter().any(|p| wildcard_match(p, cmd)))
 }
 
 /// Whether `command` can be auto-approved against the given rules.

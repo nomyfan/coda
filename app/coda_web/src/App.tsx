@@ -11,6 +11,7 @@ import {
   selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
+  selectActivePermissionMode,
   selectActiveReasoningEffort,
   selectActiveEditing,
   selectActiveForkDraft,
@@ -28,14 +29,17 @@ import {
   sendTask,
   sendTaskToNewSession,
   setModel,
+  setPermissionMode,
   takeOverActiveSession,
   updateForkDraft,
   useCodaBootstrap,
   useCodaStore,
+  type PermissionMode,
   type ReasoningEffort,
   type ServerSummary,
   type UsageRecord,
 } from "@/store/session";
+import { DEFAULT_PERMISSION_MODE } from "@/lib/protocol";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
 import { Sidebar } from "@/components/sidebar";
 import { Button } from "@/components/ui/button";
@@ -221,6 +225,7 @@ export default function App() {
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
+  const activePermissionMode = useCodaStore(selectActivePermissionMode);
   const activeSessionTitle = useCodaStore(selectActiveSessionTitle);
   const activeUsage = useCodaStore(selectActiveUsage);
   const activeHasImages = useCodaStore(selectActiveHasImages);
@@ -241,6 +246,7 @@ export default function App() {
     providerId: string;
     reasoningEffort: ReasoningEffort | null;
   } | null>(null);
+  const [newSessionMode, setNewSessionMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
@@ -256,6 +262,9 @@ export default function App() {
   useEffect(() => {
     if (!newSessionTarget) {
       setNewSessionModel(null);
+      // Nothing is remembered per workspace, so every new conversation opens on
+      // the default rather than inheriting the last one's posture.
+      setNewSessionMode(DEFAULT_PERMISSION_MODE);
       return;
     }
     const resolved = resolveNewSessionTarget(servers, newSessionTarget, activeServer);
@@ -357,6 +366,7 @@ export default function App() {
           selectedNewSessionModel?.providerId,
           selectedNewSessionModel?.reasoningEffort ?? null,
           images,
+          newSessionMode,
         );
         clearNewSessionTarget();
         return;
@@ -369,7 +379,7 @@ export default function App() {
       }
       sendTask(task, images);
     },
-    [selectedNewSessionModel, activeEditing],
+    [selectedNewSessionModel, newSessionMode, activeEditing],
   );
 
   const handleSetNewSessionModel = useCallback(
@@ -455,6 +465,7 @@ export default function App() {
                   evicted={showingNewSession ? false : activeEvicted}
                   workspace={selectedWorkspace}
                   selectingTarget={showingNewSession}
+                  permissionMode={showingNewSession ? newSessionMode : activePermissionMode}
                   providers={
                     showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
                   }
@@ -474,6 +485,7 @@ export default function App() {
                   forkDraft={showingNewSession ? undefined : activeForkDraft}
                   onForkDraftChange={handleForkDraftChange}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
+                  onSetPermissionMode={showingNewSession ? setNewSessionMode : setPermissionMode}
                   onSend={handleSend}
                   onAbort={abort}
                   onCancelEdit={cancelEdit}
