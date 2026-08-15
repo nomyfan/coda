@@ -165,12 +165,50 @@ fn entries(paths: &[&str]) -> Vec<FileEntry> {
 }
 
 #[test]
-fn rank_without_a_query_keeps_index_order() {
-    let all = entries(&["README.md", "src/main.rs", "src/app/deep.rs"]);
-    let (files, truncated) = rank(&all, "", 2);
+fn rank_without_a_query_lists_only_the_top_level() {
+    let all = entries(&["README.md", "src", "src/main.rs", "src/app/deep.rs"]);
+    let (files, truncated) = rank(&all, "", 10);
 
-    assert_eq!(paths(&files), ["README.md", "src/main.rs"]);
-    assert!(truncated, "a third entry was left out");
+    assert_eq!(
+        paths(&files),
+        ["README.md", "src"],
+        "browsing starts at the root; the menu descends when a directory is picked"
+    );
+    assert!(!truncated, "nothing at the top level was left out");
+}
+
+#[test]
+fn rank_browses_one_level_when_a_query_ends_at_a_directory() {
+    let all = entries(&["src", "src/main.rs", "src/app", "src/app/deep.rs"]);
+    let (files, truncated) = rank(&all, "src/", 10);
+
+    assert_eq!(
+        paths(&files),
+        ["src/main.rs", "src/app"],
+        "picking a directory shows what's in it, not everything under it"
+    );
+    assert!(!truncated);
+}
+
+#[test]
+fn rank_still_searches_a_query_that_only_contains_a_slash() {
+    let all = entries(&["src/main.rs", "src/app/main.rs"]);
+    let (files, _) = rank(&all, "src/ma", 10);
+
+    assert_eq!(
+        paths(&files),
+        ["src/main.rs", "src/app/main.rs"],
+        "a partial name after the slash is a search again, at any depth"
+    );
+}
+
+#[test]
+fn rank_without_a_query_reports_a_truncated_top_level() {
+    let all = entries(&["README.md", "src", "src/main.rs"]);
+    let (files, truncated) = rank(&all, "", 1);
+
+    assert_eq!(paths(&files), ["README.md"]);
+    assert!(truncated, "a second top-level entry was left out");
 }
 
 #[test]
@@ -218,16 +256,16 @@ async fn search_reuses_a_recent_walk_and_rewalks_once_it_expires() {
     let root = dir.path().to_string_lossy().into_owned();
     let index = FileIndex::new(root.clone());
 
-    assert_eq!(index.search("", 10).await.unwrap().files.len(), 2);
+    assert_eq!(index.search("", 10).await.unwrap().files.len(), 1);
     fs::write(dir.path().join("added.rs"), "x").unwrap();
     assert_eq!(
         index.search("", 10).await.unwrap().files.len(),
-        2,
+        1,
         "a walk taken moments ago is reused rather than repeated per keystroke"
     );
 
     let expiring = FileIndex::with_ttl(root, Duration::ZERO);
-    assert_eq!(expiring.search("", 10).await.unwrap().files.len(), 3);
+    assert_eq!(expiring.search("", 10).await.unwrap().files.len(), 2);
 }
 
 #[tokio::test]

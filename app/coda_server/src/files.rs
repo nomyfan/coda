@@ -85,7 +85,7 @@ impl FileIndex {
 
     /// The best `limit` matches for `query`, ranked by [`fuzzy_score`]. An empty
     /// query is not an error — it's the state right after typing `@`, and it
-    /// answers with the shallowest paths in the workspace.
+    /// answers with the workspace's top level.
     pub async fn search(&self, query: &str, limit: usize) -> Result<FileMatches, String> {
         let limit = limit.clamp(1, MAX_LIMIT);
         let listing = self.listing().await?;
@@ -189,11 +189,11 @@ fn depth(path: &str) -> usize {
 
 /// The best `limit` entries for `query`, and whether anything was left out.
 fn rank(entries: &[FileEntry], query: &str, limit: usize) -> (Vec<FileEntry>, bool) {
-    if query.is_empty() {
-        return (
-            entries.iter().take(limit).cloned().collect(),
-            entries.len() > limit,
-        );
+    // Nothing typed, or a query that just descended into a directory: either way
+    // the picker is being browsed rather than searched, so it answers with that
+    // one directory's own entries instead of everything beneath it.
+    if query.is_empty() || query.ends_with('/') {
+        return browse(entries, query, limit);
     }
 
     let mut scored: Vec<(i32, &FileEntry)> = entries
@@ -210,6 +210,25 @@ fn rank(entries: &[FileEntry], query: &str, limit: usize) -> (Vec<FileEntry>, bo
             .take(limit)
             .map(|(_, entry)| entry.clone())
             .collect(),
+        over_limit,
+    )
+}
+
+/// The direct children of `prefix` (`""` being the workspace root), in the
+/// index's shallowest-first, alphabetical order.
+fn browse(entries: &[FileEntry], prefix: &str, limit: usize) -> (Vec<FileEntry>, bool) {
+    let children: Vec<&FileEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
+        .collect();
+    let over_limit = children.len() > limit;
+    (
+        children.into_iter().take(limit).cloned().collect(),
         over_limit,
     )
 }
