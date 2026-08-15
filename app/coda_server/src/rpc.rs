@@ -82,10 +82,6 @@ pub const FORK_FAILED: i32 = -32024;
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
 /// `list_files`: the workspace could not be walked.
 pub const LIST_FILES_FAILED: i32 = -32031;
-/// `list_skills`: the workspace's `.coda/skills` could not be read (most often
-/// a malformed `SKILL.md`, which the picker reports rather than silently
-/// listing one skill short).
-pub const LIST_SKILLS_FAILED: i32 = -32032;
 
 impl RpcError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {

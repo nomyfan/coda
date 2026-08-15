@@ -250,6 +250,33 @@ async fn search_ranks_workspace_files() {
     assert!(!matches.truncated);
 }
 
+/// A picker sends a request per keystroke and each is answered from its own
+/// task, so a cold cache sees them arrive together. They must share one walk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_misses_share_one_walk() {
+    let dir = workspace(&["src/main.rs", "src/app/deep.rs", "README.md"]);
+    let index = Arc::new(FileIndex::new(dir.path().to_string_lossy().into_owned()));
+
+    // Collected, not lazily mapped: the spawns have to all be in flight before
+    // the first one is awaited, or the test serializes itself and proves nothing.
+    let searches: Vec<_> = (0..16)
+        .map(|n| {
+            let index = Arc::clone(&index);
+            // Distinct queries, so nothing but the walk itself is shared.
+            tokio::spawn(async move { index.search(&"m".repeat(n % 3), 10).await })
+        })
+        .collect();
+    for search in searches {
+        search.await.unwrap().unwrap();
+    }
+
+    assert_eq!(
+        index.walks.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "16 simultaneous cold-cache queries must coalesce into a single traversal"
+    );
+}
+
 #[tokio::test]
 async fn search_reuses_a_recent_walk_and_rewalks_once_it_expires() {
     let dir = workspace(&["src/main.rs"]);
@@ -264,8 +291,16 @@ async fn search_reuses_a_recent_walk_and_rewalks_once_it_expires() {
         "a walk taken moments ago is reused rather than repeated per keystroke"
     );
 
+    // The expiry half only means something against a *populated* cache: a fresh
+    // index misses for want of any walk at all, whatever the TTL says.
     let expiring = FileIndex::with_ttl(root, Duration::ZERO);
     assert_eq!(expiring.search("", 10).await.unwrap().files.len(), 2);
+    fs::write(dir.path().join("later.rs"), "x").unwrap();
+    assert_eq!(
+        expiring.search("", 10).await.unwrap().files.len(),
+        3,
+        "a walk older than the TTL is discarded rather than reused"
+    );
 }
 
 #[tokio::test]

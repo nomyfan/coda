@@ -49,33 +49,84 @@ pub fn read_custom_instructions(workspace_dir: &str) -> Option<String> {
     }
 }
 
-/// The workspace's `<available_skills>` XML, or an empty string when the
-/// workspace declares no skills. This is the value of the `{{workspace_available_skills}}`
-/// template variable — the skills *guide* is a separate, constant variable
-/// ([`AGENT_SKILLS_PROMPT`], exposed as `{{skills_guide}}`).
+/// One skill as the composer's `/` picker offers it — the same name and
+/// description the model reads inside `<available_skills>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+}
+
+/// The workspace's skills, read once and rendered two ways: the
+/// `<available_skills>` XML the model sees, and the name/description pairs the
+/// composer's `/` picker lists. One read serves both, so the menu can never
+/// name a skill the prompt omits (or vice versa).
 ///
 /// Pure and quiet: it is re-run on every watcher poll (a few seconds apart), so
 /// it must not log per call. A missing skills directory — the common case — is
 /// silently "no skills"; the watcher logs once when the rendered text changes.
-pub fn build_available_skills(workspace_dir: &str) -> String {
+/// A `SKILL.md` that fails to parse takes the whole set down, for the prompt and
+/// the picker alike.
+pub fn load_workspace_skills(workspace_dir: &str) -> (String, Vec<SkillSummary>) {
     let skills_dir = Path::new(workspace_dir).join(".coda").join("skills");
     if !skills_dir.exists() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     match Skills::from_dir(&skills_dir) {
-        Ok(skills) if !skills.0.is_empty() => skills.to_xml(),
-        Ok(_) => String::new(),
+        Ok(skills) if !skills.0.is_empty() => {
+            let xml = skills.to_xml();
+            let mut summaries: Vec<SkillSummary> = skills
+                .0
+                .into_iter()
+                .map(|skill| SkillSummary {
+                    name: skill.properties.name,
+                    description: skill.properties.description,
+                })
+                .collect();
+            summaries.sort_by(|a, b| a.name.cmp(&b.name));
+            (xml, summaries)
+        }
+        Ok(_) => (String::new(), Vec::new()),
         Err(err) => {
             warn!("failed to load skills, proceeding without them: {err}");
-            String::new()
+            (String::new(), Vec::new())
         }
+    }
+}
+
+/// The parsed skills list behind a shared handle, refreshed in place by the
+/// workspace watcher exactly like the prompt handles beside it.
+#[derive(Clone, Default)]
+pub struct SharedSkills(Arc<std::sync::Mutex<Arc<Vec<SkillSummary>>>>);
+
+impl SharedSkills {
+    pub fn new(skills: Vec<SkillSummary>) -> Self {
+        SharedSkills(Arc::new(std::sync::Mutex::new(Arc::new(skills))))
+    }
+
+    /// The current list. Cloning the inner `Arc` keeps the lock uncontended
+    /// while a caller reads.
+    pub fn get(&self) -> Arc<Vec<SkillSummary>> {
+        Arc::clone(&self.lock())
+    }
+
+    pub fn set(&self, skills: Vec<SkillSummary>) {
+        *self.lock() = Arc::new(skills);
+    }
+
+    /// The guarded sections only clone an `Arc`, so a poisoned lock means an
+    /// unrelated panic and the list behind it is still good data.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Arc<Vec<SkillSummary>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 /// The workspace's `AGENTS.md` wrapped in a `<custom_instructions>` block, or an
 /// empty string when absent/blank. This is the value of the
 /// `{{workspace_custom_instructions}}` template variable. Like
-/// [`build_available_skills`], this is re-run on every watcher poll and must
+/// [`load_workspace_skills`], this is re-run on every watcher poll and must
 /// stay quiet.
 pub fn build_workspace_custom_instructions(workspace_dir: &str) -> String {
     match read_custom_instructions(workspace_dir) {
@@ -95,6 +146,9 @@ pub fn build_workspace_custom_instructions(workspace_dir: &str) -> String {
 pub struct WorkspaceKnowledge {
     /// `{{workspace_available_skills}}` — the `<available_skills>` XML, or empty.
     pub available_skills: SharedSystemPrompt,
+    /// The same skills, parsed, for the composer's `/` picker. Refreshed from
+    /// the same read as `available_skills` so the two never disagree.
+    pub skills: SharedSkills,
     /// `{{workspace_custom_instructions}}` — `AGENTS.md` wrapped in
     /// `<custom_instructions>`, or empty.
     pub custom_instructions: SharedSystemPrompt,
@@ -103,8 +157,10 @@ pub struct WorkspaceKnowledge {
 impl WorkspaceKnowledge {
     /// Handles seeded from the workspace's current on-disk state.
     pub fn load(workspace_dir: &str) -> Self {
+        let (available_skills, skills) = load_workspace_skills(workspace_dir);
         WorkspaceKnowledge {
-            available_skills: SharedSystemPrompt::new(build_available_skills(workspace_dir)),
+            available_skills: SharedSystemPrompt::new(available_skills),
+            skills: SharedSkills::new(skills),
             custom_instructions: SharedSystemPrompt::new(build_workspace_custom_instructions(
                 workspace_dir,
             )),
@@ -115,6 +171,7 @@ impl WorkspaceKnowledge {
     pub fn empty() -> Self {
         WorkspaceKnowledge {
             available_skills: SharedSystemPrompt::new(String::new()),
+            skills: SharedSkills::default(),
             custom_instructions: SharedSystemPrompt::new(String::new()),
         }
     }
@@ -238,19 +295,24 @@ mod tests {
     }
 
     #[test]
-    fn build_available_skills_empty_without_or_for_empty_skills_dir() {
+    fn load_workspace_skills_empty_without_or_for_empty_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
         // No `.coda/skills` at all.
-        assert!(build_available_skills(&dir.path().to_string_lossy()).is_empty());
+        let (xml, skills) = load_workspace_skills(&dir.path().to_string_lossy());
+        assert!(xml.is_empty());
+        assert!(skills.is_empty());
         // Present but empty.
         std::fs::create_dir_all(dir.path().join(".coda").join("skills")).unwrap();
-        assert!(build_available_skills(&dir.path().to_string_lossy()).is_empty());
+        let (xml, skills) = load_workspace_skills(&dir.path().to_string_lossy());
+        assert!(xml.is_empty());
+        assert!(skills.is_empty());
     }
 
     #[test]
     fn vars_provider_exposes_all_bindings() {
         let knowledge = WorkspaceKnowledge {
             available_skills: SharedSystemPrompt::new("<available_skills>x</available_skills>"),
+            skills: SharedSkills::default(),
             custom_instructions: SharedSystemPrompt::new(
                 "<custom_instructions>y</custom_instructions>",
             ),

@@ -12,6 +12,7 @@
 //! those would be pure waste.
 
 use ignore::WalkBuilder;
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,8 +34,11 @@ pub struct FileMatches {
     pub truncated: bool,
 }
 
-/// Ceiling on one walk. A workspace bigger than this still searches, it just
-/// searches the first `MAX_ENTRIES` paths the walker yields.
+/// Ceiling on how many entries one walk *keeps*. A workspace bigger than this
+/// still searches; it searches the `MAX_ENTRIES` shallowest paths. The walk
+/// itself always runs to completion — stopping early would cut the tree along
+/// the walker's depth-first path and leave the picker's default view (the top
+/// level) missing most of itself.
 const MAX_ENTRIES: usize = 20_000;
 
 /// How long a completed walk stays reusable. Long enough that typing a query
@@ -52,6 +56,14 @@ pub struct FileIndex {
     root: String,
     ttl: Duration,
     cache: Mutex<Option<Listing>>,
+    /// Held across a walk so concurrent misses coalesce into one traversal
+    /// rather than one per request. Async, because it *is* held across the
+    /// `spawn_blocking` await.
+    walking: tokio::sync::Mutex<()>,
+    /// How many traversals this index has actually run — the only way for a
+    /// test to tell one shared walk from several duplicated ones.
+    #[cfg(test)]
+    walks: std::sync::atomic::AtomicUsize,
 }
 
 /// One completed walk.
@@ -70,6 +82,9 @@ impl FileIndex {
             root: root.into(),
             ttl: CACHE_TTL,
             cache: Mutex::new(None),
+            walking: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            walks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -96,14 +111,26 @@ impl FileIndex {
         })
     }
 
-    /// A walk from within the TTL, or a fresh one. Two concurrent misses both
-    /// walk and the later one wins: holding a lock across the walk would either
-    /// block the runtime or serialize every search behind the slowest one, and a
-    /// duplicated walk costs nothing but time.
+    /// A walk from within the TTL, or a fresh one.
+    ///
+    /// Concurrent misses **coalesce**: the first takes `walking` and traverses,
+    /// the rest queue behind it and then find the cache it filled. This matters
+    /// because the picker fires a request per keystroke and each is answered
+    /// from its own task — without coalescing, a cold cache in a large
+    /// workspace would start a full traversal for every keystroke at once and
+    /// flood the blocking pool with duplicated disk I/O.
     async fn listing(&self) -> Result<Listing, String> {
         if let Some(fresh) = self.fresh() {
             return Ok(fresh);
         }
+        let _permit = self.walking.lock().await;
+        // The walk we queued behind has just filled the cache; nothing to redo.
+        if let Some(fresh) = self.fresh() {
+            return Ok(fresh);
+        }
+        #[cfg(test)]
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = self.root.clone();
         let (entries, truncated) = tokio::task::spawn_blocking(move || walk(Path::new(&root)))
             .await
@@ -133,12 +160,17 @@ fn lock(cache: &Mutex<Option<Listing>>) -> std::sync::MutexGuard<'_, Option<List
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Walk `root`, returning workspace-relative paths and whether the walk was cut
-/// short at [`MAX_ENTRIES`]. Sorted shallowest-first, then alphabetically, which
-/// is both the order an empty query answers with and the tie-break within a
-/// ranked search.
+/// Walk `root`, returning workspace-relative paths and whether [`MAX_ENTRIES`]
+/// forced any out. Sorted shallowest-first, then alphabetically, which is both
+/// the order an empty query answers with and the tie-break within a ranked
+/// search.
+///
+/// The cap is applied *through* that same order rather than by stopping the
+/// walk: `ignore` walks depth-first, so cutting off at the cap would keep an
+/// arbitrary prefix of one subtree and drop top-level entries the walker had
+/// not reached yet — exactly the ones an empty query leads with.
 fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
-    let mut entries: Vec<FileEntry> = Vec::new();
+    let mut kept: BinaryHeap<Ranked> = BinaryHeap::with_capacity(MAX_ENTRIES + 1);
     let mut truncated = false;
 
     let walker = WalkBuilder::new(root)
@@ -165,22 +197,50 @@ fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
         else {
             continue;
         };
-        if entries.len() >= MAX_ENTRIES {
-            truncated = true;
-            break;
-        }
-        entries.push(FileEntry {
-            path: path.to_string(),
-            is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
+        kept.push(Ranked {
+            depth: depth(path),
+            entry: FileEntry {
+                path: path.to_string(),
+                is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
+            },
         });
+        // The heap's max is the deepest/last entry seen so far, so popping it
+        // once per overflow leaves the `MAX_ENTRIES` shallowest.
+        if kept.len() > MAX_ENTRIES {
+            kept.pop();
+            truncated = true;
+        }
     }
 
-    entries.sort_by(|a, b| {
-        depth(&a.path)
-            .cmp(&depth(&b.path))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    let entries = kept
+        .into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect();
     (entries, truncated)
+}
+
+/// A walked entry keyed for the bounded heap: shallowest first, then
+/// alphabetically — the order the index itself is kept in, so
+/// `into_sorted_vec` yields the answer directly.
+#[derive(PartialEq, Eq)]
+struct Ranked {
+    depth: usize,
+    entry: FileEntry,
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.depth
+            .cmp(&other.depth)
+            .then_with(|| self.entry.path.cmp(&other.entry.path))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn depth(path: &str) -> usize {
