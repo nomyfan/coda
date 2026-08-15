@@ -265,6 +265,13 @@
     mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
   }
 
+  /* Shiki highlights each block for both themes at once: the light color lands
+   * inline and the dark one as --shiki-dark. Switching themes is then a CSS
+   * flip, with no re-highlight pass. */
+  .dark .shiki-code span {
+    color: var(--shiki-dark);
+  }
+
   /* In-progress label: a bright band sweeps across dimmed text, left to right.
    * The base is muted to ~40% so the full-strength peak reads as an obvious
    * moving highlight; the band is narrow for a crisp sweep. */

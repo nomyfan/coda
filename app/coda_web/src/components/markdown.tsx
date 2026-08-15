@@ -1,7 +1,24 @@
-import { memo } from "react";
+import { memo, useDeferredValue } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useHighlighted } from "@/lib/shiki";
 import { cn } from "@/lib/utils";
+
+/* Highlighting re-runs on every streamed chunk, so it rides a deferred copy of
+ * the text: React can drop stale passes and keep the plain-text render (and
+ * typing) responsive while a long block is still growing. */
+function CodeBlock({ code, className }: { code: string; className?: string }) {
+  const lang = /language-([\w+#-]+)/.exec(className ?? "")?.[1];
+  const deferred = useDeferredValue(code);
+  const html = useHighlighted(deferred, lang);
+
+  if (html === null) {
+    return <code className={className}>{code}</code>;
+  }
+  return (
+    <code className={cn(className, "shiki-code")} dangerouslySetInnerHTML={{ __html: html }} />
+  );
+}
 
 const components: Components = {
   p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
@@ -38,9 +55,11 @@ const components: Components = {
   ),
   hr: () => <hr className="my-3 border-border" />,
   code: ({ className, children }) => {
-    const isBlock = /language-/.test(className ?? "") || String(children).includes("\n");
+    const raw = String(children);
+    const isBlock = /language-/.test(className ?? "") || raw.includes("\n");
     if (isBlock) {
-      return <code className={className}>{children}</code>;
+      // The fence's trailing newline would otherwise render as a blank line.
+      return <CodeBlock code={raw.replace(/\n$/, "")} className={className} />;
     }
     return (
       <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[0.85em] dark:bg-white/10">
