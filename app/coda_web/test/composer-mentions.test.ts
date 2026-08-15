@@ -24,7 +24,6 @@ test("a bare @ opens the file picker with an empty query", () => {
     start: 0,
     end: 1,
     query: "",
-    atMessageStart: true,
   });
 });
 
@@ -45,12 +44,24 @@ test("a trigger has to start its token, so an email address is left alone", () =
   expect(atEnd("mail bob@example.com")).toBeNull();
 });
 
-test("a slash names a skill anywhere, but only opens the message at its start", () => {
-  expect(atEnd("/rev")).toMatchObject({ kind: "slash", query: "rev", atMessageStart: true });
-  expect(atEnd("  /rev")).toMatchObject({ atMessageStart: true });
-  expect(atEnd("please run /rev")).toMatchObject({ kind: "slash", atMessageStart: false });
-  // A second line is not the start of the message.
-  expect(atEnd("context\n/rev")).toMatchObject({ kind: "slash", atMessageStart: false });
+test("a slash names a skill anywhere in the message", () => {
+  expect(atEnd("/rev")).toMatchObject({ kind: "slash", query: "rev" });
+  expect(atEnd("  /rev")).toMatchObject({ kind: "slash", query: "rev" });
+  expect(atEnd("please run /rev")).toMatchObject({ kind: "slash", query: "rev" });
+  expect(atEnd("context\n/rev")).toMatchObject({ kind: "slash", query: "rev" });
+});
+
+test("a quoted mention holds a path with spaces together", () => {
+  expect(atEnd('@"my notes/todo')).toMatchObject({
+    kind: "file",
+    start: 0,
+    query: "my notes/todo",
+  });
+  expect(atEnd('see @"my notes/')).toMatchObject({ kind: "file", start: 4, query: "my notes/" });
+  // A quote that doesn't follow a trigger character opens nothing.
+  expect(atEnd('he said "my notes/todo')).toBeNull();
+  // Nor does one in the middle of a token.
+  expect(atEnd('x@"my notes/todo')).toBeNull();
 });
 
 test("no menu opens from the middle of a token", () => {
@@ -110,14 +121,39 @@ test("accepting a skill inserts its name and closes the menu", () => {
   expect(detectTrigger(applied.text, applied.caret)).toBeNull();
 });
 
-test("text after the token survives the insertion", () => {
+test("text after the token survives the insertion, without a doubled space", () => {
   const text = "see @comp for the details";
   const found = detectTrigger(text, 9);
   expect(found).toMatchObject({ query: "comp" });
   const applied = applyMention(text, found!, { kind: "file", value: "composer.tsx" });
 
-  expect(applied.text).toBe("see @composer.tsx  for the details");
+  // The space that closes the menu is the one already there.
+  expect(applied.text).toBe("see @composer.tsx for the details");
+  // The caret steps over it, so typing carries on as a new word.
   expect(applied.caret).toBe("see @composer.tsx ".length);
+});
+
+test("a path with spaces is inserted quoted so it stays one token", () => {
+  const text = "read @my";
+  const applied = applyMention(text, trigger(text), {
+    kind: "file",
+    value: "my notes/todo.md",
+  });
+
+  expect(applied.text).toBe('read @"my notes/todo.md" ');
+  expect(applied.caret).toBe(applied.text.length);
+  expect(detectTrigger(applied.text, applied.caret)).toBeNull();
+});
+
+test("a directory with spaces leaves its quote open for the next query", () => {
+  const text = "@my";
+  const applied = applyMention(text, trigger(text), { kind: "directory", value: "my notes" });
+
+  expect(applied.text).toBe('@"my notes/');
+  expect(detectTrigger(applied.text, applied.caret)).toMatchObject({
+    kind: "file",
+    query: "my notes/",
+  });
 });
 
 // --- ranking -----------------------------------------------------------------
@@ -139,7 +175,7 @@ test("a verbatim match outranks a scattered one", () => {
 
 test("ranking drops non-matches and keeps input order for ties", () => {
   const items: MentionItem[] = [
-    { kind: "command", value: "compact" },
+    { kind: "skill", value: "compact" },
     { kind: "skill", value: "code-review" },
     { kind: "skill", value: "deploy" },
   ];
@@ -167,7 +203,5 @@ test("a path shows as a name and the directories leading to it", () => {
 
 test("an empty menu says what it was looking for", () => {
   expect(emptyMentionLabel(trigger("@comp"))).toBe("No matching files");
-  // No built-in commands exist yet, so even at the start of a message the `/`
-  // menu is skills only.
   expect(emptyMentionLabel(trigger("/rev"))).toBe("No matching skills");
 });

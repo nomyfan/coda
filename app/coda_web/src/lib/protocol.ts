@@ -214,9 +214,6 @@ export const RpcCode = {
   ALLOW_PATTERN_FAILED: -32030,
   /** `list_files`: the workspace could not be walked. */
   LIST_FILES_FAILED: -32031,
-  /** `list_skills`: `.coda/skills` could not be read — most often one malformed
-   * `SKILL.md`, which the picker reports rather than listing one skill short. */
-  LIST_SKILLS_FAILED: -32032,
 } as const;
 
 // --- Request results / server-push payloads ----------------------------------
@@ -281,7 +278,9 @@ export type RpcRequests = {
    * ranks and caps, so this is a search rather than a listing — a workspace
    * holds far more paths than a menu should carry. */
   list_files: RpcRequest<{ workspace_id: string; query?: string; limit?: number }, FileCatalog>;
-  /** The workspace's skills, for the composer's `/` picker. */
+  /** The workspace's skills, for the composer's `/` picker. Read from the same
+   * hot-reloaded handle the prompt's `<available_skills>` comes from, so it
+   * cannot fail on its own. */
   list_skills: RpcRequest<{ workspace_id: string }, SkillCatalog>;
   open_session: RpcRequest<
     {

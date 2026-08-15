@@ -3,12 +3,13 @@
  * sitting in, what accepting an item does to the text, and how a query ranks the
  * items that are filtered client-side.
  *
- * A mention is always a whitespace-delimited token that *starts* with the
+ * A mention is normally a whitespace-delimited token that *starts* with the
  * trigger character, so `@` in an email address and `/` inside a path (`@src/`)
- * never open a menu of their own.
+ * never open a menu of their own. A path that contains whitespace is quoted
+ * (`@"my notes/todo.md"`) so it can still be one token.
  */
 
-/** `@` picks a workspace file; `/` picks a skill or a built-in command. */
+/** `@` picks a workspace file; `/` picks a skill. */
 export type MentionKind = "file" | "slash";
 
 export type MentionTrigger = {
@@ -17,17 +18,11 @@ export type MentionTrigger = {
   start: number;
   /** Index just past the query — the caret. Accepting replaces `[start, end)`. */
   end: number;
-  /** What has been typed after the trigger character. */
+  /** What has been typed after the trigger character, unquoted. */
   query: string;
-  /**
-   * Only whitespace precedes the trigger, so the message *is* this token. Built-in
-   * commands are offered here and nowhere else: a command is the whole
-   * instruction, while a skill can be named in the middle of a sentence.
-   */
-  atMessageStart: boolean;
 };
 
-export type MentionItemKind = "file" | "directory" | "skill" | "command";
+export type MentionItemKind = "file" | "directory" | "skill";
 
 export type MentionItem = {
   kind: MentionItemKind;
@@ -37,22 +32,40 @@ export type MentionItem = {
   detail?: string;
 };
 
-/**
- * A built-in slash command. None exist yet — the picker lands first, and each
- * command arrives as an entry here paired with the behaviour it triggers.
- */
-export type BuiltinCommand = {
-  name: string;
-  description: string;
-};
-
-export const BUILTIN_COMMANDS: BuiltinCommand[] = [];
-
 /** Past this a "query" is prose that happens to follow a `@`, not a search. */
 const MAX_QUERY_LENGTH = 100;
 
 function isTokenBoundary(char: string | undefined): boolean {
   return char === undefined || /\s/.test(char);
+}
+
+function hasWhitespace(value: string): boolean {
+  return /\s/.test(value);
+}
+
+/**
+ * The start of an unclosed quoted mention (`@"my notes/`) ending at `caret`, or
+ * `null` when the caret is not inside one. Quoting is what lets a path with
+ * spaces stay a single token, so it has to be recognised before the ordinary
+ * whitespace scan — which would stop at the first space inside the quotes.
+ */
+function quotedStart(text: string, caret: number): number | null {
+  for (let index = caret - 1; index >= 0; index -= 1) {
+    const char = text[index];
+    // A mention never spans lines, so this bounds the scan.
+    if (char === "\n") {
+      return null;
+    }
+    if (char !== '"') {
+      continue;
+    }
+    // The first quote back is either the one that opened this mention, or a
+    // closing quote — in which case the caret is past the mention entirely.
+    const prefix = text[index - 1];
+    const opensMention = (prefix === "@" || prefix === "/") && isTokenBoundary(text[index - 2]);
+    return opensMention ? index - 1 : null;
+  }
+  return null;
 }
 
 /**
@@ -67,9 +80,12 @@ export function detectTrigger(text: string, caret: number): MentionTrigger | nul
     return null;
   }
 
-  let start = caret;
-  while (start > 0 && !isTokenBoundary(text[start - 1])) {
-    start -= 1;
+  let start = quotedStart(text, caret);
+  if (start === null) {
+    start = caret;
+    while (start > 0 && !isTokenBoundary(text[start - 1])) {
+      start -= 1;
+    }
   }
 
   const token = text.slice(start, caret);
@@ -82,18 +98,14 @@ export function detectTrigger(text: string, caret: number): MentionTrigger | nul
     return null;
   }
 
-  const query = token.slice(1);
+  // Drop the quotes a whitespace-bearing path is wrapped in; the query is the
+  // path itself either way.
+  const query = token[1] === '"' ? token.slice(2).replace(/"$/, "") : token.slice(1);
   if (query.length > MAX_QUERY_LENGTH) {
     return null;
   }
 
-  return {
-    kind,
-    start,
-    end: caret,
-    query,
-    atMessageStart: text.slice(0, start).trim() === "",
-  };
+  return { kind, start, end: caret, query };
 }
 
 /**
@@ -102,7 +114,12 @@ export function detectTrigger(text: string, caret: number): MentionTrigger | nul
  *
  * A directory keeps the menu going — it ends in `/` with no trailing space, so
  * the next keystroke searches inside it. Everything else is a finished choice
- * and gets the space that closes the menu.
+ * and gets the space that closes the menu, unless the text already has one
+ * there.
+ *
+ * A value containing whitespace is quoted, or the token would end at its first
+ * space and the mention would read as a fragment plus prose. A directory's
+ * quote is left open so the menu can carry on inside it.
  */
 export function applyMention(
   text: string,
@@ -112,10 +129,17 @@ export function applyMention(
   const prefix = trigger.kind === "file" ? "@" : "/";
   const value =
     item.kind === "directory" && !item.value.endsWith("/") ? `${item.value}/` : item.value;
-  const insertion = item.kind === "directory" ? `${prefix}${value}` : `${prefix}${value} `;
+  const isDirectory = item.kind === "directory";
+  const quote = hasWhitespace(value) ? '"' : "";
+  const token = isDirectory ? `${prefix}${quote}${value}` : `${prefix}${quote}${value}${quote}`;
+
+  const followedBySpace = hasWhitespace(text[trigger.end] ?? "");
+  const insertion = isDirectory || followedBySpace ? token : `${token} `;
   return {
     text: text.slice(0, trigger.start) + insertion + text.slice(trigger.end),
-    caret: trigger.start + insertion.length,
+    // Step over the space that was already there, so typing carries on after
+    // the mention rather than gluing onto it.
+    caret: trigger.start + insertion.length + (!isDirectory && followedBySpace ? 1 : 0),
   };
 }
 
@@ -130,9 +154,15 @@ function isWordBoundary(char: string): boolean {
 
 /**
  * How well `candidate` answers `query`, or `null` when the query's characters
- * don't appear in it in order. Mirrors the server's file ranking so the two
- * menus feel like one: runs of adjacent characters and matches that start a word
- * score highest, and a verbatim substring beats a scattered subsequence.
+ * don't appear in it in order: runs of adjacent characters and matches that
+ * start a word score highest, and a verbatim substring beats a scattered
+ * subsequence.
+ *
+ * This ranks the `/` menu only, and is deliberately its own thing — not a port
+ * of the server's `fuzzy_score` (`app/coda_server/src/files.rs`). That one
+ * ranks *paths*, so it weighs a basename against the directories leading to it
+ * and penalises length; a skill name has neither. The two share three constant
+ * names and nothing else, and neither is obliged to follow the other.
  */
 export function fuzzyScore(candidate: string, query: string): number | null {
   if (query === "") {
@@ -168,8 +198,8 @@ export function fuzzyScore(candidate: string, query: string): number | null {
 }
 
 /**
- * The items `query` matches, best first. Ties keep the order they came in, so a
- * caller's own ordering (skills alphabetical, commands as registered) survives.
+ * The items `query` matches, best first. Ties keep the order they came in, so
+ * the caller's own ordering (skills alphabetical) survives.
  */
 export function rankMentionItems(items: MentionItem[], query: string): MentionItem[] {
   if (query === "") {
@@ -182,15 +212,9 @@ export function rankMentionItems(items: MentionItem[], query: string): MentionIt
     .map((scored) => scored.item);
 }
 
-/** What "nothing matched" reads as for a trigger — commands are only in play at
- * the start of a message, and only once some exist. */
+/** What "nothing matched" reads as for a trigger. */
 export function emptyMentionLabel(trigger: MentionTrigger): string {
-  if (trigger.kind === "file") {
-    return "No matching files";
-  }
-  return trigger.atMessageStart && BUILTIN_COMMANDS.length > 0
-    ? "No matching commands or skills"
-    : "No matching skills";
+  return trigger.kind === "file" ? "No matching files" : "No matching skills";
 }
 
 /** The file name (or directory name) a path ends in. */

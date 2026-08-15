@@ -78,7 +78,11 @@ export function PermissionSelector({
         >
           <Icon className="size-3.5 shrink-0" />
           <SelectValue placeholder="Permissions">
-            <span className="hidden sm:inline">{label}</span>
+            {/* Hidden visually on narrow screens, never from a screen reader:
+                `display: none` would drop the *current mode* from the trigger's
+                accessible name, leaving the icon as the only cue that a session
+                is in Yolo. */}
+            <span className="sr-only sm:not-sr-only sm:inline">{label}</span>
           </SelectValue>
         </SelectTrigger>
         <SelectContent position="popper" side="top" className="max-w-72">

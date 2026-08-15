@@ -1,7 +1,6 @@
 import { File, Folder } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-  BUILTIN_COMMANDS,
   type MentionItem,
   type MentionTrigger,
   mentionName,
@@ -67,7 +66,10 @@ export function useMentionItems({
       return;
     }
     let live = true;
-    setFiles((previous) => ({ ...previous, loading: true, error: null }));
+    // The previous query's matches are dropped, not held over while this one is
+    // in flight: keeping them would let Enter during the debounce insert a file
+    // ranked for text the user has already replaced.
+    setFiles({ items: [], loading: true, error: null, truncated: false });
     const timer = setTimeout(() => {
       fetchWorkspaceFiles(serverUrl, workspaceId, fileQuery)
         .then((catalog) => {
@@ -141,18 +143,9 @@ export function useMentionItems({
   if (active.kind === "file") {
     return files;
   }
-  // Commands are the whole message or nothing, so they only join the list when
-  // the `/` opens it. Skills can be named anywhere, so they are always there.
-  const commands: MentionItem[] = active.atMessageStart
-    ? BUILTIN_COMMANDS.map((command) => ({
-        kind: "command",
-        value: command.name,
-        detail: command.description,
-      }))
-    : [];
   return {
     ...skills,
-    items: rankMentionItems([...commands, ...skills.items], active.query),
+    items: rankMentionItems(skills.items, active.query),
   };
 }
 
@@ -160,7 +153,6 @@ const ITEM_ICONS = {
   file: File,
   directory: Folder,
   skill: undefined,
-  command: undefined,
 } as const;
 
 /**
@@ -225,7 +217,7 @@ export function MentionMenu({
               onMouseEnter={() => onHover(index)}
             >
               {Icon ? <Icon className="size-3.5 shrink-0 text-muted-foreground" /> : null}
-              <span className="shrink-0 truncate font-medium">
+              <span className="truncate font-medium">
                 {name}
                 {item.kind === "directory" ? "/" : ""}
               </span>
