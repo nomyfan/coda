@@ -24,7 +24,16 @@ import {
   Wrench,
 } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  lazy,
+  memo,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   ImageLightbox,
   IMAGE_LIGHTBOX_TRANSITION,
@@ -56,9 +65,14 @@ import {
   SUBAGENT_TOOL_PREFIX,
   toolDisplayName,
 } from "@/lib/protocol";
+import { getStoredThemePreference, resolveTheme, subscribeThemeChange } from "@/lib/theme";
 import { cn, formatClockTime, formatDuration, formatElapsed } from "@/lib/utils";
 
 const NO_ENTRIES: TranscriptEntry[] = [];
+
+const PatchDiff = lazy(() =>
+  import("@pierre/diffs/react").then(({ PatchDiff: Component }) => ({ default: Component })),
+);
 
 const ROOT_AGENT = "coda";
 
@@ -436,6 +450,10 @@ function EntryStatus({ entry }: { entry: TranscriptEntry }) {
 }
 
 function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
+  const fileDiffs = entry.artifacts?.filter((artifact) => artifact.type === "file_diff") ?? [];
+  const theme = useSyncExternalStore(subscribeThemeChange, () =>
+    resolveTheme(getStoredThemePreference()),
+  );
   return (
     <div className="space-y-3">
       {entry.command ? (
@@ -446,9 +464,25 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
           </pre>
         </div>
       ) : null}
-      <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
-        {entry.content}
-      </pre>
+      {fileDiffs.length === 0 ? (
+        <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
+          {entry.content}
+        </pre>
+      ) : null}
+      {fileDiffs.map((artifact) => (
+        <div
+          key={`${artifact.operation}:${artifact.path}`}
+          className="overflow-hidden rounded-md border"
+        >
+          <Suspense fallback={<div className="p-3 text-sm text-muted-foreground">Loading…</div>}>
+            <PatchDiff
+              patch={artifact.patch}
+              disableWorkerPool
+              options={{ diffStyle: "unified", expandUnchanged: false, themeType: theme }}
+            />
+          </Suspense>
+        </div>
+      ))}
     </div>
   );
 }

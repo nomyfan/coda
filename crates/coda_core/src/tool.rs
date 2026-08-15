@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 pub use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info, info_span};
 
-use super::llm::ToolDefinition;
+use super::llm::{ToolArtifact, ToolDefinition};
 
 /// A tool's durable state on the calling thread, keyed by an opaque `kind`.
 ///
@@ -54,14 +54,32 @@ pub struct ToolCallContext {
     /// Where a tool keeps anything that has to outlive the call — see
     /// [`ThreadState`].
     pub state: Arc<dyn ThreadState>,
+    artifacts: Arc<std::sync::Mutex<Vec<ToolArtifact>>>,
+}
+
+impl ToolCallContext {
+    pub fn new(cancel: CancellationToken, state: Arc<dyn ThreadState>) -> Self {
+        Self {
+            cancel,
+            state,
+            artifacts: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Attach immutable presentation data to this call's eventual tool message.
+    pub fn record_artifact(&self, artifact: ToolArtifact) {
+        self.artifacts.lock().unwrap().push(artifact);
+    }
+
+    /// Drain artifacts after execution so they are persisted with the result.
+    pub fn take_artifacts(&self) -> Vec<ToolArtifact> {
+        std::mem::take(&mut *self.artifacts.lock().unwrap())
+    }
 }
 
 impl Default for ToolCallContext {
     fn default() -> Self {
-        ToolCallContext {
-            cancel: CancellationToken::new(),
-            state: Arc::new(NoState),
-        }
+        ToolCallContext::new(CancellationToken::new(), Arc::new(NoState))
     }
 }
 

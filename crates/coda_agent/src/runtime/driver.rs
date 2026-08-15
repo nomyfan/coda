@@ -887,6 +887,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         started_at: jiff::Timestamp,
         result: ToolResult<String>,
         call_state: &CallState,
+        artifacts: Vec<coda_core::llm::ToolArtifact>,
     ) -> bool {
         let (output, outcome) = match result {
             Ok(output) => (ToolOutput::Ok(output), tc.outcome),
@@ -897,12 +898,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             ),
         };
         let aborted = matches!(outcome, ToolCallOutcome::Aborted);
+        let succeeded = matches!(output, ToolOutput::Ok(_));
         // A call that did not succeed establishes no new value, whatever it
         // recorded on the way: `set` says "this is what it is now", and a call
         // that failed or was cut short never got to mean that.
-        let recorded = match output {
-            ToolOutput::Ok(_) => call_state.take(),
-            ToolOutput::Err(_) => Vec::new(),
+        let recorded = if succeeded {
+            call_state.take()
+        } else {
+            Vec::new()
         };
         self.add_message_with_state(
             ToolMessage::new(
@@ -911,7 +914,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 output,
                 outcome,
                 Some(started_at),
-            ),
+            )
+            .with_artifacts(if succeeded { artifacts } else { Vec::new() }),
             recorded,
         )
         .await;
@@ -1546,15 +1550,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // in-flight tool, and (later) a single tool can be cancelled
                 // without touching its siblings.
                 let call_state = Arc::new(CallState::new(committed.clone()));
-                let ctx = ToolCallContext {
-                    cancel: self.cancel.child_token(),
-                    state: call_state.clone(),
-                };
+                let ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
                 let future = async move {
                     let output = tool
-                        .execute(tc.tool_call.arguments.clone().unwrap_or_default(), ctx)
+                        .execute(
+                            tc.tool_call.arguments.clone().unwrap_or_default(),
+                            ctx.clone(),
+                        )
                         .await;
-                    (tc, started_at, output, call_state)
+                    (tc, started_at, output, call_state, ctx.take_artifacts())
                 };
                 futures.push(future);
             } else {
@@ -1586,9 +1590,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break true,
-                Some((tc, started_at, result, call_state)) = futures.next() => {
+                Some((tc, started_at, result, call_state, artifacts)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    self.settle_local_tool(tc, started_at, result, &call_state).await;
+                    self.settle_local_tool(tc, started_at, result, &call_state, artifacts).await;
                 }
             }
         };
@@ -1610,10 +1614,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 tokio::select! {
                     biased;
                     _ = &mut grace => break,
-                    Some((tc, started_at, result, call_state)) = futures.next() => {
+                    Some((tc, started_at, result, call_state, artifacts)) = futures.next() => {
                         pending_local.remove(&tc.tool_call.id);
                         let id = tc.tool_call.id.clone();
-                        if self.settle_local_tool(tc, started_at, result, &call_state).await {
+                        if self.settle_local_tool(tc, started_at, result, &call_state, artifacts).await {
                             aborted_ids.push(id);
                         }
                     }

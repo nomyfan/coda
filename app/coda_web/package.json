@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@callcc/toolkit-js": "^0.1.6",
+    "@pierre/diffs": "^1.3.5",
     "@radix-ui/react-select": "^2.3.0",
     "@radix-ui/react-slot": "^1.2.4",
     "class-variance-authority": "^0.7.1",

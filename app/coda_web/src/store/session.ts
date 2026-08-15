@@ -16,6 +16,7 @@ import {
   RpcCode,
   type ToolCall,
   type ToolCallResolution,
+  type ToolArtifact,
   type ToolMessage,
   type WireEvent,
   type WorkspaceSession,
@@ -75,6 +76,8 @@ export type TranscriptEntry = {
    * Never displayed. A round producing neither prose nor reasoning leaves no
    * entry of its own, so this is the turn's only record of that time. */
   generation?: GenerationSpan;
+  /** Immutable presentation data persisted with a completed tool call. */
+  artifacts?: ToolArtifact[];
 };
 
 export type GenerationSpan = { startedAt: string; endedAt: string };
@@ -487,6 +490,7 @@ function toolMessageToEntry(
     startedAt: message.started_at,
     endedAt: message.ended_at,
     generation,
+    artifacts: message.artifacts,
   };
 }
 

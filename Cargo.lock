@@ -600,6 +600,7 @@ name = "coda_tools"
 version = "0.1.0"
 dependencies = [
  "coda_core",
+ "diffy",
  "libc",
  "schemars",
  "serde",
@@ -889,6 +890,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe2444076b48641147115697648dc743c2c00b61adade0f01ce67133c7babe8c"
 dependencies = [
  "syn",
+]
+
+[[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
 ]
 
 [[package]]

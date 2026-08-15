@@ -399,6 +399,26 @@ pub enum ToolCallOutcome {
     Aborted,
 }
 
+/// Immutable presentation data produced by a tool execution. Artifacts are
+/// persisted with the result message but are not sent to the model as output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolArtifact {
+    FileDiff {
+        path: String,
+        operation: FileChangeOperation,
+        patch: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeOperation {
+    Create,
+    Modify,
+    Delete,
+}
+
 /// A message representing the result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMessage {
@@ -409,6 +429,8 @@ pub struct ToolMessage {
     pub name: String,
     pub output: ToolOutput,
     pub outcome: ToolCallOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ToolArtifact>,
     /// When the tool call began executing, when known. Calls that resolve
     /// instantly (rejections, dispatch errors) leave this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,9 +457,15 @@ impl ToolMessage {
             name: name.into(),
             output,
             outcome,
+            artifacts: Vec::new(),
             started_at,
             ended_at: jiff::Timestamp::now(),
         }
+    }
+
+    pub fn with_artifacts(mut self, artifacts: Vec<ToolArtifact>) -> Self {
+        self.artifacts = artifacts;
+        self
     }
 }
 
