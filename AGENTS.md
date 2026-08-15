@@ -40,15 +40,6 @@ When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadc
 
 After modifying `app/coda_web` code, always run `pnpm --filter coda-web lint` (oxlint) and `pnpm --filter coda-web test` as final checks.
 
-### Composer Pickers
-
-The composer completes two kinds of token, both of which only ever edit the draft text — nothing is attached, expanded, or sent behind the user's back:
-
-- `@` picks a workspace file or directory and inserts its workspace-relative path. Backed by `list_files`, which fuzzy-ranks server-side (`app/coda_server/src/files.rs`) over an `ignore` walk — the same crate `rg`/`fd` are built on, so `.gitignore` is honoured exactly as the agent's own `glob`/`grep` see it. `.git` is pruned, dot files are listed, and one walk is reused for a few seconds so a query per keystroke costs a round trip rather than a re-walk. Picking a directory ends in `/` and keeps the menu open, so the next keystroke searches inside it.
-- `/` picks a skill (`list_skills`, from the session workspace's `.coda/skills`) and inserts `/<name>`. Skills may be named anywhere in a message; **built-in commands are offered only when the `/` opens the message**, since a command is the whole instruction. No built-in commands exist yet — they land as entries in `BUILTIN_COMMANDS` (`src/lib/composer-mentions.ts`) paired with the behaviour each one triggers.
-
-Trigger detection, insertion, and client-side ranking are pure functions in `src/lib/composer-mentions.ts` (tested in `test/composer-mentions.test.ts`); the menu and its fetching live in `src/components/mention-menu.tsx`. A trigger is always a whitespace-delimited token *starting* with `@`/`/`, so an email address and the `/` inside a path never open a menu of their own.
-
 ## Architecture
 
 Cargo workspace implementing an AI Agent:
