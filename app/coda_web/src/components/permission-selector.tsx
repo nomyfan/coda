@@ -23,18 +23,17 @@ const MODE_INFO: Record<PermissionMode, { label: string; description: string; Ic
   {
     explore: {
       label: "Explore",
-      description:
-        "Reads, searches and lists. Anything else asks, except shell commands the workspace pre-approved.",
+      description: "Investigate and plan changes.",
       Icon: Eye,
     },
     accept_edits: {
       label: "Accept edits",
-      description: "Also writes and edits files without asking.",
+      description: "Automatically accept all file edits.",
       Icon: FilePen,
     },
     yolo: {
       label: "Yolo",
-      description: "Runs everything unattended, shell included.",
+      description: "Maximum autonomy with minimal interruptions.",
       Icon: Zap,
     },
   };
@@ -104,11 +103,9 @@ export function PermissionSelector({
           <DialogHeader>
             <DialogTitle>Switch to Yolo?</DialogTitle>
             <DialogDescription>
-              Every tool runs unattended, shell included &mdash; commands that write files, install
-              packages or reach the network. Only three things still stop one: a tool that has to
-              ask you something, anything this workspace&rsquo;s config requires approval for, and
-              its shell deny rules &mdash; and those reach only commands simple enough to check, so
-              a denied command written with a redirect or a substitution runs anyway.
+              Coda can edit files and run commands without asking, including installing packages or
+              accessing the network. Workspace approval rules still apply, but complex commands may
+              bypass shell deny rules.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
