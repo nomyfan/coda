@@ -16,55 +16,53 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { PERMISSION_PRESETS, type PermissionPreset } from "@/lib/protocol";
+import { PERMISSION_MODES, type PermissionMode } from "@/lib/protocol";
 
 /** The fun name carries the identity; the line under it carries the meaning. */
-const PRESET_INFO: Record<
-  PermissionPreset,
-  { label: string; description: string; Icon: typeof Eye }
-> = {
-  explore: {
-    label: "Explore",
-    description: "Read, search and list. Everything else asks first.",
-    Icon: Eye,
-  },
-  accept_edits: {
-    label: "Accept edits",
-    description: "Also writes and edits files without asking.",
-    Icon: FilePen,
-  },
-  yolo: {
-    label: "Yolo",
-    description: "Runs everything unattended, shell included.",
-    Icon: Zap,
-  },
-};
+const MODE_INFO: Record<PermissionMode, { label: string; description: string; Icon: typeof Eye }> =
+  {
+    explore: {
+      label: "Explore",
+      description: "Read, search and list. Everything else asks first.",
+      Icon: Eye,
+    },
+    accept_edits: {
+      label: "Accept edits",
+      description: "Also writes and edits files without asking.",
+      Icon: FilePen,
+    },
+    yolo: {
+      label: "Yolo",
+      description: "Runs everything unattended, shell included.",
+      Icon: Zap,
+    },
+  };
 
 export function PermissionSelector({
-  preset,
+  mode,
   disabled,
-  onSetPreset,
+  onSetMode,
 }: {
-  preset: PermissionPreset;
+  mode: PermissionMode;
   disabled: boolean;
-  onSetPreset: (preset: PermissionPreset) => void;
+  onSetMode: (mode: PermissionMode) => void;
 }) {
   // Yolo hands over the shell unattended, so it is never something a stray
   // click (or a restored selection) can turn on — it takes a deliberate yes.
   const [confirmingYolo, setConfirmingYolo] = useState(false);
-  const { label, Icon } = PRESET_INFO[preset];
-  const danger = preset === "yolo";
+  const { label, Icon } = MODE_INFO[mode];
+  const danger = mode === "yolo";
 
   return (
     <>
       <Select
-        value={preset}
+        value={mode}
         onValueChange={(next) => {
-          if (next === "yolo" && preset !== "yolo") {
+          if (next === "yolo" && mode !== "yolo") {
             setConfirmingYolo(true);
             return;
           }
-          onSetPreset(next as PermissionPreset);
+          onSetMode(next as PermissionMode);
         }}
         disabled={disabled}
       >
@@ -82,8 +80,8 @@ export function PermissionSelector({
           <SelectValue placeholder="Permissions">{label}</SelectValue>
         </SelectTrigger>
         <SelectContent position="popper" side="top" className="max-w-72">
-          {PERMISSION_PRESETS.map((item) => {
-            const info = PRESET_INFO[item];
+          {PERMISSION_MODES.map((item) => {
+            const info = MODE_INFO[item];
             return (
               <SelectItem key={item} value={item}>
                 <span className="flex items-center gap-2">
@@ -118,7 +116,7 @@ export function PermissionSelector({
               variant="destructive"
               onClick={() => {
                 setConfirmingYolo(false);
-                onSetPreset("yolo");
+                onSetMode("yolo");
               }}
             >
               <Zap className="size-4" />

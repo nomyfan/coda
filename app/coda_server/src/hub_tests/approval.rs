@@ -14,7 +14,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -52,7 +52,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -103,7 +103,7 @@ async fn aborting_a_suspended_turn_clears_its_pending_approval() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -158,7 +158,7 @@ async fn new_task_is_rejected_while_an_approval_remains_pending() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -197,7 +197,7 @@ async fn new_task_is_rejected_while_an_approval_remains_pending() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await

@@ -153,13 +153,13 @@ fn snapshot_serializes_without_type_tag() {
         pending_approvals: vec![],
         provider_id: "deepseek".into(),
         reasoning_effort: Some("high".into()),
-        permission_preset: PermissionPreset::Yolo,
+        permission_mode: PermissionMode::Yolo,
         turn_running: true,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
-        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_preset":"yolo","turn_running":true}"#
+        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true}"#
     );
 }
 
@@ -168,21 +168,18 @@ fn snapshot_without_turn_running_defaults_to_false() {
     let json = r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
     let snapshot: Snapshot = serde_json::from_str(json).unwrap();
     assert!(!snapshot.turn_running);
-    assert_eq!(snapshot.permission_preset, PermissionPreset::AcceptEdits);
+    assert_eq!(snapshot.permission_mode, PermissionMode::AcceptEdits);
 }
 
 #[test]
-fn permission_preset_round_trips_over_the_wire() {
-    for (preset, tag) in [
-        (PermissionPreset::Explore, "\"explore\""),
-        (PermissionPreset::AcceptEdits, "\"accept_edits\""),
-        (PermissionPreset::Yolo, "\"yolo\""),
+fn permission_mode_round_trips_over_the_wire() {
+    for (mode, tag) in [
+        (PermissionMode::Explore, "\"explore\""),
+        (PermissionMode::AcceptEdits, "\"accept_edits\""),
+        (PermissionMode::Yolo, "\"yolo\""),
     ] {
-        assert_eq!(serde_json::to_string(&preset).unwrap(), tag);
-        assert_eq!(
-            serde_json::from_str::<PermissionPreset>(tag).unwrap(),
-            preset
-        );
+        assert_eq!(serde_json::to_string(&mode).unwrap(), tag);
+        assert_eq!(serde_json::from_str::<PermissionMode>(tag).unwrap(), mode);
     }
 }
 

@@ -21,8 +21,8 @@ use coda_server::{
     ask_user::AskUserToolSpec,
     build_available_skills, build_workspace_custom_instructions,
     config::{
-        KeepaliveConfig, PermissionPreset, PermissionPresetCell, ToolApprovalConfig,
-        WorkspaceConfig, load_server_config,
+        KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
+        load_server_config,
     },
     hub::{
         AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
@@ -36,10 +36,10 @@ use coda_server::{
     transport::{Transport, WebSocketTransport},
     wire::{
         AddAllowPatternParams, DeleteSessionParams, EventParams, ForkAccepted, ForkSessionParams,
-        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionPresetSelection,
+        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
         ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
         RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
-        SetPermissionPresetParams, Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog,
+        SetPermissionModeParams, Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog,
         WorkspaceSummaryWire,
     },
 };
@@ -222,7 +222,7 @@ impl SessionOpener for AppOpener {
         key: &'a SessionKey,
         provider_id: &'a str,
         reasoning_effort: Option<String>,
-        permission_preset: PermissionPresetCell,
+        permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
@@ -236,7 +236,7 @@ impl SessionOpener for AppOpener {
                 &key.1,
                 provider_id,
                 reasoning_effort,
-                permission_preset,
+                permission_mode,
                 decisions,
             )
             .await
@@ -338,7 +338,7 @@ async fn open_session(
     session_id: &str,
     provider_id: &str,
     reasoning_effort: Option<String>,
-    permission_preset: PermissionPresetCell,
+    permission_mode: PermissionModeCell,
     decisions: HashMap<String, ResumeDecision>,
 ) -> Result<Session, OpenError> {
     let provider = providers
@@ -381,7 +381,7 @@ async fn open_session(
         tool_approval: workspace
             .approval_config
             .clone()
-            .into_approval_mode(permission_preset),
+            .into_approval_mode(permission_mode),
         // Disabled: approvals never auto-reject; a pending ask_user/tool call
         // waits indefinitely until the user resolves it.
         approval_timeout: None,
@@ -600,10 +600,10 @@ async fn send_pending_approval_events<T: Transport>(
 struct Selection {
     provider_id: String,
     reasoning_effort: Option<String>,
-    /// The preset the session reported in its last snapshot, so the silent
+    /// The mode the session reported in its last snapshot, so the silent
     /// re-attach after a hub-initiated close reopens on the same posture
     /// instead of dropping back to the default.
-    permission_preset: PermissionPreset,
+    permission_mode: PermissionMode,
 }
 
 /// Attach to `key` in the hub, register the replay+live stream, and remember the
@@ -621,7 +621,7 @@ async fn attach_core(
     key: SessionKey,
     provider_id: String,
     reasoning_effort: Option<String>,
-    permission_preset: PermissionPreset,
+    permission_mode: PermissionMode,
     takeover: bool,
 ) -> Result<Snapshot, AttachError> {
     let AttachSession { snapshot, events } = app
@@ -631,7 +631,7 @@ async fn attach_core(
             conn_id,
             provider_id,
             reasoning_effort,
-            permission_preset,
+            permission_mode,
             takeover,
         )
         .await?;
@@ -640,7 +640,7 @@ async fn attach_core(
         Selection {
             provider_id: snapshot.provider_id.clone(),
             reasoning_effort: snapshot.reasoning_effort.clone(),
-            permission_preset: snapshot.permission_preset,
+            permission_mode: snapshot.permission_mode,
         },
     );
     let wire_snapshot = Snapshot {
@@ -654,7 +654,7 @@ async fn attach_core(
             .collect(),
         provider_id: snapshot.provider_id,
         reasoning_effort: snapshot.reasoning_effort,
-        permission_preset: snapshot.permission_preset,
+        permission_mode: snapshot.permission_mode,
         turn_running: snapshot.turn_running,
     };
     // Register the stream *before* returning; the caller sends the snapshot
@@ -810,7 +810,7 @@ async fn dispatch_request(
                 key,
                 provider_id,
                 reasoning_effort,
-                params.permission_preset,
+                params.permission_mode,
                 params.takeover,
             )
             .await
@@ -875,16 +875,16 @@ async fn dispatch_request(
                 } => {
                     // Keep the re-attach cache on the new selection so a
                     // hub-initiated close doesn't reopen on the old model.
-                    let permission_preset = selections
+                    let permission_mode = selections
                         .get(&key)
-                        .map(|selection| selection.permission_preset)
+                        .map(|selection| selection.permission_mode)
                         .unwrap_or_default();
                     selections.insert(
                         key,
                         Selection {
                             provider_id: provider_id.clone(),
                             reasoning_effort: reasoning_effort.clone(),
-                            permission_preset,
+                            permission_mode,
                         },
                     );
                     (
@@ -948,19 +948,19 @@ async fn dispatch_request(
                     .into(),
             }
         }
-        "set_permission_preset" => {
-            let params: SetPermissionPresetParams = match parse_params(params) {
+        "set_permission_mode" => {
+            let params: SetPermissionModeParams = match parse_params(params) {
                 Ok(params) => params,
                 Err(err) => return (id, err).into(),
             };
             let key = (params.workspace_id, params.session_id);
-            let preset = params.preset;
+            let mode = params.mode;
             match app
                 .relay
                 .command(
                     key.clone(),
                     conn_id,
-                    SessionCommand::SetPermissionPreset { preset },
+                    SessionCommand::SetPermissionMode { mode },
                 )
                 .await
             {
@@ -969,12 +969,12 @@ async fn dispatch_request(
                     // hub closes underneath us must come back with the posture
                     // the user last chose, not the one it opened on.
                     if let Some(selection) = selections.get_mut(&key) {
-                        selection.permission_preset = preset;
+                        selection.permission_mode = mode;
                     }
-                    (id, &PermissionPresetSelection { preset }).into()
+                    (id, &PermissionModeSelection { mode }).into()
                 }
                 // Stale connection or no live entry — nothing was changed, so
-                // the client must not be told the preset took.
+                // the client must not be told the mode took.
                 _ => (
                     id,
                     RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
@@ -1528,7 +1528,7 @@ async fn run_connection<T: Transport>(transport: T, app: Arc<AppState>) {
                         if let Some(Selection {
                             provider_id,
                             reasoning_effort,
-                            permission_preset,
+                            permission_mode,
                         }) = selection
                             && !app.shutdown.is_cancelled()
                             && reattached.insert(key.clone())
@@ -1546,7 +1546,7 @@ async fn run_connection<T: Transport>(transport: T, app: Arc<AppState>) {
                                 key.clone(),
                                 provider_id,
                                 reasoning_effort,
-                                permission_preset,
+                                permission_mode,
                                 false,
                             ).await {
                                 Ok(snapshot) => send_notify(&transport, "snapshot", &snapshot).await,

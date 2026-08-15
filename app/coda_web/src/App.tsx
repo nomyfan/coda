@@ -11,7 +11,7 @@ import {
   selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
-  selectActivePermissionPreset,
+  selectActivePermissionMode,
   selectActiveReasoningEffort,
   selectActiveEditing,
   selectActiveForkDraft,
@@ -29,17 +29,17 @@ import {
   sendTask,
   sendTaskToNewSession,
   setModel,
-  setPermissionPreset,
+  setPermissionMode,
   takeOverActiveSession,
   updateForkDraft,
   useCodaBootstrap,
   useCodaStore,
-  type PermissionPreset,
+  type PermissionMode,
   type ReasoningEffort,
   type ServerSummary,
   type UsageRecord,
 } from "@/store/session";
-import { DEFAULT_PERMISSION_PRESET } from "@/lib/protocol";
+import { DEFAULT_PERMISSION_MODE } from "@/lib/protocol";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
 import { Sidebar } from "@/components/sidebar";
 import { Button } from "@/components/ui/button";
@@ -225,7 +225,7 @@ export default function App() {
   const activeProviders = useCodaStore(selectActiveProviders);
   const activeProviderId = useCodaStore(selectActiveProviderId);
   const activeReasoningEffort = useCodaStore(selectActiveReasoningEffort);
-  const activePermissionPreset = useCodaStore(selectActivePermissionPreset);
+  const activePermissionMode = useCodaStore(selectActivePermissionMode);
   const activeSessionTitle = useCodaStore(selectActiveSessionTitle);
   const activeUsage = useCodaStore(selectActiveUsage);
   const activeHasImages = useCodaStore(selectActiveHasImages);
@@ -246,8 +246,7 @@ export default function App() {
     providerId: string;
     reasoningEffort: ReasoningEffort | null;
   } | null>(null);
-  const [newSessionPreset, setNewSessionPreset] =
-    useState<PermissionPreset>(DEFAULT_PERMISSION_PRESET);
+  const [newSessionMode, setNewSessionMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
@@ -265,7 +264,7 @@ export default function App() {
       setNewSessionModel(null);
       // Nothing is remembered per workspace, so every new conversation opens on
       // the default rather than inheriting the last one's posture.
-      setNewSessionPreset(DEFAULT_PERMISSION_PRESET);
+      setNewSessionMode(DEFAULT_PERMISSION_MODE);
       return;
     }
     const resolved = resolveNewSessionTarget(servers, newSessionTarget, activeServer);
@@ -367,7 +366,7 @@ export default function App() {
           selectedNewSessionModel?.providerId,
           selectedNewSessionModel?.reasoningEffort ?? null,
           images,
-          newSessionPreset,
+          newSessionMode,
         );
         clearNewSessionTarget();
         return;
@@ -380,7 +379,7 @@ export default function App() {
       }
       sendTask(task, images);
     },
-    [selectedNewSessionModel, newSessionPreset, activeEditing],
+    [selectedNewSessionModel, newSessionMode, activeEditing],
   );
 
   const handleSetNewSessionModel = useCallback(
@@ -466,7 +465,7 @@ export default function App() {
                   evicted={showingNewSession ? false : activeEvicted}
                   workspace={selectedWorkspace}
                   selectingTarget={showingNewSession}
-                  permissionPreset={showingNewSession ? newSessionPreset : activePermissionPreset}
+                  permissionMode={showingNewSession ? newSessionMode : activePermissionMode}
                   providers={
                     showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
                   }
@@ -486,9 +485,7 @@ export default function App() {
                   forkDraft={showingNewSession ? undefined : activeForkDraft}
                   onForkDraftChange={handleForkDraftChange}
                   onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
-                  onSetPermissionPreset={
-                    showingNewSession ? setNewSessionPreset : setPermissionPreset
-                  }
+                  onSetPermissionMode={showingNewSession ? setNewSessionMode : setPermissionMode}
                   onSend={handleSend}
                   onAbort={abort}
                   onCancelEdit={cancelEdit}

@@ -16,7 +16,7 @@ async fn a_second_task_is_rejected_while_the_first_keeps_fork_busy() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -93,7 +93,7 @@ async fn forking_a_live_session_reports_it_as_live() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -154,7 +154,7 @@ async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
                 1,
                 "prov".into(),
                 None,
-                PermissionPreset::default(),
+                PermissionMode::default(),
                 false,
             )
             .await
@@ -221,7 +221,7 @@ async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -273,7 +273,7 @@ async fn slow_sub_agent_session() -> (SessionHub, BoxStream<'static, RelayEvent>
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await

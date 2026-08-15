@@ -1,10 +1,6 @@
-import {
-  DEFAULT_PERMISSION_PRESET,
-  isPermissionPreset,
-  type PermissionPreset,
-} from "@/lib/protocol";
+import { DEFAULT_PERMISSION_MODE, isPermissionMode, type PermissionMode } from "@/lib/protocol";
 
-const storageKey = "coda.permissionPresets";
+const storageKey = "coda.permissionModes";
 
 /**
  * How many sessions to remember per server. Every session ever opened would
@@ -14,29 +10,29 @@ const storageKey = "coda.permissionPresets";
 const MAX_REMEMBERED = 200;
 
 /** `{ ts }` is the LRU stamp, refreshed on every write. */
-type StoredPreset = { preset: PermissionPreset; ts: number };
-type PresetMemory = Record<string, Record<string, StoredPreset>>;
+type StoredMode = { mode: PermissionMode; ts: number };
+type ModeMemory = Record<string, Record<string, StoredMode>>;
 
 /**
- * The preset is remembered per *session*, not per workspace: switching mid-
+ * The mode is remembered per *session*, not per workspace: switching mid-
  * conversation is scoped to that conversation, and a new one always starts on
- * {@link DEFAULT_PERMISSION_PRESET}. Nothing is persisted server-side, so this
+ * {@link DEFAULT_PERMISSION_MODE}. Nothing is persisted server-side, so this
  * is the only record of what a released session was running under.
  */
 function sessionSlot(workspaceId: string, sessionId: string) {
   return `${workspaceId}:${sessionId}`;
 }
 
-function isStoredPreset(value: unknown): value is StoredPreset {
+function isStoredMode(value: unknown): value is StoredMode {
   if (!value || typeof value !== "object") {
     return false;
   }
-  const stored = value as Partial<StoredPreset>;
-  return isPermissionPreset(stored.preset) && typeof stored.ts === "number";
+  const stored = value as Partial<StoredMode>;
+  return isPermissionMode(stored.mode) && typeof stored.ts === "number";
 }
 
-function loadMemory(): PresetMemory {
-  const memory: PresetMemory = Object.create(null);
+function loadMemory(): ModeMemory {
+  const memory: ModeMemory = Object.create(null);
   try {
     const raw = window.localStorage.getItem(storageKey);
     if (!raw) {
@@ -50,9 +46,9 @@ function loadMemory(): PresetMemory {
       if (!storedSessions || typeof storedSessions !== "object") {
         continue;
       }
-      const sessions: Record<string, StoredPreset> = Object.create(null);
+      const sessions: Record<string, StoredMode> = Object.create(null);
       for (const [slot, stored] of Object.entries(storedSessions)) {
-        if (isStoredPreset(stored)) {
+        if (isStoredMode(stored)) {
           sessions[slot] = stored;
         }
       }
@@ -67,7 +63,7 @@ function loadMemory(): PresetMemory {
 }
 
 /** Drop the least recently written entries once a server exceeds the cap. */
-function prune(sessions: Record<string, StoredPreset>) {
+function prune(sessions: Record<string, StoredMode>) {
   const slots = Object.keys(sessions);
   if (slots.length <= MAX_REMEMBERED) {
     return;
@@ -78,16 +74,16 @@ function prune(sessions: Record<string, StoredPreset>) {
   }
 }
 
-export function rememberSessionPreset(
+export function rememberSessionMode(
   server: string,
   workspaceId: string,
   sessionId: string,
-  preset: PermissionPreset,
+  mode: PermissionMode,
 ) {
   try {
     const memory = loadMemory();
     memory[server] ??= Object.create(null);
-    memory[server][sessionSlot(workspaceId, sessionId)] = { preset, ts: Date.now() };
+    memory[server][sessionSlot(workspaceId, sessionId)] = { mode, ts: Date.now() };
     prune(memory[server]);
     window.localStorage.setItem(storageKey, JSON.stringify(memory));
   } catch {
@@ -95,7 +91,7 @@ export function rememberSessionPreset(
   }
 }
 
-export function forgetSessionPreset(server: string, workspaceId: string, sessionId: string) {
+export function forgetSessionMode(server: string, workspaceId: string, sessionId: string) {
   try {
     const memory = loadMemory();
     const sessions = memory[server];
@@ -110,19 +106,19 @@ export function forgetSessionPreset(server: string, workspaceId: string, session
 }
 
 /**
- * The preset to open this session on: what it was last seen running under, or
+ * The mode to open this session on: what it was last seen running under, or
  * the default for one this browser has never opened (a new conversation, a new
  * device, or cleared storage).
  *
- * Only a seed — a session the server still has live answers with its own preset
+ * Only a seed — a session the server still has live answers with its own mode
  * in the snapshot, and that value wins.
  */
-export function initialSessionPreset(
+export function initialSessionMode(
   server: string,
   workspaceId: string,
   sessionId: string,
-): PermissionPreset {
+): PermissionMode {
   return (
-    loadMemory()[server]?.[sessionSlot(workspaceId, sessionId)]?.preset ?? DEFAULT_PERMISSION_PRESET
+    loadMemory()[server]?.[sessionSlot(workspaceId, sessionId)]?.mode ?? DEFAULT_PERMISSION_MODE
   );
 }

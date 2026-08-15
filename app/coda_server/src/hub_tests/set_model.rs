@@ -17,7 +17,7 @@ async fn set_model_to_current_selection_is_unchanged() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -48,7 +48,7 @@ async fn set_model_effort_switch_returns_model_changed() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -80,7 +80,7 @@ async fn set_model_rejects_a_different_provider_or_model() {
             1,
             "prov:model-a".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -111,7 +111,7 @@ async fn failed_effort_persistence_keeps_live_selection() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -136,7 +136,7 @@ async fn failed_effort_persistence_keeps_live_selection() {
             1,
             "prov".into(),
             Some("high".into()),
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -159,7 +159,7 @@ async fn set_model_while_turn_running_is_rejected() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -209,7 +209,7 @@ async fn set_model_on_unattached_connection_is_ignored() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await

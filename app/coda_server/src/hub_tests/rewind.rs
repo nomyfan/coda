@@ -19,7 +19,7 @@ async fn session_with_one_turn(
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -167,7 +167,7 @@ async fn a_rewind_replaces_the_discarded_turn_and_reports_what_survived() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -193,7 +193,7 @@ async fn a_rewind_is_refused_while_a_turn_is_in_flight() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -240,7 +240,7 @@ async fn a_rewind_is_refused_while_a_call_waits_on_a_human() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -308,7 +308,7 @@ async fn a_refused_rewind_leaves_the_session_exactly_as_it_was() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await

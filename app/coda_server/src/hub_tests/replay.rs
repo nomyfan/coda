@@ -16,7 +16,7 @@ async fn task_settles_then_reattach_shows_folded_history() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -47,7 +47,7 @@ async fn task_settles_then_reattach_shows_folded_history() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -89,7 +89,7 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -117,7 +117,7 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -176,7 +176,7 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -204,7 +204,7 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -249,7 +249,7 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -276,7 +276,7 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -296,7 +296,7 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -331,7 +331,7 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -351,7 +351,7 @@ async fn burst_of_chunks_survives_replay_and_fold() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -377,7 +377,7 @@ async fn burst_of_chunks_survives_replay_and_fold() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -400,7 +400,7 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -430,7 +430,7 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -447,7 +447,7 @@ async fn delete_evicts_attached_client_and_removes_entry() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -470,7 +470,7 @@ async fn attach_without_takeover_is_refused_while_held() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -483,7 +483,7 @@ async fn attach_without_takeover_is_refused_while_held() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false
         )
         .await,
@@ -501,7 +501,7 @@ async fn attach_without_takeover_is_refused_while_held() {
         2,
         "prov".into(),
         None,
-        PermissionPreset::default(),
+        PermissionMode::default(),
         true,
     )
     .await
@@ -523,7 +523,7 @@ async fn delete_from_stale_connection_is_rejected() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -534,7 +534,7 @@ async fn delete_from_stale_connection_is_rejected() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -560,7 +560,7 @@ async fn failed_resume_does_not_stick_turn_running() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -611,7 +611,7 @@ async fn lagged_stream_drains_session_and_closes_client() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -639,7 +639,7 @@ async fn lagged_stream_drains_session_and_closes_client() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             true,
         )
         .await
@@ -663,7 +663,7 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
             1,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await
@@ -696,7 +696,7 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
             2,
             "prov".into(),
             None,
-            PermissionPreset::default(),
+            PermissionMode::default(),
             false,
         )
         .await

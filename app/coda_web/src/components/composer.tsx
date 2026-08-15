@@ -6,7 +6,7 @@ import { Textarea } from "@/components/ui/textarea";
 import type {
   ConnectionStatus,
   OpenedSession,
-  PermissionPreset,
+  PermissionMode,
   ProviderInfo,
   ReasoningEffort,
   UsageRecord,
@@ -41,7 +41,7 @@ export const Composer = memo(function Composer({
   evicted,
   workspace,
   selectingTarget,
-  permissionPreset,
+  permissionMode,
   providers,
   providerId,
   reasoningEffort,
@@ -53,7 +53,7 @@ export const Composer = memo(function Composer({
   forkDraft,
   onForkDraftChange,
   onSetModel,
-  onSetPermissionPreset,
+  onSetPermissionMode,
   onSend,
   onAbort,
   onCancelEdit,
@@ -74,7 +74,7 @@ export const Composer = memo(function Composer({
   /** New-session mode: the send target is still being picked in the header. */
   selectingTarget: boolean;
   /** How much this session may do unattended, and the control to change it. */
-  permissionPreset: PermissionPreset;
+  permissionMode: PermissionMode;
   providers: ProviderInfo[];
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
@@ -96,7 +96,7 @@ export const Composer = memo(function Composer({
   forkDraft?: NonNullable<OpenedSession["forkDraft"]>;
   onForkDraftChange: (text: string, images: string[]) => void;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
-  onSetPermissionPreset: (preset: PermissionPreset) => void;
+  onSetPermissionMode: (mode: PermissionMode) => void;
   onSend: (task: string, images: string[]) => void;
   onAbort: () => void;
   onCancelEdit: () => void;
@@ -335,12 +335,12 @@ export const Composer = memo(function Composer({
             <div className="flex min-w-0 items-center gap-1">
               {showControls ? (
                 <PermissionSelector
-                  preset={permissionPreset}
+                  mode={permissionMode}
                   // Switchable whenever the session can hear it: the server
                   // rebuilds nothing, so mid-turn and awaiting-approval are
                   // both fine — and are exactly when the user wants it.
                   disabled={!connected || evicted}
-                  onSetPreset={onSetPermissionPreset}
+                  onSetMode={onSetPermissionMode}
                 />
               ) : null}
             </div>

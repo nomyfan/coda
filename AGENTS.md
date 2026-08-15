@@ -83,19 +83,19 @@ Selection keys on the wire are composite (`{provider_id}:{model_id}`). The first
 
 ### Workspace Approval Configuration
 
-Each session runs under a **permission preset** (`coda_server::config::PermissionPreset`), chosen in the composer. A preset is an allow-list: the tools it names run unattended and everything else suspends for human approval.
+Each session runs under a **permission mode** (`coda_server::config::PermissionMode`), chosen in the composer. A mode is an allow-list: the tools it names run unattended and everything else suspends for human approval. It is distinct from `coda_agent::ToolApprovalMode` one layer down — that is the runtime's mechanism (`Auto` / `Manual` / `RequireWhen`), this is the user's choice; `ToolApprovalConfig::into_approval_mode` turns one into the other.
 
-| preset | auto-approves |
+| mode | auto-approves |
 | --- | --- |
 | `explore` | `ls`, `read_file`, `glob`, `grep`, `read_todos`, `write_todos` |
 | `accept_edits` (default) | the above plus `write_file`, `edit_file` |
 | `yolo` | everything, `shell` included |
 
-Delegation (`agent__*`) is auto-approved under every preset — the sub-agent's own calls go through this same policy, so gating the hand-off too would charge two approvals for one action.
+Delegation (`agent__*`) is auto-approved under every mode — the sub-agent's own calls go through this same policy, so gating the hand-off too would charge two approvals for one action.
 
-The preset is per session and lives only in memory: `PermissionPresetCell` is shared between the hub entry and the approval closure inside the runtime, so `set_permission_preset` takes effect on the next tool call without a rebuild — accepted mid-turn and mid-suspension, and applying to the next call rather than to one already parked. It survives the `SetModel` rebuild and the `Pending` → `Live` promotion because it hangs off the entry, not the phase. Nothing is persisted: the attach that *opens* a session seeds the preset from the client, every later attach is told the live value in its snapshot (a client reconnecting to a running session adopts it), and the web client remembers a preset per session in `localStorage` so a released session reopens as it was.
+The mode is per session and lives only in memory: `PermissionModeCell` is shared between the hub entry and the approval closure inside the runtime, so `set_permission_mode` takes effect on the next tool call without a rebuild — accepted mid-turn and mid-suspension, and applying to the next call rather than to one already parked. It survives the `SetModel` rebuild and the `Pending` → `Live` promotion because it hangs off the entry, not the phase. Nothing is persisted: the attach that *opens* a session seeds the mode from the client, every later attach is told the live value in its snapshot (a client reconnecting to a running session adopts it), and the web client remembers a mode per session in `localStorage` so a released session reopens as it was.
 
-Workspace rules in `.coda/config.toml` layer on top and can only *tighten*: a tool matching `[permissions.tools].approval_required` suspends under every preset, `yolo` included (use `mcp__server__*` to cover one MCP server). It defaults to empty, since the preset now carries the baseline. The `ask_user` tool is always interactive and always suspends to open the web UI.
+Workspace rules in `.coda/config.toml` layer on top and can only *tighten*: a tool matching `[permissions.tools].approval_required` suspends under every mode, `yolo` included (use `mcp__server__*` to cover one MCP server). It defaults to empty, since the mode now carries the baseline. The `ask_user` tool is always interactive and always suspends to open the web UI.
 
 Shell approvals use `[permissions.shell]` allow/deny glob lists. Outside `yolo`, a `shell` call auto-approves only when every decomposed simple command matches `allow`, no simple command matches `deny`, and the command uses only statically-vetted sequencing/pipe constructs; other shell constructs suspend for approval. Under `yolo` the allow-list is skipped but `deny` still bites — on the commands that decompose, which is what it can be checked against.
 

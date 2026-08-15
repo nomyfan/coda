@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
-use crate::config::{PermissionPreset, PermissionPresetCell, RelayConfig};
+use crate::config::{PermissionMode, PermissionModeCell, RelayConfig};
 use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError};
 use crate::wire::WireEvent;
 
@@ -68,11 +68,11 @@ pub enum SessionCommand {
         reasoning_effort: Option<String>,
     },
     /// Change how much this session may do unattended. Unlike `SetModel` this
-    /// needs no rebuild — the runtime reads the preset through a shared cell —
+    /// needs no rebuild — the runtime reads the mode through a shared cell —
     /// so it is accepted mid-turn and mid-suspension, and applies to the next
     /// approval check rather than to calls already parked.
-    SetPermissionPreset {
-        preset: PermissionPreset,
+    SetPermissionMode {
+        mode: PermissionMode,
     },
 }
 
@@ -94,11 +94,11 @@ pub struct SnapshotPayload {
     pub pending_approvals: Vec<PendingApproval>,
     pub provider_id: String,
     pub reasoning_effort: Option<String>,
-    /// The preset the session is actually running under, which is not
+    /// The mode the session is actually running under, which is not
     /// necessarily the one the attaching client asked for: a client that
     /// reconnects to a session still running from an earlier attachment adopts
     /// this value rather than imposing its own.
-    pub permission_preset: PermissionPreset,
+    pub permission_mode: PermissionMode,
     /// A turn is in flight; its events so far are replayed at the head of the
     /// attach stream.
     pub turn_running: bool,
@@ -182,7 +182,7 @@ pub trait SessionOpener: Send + Sync + 'static {
     /// Open (or resume) the session for `key`, seeded with `decisions` for any
     /// pending approvals carried over from a prior suspension.
     ///
-    /// `permission_preset` is handed over as a shared cell rather than a value:
+    /// `permission_mode` is handed over as a shared cell rather than a value:
     /// the runtime's approval closure keeps reading it, so the caller can change
     /// the session's posture later without opening a new one.
     fn open<'a>(
@@ -190,7 +190,7 @@ pub trait SessionOpener: Send + Sync + 'static {
         key: &'a SessionKey,
         provider_id: &'a str,
         reasoning_effort: Option<String>,
-        permission_preset: PermissionPresetCell,
+        permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
 
@@ -253,7 +253,7 @@ pub trait SessionRelay: Send + Sync {
     /// [`AttachError::Busy`] and nothing changes — taking a session away from
     /// another client must be an explicit user decision, not a side effect of
     /// opening it. `provider_id`/`reasoning_effort` must be pre-validated
-    /// against the provider catalog; they — and `permission_preset` — only apply
+    /// against the provider catalog; they — and `permission_mode` — only apply
     /// when the session is not already live. A session that is still running
     /// keeps the posture it was started with, and reports it back in the
     /// snapshot.
@@ -264,7 +264,7 @@ pub trait SessionRelay: Send + Sync {
         conn_id: ConnId,
         provider_id: String,
         reasoning_effort: Option<String>,
-        permission_preset: PermissionPreset,
+        permission_mode: PermissionMode,
         takeover: bool,
     ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>>;
 
@@ -551,9 +551,9 @@ struct EntryState {
     ///
     /// Its value is set by whichever attach initializes the phase and is
     /// authoritative from then on — a later attach carries the client's
-    /// remembered preset, which is exactly the value a live session must
+    /// remembered mode, which is exactly the value a live session must
     /// *not* be reset to.
-    permission_preset: PermissionPresetCell,
+    permission_mode: PermissionModeCell,
 }
 
 /// A cheap, cloneable handle to a session's slot, kept separate from the
@@ -596,7 +596,7 @@ impl SessionHub {
                             inner: Arc::new(Mutex::new(EntryState {
                                 phase: EntryPhase::Uninitialized,
                                 attached: None,
-                                permission_preset: PermissionPresetCell::default(),
+                                permission_mode: PermissionModeCell::default(),
                             })),
                         })
                     })
@@ -877,7 +877,7 @@ impl SessionHub {
         task: String,
         images: Vec<String>,
     ) -> CommandOutcome {
-        let permission_preset = state.permission_preset.clone();
+        let permission_mode = state.permission_mode.clone();
         let (provider_id, reasoning_effort, generation, previous_snapshot) = {
             let EntryPhase::Live(live) = &mut state.phase else {
                 return CommandOutcome::Ignored;
@@ -914,7 +914,7 @@ impl SessionHub {
                 key,
                 &provider_id,
                 reasoning_effort.clone(),
-                permission_preset,
+                permission_mode,
                 HashMap::new(),
             )
             .await
@@ -1005,7 +1005,7 @@ impl SessionHub {
                         key,
                         &provider_id,
                         reasoning_effort.clone(),
-                        state.permission_preset.clone(),
+                        state.permission_mode.clone(),
                         decisions,
                     )
                     .await
@@ -1055,7 +1055,7 @@ impl SessionHub {
         // Not `Live` (stale/not-attached is caught earlier by `command`'s guard;
         // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
         // `set_model` path as `SESSION_NOT_LIVE` (Decision 8).
-        let permission_preset = state.permission_preset.clone();
+        let permission_mode = state.permission_mode.clone();
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
@@ -1082,7 +1082,7 @@ impl SessionHub {
                 reasoning_effort.clone(),
                 // The same cell, so the rebuilt runtime keeps reading the
                 // posture the session already had.
-                permission_preset,
+                permission_mode,
                 HashMap::new(),
             )
             .await
@@ -1135,7 +1135,7 @@ impl SessionRelay for SessionHub {
         conn_id: ConnId,
         provider_id: String,
         reasoning_effort: Option<String>,
-        permission_preset: PermissionPreset,
+        permission_mode: PermissionMode,
         takeover: bool,
     ) -> Pin<Box<dyn Future<Output = Result<AttachSession, AttachError>> + Send + 'a>> {
         Box::pin(async move {
@@ -1162,16 +1162,16 @@ impl SessionRelay for SessionHub {
             }
 
             if matches!(state.phase, EntryPhase::Uninitialized) {
-                // Only a fresh entry adopts the client's preset; anything
+                // Only a fresh entry adopts the client's mode; anything
                 // already initialized keeps the one it is running under.
-                state.permission_preset.set(permission_preset);
+                state.permission_mode.set(permission_mode);
                 match self
                     .opener
                     .open(
                         &key,
                         &provider_id,
                         reasoning_effort.clone(),
-                        state.permission_preset.clone(),
+                        state.permission_mode.clone(),
                         HashMap::new(),
                     )
                     .await
@@ -1212,7 +1212,7 @@ impl SessionRelay for SessionHub {
                 }
             }
 
-            let snapshot = compose_snapshot(&state.phase, state.permission_preset.get())
+            let snapshot = compose_snapshot(&state.phase, state.permission_mode.get())
                 .expect("phase is Live or Pending after initialization");
 
             // Register the stream and capture the replay in the same critical
@@ -1280,9 +1280,9 @@ impl SessionRelay for SessionHub {
                 // No phase check: the cell is the runtime's own source of
                 // truth, so writing it is meaningful whether the session is
                 // Live, mid-turn, or still Pending on its gated open.
-                SessionCommand::SetPermissionPreset { preset } => {
-                    state.permission_preset.set(preset);
-                    info!(workspace_id = %key.0, session_id = %key.1, "permission preset set to {preset:?}");
+                SessionCommand::SetPermissionMode { mode } => {
+                    state.permission_mode.set(mode);
+                    info!(workspace_id = %key.0, session_id = %key.1, "permission mode set to {mode:?}");
                     CommandOutcome::Ok
                 }
             }
@@ -1508,7 +1508,7 @@ impl SessionHub {
 /// it is unit-testable.
 fn compose_snapshot(
     phase: &EntryPhase,
-    permission_preset: PermissionPreset,
+    permission_mode: PermissionMode,
 ) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
@@ -1523,7 +1523,7 @@ fn compose_snapshot(
                 pending_approvals: live.pending_approvals.clone(),
                 provider_id: live.provider_id.clone(),
                 reasoning_effort: live.reasoning_effort.clone(),
-                permission_preset,
+                permission_mode,
                 turn_running: live.turn_running,
             })
         }
@@ -1537,7 +1537,7 @@ fn compose_snapshot(
                 .collect(),
             provider_id: pending.provider_id.clone(),
             reasoning_effort: pending.reasoning_effort.clone(),
-            permission_preset,
+            permission_mode,
             turn_running: false,
         }),
         _ => None,

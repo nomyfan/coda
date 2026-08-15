@@ -118,22 +118,22 @@ export type ReasoningEffort = string;
 
 /**
  * How much a session may do without stopping to ask. An allow-list: the tools a
- * preset covers run unattended, everything else suspends for approval.
+ * mode covers run unattended, everything else suspends for approval.
  *
  * - `explore` — read-only tools only.
  * - `accept_edits` — plus writing files. The default for a new session.
  * - `yolo` — everything, `shell` included (`ask_user` still asks, and the
  *   workspace's shell deny-list still bites).
  */
-export type PermissionPreset = "explore" | "accept_edits" | "yolo";
+export type PermissionMode = "explore" | "accept_edits" | "yolo";
 
-export const PERMISSION_PRESETS: PermissionPreset[] = ["explore", "accept_edits", "yolo"];
+export const PERMISSION_MODES: PermissionMode[] = ["explore", "accept_edits", "yolo"];
 
 /** What a session starts on, and what anything unremembered falls back to. */
-export const DEFAULT_PERMISSION_PRESET: PermissionPreset = "accept_edits";
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "accept_edits";
 
-export function isPermissionPreset(value: unknown): value is PermissionPreset {
-  return PERMISSION_PRESETS.includes(value as PermissionPreset);
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  return PERMISSION_MODES.includes(value as PermissionMode);
 }
 
 export type Modality = "text" | "image";
@@ -205,10 +205,10 @@ type Snapshot = {
   pending_approvals?: PendingApproval[];
   provider_id: string;
   reasoning_effort?: ReasoningEffort | null;
-  /** The preset the session is *actually* running under. Authoritative: a
+  /** The mode the session is *actually* running under. Authoritative: a
    * client attaching to a session that is already live adopts this instead of
    * imposing the one it remembered. */
-  permission_preset?: PermissionPreset;
+  permission_mode?: PermissionMode;
   /** A turn is still in flight; its events are replayed after the snapshot. */
   turn_running?: boolean;
 };
@@ -253,7 +253,7 @@ export type RpcRequests = {
       /** The posture this client remembers for the session. Seeds a session the
        * server is not already running; ignored (and answered with the live
        * value) for one that is. */
-      permission_preset?: PermissionPreset;
+      permission_mode?: PermissionMode;
       /** Evict whoever currently holds the session; without it the server
        * rejects with `SESSION_BUSY`. */
       takeover?: boolean;
@@ -263,9 +263,9 @@ export type RpcRequests = {
   /** Change how much the session may do unattended. Unlike `set_model` this
    * rebuilds nothing, so it is accepted mid-turn and while approvals are
    * pending; it applies to the next tool call, not to calls already suspended. */
-  set_permission_preset: RpcRequest<
-    { workspace_id: string; session_id: string; preset: PermissionPreset },
-    { preset: PermissionPreset }
+  set_permission_mode: RpcRequest<
+    { workspace_id: string; session_id: string; mode: PermissionMode },
+    { mode: PermissionMode }
   >;
   set_model: RpcRequest<
     {

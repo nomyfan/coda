@@ -63,7 +63,7 @@ fn parse_empty_config() {
     let permissions = parse_permissions("").unwrap();
     assert!(permissions.shell_allow.is_empty());
     assert!(permissions.shell_deny.is_empty());
-    // The preset decides the baseline; a silent config adds no locks of its own.
+    // The mode decides the baseline; a silent config adds no locks of its own.
     assert!(permissions.approval_required_tools.is_empty());
 }
 
@@ -665,7 +665,7 @@ fn parse_permissions_rejects_non_string_approval_required_item() {
 #[test]
 fn config_load_nonexistent() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("ls")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("ls")));
 }
 
 #[test]
@@ -676,8 +676,8 @@ fn config_deny_overrides_allow() {
         inner.allow.push("rm *".to_string());
         inner.deny.push("rm -rf *".to_string());
     }
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("rm file.txt")));
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("rm -rf /")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &shell_call("rm file.txt")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("rm -rf /")));
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn config_non_shell_tools_skip() {
         name: "read_file".into(),
         arguments: None,
     };
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &call));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &call));
 }
 
 #[test]
@@ -703,13 +703,13 @@ fn explore_auto_approves_only_read_only_tools() {
         "write_todos",
     ] {
         assert!(
-            !config.requires_approval(PermissionPreset::Explore, &tool_call(tool)),
+            !config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should run unattended under explore"
         );
     }
     for tool in ["write_file", "edit_file", "mcp__time__now"] {
         assert!(
-            config.requires_approval(PermissionPreset::Explore, &tool_call(tool)),
+            config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should ask under explore"
         );
     }
@@ -718,11 +718,11 @@ fn explore_auto_approves_only_read_only_tools() {
 #[test]
 fn accept_edits_adds_the_file_writers() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("write_file")));
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("edit_file")));
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("read_file")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("write_file")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("edit_file")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("read_file")));
     // Still an allow-list: anything it does not name keeps asking.
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("mcp__time__now")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &tool_call("mcp__time__now")));
 }
 
 #[test]
@@ -730,28 +730,25 @@ fn yolo_auto_approves_everything_it_can() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
     for tool in ["write_file", "mcp__time__now", "some_unknown_tool"] {
         assert!(
-            !config.requires_approval(PermissionPreset::Yolo, &tool_call(tool)),
+            !config.requires_approval(PermissionMode::Yolo, &tool_call(tool)),
             "{tool} should run unattended under yolo"
         );
     }
-    // An empty allow-list would stop every command under the other presets;
+    // An empty allow-list would stop every command under the other modes;
     // yolo runs them anyway.
-    assert!(!config.requires_approval(PermissionPreset::Yolo, &shell_call("rm -rf /tmp/x")));
-    assert!(config.requires_approval(PermissionPreset::Explore, &shell_call("rm -rf /tmp/x")));
+    assert!(!config.requires_approval(PermissionMode::Yolo, &shell_call("rm -rf /tmp/x")));
+    assert!(config.requires_approval(PermissionMode::Explore, &shell_call("rm -rf /tmp/x")));
     // Except `ask_user`, which asks a question rather than for permission.
-    assert!(config.requires_approval(PermissionPreset::Yolo, &tool_call("ask_user")));
+    assert!(config.requires_approval(PermissionMode::Yolo, &tool_call("ask_user")));
 }
 
 #[test]
 fn yolo_still_respects_the_deny_list() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
     config.inner.lock().unwrap().deny.push("git push *".into());
-    assert!(config.requires_approval(PermissionPreset::Yolo, &shell_call("git push origin main")));
-    assert!(config.requires_approval(
-        PermissionPreset::Yolo,
-        &shell_call("ls && git push --force")
-    ));
-    assert!(!config.requires_approval(PermissionPreset::Yolo, &shell_call("git pull")));
+    assert!(config.requires_approval(PermissionMode::Yolo, &shell_call("git push origin main")));
+    assert!(config.requires_approval(PermissionMode::Yolo, &shell_call("ls && git push --force")));
+    assert!(!config.requires_approval(PermissionMode::Yolo, &shell_call("git pull")));
 }
 
 #[test]
@@ -759,12 +756,12 @@ fn delegation_is_never_gated() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
     // Each tool the sub-agent then calls is checked against this same policy,
     // so gating the delegation itself would only double-charge the user.
-    for preset in [
-        PermissionPreset::Explore,
-        PermissionPreset::AcceptEdits,
-        PermissionPreset::Yolo,
+    for mode in [
+        PermissionMode::Explore,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Yolo,
     ] {
-        assert!(!config.requires_approval(preset, &tool_call("agent__explore")));
+        assert!(!config.requires_approval(mode, &tool_call("agent__explore")));
     }
 }
 
@@ -780,11 +777,11 @@ fn interactive_tools_always_require_approval() {
     .unwrap();
 
     let config = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("ask_user")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &tool_call("ask_user")));
 }
 
 #[test]
-fn configured_tools_tighten_every_preset() {
+fn configured_tools_tighten_every_mode() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join(".coda").join("config.toml");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
@@ -795,11 +792,11 @@ fn configured_tools_tighten_every_preset() {
     .unwrap();
 
     let config = ToolApprovalConfig::load(dir.path()).unwrap();
-    // The workspace's own lock outranks the preset — yolo included.
-    assert!(config.requires_approval(PermissionPreset::Explore, &tool_call("write_todos")));
-    assert!(config.requires_approval(PermissionPreset::Yolo, &tool_call("write_todos")));
-    // Everything it does not name is left to the preset.
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("write_file")));
+    // The workspace's own lock outranks the mode — yolo included.
+    assert!(config.requires_approval(PermissionMode::Explore, &tool_call("write_todos")));
+    assert!(config.requires_approval(PermissionMode::Yolo, &tool_call("write_todos")));
+    // Everything it does not name is left to the mode.
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("write_file")));
 }
 
 #[test]
@@ -814,27 +811,24 @@ fn configured_tool_patterns_require_approval() {
     .unwrap();
 
     let config = ToolApprovalConfig::load(dir.path()).unwrap();
-    // Read the pattern under yolo: that is the preset where being on the
+    // Read the pattern under yolo: that is the mode where being on the
     // tightening list is the only thing that can still stop a tool, so a match
     // and a miss are told apart cleanly.
     assert!(config.requires_approval(
-        PermissionPreset::Yolo,
+        PermissionMode::Yolo,
         &tool_call("mcp__time__get_current_time")
     ));
-    assert!(config.requires_approval(
-        PermissionPreset::Yolo,
-        &tool_call("mcp__time__convert_time")
-    ));
+    assert!(config.requires_approval(PermissionMode::Yolo, &tool_call("mcp__time__convert_time")));
     assert!(!config.requires_approval(
-        PermissionPreset::Yolo,
+        PermissionMode::Yolo,
         &tool_call("mcp__filesystem__read_file")
     ));
 }
 
 #[test]
 fn approval_required_defaults_to_empty() {
-    // The preset carries the baseline now, so a workspace that says nothing
-    // adds nothing: `edit_file` is decided by the preset alone.
+    // The mode carries the baseline now, so a workspace that says nothing
+    // adds nothing: `edit_file` is decided by the mode alone.
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
     assert!(
         config
@@ -844,8 +838,8 @@ fn approval_required_defaults_to_empty() {
             .approval_required_tools
             .is_empty()
     );
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &tool_call("edit_file")));
-    assert!(config.requires_approval(PermissionPreset::Explore, &tool_call("edit_file")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("edit_file")));
+    assert!(config.requires_approval(PermissionMode::Explore, &tool_call("edit_file")));
 }
 
 #[test]
@@ -887,9 +881,9 @@ fn add_allow_pattern_roundtrip() {
     config.add_allow_pattern("git *").unwrap();
 
     let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git status")));
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("cargo test")));
-    assert!(reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("rm file")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("git status")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("cargo test")));
+    assert!(reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("rm file")));
 }
 
 #[test]
@@ -903,8 +897,8 @@ fn add_allow_preserves_deny() {
     config.add_allow_pattern("git *").unwrap();
 
     let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git push")));
-    assert!(reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("rm -rf /")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("git push")));
+    assert!(reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("rm -rf /")));
 }
 
 #[test]
@@ -915,7 +909,7 @@ fn add_allow_not_persisted_on_write_failure() {
     let config = ToolApprovalConfig::load(dir.path()).unwrap();
     let result = config.add_allow_pattern("git *");
     assert!(result.is_err());
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git status")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("git status")));
 }
 
 #[test]
@@ -929,7 +923,7 @@ fn write_handles_wrong_shaped_permissions() {
     config.add_allow_pattern("git *").unwrap();
 
     let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git status")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("git status")));
 }
 
 #[test]
@@ -943,7 +937,7 @@ fn write_handles_wrong_shaped_shell() {
     config.add_allow_pattern("cargo *").unwrap();
 
     let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("cargo test")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("cargo test")));
 }
 
 #[test]
@@ -961,8 +955,8 @@ fn write_preserves_inline_table_deny() {
     config.add_allow_pattern("git *").unwrap();
 
     let reloaded = ToolApprovalConfig::load(dir.path()).unwrap();
-    assert!(!reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git push")));
-    assert!(reloaded.requires_approval(PermissionPreset::AcceptEdits, &shell_call("rm -rf /")));
+    assert!(!reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("git push")));
+    assert!(reloaded.requires_approval(PermissionMode::AcceptEdits, &shell_call("rm -rf /")));
 }
 
 #[test]
@@ -976,25 +970,25 @@ fn compound_of_allowed_commands_auto_approves() {
     }
     // Sequencing, and-or, and pipes auto-approve when every constituent
     // simple command is allowed.
-    assert!(!config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git status")));
+    assert!(!config.requires_approval(PermissionMode::AcceptEdits, &shell_call("git status")));
     assert!(!config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("cd app && cargo test")
     ));
     assert!(!config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git fetch; git status")
     ));
     assert!(!config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git log | cargo run")
     ));
     assert!(!config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status || git fetch")
     ));
     assert!(!config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status\ncargo test")
     ));
 }
@@ -1008,14 +1002,14 @@ fn compound_with_disallowed_command_requires_approval() {
     }
     // A single disallowed simple command anywhere in the compound gates it.
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status; rm -rf /")
     ));
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status && echo done")
     ));
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git log | head")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("git log | head")));
 }
 
 #[test]
@@ -1029,27 +1023,27 @@ fn unresolvable_constructs_require_approval() {
     // Backgrounding, redirections, and substitutions can't be statically
     // vetted even when the visible command is allowed.
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status & echo done")
     ));
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status > /tmp/out")
     ));
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("git status < /dev/null")
     ));
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("echo `whoami`")));
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("echo $(whoami)")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("echo `whoami`")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("echo $(whoami)")));
     // Compound commands (subshells, loops) fall back to approval.
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("(git status)")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("(git status)")));
     assert!(config.requires_approval(
-        PermissionPreset::AcceptEdits,
+        PermissionMode::AcceptEdits,
         &shell_call("for f in *; do echo $f; done")
     ));
     // A syntactically invalid command is never auto-approved.
-    assert!(config.requires_approval(PermissionPreset::AcceptEdits, &shell_call("git status &&")));
+    assert!(config.requires_approval(PermissionMode::AcceptEdits, &shell_call("git status &&")));
 }
 
 #[test]

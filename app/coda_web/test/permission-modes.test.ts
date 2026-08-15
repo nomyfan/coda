@@ -1,10 +1,10 @@
 import { beforeEach, expect, test } from "vitest";
 
 import {
-  forgetSessionPreset,
-  initialSessionPreset,
-  rememberSessionPreset,
-} from "../src/store/permission-presets.ts";
+  forgetSessionMode,
+  initialSessionMode,
+  rememberSessionMode,
+} from "../src/store/permission-modes.ts";
 import { applySnapshotToSession, type OpenedSession } from "../src/store/session.ts";
 
 const values = new Map<string, string>();
@@ -35,63 +35,63 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
     allowDrafts: {},
     running: false,
     evicted: false,
-    permissionPreset: "accept_edits",
+    permissionMode: "accept_edits",
     usage: [],
     ...overrides,
   } as OpenedSession;
 }
 
-test("remembers a preset per session, not per workspace", () => {
-  rememberSessionPreset("ws://one", "alpha", "s1", "yolo");
+test("remembers a mode per session, not per workspace", () => {
+  rememberSessionMode("ws://one", "alpha", "s1", "yolo");
 
-  expect(initialSessionPreset("ws://one", "alpha", "s1")).toBe("yolo");
+  expect(initialSessionMode("ws://one", "alpha", "s1")).toBe("yolo");
   // A sibling session in the same workspace is untouched: switching inside one
   // conversation must not change what the next one starts on.
-  expect(initialSessionPreset("ws://one", "alpha", "s2")).toBe("accept_edits");
+  expect(initialSessionMode("ws://one", "alpha", "s2")).toBe("accept_edits");
   // Neither is the same session id on another server.
-  expect(initialSessionPreset("ws://two", "alpha", "s1")).toBe("accept_edits");
+  expect(initialSessionMode("ws://two", "alpha", "s1")).toBe("accept_edits");
 });
 
 test("an unremembered session opens on the default", () => {
-  expect(initialSessionPreset("ws://one", "alpha", "never-seen")).toBe("accept_edits");
+  expect(initialSessionMode("ws://one", "alpha", "never-seen")).toBe("accept_edits");
 });
 
 test("malformed storage is ignored rather than trusted", () => {
-  values.set("coda.permissionPresets", JSON.stringify({ "ws://one": { "alpha:s1": "yolo" } }));
-  expect(initialSessionPreset("ws://one", "alpha", "s1")).toBe("accept_edits");
+  values.set("coda.permissionModes", JSON.stringify({ "ws://one": { "alpha:s1": "yolo" } }));
+  expect(initialSessionMode("ws://one", "alpha", "s1")).toBe("accept_edits");
 });
 
 test("forgetting a session drops its memory", () => {
-  rememberSessionPreset("ws://one", "alpha", "s1", "explore");
-  forgetSessionPreset("ws://one", "alpha", "s1");
+  rememberSessionMode("ws://one", "alpha", "s1", "explore");
+  forgetSessionMode("ws://one", "alpha", "s1");
 
-  expect(initialSessionPreset("ws://one", "alpha", "s1")).toBe("accept_edits");
+  expect(initialSessionMode("ws://one", "alpha", "s1")).toBe("accept_edits");
 });
 
 test("the memory is capped, dropping the least recently written first", () => {
   for (let index = 0; index < 205; index += 1) {
-    rememberSessionPreset("ws://one", "alpha", `s${index}`, "explore");
+    rememberSessionMode("ws://one", "alpha", `s${index}`, "explore");
   }
 
   // The five oldest are gone; the newest survive.
-  expect(initialSessionPreset("ws://one", "alpha", "s0")).toBe("accept_edits");
-  expect(initialSessionPreset("ws://one", "alpha", "s4")).toBe("accept_edits");
-  expect(initialSessionPreset("ws://one", "alpha", "s5")).toBe("explore");
-  expect(initialSessionPreset("ws://one", "alpha", "s204")).toBe("explore");
+  expect(initialSessionMode("ws://one", "alpha", "s0")).toBe("accept_edits");
+  expect(initialSessionMode("ws://one", "alpha", "s4")).toBe("accept_edits");
+  expect(initialSessionMode("ws://one", "alpha", "s5")).toBe("explore");
+  expect(initialSessionMode("ws://one", "alpha", "s204")).toBe("explore");
 });
 
 // The reconnect case: a session that kept running while this client was away
 // answers with the posture it is actually executing under, and that wins over
 // whatever the browser had remembered for it.
-test("a snapshot's preset replaces the local one", () => {
-  const applied = applySnapshotToSession(session({ permissionPreset: "explore" }), {
+test("a snapshot's mode replaces the local one", () => {
+  const applied = applySnapshotToSession(session({ permissionMode: "explore" }), {
     messages: [],
     approvals: [],
     providerId: "provider:model",
     reasoningEffort: null,
-    permissionPreset: "yolo",
+    permissionMode: "yolo",
     turnRunning: true,
   });
 
-  expect(applied.permissionPreset).toBe("yolo");
+  expect(applied.permissionMode).toBe("yolo");
 });
