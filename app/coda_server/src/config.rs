@@ -549,9 +549,11 @@ pub enum PermissionMode {
     /// session.
     #[default]
     AcceptEdits,
-    /// Auto-approve everything, `shell` included. `ask_user` still opens the UI
-    /// (it asks a question rather than seeking permission) and the workspace's
-    /// `deny` rules still bite — see [`ToolApprovalConfig::requires_approval`].
+    /// Auto-approve everything, `shell` included — everything, that is, that
+    /// the three rules outranking the mode leave alone: `ask_user` still opens
+    /// the UI (it asks a question rather than seeking permission), the
+    /// workspace's `approval_required` list still holds, and its shell `deny`
+    /// rules still bite. See [`ToolApprovalConfig::requires_approval`].
     Yolo,
 }
 

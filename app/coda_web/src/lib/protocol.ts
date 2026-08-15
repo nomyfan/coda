@@ -122,8 +122,9 @@ export type ReasoningEffort = string;
  *
  * - `explore` — read-only tools only.
  * - `accept_edits` — plus writing files. The default for a new session.
- * - `yolo` — everything, `shell` included (`ask_user` still asks, and the
- *   workspace's shell deny-list still bites).
+ * - `yolo` — everything, `shell` included. Only what outranks the mode still
+ *   stops a call: `ask_user`, the workspace's `approval_required` list, and its
+ *   shell deny-list.
  */
 export type PermissionMode = "explore" | "accept_edits" | "yolo";
 

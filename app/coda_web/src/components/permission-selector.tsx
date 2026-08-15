@@ -104,9 +104,10 @@ export function PermissionSelector({
           <DialogHeader>
             <DialogTitle>Switch to Yolo?</DialogTitle>
             <DialogDescription>
-              Every tool runs without asking, including shell commands that write files, install
-              packages or reach the network. The workspace&rsquo;s deny rules are the only thing
-              still stopping a command, and they only reach commands simple enough to check &mdash;
+              Every tool runs unattended, shell included &mdash; commands that write files, install
+              packages or reach the network. Only three things still stop one: a tool that has to
+              ask you something, anything this workspace&rsquo;s config requires approval for, and
+              its shell deny rules &mdash; and those reach only commands simple enough to check, so
               a denied command written with a redirect or a substitution runs anyway.
             </DialogDescription>
           </DialogHeader>
