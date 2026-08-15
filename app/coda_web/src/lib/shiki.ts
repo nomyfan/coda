@@ -129,7 +129,10 @@ export function highlight(code: string, lang: string): string | null {
   return highlighter.codeToHtml(code, {
     lang,
     themes: { light: LIGHT, dark: DARK },
-    defaultColor: "light",
+    // Both colors as custom properties, none as an inline `color`: an inline
+    // color would outrank the stylesheet's dark rule and pin every block to
+    // the light palette.
+    defaultColor: false,
     cssVariablePrefix: "--shiki-",
     structure: "inline",
   });

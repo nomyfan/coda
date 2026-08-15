@@ -372,3 +372,47 @@ fn event_params_roundtrips() {
         WireEvent::LlmContentChunk { content, .. } if content == "hi"
     ));
 }
+
+#[test]
+fn list_files_params_default_to_the_whole_workspace() {
+    // Right after typing `@` the client sends no query and no limit; both fall
+    // back to server-side defaults rather than being required of the picker.
+    let params: ListFilesParams = serde_json::from_str(r#"{"workspace_id":"coda"}"#).unwrap();
+    assert_eq!(params.query, "");
+    assert!(params.limit.is_none());
+
+    let params: ListFilesParams =
+        serde_json::from_str(r#"{"workspace_id":"coda","query":"comp","limit":10}"#).unwrap();
+    assert_eq!(params.query, "comp");
+    assert_eq!(params.limit, Some(10));
+}
+
+#[test]
+fn file_catalog_roundtrips() {
+    let catalog = FileCatalog {
+        files: vec![FileEntry {
+            path: "src/main.rs".into(),
+            is_dir: false,
+        }],
+        truncated: true,
+    };
+    let back: FileCatalog =
+        serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
+    assert_eq!(back.files[0].path, "src/main.rs");
+    assert!(!back.files[0].is_dir);
+    assert!(back.truncated);
+}
+
+#[test]
+fn skill_catalog_roundtrips() {
+    let catalog = SkillCatalog {
+        skills: vec![SkillInfoWire {
+            name: "code-review".into(),
+            description: "Review the current diff".into(),
+        }],
+    };
+    let back: SkillCatalog =
+        serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
+    assert_eq!(back.skills[0].name, "code-review");
+    assert_eq!(back.skills[0].description, "Review the current diff");
+}

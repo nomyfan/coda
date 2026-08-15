@@ -80,6 +80,8 @@ pub const REWIND_FAILED: i32 = -32023;
 pub const FORK_FAILED: i32 = -32024;
 /// A fork the database was not ready for: the cut, or the newest turn, has not
 pub const ALLOW_PATTERN_FAILED: i32 = -32030;
+/// `list_files`: the workspace could not be walked.
+pub const LIST_FILES_FAILED: i32 = -32031;
 
 impl RpcError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {

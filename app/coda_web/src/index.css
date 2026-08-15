@@ -265,9 +265,13 @@
     mask-image: linear-gradient(to bottom, #000 calc(100% - 2rem), transparent);
   }
 
-  /* Shiki highlights each block for both themes at once: the light color lands
-   * inline and the dark one as --shiki-dark. Switching themes is then a CSS
-   * flip, with no re-highlight pass. */
+  /* Shiki highlights each block for both themes at once, emitting both palettes
+   * as --shiki-light/--shiki-dark. Switching themes is then a CSS flip, with no
+   * re-highlight pass. */
+  .shiki-code span {
+    color: var(--shiki-light);
+  }
+
   .dark .shiki-code span {
     color: var(--shiki-dark);
   }

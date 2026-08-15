@@ -19,15 +19,17 @@ use coda_server::{
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_available_skills, build_workspace_custom_instructions,
+    build_workspace_custom_instructions,
     config::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
     },
+    files::{DEFAULT_LIMIT, FileIndex},
     hub::{
         AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
         SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
     },
+    load_workspace_skills,
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
     storage::{
@@ -35,12 +37,12 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, DeleteSessionParams, EventParams, ForkAccepted, ForkSessionParams,
-        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
-        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
-        RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
-        SetPermissionModeParams, Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog,
-        WorkspaceSummaryWire,
+        AddAllowPatternParams, DeleteSessionParams, EventParams, FileCatalog, ForkAccepted,
+        ForkSessionParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
+        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
+        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
+        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
+        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -135,6 +137,13 @@ struct WorkspaceState {
     /// Agents absent here inherit the session's default (root) model.
     agent_models: HashMap<String, AgentModelSelection>,
     approval_config: ToolApprovalConfig,
+    /// Backs the composer's `@` picker: the workspace's files, walked on demand
+    /// and briefly cached so one query per keystroke costs one walk.
+    files: FileIndex,
+    /// The session workspace's hot-reloaded knowledge handles. Shared with the
+    /// agents rooted here, so the composer's `/` picker lists exactly the skills
+    /// the prompt's `<available_skills>` was rendered from.
+    knowledge: WorkspaceKnowledge,
 }
 
 /// A validated per-agent model override: a provider selection key plus the
@@ -670,14 +679,66 @@ fn parse_params<P: DeserializeOwned>(params: Value) -> Result<P, RpcError> {
     serde_json::from_value(params).map_err(|err| RpcError::invalid_params(err.to_string()))
 }
 
+/// The composer's `@` picker. A search, not a listing: the workspace can hold
+/// far more paths than a menu should ever carry, so the ranking and the cap both
+/// live server-side and the client just renders the answer.
+///
+/// Split out of `dispatch_request` because it is the one request that can take
+/// real time: a cache miss walks the whole workspace, and awaiting that inside
+/// the connection loop would freeze this client's event stream for the duration
+/// (see the spawn in [`handle_frame`]).
+async fn list_files_reply(app: &Arc<AppState>, id: RpcId, params: Value) -> RpcOutgoing {
+    let params: ListFilesParams = match parse_params(params) {
+        Ok(params) => params,
+        Err(err) => return (id, err).into(),
+    };
+    let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+        return (
+            id,
+            RpcError::with_detail(
+                rpc::UNKNOWN_WORKSPACE,
+                "unknown workspace",
+                params.workspace_id,
+            ),
+        )
+            .into();
+    };
+    match workspace
+        .files
+        .search(params.query.trim(), params.limit.unwrap_or(DEFAULT_LIMIT))
+        .await
+    {
+        Ok(matches) => (
+            id,
+            &FileCatalog {
+                files: matches.files,
+                truncated: matches.truncated,
+            },
+        )
+            .into(),
+        Err(detail) => {
+            warn!(workspace_id = %params.workspace_id, "failed to list files: {detail}");
+            (
+                id,
+                RpcError::with_detail(
+                    rpc::LIST_FILES_FAILED,
+                    "failed to list workspace files",
+                    detail,
+                ),
+            )
+                .into()
+        }
+    }
+}
+
 /// Classify one decoded frame and act on it. A *request* always produces exactly
 /// one framed reply (`result` or `error`); a *notification* runs for effect and
 /// is never answered (an unknown method or bad params on a notification is
 /// logged and dropped — there is no id to answer against); a structurally
 /// invalid frame is answered with the recovered id (or `null`). Returns `false`
 /// when the transport is gone and the connection should tear down.
-async fn handle_frame<T: Transport>(
-    transport: &T,
+async fn handle_frame<T: Transport + Send + Sync + 'static>(
+    transport: &Arc<T>,
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
@@ -685,6 +746,20 @@ async fn handle_frame<T: Transport>(
     frame: String,
 ) -> bool {
     match rpc::decode(&frame) {
+        // Answered off the connection loop: a cold `@` query walks the whole
+        // workspace, and the loop must stay free to keep forwarding this
+        // client's session events while that runs. Touching no per-connection
+        // state, this arm is the one request that can safely leave the loop —
+        // a send failure is left for the loop itself to notice.
+        rpc::Incoming::Request { id, method, params } if method == "list_files" => {
+            let app = Arc::clone(app);
+            let transport = Arc::clone(transport);
+            tokio::spawn(async move {
+                let reply = list_files_reply(&app, id, params).await;
+                transport.send(&reply).await;
+            });
+            true
+        }
         rpc::Incoming::Request { id, method, params } => {
             let reply =
                 dispatch_request(app, conn_id, streams, selections, id, &method, params).await;
@@ -730,6 +805,42 @@ async fn dispatch_request(
             },
         )
             .into(),
+        // `list_files` is answered from its own task in `handle_frame` (see
+        // `list_files_reply`), so it never reaches this match.
+        // The composer's `/` picker. Literally the same read the model's
+        // `<available_skills>` comes from — the workspace's knowledge handle,
+        // kept current by its watcher — so the menu and the prompt cannot
+        // disagree, and opening the menu touches no disk. Session workspace
+        // only: an agent rooted elsewhere has its own skills, but the composer
+        // types into the root agent's conversation.
+        "list_skills" => {
+            let params: ListSkillsParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+                return (
+                    id,
+                    RpcError::with_detail(
+                        rpc::UNKNOWN_WORKSPACE,
+                        "unknown workspace",
+                        params.workspace_id,
+                    ),
+                )
+                    .into();
+            };
+            let skills = workspace
+                .knowledge
+                .skills
+                .get()
+                .iter()
+                .map(|skill| SkillInfoWire {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                })
+                .collect();
+            (id, &SkillCatalog { skills }).into()
+        }
         "open_session" => {
             let params: OpenSessionParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1462,7 +1573,10 @@ async fn handle_resume<T: Transport>(
 /// stale-command rejection). Monotonic per process.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
-async fn run_connection<T: Transport>(transport: T, app: Arc<AppState>) {
+async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app: Arc<AppState>) {
+    // Shared so a long-running request (`list_files`) can answer from its own
+    // task instead of holding up the loop below.
+    let transport = Arc::new(transport);
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     // Event streams of the sessions this connection is attached to. A stream
     // that ends silently (detach/takeover elsewhere) is dropped from the map
@@ -1605,10 +1719,13 @@ fn spawn_workspace_knowledge_watcher(
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let skills = build_available_skills(&workspace_str);
-                    if skills != last_skills {
-                        last_skills = skills.clone();
-                        knowledge.available_skills.set(skills);
+                    let (skills_xml, skills) = load_workspace_skills(&workspace_str);
+                    if skills_xml != last_skills {
+                        last_skills = skills_xml.clone();
+                        knowledge.available_skills.set(skills_xml);
+                        // The XML is rendered from this very list, so one
+                        // comparison covers both handles.
+                        knowledge.skills.set(skills);
                         info!(workspace_id = %workspace_id, path = %workspace_str, "workspace skills changed, reloaded");
                     }
                     let instructions = build_workspace_custom_instructions(&workspace_str);
@@ -1768,8 +1885,16 @@ async fn build_workspace(
         "workspace loaded"
     );
 
+    // The session workspace's own handles: what `list_skills` answers from.
+    let session_knowledge = knowledge
+        .get(&workspace_str)
+        .cloned()
+        .unwrap_or_else(WorkspaceKnowledge::empty);
+
     Ok(WorkspaceState {
         id: workspace.id,
+        files: FileIndex::new(workspace_str.clone()),
+        knowledge: session_knowledge,
         storage,
         workspace_str,
         mcp_servers,

@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::warn;
@@ -38,6 +39,19 @@ pub trait Transport {
     /// Send a built envelope. Returns `false` once the frame cannot be delivered
     /// and the caller should tear down.
     fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send;
+}
+
+/// A shared transport is a transport. This is what lets a connection keep
+/// driving its loop while handing a clone to a task that answers a request too
+/// slow to await inline.
+impl<T: Transport + Send + Sync> Transport for Arc<T> {
+    fn recv(&self) -> impl Future<Output = Option<String>> + Send {
+        (**self).recv()
+    }
+
+    fn send(&self, msg: &RpcOutgoing) -> impl Future<Output = bool> + Send {
+        (**self).send(msg)
+    }
 }
 
 /// Everything `recv` touches, behind one lock: the read half and its keepalive

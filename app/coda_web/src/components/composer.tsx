@@ -1,8 +1,16 @@
 import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
-import { memo, useCallback, useEffect, useId, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  applyMention,
+  detectTrigger,
+  emptyMentionLabel,
+  type MentionItem,
+  type MentionTrigger,
+} from "@/lib/composer-mentions";
+import { MentionMenu, useMentionItems } from "@/components/mention-menu";
 import type {
   ConnectionStatus,
   OpenedSession,
@@ -111,7 +119,32 @@ export const Composer = memo(function Composer({
   );
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const hasForkDraft = forkDraft !== undefined;
+  // The `@` / `/` token the caret is in, if any, and which entry of its menu is
+  // selected. `dismissed` remembers the token Escape closed — its offset *and*
+  // the query it held — so the menu stays shut while the user keeps typing that
+  // same mention, but a different one starting at the same offset still opens.
+  const [trigger, setTrigger] = useState<MentionTrigger | null>(null);
+  const [highlighted, setHighlighted] = useState(0);
+  const [dismissed, setDismissed] = useState<{ start: number; query: string } | null>(null);
+  // Where the caret goes once React has rendered an accepted completion; the DOM
+  // still holds the pre-insertion text at the moment the item is picked.
+  const pendingCaret = useRef<number | null>(null);
+  // Whether the edit now arriving replaces a *selected range*. Captured from
+  // `keydown`/`paste`, the events that still see the pre-edit selection — by
+  // `change` it has already collapsed, and the resulting text cannot tell a
+  // replacement from ordinary typing (replacing `foo` with `foobar` leaves
+  // exactly what typing `bar` would have).
+  const replacingSelection = useRef(false);
+  const noteSelection = useCallback((element: HTMLTextAreaElement) => {
+    replacingSelection.current = element.selectionStart !== element.selectionEnd;
+  }, []);
+  const mentionListId = useId();
+  const mentionOptionId = useCallback(
+    (index: number) => `${mentionListId}-option-${index}`,
+    [mentionListId],
+  );
 
   useEffect(() => {
     if (hasForkDraft) {
@@ -152,6 +185,83 @@ export const Composer = memo(function Composer({
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
   const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
+
+  // The pickers search a workspace over a live connection, and they stay out of
+  // a frozen draft entirely — there is nothing useful to insert into text the
+  // user cannot edit.
+  const mentionsEnabled = connected && !frozen && Boolean(workspaceId);
+  // A dismissal only holds while the caret is still extending the very token it
+  // closed. Typing forward keeps it shut; deleting back out of it, or replacing
+  // it outright (see `onBeforeInput`), opens the menu again. The prefix test
+  // alone cannot carry that second case — replacing `foo` with `foobar` leaves
+  // exactly the text typing `bar` would have.
+  const mentionOpen =
+    trigger !== null &&
+    !(trigger.start === dismissed?.start && trigger.query.startsWith(dismissed.query));
+  const mentionResults = useMentionItems({
+    // A dismissed menu searches nothing: it isn't rendered, so a request per
+    // keystroke would be a workspace walk for no one.
+    trigger: mentionOpen ? trigger : null,
+    serverUrl,
+    workspaceId,
+    enabled: mentionsEnabled,
+  });
+  const mentionItems = mentionResults.items;
+  // The highlight follows a list that changes under it, so it is clamped rather
+  // than reset: a shrinking result set keeps a valid selection.
+  const highlightedIndex =
+    mentionItems.length === 0 ? -1 : Math.min(highlighted, mentionItems.length - 1);
+  const highlightedItem = highlightedIndex >= 0 ? mentionItems[highlightedIndex] : undefined;
+
+  /** Re-read the caret's surroundings after anything that could move it. */
+  const syncTrigger = useCallback(
+    (element: HTMLTextAreaElement) => {
+      const next = mentionsEnabled
+        ? detectTrigger(element.value, element.selectionStart ?? element.value.length)
+        : null;
+      setTrigger(next);
+      // Leaving the token clears the dismissal, so deleting a mention and
+      // typing a fresh one opens the menu again.
+      if (!next) {
+        setDismissed(null);
+      }
+    },
+    [mentionsEnabled],
+  );
+
+  // A new token, or a new query within it, means a new result set — start at the
+  // top of it.
+  useEffect(() => {
+    setHighlighted(0);
+  }, [trigger?.kind, trigger?.start, trigger?.query]);
+
+  const acceptMention = useCallback(
+    (item: MentionItem) => {
+      if (!trigger) {
+        return;
+      }
+      const applied = applyMention(task, trigger, item);
+      setTask(applied.text);
+      pendingCaret.current = applied.caret;
+      setTrigger(null);
+    },
+    [task, trigger],
+  );
+
+  // Placing the caret has to wait for the inserted text to be in the DOM. The
+  // re-sync afterwards is what keeps a directory's menu open on its new query
+  // while a file's menu closes on the space that follows it.
+  useLayoutEffect(() => {
+    const caret = pendingCaret.current;
+    const element = textareaRef.current;
+    if (caret === null || !element) {
+      return;
+    }
+    pendingCaret.current = null;
+    element.focus();
+    element.setSelectionRange(caret, caret);
+    syncTrigger(element);
+  });
 
   const addFiles = useCallback(
     async (files: FileList | File[]) => {
@@ -208,6 +318,9 @@ export const Composer = memo(function Composer({
   function submit() {
     if (!canSend) return;
     onSend(task.trim(), images);
+    // The draft the menu was completing is on its way out; nothing about the
+    // text that follows will move the caret, so close it here.
+    setTrigger(null);
     // While editing, clearing is the parent's job: dropping `editing` changes
     // our key and remounts us empty. Clearing here too would wipe the draft on
     // a *failed* submit — the one case where the user needs it back, since the
@@ -291,10 +404,63 @@ export const Composer = memo(function Composer({
               ))}
             </div>
           )}
+          {mentionOpen && trigger ? (
+            <MentionMenu
+              results={mentionResults}
+              activeIndex={highlightedIndex}
+              listId={mentionListId}
+              optionId={mentionOptionId}
+              emptyLabel={emptyMentionLabel(trigger)}
+              onSelect={acceptMention}
+              onHover={setHighlighted}
+            />
+          ) : null}
           <Textarea
+            ref={textareaRef}
             value={task}
-            onChange={(event) => setTask(event.target.value)}
+            onChange={(event) => {
+              setTask(event.target.value);
+              // Replacing the dismissed token is a new mention and re-opens the
+              // menu; typing on past it is the continuation the dismissal is
+              // meant to stay shut for.
+              if (replacingSelection.current) {
+                setDismissed(null);
+              }
+              replacingSelection.current = false;
+              syncTrigger(event.target);
+            }}
+            // Arrow keys, Home/End and clicks move the caret without changing
+            // the text, and the menu follows the caret.
+            onKeyUp={(event) => syncTrigger(event.currentTarget)}
+            onClick={(event) => syncTrigger(event.currentTarget)}
+            onBlur={() => setTrigger(null)}
             onKeyDown={(event) => {
+              noteSelection(event.currentTarget);
+              // While the menu is open it owns the navigation keys — but never
+              // mid-composition, where Enter is the IME committing a candidate.
+              if (mentionOpen && !event.nativeEvent.isComposing) {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  if (mentionItems.length > 0) {
+                    const step = event.key === "ArrowDown" ? 1 : -1;
+                    const from = highlightedIndex < 0 ? 0 : highlightedIndex;
+                    setHighlighted((from + step + mentionItems.length) % mentionItems.length);
+                  }
+                  return;
+                }
+                if ((event.key === "Enter" || event.key === "Tab") && highlightedItem) {
+                  event.preventDefault();
+                  acceptMention(highlightedItem);
+                  return;
+                }
+                if (event.key === "Escape" && trigger) {
+                  // Dismiss the menu only; an Escape meant for the edit banner
+                  // is the *second* one, once the menu is gone.
+                  event.preventDefault();
+                  setDismissed({ start: trigger.start, query: trigger.query });
+                  return;
+                }
+              }
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 submit();
@@ -304,15 +470,28 @@ export const Composer = memo(function Composer({
                 onCancelEdit();
               }
             }}
-            onPaste={handlePaste}
+            onPaste={(event) => {
+              noteSelection(event.currentTarget);
+              handlePaste(event);
+            }}
             disabled={frozen}
+            // The ARIA 1.2 combobox pattern: `textbox` (a textarea's implicit
+            // role) carries no `aria-expanded`, so without this the popup below
+            // is never announced as attached to the field.
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={mentionOpen}
+            aria-controls={mentionOpen ? mentionListId : undefined}
+            aria-activedescendant={
+              mentionOpen && highlightedIndex >= 0 ? mentionOptionId(highlightedIndex) : undefined
+            }
             placeholder={
               evicted
                 ? "Session opened in another window — take over to continue"
-                : "Enter to send, Shift+Enter for newline"
+                : "Enter to send, Shift+Enter for newline, @ for files, / for skills"
             }
             className={[
-              "min-h-[104px] pb-20 pr-3 sm:min-h-[80px] sm:pb-10",
+              "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
               dragOver ? "border-primary ring-1 ring-primary" : "",
             ]
               .filter(Boolean)
@@ -331,7 +510,7 @@ export const Composer = memo(function Composer({
               e.target.value = "";
             }}
           />
-          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center justify-between gap-1">
+          <div className="absolute bottom-2 left-2 right-2 flex flex-wrap items-center gap-1">
             <div className="flex min-w-0 items-center gap-1">
               {showControls ? (
                 <PermissionSelector
@@ -344,7 +523,7 @@ export const Composer = memo(function Composer({
                 />
               ) : null}
             </div>
-            <div className="flex min-w-0 items-center gap-1">
+            <div className="ml-auto flex min-w-0 items-center gap-1">
               {showControls && contextWindow ? (
                 <ContextUsage contextWindow={contextWindow} records={usage} />
               ) : null}
