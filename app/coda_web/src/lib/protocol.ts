@@ -39,6 +39,13 @@ export type AssistantMessage = {
 
 export type ToolOutput = { Ok: string } | { Err: string };
 
+export type ToolArtifact = {
+  type: "file_diff";
+  path: string;
+  operation: "create" | "modify" | "delete";
+  patch: string;
+};
+
 export type ToolCallOutcome =
   | "Auto"
   | "Approved"
@@ -54,6 +61,7 @@ export type ToolMessage = {
   name: string;
   output: ToolOutput;
   outcome: ToolCallOutcome;
+  artifacts?: ToolArtifact[];
   /** RFC 3339 timestamps; the gap between them is the execution duration.
    * `started_at` is absent for instantly-resolved calls (rejections, dispatch errors). */
   started_at?: string | null;

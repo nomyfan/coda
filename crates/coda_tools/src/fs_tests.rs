@@ -401,17 +401,93 @@ async fn write_creates_new_file() {
     let path = tmp_path("write_new");
     std::fs::remove_file(&path).ok();
     let tool = WriteFileTool::new(test_locks());
+    let ctx = ToolCallContext::default();
     tool.execute(
         WriteFileToolParams {
             file_path: path.to_str().unwrap().to_string(),
             content: "hello".to_string(),
         },
-        ToolCallContext::default(),
+        ctx.clone(),
     )
     .await
     .unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    let artifacts = ctx.take_artifacts();
+    let [
+        ToolArtifact::FileDiff {
+            path: artifact_path,
+            operation,
+            patch,
+        },
+    ] = artifacts.as_slice()
+    else {
+        panic!("expected one file diff artifact");
+    };
+    assert_eq!(artifact_path, path.to_str().unwrap());
+    assert_eq!(*operation, FileChangeOperation::Create);
+    assert!(
+        patch.starts_with(&format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n",
+            path = path.display(),
+        )),
+        "{patch}",
+    );
+    assert!(patch.contains("+hello"), "{patch}");
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn edit_records_the_applied_change_as_a_diff_artifact() {
+    let path = tmp_file("edit_artifact", "before\n");
+    let tool = EditFileTool::new(test_locks());
+    let ctx = ToolCallContext::default();
+    tool.execute(
+        EditFileToolParams {
+            file_path: path.to_str().unwrap().to_string(),
+            old_string: "before".to_string(),
+            new_string: "after".to_string(),
+            replace_all: None,
+        },
+        ctx.clone(),
+    )
+    .await
+    .unwrap();
+
+    let artifacts = ctx.take_artifacts();
+    let [
+        ToolArtifact::FileDiff {
+            operation, patch, ..
+        },
+    ] = artifacts.as_slice()
+    else {
+        panic!("expected one file diff artifact");
+    };
+    assert_eq!(*operation, FileChangeOperation::Modify);
+    assert!(
+        patch.starts_with(&format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n",
+            path = path.display(),
+        )),
+        "{patch}",
+    );
+    assert!(patch.contains("-before"), "{patch}");
+    assert!(patch.contains("+after"), "{patch}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn diff_artifact_quotes_special_characters_in_paths() {
+    let ToolArtifact::FileDiff { patch, .. } = file_diff_artifact(
+        "/tmp/a b\tline\n\"file\\.txt",
+        FileChangeOperation::Modify,
+        "before\n",
+        "after\n",
+    );
+
+    assert_eq!(
+        patch.lines().next().unwrap(),
+        "diff --git \"a//tmp/a b\\tline\\n\\\"file\\\\.txt\" \"b//tmp/a b\\tline\\n\\\"file\\\\.txt\"",
+    );
 }
 
 #[tokio::test]

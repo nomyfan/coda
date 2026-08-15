@@ -1,6 +1,8 @@
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use coda_core::llm::{FileChangeOperation, ToolArtifact};
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 
 use crate::locks::KeyedLock;
@@ -245,7 +247,7 @@ impl Tool for WriteFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let locks = self.locks.clone();
         async move {
@@ -302,6 +304,13 @@ impl Tool for WriteFileTool {
             file.flush()
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
+
+            ctx.record_artifact(file_diff_artifact(
+                &params.file_path,
+                FileChangeOperation::Create,
+                "",
+                &params.content,
+            ));
 
             Ok(format!(
                 "Successfully wrote {} bytes to {}",
@@ -362,7 +371,7 @@ impl Tool for EditFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let locks = self.locks.clone();
         async move {
@@ -440,12 +449,92 @@ impl Tool for EditFileTool {
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
 
+            ctx.record_artifact(file_diff_artifact(
+                &params.file_path,
+                FileChangeOperation::Modify,
+                &content,
+                &updated,
+            ));
+
             Ok(format!(
                 "Successfully replaced {} occurrence(s) in {}",
                 replaced, params.file_path
             ))
         }
     }
+}
+
+fn file_diff_artifact(
+    path: &str,
+    operation: FileChangeOperation,
+    before: &str,
+    after: &str,
+) -> ToolArtifact {
+    let original_path = git_patch_path('a', path);
+    let modified_path = git_patch_path('b', path);
+    let (original_filename, modified_filename, mode) = match operation {
+        FileChangeOperation::Create => {
+            ("/dev/null".to_string(), modified_path.clone(), Some("new"))
+        }
+        FileChangeOperation::Modify => (original_path.clone(), modified_path.clone(), None),
+        FileChangeOperation::Delete => (
+            original_path.clone(),
+            "/dev/null".to_string(),
+            Some("deleted"),
+        ),
+    };
+
+    let mut options = diffy::DiffOptions::new();
+    options
+        .set_original_filename(original_filename)
+        .set_modified_filename(modified_filename);
+
+    let mut patch = format!("diff --git {original_path} {modified_path}\n");
+    if let Some(mode) = mode {
+        writeln!(patch, "{mode} file mode 100644").unwrap();
+    }
+    patch.push_str(
+        &diffy::PatchFormatter::new()
+            .fmt_patch(&options.create_patch(before, after))
+            .to_string(),
+    );
+
+    ToolArtifact::FileDiff {
+        path: path.to_string(),
+        operation,
+        patch,
+    }
+}
+
+fn git_patch_path(prefix: char, path: &str) -> String {
+    let path = format!("{prefix}/{path}");
+    if !path
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '\\' | '"'))
+    {
+        return path;
+    }
+
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for ch in path.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if ch.is_control() => {
+                let mut bytes = [0; 4];
+                for byte in ch.encode_utf8(&mut bytes).bytes() {
+                    write!(quoted, "\\{byte:03o}").unwrap();
+                }
+            }
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 // ---- ListDirectory ----

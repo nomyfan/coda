@@ -7,13 +7,13 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#fcfbf9" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#262321" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#221f1d" media="(prefers-color-scheme: dark)" />
     <script>
       (() => {
         // Pre-CSS seed to avoid a flash before the stylesheet loads; must match
         // --background in src/index.css (:root / .dark). Cleared by
         // applyThemePreference() once the app mounts and CSS takes over.
-        const colors = { light: "#fcfbf9", dark: "#262321" };
+        const colors = { light: "#fcfbf9", dark: "#221f1d" };
         const saved = localStorage.getItem("coda-theme");
         const preference =
           saved === "light" || saved === "dark" || saved === "system" ? saved : "system";

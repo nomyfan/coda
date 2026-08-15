@@ -19,10 +19,7 @@ impl ThreadState for FakeThread {
 }
 
 fn ctx(thread: &Arc<FakeThread>) -> ToolCallContext {
-    ToolCallContext {
-        state: thread.clone(),
-        ..Default::default()
-    }
+    ToolCallContext::new(Default::default(), thread.clone())
 }
 
 fn params(titles: &[(&str, bool)]) -> WriteTodosParams {
