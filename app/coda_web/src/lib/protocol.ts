@@ -120,7 +120,7 @@ export type ReasoningEffort = string;
  * How much a session may do without stopping to ask. An allow-list: the tools a
  * mode covers run unattended, everything else suspends for approval.
  *
- * - `explore` — read-only tools only.
+ * - `explore` — inspection tools, plus shell commands pre-approved by the workspace.
  * - `accept_edits` — plus writing files. The default for a new session.
  * - `yolo` — everything, `shell` included. Only what outranks the mode still
  *   stops a call: `ask_user`, the workspace's `approval_required` list, and its

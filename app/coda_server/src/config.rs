@@ -542,8 +542,8 @@ fn resolve_workspace_path(base_dir: &Path, raw_path: &str) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Look, don't touch: inspection tools only. Anything that writes a file or
-    /// runs a command asks first.
+    /// Built-in inspection tools. Workspace shell rules may separately
+    /// auto-approve specific commands.
     Explore,
     /// [`Self::Explore`] plus the file-editing tools. The default for a new
     /// session.
@@ -824,13 +824,6 @@ fn default_approval_required_tools() -> Vec<String> {
         .collect()
 }
 
-/// Whether `command` can be auto-approved against the given rules.
-///
-/// Parses the command and reduces it to a flat list of plain simple commands.
-/// Returns `true` only when every simple command matches `allow` and none
-/// matches `deny`. Any construct that can't be statically reduced — a parse
-/// error, backgrounding, redirections, substitutions, compound commands, etc.
-/// — yields `false` (require approval).
 /// Whether any simple command in `command` matches a `deny` glob.
 ///
 /// The deny-list is the one rule [`PermissionMode::Yolo`] still respects, so
@@ -847,6 +840,13 @@ fn matches_deny(command: &str, deny: &[String]) -> bool {
         .any(|cmd| deny.iter().any(|p| wildcard_match(p, cmd)))
 }
 
+/// Whether `command` can be auto-approved against the given rules.
+///
+/// Parses the command and reduces it to a flat list of plain simple commands.
+/// Returns `true` only when every simple command matches `allow` and none
+/// matches `deny`. Any construct that can't be statically reduced — a parse
+/// error, backgrounding, redirections, substitutions, compound commands, etc.
+/// — yields `false` (require approval).
 fn is_auto_approved(command: &str, allow: &[String], deny: &[String]) -> bool {
     let Some(simple_commands) = decompose(command) else {
         return false;

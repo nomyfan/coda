@@ -1,11 +1,17 @@
 import { beforeEach, expect, test } from "vitest";
+import { JSONRPCErrorException } from "json-rpc-2.0";
 
 import {
   forgetSessionMode,
   initialSessionMode,
   rememberSessionMode,
 } from "../src/store/permission-modes.ts";
-import { applySnapshotToSession, type OpenedSession } from "../src/store/session.ts";
+import {
+  applySnapshotToSession,
+  codaStore,
+  setPermissionMode,
+  type OpenedSession,
+} from "../src/store/session.ts";
 
 const values = new Map<string, string>();
 globalThis.window = {
@@ -19,7 +25,19 @@ globalThis.window = {
   },
 } as unknown as Window & typeof globalThis;
 
-beforeEach(() => values.clear());
+const testServer = "ws://permission-modes";
+
+beforeEach(() => {
+  values.clear();
+  codaStore.setState((state) => {
+    delete state.rpcMap[testServer];
+    delete state.servers[testServer];
+    if (state.activeServer === testServer) {
+      state.activeServer = undefined;
+      state.activeKey = undefined;
+    }
+  });
+});
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
@@ -105,4 +123,67 @@ test("an unrecorded session falls back to what the caller already knows", () => 
   // A record still wins over the caller's guess.
   rememberSessionMode("ws://one", "alpha", "forked", "yolo");
   expect(initialSessionMode("ws://one", "alpha", "forked", "explore")).toBe("yolo");
+});
+
+test("an evicted session ignores permission changes", () => {
+  let requests = 0;
+  codaStore.setState((state) => {
+    state.servers[testServer] = {
+      url: testServer,
+      status: "connected",
+      catalog: [],
+      providers: [],
+      sessions: {
+        "ws/s1": session({ evicted: true, permissionMode: "explore" }),
+      },
+    };
+    state.activeServer = testServer;
+    state.activeKey = "ws/s1";
+    state.rpcMap[testServer] = {
+      request: () => {
+        requests += 1;
+        return Promise.resolve(undefined);
+      },
+    } as never;
+  });
+  rememberSessionMode(testServer, "ws", "s1", "explore");
+
+  setPermissionMode("yolo");
+
+  expect(requests).toBe(0);
+  expect(codaStore.getState().servers[testServer]?.sessions["ws/s1"]?.permissionMode).toBe(
+    "explore",
+  );
+  expect(initialSessionMode(testServer, "ws", "s1")).toBe("explore");
+});
+
+test("an explicit server rejection rolls back the optimistic permission change", async () => {
+  codaStore.setState((state) => {
+    state.servers[testServer] = {
+      url: testServer,
+      status: "connected",
+      catalog: [],
+      providers: [],
+      sessions: {
+        "ws/s1": session({ permissionMode: "explore" }),
+      },
+    };
+    state.activeServer = testServer;
+    state.activeKey = "ws/s1";
+    state.rpcMap[testServer] = {
+      request: () => Promise.reject(new JSONRPCErrorException("session is not live", -32000)),
+    } as never;
+  });
+  rememberSessionMode(testServer, "ws", "s1", "explore");
+
+  setPermissionMode("yolo");
+  expect(codaStore.getState().servers[testServer]?.sessions["ws/s1"]?.permissionMode).toBe("yolo");
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(codaStore.getState().servers[testServer]?.sessions["ws/s1"]?.permissionMode).toBe(
+    "explore",
+  );
+  expect(initialSessionMode(testServer, "ws", "s1")).toBe("explore");
 });

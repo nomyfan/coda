@@ -2894,18 +2894,17 @@ function setSessionMode(store: CodaStore, server: string, key: SessionKey, mode:
 /**
  * Change the active session's posture.
  *
- * Applied locally first, unlike `setModel`: the server cannot refuse this on
- * any ground the user could act on — there is no "locked" or "busy" case, since
- * nothing is rebuilt — and a mode the user picked should be visible whether
- * or not the session has been opened yet. A draft session carries it out in its
- * `open_session`; a live one sends it now.
+ * Applied locally first so drafts carry the choice into `open_session` and a
+ * dropped connection can retry it while reconnecting. A live server may still
+ * reject a stale session, in which case the optimistic choice is rolled back.
  */
 export function setPermissionMode(mode: PermissionMode) {
   const active = currentActive();
-  if (!active || active.session.deleting) {
+  if (!active || active.session.deleting || active.session.evicted) {
     return;
   }
   const { server, session } = active;
+  const previousMode = session.permissionMode;
   setSessionMode(codaStore, server, session.key, mode);
   rememberSessionMode(server, session.workspaceId, session.sessionId, mode);
   if (session.draft) {
@@ -2924,6 +2923,13 @@ export function setPermissionMode(mode: PermissionMode) {
     })
     .catch((err) => {
       if (isServerError(err)) {
+        // Do not let an older failed request overwrite a choice made while it
+        // was in flight.
+        const current = codaStore.getState().servers[server]?.sessions[session.key];
+        if (current?.permissionMode === mode) {
+          setSessionMode(codaStore, server, session.key, previousMode);
+          rememberSessionMode(server, session.workspaceId, session.sessionId, previousMode);
+        }
         addSessionActivity(server, session.workspaceId, session.sessionId, {
           tone: "warning",
           label: "permission change failed",
