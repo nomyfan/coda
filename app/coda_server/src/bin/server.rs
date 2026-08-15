@@ -42,7 +42,6 @@ use coda_server::{
         RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
         SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
         Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
-
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
