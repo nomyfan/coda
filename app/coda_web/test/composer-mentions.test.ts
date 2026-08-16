@@ -9,6 +9,8 @@ import {
   mentionName,
   mentionParent,
   rankMentionItems,
+  rankSlashItems,
+  SLASH_COMMANDS,
 } from "../src/lib/composer-mentions.ts";
 
 /** Detect at the end of `text`, which is where a caret sits while typing. */
@@ -113,6 +115,14 @@ test("accepting a directory keeps the query going", () => {
   });
 });
 
+test("accepting a command inserts it the same way a skill does", () => {
+  const text = "/comp";
+  const applied = applyMention(text, trigger(text), { kind: "command", value: "compact" });
+
+  expect(applied.text).toBe("/compact ");
+  expect(detectTrigger(applied.text, applied.caret)).toBeNull();
+});
+
 test("accepting a skill inserts its name and closes the menu", () => {
   const text = "please /rev";
   const applied = applyMention(text, trigger(text), { kind: "skill", value: "code-review" });
@@ -203,5 +213,26 @@ test("a path shows as a name and the directories leading to it", () => {
 
 test("an empty menu says what it was looking for", () => {
   expect(emptyMentionLabel(trigger("@comp"))).toBe("No matching files");
-  expect(emptyMentionLabel(trigger("/rev"))).toBe("No matching skills");
+  expect(emptyMentionLabel(trigger("/rev"))).toBe("No matching commands or skills");
+});
+
+test("the slash menu lists matching commands above matching skills", () => {
+  const skills: MentionItem[] = [
+    { kind: "skill", value: "compact" },
+    { kind: "skill", value: "code-review" },
+  ];
+
+  expect(rankSlashItems(skills, "").map((item) => `${item.kind}:${item.value}`)).toEqual([
+    "command:compact",
+    "skill:compact",
+    "skill:code-review",
+  ]);
+  expect(rankSlashItems(skills, "comp").map((item) => `${item.kind}:${item.value}`)).toEqual([
+    "command:compact",
+    "skill:compact",
+  ]);
+  expect(rankSlashItems(skills, "review").map((item) => `${item.kind}:${item.value}`)).toEqual([
+    "skill:code-review",
+  ]);
+  expect(SLASH_COMMANDS.map((item) => item.value)).toEqual(["compact"]);
 });

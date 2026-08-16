@@ -458,6 +458,8 @@ pub enum CompactResult {
     /// Nothing was written at all — the client can retry as it stands.
     /// `stale` distinguishes "the conversation moved on" from a write failure.
     Abandoned { stale: bool, reason: String },
+    /// The root thread has no history to summarize.
+    Empty,
 }
 
 /// Params of an `event` notification: one live runtime event. Nested under

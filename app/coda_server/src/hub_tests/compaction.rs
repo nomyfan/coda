@@ -36,6 +36,25 @@ async fn attached_compaction(
     (hub, opener, attach.events)
 }
 
+/// One settled turn so the live snapshot is not empty. A compact against an
+/// empty thread is refused before the opener runs.
+async fn seed_history(hub: &SessionHub, events: &mut BoxStream<'static, RelayEvent>) {
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "prior work".into(),
+                images: vec![],
+            },
+        )
+        .await,
+        CommandOutcome::TaskAccepted { .. }
+    ));
+    next_matching(events, is_settling_llm_end).await;
+    wait_idle(hub).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn compaction_stays_attachable_but_gates_every_history_mutation() {
     let gate = Arc::new(Notify::new());
@@ -54,6 +73,7 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
         .await
         .expect("attach");
     let mut old_events = attach.events;
+    seed_history(&hub, &mut old_events).await;
 
     let compact = {
         let hub = hub.clone();
@@ -110,7 +130,7 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
             },
         )
         .await,
-        CommandOutcome::TurnRunning
+        CommandOutcome::NotIdle
     ));
     assert!(matches!(
         hub.command(
@@ -126,6 +146,8 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
         CommandOutcome::NotIdle
     ));
     assert!(matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle));
+    assert!(matches!(hub.delete(key(), 2).await, DeleteOutcome::NotIdle));
+    assert!(hub.get_entry(&key()).is_some());
     assert!(opener.forks.lock().unwrap().is_empty());
     assert!(matches!(
         hub.command(
@@ -149,9 +171,12 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
     else {
         unreachable!()
     };
-    assert_eq!(finished.messages.len(), 2);
     assert!(
-        matches!(&finished.messages[1], Message::Custom(message) if message.kind == "compaction")
+        finished.messages.len() >= 2,
+        "the prior turn plus the two compaction messages"
+    );
+    assert!(
+        matches!(finished.messages.last(), Some(Message::Custom(message)) if message.kind == "compaction")
     );
 
     // A snapshot event is not terminal: the same stream carries the next turn.
@@ -189,6 +214,7 @@ async fn detach_during_compaction_releases_only_after_it_finishes() {
         .await
         .expect("attach");
     let mut events = attach.events;
+    seed_history(&hub, &mut events).await;
     let compact = {
         let hub = hub.clone();
         tokio::spawn(async move {
@@ -221,6 +247,7 @@ async fn detach_during_compaction_releases_only_after_it_finishes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_summary_failure_writes_history_without_moving_the_boundary() {
     let (hub, _opener, mut events) = attached_compaction(Ok(false)).await;
+    seed_history(&hub, &mut events).await;
 
     assert!(matches!(
         hub.command(
@@ -239,9 +266,8 @@ async fn a_recorded_summary_failure_writes_history_without_moving_the_boundary()
     else {
         unreachable!()
     };
-    assert_eq!(finished.messages.len(), 2);
     assert!(
-        matches!(&finished.messages[1], Message::Custom(message) if message.kind == "compaction_failed")
+        matches!(finished.messages.last(), Some(Message::Custom(message)) if message.kind == "compaction_failed")
     );
     hub.shutdown_all().await;
 }
@@ -249,6 +275,7 @@ async fn a_recorded_summary_failure_writes_history_without_moving_the_boundary()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_compaction_writes_nothing_and_still_clears_busy() {
     let (hub, _opener, mut events) = attached_compaction(Err(CompactError::Stale)).await;
+    seed_history(&hub, &mut events).await;
 
     assert!(matches!(
         hub.command(
@@ -267,7 +294,13 @@ async fn a_stale_compaction_writes_nothing_and_still_clears_busy() {
     else {
         unreachable!()
     };
-    assert!(finished.messages.is_empty());
+    assert!(
+        !finished
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Custom(_))),
+        "a stale compaction must not append a marker"
+    );
 
     // There is no hidden terminal event after the closing snapshot.
     assert!(
@@ -338,6 +371,30 @@ async fn a_turn_in_flight_refuses_compaction_without_writing_a_marker() {
             .messages
             .iter()
             .any(|message| matches!(message, Message::Custom(_)))
+    );
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_thread_is_refused_without_writing_or_going_busy() {
+    let (hub, _opener, mut events) = attached_compaction(Ok(true)).await;
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Compact {
+                instructions: String::new(),
+            },
+        )
+        .await,
+        CommandOutcome::CompactionEmpty
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), events.next())
+            .await
+            .is_err(),
+        "refusing an empty thread must not push a compacting snapshot"
     );
     hub.shutdown_all().await;
 }

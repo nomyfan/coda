@@ -186,6 +186,8 @@ pub enum CommandOutcome {
     /// A `Compact` that wrote nothing: the conversation moved on while the
     /// summary was being generated, or the write failed.
     CompactionAbandoned { stale: bool, reason: String },
+    /// A `Compact` refused because the root thread has nothing to summarize.
+    CompactionEmpty,
     /// The replacement runtime was valid, but persisting its effort failed;
     /// the current live runtime remains unchanged.
     PersistenceFailed(String),
@@ -200,6 +202,16 @@ pub enum ForkOutcome {
     /// a human, or a task is queued behind the current one.
     NotIdle,
     Failed(ForkError),
+}
+
+/// Result of [`SessionRelay::delete`].
+pub enum DeleteOutcome {
+    Deleted,
+    /// Another connection currently holds the session.
+    NotOwner,
+    /// A compaction is running. Deleting would waste the summary and race the
+    /// commit; wait it out.
+    NotIdle,
 }
 
 /// What a compaction wrote to the root thread. Both messages are always
@@ -218,6 +230,8 @@ pub enum CompactError {
     /// The root thread grew while the summary was being generated, so the
     /// summary no longer describes the whole thread.
     Stale,
+    /// There is no root-thread history to summarize.
+    Empty,
     Storage(String),
 }
 
@@ -353,17 +367,18 @@ pub trait SessionRelay: Send + Sync {
     fn detach_all<'a>(&'a self, conn_id: ConnId) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Stop and remove the session immediately (aborting in-flight work, no
-    /// checkpoint write-back). Returns `true` once the runtime is gone so the
-    /// caller can safely delete persisted state, and `false` when the session
-    /// is currently attached by a *different* connection — a stale client must
-    /// not be able to erase work another client is driving (latest-wins).
-    /// Unattached sessions (e.g. deleting history from the catalog) are fair
-    /// game for any connection.
+    /// checkpoint write-back). [`DeleteOutcome::Deleted`] means the runtime is
+    /// gone so the caller can safely delete persisted state.
+    /// [`DeleteOutcome::NotOwner`] is a stale client trying to erase work
+    /// another connection is driving (latest-wins). [`DeleteOutcome::NotIdle`]
+    /// is a running compaction: the summary is in flight with no lock held, and
+    /// deleting now would only waste it. Unattached idle sessions (e.g. deleting
+    /// history from the catalog) are fair game for any connection.
     fn delete<'a>(
         &'a self,
         key: SessionKey,
         conn_id: ConnId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = DeleteOutcome> + Send + 'a>>;
 
     /// Copy `source` under a new session id, keeping the turns before the user
     /// message named by `cut` (`None` copies everything stored).
@@ -946,6 +961,9 @@ impl SessionHub {
             {
                 return CommandOutcome::NotIdle;
             }
+            if live.snapshot.is_empty() {
+                return CommandOutcome::CompactionEmpty;
+            }
             state.compacting = true;
             (
                 live.provider_id.clone(),
@@ -988,6 +1006,7 @@ impl SessionHub {
                 stale: true,
                 reason: "the conversation changed while it was being summarized".to_string(),
             },
+            Err(CompactError::Empty) => CommandOutcome::CompactionEmpty,
             Err(CompactError::Storage(reason)) => {
                 warn!(workspace_id = %key.0, session_id = %key.1, "compaction failed to persist: {reason}");
                 CommandOutcome::CompactionAbandoned {
@@ -1226,7 +1245,7 @@ impl SessionHub {
         // The rebuild below replaces the whole `LiveState`, which a running
         // compaction is about to write its result into.
         if state.compacting {
-            return CommandOutcome::TurnRunning;
+            return CommandOutcome::NotIdle;
         }
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
@@ -1515,10 +1534,10 @@ impl SessionRelay for SessionHub {
         &'a self,
         key: SessionKey,
         conn_id: ConnId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = DeleteOutcome> + Send + 'a>> {
         Box::pin(async move {
             let Some(entry) = self.get_entry(&key) else {
-                return true; // nothing live; persisted state is free to go
+                return DeleteOutcome::Deleted; // nothing live; persisted state is free to go
             };
             let mut guard = entry.inner.clone().lock_owned().await;
             let state = &mut *guard;
@@ -1534,7 +1553,10 @@ impl SessionRelay for SessionHub {
                     session_id = %key.1,
                     "rejecting delete from a connection that is not attached"
                 );
-                return false;
+                return DeleteOutcome::NotOwner;
+            }
+            if state.compacting {
+                return DeleteOutcome::NotIdle;
             }
             if matches!(
                 state.phase,
@@ -1551,7 +1573,7 @@ impl SessionRelay for SessionHub {
                         }
                     }
                 }
-                return true;
+                return DeleteOutcome::Deleted;
             }
             if let Some(attachment) = state.attached.take() {
                 let _ = attachment.tx.send(RelayEvent::Evicted);
@@ -1564,7 +1586,7 @@ impl SessionRelay for SessionHub {
             drop(guard);
             // Inline: the caller deletes persisted state right after.
             release.await;
-            true
+            DeleteOutcome::Deleted
         })
     }
 

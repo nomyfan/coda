@@ -1,6 +1,6 @@
 # Compaction — 设计方案
 
-> 状态：v4，待评审。
+> 状态：v4.4 已实现。评审见 `docs/review/compaction.md`。
 > v1→v2：移除自动 compaction，只保留显式 `/compact`。
 > v2→v3：整体下沉到应用层（`coda_server`），运行层只剩一处改动；压缩记录改用 `thread_state` 边界标记。
 > v3→v4：**拆分 `Message` / `RequestMessage`**，新增 `Message::Custom`；压缩边界改由摘要消息自身承担，**`thread_state` 标记整个去掉**。
@@ -8,6 +8,7 @@
 > v4.1→v4.2（评审修订）：修正 CAS 的 root thread id（是 session id，不是字面量 `"root"`）；`compacting` 改挂 `EntryState` 并补上 `rewind` 门闩；`compacting` 进 snapshot。
 > v4.2→v4.3（评审修订）：`CustomRole` 收窄为 `User | Assistant`（`Tool` 降级不出合法消息）；快照推送改为新增内部事件 `RelayEvent::Snapshot`，压缩开始与结束各推一次。
 > v4.3→v4.4（评审修订）：`compact` RPC 响应不再携带消息实体，transcript 只由快照事件更新。
+> v4.4→v4.5：`coda_web` 发送 `/compact` 时先乐观展示该行（`pendingCompact` 标记），结束快照按内容对账；响应仍只报告结果，失败/拒绝路径移除乐观副本。
 
 ## Problem
 
@@ -146,7 +147,7 @@ User(下一个任务)…
 - `coda_core`：拆 `Message` / `RequestMessage`，新增 `Message::Custom` 与 `From<&Message> for RequestMessage`。
 - `coda_agent`：`compaction::view()` 纯函数 + `Agent::messages()` 调用它并降级。
 - `coda_server`：`SessionOpener::compact()`（读视图 → 摊平 → 调一次 LLM → 一个事务写回）、`SessionCommand::Compact`、`compact` RPC、内置 `compaction-prompt.md`；`EntryState.compacting` 门闩；`message_row_identity` 增加 `"custom"` role；`SnapshotPayload` / `Snapshot` 增加 `compacting` 字段；新增内部事件 `RelayEvent::Snapshot`。
-- `coda_web`：`HistoryMessage` 增加 `Custom` 分支、去掉 `System` 分支；`Snapshot` 类型跟进 `compacting`；composer 识别 `/compact ` 前缀，改调 `compact` RPC 而非 `task`，进行中状态由快照驱动。
+- `coda_web`：`HistoryMessage` 增加 `Custom` 分支、去掉 `System` 分支；`Snapshot` 类型跟进 `compacting`；composer 识别 `/compact ` 前缀，改调 `compact` RPC 而非 `task`，进行中状态由快照驱动；发送时先乐观展示 `/compact` 行（`pendingCompact` 标记，非 turn、不置 `running`），结束快照按内容对账、失败/拒绝时移除。
 
 **Out:**
 
@@ -223,7 +224,7 @@ User(下一个任务)…
 7. **`compact` RPC（新）** — 参数 `{ workspace_id, session_id, instructions }`。响应**只报告结果，不带消息实体**：`"applied"`（边界已推进）/ `"recorded"`（摘要失败，记录已写，边界未动）/ `"stale"` / `"storage_error"`（都是一条没写、可原样重试）。transcript 一律由快照事件更新，见 Decision 9。
 8. **`compacting` 上线（新字段 + 新内部事件）** — `hub.rs:92` 的 `SnapshotPayload`、`wire.rs:415` 的 `Snapshot`、`protocol.ts` 的对应类型各加一个 `compacting: bool`，`session.ts` 读它的地方（`2050`/`2183`）跟着传。另加内部事件 `RelayEvent::Snapshot(Box<SnapshotPayload>)`，hub 在压缩**开始**与**结束**各推一次；连接层把它转成已有的 `snapshot` wire 通知。**这个变体不终止流**——`Evicted` / `Closed` 都是终止的，连接层处理它时不能动 `streams` / `selections` / `reattached`。
 9. **`compaction-prompt.md`（新）** — 内置摘要 system prompt，说明如何对待用户追加的自定义要求。
-10. **`coda_web`（改）** — `protocol.ts` 的 `HistoryMessage` 加 `{ Custom: CustomMessage }`、去掉 `{ System: string }`；`historyToEntries` 加对应分支；composer 在发送前识别 `/compact ` 前缀，改调 `compact`；**composer 的进行中状态由快照里的 `compacting` 驱动**（而非只在本地记一次），这样中途接管的客户端也能正确禁用发送；不做乐观渲染。
+10. **`coda_web`（改）** — `protocol.ts` 的 `HistoryMessage` 加 `{ Custom: CustomMessage }`、去掉 `{ System: string }`；`historyToEntries` 加对应分支；composer 在发送前识别 `/compact ` 前缀，改调 `compact`；**composer 的进行中状态由快照里的 `compacting` 驱动**（而非只在本地记一次），这样中途接管的客户端也能正确禁用发送。v4.5 修订：**发送时乐观展示 `/compact` 行**——`compact` 响应不带消息实体，结束快照按内容（`/compact` / `/compact {instructions}`）对账，移除乐观副本、保留落库行；`empty` / `abandoned` / RPC 错误路径直接移除；乐观副本带 `pendingCompact` 标记，不计入 pending task（不置 `running`，避免出现无意义的 abort 按钮）。
 
 ## Interfaces
 

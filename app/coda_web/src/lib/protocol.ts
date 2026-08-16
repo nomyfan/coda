@@ -267,7 +267,8 @@ type ModelSelectionResult = {
 export type CompactResult =
   | { outcome: "applied" }
   | { outcome: "recorded" }
-  | { outcome: "abandoned"; stale: boolean; reason: string };
+  | { outcome: "abandoned"; stale: boolean; reason: string }
+  | { outcome: "empty" };
 
 /** Params of an `event` push: one live runtime event, nested under `event`. */
 type EventPush = { workspace_id: string; session_id: string; event: WireEvent };

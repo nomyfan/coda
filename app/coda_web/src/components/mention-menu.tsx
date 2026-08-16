@@ -1,11 +1,11 @@
 import { File, Folder } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import {
   type MentionItem,
   type MentionTrigger,
   mentionName,
   mentionParent,
-  rankMentionItems,
+  rankSlashItems,
 } from "@/lib/composer-mentions";
 import { fetchWorkspaceFiles, fetchWorkspaceSkills } from "@/store/session";
 
@@ -36,9 +36,9 @@ const NO_RESULTS: MentionResults = {
  *
  * The two menus are fed differently on purpose. Files are searched server-side
  * per keystroke (debounced): a workspace holds more paths than are worth
- * shipping to the browser, and the server already ranks them. Skills are a
- * handful of entries, so they are fetched once when the menu opens and filtered
- * locally — no round trip per character.
+ * shipping to the browser, and the server already ranks them. The `/` menu is
+ * local: built-in commands plus workspace skills, fetched once when it opens
+ * and filtered per keystroke — no round trip per character.
  */
 export function useMentionItems({
   trigger,
@@ -145,7 +145,7 @@ export function useMentionItems({
   }
   return {
     ...skills,
-    items: rankMentionItems(skills.items, active.query),
+    items: rankSlashItems(skills.items, active.query),
   };
 }
 
@@ -153,7 +153,18 @@ const ITEM_ICONS = {
   file: File,
   directory: Folder,
   skill: undefined,
+  command: undefined,
 } as const;
+
+function slashGroupLabel(kind: MentionItem["kind"]): string | null {
+  if (kind === "command") {
+    return "Commands";
+  }
+  if (kind === "skill") {
+    return "Skills";
+  }
+  return null;
+}
 
 /**
  * The popup above the composer. Purely presentational: the composer owns the
@@ -195,38 +206,55 @@ export function MentionMenu({
           const isFile = item.kind === "file" || item.kind === "directory";
           const name = isFile ? mentionName(item.value) : `/${item.value}`;
           const detail = isFile ? mentionParent(item.value) : item.detail;
+          const group = slashGroupLabel(item.kind);
+          const previousGroup = index > 0 ? slashGroupLabel(items[index - 1].kind) : null;
+          const showGroup = group !== null && group !== previousGroup;
           return (
-            <li
-              key={`${item.kind}:${item.value}`}
-              ref={index === activeIndex ? activeRef : undefined}
-              id={optionId(index)}
-              role="option"
-              aria-selected={index === activeIndex}
-              className={[
-                "flex cursor-pointer items-center gap-2 px-2.5 py-1.5 text-sm",
-                index === activeIndex ? "bg-accent text-accent-foreground" : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              // Committing on mousedown keeps the caret where it is: a click
-              // that first blurred the textarea would lose the insertion point.
-              onMouseDown={(event) => {
-                event.preventDefault();
-                onSelect(item);
-              }}
-              onMouseEnter={() => onHover(index)}
-            >
-              {Icon ? <Icon className="size-3.5 shrink-0 text-muted-foreground" /> : null}
-              <span className="truncate font-medium">
-                {name}
-                {item.kind === "directory" ? "/" : ""}
-              </span>
-              {detail ? (
-                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                  {detail}
-                </span>
+            <Fragment key={`${item.kind}:${item.value}`}>
+              {showGroup ? (
+                <li
+                  role="presentation"
+                  className={[
+                    "px-2.5 py-1 text-xs text-muted-foreground",
+                    previousGroup ? "mt-1 border-t border-border pt-1.5" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                >
+                  {group}
+                </li>
               ) : null}
-            </li>
+              <li
+                ref={index === activeIndex ? activeRef : undefined}
+                id={optionId(index)}
+                role="option"
+                aria-selected={index === activeIndex}
+                className={[
+                  "flex cursor-pointer items-center gap-2 px-2.5 py-1.5 text-sm",
+                  index === activeIndex ? "bg-accent text-accent-foreground" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                // Committing on mousedown keeps the caret where it is: a click
+                // that first blurred the textarea would lose the insertion point.
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  onSelect(item);
+                }}
+                onMouseEnter={() => onHover(index)}
+              >
+                {Icon ? <Icon className="size-3.5 shrink-0 text-muted-foreground" /> : null}
+                <span className="truncate font-medium">
+                  {name}
+                  {item.kind === "directory" ? "/" : ""}
+                </span>
+                {detail ? (
+                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                    {detail}
+                  </span>
+                ) : null}
+              </li>
+            </Fragment>
           );
         })}
         {items.length === 0 ? (

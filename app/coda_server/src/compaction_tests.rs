@@ -95,7 +95,15 @@ fn user_instructions_reach_both_the_request_and_the_summary() {
         &[],
         "keep the architecture decisions",
     );
-    assert!(request_text(&request).contains("keep the architecture decisions"));
+    let text = request_text(&request);
+    let instructions_at = text
+        .find("keep the architecture decisions")
+        .expect("instructions");
+    let transcript_at = text.find("<transcript>").expect("transcript");
+    assert!(
+        instructions_at < transcript_at,
+        "instructions must precede the transcript so a truncated window cannot drop them"
+    );
 
     let Message::Custom(summary) = summary_message("keep the architecture decisions", "the gist")
     else {

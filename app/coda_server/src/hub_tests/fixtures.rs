@@ -423,6 +423,7 @@ impl SessionOpener for TestOpener {
             let applied = match &self.compact_result {
                 Ok(applied) => *applied,
                 Err(CompactError::Stale) => return Err(CompactError::Stale),
+                Err(CompactError::Empty) => return Err(CompactError::Empty),
                 Err(CompactError::Storage(reason)) => {
                     return Err(CompactError::Storage(reason.clone()));
                 }

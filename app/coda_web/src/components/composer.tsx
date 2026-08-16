@@ -174,7 +174,9 @@ export const Composer = memo(function Composer({
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
   const canAddImages = acceptsImages && !frozen && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
-  const compactCommandHasImages = images.length > 0 && parseCompactCommand(task.trim()) !== null;
+  const compactCommand = parseCompactCommand(task.trim());
+  const compactCommandHasImages = images.length > 0 && compactCommand !== null;
+  const compactOnNewSession = selectingTarget && compactCommand !== null;
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
   const requireImageModel = images.length > 0 || sessionHasImages;
@@ -188,6 +190,7 @@ export const Composer = memo(function Composer({
     !editing?.submitting &&
     !imagesBlockSend &&
     !compactCommandHasImages &&
+    !compactOnNewSession &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
   const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
@@ -203,6 +206,7 @@ export const Composer = memo(function Composer({
   // exactly the text typing `bar` would have.
   const mentionOpen =
     trigger !== null &&
+    compactCommand === null &&
     !(trigger.start === dismissed?.start && trigger.query.startsWith(dismissed.query));
   const mentionResults = useMentionItems({
     // A dismissed menu searches nothing: it isn't rendered, so a request per
@@ -494,7 +498,7 @@ export const Composer = memo(function Composer({
             placeholder={
               evicted
                 ? "Session opened in another window — take over to continue"
-                : "Enter to send, Shift+Enter for newline, @ for files, / for skills"
+                : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
             }
             className={[
               "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
@@ -607,6 +611,11 @@ export const Composer = memo(function Composer({
         {compactCommandHasImages && (
           <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
             Remove image attachments before compacting the conversation.
+          </p>
+        )}
+        {compactOnNewSession && (
+          <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
+            Open a conversation before compacting it.
           </p>
         )}
         {lightboxIndex !== null && (

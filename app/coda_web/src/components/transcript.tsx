@@ -59,6 +59,7 @@ import {
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
+import { parseCompactCommand } from "@/lib/compact-command";
 import {
   isSubAgentToolName,
   subAgentDisplayName,
@@ -1113,7 +1114,11 @@ function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkab
             content={entry.content}
             label="message"
             align="end"
-            onEdit={canRewind && messageId ? () => beginEdit(messageId) : undefined}
+            onEdit={
+              canRewind && messageId && parseCompactCommand(entry.content) === null
+                ? () => beginEdit(messageId)
+                : undefined
+            }
             forkFrom={forkable && messageId ? entry : undefined}
           />
         </div>

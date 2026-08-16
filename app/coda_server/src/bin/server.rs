@@ -29,9 +29,9 @@ use coda_server::{
     },
     files::{DEFAULT_LIMIT, FileIndex},
     hub::{
-        AttachError, AttachSession, CommandOutcome, CompactError, Compacted, ConnId, ForkOutcome,
-        RelayEvent, SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
-        SnapshotPayload,
+        AttachError, AttachSession, CommandOutcome, CompactError, Compacted, ConnId, DeleteOutcome,
+        ForkOutcome, RelayEvent, SessionCommand, SessionHub, SessionKey, SessionOpener,
+        SessionRelay, SnapshotPayload,
     },
     load_workspace_skills,
     mcp::McpServers,
@@ -354,7 +354,10 @@ impl SessionOpener for AppOpener {
                 .load_checkpoint(&key.1)
                 .await
                 .map_err(CompactError::Storage)?
-                .ok_or(CompactError::Stale)?;
+                .ok_or(CompactError::Empty)?;
+            if checkpoint.messages.is_empty() {
+                return Err(CompactError::Empty);
+            }
 
             // Read before the round-trip and handed back to the commit, where
             // it is the compare-and-swap that catches the thread having grown
@@ -804,10 +807,9 @@ fn parse_params<P: DeserializeOwned>(params: Value) -> Result<P, RpcError> {
 /// far more paths than a menu should ever carry, so the ranking and the cap both
 /// live server-side and the client just renders the answer.
 ///
-/// Split out of `dispatch_request` because it is the one request that can take
-/// real time: a cache miss walks the whole workspace, and awaiting that inside
-/// the connection loop would freeze this client's event stream for the duration
-/// (see the spawn in [`handle_frame`]).
+/// Split out of `dispatch_request` because a cache miss walks the whole
+/// workspace, and awaiting that inside the connection loop would freeze this
+/// client's event stream for the duration (see the spawn in [`handle_frame`]).
 async fn list_files_reply(app: &Arc<AppState>, id: RpcId, params: Value) -> RpcOutgoing {
     let params: ListFilesParams = match parse_params(params) {
         Ok(params) => params,
@@ -852,6 +854,33 @@ async fn list_files_reply(app: &Arc<AppState>, id: RpcId, params: Value) -> RpcO
     }
 }
 
+/// Requests that must not hold the connection loop: they take long enough that
+/// awaiting them inline would freeze event forwarding and keepalive for this
+/// client. They touch no per-connection `streams` / `selections`.
+fn answers_off_loop(method: &str) -> bool {
+    matches!(method, "list_files" | "compact")
+}
+
+async fn dispatch_off_loop(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    id: RpcId,
+    method: &str,
+    params: Value,
+) -> RpcOutgoing {
+    match method {
+        "list_files" => list_files_reply(app, id, params).await,
+        "compact" => {
+            let params: CompactParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            handle_compact(app, conn_id, id, params).await
+        }
+        other => unreachable!("answers_off_loop admitted {other}"),
+    }
+}
+
 /// Classify one decoded frame and act on it. A *request* always produces exactly
 /// one framed reply (`result` or `error`); a *notification* runs for effect and
 /// is never answered (an unknown method or bad params on a notification is
@@ -867,16 +896,17 @@ async fn handle_frame<T: Transport + Send + Sync + 'static>(
     frame: String,
 ) -> bool {
     match rpc::decode(&frame) {
-        // Answered off the connection loop: a cold `@` query walks the whole
-        // workspace, and the loop must stay free to keep forwarding this
-        // client's session events while that runs. Touching no per-connection
-        // state, this arm is the one request that can safely leave the loop —
-        // a send failure is left for the loop itself to notice.
-        rpc::Incoming::Request { id, method, params } if method == "list_files" => {
+        // Answered off the connection loop: these take long enough that awaiting
+        // them inline would freeze this client's event stream and keepalive.
+        // They touch no per-connection `streams` / `selections`, so they can
+        // safely leave the loop — a send failure is left for the loop itself
+        // to notice. `compact` is the load-bearing case: it must keep forwarding
+        // the `compacting` snapshots it just pushed.
+        rpc::Incoming::Request { id, method, params } if answers_off_loop(&method) => {
             let app = Arc::clone(app);
             let transport = Arc::clone(transport);
             tokio::spawn(async move {
-                let reply = list_files_reply(&app, id, params).await;
+                let reply = dispatch_off_loop(&app, conn_id, id, &method, params).await;
                 transport.send(&reply).await;
             });
             true
@@ -926,8 +956,8 @@ async fn dispatch_request(
             },
         )
             .into(),
-        // `list_files` is answered from its own task in `handle_frame` (see
-        // `list_files_reply`), so it never reaches this match.
+        // `list_files` / `compact` are answered from their own task in
+        // `handle_frame` (see `dispatch_off_loop`), so they never reach this match.
         // The composer's `/` picker. Literally the same read the model's
         // `<available_skills>` comes from — the workspace's knowledge handle,
         // kept current by its watcher — so the menu and the prompt cannot
@@ -1145,6 +1175,14 @@ async fn dispatch_request(
                     ),
                 )
                     .into(),
+                CommandOutcome::NotIdle => (
+                    id,
+                    RpcError::new(
+                        rpc::SESSION_NOT_IDLE,
+                        "cannot switch model while the session is compacting",
+                    ),
+                )
+                    .into(),
                 CommandOutcome::ModelLocked => (
                     id,
                     RpcError::new(
@@ -1271,12 +1309,25 @@ async fn dispatch_request(
             // written back after deletion. Refused when another connection is
             // attached — a stale client must not erase work someone else is
             // driving (the persisted state stays too).
-            if !app.relay.delete(key.clone(), conn_id).await {
-                return (
-                    id,
-                    RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
-                )
-                    .into();
+            match app.relay.delete(key.clone(), conn_id).await {
+                DeleteOutcome::Deleted => {}
+                DeleteOutcome::NotOwner => {
+                    return (
+                        id,
+                        RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
+                    )
+                        .into();
+                }
+                DeleteOutcome::NotIdle => {
+                    return (
+                        id,
+                        RpcError::new(
+                            rpc::SESSION_NOT_IDLE,
+                            "the session must finish compacting first",
+                        ),
+                    )
+                        .into();
+                }
             }
             // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
@@ -1365,13 +1416,6 @@ async fn dispatch_request(
                 Err(err) => return (id, err).into(),
             };
             handle_rewind(app, conn_id, id, params).await
-        }
-        "compact" => {
-            let params: CompactParams = match parse_params(params) {
-                Ok(params) => params,
-                Err(err) => return (id, err).into(),
-            };
-            handle_compact(app, conn_id, id, params).await
         }
         "rename_session" => {
             let params: RenameSessionParams = match parse_params(params) {
@@ -1521,7 +1565,7 @@ async fn handle_task(
             id,
             RpcError::new(
                 rpc::SESSION_NOT_IDLE,
-                "the session already has an active turn",
+                "the session already has an active turn or is compacting",
             ),
         )
             .into(),
@@ -1611,11 +1655,12 @@ async fn handle_compact(
         CommandOutcome::CompactionAbandoned { stale, reason } => {
             (id, &CompactResult::Abandoned { stale, reason }).into()
         }
+        CommandOutcome::CompactionEmpty => (id, &CompactResult::Empty).into(),
         CommandOutcome::NotIdle => (
             id,
             RpcError::new(
                 rpc::SESSION_NOT_IDLE,
-                "the session must finish or abort its current turn first",
+                "the session must finish its current turn or compaction first",
             ),
         )
             .into(),
@@ -1676,7 +1721,7 @@ async fn handle_rewind(
             id,
             RpcError::new(
                 rpc::SESSION_NOT_IDLE,
-                "the session must finish or abort its current turn first",
+                "the session must finish its current turn or compaction first",
             ),
         )
             .into(),
@@ -1758,8 +1803,8 @@ async fn handle_resume<T: Transport>(
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app: Arc<AppState>) {
-    // Shared so a long-running request (`list_files`) can answer from its own
-    // task instead of holding up the loop below.
+    // Shared so a long-running request (`list_files`, `compact`) can answer
+    // from its own task instead of holding up the loop below.
     let transport = Arc::new(transport);
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     // Event streams of the sessions this connection is attached to. A stream

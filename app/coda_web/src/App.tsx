@@ -362,6 +362,9 @@ export default function App() {
     (task: string, images: string[] = []) => {
       const target = newSessionStore.getState().target;
       if (target) {
+        if (images.length === 0 && parseCompactCommand(task) !== null) {
+          return;
+        }
         rememberNewSessionTarget(target);
         sendTaskToNewSession(
           target.serverUrl,

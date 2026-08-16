@@ -29,18 +29,19 @@ pub fn summary_request(
     messages: &[HistoryEntry],
     instructions: &str,
 ) -> ChatCompletionRequest {
-    let mut task = String::from("<transcript>\n");
-    task.push_str(&transcript(messages));
-    task.push_str("</transcript>\n");
+    let mut task = String::new();
     if !instructions.is_empty() {
         task.push_str(
-            "\nThe user asked for this compaction and added the following. Follow it \
+            "The user asked for this compaction and added the following. Follow it \
              where it narrows what to keep, but never at the cost of leaving the agent \
              unable to resume:\n",
         );
         task.push_str(instructions);
-        task.push('\n');
+        task.push_str("\n\n");
     }
+    task.push_str("<transcript>\n");
+    task.push_str(&transcript(messages));
+    task.push_str("</transcript>\n");
     ChatCompletionRequest {
         model,
         messages: vec![
