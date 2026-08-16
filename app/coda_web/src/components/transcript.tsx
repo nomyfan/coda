@@ -87,6 +87,20 @@ function isSubAgentEntry(entry: TranscriptEntry) {
   return Boolean(entry.agentName && entry.agentName !== ROOT_AGENT);
 }
 
+/** An entry backed by a real tool invocation — `tool_call` while it's running,
+ * `tool_result` once it resolves (same entry, updated in place). Checking
+ * both catches a call left stranded mid-flight by an abort, which never gets
+ * the `tool_result` update but was still a real operation. Excludes a
+ * rejected call: it never runs, but still gets a result-only entry (no
+ * `tool_start` preceded it) carrying `status: "rejected"`, since the server
+ * answers a denied approval with a `tool_end` of its own. */
+function isToolEntry(entry: TranscriptEntry) {
+  if (entry.kind === "tool_call") {
+    return true;
+  }
+  return entry.kind === "tool_result" && entry.status !== "rejected";
+}
+
 type TranscriptRenderItem =
   | { type: "entry"; entry: TranscriptEntry }
   | { type: "turn"; id: string; entries: TranscriptEntry[] };
@@ -620,7 +634,7 @@ type SubAgentItem = Extract<ProcessItem, { type: "subagent" }>;
  * Works identically for live turns and resumed history (where only the anchor
  * survives, with no inner process), since the prefix self-identifies it.
  */
-function groupProcessItems(entries: TranscriptEntry[]): ProcessItem[] {
+export function groupProcessItems(entries: TranscriptEntry[]): ProcessItem[] {
   const items: ProcessItem[] = [];
   // Open sub-agent groups keyed by agent display name.
   const openByName = new Map<string, SubAgentItem>();
@@ -690,6 +704,25 @@ function latestActiveProcessEntry(entries: TranscriptEntry[]) {
 
 function processStepText(stepCount: number) {
   return `${stepCount} ${stepCount === 1 ? "step" : "steps"}`;
+}
+
+/**
+ * Count actual tool invocations behind a turn's process items, rather than
+ * items themselves — reasoning and intermediate assistant prose aren't
+ * operations. A sub-agent group counts its own invocation (the `agent__*`
+ * call) plus every tool entry nested inside it; a nested sub-agent's own
+ * invocation is itself a tool entry already flattened into that same
+ * `entries` list by `groupProcessItems`, so no recursion is needed.
+ */
+export function processStepCount(items: ProcessItem[]): number {
+  return items.reduce((total, item) => {
+    if (item.type === "entry") {
+      return total + (isToolEntry(item.entry) ? 1 : 0);
+    }
+    const ownCall = item.callEntry && isToolEntry(item.callEntry) ? 1 : 0;
+    const nested = item.entries.filter(isToolEntry).length;
+    return total + ownCall + nested;
+  }, 0);
 }
 
 type Span = { start: number; end: number };
@@ -781,10 +814,12 @@ function SubAgentGroup({ item }: { item: Extract<ProcessItem, { type: "subagent"
   }, [complete]);
 
   const task = item.callEntry?.detail;
-  const stepCount = item.entries.length;
+  const stepCount = item.entries.filter(isToolEntry).length;
   // Resumed history keeps no inner process — surface the reply that survived so
-  // the group isn't empty when expanded.
-  const showResultOnly = stepCount === 0 && item.callEntry?.kind === "tool_result";
+  // the group isn't empty when expanded. Checked against the raw entry count,
+  // not the tool-only `stepCount`, since a resumed run with no tool calls but
+  // some other leftover entry still has an inner process to show.
+  const showResultOnly = item.entries.length === 0 && item.callEntry?.kind === "tool_result";
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -888,7 +923,7 @@ const AssistantTurnBubble = memo(
     const activeSummary = approvalPending
       ? { title: "Approval required" }
       : processEntrySummary(activeProcessEntry);
-    const stepText = processStepText(processItems.length);
+    const stepText = processStepText(processStepCount(processItems));
     // The process only: writing the answer is the turn's product, not work spent
     // getting there. Its reasoning entry stays in — only the prose drops out.
     const workMs = processWorkMs(intermediateEntries);

@@ -1,6 +1,11 @@
 import { expect, test } from "vitest";
 
-import { finalAssistantIndexOf, processWorkMs } from "../src/components/transcript.tsx";
+import {
+  finalAssistantIndexOf,
+  groupProcessItems,
+  processStepCount,
+  processWorkMs,
+} from "../src/components/transcript.tsx";
 import type { TranscriptEntry } from "../src/store/session.ts";
 
 function reply(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
@@ -110,4 +115,69 @@ test("a turn with nothing timed has no duration to show", () => {
   expect(processWorkMs([step({ id: "running", kind: "tool_call", status: "running" })])).toBe(
     undefined,
   );
+});
+
+test("steps count tool calls, not reasoning or intermediate prose", () => {
+  const entries = [
+    step({ id: "r1", kind: "reasoning" }),
+    step({ id: "t1", kind: "tool_result" }),
+    reply({ id: "a1", isFinalResponse: false }),
+  ];
+
+  expect(processStepCount(groupProcessItems(entries))).toBe(1);
+});
+
+test("a call stranded mid-flight by an abort still counts as a step", () => {
+  const entries = [step({ id: "t1", kind: "tool_call", status: "running" })];
+
+  expect(processStepCount(groupProcessItems(entries))).toBe(1);
+});
+
+test("a rejected call never ran, so it doesn't count as a step", () => {
+  // A denied approval gets no `tool_start` — just a result-only entry (see
+  // `finishToolEntry`'s index<0 branch) carrying status "rejected".
+  const entries = [step({ id: "t1", kind: "tool_result", status: "rejected" })];
+
+  expect(processStepCount(groupProcessItems(entries))).toBe(0);
+});
+
+test("a turn where every requested call was denied has zero steps, not one", () => {
+  const entries = [
+    step({ id: "t1", kind: "tool_result", status: "rejected" }),
+    step({ id: "t2", kind: "tool_result", status: "rejected" }),
+  ];
+
+  expect(processStepCount(groupProcessItems(entries))).toBe(0);
+});
+
+test("a sub-agent invocation counts itself plus its nested tool calls, not one flat group", () => {
+  const entries = [
+    step({ id: "call1", kind: "tool_result", title: "agent__researcher", agentName: "coda" }),
+    step({ id: "r1", kind: "reasoning", agentName: "researcher" }),
+    step({ id: "t1", kind: "tool_result", agentName: "researcher", title: "read_file" }),
+    step({ id: "t2", kind: "tool_result", agentName: "researcher", title: "grep" }),
+  ];
+
+  const items = groupProcessItems(entries);
+  expect(items).toHaveLength(1);
+  // 1 for the invocation itself + 2 nested tool calls; the reasoning step doesn't count.
+  expect(processStepCount(items)).toBe(3);
+});
+
+test("a sub-agent calling a sub-agent still flattens into one group's step count", () => {
+  const entries = [
+    step({ id: "call1", kind: "tool_result", title: "agent__researcher", agentName: "coda" }),
+    step({
+      id: "call2",
+      kind: "tool_result",
+      title: "agent__fact_checker",
+      agentName: "researcher",
+    }),
+    step({ id: "f1", kind: "tool_result", agentName: "fact_checker", title: "search" }),
+  ];
+
+  const items = groupProcessItems(entries);
+  expect(items).toHaveLength(1);
+  // 1 for the outer invocation + 1 for the nested invocation + 1 for its own tool call.
+  expect(processStepCount(items)).toBe(3);
 });
