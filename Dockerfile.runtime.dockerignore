@@ -1,0 +1,2 @@
+# This Dockerfile has no COPY from the build context, so nothing is needed.
+*

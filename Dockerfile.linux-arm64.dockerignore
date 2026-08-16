@@ -1,0 +1,6 @@
+# Dockerfile.linux-arm64 only needs the prebuilt binary under dist/ (see
+# `pnpm build:linux:arm64`) — nothing else goes into the build context.
+*
+!dist
+!dist/**
+dist/*.tar.gz

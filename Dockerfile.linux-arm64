@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# Layers the coda-server binary onto coda-server-runtime:arm64 (build that
+# first via Dockerfile.runtime). The binary is cross-compiled on the host, not
+# in this image — run `pnpm build:linux:arm64` first, which produces
+# dist/coda-server-aarch64-linux-gnu-glibc-2.31/coda-server.
+FROM coda-server-runtime:arm64
+
+COPY dist/coda-server-aarch64-linux-gnu-glibc-2.31/coda-server /usr/local/bin/coda-server
+
+# Default is 127.0.0.1, unreachable from outside the container.
+ENV CODA_LISTEN_ADDR=0.0.0.0:3000
+EXPOSE 3000
+
+# coda-server.toml/.env are mounted into /app at `docker run` time, not baked
+# in. A workspace path referenced from coda-server.toml should be mounted
+# under /workspace to match.
+WORKDIR /app
+VOLUME ["/workspace"]
+
+ENTRYPOINT ["coda-server"]

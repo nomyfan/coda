@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+
+# Base image for coda-server: everything but the binary. Rebuild only when the
+# package list changes; Dockerfile.linux-arm64 layers the binary on top so
+# normal rebuilds skip apt-get entirely.
+FROM debian:bookworm
+
+# Full bookworm, not -slim: the `shell` tool runs arbitrary commands in this
+# container, so a bare-bones shell environment would limit the agent.
+# bash/rg/fd are hard requirements of the shell/grep/glob tools (AGENTS.md).
+# fd-find installs as `fdfind` on Debian; symlinked to `fd` below.
+# Debian's own `nodejs` package is stuck on 18.x, so Node comes from
+# NodeSource's 22.x LTS repo instead. Corepack is no longer bundled by
+# default, so it's installed separately via npm either way.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      bash \
+      ripgrep \
+      fd-find \
+      curl \
+      wget \
+      git \
+      unzip \
+      tar \
+      gzip \
+      less \
+      nano \
+      jq \
+      procps \
+      iproute2 \
+      openssh-client \
+      gnupg \
+      python3 \
+      python3-dev \
+      python3-pip \
+      python3-venv \
+      python-is-python3 \
+      build-essential \
+      pkg-config \
+      cmake \
+      libssl-dev \
+      libffi-dev \
+      zlib1g-dev \
+      libexpat1-dev \
+      patch \
+      xz-utils \
+      bzip2 \
+      zstd \
+      zip \
+      iputils-ping \
+      dnsutils \
+      netcat-openbsd \
+      file \
+      tree \
+      rsync \
+      lsof \
+      strace \
+      sqlite3 \
+      vim \
+      htop \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g corepack \
+    && corepack enable \
+    && rm -rf /var/lib/apt/lists/*
