@@ -55,7 +55,15 @@ export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | 
 
 export type TranscriptEntry = {
   id: string;
-  kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
+  kind:
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "compaction"
+    | "system"
+    | "error";
   /** The server's id for this message, once the server has acknowledged it.
    * On a user entry that is the condition for rewinding or forking from it. */
   messageId?: string;
@@ -120,6 +128,8 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** A compaction runs outside a normal turn but still owns the session. */
+  compacting: boolean;
   /** A draft session's opening `open_session` is in flight, ahead of its first
    * task. `running` can't cover this window — it isn't set until the task is
    * actually sent — so without it a second submit during the round trip would
@@ -257,6 +267,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     drafts: {},
     allowDrafts: {},
     running: false,
+    compacting: false,
     evicted: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     usage: [],
@@ -394,9 +405,6 @@ function historyToEntries(
   argsById: Record<string, string | null | undefined>,
   spansById: Record<string, GenerationSpan>,
 ): TranscriptEntry[] {
-  if ("System" in message) {
-    return [];
-  }
   if ("User" in message) {
     const textContent = message.User.parts
       .filter((p) => p.type === "text")
@@ -461,6 +469,31 @@ function historyToEntries(
           : undefined,
         spansById[message.Tool.id],
       ),
+    ];
+  }
+  if ("Custom" in message) {
+    const custom = message.Custom;
+    if (custom.kind === "compaction") {
+      return [
+        {
+          id: `compaction:${custom.message_id}`,
+          messageId: custom.message_id,
+          kind: "compaction",
+          title: "Context compacted",
+          content: custom.content,
+          startedAt: custom.created_at,
+        },
+      ];
+    }
+    return [
+      {
+        id: `custom:${custom.message_id}`,
+        messageId: custom.message_id,
+        kind: custom.kind === "compaction_failed" ? "error" : "system",
+        title: custom.kind === "compaction_failed" ? "Compaction failed" : custom.kind,
+        content: custom.content,
+        startedAt: custom.created_at,
+      },
     ];
   }
   return [];
@@ -1407,6 +1440,7 @@ export function applySnapshotToSession(
     reasoningEffort: ReasoningEffort | null;
     permissionMode: PermissionMode;
     turnRunning: boolean;
+    compacting?: boolean;
   },
 ): OpenedSession {
   const argsById = collectToolArgs(snapshot.messages);
@@ -1434,6 +1468,7 @@ export function applySnapshotToSession(
     // and lets a second task go out under the first one — so the pending
     // message speaks for its own turn until the reply that created it lands.
     running: snapshot.turnRunning || pending.length > 0,
+    compacting: snapshot.compacting ?? false,
     evicted: false,
     editing: reconcileEditing(session.editing, snapshot.messages),
     entries: [
@@ -1461,6 +1496,7 @@ function applySnapshot(
   reasoningEffort: ReasoningEffort | null,
   permissionMode: PermissionMode,
   turnRunning: boolean,
+  compacting: boolean,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
@@ -1492,6 +1528,7 @@ function applySnapshot(
       reasoningEffort,
       permissionMode,
       turnRunning,
+      compacting,
     });
   });
   // Self-heal the memory: whatever the session is running under is what this
@@ -2048,6 +2085,7 @@ async function requestOpenAndApply(
       snap.reasoning_effort ?? null,
       snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
       snap.turn_running ?? false,
+      snap.compacting ?? false,
     );
     return true;
   } catch (err) {
@@ -2181,6 +2219,7 @@ export function connectServer(rawUrl: string) {
       params.reasoning_effort ?? null,
       params.permission_mode ?? DEFAULT_PERMISSION_MODE,
       params.turn_running ?? false,
+      params.compacting ?? false,
     );
   });
   rpc.addMethod("session_evicted", (params) => {
@@ -2421,7 +2460,8 @@ export async function forkSession(
   forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const key = forkKey(server, workspaceId, sessionId);
-  if (codaStore.getState().forking[key]) {
+  const source = codaStore.getState().servers[server]?.sessions[sessionKey(workspaceId, sessionId)];
+  if (codaStore.getState().forking[key] || source?.compacting) {
     return;
   }
   const params = {
@@ -2502,7 +2542,7 @@ export async function forkActiveSession(
 ): Promise<void> {
   const active = currentActive();
   // A draft was never opened on the server, so there is nothing to copy.
-  if (!active || active.session.draft) {
+  if (!active || active.session.draft || active.session.compacting) {
     return;
   }
   const { workspaceId, sessionId } = active.session;
@@ -2572,7 +2612,7 @@ export async function sendTask(task: string, images: string[] = []) {
   if (!active || active.session.deleting || active.session.starting) {
     return;
   }
-  if (active.session.running || active.session.approvals.length > 0) {
+  if (active.session.running || active.session.compacting || active.session.approvals.length > 0) {
     return;
   }
   // A draft/new session must be live before its first task, or the task would
@@ -2588,6 +2628,66 @@ export async function sendTask(task: string, images: string[] = []) {
     text,
     images,
   );
+}
+
+/** Ask the server to compact the active persisted session. Transcript changes
+ * are deliberately left to snapshot pushes; the response only reports the
+ * outcome. */
+export async function compactActiveSession(instructions: string): Promise<void> {
+  const active = currentActive();
+  if (
+    !active ||
+    active.session.draft ||
+    active.session.deleting ||
+    active.session.starting ||
+    active.session.evicted ||
+    active.session.running ||
+    active.session.compacting ||
+    active.session.approvals.length > 0 ||
+    active.session.editing
+  ) {
+    return;
+  }
+  const { server, session } = active;
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    return;
+  }
+  try {
+    const result = await rpc.request("compact", {
+      workspace_id: session.workspaceId,
+      session_id: session.sessionId,
+      ...(instructions ? { instructions } : {}),
+    });
+    if (result.outcome === "applied") {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "success",
+        label: "context compacted",
+        detail: "Future turns will continue from the new summary.",
+      });
+    } else if (result.outcome === "recorded") {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "warning",
+        label: "compaction failed",
+        detail: "The conversation remains unchanged; the reason is in the transcript.",
+      });
+    } else {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: result.stale ? "warning" : "danger",
+        label: "compaction not applied",
+        detail: result.reason,
+      });
+    }
+  } catch (err) {
+    addSessionActivity(server, session.workspaceId, session.sessionId, {
+      tone: "danger",
+      label: "compaction rejected",
+      detail: isServerError(err)
+        ? err.message
+        : "Connection lost before compaction completed; reconnect to check its state.",
+    });
+  }
 }
 
 export async function sendTaskToNewSession(
@@ -2640,7 +2740,13 @@ export function beginEdit(messageId: string) {
     return;
   }
   const { server, session } = active;
-  if (session.running || session.starting || session.evicted || session.deleting) {
+  if (
+    session.running ||
+    session.compacting ||
+    session.starting ||
+    session.evicted ||
+    session.deleting
+  ) {
     return;
   }
   if (session.approvals.length > 0 || session.editing?.submitting) {
@@ -2844,7 +2950,7 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
     rememberModelSelection(active.server, active.session.workspaceId, providerId, reasoningEffort);
     return;
   }
-  if (active.session.deleting) {
+  if (active.session.deleting || active.session.compacting) {
     return;
   }
   const rpc = rpcFor(active.server);
@@ -3257,6 +3363,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveCompacting = (state: CodaStoreState) =>
+  activeSessionOf(state)?.compacting ?? false;
 export const selectActiveStarting = (state: CodaStoreState) =>
   activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
@@ -3310,6 +3418,7 @@ export const selectCanRewind = (state: CodaStoreState): boolean => {
     !!session &&
     selectActiveStatus(state) === "connected" &&
     !session.running &&
+    !session.compacting &&
     !session.starting &&
     !session.evicted &&
     !session.deleting &&

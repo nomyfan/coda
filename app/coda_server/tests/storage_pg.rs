@@ -16,13 +16,13 @@ use coda_agent::persist::{StateEntry, StoredCheckpoint, StoredResumePoint, Store
 use coda_agent::runtime::SessionStorage;
 use coda_agent::{Envelope, HistoryEntry, Sender};
 use coda_core::llm::{
-    AssistantMessage, Message, MessageId, MessageOrigin, ReasoningContinuation, ToolCall,
-    ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, CustomMessage, CustomRole, Message, MessageId, MessageOrigin,
+    ReasoningContinuation, ToolCall, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_server::storage::DbPool;
 use coda_server::storage::{
-    ForkCut, ForkError, ForkSource, PgSessionStorage, RenameSessionError, RewindError,
-    SessionMetadataError, SessionModelBinding, WorkspaceStorage,
+    CompactionError, ForkCut, ForkError, ForkSource, PgSessionStorage, RenameSessionError,
+    RewindError, SessionMetadataError, SessionModelBinding, WorkspaceStorage,
 };
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
@@ -150,16 +150,6 @@ fn entry(turn_id: TurnId, message: Message) -> HistoryEntry {
     HistoryEntry { turn_id, message }
 }
 
-/// The id a message carries, so a test can name it as a fork's cut later.
-fn id_of(message: &Message) -> MessageId {
-    match message {
-        Message::User(message) => message.message_id,
-        Message::Assistant(message) => message.message_id,
-        Message::Tool(message) => message.message_id,
-        Message::System(_) => unreachable!("system messages are not history"),
-    }
-}
-
 /// A plain assistant reply, so tests that only need "something the agent said"
 /// don't spell out ten fields of timing and reasoning state.
 fn assistant(content: &str) -> Message {
@@ -174,6 +164,17 @@ fn assistant(content: &str) -> Message {
         aborted: false,
         started_at: jiff::Timestamp::default(),
         ended_at: jiff::Timestamp::default(),
+    })
+}
+
+/// A message the server authored, which is what a compaction writes.
+fn summary_message(kind: &str, content: &str) -> Message {
+    Message::Custom(CustomMessage {
+        message_id: MessageId::new(),
+        kind: kind.to_string(),
+        role: CustomRole::User,
+        content: content.to_string(),
+        created_at: jiff::Timestamp::default(),
     })
 }
 
@@ -592,6 +593,212 @@ async fn an_assistant_message_keeps_its_reasoning_continuation() {
         ])),
         "the opaque provider payload must survive verbatim"
     );
+}
+
+/// A custom message rides the same row shape as any other, under its own role.
+/// The role only has to be distinct — nothing reads it back to reconstruct the
+/// message, and the `role = 'user'` filters that pick turn boundaries and rewind
+/// targets must not match it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_custom_message_round_trips_under_its_own_role() {
+    let pool = pool().await;
+    let workspace = workspace_id("custom-role");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "hi")),
+                    ),
+                    entry(
+                        turn,
+                        Message::Custom(CustomMessage {
+                            message_id: MessageId::new(),
+                            kind: "compaction".to_string(),
+                            role: CustomRole::User,
+                            content: "everything so far, in one paragraph".to_string(),
+                            created_at: jiff::Timestamp::now(),
+                        }),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    let Message::Custom(message) = &loaded.messages[1].message else {
+        panic!("expected a custom message");
+    };
+    assert_eq!(message.kind, "compaction");
+    assert!(matches!(message.role, CustomRole::User));
+    assert_eq!(message.content, "everything so far, in one paragraph");
+
+    let user_rows = diesel::sql_query(
+        "select count(*) from messages where workspace_id = $1 and role = 'user'",
+    )
+    .bind::<Text, _>(&workspace)
+    .get_result::<CountRow>(&mut conn(&pool).await)
+    .await
+    .unwrap()
+    .count;
+    assert_eq!(
+        user_rows, 1,
+        "a custom message must not read as a user turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_appends_its_two_messages_and_moves_the_watermark() {
+    let pool = pool().await;
+    let workspace = workspace_id("compact-commit");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![
+                    entry(
+                        turn,
+                        Message::User(UserMessage::text(MessageId::new(), "do the thing")),
+                    ),
+                    entry(turn, assistant("done")),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let compaction_turn = TurnId::from(MessageId::new());
+    let command = Message::User(UserMessage::text(
+        MessageId::new(),
+        "/compact keep the decisions",
+    ));
+    let summary = summary_message("compaction", "we did the thing");
+    storage
+        .commit_compaction(2, compaction_turn, [&command, &summary])
+        .await
+        .unwrap();
+
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    assert_eq!(loaded.messages.len(), 4);
+    assert!(matches!(&loaded.messages[3].message, Message::Custom(c) if c.kind == "compaction"));
+
+    // The watermark has to move with the rows: a later save starts its seqs
+    // from it, and a stale one would collide with what was just written.
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                loaded
+                    .messages
+                    .into_iter()
+                    .chain([entry(compaction_turn, assistant("carrying on"))])
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("a normal save after a compaction must not collide");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_whose_thread_moved_on_writes_nothing() {
+    let pool = pool().await;
+    let workspace = workspace_id("compact-stale");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    let opening = vec![entry(
+        turn,
+        Message::User(UserMessage::text(MessageId::new(), "do the thing")),
+    )];
+    storage
+        .save_checkpoint("chat".to_string(), checkpoint("chat", opening.clone()))
+        .await
+        .unwrap();
+
+    // What a compaction reads before it goes off to build a summary.
+    let baseline = 1;
+
+    // Meanwhile the session was released, reopened and given another turn.
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                opening
+                    .into_iter()
+                    .chain([entry(turn, assistant("a reply the summary never saw"))])
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let compaction_turn = TurnId::from(MessageId::new());
+    let command = Message::User(UserMessage::text(MessageId::new(), "/compact"));
+    let summary = summary_message("compaction", "a summary of one message");
+    let refused = storage
+        .commit_compaction(baseline, compaction_turn, [&command, &summary])
+        .await;
+
+    assert!(matches!(refused, Err(CompactionError::Stale)));
+    let loaded = storage.load_checkpoint("chat").await.unwrap().unwrap();
+    assert_eq!(
+        loaded.messages.len(),
+        2,
+        "a stale compaction must leave the thread exactly as it found it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_into_a_deleted_session_writes_nothing() {
+    let pool = pool().await;
+    let workspace = workspace_id("compact-deleted");
+    seed_session(&pool, &workspace, "chat").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
+
+    let turn = TurnId::from(MessageId::new());
+    storage
+        .save_checkpoint(
+            "chat".to_string(),
+            checkpoint(
+                "chat",
+                vec![entry(
+                    turn,
+                    Message::User(UserMessage::text(MessageId::new(), "do the thing")),
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+
+    WorkspaceStorage::new(pool.clone(), &workspace)
+        .delete_session("chat")
+        .await
+        .unwrap();
+
+    let command = Message::User(UserMessage::text(MessageId::new(), "/compact"));
+    let summary = summary_message("compaction", "a summary of a session that is gone");
+    let refused = storage
+        .commit_compaction(1, TurnId::from(MessageId::new()), [&command, &summary])
+        .await;
+
+    assert!(matches!(refused, Err(CompactionError::Stale)));
+    assert_eq!(row_count(&pool, "messages", &workspace).await, 0);
 }
 
 /// A binary `read_file`, or a `shell` command that wrote raw bytes, lands a NUL
@@ -1719,7 +1926,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
     // The turn to branch away from: everything before it is kept, it and the
     // rest are not.
     let branch_point = Message::User(UserMessage::text(MessageId::new(), "q3"));
-    let cut = id_of(&branch_point);
+    let cut = branch_point.message_id();
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -1844,7 +2051,11 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
         MessageId::new(),
         "and now something else",
     ));
-    let (cut, reply_cut, sub_agent_cut) = (id_of(&branch_point), id_of(&reply), id_of(&sub_reply));
+    let (cut, reply_cut, sub_agent_cut) = (
+        branch_point.message_id(),
+        reply.message_id(),
+        sub_reply.message_id(),
+    );
 
     storage
         .save_checkpoint(
@@ -1932,7 +2143,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
     // A valid cut, so what the fork trips over is the resting point and not the
     // cut lookup.
     let prompt = Message::User(UserMessage::text(MessageId::new(), "q"));
-    let cut = id_of(&prompt);
+    let cut = prompt.message_id();
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -2001,7 +2212,7 @@ async fn a_cut_ignores_the_half_written_turn_it_opens() {
         TurnId::from(MessageId::new()),
     );
     let prompt = Message::User(UserMessage::text(MessageId::new(), "run the thing"));
-    let cut = id_of(&prompt);
+    let cut = prompt.message_id();
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -2053,7 +2264,7 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
         TurnId::from(MessageId::new()),
     );
     let branch_point = Message::User(UserMessage::text(MessageId::new(), "next"));
-    let cut = id_of(&branch_point);
+    let cut = branch_point.message_id();
     storage
         .save_checkpoint(
             "source-session".to_string(),
@@ -2287,8 +2498,7 @@ async fn current_state(
         .unwrap()
         .state
         .into_iter()
-        .filter(|entry| entry.kind == kind)
-        .next_back()
+        .rfind(|entry| entry.kind == kind)
         .map(|entry| entry.value)
 }
 

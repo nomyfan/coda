@@ -12,8 +12,8 @@ use crate::{
 };
 use coda_core::{
     llm::{
-        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
-        ReasoningContinuation, StreamError, ToolCall, ToolMessage,
+        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, MessageId,
+        ReasoningContinuation, RequestMessage, StreamError, ToolCall, ToolMessage,
     },
     tool::{Tool, ToolCallContext, ToolObject, ToolResult, ToolWrapper},
 };
@@ -459,7 +459,7 @@ impl LLMProvider for TestProvider {
             .messages
             .first()
             .and_then(|message| match message {
-                Message::System(system) => Some(system.0.as_str()),
+                RequestMessage::System(system) => Some(system.0.as_str()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -467,7 +467,7 @@ impl LLMProvider for TestProvider {
         match system_prompt {
             "main-system" => {
                 let has_explore_result = request.messages.iter().any(
-                    |message| matches!(message, Message::Tool(tool) if tool.name == "explore"),
+                    |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "explore"),
                 );
 
                 if has_explore_result {
@@ -495,7 +495,7 @@ impl LLMProvider for TestProvider {
                     .messages
                     .iter()
                     .filter(
-                        |message| matches!(message, Message::Tool(tool) if tool.name == "explore"),
+                        |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "explore"),
                     )
                     .count();
                 if explore_results >= 2 {
@@ -525,10 +525,9 @@ impl LLMProvider for TestProvider {
             }),
             // A middle layer: calls its own sub-agent, then answers.
             "nested-explore" => {
-                let has_probe_result = request
-                    .messages
-                    .iter()
-                    .any(|message| matches!(message, Message::Tool(tool) if tool.name == "probe"));
+                let has_probe_result = request.messages.iter().any(
+                    |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "probe"),
+                );
                 if has_probe_result {
                     Self::completed(AssistantMessage {
                         content: "explore done".into(),
@@ -547,7 +546,7 @@ impl LLMProvider for TestProvider {
             }
             "explore-system" => {
                 let has_read_todos_result = request.messages.iter().any(
-                    |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
+                    |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "read_todos"),
                 );
 
                 if has_read_todos_result {
@@ -577,7 +576,7 @@ impl LLMProvider for TestProvider {
                     .messages
                     .iter()
                     .filter(
-                        |message| matches!(message, Message::Tool(tool) if tool.name == "read_todos"),
+                        |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "read_todos"),
                     )
                     .count();
                 if answered < 2 {
@@ -743,7 +742,7 @@ impl LLMProvider for TestProvider {
                 if tool_message(&request.messages, "call_read_todos").is_some() {
                     let replayed =
                         request.messages.iter().any(|message| {
-                            let Message::Assistant(assistant) = message else {
+                            let RequestMessage::Assistant(assistant) = message else {
                                 return false;
                             };
                             assistant
@@ -826,25 +825,28 @@ impl LLMProvider for TestProvider {
     }
 }
 
-fn last_user(messages: &[Message]) -> Option<&str> {
+fn last_user(messages: &[RequestMessage]) -> Option<&str> {
     messages.iter().rev().find_map(|message| match message {
-        Message::User(user) => user.first_text(),
+        RequestMessage::User(user) => user.first_text(),
         _ => None,
     })
 }
 
-pub(super) fn tool_message<'a>(messages: &'a [Message], id: &str) -> Option<&'a ToolMessage> {
+pub(super) fn tool_message<'a>(
+    messages: &'a [RequestMessage],
+    id: &str,
+) -> Option<&'a ToolMessage> {
     messages.iter().find_map(|message| match message {
-        Message::Tool(tool) if tool.id == id => Some(tool),
+        RequestMessage::Tool(tool) if tool.id == id => Some(tool),
         _ => None,
     })
 }
 
-fn describe_tools(messages: &[Message]) -> String {
+fn describe_tools(messages: &[RequestMessage]) -> String {
     let mut tools = messages
         .iter()
         .filter_map(|message| match message {
-            Message::Tool(tool) => {
+            RequestMessage::Tool(tool) => {
                 Some(format!("{}:{:?}:{:?}", tool.id, tool.outcome, tool.output))
             }
             _ => None,

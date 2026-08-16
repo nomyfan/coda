@@ -17,8 +17,8 @@ use async_openai::types::chat::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompletionTokensDetails, CompletionUsage, ContentPart,
-    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId, PromptTokensDetails,
-    ProviderError, ReasoningContinuation, StreamError, ToolCall, ToolCallOutcome, ToolDefinition,
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, MessageId, PromptTokensDetails, ProviderError,
+    ReasoningContinuation, RequestMessage, StreamError, ToolCall, ToolCallOutcome, ToolDefinition,
     ToolOutput,
 };
 use futures::{Stream, StreamExt};
@@ -27,10 +27,10 @@ trait IntoOpenAIType<T> {
     fn into_openai_type(self) -> T;
 }
 
-impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
+impl IntoOpenAIType<ChatCompletionRequestMessage> for RequestMessage {
     fn into_openai_type(self) -> ChatCompletionRequestMessage {
         match self {
-            Message::System(system_message) => {
+            RequestMessage::System(system_message) => {
                 //
                 ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text(system_message.0),
@@ -38,7 +38,7 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 }
                 .into()
             }
-            Message::User(user_message) => {
+            RequestMessage::User(user_message) => {
                 let has_images = user_message
                     .parts
                     .iter()
@@ -81,7 +81,7 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 }
                 .into()
             }
-            Message::Assistant(assistant_message) => {
+            RequestMessage::Assistant(assistant_message) => {
                 let content = if assistant_message.aborted {
                     // Aborted messages use array form so the abort marker is a
                     // separate content part the model won't confuse with normal output.
@@ -132,7 +132,7 @@ impl IntoOpenAIType<ChatCompletionRequestMessage> for Message {
                 }
                 .into()
             }
-            Message::Tool(tool_message) => {
+            RequestMessage::Tool(tool_message) => {
                 let content = match tool_message.outcome {
                     ToolCallOutcome::Rejected { reason } => match reason {
                         Some(r) => format!("[REJECTED BY USER] {r}"),
@@ -368,7 +368,7 @@ pub enum ProviderKind {
     OpenRouter,
 }
 
-fn inject_deepseek_reasoning(body: &mut serde_json::Value, messages: &[Message]) {
+fn inject_deepseek_reasoning(body: &mut serde_json::Value, messages: &[RequestMessage]) {
     let Some(wire_messages) = body
         .get_mut("messages")
         .and_then(|value| value.as_array_mut())
@@ -376,7 +376,7 @@ fn inject_deepseek_reasoning(body: &mut serde_json::Value, messages: &[Message])
         return;
     };
     for (wire_message, message) in wire_messages.iter_mut().zip(messages) {
-        let Message::Assistant(assistant) = message else {
+        let RequestMessage::Assistant(assistant) = message else {
             continue;
         };
         if assistant.tool_calls.is_empty() {
@@ -398,7 +398,7 @@ const OPENROUTER_REASONING_DETAILS_FORMAT: &str = "openrouter.reasoning_details.
 
 fn inject_openrouter_reasoning(
     body: &mut serde_json::Value,
-    messages: &[Message],
+    messages: &[RequestMessage],
 ) -> Result<(), StreamError> {
     let Some(wire_messages) = body
         .get_mut("messages")
@@ -409,7 +409,7 @@ fn inject_openrouter_reasoning(
         ));
     };
     for (wire_message, message) in wire_messages.iter_mut().zip(messages) {
-        let Message::Assistant(assistant) = message else {
+        let RequestMessage::Assistant(assistant) = message else {
             continue;
         };
         if assistant.tool_calls.is_empty() {

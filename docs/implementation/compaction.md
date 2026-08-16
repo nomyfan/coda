@@ -189,7 +189,7 @@ User(下一个任务)…
 | 客户端怎么知道正在压缩？ | `wire.rs:427` `Snapshot.turn_running`；`session.ts:2050`/`2183` | 快照只有 `turn_running`，压缩期间为假 | 接管/重连的客户端会把会话当 idle 并允许发送，直到被 `NotIdle` 拒。`compacting` 要进快照，见 Decision 8 |
 | hub 能主动推快照吗？ | `hub.rs:81` `enum RelayEvent`；`bin/server.rs:1666` | **不能。** `RelayEvent` 只有 `Event` / `Evicted` / `Closed`；那条 `snapshot` 通知是连接层在收到 `Closed` 后**重新 attach 一次**才发的，hub 手里没有 `send_notify` | 需要新增内部事件 `RelayEvent::Snapshot(Box<SnapshotPayload>)`，由连接层映射到已有的 `snapshot` wire 通知。**wire 类型不新增，内部事件类型要新增**，见 Decision 8 |
 | hub 怎么拿到当前 model binding？ | `hub.rs:484` `LiveState.provider_id` / `reasoning_effort`；`hub.rs:186` `SessionOpener::open` | live state 持有，且 `open` 是**显式传参**，不让 opener 自己去存储里读 | `compact` 照此办理，见 Decision 7 |
-| session 被删除时的写入竞争？ | `messages` 对 `sessions` 的复合外键 + `hub.rs:1332` | 级联删除；session 行没了，插入直接违反 FK | 删除不会被压缩写活。把压缩接进门闩是为了省掉白花的 LLM 调用与费解的报错，不是正确性要求 |
+| session 被删除时的写入竞争？ | `thread_checkpoints` / `messages` 对 `sessions` 的复合外键 + `commit_compaction` 的首条 CAS | 级联删除先带走 checkpoint，CAS 影响 0 行并返回 `Stale`；FK 仍是最后防线 | 删除不会被压缩写活。把压缩接进门闩是为了省掉白花的 LLM 调用与费解的报错，不是正确性要求 |
 
 ## Alternatives Considered
 
@@ -323,7 +323,7 @@ pub enum CompactError {
    - 压缩完成后必须补一次 `maybe_release`，否则断线的 entry 会滞留到超时——与 turn settle 那条路径（`hub.rs:1698`）同一个处理。
    - **不要拿 `turn_running` 兼职**：`Shutdown::graceful_unbounded` 与 `Shutdown::abort` 都是冲着 runtime 里的 turn 去的，压缩根本不在 runtime 里，复用会让优雅关闭去等一个不存在的 turn。
    - **CAS**：门闩挡不住进程退出、驱逐、删除这些路径，所以真正的保证在存储层。`commit_compaction` 以拼视图时读到的 `message_count` 为条件更新（`WHERE thread_id = $session_id AND message_count = $expected`），不匹配就整体回滚成 `Stale`。语义正好是「我读完之后 root 有没有被人追加过」。**`thread_id` 是 session id**，不是字面量 `"root"`（`storage.rs:984`）。
-   - 删除路径**已有兜底**：`messages` 对 `sessions` 是复合外键级联，session 行没了插入直接违反 FK，压缩写不活已删除的会话。门闩覆盖它只是为了省掉一次白花的 LLM 调用和一个费解的报错。
+   - 删除路径**已有兜底**：级联删除会先带走 root checkpoint，事务开头的 CAS 因而影响 0 行并返回 `Stale`；`messages` 对 `sessions` 的复合外键还是最后防线。压缩写不活已删除的会话，门闩覆盖它只是为了省掉一次白花的 LLM 调用和一个费解的报错。
 
 7. **model binding 由 hub 显式传给 opener。** 与 `open`(`hub.rs:186`) 同规矩：权威值在 `LiveState.provider_id` / `reasoning_effort`（`hub.rs:484`），opener 不去存储里猜。让 opener 自己读会在 `SetModel` 之后拿到不一致的值。
 
@@ -345,7 +345,7 @@ pub enum CompactError {
 
 10. **成功与失败写入同样的结构，只差 `kind`——但仅限「写进去了」这一类结果。** LLM 失败时：用户输入的自定义指令不会凭空消失、transcript 里不存在「用户说了话没人应答」、重试无需清理（失败那对消息落在新边界之前，**自动从视图里掉出去**）。而 `Stale` / `Storage` 是另一类：一条消息都没写，`/compact` 那条也没有。结果类型必须把这两类分开，否则 UI 会去展示一条并不存在的记录。
 
-11. **压缩请求把对话摊平成文本，不重放为对话结构。** 一次性消掉三个 provider 兼容性问题（tool definitions、reasoning continuation、孤儿 tool result）。代价是图片摊不平。
+11. **压缩请求以原始持久化 messages 为数据源，但先在服务端摊平成专用纯文本 transcript，不把 messages 原样重放给 provider，也不复用前端的 transcript/UI 模型。** 一次性消掉三个 provider 兼容性问题（tool definitions、reasoning continuation、孤儿 tool result）。代价是图片摊不平，只能记为附件占位。
 
 ## Risks / Open Questions
 
@@ -370,27 +370,33 @@ pub enum CompactError {
       Purpose：验证 Decision 11 与 Risk 2、Risk 3。
       Verification：两次请求都返回 200；人工阅读摘要，判断「正在做什么 / 下一步 / 改过哪些文件」是否都在。
 
-- [ ] **[基础] 拆 `Message` / `RequestMessage` + `Message::Custom`**
+- [x] **[基础] 拆 `Message` / `RequestMessage` + `Message::Custom`**
       纯类型改动，先不涉及压缩逻辑：`coda_core` 定义与降级、`agent.rs:605` 组请求、`coda_openai` 换签名、`message_id_of` 与 `message_row_identity` 简化、`protocol.ts` 与 `historyToEntries` 跟进。
       Purpose：把「降级必须发生在进 provider 之前」变成编译期保证，并让后续压缩改动只剩逻辑。
       Verification：`cargo clippy` + `cargo test` 全绿；`pnpm --filter coda-web lint` + `test` 全绿；`storage_pg`（`--features pg-tests`）写入并读回一条 `role = "custom"` 的消息。
+      **状态**：全部通过。`storage_pg` 那条是 `a_custom_message_round_trips_under_its_own_role`，顺带断言 `role = "custom"` 不被 `role = 'user'` 的过滤命中——rewind 目标与 turn 边界都靠那个过滤。
 
-- [ ] **[核心逻辑] `coda_agent::compaction::view` + `Agent::messages()`**
+- [x] **[核心逻辑] `coda_agent::compaction::view` + `Agent::messages()`**
       Purpose：把压缩规则做成一份可单测的纯逻辑，并接进唯一的视图组装点。
       Verification：单测覆盖 —— 无 compaction 消息时视图 == 全量；有一条时从它切起且它本身保留；有多条时取最后一条；`compaction_failed` 不构成边界；sub-agent 线程（无此类消息）得到全量。
+      **状态**：5 条 `coda_agent::compaction` 单测通过；默认无边界路径也由既有 session/runtime 测试覆盖。
 
 - [ ] **[存储] `commit_compaction` 事务 + `message_count` CAS**
       Purpose：确认两条消息 + `message_count` 推进是原子的（推进**不能漏**——漏了下一次 `save_checkpoint` 会按旧 count 算 seq、与新行撞主键，整个 checkpoint 写失败），且陈旧提交被拒绝。
-      Verification：`storage_pg` 测试 —— **正常路径必须真的写进去**（这条同时钉住 `thread_id` 用的是 session id：写成 `"root"` 会让 CAS 影响 0 行，表现为永远 `Stale`）；写入后 `load_checkpoint` 的消息数与 `message_count` 一致；随后再跑一次正常 checkpoint 保存不冲突；**读基线之后先追加一条消息再提交，必须返回 `Stale` 且一条都没写**；session 已删除时提交因 FK 失败且不复活任何行；rewind 到压缩之前时两条消息一起消失且视图恢复全量。
+      Verification：`storage_pg` 测试 —— **正常路径必须真的写进去**（这条同时钉住 `thread_id` 用的是 session id：写成 `"root"` 会让 CAS 影响 0 行，表现为永远 `Stale`）；写入后 `load_checkpoint` 的消息数与 `message_count` 一致；随后再跑一次正常 checkpoint 保存不冲突；**读基线之后先追加一条消息再提交，必须返回 `Stale` 且一条都没写**；session 已删除时 CAS 返回 `Stale` 且不复活任何行；rewind 到压缩之前时两条消息一起消失且视图恢复全量。
+      **状态**：实现与 3 条 compaction PostgreSQL 测试已完成，并通过 `--all-features` 编译；当前环境没有 `DATABASE_URL`，尚未实际执行数据库断言。
 
-- [ ] **[集成] `SessionOpener::compact` + hub 门闩 + RPC**
+- [x] **[集成] `SessionOpener::compact` + hub 门闩 + RPC**
       含闲置检查、`EntryState.compacting` 门闩五处、model binding 显式传参、放锁、generation 校验、快照更新与推送、完成后补 `maybe_release`。
       Purpose：打通链路，确认长时间的 LLM 调用不会堵住 session，也不会让 entry 在脚下消失。
       Verification：`hub_tests` —— 压缩期间 `task` / `set_model` / `fork` / **`rewind`** 全部返回 `NotIdle` 且 attach 不被阻塞；**压缩期间 detach 不释放 entry，压缩完成后才释放**；**压缩开始收到一次 `compacting == true` 的快照事件，结束收到一次带新消息且 `compacting == false` 的，且这两次都不终止事件流**；压缩期间 attach 拿到的快照 `compacting == true`；LLM 失败路径写入两条消息但视图不变；`Stale` 路径一条不写且 transcript 无残留；非闲置时 `compact` 什么都不改。
+      **状态**：新增 5 条 `hub::tests::compaction` 集成测试，以上门闩、takeover、快照、释放、失败与 stale 路径全部通过。
 
-- [ ] **[集成] web：`/compact ` 前缀识别 + `Custom` 渲染**
+- [x] **[集成] web：`/compact ` 前缀识别 + `Custom` 渲染**
       Purpose：把能力交到用户手上。
       Verification：`pnpm --filter coda-web test` 覆盖 —— `/compact`、`/compact 只保留架构决策` 走命令路径；`/compact` 出现在句中或作为普通文本的一部分时**不**走命令路径；`Custom{kind:"compaction"}` 渲染成可辨识的分隔条目而非普通气泡。
+      **状态**：命令解析、RPC 路由、快照 busy 状态和 `Custom` 分隔条目的 4 条测试通过；完整 web suite 为 96 条通过。
 
-- [ ] **[收尾] `cargo clippy` + `cargo test` + `pnpm --filter coda-web lint` + `pnpm --filter coda-web test`**
+- [x] **[收尾] `cargo clippy` + `cargo test` + `pnpm --filter coda-web lint` + `pnpm --filter coda-web test`**
       Verification：全绿。
+      **状态**：默认 workspace 全绿；`cargo clippy --workspace --all-targets --all-features` 也通过。带 `pg-tests` 的运行仍受上一项所述数据库环境限制。

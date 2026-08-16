@@ -25,7 +25,7 @@ fn assistant() -> AssistantMessage {
 #[test]
 fn user_text_message_uses_text_content_form() {
     let message: ChatCompletionRequestMessage =
-        Message::User(coda_core::llm::UserMessage::text(MessageId::new(), "hello"))
+        RequestMessage::User(coda_core::llm::UserMessage::text(MessageId::new(), "hello"))
             .into_openai_type();
 
     let ChatCompletionRequestMessage::User(user) = message else {
@@ -41,7 +41,7 @@ fn user_text_message_uses_text_content_form() {
 fn user_image_message_uses_array_content_form() {
     let image_url = "data:image/png;base64,abc123".to_string();
     let message: ChatCompletionRequestMessage =
-        Message::User(coda_core::llm::UserMessage::with_images(
+        RequestMessage::User(coda_core::llm::UserMessage::with_images(
             MessageId::new(),
             "look",
             std::slice::from_ref(&image_url),
@@ -70,7 +70,7 @@ fn user_image_message_uses_array_content_form() {
 #[test]
 fn injects_reasoning_only_for_assistant_tool_calls() {
     let messages = vec![
-        Message::Assistant(AssistantMessage {
+        RequestMessage::Assistant(AssistantMessage {
             content: String::new(),
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
@@ -80,7 +80,7 @@ fn injects_reasoning_only_for_assistant_tool_calls() {
             reasoning_content: Some("need a tool".into()),
             ..assistant()
         }),
-        Message::Assistant(AssistantMessage {
+        RequestMessage::Assistant(AssistantMessage {
             content: "done".into(),
             reasoning_content: Some("final reasoning".into()),
             ..assistant()
@@ -285,7 +285,7 @@ fn openrouter_replays_details_and_maps_off_effort_to_none() {
     .unwrap();
     let request = ChatCompletionRequest {
         model: "x-ai/grok-4.5".into(),
-        messages: vec![Message::Assistant(AssistantMessage {
+        messages: vec![RequestMessage::Assistant(AssistantMessage {
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
                 name: "lookup_weather".into(),
@@ -328,7 +328,7 @@ fn openrouter_classifies_malformed_continuation_as_invalid_request() {
     .unwrap();
     let request = ChatCompletionRequest {
         model: "x-ai/grok-4.5".into(),
-        messages: vec![Message::Assistant(AssistantMessage {
+        messages: vec![RequestMessage::Assistant(AssistantMessage {
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
                 name: "lookup_weather".into(),
@@ -356,7 +356,7 @@ fn openrouter_replays_plain_reasoning_only_for_tool_turns() {
     let request = ChatCompletionRequest {
         model: "moonshotai/kimi-k3".into(),
         messages: vec![
-            Message::Assistant(AssistantMessage {
+            RequestMessage::Assistant(AssistantMessage {
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "lookup_weather".into(),
@@ -365,7 +365,7 @@ fn openrouter_replays_plain_reasoning_only_for_tool_turns() {
                 reasoning_content: Some("tool reasoning".into()),
                 ..assistant()
             }),
-            Message::Assistant(AssistantMessage {
+            RequestMessage::Assistant(AssistantMessage {
                 content: "done".into(),
                 reasoning_content: Some("final reasoning".into()),
                 ..assistant()
@@ -401,12 +401,12 @@ fn openrouter_keeps_image_input_and_tool_continuation_in_one_request() {
     let request = ChatCompletionRequest {
         model: "moonshotai/kimi-k3".into(),
         messages: vec![
-            Message::User(coda_core::llm::UserMessage::with_images(
+            RequestMessage::User(coda_core::llm::UserMessage::with_images(
                 MessageId::new(),
                 "inspect",
                 &["data:image/png;base64,abc123".to_string()],
             )),
-            Message::Assistant(AssistantMessage {
+            RequestMessage::Assistant(AssistantMessage {
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "lookup_weather".into(),

@@ -14,8 +14,8 @@ use coda_agent::{
     SessionEvent, SessionStreamItem, Shutdown, SubAgentMode, ToolApprovalMode, ToolCallResolution,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, MessageId, StreamError,
-    ToolCall, ToolOutput,
+    AssistantMessage, ChatCompletionRequest, LLMStreamEvent, Message, MessageId, RequestMessage,
+    StreamError, ToolCall, ToolOutput,
 };
 use futures::{Stream, stream};
 use serde_json::json;
@@ -26,12 +26,12 @@ use tokio::time::timeout;
 // ---------------------------------------------------------------------------
 
 /// Extracts the text of the last `User` message in a request.
-fn last_user_text(messages: &[Message]) -> &str {
+fn last_user_text(messages: &[RequestMessage]) -> &str {
     messages
         .iter()
         .rev()
         .find_map(|m| match m {
-            Message::User(u) => u.first_text(),
+            RequestMessage::User(u) => u.first_text(),
             _ => None,
         })
         .unwrap_or("")
@@ -40,9 +40,9 @@ fn last_user_text(messages: &[Message]) -> &str {
 /// The most recent result of one named tool, if the thread holds one. Distinct
 /// from [`has_tool_results`]: a thread several turns in always holds *some* tool
 /// message, so a branch that must fire once per turn has to name its own.
-fn tool_result(messages: &[Message], name: &str) -> Option<String> {
+fn tool_result(messages: &[RequestMessage], name: &str) -> Option<String> {
     messages.iter().rev().find_map(|message| match message {
-        Message::Tool(tool) if tool.name == name => Some(match &tool.output {
+        RequestMessage::Tool(tool) if tool.name == name => Some(match &tool.output {
             ToolOutput::Ok(text) => text.clone(),
             ToolOutput::Err(err) => format!("error: {err}"),
         }),
@@ -51,15 +51,17 @@ fn tool_result(messages: &[Message], name: &str) -> Option<String> {
 }
 
 /// Returns `true` if the message list contains any `Tool` message.
-fn has_tool_results(messages: &[Message]) -> bool {
-    messages.iter().any(|m| matches!(m, Message::Tool(_)))
+fn has_tool_results(messages: &[RequestMessage]) -> bool {
+    messages
+        .iter()
+        .any(|m| matches!(m, RequestMessage::Tool(_)))
 }
 
 /// Count the number of `User` messages in the request.
-fn user_message_count(messages: &[Message]) -> usize {
+fn user_message_count(messages: &[RequestMessage]) -> usize {
     messages
         .iter()
-        .filter(|m| matches!(m, Message::User(_)))
+        .filter(|m| matches!(m, RequestMessage::User(_)))
         .count()
 }
 
@@ -169,7 +171,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .iter()
                     .rev()
                     .find_map(|m| match m {
-                        Message::Tool(t) if t.name == "read_file" => {
+                        RequestMessage::Tool(t) if t.name == "read_file" => {
                             if let ToolOutput::Ok(ref s) = t.output {
                                 Some(s.clone())
                             } else {
@@ -201,11 +203,11 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             let has_write = request
                 .messages
                 .iter()
-                .any(|m| matches!(m, Message::Tool(t) if t.name == "write_file"));
+                .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "write_file"));
             let has_read = request
                 .messages
                 .iter()
-                .any(|m| matches!(m, Message::Tool(t) if t.name == "read_file"));
+                .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "read_file"));
 
             if has_read {
                 let read_output = request
@@ -213,7 +215,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .iter()
                     .rev()
                     .find_map(|m| match m {
-                        Message::Tool(t) if t.name == "read_file" => {
+                        RequestMessage::Tool(t) if t.name == "read_file" => {
                             if let ToolOutput::Ok(ref s) = t.output {
                                 Some(s.clone())
                             } else {
@@ -258,7 +260,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .iter()
                     .rev()
                     .find_map(|m| match m {
-                        Message::Tool(t) if t.name == "explore" => {
+                        RequestMessage::Tool(t) if t.name == "explore" => {
                             if let ToolOutput::Ok(ref s) = t.output {
                                 Some(s.clone())
                             } else {
@@ -382,7 +384,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
                     .iter()
                     .rev()
                     .find_map(|m| match m {
-                        Message::Tool(t) if t.name == "read_todos" => {
+                        RequestMessage::Tool(t) if t.name == "read_todos" => {
                             Some(format!("{:?}", t.outcome))
                         }
                         _ => None,

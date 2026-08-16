@@ -1,4 +1,4 @@
-import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, LoaderCircle, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import type {
 import { ModelSelector } from "@/components/model-selector";
 import { PermissionSelector } from "@/components/permission-selector";
 import { ContextUsage } from "@/components/context-usage";
+import { parseCompactCommand } from "@/lib/compact-command";
 import {
   ImageLightbox,
   IMAGE_LIGHTBOX_TRANSITION,
@@ -44,6 +45,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  compacting,
   approvalPending,
   starting,
   evicted,
@@ -68,6 +70,8 @@ export const Composer = memo(function Composer({
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** A summary request owns the session but has no abort path. */
+  compacting: boolean;
   /** A suspended turn is idle computationally but still owns the session. */
   approvalPending: boolean;
   /** The session is being opened for its first task. Blocks send without
@@ -153,7 +157,7 @@ export const Composer = memo(function Composer({
   }, [hasForkDraft, images, onForkDraftChange, task]);
 
   const connected = status === "connected";
-  const busy = running || approvalPending;
+  const busy = running || approvalPending || compacting;
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when
   // the request went out, and a reconnect can remount us from them at any
   // moment. Anything typed past that point would vanish without trace, so the
@@ -170,6 +174,7 @@ export const Composer = memo(function Composer({
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
   const canAddImages = acceptsImages && !frozen && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
+  const compactCommandHasImages = images.length > 0 && parseCompactCommand(task.trim()) !== null;
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
   const requireImageModel = images.length > 0 || sessionHasImages;
@@ -182,6 +187,7 @@ export const Composer = memo(function Composer({
     !evicted &&
     !editing?.submitting &&
     !imagesBlockSend &&
+    !compactCommandHasImages &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
   const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
@@ -555,7 +561,7 @@ export const Composer = memo(function Composer({
                   <ImagePlus className="size-4" />
                 </Button>
               )}
-              {busy ? (
+              {running || approvalPending ? (
                 <Button
                   size="icon"
                   variant="secondary"
@@ -566,6 +572,17 @@ export const Composer = memo(function Composer({
                   title="Abort"
                 >
                   <CircleStop />
+                </Button>
+              ) : compacting ? (
+                <Button
+                  size="icon"
+                  variant="secondary"
+                  className="size-8 rounded-md"
+                  type="button"
+                  disabled
+                  title="Compacting context"
+                >
+                  <LoaderCircle className="animate-spin" />
                 </Button>
               ) : (
                 <Button
@@ -585,6 +602,11 @@ export const Composer = memo(function Composer({
           <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
             The selected model does not support images. Switch to a vision-capable model or remove
             the attached images.
+          </p>
+        )}
+        {compactCommandHasImages && (
+          <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
+            Remove image attachments before compacting the conversation.
           </p>
         )}
         {lightboxIndex !== null && (

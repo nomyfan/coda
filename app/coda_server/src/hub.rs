@@ -74,12 +74,23 @@ pub enum SessionCommand {
     SetPermissionMode {
         mode: PermissionMode,
     },
+    /// Summarize the root thread and append the summary, so later turns are
+    /// built from it instead of the whole conversation. Unlike every other
+    /// command this lets go of the entry lock partway through — the summary is
+    /// a full LLM round-trip.
+    Compact {
+        instructions: String,
+    },
 }
 
 /// An element of the per-attachment event stream.
 #[derive(Debug)]
 pub enum RelayEvent {
     Event(Box<WireEvent>),
+    /// The session's state changed outside the event stream and the attached
+    /// client needs the whole picture again. Unlike the two below, the stream
+    /// continues after it.
+    Snapshot(Box<SnapshotPayload>),
     /// Another client attached to this session; this stream ends after this.
     Evicted,
     /// The session runtime ended (released, deleted, or replaced); this stream
@@ -102,6 +113,10 @@ pub struct SnapshotPayload {
     /// A turn is in flight; its events so far are replayed at the head of the
     /// attach stream.
     pub turn_running: bool,
+    /// A compaction is in flight. It is not a turn and produces no events, so
+    /// without this a client attaching mid-compaction would read the session as
+    /// idle and let the user send — only to be refused.
+    pub compacting: bool,
 }
 
 pub struct AttachSession {
@@ -160,6 +175,17 @@ pub enum CommandOutcome {
     /// A `SetModel` rejected because a turn is in flight (the session can only be
     /// rebuilt while idle). Reported as `MODEL_SWITCH_WHILE_RUNNING`.
     TurnRunning,
+    /// A `Compact` wrote its two messages. `applied` is false when the summary
+    /// could not be generated: the record is in the transcript, but the
+    /// boundary has not moved and the model still sees everything.
+    ///
+    /// The messages themselves are not here on purpose — the client gets them
+    /// from the snapshot pushed alongside, so only one path writes the
+    /// transcript and it cannot render them twice.
+    Compacted { applied: bool },
+    /// A `Compact` that wrote nothing: the conversation moved on while the
+    /// summary was being generated, or the write failed.
+    CompactionAbandoned { stale: bool, reason: String },
     /// The replacement runtime was valid, but persisting its effort failed;
     /// the current live runtime remains unchanged.
     PersistenceFailed(String),
@@ -174,6 +200,25 @@ pub enum ForkOutcome {
     /// a human, or a task is queued behind the current one.
     NotIdle,
     Failed(ForkError),
+}
+
+/// What a compaction wrote to the root thread. Both messages are always
+/// written; `applied` says whether the second one is the summary — and so the
+/// new boundary — or a record of why there is none.
+pub struct Compacted {
+    pub command: Message,
+    pub outcome: Message,
+    pub applied: bool,
+}
+
+/// Why a compaction wrote nothing at all. The client's transcript is untouched,
+/// so a retry needs no cleanup.
+#[derive(Debug)]
+pub enum CompactError {
+    /// The root thread grew while the summary was being generated, so the
+    /// summary no longer describes the whole thread.
+    Stale,
+    Storage(String),
 }
 
 /// Builds sessions for the relay. Injected at construction: configuration is
@@ -224,6 +269,25 @@ pub trait SessionOpener: Send + Sync + 'static {
         cut: ForkCut,
         source: ForkSource,
     ) -> Pin<Box<dyn Future<Output = Result<ForkedSession, ForkError>> + Send + 'a>>;
+
+    /// Summarize the root thread since its last compaction and append the
+    /// result to it, returning the two messages written.
+    ///
+    /// The caller must have gated the session idle and marked it compacting,
+    /// and must **not** hold the entry lock: this makes a full LLM round-trip.
+    /// The model binding is passed in rather than read from storage, so a
+    /// compaction always uses the selection the session is actually running.
+    ///
+    /// A summary that cannot be generated is still recorded — `applied` is then
+    /// false and the boundary has not moved. Only [`CompactError`] means
+    /// nothing was written.
+    fn compact<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<&'a str>,
+        instructions: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Compacted, CompactError>> + Send + 'a>>;
 
     /// Persist an effort update after a replacement runtime has been built but
     /// before it becomes live.
@@ -554,6 +618,12 @@ struct EntryState {
     /// remembered mode, which is exactly the value a live session must
     /// *not* be reset to.
     permission_mode: PermissionModeCell,
+    /// A compaction is running with the lock released. It sits on the entry for
+    /// the same reason `permission_mode` does, and more sharply: `rewind` and
+    /// `SetModel` both replace the whole `LiveState` via `make_live`, so a flag
+    /// kept in the phase would vanish under a compaction and leave the entry
+    /// looking idle — free to be released, or to accept a second compaction.
+    compacting: bool,
 }
 
 /// A cheap, cloneable handle to a session's slot, kept separate from the
@@ -597,6 +667,7 @@ impl SessionHub {
                                 phase: EntryPhase::Uninitialized,
                                 attached: None,
                                 permission_mode: PermissionModeCell::default(),
+                                compacting: false,
                             })),
                         })
                     })
@@ -750,7 +821,7 @@ impl SessionHub {
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        if state.attached.is_some() {
+        if state.attached.is_some() || state.compacting {
             return None;
         }
         let idle = match &state.phase {
@@ -805,6 +876,9 @@ impl SessionHub {
         task: String,
         images: Vec<String>,
     ) -> CommandOutcome {
+        if state.compacting {
+            return CommandOutcome::NotIdle;
+        }
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
@@ -840,6 +914,96 @@ impl SessionHub {
             Message::User(UserMessage::with_images(message_id, task, &images)),
         ));
         CommandOutcome::TaskAccepted { message_id }
+    }
+
+    /// Summarize the root thread and fold the result into the live view.
+    ///
+    /// The only command that lets go of the entry lock partway through: the
+    /// summary is a 10–30 second round-trip, and holding the lock across it
+    /// would block this session's attaches, aborts and every other command.
+    /// What keeps that safe is two-layered — `compacting` stops anything from
+    /// rewriting the thread or releasing the entry meanwhile, and the storage
+    /// commit compare-and-swaps on the message count for the paths a flag
+    /// cannot cover (process exit, eviction, a deleted session).
+    async fn handle_compact(
+        &self,
+        entry: &Arc<SessionEntry>,
+        mut guard: EntryGuard,
+        key: &SessionKey,
+        instructions: String,
+    ) -> CommandOutcome {
+        let (provider_id, reasoning_effort, generation) = {
+            let state = &mut *guard;
+            if state.compacting {
+                return CommandOutcome::NotIdle;
+            }
+            let EntryPhase::Live(live) = &state.phase else {
+                return CommandOutcome::Ignored;
+            };
+            if live.turn_running
+                || !live.pending_approvals.is_empty()
+                || live.unsettled_user_message.is_some()
+            {
+                return CommandOutcome::NotIdle;
+            }
+            state.compacting = true;
+            (
+                live.provider_id.clone(),
+                live.reasoning_effort.clone(),
+                live.generation,
+            )
+        };
+        push_snapshot(&guard);
+        drop(guard);
+
+        let result = self
+            .opener
+            .compact(
+                key,
+                &provider_id,
+                reasoning_effort.as_deref(),
+                &instructions,
+            )
+            .await;
+
+        let mut guard = entry.inner.clone().lock_owned().await;
+        guard.compacting = false;
+        let outcome = match result {
+            Ok(compacted) => {
+                // The entry may have been rebuilt or torn down while the lock
+                // was free. The write is safe either way — the commit's
+                // compare-and-swap decided that — but this in-memory view is
+                // only the right one to update if it is still the same one.
+                if let EntryPhase::Live(live) = &mut guard.phase
+                    && live.generation == generation
+                {
+                    live.snapshot.push(compacted.command);
+                    live.snapshot.push(compacted.outcome);
+                }
+                CommandOutcome::Compacted {
+                    applied: compacted.applied,
+                }
+            }
+            Err(CompactError::Stale) => CommandOutcome::CompactionAbandoned {
+                stale: true,
+                reason: "the conversation changed while it was being summarized".to_string(),
+            },
+            Err(CompactError::Storage(reason)) => {
+                warn!(workspace_id = %key.0, session_id = %key.1, "compaction failed to persist: {reason}");
+                CommandOutcome::CompactionAbandoned {
+                    stale: false,
+                    reason,
+                }
+            }
+        };
+        push_snapshot(&guard);
+        // The client may have disconnected during the round-trip, and the
+        // release that would normally follow was held off by `compacting`.
+        if let Some(release) = Self::maybe_release(&self.entries, entry, &mut guard) {
+            drop(guard);
+            tokio::spawn(release);
+        }
+        outcome
     }
 
     /// Give up on an entry that can no longer serve: tell the attached client so
@@ -878,11 +1042,14 @@ impl SessionHub {
         images: Vec<String>,
     ) -> CommandOutcome {
         let permission_mode = state.permission_mode.clone();
+        let compacting = state.compacting;
         let (provider_id, reasoning_effort, generation, previous_snapshot) = {
             let EntryPhase::Live(live) = &mut state.phase else {
                 return CommandOutcome::Ignored;
             };
-            if live.turn_running || !live.pending_approvals.is_empty() {
+            // A rewind rewrites the very history a running compaction is
+            // summarizing, and rebuilds the runtime under it.
+            if compacting || live.turn_running || !live.pending_approvals.is_empty() {
                 warn!(workspace_id = %key.0, session_id = %key.1, "ignoring rewind while the session is busy");
                 return CommandOutcome::NotIdle;
             }
@@ -1056,6 +1223,11 @@ impl SessionHub {
         // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
         // `set_model` path as `SESSION_NOT_LIVE` (Decision 8).
         let permission_mode = state.permission_mode.clone();
+        // The rebuild below replaces the whole `LiveState`, which a running
+        // compaction is about to write its result into.
+        if state.compacting {
+            return CommandOutcome::TurnRunning;
+        }
         let EntryPhase::Live(live) = &mut state.phase else {
             return CommandOutcome::Ignored;
         };
@@ -1212,8 +1384,9 @@ impl SessionRelay for SessionHub {
                 }
             }
 
-            let snapshot = compose_snapshot(&state.phase, state.permission_mode.get())
-                .expect("phase is Live or Pending after initialization");
+            let snapshot =
+                compose_snapshot(&state.phase, state.permission_mode.get(), state.compacting)
+                    .expect("phase is Live or Pending after initialization");
 
             // Register the stream and capture the replay in the same critical
             // section the forwarder appends under: every event lands in the
@@ -1242,6 +1415,14 @@ impl SessionRelay for SessionHub {
         Box::pin(async move {
             let Some((entry, mut guard)) = self.lock_entry_for_conn(&key, conn_id).await else {
                 return CommandOutcome::Ignored;
+            };
+            // Taken by value rather than through `state` below: it is the one
+            // command that has to drop the guard partway through.
+            let command = match command {
+                SessionCommand::Compact { instructions } => {
+                    return self.handle_compact(&entry, guard, &key, instructions).await;
+                }
+                other => other,
             };
             let state = &mut *guard;
             match command {
@@ -1285,6 +1466,7 @@ impl SessionRelay for SessionHub {
                     info!(workspace_id = %key.0, session_id = %key.1, "permission mode set to {mode:?}");
                     CommandOutcome::Ok
                 }
+                SessionCommand::Compact { .. } => unreachable!("taken by the guard above"),
             }
         })
     }
@@ -1399,6 +1581,7 @@ impl SessionRelay for SessionHub {
             let borrowed = matches!(guard.phase, EntryPhase::Uninitialized);
 
             let gate = match &guard.phase {
+                _ if guard.compacting => ForkGate::Busy,
                 EntryPhase::Live(live) => {
                     if live.turn_running
                         || !live.pending_approvals.is_empty()
@@ -1504,11 +1687,26 @@ impl SessionHub {
     }
 }
 
+/// Hand the attached client the current snapshot. Used where the session
+/// changes outside the event stream, which is the one thing a client following
+/// only events cannot see.
+fn push_snapshot(state: &EntryState) {
+    let Some(attachment) = &state.attached else {
+        return;
+    };
+    if let Some(snapshot) =
+        compose_snapshot(&state.phase, state.permission_mode.get(), state.compacting)
+    {
+        let _ = attachment.tx.send(RelayEvent::Snapshot(Box::new(snapshot)));
+    }
+}
+
 /// Compose the attach-time snapshot for an entry. Pure over the entry state so
 /// it is unit-testable.
 fn compose_snapshot(
     phase: &EntryPhase,
     permission_mode: PermissionMode,
+    compacting: bool,
 ) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
@@ -1525,6 +1723,7 @@ fn compose_snapshot(
                 reasoning_effort: live.reasoning_effort.clone(),
                 permission_mode,
                 turn_running: live.turn_running,
+                compacting,
             })
         }
         EntryPhase::Pending(pending) => Some(SnapshotPayload {
@@ -1539,6 +1738,7 @@ fn compose_snapshot(
             reasoning_effort: pending.reasoning_effort.clone(),
             permission_mode,
             turn_running: false,
+            compacting,
         }),
         _ => None,
     }

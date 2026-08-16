@@ -156,13 +156,14 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
 fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
     messages
         .iter()
-        .map(|m| match m {
-            Message::User(u) => ("user", u.message_id),
-            Message::Assistant(a) => ("assistant", a.message_id),
-            Message::Tool(t) => ("tool", t.message_id),
-            // Built fresh for each request and never persisted, so it has no id
-            // and cannot appear in either list.
-            Message::System(_) => unreachable!("a system message reached persisted history"),
+        .map(|m| {
+            let role = match m {
+                Message::User(_) => "user",
+                Message::Assistant(_) => "assistant",
+                Message::Tool(_) => "tool",
+                Message::Custom(_) => "custom",
+            };
+            (role, m.message_id())
         })
         .collect()
 }

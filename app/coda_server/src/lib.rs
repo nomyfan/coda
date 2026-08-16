@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod ask_user;
+pub mod compaction;
 pub mod config;
 pub mod files;
 pub mod hub;

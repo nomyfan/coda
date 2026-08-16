@@ -5,13 +5,16 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
+use coda_agent::HistoryEntry;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, Message, Modality};
+use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
-use coda_server::storage::{DbPool, ForkCut, ForkError, ForkSource, ForkedSession};
+use coda_server::storage::{
+    CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
+};
 use coda_server::{
     WorkspaceKnowledge,
     agents::{
@@ -19,15 +22,16 @@ use coda_server::{
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_workspace_custom_instructions,
+    build_workspace_custom_instructions, compaction,
     config::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
     },
     files::{DEFAULT_LIMIT, FileIndex},
     hub::{
-        AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
-        SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
+        AttachError, AttachSession, CommandOutcome, CompactError, Compacted, ConnId, ForkOutcome,
+        RelayEvent, SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
+        SnapshotPayload,
     },
     load_workspace_skills,
     mcp::McpServers,
@@ -37,12 +41,13 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, DeleteSessionParams, EventParams, FileCatalog, ForkAccepted,
-        ForkSessionParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
-        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
-        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
-        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
-        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        AddAllowPatternParams, CompactParams, CompactResult, DeleteSessionParams, EventParams,
+        FileCatalog, ForkAccepted, ForkSessionParams, ListFilesParams, ListSkillsParams,
+        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
+        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
+        RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
+        SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskParams,
+        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -56,6 +61,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::time::timeout;
 use tokio_stream::{StreamExt as _, StreamMap};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -225,6 +231,58 @@ struct AppOpener {
     workspaces: HashMap<String, Arc<WorkspaceState>>,
 }
 
+/// How long a compaction waits on its provider. There is no abort path — the
+/// request goes out with no lock held and nothing to cancel it — so without a
+/// bound a hung provider would leave the session marked compacting for good.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl AppOpener {
+    /// One provider round-trip turning the visible history into a summary.
+    ///
+    /// The error text is recorded in the transcript when there is no summary,
+    /// so it has to read as an explanation to the user, not a stack trace.
+    async fn summarize(
+        &self,
+        provider_id: &str,
+        reasoning_effort: Option<&str>,
+        history: &[HistoryEntry],
+        instructions: &str,
+    ) -> Result<String, String> {
+        let handle = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+        let request = compaction::summary_request(
+            handle.model_id.clone(),
+            handle.max_completion_tokens,
+            reasoning_effort.map(str::to_string),
+            // The same rule the runtime slices by, so the summary covers
+            // exactly what the model can currently see: everything since the
+            // last compaction, that summary included.
+            coda_agent::compaction::view(history),
+            instructions,
+        );
+
+        let summary = timeout(SUMMARY_TIMEOUT, async {
+            let mut stream = std::pin::pin!(handle.provider.stream(request));
+            while let Some(event) = stream.next().await {
+                match event.map_err(|err| err.to_string())? {
+                    LLMStreamEvent::Completed(message) => return Ok(message.content.clone()),
+                    LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+                }
+            }
+            Err("the provider closed the stream without a summary".to_string())
+        })
+        .await
+        .map_err(|_| format!("the provider did not answer within {SUMMARY_TIMEOUT:?}"))??;
+
+        if summary.trim().is_empty() {
+            return Err("the provider returned an empty summary".to_string());
+        }
+        Ok(summary)
+    }
+}
+
 impl SessionOpener for AppOpener {
     fn open<'a>(
         &'a self,
@@ -276,6 +334,62 @@ impl SessionOpener for AppOpener {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<&'a str>,
+        instructions: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Compacted, CompactError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| CompactError::Storage(format!("unknown workspace '{}'", key.0)))?;
+            let storage = workspace.storage.session(&key.1);
+            let checkpoint = storage
+                .load_checkpoint(&key.1)
+                .await
+                .map_err(CompactError::Storage)?
+                .ok_or(CompactError::Stale)?;
+
+            // Read before the round-trip and handed back to the commit, where
+            // it is the compare-and-swap that catches the thread having grown
+            // under us. Everything below runs with no lock held.
+            let baseline = checkpoint.messages.len();
+            let summary = self
+                .summarize(
+                    provider_id,
+                    reasoning_effort,
+                    &checkpoint.messages,
+                    instructions,
+                )
+                .await;
+
+            let command = compaction::command_message(instructions);
+            let (outcome, applied) = match &summary {
+                Ok(summary) => (compaction::summary_message(instructions, summary), true),
+                Err(reason) => {
+                    warn!(workspace_id = %key.0, session_id = %key.1, "could not summarize: {reason}");
+                    (compaction::failure_message(reason), false)
+                }
+            };
+            let turn_id = TurnId::from(command.message_id());
+            storage
+                .commit_compaction(baseline, turn_id, [&command, &outcome])
+                .await
+                .map_err(|err| match err {
+                    CompactionError::Stale => CompactError::Stale,
+                    CompactionError::Persistence(reason) => CompactError::Storage(reason),
+                })?;
+            Ok(Compacted {
+                command,
+                outcome,
+                applied,
+            })
         })
     }
 
@@ -652,7 +766,18 @@ async fn attach_core(
             permission_mode: snapshot.permission_mode,
         },
     );
-    let wire_snapshot = Snapshot {
+    let wire_snapshot = wire_snapshot(&key, snapshot);
+    // Register the stream *before* returning; the caller sends the snapshot
+    // (result or notification) before the connection loop next polls the stream,
+    // so the snapshot always precedes the replayed events.
+    streams.insert(key, events);
+    Ok(wire_snapshot)
+}
+
+/// Address a hub snapshot to a session. Shared by the two ways one reaches a
+/// client: as the answer to `open_session`, and as a pushed `snapshot`.
+fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
+    Snapshot {
         workspace_id: key.0.clone(),
         session_id: key.1.clone(),
         messages: snapshot.messages,
@@ -665,12 +790,8 @@ async fn attach_core(
         reasoning_effort: snapshot.reasoning_effort,
         permission_mode: snapshot.permission_mode,
         turn_running: snapshot.turn_running,
-    };
-    // Register the stream *before* returning; the caller sends the snapshot
-    // (result or notification) before the connection loop next polls the stream,
-    // so the snapshot always precedes the replayed events.
-    streams.insert(key, events);
-    Ok(wire_snapshot)
+        compacting: snapshot.compacting,
+    }
 }
 
 /// Deserialize a request's `params` into the per-method type, mapping a failure
@@ -1245,6 +1366,13 @@ async fn dispatch_request(
             };
             handle_rewind(app, conn_id, id, params).await
         }
+        "compact" => {
+            let params: CompactParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            handle_compact(app, conn_id, id, params).await
+        }
         "rename_session" => {
             let params: RenameSessionParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1443,6 +1571,62 @@ async fn accept_turn_input(
     Ok((task, images))
 }
 
+/// Summarize the conversation so far and continue from the summary.
+///
+/// The answer reports only what happened. The two messages a compaction writes
+/// reach the client through the snapshot pushed alongside — one path to the
+/// transcript, so it cannot render them twice, and the answer's arrival order
+/// relative to that push stops mattering.
+async fn handle_compact(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    id: RpcId,
+    params: CompactParams,
+) -> RpcOutgoing {
+    let instructions = params.instructions.trim().to_string();
+    if instructions.len() > compaction::MAX_INSTRUCTIONS {
+        return (
+            id,
+            RpcError::new(
+                rpc::INVALID_PARAMS,
+                format!(
+                    "compaction instructions must be at most {} bytes",
+                    compaction::MAX_INSTRUCTIONS
+                ),
+            ),
+        )
+            .into();
+    }
+    match app
+        .relay
+        .command(
+            (params.workspace_id, params.session_id),
+            conn_id,
+            SessionCommand::Compact { instructions },
+        )
+        .await
+    {
+        CommandOutcome::Compacted { applied: true } => (id, &CompactResult::Applied).into(),
+        CommandOutcome::Compacted { applied: false } => (id, &CompactResult::Recorded).into(),
+        CommandOutcome::CompactionAbandoned { stale, reason } => {
+            (id, &CompactResult::Abandoned { stale, reason }).into()
+        }
+        CommandOutcome::NotIdle => (
+            id,
+            RpcError::new(
+                rpc::SESSION_NOT_IDLE,
+                "the session must finish or abort its current turn first",
+            ),
+        )
+            .into(),
+        _ => (
+            id,
+            RpcError::new(rpc::SESSION_NOT_LIVE, "the session is not live"),
+        )
+            .into(),
+    }
+}
+
 /// Discard a message and everything after it, then start a turn from the edited
 /// text.
 ///
@@ -1619,6 +1803,12 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                     RelayEvent::Event(event) => {
                         reattached.remove(&key);
                         send_event(&transport, key.0.clone(), key.1.clone(), *event).await
+                    }
+                    // The session changed outside the event stream. Unlike the
+                    // two below this is not the end of anything, so the stream
+                    // and this connection's claim on it both stay put.
+                    RelayEvent::Snapshot(snapshot) => {
+                        send_notify(&transport, "snapshot", &wire_snapshot(&key, *snapshot)).await
                     }
                     RelayEvent::Evicted => {
                         streams.remove(&key);

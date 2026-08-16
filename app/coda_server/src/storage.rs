@@ -776,20 +776,14 @@ impl std::fmt::Debug for PgSessionStorage {
 }
 
 /// The identity and role columns of a message row.
-///
-/// A `System` message never reaches a checkpoint: the system prompt is inserted
-/// on a clone when a request is built, and `restore_history` drops it. So there
-/// is no row shape for one, and hitting this means the invariant broke upstream —
-/// worth a failed save rather than a minted id nobody can trace.
-fn message_row_identity(message: &Message) -> Result<(MessageId, &'static str), String> {
-    Ok(match message {
-        Message::User(message) => (message.message_id, "user"),
-        Message::Assistant(message) => (message.message_id, "assistant"),
-        Message::Tool(message) => (message.message_id, "tool"),
-        Message::System(_) => {
-            return Err("cannot persist a system message: the system prompt is not history".into());
-        }
-    })
+fn message_row_identity(message: &Message) -> (MessageId, &'static str) {
+    let role = match message {
+        Message::User(_) => "user",
+        Message::Assistant(_) => "assistant",
+        Message::Tool(_) => "tool",
+        Message::Custom(_) => "custom",
+    };
+    (message.message_id(), role)
 }
 
 /// Whether a thread in this state is waiting on a human.
@@ -814,6 +808,33 @@ enum SaveError {
 impl From<diesel::result::Error> for SaveError {
     fn from(err: diesel::result::Error) -> Self {
         Self::Db(err)
+    }
+}
+
+/// Why a compaction was not committed. Either way nothing was written — a
+/// caller can retry as it stands, and has no transcript to roll back.
+#[derive(Debug)]
+pub enum CompactionError {
+    /// The root thread grew while the summary was being generated, so the
+    /// summary no longer describes the whole thread.
+    Stale,
+    Persistence(String),
+}
+
+impl std::fmt::Display for CompactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactionError::Stale => {
+                write!(f, "the conversation changed while it was being summarized")
+            }
+            CompactionError::Persistence(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+impl From<diesel::result::Error> for CompactionError {
+    fn from(error: diesel::result::Error) -> Self {
+        CompactionError::Persistence(error.to_string())
     }
 }
 
@@ -1070,8 +1091,7 @@ impl PgSessionStorage {
             }
 
             for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
-                let (message_id, role) =
-                    message_row_identity(&entry.message).map_err(SaveError::Rejected)?;
+                let (message_id, role) = message_row_identity(&entry.message);
                 let origin = match &entry.message {
                     Message::User(message) => message.origin.as_ref(),
                     _ => None,
@@ -1101,8 +1121,7 @@ impl PgSessionStorage {
             let appended: std::collections::HashSet<MessageId> = checkpoint.messages
                 [stored_count..]
                 .iter()
-                .filter_map(|entry| message_row_identity(&entry.message).ok())
-                .map(|(message_id, _)| message_id)
+                .map(|entry| entry.message.message_id())
                 .collect();
             for entry in &checkpoint.state {
                 if !appended.contains(&entry.message_id) {
@@ -1293,6 +1312,74 @@ impl PgSessionStorage {
             checkpoints.push(checkpoint);
         }
         Ok(checkpoints)
+    }
+
+    /// Append a compaction's two messages to the root thread, provided nothing
+    /// has appended to it since `expected_message_count` was read.
+    ///
+    /// The caller reads that count when it takes the history to summarize, so
+    /// the comparison means exactly "what I summarized is still the whole
+    /// thread". Between the two the caller holds no lock — the summary is a
+    /// full LLM round-trip — and the session may be released, reopened, and
+    /// given a new turn in the meantime. Appending then would put the boundary
+    /// *after* messages the summary never saw, cutting them out of the model's
+    /// view; so a mismatch rolls back and writes nothing at all.
+    pub async fn commit_compaction(
+        &self,
+        expected_message_count: usize,
+        turn_id: TurnId,
+        messages: [&Message; 2],
+    ) -> Result<(), CompactionError> {
+        let mut conn = self.conn().await.map_err(CompactionError::Persistence)?;
+        conn.transaction(async |conn| {
+            // The root thread's id is the session id. Updating the watermark
+            // under the expected value *is* the compare-and-swap: the row lock
+            // it takes also serializes this against a concurrent save.
+            let claimed = diesel::update(
+                thread_checkpoints::table.filter(
+                    thread_checkpoints::workspace_id
+                        .eq(&self.workspace_id)
+                        .and(thread_checkpoints::session_id.eq(&self.session_id))
+                        .and(thread_checkpoints::thread_id.eq(&self.session_id))
+                        .and(thread_checkpoints::message_count.eq(expected_message_count as i32)),
+                ),
+            )
+            .set(
+                thread_checkpoints::message_count
+                    .eq((expected_message_count + messages.len()) as i32),
+            )
+            .execute(conn)
+            .await?;
+            if claimed == 0 {
+                return Err(CompactionError::Stale);
+            }
+
+            for (offset, message) in messages.into_iter().enumerate() {
+                let (message_id, role) = message_row_identity(message);
+                diesel::insert_into(messages::table)
+                    .values((
+                        messages::workspace_id.eq(&self.workspace_id),
+                        messages::session_id.eq(&self.session_id),
+                        messages::thread_id.eq(&self.session_id),
+                        messages::seq.eq((expected_message_count + offset) as i32),
+                        messages::message_id.eq(message_id.as_uuid()),
+                        messages::turn_id.eq(turn_id.as_uuid()),
+                        messages::role.eq(role),
+                        // Origin names the sub-agent call that opened a thread;
+                        // these two are appended to the root thread, which
+                        // nothing calls.
+                        messages::origin_message_id.eq(None::<uuid::Uuid>),
+                        messages::origin_call_id.eq(None::<&str>),
+                        messages::payload.eq(Json(message)),
+                    ))
+                    .execute(conn)
+                    .await?;
+            }
+
+            touch(conn, &self.workspace_id, &self.session_id).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Discard `target` and everything the session produced from it onward, then

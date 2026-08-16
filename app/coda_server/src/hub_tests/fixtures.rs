@@ -10,7 +10,8 @@ use coda_agent::{
     AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ThreadId, ToolApprovalMode,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, StreamError, ToolCall,
+    AssistantMessage, ChatCompletionRequest, CustomMessage, CustomRole, LLMProvider,
+    LLMStreamEvent, RequestMessage, StreamError, ToolCall,
 };
 use coda_tools::ReadTodosToolSpec;
 use futures::{Stream, StreamExt, stream};
@@ -42,7 +43,7 @@ impl LLMProvider for TestProvider {
             .messages
             .first()
             .and_then(|m| match m {
-                Message::System(s) => Some(s.0.clone()),
+                RequestMessage::System(s) => Some(s.0.clone()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -78,7 +79,7 @@ impl LLMProvider for TestProvider {
                 let has_result = request
                     .messages
                     .iter()
-                    .any(|m| matches!(m, Message::Tool(t) if t.name == "read_todos"));
+                    .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "read_todos"));
                 if has_result {
                     Self::completed(assistant(
                         "should not settle: resync should have fired first",
@@ -102,12 +103,12 @@ impl LLMProvider for TestProvider {
             // thread afterwards and know whose messages it is looking at.
             "delegate" => {
                 let replacement = request.messages.iter().any(
-                    |m| matches!(m, Message::User(user) if user.first_text() == Some("different")),
+                    |m| matches!(m, RequestMessage::User(user) if user.first_text() == Some("different")),
                 );
                 let answered = request
                     .messages
                     .iter()
-                    .any(|m| matches!(m, Message::Tool(_)));
+                    .any(|m| matches!(m, RequestMessage::Tool(_)));
                 if replacement || answered {
                     Self::completed(assistant("done"))
                 } else {
@@ -124,7 +125,7 @@ impl LLMProvider for TestProvider {
                 let has_result = request
                     .messages
                     .iter()
-                    .any(|m| matches!(m, Message::Tool(t) if t.name == "read_todos"));
+                    .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "read_todos"));
                 if has_result {
                     Self::completed(assistant("approved-done"))
                 } else {
@@ -264,6 +265,13 @@ pub(super) struct TestOpener {
     /// a test can read one back to see what the *running* session would now
     /// decide — which is how the live-switch path is checked without a rebuild.
     pub(super) opened_modes: Arc<std::sync::Mutex<Vec<PermissionModeCell>>>,
+    /// Holds `compact` until released, so a test can drive other commands while
+    /// the summary is notionally in flight — which is the whole point of the
+    /// entry lock being free during one.
+    pub(super) compact_gate: Option<Arc<Notify>>,
+    /// What `compact` reports. `Ok(true)` is a summary that moved the boundary,
+    /// `Ok(false)` a recorded failure that did not.
+    pub(super) compact_result: Result<bool, CompactError>,
 }
 
 impl TestOpener {
@@ -340,6 +348,8 @@ impl TestOpener {
             fork_gate: None,
             fork_error: None,
             opened_modes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            compact_gate: None,
+            compact_result: Ok(true),
         }
     }
 }
@@ -397,6 +407,53 @@ impl SessionOpener for TestOpener {
         _key: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Vec<Message>> + Send + 'a>> {
         Box::pin(async { vec![] })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        _provider_id: &'a str,
+        _reasoning_effort: Option<&'a str>,
+        instructions: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Compacted, CompactError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(gate) = &self.compact_gate {
+                gate.notified().await;
+            }
+            let applied = match &self.compact_result {
+                Ok(applied) => *applied,
+                Err(CompactError::Stale) => return Err(CompactError::Stale),
+                Err(CompactError::Storage(reason)) => {
+                    return Err(CompactError::Storage(reason.clone()));
+                }
+            };
+            Ok(Compacted {
+                command: Message::User(UserMessage::text(
+                    MessageId::new(),
+                    if instructions.is_empty() {
+                        "/compact".to_string()
+                    } else {
+                        format!("/compact {instructions}")
+                    },
+                )),
+                outcome: Message::Custom(CustomMessage {
+                    message_id: MessageId::new(),
+                    kind: if applied {
+                        "compaction".into()
+                    } else {
+                        "compaction_failed".into()
+                    },
+                    role: if applied {
+                        CustomRole::User
+                    } else {
+                        CustomRole::Assistant
+                    },
+                    content: "a summary".into(),
+                    created_at: jiff::Timestamp::now(),
+                }),
+                applied,
+            })
+        })
     }
 
     /// A stand-in for the SQL one: same predicate (drop every turn the root
