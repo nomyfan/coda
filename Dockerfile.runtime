@@ -10,7 +10,7 @@ FROM debian:bookworm
 # bash/rg/fd are hard requirements of the shell/grep/glob tools (AGENTS.md).
 # fd-find installs as `fdfind` on Debian; symlinked to `fd` below.
 # Debian's own `nodejs` package is stuck on 18.x, so Node comes from
-# NodeSource's 22.x LTS repo instead. Corepack is no longer bundled by
+# NodeSource's 24.x LTS repo instead. Corepack is no longer bundled by
 # default, so it's installed separately via npm either way.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       vim \
       htop \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g corepack \
     && corepack enable \
