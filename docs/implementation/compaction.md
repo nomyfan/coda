@@ -320,7 +320,7 @@ pub enum CompactError {
    `maybe_release` 只看 `attached.is_none() && !turn_running`（`hub.rs:757`），压缩期间 `turn_running` 为假，所以**客户端断线就会释放 entry**。entry 一旦消失，就没有 generation 可校验；随后新 attach 打开新 runtime、用户发新 turn、消息落库，旧的压缩请求回来把边界追加在这些新消息**之后**——视图把它们整段切掉。这比压缩失败严重得多。
 
    - **门闩挂在 `EntryState` 上，不挂 `LiveState`。** 这是评审第二轮补的，也是个真坑：`handle_rewind` 与 `set_model` 都走 `make_live`(`hub.rs:768`) **重建一个全新的 `LiveState`**，挂在上面的字段会被整体丢弃——entry 随即显示为 idle，`maybe_release` 可以在压缩进行中释放它，第二次 `/compact` 也会被放行，门闩形同虚设。`PermissionModeCell` 正是因为「hangs off the entry, not the phase」才扛得住 `SetModel` 重建，照抄。挂到 entry 上之后五个检查点拿的都是同一个 `state`，反而更简单。
-   - **五个检查点**：`maybe_release`(757)、`task`(811)、`set_model`(1067)、`fork` 的 `ForkGate`、`rewind`(885)。**`rewind` 不能漏**——它同样改写 root 历史并重建 runtime。选择让它**拒绝**（返回 `NotIdle`）而不是取消压缩：取消要把 cancellation token 一路穿进 opener 再 await，为一个罕见竞态加一套机制不划算，用户等 ≤60s 重试即可。
+   - **五个检查点**：`maybe_release`(757)、`task`(811)、`set_model`(1067)、`fork` 的 `ForkGate`、`rewind`(885)。**`rewind` 不能漏**——它同样改写 root 历史并重建 runtime。选择让它**拒绝**（返回 `NotIdle`）而不是取消压缩：取消要把 cancellation token 一路穿进 opener 再 await，为一个罕见竞态加一套机制不划算，用户等 ≤10 分钟重试即可。
    - 压缩完成后必须补一次 `maybe_release`，否则断线的 entry 会滞留到超时——与 turn settle 那条路径（`hub.rs:1698`）同一个处理。
    - **不要拿 `turn_running` 兼职**：`Shutdown::graceful_unbounded` 与 `Shutdown::abort` 都是冲着 runtime 里的 turn 去的，压缩根本不在 runtime 里，复用会让优雅关闭去等一个不存在的 turn。
    - **CAS**：门闩挡不住进程退出、驱逐、删除这些路径，所以真正的保证在存储层。`commit_compaction` 以拼视图时读到的 `message_count` 为条件更新（`WHERE thread_id = $session_id AND message_count = $expected`），不匹配就整体回滚成 `Stale`。语义正好是「我读完之后 root 有没有被人追加过」。**`thread_id` 是 session id**，不是字面量 `"root"`（`storage.rs:984`）。
@@ -356,7 +356,7 @@ pub enum CompactError {
 
 3. **摘要降级成 user 消息后，视图开头可能出现连续两条 user 消息。** OpenAI 兼容接口允许，但 `kind = "deepseek"` 那条路径要实测。若某 provider 不接受，把 `CustomRole` 改成 `Assistant` 即可——这正是这个字段存在的意义，改一处配置而非改结构。spike 里一并验。
 
-4. **没有中断路径。** 压缩发出后无法 abort，靠请求超时兜底，否则 `compacting` 标志会把 session 卡住。超时值需要定（建议 60s）。
+4. **没有中断路径。** 压缩发出后无法 abort，靠请求超时兜底，否则 `compacting` 标志会把 session 卡住。超时值当前为 600s（10 分钟）——长 transcript 的摘要确实可能耗时，放宽后代价只是 session 被占住更久，不会产生错误结果。
 
 5. **压缩期间 session 被释放或驱逐。** 已由 Decision 6 的门闩 + CAS 覆盖，剩下的是**用户可见的行为**：断线重连后压缩可能报 `Stale` 而什么都没发生，用户得重按一次。可以接受（压缩本来就是显式操作），但 UI 的提示要说清「没执行」而不是「失败了」。回来时 entry 已被换掉的情况另外校验 generation，仅用于决定要不要更新快照——写回本身由 CAS 保证，不依赖 entry 还在。
 

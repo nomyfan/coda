@@ -234,7 +234,10 @@ struct AppOpener {
 /// How long a compaction waits on its provider. There is no abort path — the
 /// request goes out with no lock held and nothing to cancel it — so without a
 /// bound a hung provider would leave the session marked compacting for good.
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ten minutes is deliberately generous: a long transcript can take a while to
+/// summarize, and the cost of the bound is only a session held busy, not a
+/// wrong result.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl AppOpener {
     /// One provider round-trip turning the visible history into a summary.
