@@ -32,6 +32,35 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   };
 }
 
+function assistantMessage(id: string, promptTokens: number): HistoryMessage {
+  return {
+    Assistant: {
+      message_id: id,
+      content: "done",
+      tool_calls: [],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: 10,
+        total_tokens: promptTokens + 10,
+      },
+      started_at: "2026-08-16T00:00:00Z",
+      ended_at: "2026-08-16T00:00:01Z",
+    },
+  };
+}
+
+function compactionMessage(id: string): HistoryMessage {
+  return {
+    Custom: {
+      message_id: id,
+      kind: "compaction",
+      role: "User",
+      content: "Summary",
+      created_at: "2026-08-16T00:00:02Z",
+    },
+  };
+}
+
 test("only a whole composer input is a compact command", () => {
   expect(parseCompactCommand("/compact")).toBe("");
   expect(parseCompactCommand("/compact 只保留架构决策")).toBe("只保留架构决策");
@@ -306,6 +335,53 @@ test("the start-of-compaction snapshot keeps the optimistic line without running
   ]);
 });
 
+test("a repeated /compact line stays optimistic until its compaction finishes", () => {
+  const before = session({
+    entries: [
+      {
+        id: "user:old-command",
+        kind: "user",
+        messageId: "old-command",
+        content: "/compact keep decisions",
+      },
+      {
+        id: "user:opt",
+        kind: "user",
+        pendingCompact: true,
+        content: "/compact keep decisions",
+      },
+    ],
+  });
+  const after = applySnapshotToSession(before, {
+    messages: [
+      {
+        User: {
+          message_id: "old-command",
+          parts: [{ type: "text", text: "/compact keep decisions" }],
+          created_at: "2026-08-16T00:00:00Z",
+        },
+      },
+      compactionMessage("old-summary"),
+    ],
+    approvals: [],
+    providerId: "provider:model",
+    reasoningEffort: null,
+    permissionMode: "accept_edits",
+    turnRunning: false,
+    compacting: true,
+  });
+
+  expect(after.entries).toEqual([
+    expect.objectContaining({ id: "user:old-command", messageId: "old-command" }),
+    expect.objectContaining({ id: "compaction:old-summary" }),
+    expect.objectContaining({
+      id: "user:opt",
+      pendingCompact: true,
+      content: "/compact keep decisions",
+    }),
+  ]);
+});
+
 test("the end-of-compaction snapshot retires the optimistic copy by content", () => {
   const before = session({
     entries: [
@@ -347,6 +423,39 @@ test("the end-of-compaction snapshot retires the optimistic copy by content", ()
     }),
   ]);
   expect(after.entries.some((entry) => entry.pendingCompact)).toBe(false);
+});
+
+test("a successful compaction clears usage until the next assistant response", () => {
+  const compacted = applySnapshotToSession(session(), {
+    messages: [assistantMessage("old-assistant", 900), compactionMessage("summary")],
+    approvals: [],
+    providerId: "provider:model",
+    reasoningEffort: null,
+    permissionMode: "accept_edits",
+    turnRunning: false,
+    compacting: false,
+  });
+  expect(compacted.usage).toEqual([]);
+
+  const continued = applySnapshotToSession(compacted, {
+    messages: [
+      assistantMessage("old-assistant", 900),
+      compactionMessage("summary"),
+      assistantMessage("new-assistant", 100),
+    ],
+    approvals: [],
+    providerId: "provider:model",
+    reasoningEffort: null,
+    permissionMode: "accept_edits",
+    turnRunning: false,
+    compacting: false,
+  });
+  expect(continued.usage).toEqual([
+    {
+      agentName: "coda",
+      usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+    },
+  ]);
 });
 
 test("compactActiveSession does not call the server when the conversation is empty", async () => {

@@ -503,7 +503,15 @@ function historyToEntries(
 }
 
 function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
-  return messages.flatMap((message) => {
+  let boundary = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if ("Custom" in message && message.Custom.kind === "compaction") {
+      boundary = index + 1;
+      break;
+    }
+  }
+  return messages.slice(boundary).flatMap((message) => {
     if ("Assistant" in message && message.Assistant.usage) {
       return [{ agentName: rootName, usage: message.Assistant.usage }];
     }
@@ -1478,7 +1486,9 @@ export function applySnapshotToSession(
   // with the persisted entry.
   const recordedTexts = new Set(snapshot.messages.map(userMessageText));
   const pendingCompaction = session.entries.filter(
-    (entry) => isPendingCompactionEntry(entry) && !recordedTexts.has(entry.content),
+    (entry) =>
+      isPendingCompactionEntry(entry) &&
+      (snapshot.compacting === true || !recordedTexts.has(entry.content)),
   );
   return {
     ...session,
