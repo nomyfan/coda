@@ -12,7 +12,7 @@ use coda_agent::HistoryEntry;
 use coda_agent::compaction::{COMPACTION_FAILED_KIND, COMPACTION_KIND};
 use coda_core::llm::{
     ChatCompletionRequest, ContentPart, CustomMessage, CustomRole, Message, MessageId,
-    RequestMessage, SystemMessage, ToolOutput, UserMessage,
+    RequestMessage, SystemMessage, ToolOutput, UserMessage, Visibility,
 };
 
 static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
@@ -21,12 +21,14 @@ static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 /// a composer, and small enough that it cannot crowd out the transcript.
 pub const MAX_INSTRUCTIONS: usize = 4096;
 
-/// The request that asks `model` to summarize `messages`.
-pub fn summary_request(
+/// The request that asks `model` to summarize `messages`. `messages` is the
+/// model view — `compaction::view` output — so failure records, which are
+/// transcript-only, never reach the summarizer.
+pub fn summary_request<'a>(
     model: String,
     max_completion_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    messages: &[HistoryEntry],
+    messages: impl IntoIterator<Item = &'a HistoryEntry>,
     instructions: &str,
 ) -> ChatCompletionRequest {
     let mut task = String::new();
@@ -75,31 +77,39 @@ pub fn summary_message(instructions: &str, summary: &str) -> Message {
     } else {
         format!("[compacted at the user's request: {instructions}]\n\n{summary}")
     };
-    custom(COMPACTION_KIND, CustomRole::User, content)
+    custom(COMPACTION_KIND, CustomRole::User, None, content)
 }
 
-/// What is recorded when no summary could be produced. It is *not* a boundary,
-/// so the model still sees the whole conversation — plus this, which is an
-/// honest account of why the user's request did nothing.
+/// What is recorded when no summary could be produced. It is *not* a boundary
+/// and it is transcript-only (`Some(vec![Visibility::Transcript])`), so the
+/// model view is untouched — the transcript keeps it as an honest account of
+/// why the user's request did nothing.
 pub fn failure_message(reason: &str) -> Message {
     custom(
         COMPACTION_FAILED_KIND,
         CustomRole::Assistant,
+        Some(vec![Visibility::Transcript]),
         format!("Compaction failed, so the conversation was left as it is: {reason}"),
     )
 }
 
-fn custom(kind: &str, role: CustomRole, content: String) -> Message {
+fn custom(
+    kind: &str,
+    role: CustomRole,
+    visibility: Option<Vec<Visibility>>,
+    content: String,
+) -> Message {
     Message::Custom(CustomMessage {
         message_id: MessageId::new(),
         kind: kind.to_string(),
         role,
         content,
         created_at: jiff::Timestamp::now(),
+        visibility,
     })
 }
 
-fn transcript(messages: &[HistoryEntry]) -> String {
+fn transcript<'a>(messages: impl IntoIterator<Item = &'a HistoryEntry>) -> String {
     let mut out = String::new();
     for entry in messages {
         match &entry.message {

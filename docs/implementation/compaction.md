@@ -9,6 +9,7 @@
 > v4.2→v4.3（评审修订）：`CustomRole` 收窄为 `User | Assistant`（`Tool` 降级不出合法消息）；快照推送改为新增内部事件 `RelayEvent::Snapshot`，压缩开始与结束各推一次。
 > v4.3→v4.4（评审修订）：`compact` RPC 响应不再携带消息实体，transcript 只由快照事件更新。
 > v4.4→v4.5：`coda_web` 发送 `/compact` 时先乐观展示该行（`pendingCompact` 标记），结束快照按内容对账；响应仍只报告结果，失败/拒绝路径移除乐观副本。
+> v4.5→v4.6：`CustomMessage` 新增 `visibility: Option<Vec<Visibility>>`（`None` = 不限视图；`Transcript` / `Model` 组合）。失败消息（`compaction_failed`）写 `Some(vec![Transcript])`，模型视图（`compaction::view` + `Message::visible_to_llm()`）据此滤掉它，只留在 transcript（UI 照常展示）；运行层与摘要输入共用同一条规则。
 
 ## Problem
 
@@ -136,7 +137,7 @@ User(<摘要，由 Custom 降级而来>)
 User(下一个任务)…
 ```
 
-失败时写 `Custom{kind:"compaction_failed", role:Assistant}`，内容是失败原因。它不是 compaction kind，**边界不动**，视图照旧；下一次成功压缩的边界会把它一起甩到后面，不需要任何清理逻辑。
+失败时写 `Custom{kind:"compaction_failed", role:Assistant}`，内容是失败原因，并带 `visibility = Some(vec![Transcript])`。它不是 compaction kind，**边界不动**。v4.6 起模型视图按 visibility 过滤：失败记录只进 transcript（前端照常展示），模型视图保持「失败等于什么都没发生」——否则每次后续 turn 和下一次摘要输入都要白付 token 看这条错误。下一次成功压缩的边界会把这条记录（连同 `/compact` 行）从 transcript 视图一起甩到后面，不需要任何清理逻辑。
 
 **边界是一条消息，不是旁路状态。** 这是 v4 相对 v3 最重要的一点：rewind 按 seq 切消息、fork 复制消息前缀，两者都**天然**把边界切对，不需要 FK、不需要锚点、不需要绕开 `storage.rs:1101` 那条「只持久化本次追加消息上的 state」的过滤。子 agent 线程里没有这种消息，`rposition` 返回 `None` 走 `unwrap_or(0)` 得到全量历史，也不用判断线程身份。
 
@@ -215,7 +216,7 @@ User(下一个任务)…
 ## Components
 
 1. **`coda_core::llm`（改）** — 拆 `Message` / `RequestMessage`；新增 `CustomMessage`、`CustomRole`、`From<&Message> for RequestMessage`。
-2. **`coda_agent::compaction`（新模块）** — `view(&[HistoryEntry]) -> &[HistoryEntry]`：`rposition` 找最新 `Custom{kind:"compaction"}`，返回从那里开始的后缀；没有则返回全部。纯函数，无 I/O。**压缩规则的唯一实现**：运行层拼请求要用它，应用层取「上次压缩之后的消息」当摘要输入也要用它，两处各写一遍迟早分叉。`coda_server` 本就依赖 `coda_agent`。
+2. **`coda_agent::compaction`（新模块）** — `view(&[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry>`：`rposition` 找最新 `Custom{kind:"compaction"}`，返回从那里开始的后缀，并滤掉 `Message::visible_to_llm()` 为假的记录（v4.6：`visibility` 不含 `Model` 的 custom 消息，目前只有失败记录）；没有则返回全部。纯函数，无 I/O。**压缩规则的唯一实现**：运行层拼请求要用它，应用层取「上次压缩之后的消息」当摘要输入也要用它，两处各写一遍迟早分叉。`coda_server` 本就依赖 `coda_agent`。
 3. **`Agent::messages()`（改）** — `system + view(history).map(RequestMessage::from)`。运行层的全部改动。
 4. **`PgSessionStorage::commit_compaction()`（新）** — 一个事务，带 `expected_message_count` 参数：以 `WHERE thread_id = $session_id AND message_count = $expected` 为条件更新，不匹配即回滚成 `Stale`；插入两条 message 行（`role` 分别为 `"user"` / `"custom"`）；`message_count += 2`；`touch`。
    **`thread_id` 就是 session id** —— root thread 的 id 不是字面量 `"root"`（`storage.rs:984`）。`rewind_to` 已经是这么写的（`messages::thread_id.eq(&self.session_id)`），照抄即可；写错会让 CAS 每次影响 0 行，压缩永远 `Stale`。
@@ -293,7 +294,7 @@ pub enum CompactError {
 
 - **`/compact` 命令消息** 是 `messages` 表的普通行，`role = "user"`。只服务 transcript，模型看不到。
 - **摘要消息** 是 `messages` 表的行，`role = "custom"`，payload 里 `kind = "compaction"`、`role = User`。**它既是内容也是边界**，只存一份。
-- **失败消息** 同样 `role = "custom"`，`kind = "compaction_failed"`、`role = Assistant`。它落在边界判定之外，会出现在视图里（这是诚实的记录：用户要求压缩、失败了）。
+- **失败消息** 同样 `role = "custom"`，`kind = "compaction_failed"`、`role = Assistant`，`visibility = Some(vec![Transcript])`。它落在边界判定之外，但模型视图按 visibility 把它过滤掉（v4.6 修订：诚实记录归 transcript，模型看到它只会浪费 token 并污染下一次摘要输入）。
 - **`usage` 不存在**：`CustomMessage` 没有这个字段，压缩请求的 token 消耗不进入前端的「当前上下文占用」估算。
 - **turn 归属**：两条消息共享一个 turn id，取那条 user 消息的 id（沿用「turn 由开启它的 user message 命名」的既有规则）。
 - **不变量：**

@@ -4,7 +4,7 @@
 > 对照：`docs/implementation/compaction.md`（v4.4）
 > 日期：2026-08-16
 >
-> 后续已处理：连接循环阻塞、`delete` 门闩、空会话、`/compact` 命令入口（新会话 / 编辑 / mention Enter）、指令放在 transcript 前、忙时错误文案、发送 `/compact` 时乐观展示用户消息（`pendingCompact` 标记，结束快照按内容对账）、压缩超时放宽到 10 分钟（原 60s）。ContextUsage 环暂不改。
+> 后续已处理：连接循环阻塞、`delete` 门闩、空会话、`/compact` 命令入口（新会话 / 编辑 / mention Enter）、指令放在 transcript 前、忙时错误文案、发送 `/compact` 时乐观展示用户消息（`pendingCompact` 标记，结束快照按内容对账）、压缩超时放宽到 10 分钟（原 60s）、失败消息不进模型视图（`CustomMessage.visibility = Some(vec![Transcript])`，`Message::visible_to_llm()` 过滤，只留 transcript）。ContextUsage 环暂不改。
 
 后续 `40c0e120` 只动了 `.gitignore`，不在本次范围内。
 

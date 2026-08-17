@@ -175,6 +175,7 @@ fn summary_message(kind: &str, content: &str) -> Message {
         role: CustomRole::User,
         content: content.to_string(),
         created_at: jiff::Timestamp::default(),
+        visibility: None,
     })
 }
 
@@ -625,6 +626,7 @@ async fn a_custom_message_round_trips_under_its_own_role() {
                             role: CustomRole::User,
                             content: "everything so far, in one paragraph".to_string(),
                             created_at: jiff::Timestamp::now(),
+                            visibility: None,
                         }),
                     ),
                 ],

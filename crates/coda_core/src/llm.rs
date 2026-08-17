@@ -474,7 +474,7 @@ impl ToolMessage {
 /// `kind` is opaque to everything below the layer that wrote it: the UI keys
 /// its rendering on it, and nothing here interprets it. `role` is the only
 /// field the provider path reads — it says which ordinary message this becomes
-/// when the request is built.
+/// when the request is built. `visibility` decides which views show it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomMessage {
     pub message_id: MessageId,
@@ -482,6 +482,23 @@ pub struct CustomMessage {
     pub role: CustomRole,
     pub content: String,
     pub created_at: jiff::Timestamp,
+    /// The views that include this message. `None` (the default, and what old
+    /// rows deserialize to) means every view; a list composes the views that
+    /// include it — a compaction failure record writes
+    /// `Some(vec![Transcript])` so the model never pays tokens for it.
+    pub visibility: Option<Vec<Visibility>>,
+}
+
+/// The views that may include a custom message. [`CustomMessage::visibility`]
+/// composes these; `None` on the message means no restriction. The UI side
+/// currently shows every custom message, so `Model` is declared for future use
+/// and has no effect yet — only `Transcript` (model view excluded) is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Visibility {
+    /// The UI/transcript view.
+    Transcript,
+    /// The model view.
+    Model,
 }
 
 /// What a [`CustomMessage`] becomes on its way to the provider.
@@ -521,6 +538,19 @@ impl Message {
             Message::Assistant(message) => message.message_id,
             Message::Tool(message) => message.message_id,
             Message::Custom(message) => message.message_id,
+        }
+    }
+
+    /// Whether the model view shows this message. Custom messages may restrict
+    /// their views via [`Visibility`]; everything else is ordinary conversation
+    /// shown in full.
+    pub fn visible_to_llm(&self) -> bool {
+        match self {
+            Message::Custom(custom) => custom
+                .visibility
+                .as_ref()
+                .is_none_or(|views| views.contains(&Visibility::Model)),
+            _ => true,
         }
     }
 }

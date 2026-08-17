@@ -11,7 +11,7 @@ use coda_agent::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CustomMessage, CustomRole, LLMProvider,
-    LLMStreamEvent, RequestMessage, StreamError, ToolCall,
+    LLMStreamEvent, RequestMessage, StreamError, ToolCall, Visibility,
 };
 use coda_tools::ReadTodosToolSpec;
 use futures::{Stream, StreamExt, stream};
@@ -451,6 +451,11 @@ impl SessionOpener for TestOpener {
                     },
                     content: "a summary".into(),
                     created_at: jiff::Timestamp::now(),
+                    visibility: if applied {
+                        None
+                    } else {
+                        Some(vec![Visibility::Transcript])
+                    },
                 }),
                 applied,
             })

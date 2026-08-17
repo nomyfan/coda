@@ -128,7 +128,8 @@ fn a_bare_compact_adds_no_instruction_framing() {
 }
 
 /// A failure is recorded but must not become a boundary, or a compaction that
-/// did not happen would hide the conversation anyway.
+/// did not happen would hide the conversation anyway. It is transcript-only,
+/// so the model view never pays for it.
 #[test]
 fn a_failure_is_not_a_summary() {
     let Message::Custom(failure) = failure_message("the provider timed out") else {
@@ -136,5 +137,6 @@ fn a_failure_is_not_a_summary() {
     };
     assert_eq!(failure.kind, COMPACTION_FAILED_KIND);
     assert_ne!(failure.kind, COMPACTION_KIND);
+    assert_eq!(failure.visibility, Some(vec![Visibility::Transcript]));
     assert!(failure.content.contains("the provider timed out"));
 }

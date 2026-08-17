@@ -597,15 +597,11 @@ impl Agent {
     pub async fn messages(&self) -> Vec<RequestMessage> {
         let history = self.state.lock().await;
         let visible = compaction::view(&history.messages);
-        let mut messages = Vec::with_capacity(visible.len() + 1);
+        let mut messages = Vec::with_capacity(history.messages.len() + 1);
         messages.push(RequestMessage::System(SystemMessage(
             self.system_prompt.resolve(),
         )));
-        messages.extend(
-            visible
-                .iter()
-                .map(|entry| RequestMessage::from(&entry.message)),
-        );
+        messages.extend(visible.map(|entry| RequestMessage::from(&entry.message)));
         messages
     }
 
