@@ -161,8 +161,10 @@ export const Composer = memo(function Composer({
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when
   // the request went out, and a reconnect can remount us from them at any
   // moment. Anything typed past that point would vanish without trace, so the
-  // draft goes read-only until the request settles.
-  const frozen = evicted || editing?.submitting === true;
+  // draft goes read-only until the request settles. A compaction owns the whole
+  // session the same way — nothing can be sent while it runs, so the composer
+  // is fully disabled instead of merely holding the send button.
+  const frozen = evicted || editing?.submitting === true || compacting;
   // Reading a file is asynchronous, so a paste or drop begun a moment before
   // the submit finishes after it — with `frozen` captured as it was at the
   // start. The guards below open the door; this is what checks it is still open
@@ -496,9 +498,11 @@ export const Composer = memo(function Composer({
               mentionOpen && highlightedIndex >= 0 ? mentionOptionId(highlightedIndex) : undefined
             }
             placeholder={
-              evicted
-                ? "Session opened in another window — take over to continue"
-                : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
+              compacting
+                ? "Compacting context…"
+                : evicted
+                  ? "Session opened in another window — take over to continue"
+                  : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
             }
             className={[
               "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
