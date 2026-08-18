@@ -1,7 +1,7 @@
 use coda_core::llm::{
-    ChatCompletionRequest, LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId,
-    StreamError, SystemMessage, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
-    UserMessage,
+    ChatCompletionRequest, LLMProvider, LLMProviderConfig, LLMStreamEvent, MessageId,
+    RequestMessage, StreamError, SystemMessage, ToolCallOutcome, ToolDefinition, ToolMessage,
+    ToolOutput, UserMessage,
 };
 use coda_openai::{OpenAICompatible, ProviderKind};
 use futures::StreamExt as _;
@@ -72,11 +72,11 @@ async fn three_models_replay_reasoning_continuations_after_tool_calls() {
 
     for (model, effort) in cases {
         eprintln!("{model}: requesting tool call");
-        let system = Message::System(SystemMessage(
+        let system = RequestMessage::System(SystemMessage(
             "You execute tasks with the provided tools. When the user asks for a tool call, you must call it and must not answer from memory."
                 .into(),
         ));
-        let user = Message::User(UserMessage::text(
+        let user = RequestMessage::User(UserMessage::text(
             MessageId::new(),
             "Your only valid action is to call lookup_weather exactly once with city Singapore. Do not emit a direct answer.",
         ));
@@ -103,7 +103,7 @@ async fn three_models_replay_reasoning_continuations_after_tool_calls() {
         );
         eprintln!("{model}: tool call and reasoning continuation accepted");
         let tool_call = &assistant.tool_calls[0];
-        let tool = Message::Tool(ToolMessage::new(
+        let tool = RequestMessage::Tool(ToolMessage::new(
             tool_call.id.clone(),
             tool_call.name.clone(),
             ToolOutput::Ok(r#"{"temperature_c":30,"condition":"humid"}"#.into()),
@@ -114,7 +114,7 @@ async fn three_models_replay_reasoning_continuations_after_tool_calls() {
             &provider,
             ChatCompletionRequest {
                 model: model.into(),
-                messages: vec![system, user, Message::Assistant(assistant), tool],
+                messages: vec![system, user, RequestMessage::Assistant(assistant), tool],
                 tools: vec![weather_tool()],
                 max_completion_tokens: Some(2048),
                 reasoning_effort: Some(effort.into()),

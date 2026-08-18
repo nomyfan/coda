@@ -155,11 +155,12 @@ fn snapshot_serializes_without_type_tag() {
         reasoning_effort: Some("high".into()),
         permission_mode: PermissionMode::Yolo,
         turn_running: true,
+        compacting: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
-        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true}"#
+        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true,"compacting":false}"#
     );
 }
 

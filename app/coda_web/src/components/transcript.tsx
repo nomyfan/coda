@@ -59,6 +59,7 @@ import {
   type TranscriptEntry,
   useCodaStore,
 } from "@/store/session";
+import { parseCompactCommand } from "@/lib/compact-command";
 import {
   isSubAgentToolName,
   subAgentDisplayName,
@@ -1113,7 +1114,11 @@ function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkab
             content={entry.content}
             label="message"
             align="end"
-            onEdit={canRewind && messageId ? () => beginEdit(messageId) : undefined}
+            onEdit={
+              canRewind && messageId && parseCompactCommand(entry.content) === null
+                ? () => beginEdit(messageId)
+                : undefined
+            }
             forkFrom={forkable && messageId ? entry : undefined}
           />
         </div>
@@ -1141,6 +1146,37 @@ const TranscriptItem = memo(function TranscriptItem({
 
   if (entry.kind === "user") {
     return <UserMessageBubble entry={entry} forkable={forkable === true} />;
+  }
+
+  if (entry.kind === "compaction") {
+    return (
+      <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
+        <div className="flex items-center gap-3 py-2 text-muted-foreground">
+          <div className="h-px flex-1 bg-border" />
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="quiet"
+              size="sm"
+              className="h-7 gap-1.5 px-2 text-xs"
+              title={toolResultOpen ? "Hide compaction summary" : "Show compaction summary"}
+            >
+              <span>Context compacted</span>
+              {toolResultOpen ? (
+                <ChevronDown className="size-3.5" />
+              ) : (
+                <ChevronRight className="size-3.5" />
+              )}
+            </Button>
+          </CollapsibleTrigger>
+          <div className="h-px flex-1 bg-border" />
+        </div>
+        <CollapsibleContent>
+          <article className="mx-auto mb-2 max-w-3xl rounded-md border border-border/70 bg-muted/20 p-3 text-sm">
+            <Markdown>{entry.content}</Markdown>
+          </article>
+        </CollapsibleContent>
+      </Collapsible>
+    );
   }
 
   const tone =

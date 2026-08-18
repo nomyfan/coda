@@ -5,13 +5,16 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
+use coda_agent::HistoryEntry;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProviderConfig, Message, Modality};
+use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
-use coda_server::storage::{DbPool, ForkCut, ForkError, ForkSource, ForkedSession};
+use coda_server::storage::{
+    CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
+};
 use coda_server::{
     WorkspaceKnowledge,
     agents::{
@@ -19,15 +22,16 @@ use coda_server::{
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_workspace_custom_instructions,
+    build_workspace_custom_instructions, compaction,
     config::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
     },
     files::{DEFAULT_LIMIT, FileIndex},
     hub::{
-        AttachError, AttachSession, CommandOutcome, ConnId, ForkOutcome, RelayEvent,
-        SessionCommand, SessionHub, SessionKey, SessionOpener, SessionRelay,
+        AttachError, AttachSession, CommandOutcome, CompactError, Compacted, ConnId, DeleteOutcome,
+        ForkOutcome, RelayEvent, SessionCommand, SessionHub, SessionKey, SessionOpener,
+        SessionRelay, SnapshotPayload,
     },
     load_workspace_skills,
     mcp::McpServers,
@@ -37,12 +41,13 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, DeleteSessionParams, EventParams, FileCatalog, ForkAccepted,
-        ForkSessionParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
-        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
-        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
-        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
-        Snapshot, TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        AddAllowPatternParams, CompactParams, CompactResult, DeleteSessionParams, EventParams,
+        FileCatalog, ForkAccepted, ForkSessionParams, ListFilesParams, ListSkillsParams,
+        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
+        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
+        RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
+        SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskParams,
+        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -56,6 +61,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::time::timeout;
 use tokio_stream::{StreamExt as _, StreamMap};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -225,6 +231,61 @@ struct AppOpener {
     workspaces: HashMap<String, Arc<WorkspaceState>>,
 }
 
+/// How long a compaction waits on its provider. There is no abort path — the
+/// request goes out with no lock held and nothing to cancel it — so without a
+/// bound a hung provider would leave the session marked compacting for good.
+/// Ten minutes is deliberately generous: a long transcript can take a while to
+/// summarize, and the cost of the bound is only a session held busy, not a
+/// wrong result.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(600);
+
+impl AppOpener {
+    /// One provider round-trip turning the visible history into a summary.
+    ///
+    /// The error text is recorded in the transcript when there is no summary,
+    /// so it has to read as an explanation to the user, not a stack trace.
+    async fn summarize(
+        &self,
+        provider_id: &str,
+        reasoning_effort: Option<&str>,
+        history: &[HistoryEntry],
+        instructions: &str,
+    ) -> Result<String, String> {
+        let handle = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+        let request = compaction::summary_request(
+            handle.model_id.clone(),
+            handle.max_completion_tokens,
+            reasoning_effort.map(str::to_string),
+            // The same rule the runtime slices by, so the summary covers
+            // exactly what the model can currently see: everything since the
+            // last compaction, that summary included.
+            coda_agent::message_view::model_view(history),
+            instructions,
+        );
+
+        let summary = timeout(SUMMARY_TIMEOUT, async {
+            let mut stream = std::pin::pin!(handle.provider.stream(request));
+            while let Some(event) = stream.next().await {
+                match event.map_err(|err| err.to_string())? {
+                    LLMStreamEvent::Completed(message) => return Ok(message.content.clone()),
+                    LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+                }
+            }
+            Err("the provider closed the stream without a summary".to_string())
+        })
+        .await
+        .map_err(|_| format!("the provider did not answer within {SUMMARY_TIMEOUT:?}"))??;
+
+        if summary.trim().is_empty() {
+            return Err("the provider returned an empty summary".to_string());
+        }
+        Ok(summary)
+    }
+}
+
 impl SessionOpener for AppOpener {
     fn open<'a>(
         &'a self,
@@ -276,6 +337,65 @@ impl SessionOpener for AppOpener {
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        provider_id: &'a str,
+        reasoning_effort: Option<&'a str>,
+        instructions: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Compacted, CompactError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| CompactError::Storage(format!("unknown workspace '{}'", key.0)))?;
+            let storage = workspace.storage.session(&key.1);
+            let checkpoint = storage
+                .load_checkpoint(&key.1)
+                .await
+                .map_err(CompactError::Storage)?
+                .ok_or(CompactError::Empty)?;
+            if checkpoint.messages.is_empty() {
+                return Err(CompactError::Empty);
+            }
+
+            // Read before the round-trip and handed back to the commit, where
+            // it is the compare-and-swap that catches the thread having grown
+            // under us. Everything below runs with no lock held.
+            let baseline = checkpoint.messages.len();
+            let summary = self
+                .summarize(
+                    provider_id,
+                    reasoning_effort,
+                    &checkpoint.messages,
+                    instructions,
+                )
+                .await;
+
+            let command = compaction::command_message(instructions);
+            let (outcome, applied) = match &summary {
+                Ok(summary) => (compaction::summary_message(instructions, summary), true),
+                Err(reason) => {
+                    warn!(workspace_id = %key.0, session_id = %key.1, "could not summarize: {reason}");
+                    (compaction::failure_message(reason), false)
+                }
+            };
+            let turn_id = TurnId::from(command.message_id());
+            storage
+                .commit_compaction(baseline, turn_id, [&command, &outcome])
+                .await
+                .map_err(|err| match err {
+                    CompactionError::Stale => CompactError::Stale,
+                    CompactionError::Persistence(reason) => CompactError::Storage(reason),
+                })?;
+            Ok(Compacted {
+                command,
+                outcome,
+                applied,
+            })
         })
     }
 
@@ -652,7 +772,18 @@ async fn attach_core(
             permission_mode: snapshot.permission_mode,
         },
     );
-    let wire_snapshot = Snapshot {
+    let wire_snapshot = wire_snapshot(&key, snapshot);
+    // Register the stream *before* returning; the caller sends the snapshot
+    // (result or notification) before the connection loop next polls the stream,
+    // so the snapshot always precedes the replayed events.
+    streams.insert(key, events);
+    Ok(wire_snapshot)
+}
+
+/// Address a hub snapshot to a session. Shared by the two ways one reaches a
+/// client: as the answer to `open_session`, and as a pushed `snapshot`.
+fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
+    Snapshot {
         workspace_id: key.0.clone(),
         session_id: key.1.clone(),
         messages: snapshot.messages,
@@ -665,12 +796,8 @@ async fn attach_core(
         reasoning_effort: snapshot.reasoning_effort,
         permission_mode: snapshot.permission_mode,
         turn_running: snapshot.turn_running,
-    };
-    // Register the stream *before* returning; the caller sends the snapshot
-    // (result or notification) before the connection loop next polls the stream,
-    // so the snapshot always precedes the replayed events.
-    streams.insert(key, events);
-    Ok(wire_snapshot)
+        compacting: snapshot.compacting,
+    }
 }
 
 /// Deserialize a request's `params` into the per-method type, mapping a failure
@@ -683,10 +810,9 @@ fn parse_params<P: DeserializeOwned>(params: Value) -> Result<P, RpcError> {
 /// far more paths than a menu should ever carry, so the ranking and the cap both
 /// live server-side and the client just renders the answer.
 ///
-/// Split out of `dispatch_request` because it is the one request that can take
-/// real time: a cache miss walks the whole workspace, and awaiting that inside
-/// the connection loop would freeze this client's event stream for the duration
-/// (see the spawn in [`handle_frame`]).
+/// Split out of `dispatch_request` because a cache miss walks the whole
+/// workspace, and awaiting that inside the connection loop would freeze this
+/// client's event stream for the duration (see the spawn in [`handle_frame`]).
 async fn list_files_reply(app: &Arc<AppState>, id: RpcId, params: Value) -> RpcOutgoing {
     let params: ListFilesParams = match parse_params(params) {
         Ok(params) => params,
@@ -731,6 +857,33 @@ async fn list_files_reply(app: &Arc<AppState>, id: RpcId, params: Value) -> RpcO
     }
 }
 
+/// Requests that must not hold the connection loop: they take long enough that
+/// awaiting them inline would freeze event forwarding and keepalive for this
+/// client. They touch no per-connection `streams` / `selections`.
+fn answers_off_loop(method: &str) -> bool {
+    matches!(method, "list_files" | "compact")
+}
+
+async fn dispatch_off_loop(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    id: RpcId,
+    method: &str,
+    params: Value,
+) -> RpcOutgoing {
+    match method {
+        "list_files" => list_files_reply(app, id, params).await,
+        "compact" => {
+            let params: CompactParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(err) => return (id, err).into(),
+            };
+            handle_compact(app, conn_id, id, params).await
+        }
+        other => unreachable!("answers_off_loop admitted {other}"),
+    }
+}
+
 /// Classify one decoded frame and act on it. A *request* always produces exactly
 /// one framed reply (`result` or `error`); a *notification* runs for effect and
 /// is never answered (an unknown method or bad params on a notification is
@@ -746,16 +899,17 @@ async fn handle_frame<T: Transport + Send + Sync + 'static>(
     frame: String,
 ) -> bool {
     match rpc::decode(&frame) {
-        // Answered off the connection loop: a cold `@` query walks the whole
-        // workspace, and the loop must stay free to keep forwarding this
-        // client's session events while that runs. Touching no per-connection
-        // state, this arm is the one request that can safely leave the loop —
-        // a send failure is left for the loop itself to notice.
-        rpc::Incoming::Request { id, method, params } if method == "list_files" => {
+        // Answered off the connection loop: these take long enough that awaiting
+        // them inline would freeze this client's event stream and keepalive.
+        // They touch no per-connection `streams` / `selections`, so they can
+        // safely leave the loop — a send failure is left for the loop itself
+        // to notice. `compact` is the load-bearing case: it must keep forwarding
+        // the `compacting` snapshots it just pushed.
+        rpc::Incoming::Request { id, method, params } if answers_off_loop(&method) => {
             let app = Arc::clone(app);
             let transport = Arc::clone(transport);
             tokio::spawn(async move {
-                let reply = list_files_reply(&app, id, params).await;
+                let reply = dispatch_off_loop(&app, conn_id, id, &method, params).await;
                 transport.send(&reply).await;
             });
             true
@@ -805,8 +959,8 @@ async fn dispatch_request(
             },
         )
             .into(),
-        // `list_files` is answered from its own task in `handle_frame` (see
-        // `list_files_reply`), so it never reaches this match.
+        // `list_files` / `compact` are answered from their own task in
+        // `handle_frame` (see `dispatch_off_loop`), so they never reach this match.
         // The composer's `/` picker. Literally the same read the model's
         // `<available_skills>` comes from — the workspace's knowledge handle,
         // kept current by its watcher — so the menu and the prompt cannot
@@ -1024,6 +1178,14 @@ async fn dispatch_request(
                     ),
                 )
                     .into(),
+                CommandOutcome::NotIdle => (
+                    id,
+                    RpcError::new(
+                        rpc::SESSION_NOT_IDLE,
+                        "cannot switch model while the session is compacting",
+                    ),
+                )
+                    .into(),
                 CommandOutcome::ModelLocked => (
                     id,
                     RpcError::new(
@@ -1150,12 +1312,25 @@ async fn dispatch_request(
             // written back after deletion. Refused when another connection is
             // attached — a stale client must not erase work someone else is
             // driving (the persisted state stays too).
-            if !app.relay.delete(key.clone(), conn_id).await {
-                return (
-                    id,
-                    RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
-                )
-                    .into();
+            match app.relay.delete(key.clone(), conn_id).await {
+                DeleteOutcome::Deleted => {}
+                DeleteOutcome::NotOwner => {
+                    return (
+                        id,
+                        RpcError::new(rpc::NOT_OWNER, "another client is driving this session"),
+                    )
+                        .into();
+                }
+                DeleteOutcome::NotIdle => {
+                    return (
+                        id,
+                        RpcError::new(
+                            rpc::SESSION_NOT_IDLE,
+                            "the session must finish compacting first",
+                        ),
+                    )
+                        .into();
+                }
             }
             // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
@@ -1393,7 +1568,7 @@ async fn handle_task(
             id,
             RpcError::new(
                 rpc::SESSION_NOT_IDLE,
-                "the session already has an active turn",
+                "the session already has an active turn or is compacting",
             ),
         )
             .into(),
@@ -1441,6 +1616,63 @@ async fn accept_turn_input(
         ));
     }
     Ok((task, images))
+}
+
+/// Summarize the conversation so far and continue from the summary.
+///
+/// The answer reports only what happened. The two messages a compaction writes
+/// reach the client through the snapshot pushed alongside — one path to the
+/// transcript, so it cannot render them twice, and the answer's arrival order
+/// relative to that push stops mattering.
+async fn handle_compact(
+    app: &Arc<AppState>,
+    conn_id: ConnId,
+    id: RpcId,
+    params: CompactParams,
+) -> RpcOutgoing {
+    let instructions = params.instructions.trim().to_string();
+    if instructions.len() > compaction::MAX_INSTRUCTIONS {
+        return (
+            id,
+            RpcError::new(
+                rpc::INVALID_PARAMS,
+                format!(
+                    "compaction instructions must be at most {} bytes",
+                    compaction::MAX_INSTRUCTIONS
+                ),
+            ),
+        )
+            .into();
+    }
+    match app
+        .relay
+        .command(
+            (params.workspace_id, params.session_id),
+            conn_id,
+            SessionCommand::Compact { instructions },
+        )
+        .await
+    {
+        CommandOutcome::Compacted { applied: true } => (id, &CompactResult::Applied).into(),
+        CommandOutcome::Compacted { applied: false } => (id, &CompactResult::Recorded).into(),
+        CommandOutcome::CompactionAbandoned { stale, reason } => {
+            (id, &CompactResult::Abandoned { stale, reason }).into()
+        }
+        CommandOutcome::CompactionEmpty => (id, &CompactResult::Empty).into(),
+        CommandOutcome::NotIdle => (
+            id,
+            RpcError::new(
+                rpc::SESSION_NOT_IDLE,
+                "the session must finish its current turn or compaction first",
+            ),
+        )
+            .into(),
+        _ => (
+            id,
+            RpcError::new(rpc::SESSION_NOT_LIVE, "the session is not live"),
+        )
+            .into(),
+    }
 }
 
 /// Discard a message and everything after it, then start a turn from the edited
@@ -1492,7 +1724,7 @@ async fn handle_rewind(
             id,
             RpcError::new(
                 rpc::SESSION_NOT_IDLE,
-                "the session must finish or abort its current turn first",
+                "the session must finish its current turn or compaction first",
             ),
         )
             .into(),
@@ -1574,8 +1806,8 @@ async fn handle_resume<T: Transport>(
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app: Arc<AppState>) {
-    // Shared so a long-running request (`list_files`) can answer from its own
-    // task instead of holding up the loop below.
+    // Shared so a long-running request (`list_files`, `compact`) can answer
+    // from its own task instead of holding up the loop below.
     let transport = Arc::new(transport);
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     // Event streams of the sessions this connection is attached to. A stream
@@ -1619,6 +1851,12 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                     RelayEvent::Event(event) => {
                         reattached.remove(&key);
                         send_event(&transport, key.0.clone(), key.1.clone(), *event).await
+                    }
+                    // The session changed outside the event stream. Unlike the
+                    // two below this is not the end of anything, so the stream
+                    // and this connection's claim on it both stay put.
+                    RelayEvent::Snapshot(snapshot) => {
+                        send_notify(&transport, "snapshot", &wire_snapshot(&key, *snapshot)).await
                     }
                     RelayEvent::Evicted => {
                         streams.remove(&key);

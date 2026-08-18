@@ -6,11 +6,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, MessageId, SystemMessage, ToolCall,
-    ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, Message, MessageId, RequestMessage, SystemMessage,
+    ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 
+use crate::message_view;
 use crate::persist::StateEntry;
 use tracing::{debug, error};
 
@@ -140,18 +141,6 @@ pub enum ResumePoint {
 pub struct HistoryEntry {
     pub turn_id: TurnId,
     pub message: Message,
-}
-
-/// The id a message carries, so state recorded during a call can be anchored to
-/// the message that records it. A system message has none — and never reaches a
-/// thread's history — so it can anchor nothing.
-fn message_id_of(message: &Message) -> Option<MessageId> {
-    match message {
-        Message::User(message) => Some(message.message_id),
-        Message::Assistant(message) => Some(message.message_id),
-        Message::Tool(message) => Some(message.message_id),
-        Message::System(_) => None,
-    }
 }
 
 pub struct AgentState {
@@ -602,11 +591,17 @@ impl Agent {
         self.state.lock().await.current_turn
     }
 
-    pub async fn messages(&self) -> Vec<Message> {
+    /// The request this thread's history makes: the system prompt, then the
+    /// part of history a compaction left visible, lowered to what a provider
+    /// accepts.
+    pub async fn messages(&self) -> Vec<RequestMessage> {
         let history = self.state.lock().await;
+        let visible = message_view::model_view(&history.messages);
         let mut messages = Vec::with_capacity(history.messages.len() + 1);
-        messages.push(Message::System(SystemMessage(self.system_prompt.resolve())));
-        messages.extend(history.messages.iter().map(|entry| entry.message.clone()));
+        messages.push(RequestMessage::System(SystemMessage(
+            self.system_prompt.resolve(),
+        )));
+        messages.extend(visible.filter_map(|entry| (&entry.message).into()));
         messages
     }
 
@@ -654,21 +649,17 @@ impl Agent {
         message: Message,
         recorded: Vec<(String, serde_json::Value)>,
     ) {
-        let anchor = message_id_of(&message);
+        let anchor = message.message_id();
         let mut state = self.state.lock().await;
         let turn_id = state.stamp();
         state.messages.push(HistoryEntry { turn_id, message });
-        if let Some(anchor) = anchor {
-            state
-                .state
-                .extend(recorded.into_iter().map(|(kind, value)| StateEntry {
-                    message_id: anchor,
-                    kind,
-                    value,
-                }));
-        } else if !recorded.is_empty() {
-            error!("dropping state recorded against a message with no id");
-        }
+        state
+            .state
+            .extend(recorded.into_iter().map(|(kind, value)| StateEntry {
+                message_id: anchor,
+                kind,
+                value,
+            }));
     }
 }
 

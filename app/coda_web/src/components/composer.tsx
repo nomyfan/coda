@@ -1,4 +1,4 @@
-import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, LoaderCircle, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import type {
 import { ModelSelector } from "@/components/model-selector";
 import { PermissionSelector } from "@/components/permission-selector";
 import { ContextUsage } from "@/components/context-usage";
+import { parseCompactCommand } from "@/lib/compact-command";
 import {
   ImageLightbox,
   IMAGE_LIGHTBOX_TRANSITION,
@@ -44,6 +45,7 @@ function toDataUri(file: File): Promise<string> {
 export const Composer = memo(function Composer({
   status,
   running,
+  compacting,
   approvalPending,
   starting,
   evicted,
@@ -68,6 +70,8 @@ export const Composer = memo(function Composer({
 }: {
   status: ConnectionStatus;
   running: boolean;
+  /** A summary request owns the session but has no abort path. */
+  compacting: boolean;
   /** A suspended turn is idle computationally but still owns the session. */
   approvalPending: boolean;
   /** The session is being opened for its first task. Blocks send without
@@ -153,12 +157,14 @@ export const Composer = memo(function Composer({
   }, [hasForkDraft, images, onForkDraftChange, task]);
 
   const connected = status === "connected";
-  const busy = running || approvalPending;
+  const busy = running || approvalPending || compacting;
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when
   // the request went out, and a reconnect can remount us from them at any
   // moment. Anything typed past that point would vanish without trace, so the
-  // draft goes read-only until the request settles.
-  const frozen = evicted || editing?.submitting === true;
+  // draft goes read-only until the request settles. A compaction owns the whole
+  // session the same way — nothing can be sent while it runs, so the composer
+  // is fully disabled instead of merely holding the send button.
+  const frozen = evicted || editing?.submitting === true || compacting;
   // Reading a file is asynchronous, so a paste or drop begun a moment before
   // the submit finishes after it — with `frozen` captured as it was at the
   // start. The guards below open the door; this is what checks it is still open
@@ -170,6 +176,9 @@ export const Composer = memo(function Composer({
     (providers.find((p) => p.id === providerId)?.input_modalities?.includes("image") ?? false);
   const canAddImages = acceptsImages && !frozen && images.length < MAX_IMAGES;
   const imagesBlockSend = !acceptsImages && images.length > 0;
+  const compactCommand = parseCompactCommand(task.trim());
+  const compactCommandHasImages = images.length > 0 && compactCommand !== null;
+  const compactOnNewSession = selectingTarget && compactCommand !== null;
   // Once images are in play — staged in the draft or already in history — only a
   // vision-capable model can serve the turn, so text-only models are locked out.
   const requireImageModel = images.length > 0 || sessionHasImages;
@@ -182,6 +191,8 @@ export const Composer = memo(function Composer({
     !evicted &&
     !editing?.submitting &&
     !imagesBlockSend &&
+    !compactCommandHasImages &&
+    !compactOnNewSession &&
     (Boolean(task.trim()) || images.length > 0);
   const showControls = selectingTarget || Boolean(workspace);
   const contextWindow = providers.find((provider) => provider.id === providerId)?.context_window;
@@ -197,6 +208,7 @@ export const Composer = memo(function Composer({
   // exactly the text typing `bar` would have.
   const mentionOpen =
     trigger !== null &&
+    compactCommand === null &&
     !(trigger.start === dismissed?.start && trigger.query.startsWith(dismissed.query));
   const mentionResults = useMentionItems({
     // A dismissed menu searches nothing: it isn't rendered, so a request per
@@ -486,9 +498,11 @@ export const Composer = memo(function Composer({
               mentionOpen && highlightedIndex >= 0 ? mentionOptionId(highlightedIndex) : undefined
             }
             placeholder={
-              evicted
-                ? "Session opened in another window — take over to continue"
-                : "Enter to send, Shift+Enter for newline, @ for files, / for skills"
+              compacting
+                ? "Compacting context…"
+                : evicted
+                  ? "Session opened in another window — take over to continue"
+                  : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
             }
             className={[
               "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
@@ -555,7 +569,7 @@ export const Composer = memo(function Composer({
                   <ImagePlus className="size-4" />
                 </Button>
               )}
-              {busy ? (
+              {running || approvalPending ? (
                 <Button
                   size="icon"
                   variant="secondary"
@@ -566,6 +580,17 @@ export const Composer = memo(function Composer({
                   title="Abort"
                 >
                   <CircleStop />
+                </Button>
+              ) : compacting ? (
+                <Button
+                  size="icon"
+                  variant="secondary"
+                  className="size-8 rounded-md"
+                  type="button"
+                  disabled
+                  title="Compacting context"
+                >
+                  <LoaderCircle className="animate-spin" />
                 </Button>
               ) : (
                 <Button
@@ -585,6 +610,16 @@ export const Composer = memo(function Composer({
           <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
             The selected model does not support images. Switch to a vision-capable model or remove
             the attached images.
+          </p>
+        )}
+        {compactCommandHasImages && (
+          <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
+            Remove image attachments before compacting the conversation.
+          </p>
+        )}
+        {compactOnNewSession && (
+          <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
+            Open a conversation before compacting it.
           </p>
         )}
         {lightboxIndex !== null && (

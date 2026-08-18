@@ -9,7 +9,7 @@
  * (`@"my notes/todo.md"`) so it can still be one token.
  */
 
-/** `@` picks a workspace file; `/` picks a skill. */
+/** `@` picks a workspace file; `/` picks a command or a skill. */
 export type MentionKind = "file" | "slash";
 
 export type MentionTrigger = {
@@ -22,7 +22,7 @@ export type MentionTrigger = {
   query: string;
 };
 
-export type MentionItemKind = "file" | "directory" | "skill";
+export type MentionItemKind = "file" | "directory" | "skill" | "command";
 
 export type MentionItem = {
   kind: MentionItemKind;
@@ -31,6 +31,15 @@ export type MentionItem = {
   /** Second line in the menu: a skill's description, a file's parent directory. */
   detail?: string;
 };
+
+/** Built-in `/` commands. Shown above workspace skills, in this order. */
+export const SLASH_COMMANDS: MentionItem[] = [
+  {
+    kind: "command",
+    value: "compact",
+    detail: "Summarize the conversation and continue from the summary",
+  },
+];
 
 /** Past this a "query" is prose that happens to follow a `@`, not a search. */
 const MAX_QUERY_LENGTH = 100;
@@ -158,7 +167,8 @@ function isWordBoundary(char: string): boolean {
  * start a word score highest, and a verbatim substring beats a scattered
  * subsequence.
  *
- * This ranks the `/` menu only, and is deliberately its own thing — not a port
+ * This ranks one `/` group (commands or skills) and is deliberately its own
+ * thing — not a port
  * of the server's `fuzzy_score` (`app/coda_server/src/files.rs`). That one
  * ranks *paths*, so it weighs a basename against the directories leading to it
  * and penalises length; a skill name has neither. The two share three constant
@@ -212,9 +222,18 @@ export function rankMentionItems(items: MentionItem[], query: string): MentionIt
     .map((scored) => scored.item);
 }
 
+/**
+ * The `/` menu: matching commands first, then matching skills. Each group is
+ * ranked on its own so a popular skill cannot bury a command, and empty groups
+ * simply disappear.
+ */
+export function rankSlashItems(skills: MentionItem[], query: string): MentionItem[] {
+  return [...rankMentionItems(SLASH_COMMANDS, query), ...rankMentionItems(skills, query)];
+}
+
 /** What "nothing matched" reads as for a trigger. */
 export function emptyMentionLabel(trigger: MentionTrigger): string {
-  return trigger.kind === "file" ? "No matching files" : "No matching skills";
+  return trigger.kind === "file" ? "No matching files" : "No matching commands or skills";
 }
 
 /** The file name (or directory name) a path ends in. */

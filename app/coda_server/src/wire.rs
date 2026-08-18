@@ -425,6 +425,41 @@ pub struct Snapshot {
     pub permission_mode: PermissionMode,
     #[serde(default)]
     pub turn_running: bool,
+    /// A compaction is in flight. It runs outside the turn machinery and emits
+    /// no events, so this is the only way an attaching client learns the
+    /// session is busy.
+    #[serde(default)]
+    pub compacting: bool,
+}
+
+/// Params of `compact`. `instructions` is what the user typed after
+/// `/compact` — free text, shown to the summarizing model and recorded in the
+/// transcript. Empty means a plain `/compact`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub instructions: String,
+}
+
+/// Result of `compact`. Deliberately carries no messages: the two it wrote
+/// arrive in the snapshot pushed alongside, so only one path ever writes the
+/// client's transcript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum CompactResult {
+    /// The summary was written and later turns are built from it.
+    Applied,
+    /// No summary could be generated. What happened is recorded in the
+    /// transcript — which is where the client reads it — but the conversation
+    /// the model sees is unchanged.
+    Recorded,
+    /// Nothing was written at all — the client can retry as it stands.
+    /// `stale` distinguishes "the conversation moved on" from a write failure.
+    Abandoned { stale: bool, reason: String },
+    /// The root thread has no history to summarize.
+    Empty,
 }
 
 /// Params of an `event` notification: one live runtime event. Nested under

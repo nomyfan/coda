@@ -77,11 +77,22 @@ export type UserMessage = {
   created_at: string;
 };
 
+/** A message the server authored, carrying its own meaning in `kind`. `role`
+ * is what the model is shown it as, and is of no interest to the UI; `null`
+ * marks a transcript-only record (e.g. a failed compaction). */
+export type CustomMessage = {
+  message_id: string;
+  kind: string;
+  role: "User" | "Assistant" | null;
+  content: string;
+  created_at: string;
+};
+
 export type HistoryMessage =
-  | { System: string }
   | { User: UserMessage }
   | { Assistant: AssistantMessage }
-  | { Tool: ToolMessage };
+  | { Tool: ToolMessage }
+  | { Custom: CustomMessage };
 
 export type PendingApproval = {
   thread_id: string;
@@ -234,6 +245,8 @@ type Snapshot = {
   permission_mode?: PermissionMode;
   /** A turn is still in flight; its events are replayed after the snapshot. */
   turn_running?: boolean;
+  /** A compaction request is running outside the normal turn machinery. */
+  compacting?: boolean;
 };
 
 type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
@@ -251,6 +264,12 @@ type ModelSelectionResult = {
   provider_id: string;
   reasoning_effort?: ReasoningEffort | null;
 };
+
+export type CompactResult =
+  | { outcome: "applied" }
+  | { outcome: "recorded" }
+  | { outcome: "abandoned"; stale: boolean; reason: string }
+  | { outcome: "empty" };
 
 /** Params of an `event` push: one live runtime event, nested under `event`. */
 type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
@@ -338,6 +357,9 @@ export type RpcRequests = {
     },
     { message_id: string }
   >;
+  /** Summarize the current root-thread view. The written messages arrive only
+   * through a snapshot push, keeping the transcript single-sourced. */
+  compact: RpcRequest<SessionRef & { instructions?: string }, CompactResult>;
   /** Discard `message_id` and everything the session produced from it onward,
    * then start a turn from the edited text. Answers with the id minted for that
    * text and the history that survived — *without* it, since the event stream

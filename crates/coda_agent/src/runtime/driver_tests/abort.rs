@@ -13,14 +13,18 @@ use tokio::sync::Notify;
 use tokio::task::yield_now;
 use tokio::time::{Duration, timeout};
 
-/// A checkpoint's conversation without the turn tags, for assertions that only
-/// care about the messages themselves.
-fn messages_of(checkpoint: &StoredCheckpoint) -> Vec<Message> {
+/// The result a checkpoint recorded for one tool call.
+fn recorded_result<'a>(
+    checkpoint: &'a StoredCheckpoint,
+    call_id: &str,
+) -> Option<&'a coda_core::llm::ToolMessage> {
     checkpoint
         .messages
         .iter()
-        .map(|entry| entry.message.clone())
-        .collect()
+        .find_map(|entry| match &entry.message {
+            Message::Tool(tool) if tool.id == call_id => Some(tool),
+            _ => None,
+        })
 }
 
 #[tokio::test]
@@ -104,11 +108,11 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     harness.shutdown().await;
     result.expect("timed out waiting for abort event");
     assert!(matches!(
-        tool_message(&messages_of(&checkpoint), "call_slow"),
+        recorded_result(&checkpoint, "call_slow"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
     ));
     assert!(matches!(
-        tool_message(&messages_of(&checkpoint), "call_explore"),
+        recorded_result(&checkpoint, "call_explore"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
     ));
 }
@@ -181,7 +185,7 @@ async fn abort_settles_cancel_aware_tool_with_partial_output() {
     harness.shutdown().await;
     result.expect("timed out waiting for abort event");
     assert!(matches!(
-        tool_message(&messages_of(&checkpoint), "call_cancel"),
+        recorded_result(&checkpoint, "call_cancel"),
         Some(tool) if matches!(tool.outcome, ToolCallOutcome::Aborted)
             && matches!(
                 &tool.output,

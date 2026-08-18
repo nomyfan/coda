@@ -156,13 +156,14 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
 fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
     messages
         .iter()
-        .map(|m| match m {
-            Message::User(u) => ("user", u.message_id),
-            Message::Assistant(a) => ("assistant", a.message_id),
-            Message::Tool(t) => ("tool", t.message_id),
-            // Built fresh for each request and never persisted, so it has no id
-            // and cannot appear in either list.
-            Message::System(_) => unreachable!("a system message reached persisted history"),
+        .map(|m| {
+            let role = match m {
+                Message::User(_) => "user",
+                Message::Assistant(_) => "assistant",
+                Message::Tool(_) => "tool",
+                Message::Custom(_) => "custom",
+            };
+            (role, m.message_id())
         })
         .collect()
 }
@@ -454,7 +455,7 @@ async fn delete_evicts_attached_client_and_removes_entry() {
         .expect("attach");
     let mut events1 = attach1.events;
 
-    assert!(hub.delete(key(), 1).await);
+    assert!(matches!(hub.delete(key(), 1).await, DeleteOutcome::Deleted));
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
     assert!(hub.get_entry(&key()).is_none());
 }
@@ -540,11 +541,14 @@ async fn delete_from_stale_connection_is_rejected() {
         .await
         .expect("attach2 evicts conn 1");
 
-    assert!(!hub.delete(key(), 1).await);
+    assert!(matches!(
+        hub.delete(key(), 1).await,
+        DeleteOutcome::NotOwner
+    ));
     assert!(hub.get_entry(&key()).is_some());
 
     // The attached client itself may delete.
-    assert!(hub.delete(key(), 2).await);
+    assert!(matches!(hub.delete(key(), 2).await, DeleteOutcome::Deleted));
     assert!(hub.get_entry(&key()).is_none());
 }
 

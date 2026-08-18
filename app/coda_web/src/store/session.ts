@@ -30,6 +30,7 @@ import {
   outputText,
   subAgentDisplayName,
 } from "@/lib/protocol";
+import { parseCompactCommand } from "@/lib/compact-command";
 import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
 import { sessionTitle } from "@/components/session-utils";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
@@ -55,10 +56,23 @@ export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | 
 
 export type TranscriptEntry = {
   id: string;
-  kind: "user" | "assistant" | "reasoning" | "tool_call" | "tool_result" | "system" | "error";
+  kind:
+    | "user"
+    | "assistant"
+    | "reasoning"
+    | "tool_call"
+    | "tool_result"
+    | "compaction"
+    | "system"
+    | "error";
   /** The server's id for this message, once the server has acknowledged it.
    * On a user entry that is the condition for rewinding or forking from it. */
   messageId?: string;
+  /** Marker on the optimistic copy of a `/compact` command, shown ahead of the
+   * compaction's own write. Unlike a pending task entry it is not a turn — it
+   * must not set `running` — and it is retired by content against the recorded
+   * line, not by an id, because `compact` answers without one. */
+  pendingCompact?: boolean;
   agentName?: string;
   threadId?: string;
   title?: string;
@@ -120,6 +134,8 @@ export type OpenedSession = {
    * server only on submit, so the intent stays cancelable until then. */
   allowDrafts: Record<string, Record<string, string>>;
   running: boolean;
+  /** A compaction runs outside a normal turn but still owns the session. */
+  compacting: boolean;
   /** A draft session's opening `open_session` is in flight, ahead of its first
    * task. `running` can't cover this window — it isn't set until the task is
    * actually sent — so without it a second submit during the round trip would
@@ -257,6 +273,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     drafts: {},
     allowDrafts: {},
     running: false,
+    compacting: false,
     evicted: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     usage: [],
@@ -394,14 +411,8 @@ function historyToEntries(
   argsById: Record<string, string | null | undefined>,
   spansById: Record<string, GenerationSpan>,
 ): TranscriptEntry[] {
-  if ("System" in message) {
-    return [];
-  }
   if ("User" in message) {
-    const textContent = message.User.parts
-      .filter((p) => p.type === "text")
-      .map((p) => (p as { type: "text"; text: string }).text)
-      .join("");
+    const textContent = userMessageText(message);
     const images = message.User.parts
       .filter((p) => p.type === "image")
       .map((p) => (p as { type: "image"; url: string }).url);
@@ -463,11 +474,44 @@ function historyToEntries(
       ),
     ];
   }
+  if ("Custom" in message) {
+    const custom = message.Custom;
+    if (custom.kind === "compaction") {
+      return [
+        {
+          id: `compaction:${custom.message_id}`,
+          messageId: custom.message_id,
+          kind: "compaction",
+          title: "Context compacted",
+          content: custom.content,
+          startedAt: custom.created_at,
+        },
+      ];
+    }
+    return [
+      {
+        id: `custom:${custom.message_id}`,
+        messageId: custom.message_id,
+        kind: custom.kind === "compaction_failed" ? "error" : "system",
+        title: custom.kind === "compaction_failed" ? "Compaction failed" : custom.kind,
+        content: custom.content,
+        startedAt: custom.created_at,
+      },
+    ];
+  }
   return [];
 }
 
 function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
-  return messages.flatMap((message) => {
+  let boundary = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if ("Custom" in message && message.Custom.kind === "compaction") {
+      boundary = index + 1;
+      break;
+    }
+  }
+  return messages.slice(boundary).flatMap((message) => {
     if ("Assistant" in message && message.Assistant.usage) {
       return [{ agentName: rootName, usage: message.Assistant.usage }];
     }
@@ -1373,9 +1417,31 @@ function selectSession(store: CodaStore, server: string, workspaceId: string, se
  * Every other route to a user entry stamps the server's id on it — history
  * replay, a rewind's own append — and events never carry user messages at all,
  * so the missing id is exactly the "the server has not confirmed this yet"
- * marker, with no extra state to keep in step. */
+ * marker, with no extra state to keep in step. A compaction's optimistic copy
+ * carries the same missing id but is not a pending *task*: it must not make the
+ * session look running, so it is excluded here and tracked separately. */
 function isPendingUserEntry(entry: TranscriptEntry): boolean {
-  return entry.kind === "user" && !entry.messageId;
+  return entry.kind === "user" && !entry.messageId && !entry.pendingCompact;
+}
+
+/** The optimistic copy of a `/compact` command. `compact` deliberately answers
+ * without a message id, so this entry cannot be adopted like a task's; the
+ * end-of-compaction snapshot records the very line it mirrors, and content
+ * equality retires it there (`applySnapshotToSession`). */
+function isPendingCompactionEntry(entry: TranscriptEntry): boolean {
+  return entry.kind === "user" && !entry.messageId && entry.pendingCompact === true;
+}
+
+/** The text a user message carries in a snapshot, shared by history replay and
+ * the content match that retires a pending compaction copy. */
+function userMessageText(message: HistoryMessage): string {
+  if (!("User" in message)) {
+    return "";
+  }
+  return message.User.parts
+    .filter((p) => p.type === "text")
+    .map((p) => (p as { type: "text"; text: string }).text)
+    .join("");
 }
 
 /** Everything a snapshot decides about one session.
@@ -1407,11 +1473,23 @@ export function applySnapshotToSession(
     reasoningEffort: ReasoningEffort | null;
     permissionMode: PermissionMode;
     turnRunning: boolean;
+    compacting?: boolean;
   },
 ): OpenedSession {
   const argsById = collectToolArgs(snapshot.messages);
   const spansById = collectGenerationSpans(snapshot.messages);
   const pending = session.entries.filter(isPendingUserEntry);
+  // A compaction's optimistic copy is reconciled by content: `compact` answers
+  // without a message id, so the only thing that retires the copy is the
+  // end-of-compaction snapshot carrying the recorded `/compact` line. The start
+  // snapshot (compacting, nothing new yet) keeps it, the ending one replaces it
+  // with the persisted entry.
+  const recordedTexts = new Set(snapshot.messages.map(userMessageText));
+  const pendingCompaction = session.entries.filter(
+    (entry) =>
+      isPendingCompactionEntry(entry) &&
+      (snapshot.compacting === true || !recordedTexts.has(entry.content)),
+  );
   return {
     ...session,
     // Rebuilt, not merged: the snapshot is the whole history, so a span it
@@ -1434,11 +1512,13 @@ export function applySnapshotToSession(
     // and lets a second task go out under the first one — so the pending
     // message speaks for its own turn until the reply that created it lands.
     running: snapshot.turnRunning || pending.length > 0,
+    compacting: snapshot.compacting ?? false,
     evicted: false,
     editing: reconcileEditing(session.editing, snapshot.messages),
     entries: [
       ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById, spansById)),
       ...pending,
+      ...pendingCompaction,
     ],
     drafts: {},
     allowDrafts: {},
@@ -1461,6 +1541,7 @@ function applySnapshot(
   reasoningEffort: ReasoningEffort | null,
   permissionMode: PermissionMode,
   turnRunning: boolean,
+  compacting: boolean,
 ) {
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
@@ -1492,6 +1573,7 @@ function applySnapshot(
       reasoningEffort,
       permissionMode,
       turnRunning,
+      compacting,
     });
   });
   // Self-heal the memory: whatever the session is running under is what this
@@ -1789,6 +1871,44 @@ function discardOptimisticTask(
   });
 }
 
+/** Show the `/compact` line immediately, like a task's user message, instead of
+ * leaving the transcript silent across the summary round-trip. The copy is
+ * marked `pendingCompact` so it neither sets `running` (a compaction is not a
+ * turn — that would offer the abort button) nor claims a server id; the
+ * end-of-compaction snapshot retires it by content, and a failed request drops
+ * it outright. */
+function appendCompactionMessage(
+  store: CodaStore,
+  server: string,
+  key: SessionKey,
+  text: string,
+): string {
+  const entryId = newId("user");
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    session.entries.push({
+      id: entryId,
+      kind: "user",
+      pendingCompact: true,
+      content: text,
+      startedAt: new Date().toISOString(),
+    });
+  });
+  return entryId;
+}
+
+function discardPendingCompaction(server: string, key: SessionKey, entryId: string) {
+  updateState(codaStore, (state) => {
+    const session = draftSession(state, server, key);
+    if (session) {
+      session.entries = session.entries.filter((e) => e.id !== entryId);
+    }
+  });
+}
+
 /** Start a turn: show the user's message right away, then reconcile it with the
  * id the server minted. Rendering first costs a round trip of staleness on the
  * entry's key but avoids stalling the user's own message behind the ack.
@@ -2048,6 +2168,7 @@ async function requestOpenAndApply(
       snap.reasoning_effort ?? null,
       snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
       snap.turn_running ?? false,
+      snap.compacting ?? false,
     );
     return true;
   } catch (err) {
@@ -2181,6 +2302,7 @@ export function connectServer(rawUrl: string) {
       params.reasoning_effort ?? null,
       params.permission_mode ?? DEFAULT_PERMISSION_MODE,
       params.turn_running ?? false,
+      params.compacting ?? false,
     );
   });
   rpc.addMethod("session_evicted", (params) => {
@@ -2353,6 +2475,9 @@ export function deleteSession(server: string, workspaceId: string, sessionId: st
   if (local?.deleting) {
     return;
   }
+  if (local?.compacting) {
+    return;
+  }
   // Mark deleting and remove only once the server confirms a durable delete;
   // no optimistic removal (no phantom deletion, and no resurrection if the
   // response is lost to a disconnect — Decision 9).
@@ -2421,7 +2546,8 @@ export async function forkSession(
   forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const key = forkKey(server, workspaceId, sessionId);
-  if (codaStore.getState().forking[key]) {
+  const source = codaStore.getState().servers[server]?.sessions[sessionKey(workspaceId, sessionId)];
+  if (codaStore.getState().forking[key] || source?.compacting) {
     return;
   }
   const params = {
@@ -2502,7 +2628,7 @@ export async function forkActiveSession(
 ): Promise<void> {
   const active = currentActive();
   // A draft was never opened on the server, so there is nothing to copy.
-  if (!active || active.session.draft) {
+  if (!active || active.session.draft || active.session.compacting) {
     return;
   }
   const { workspaceId, sessionId } = active.session;
@@ -2572,7 +2698,7 @@ export async function sendTask(task: string, images: string[] = []) {
   if (!active || active.session.deleting || active.session.starting) {
     return;
   }
-  if (active.session.running || active.session.approvals.length > 0) {
+  if (active.session.running || active.session.compacting || active.session.approvals.length > 0) {
     return;
   }
   // A draft/new session must be live before its first task, or the task would
@@ -2590,6 +2716,90 @@ export async function sendTask(task: string, images: string[] = []) {
   );
 }
 
+/** Ask the server to compact the active persisted session. The user's `/compact`
+ * line is shown immediately, like a task's message; the compaction itself stays
+ * snapshot-driven — the response only reports the outcome, and the recorded
+ * line arrives with the end-of-compaction snapshot, which retires the
+ * optimistic copy by content. */
+export async function compactActiveSession(instructions: string): Promise<void> {
+  const active = currentActive();
+  if (
+    !active ||
+    active.session.draft ||
+    active.session.deleting ||
+    active.session.starting ||
+    active.session.evicted ||
+    active.session.running ||
+    active.session.compacting ||
+    active.session.approvals.length > 0 ||
+    active.session.editing
+  ) {
+    return;
+  }
+  const { server, session } = active;
+  if (session.entries.length === 0) {
+    addSessionActivity(server, session.workspaceId, session.sessionId, {
+      tone: "warning",
+      label: "nothing to compact",
+      detail: "The conversation is empty.",
+    });
+    return;
+  }
+  const rpc = rpcFor(server);
+  if (!rpc) {
+    setServerStatus(codaStore, server, "error", "Connection closed");
+    return;
+  }
+  const key = sessionKey(session.workspaceId, session.sessionId);
+  const text = instructions ? `/compact ${instructions}` : "/compact";
+  const entryId = appendCompactionMessage(codaStore, server, key, text);
+  try {
+    const result = await rpc.request("compact", {
+      workspace_id: session.workspaceId,
+      session_id: session.sessionId,
+      ...(instructions ? { instructions } : {}),
+    });
+    if (result.outcome === "applied") {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "success",
+        label: "context compacted",
+        detail: "Future turns will continue from the new summary.",
+      });
+    } else if (result.outcome === "recorded") {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "warning",
+        label: "compaction failed",
+        detail: "The conversation remains unchanged; the reason is in the transcript.",
+      });
+    } else if (result.outcome === "empty") {
+      // Nothing was written, so the optimistic line has nothing to correspond
+      // to — drop it rather than leave a phantom message.
+      discardPendingCompaction(server, key, entryId);
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "warning",
+        label: "nothing to compact",
+        detail: "The conversation is empty.",
+      });
+    } else {
+      discardPendingCompaction(server, key, entryId);
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: result.stale ? "warning" : "danger",
+        label: "compaction not applied",
+        detail: result.reason,
+      });
+    }
+  } catch (err) {
+    discardPendingCompaction(server, key, entryId);
+    addSessionActivity(server, session.workspaceId, session.sessionId, {
+      tone: "danger",
+      label: "compaction rejected",
+      detail: isServerError(err)
+        ? err.message
+        : "Connection lost before compaction completed; reconnect to check its state.",
+    });
+  }
+}
+
 export async function sendTaskToNewSession(
   server: string,
   workspaceId: string,
@@ -2602,6 +2812,9 @@ export async function sendTaskToNewSession(
   const workspace = workspaceId.trim();
   const text = task.trim();
   if (!server || !workspace || (!text && images.length === 0)) {
+    return;
+  }
+  if (images.length === 0 && parseCompactCommand(text) !== null) {
     return;
   }
   const current = codaStore.getState().servers[server];
@@ -2640,7 +2853,13 @@ export function beginEdit(messageId: string) {
     return;
   }
   const { server, session } = active;
-  if (session.running || session.starting || session.evicted || session.deleting) {
+  if (
+    session.running ||
+    session.compacting ||
+    session.starting ||
+    session.evicted ||
+    session.deleting
+  ) {
     return;
   }
   if (session.approvals.length > 0 || session.editing?.submitting) {
@@ -2651,6 +2870,9 @@ export function beginEdit(messageId: string) {
     return;
   }
   const entry = session.entries[index];
+  if (parseCompactCommand(entry.content) !== null) {
+    return;
+  }
   const key = sessionKey(session.workspaceId, session.sessionId);
   updateState(codaStore, (state) => {
     const draft = draftSession(state, server, key);
@@ -2844,7 +3066,7 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
     rememberModelSelection(active.server, active.session.workspaceId, providerId, reasoningEffort);
     return;
   }
-  if (active.session.deleting) {
+  if (active.session.deleting || active.session.compacting) {
     return;
   }
   const rpc = rpcFor(active.server);
@@ -3257,6 +3479,8 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveCompacting = (state: CodaStoreState) =>
+  activeSessionOf(state)?.compacting ?? false;
 export const selectActiveStarting = (state: CodaStoreState) =>
   activeSessionOf(state)?.starting ?? false;
 export const selectActiveEvicted = (state: CodaStoreState) =>
@@ -3310,6 +3534,7 @@ export const selectCanRewind = (state: CodaStoreState): boolean => {
     !!session &&
     selectActiveStatus(state) === "connected" &&
     !session.running &&
+    !session.compacting &&
     !session.starting &&
     !session.evicted &&
     !session.deleting &&

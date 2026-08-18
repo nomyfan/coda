@@ -3,9 +3,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abort,
   clearActiveSession,
+  compactActiveSession,
   dismissPersistError,
   openSession,
   selectActiveApprovalCount,
+  selectActiveCompacting,
   selectActiveEvicted,
   selectActivePersistError,
   selectActiveHasImages,
@@ -40,6 +42,7 @@ import {
   type UsageRecord,
 } from "@/store/session";
 import { DEFAULT_PERMISSION_MODE } from "@/lib/protocol";
+import { parseCompactCommand } from "@/lib/compact-command";
 import { initialModelSelection, rememberModelSelection } from "@/store/model-preferences";
 import { Sidebar } from "@/components/sidebar";
 import { Button } from "@/components/ui/button";
@@ -215,6 +218,7 @@ export default function App() {
   const activeWorkspace = useCodaStore(selectActiveWorkspace);
   const activeStatus = useCodaStore(selectActiveStatus);
   const activeRunning = useCodaStore(selectActiveRunning);
+  const activeCompacting = useCodaStore(selectActiveCompacting);
   const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeEditing = useCodaStore(selectActiveEditing);
   const activeForkDraft = useCodaStore(selectActiveForkDraft);
@@ -358,6 +362,9 @@ export default function App() {
     (task: string, images: string[] = []) => {
       const target = newSessionStore.getState().target;
       if (target) {
+        if (images.length === 0 && parseCompactCommand(task) !== null) {
+          return;
+        }
         rememberNewSessionTarget(target);
         sendTaskToNewSession(
           target.serverUrl,
@@ -375,6 +382,11 @@ export default function App() {
       // editor, so its submit rewinds instead of appending.
       if (activeEditing) {
         rewindTurn(task, images);
+        return;
+      }
+      const compactInstructions = images.length === 0 ? parseCompactCommand(task) : null;
+      if (compactInstructions !== null) {
+        void compactActiveSession(compactInstructions);
         return;
       }
       sendTask(task, images);
@@ -460,6 +472,7 @@ export default function App() {
                     showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                   }
                   running={showingNewSession ? false : activeRunning}
+                  compacting={showingNewSession ? false : activeCompacting}
                   approvalPending={showingNewSession ? false : activeApprovalCount > 0}
                   starting={showingNewSession ? false : activeStarting}
                   evicted={showingNewSession ? false : activeEvicted}

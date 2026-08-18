@@ -469,8 +469,82 @@ impl ToolMessage {
     }
 }
 
+/// A message the application layer authored, carrying its own meaning.
+///
+/// `kind` is opaque to everything below the layer that wrote it: the UI keys
+/// its rendering on it, and nothing here interprets it. `role` says which
+/// ordinary message this becomes when the request is built — and `None` marks
+/// a transcript-only message, which the model view never includes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMessage {
+    pub message_id: MessageId,
+    pub kind: String,
+    /// The role the message is lowered to on the provider path. `None` marks a
+    /// transcript-only message — the model view filters it out before anything
+    /// lowers, so it has no request shape.
+    pub role: Option<CustomRole>,
+    pub content: String,
+    pub created_at: jiff::Timestamp,
+}
+
+/// What a [`CustomMessage`] becomes on its way to the provider.
+///
+/// No `Tool`: a tool message needs the id of the call it answers, and one built
+/// without a matching `tool_calls` entry ahead of it is an orphan result that
+/// providers reject. Projecting to a tool message needs a payload that carries
+/// all of that, not another variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomRole {
+    User,
+    Assistant,
+}
+
+/// What a thread's history holds.
+///
+/// No `System`: the system prompt is not history. It is prepended when a
+/// request is built — see [`RequestMessage`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
+    /// User message.
+    User(UserMessage),
+    /// A message representing a response from the AI, which may include tool calls.
+    Assistant(AssistantMessage),
+    /// A message representing the result of a tool execution.
+    Tool(ToolMessage),
+    /// A message the application layer authored — see [`CustomMessage`].
+    Custom(CustomMessage),
+}
+
+impl Message {
+    /// The id this message carries. Total, which is what lets state recorded
+    /// during a call always find an anchor.
+    pub fn message_id(&self) -> MessageId {
+        match self {
+            Message::User(message) => message.message_id,
+            Message::Assistant(message) => message.message_id,
+            Message::Tool(message) => message.message_id,
+            Message::Custom(message) => message.message_id,
+        }
+    }
+
+    /// Whether the model view shows this message. A custom message without a
+    /// role is transcript-only; everything else is ordinary conversation shown
+    /// in full.
+    pub fn visible_to_model(&self) -> bool {
+        match self {
+            Message::Custom(custom) => custom.role.is_some(),
+            _ => true,
+        }
+    }
+}
+
+/// What a provider is sent.
+///
+/// No `Custom`: every custom message is lowered to an ordinary one before the
+/// request is built, so a provider adapter never has to know what any `kind`
+/// means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RequestMessage {
     /// System message.
     System(SystemMessage),
     /// User message.
@@ -479,6 +553,40 @@ pub enum Message {
     Assistant(AssistantMessage),
     /// A message representing the result of a tool execution.
     Tool(ToolMessage),
+}
+
+impl From<&Message> for Option<RequestMessage> {
+    fn from(message: &Message) -> Self {
+        match message {
+            Message::User(message) => Some(RequestMessage::User(message.clone())),
+            Message::Assistant(message) => Some(RequestMessage::Assistant(message.clone())),
+            Message::Tool(message) => Some(RequestMessage::Tool(message.clone())),
+            // The request vector is discarded after the call, so reusing the
+            // custom message's own id costs nothing. The `None` arm is not a
+            // tripwire: a role-less custom message is transcript-only by
+            // definition, so skipping it at the lowering is the correct
+            // behavior even if a caller forgot to filter the model view.
+            Message::Custom(message) => match message.role {
+                Some(CustomRole::User) => Some(RequestMessage::User(UserMessage::text(
+                    message.message_id,
+                    message.content.clone(),
+                ))),
+                Some(CustomRole::Assistant) => Some(RequestMessage::Assistant(AssistantMessage {
+                    message_id: message.message_id,
+                    content: message.content.clone(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    reasoning_continuation: None,
+                    reasoning_ended_at: None,
+                    aborted: false,
+                    started_at: message.created_at,
+                    ended_at: message.created_at,
+                })),
+                None => None,
+            },
+        }
+    }
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -503,7 +611,7 @@ pub enum Modality {
 #[derive(Debug, Clone, Default)]
 pub struct ChatCompletionRequest {
     pub model: String,
-    pub messages: Vec<Message>,
+    pub messages: Vec<RequestMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
