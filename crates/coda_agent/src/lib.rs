@@ -1,5 +1,5 @@
 pub mod agent;
-pub mod compaction;
+pub mod message_view;
 pub mod persist;
 pub mod runtime;
 pub mod session;

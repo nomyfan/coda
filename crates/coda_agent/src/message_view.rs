@@ -1,11 +1,14 @@
-//! What a compacted thread shows the model.
+//! What a thread shows the model — the model view — and the kinds the
+//! compaction machinery writes.
 //!
-//! A compaction appends a summary to the thread and nothing else: the summary
-//! message *is* the boundary, so rewind and fork cut it by the rule they
-//! already apply to messages, and nothing here needs its own lifecycle. A
-//! failed compaction appends its record too, but that record is transcript
-//! material only: the view filters it out, so a failure changes what the
-//! model sees exactly as little as the boundary rule already does.
+//! [`model_view`] is the model's window on a thread: everything from the last
+//! compaction summary onward, that summary included, minus the records that
+//! declared themselves transcript-only. The summary message *is* the boundary,
+//! so rewind and fork cut it by the rule they already apply to messages, and
+//! nothing here needs its own lifecycle. A failed compaction appends its
+//! record too, but that record is transcript material only: the model view
+//! filters it out, so a failure changes what the model sees exactly as little
+//! as the boundary rule already does.
 
 use crate::agent::HistoryEntry;
 use coda_core::llm::Message;
@@ -27,14 +30,14 @@ pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// A thread with no summary is shown whole — which covers every sub-agent
 /// thread and every root thread before its first `/compact`, with no need to
 /// ask which kind of thread this is.
-pub fn view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
+pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
     let boundary = messages
         .iter()
         .rposition(|entry| is_compaction_summary(&entry.message))
         .unwrap_or(0);
     messages[boundary..]
         .iter()
-        .filter(|entry| entry.message.visible_to_llm())
+        .filter(|entry| entry.message.visible_to_model())
 }
 
 fn is_compaction_summary(message: &Message) -> bool {
@@ -90,7 +93,7 @@ mod tests {
     #[test]
     fn a_thread_without_a_summary_is_shown_whole() {
         let history = vec![user("first"), user("second")];
-        assert_eq!(texts(view(&history)), ["first", "second"]);
+        assert_eq!(texts(model_view(&history)), ["first", "second"]);
     }
 
     #[test]
@@ -101,7 +104,7 @@ mod tests {
             custom(COMPACTION_KIND, "summary"),
             user("next"),
         ];
-        assert_eq!(texts(view(&history)), ["summary", "next"]);
+        assert_eq!(texts(model_view(&history)), ["summary", "next"]);
     }
 
     #[test]
@@ -111,7 +114,7 @@ mod tests {
             user("work"),
             custom(COMPACTION_KIND, "second summary"),
         ];
-        assert_eq!(texts(view(&history)), ["second summary"]);
+        assert_eq!(texts(model_view(&history)), ["second summary"]);
     }
 
     /// A failed compaction records what happened without hiding the history it
@@ -128,7 +131,7 @@ mod tests {
                 Some(vec![Visibility::Transcript]),
             ),
         ];
-        assert_eq!(texts(view(&history)), ["old", "/compact"]);
+        assert_eq!(texts(model_view(&history)), ["old", "/compact"]);
     }
 
     /// Failure records are transcript-only wherever they sit: even between the
@@ -149,7 +152,7 @@ mod tests {
             ),
             user("next"),
         ];
-        assert_eq!(texts(view(&history)), ["summary", "/compact", "next"]);
+        assert_eq!(texts(model_view(&history)), ["summary", "/compact", "next"]);
     }
 
     /// The rule keys on the declared visibility, not on any particular kind:
@@ -157,11 +160,14 @@ mod tests {
     #[test]
     fn a_custom_message_without_visibility_restriction_stays_visible() {
         let history = vec![user("old"), custom("note", "a plain custom record")];
-        assert_eq!(texts(view(&history)), ["old", "a plain custom record"]);
+        assert_eq!(
+            texts(model_view(&history)),
+            ["old", "a plain custom record"]
+        );
     }
 
     #[test]
     fn an_empty_thread_has_an_empty_view() {
-        assert!(view(&[]).next().is_none());
+        assert!(model_view(&[]).next().is_none());
     }
 }

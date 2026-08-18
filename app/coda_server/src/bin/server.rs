@@ -262,7 +262,7 @@ impl AppOpener {
             // The same rule the runtime slices by, so the summary covers
             // exactly what the model can currently see: everything since the
             // last compaction, that summary included.
-            coda_agent::compaction::view(history),
+            coda_agent::message_view::model_view(history),
             instructions,
         );
 

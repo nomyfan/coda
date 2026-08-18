@@ -11,7 +11,7 @@ use coda_core::llm::{
 };
 use coda_core::tool::Tools;
 
-use crate::compaction;
+use crate::message_view;
 use crate::persist::StateEntry;
 use tracing::{debug, error};
 
@@ -596,7 +596,7 @@ impl Agent {
     /// accepts.
     pub async fn messages(&self) -> Vec<RequestMessage> {
         let history = self.state.lock().await;
-        let visible = compaction::view(&history.messages);
+        let visible = message_view::model_view(&history.messages);
         let mut messages = Vec::with_capacity(history.messages.len() + 1);
         messages.push(RequestMessage::System(SystemMessage(
             self.system_prompt.resolve(),

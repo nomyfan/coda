@@ -9,7 +9,7 @@
 //! for what is really a single instruction: summarize this record.
 
 use coda_agent::HistoryEntry;
-use coda_agent::compaction::{COMPACTION_FAILED_KIND, COMPACTION_KIND};
+use coda_agent::message_view::{COMPACTION_FAILED_KIND, COMPACTION_KIND};
 use coda_core::llm::{
     ChatCompletionRequest, ContentPart, CustomMessage, CustomRole, Message, MessageId,
     RequestMessage, SystemMessage, ToolOutput, UserMessage, Visibility,
@@ -22,8 +22,8 @@ static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 pub const MAX_INSTRUCTIONS: usize = 4096;
 
 /// The request that asks `model` to summarize `messages`. `messages` is the
-/// model view — `compaction::view` output — so failure records, which are
-/// transcript-only, never reach the summarizer.
+/// model view — `coda_agent::message_view::model_view` output — so failure
+/// records, which are transcript-only, never reach the summarizer.
 pub fn summary_request<'a>(
     model: String,
     max_completion_tokens: Option<u32>,

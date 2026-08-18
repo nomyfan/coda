@@ -544,7 +544,7 @@ impl Message {
     /// Whether the model view shows this message. Custom messages may restrict
     /// their views via [`Visibility`]; everything else is ordinary conversation
     /// shown in full.
-    pub fn visible_to_llm(&self) -> bool {
+    pub fn visible_to_model(&self) -> bool {
         match self {
             Message::Custom(custom) => custom
                 .visibility
