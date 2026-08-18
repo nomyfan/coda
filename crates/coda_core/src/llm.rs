@@ -472,33 +472,19 @@ impl ToolMessage {
 /// A message the application layer authored, carrying its own meaning.
 ///
 /// `kind` is opaque to everything below the layer that wrote it: the UI keys
-/// its rendering on it, and nothing here interprets it. `role` is the only
-/// field the provider path reads — it says which ordinary message this becomes
-/// when the request is built. `visibility` decides which views show it.
+/// its rendering on it, and nothing here interprets it. `role` says which
+/// ordinary message this becomes when the request is built — and `None` marks
+/// a transcript-only message, which the model view never includes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomMessage {
     pub message_id: MessageId,
     pub kind: String,
-    pub role: CustomRole,
+    /// The role the message is lowered to on the provider path. `None` marks a
+    /// transcript-only message — the model view filters it out before anything
+    /// lowers, so it has no request shape.
+    pub role: Option<CustomRole>,
     pub content: String,
     pub created_at: jiff::Timestamp,
-    /// The views that include this message. `None` (the default, and what old
-    /// rows deserialize to) means every view; a list composes the views that
-    /// include it — a compaction failure record writes
-    /// `Some(vec![Transcript])` so the model never pays tokens for it.
-    pub visibility: Option<Vec<Visibility>>,
-}
-
-/// The views that may include a custom message. [`CustomMessage::visibility`]
-/// composes these; `None` on the message means no restriction. The UI side
-/// currently shows every custom message, so `Model` is declared for future use
-/// and has no effect yet — only `Transcript` (model view excluded) is live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Visibility {
-    /// The UI/transcript view.
-    Transcript,
-    /// The model view.
-    Model,
 }
 
 /// What a [`CustomMessage`] becomes on its way to the provider.
@@ -507,7 +493,7 @@ pub enum Visibility {
 /// without a matching `tool_calls` entry ahead of it is an orphan result that
 /// providers reject. Projecting to a tool message needs a payload that carries
 /// all of that, not another variant here.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustomRole {
     User,
     Assistant,
@@ -541,15 +527,12 @@ impl Message {
         }
     }
 
-    /// Whether the model view shows this message. Custom messages may restrict
-    /// their views via [`Visibility`]; everything else is ordinary conversation
-    /// shown in full.
+    /// Whether the model view shows this message. A custom message without a
+    /// role is transcript-only; everything else is ordinary conversation shown
+    /// in full.
     pub fn visible_to_model(&self) -> bool {
         match self {
-            Message::Custom(custom) => custom
-                .visibility
-                .as_ref()
-                .is_none_or(|views| views.contains(&Visibility::Model)),
+            Message::Custom(custom) => custom.role.is_some(),
             _ => true,
         }
     }
@@ -581,11 +564,11 @@ impl From<&Message> for RequestMessage {
             // The request vector is discarded after the call, so reusing the
             // custom message's own id costs nothing and keeps this total.
             Message::Custom(message) => match message.role {
-                CustomRole::User => RequestMessage::User(UserMessage::text(
+                Some(CustomRole::User) => RequestMessage::User(UserMessage::text(
                     message.message_id,
                     message.content.clone(),
                 )),
-                CustomRole::Assistant => RequestMessage::Assistant(AssistantMessage {
+                Some(CustomRole::Assistant) => RequestMessage::Assistant(AssistantMessage {
                     message_id: message.message_id,
                     content: message.content.clone(),
                     tool_calls: Vec::new(),
@@ -597,6 +580,12 @@ impl From<&Message> for RequestMessage {
                     started_at: message.created_at,
                     ended_at: message.created_at,
                 }),
+                // Transcript-only messages are filtered out of the model view
+                // before anything lowers, so this arm is a tripwire, not a
+                // path: a role-less custom message has no request shape.
+                None => {
+                    unreachable!("transcript-only custom messages never reach the request path")
+                }
             },
         }
     }

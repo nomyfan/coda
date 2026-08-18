@@ -11,7 +11,7 @@ use coda_agent::{
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CustomMessage, CustomRole, LLMProvider,
-    LLMStreamEvent, RequestMessage, StreamError, ToolCall, Visibility,
+    LLMStreamEvent, RequestMessage, StreamError, ToolCall,
 };
 use coda_tools::ReadTodosToolSpec;
 use futures::{Stream, StreamExt, stream};
@@ -444,18 +444,14 @@ impl SessionOpener for TestOpener {
                     } else {
                         "compaction_failed".into()
                     },
+                    // A failure record is transcript-only: no role.
                     role: if applied {
-                        CustomRole::User
+                        Some(CustomRole::User)
                     } else {
-                        CustomRole::Assistant
+                        None
                     },
                     content: "a summary".into(),
                     created_at: jiff::Timestamp::now(),
-                    visibility: if applied {
-                        None
-                    } else {
-                        Some(vec![Visibility::Transcript])
-                    },
                 }),
                 applied,
             })

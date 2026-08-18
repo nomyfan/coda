@@ -172,10 +172,9 @@ fn summary_message(kind: &str, content: &str) -> Message {
     Message::Custom(CustomMessage {
         message_id: MessageId::new(),
         kind: kind.to_string(),
-        role: CustomRole::User,
+        role: Some(CustomRole::User),
         content: content.to_string(),
         created_at: jiff::Timestamp::default(),
-        visibility: None,
     })
 }
 
@@ -623,10 +622,9 @@ async fn a_custom_message_round_trips_under_its_own_role() {
                         Message::Custom(CustomMessage {
                             message_id: MessageId::new(),
                             kind: "compaction".to_string(),
-                            role: CustomRole::User,
+                            role: Some(CustomRole::User),
                             content: "everything so far, in one paragraph".to_string(),
                             created_at: jiff::Timestamp::now(),
-                            visibility: None,
                         }),
                     ),
                 ],
@@ -640,7 +638,7 @@ async fn a_custom_message_round_trips_under_its_own_role() {
         panic!("expected a custom message");
     };
     assert_eq!(message.kind, "compaction");
-    assert!(matches!(message.role, CustomRole::User));
+    assert!(matches!(message.role, Some(CustomRole::User)));
     assert_eq!(message.content, "everything so far, in one paragraph");
 
     let user_rows = diesel::sql_query(

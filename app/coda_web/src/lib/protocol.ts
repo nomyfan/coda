@@ -78,16 +78,14 @@ export type UserMessage = {
 };
 
 /** A message the server authored, carrying its own meaning in `kind`. `role`
- * is what the model is shown it as, and is of no interest to the UI.
- * `visibility` is the server's view restriction: absent/null means every view
- * shows it; the UI currently shows all custom messages regardless. */
+ * is what the model is shown it as, and is of no interest to the UI; `null`
+ * marks a transcript-only record (e.g. a failed compaction). */
 export type CustomMessage = {
   message_id: string;
   kind: string;
-  role: "User" | "Assistant";
+  role: "User" | "Assistant" | null;
   content: string;
   created_at: string;
-  visibility?: ("Transcript" | "Model")[] | null;
 };
 
 export type HistoryMessage =

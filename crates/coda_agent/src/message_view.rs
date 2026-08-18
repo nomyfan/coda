@@ -18,9 +18,8 @@ use coda_core::llm::Message;
 pub const COMPACTION_KIND: &str = "compaction";
 
 /// The `kind` written when the summary could not be generated. It records what
-/// happened for the transcript but is written transcript-only
-/// (`visibility = Some(vec![Visibility::Transcript])`), so the model view never
-/// pays for it. The boundary stays where it was.
+/// happened for the transcript but is written without a role (`role: None`),
+/// so the model view never pays for it. The boundary stays where it was.
 pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 
 /// What the model is shown of `messages`: everything from the last compaction
@@ -47,7 +46,7 @@ fn is_compaction_summary(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coda_core::llm::{CustomMessage, CustomRole, MessageId, TurnId, UserMessage, Visibility};
+    use coda_core::llm::{CustomMessage, CustomRole, MessageId, TurnId, UserMessage};
 
     fn entry(message: Message) -> HistoryEntry {
         HistoryEntry {
@@ -60,22 +59,25 @@ mod tests {
         entry(Message::User(UserMessage::text(MessageId::new(), text)))
     }
 
+    /// A custom message with a role: model-visible, like a summary.
     fn custom(kind: &str, content: &str) -> HistoryEntry {
-        custom_with_visibility(kind, content, None)
-    }
-
-    fn custom_with_visibility(
-        kind: &str,
-        content: &str,
-        visibility: Option<Vec<Visibility>>,
-    ) -> HistoryEntry {
         entry(Message::Custom(CustomMessage {
             message_id: MessageId::new(),
             kind: kind.to_string(),
-            role: CustomRole::User,
+            role: Some(CustomRole::User),
             content: content.to_string(),
             created_at: jiff::Timestamp::now(),
-            visibility,
+        }))
+    }
+
+    /// A role-less custom message: transcript-only, like a failure record.
+    fn custom_transcript_only(kind: &str, content: &str) -> HistoryEntry {
+        entry(Message::Custom(CustomMessage {
+            message_id: MessageId::new(),
+            kind: kind.to_string(),
+            role: None,
+            content: content.to_string(),
+            created_at: jiff::Timestamp::now(),
         }))
     }
 
@@ -125,11 +127,7 @@ mod tests {
         let history = vec![
             user("old"),
             user("/compact"),
-            custom_with_visibility(
-                COMPACTION_FAILED_KIND,
-                "the provider timed out",
-                Some(vec![Visibility::Transcript]),
-            ),
+            custom_transcript_only(COMPACTION_FAILED_KIND, "the provider timed out"),
         ];
         assert_eq!(texts(model_view(&history)), ["old", "/compact"]);
     }
@@ -145,20 +143,16 @@ mod tests {
             user("old"),
             custom(COMPACTION_KIND, "summary"),
             user("/compact"),
-            custom_with_visibility(
-                COMPACTION_FAILED_KIND,
-                "the provider timed out",
-                Some(vec![Visibility::Transcript]),
-            ),
+            custom_transcript_only(COMPACTION_FAILED_KIND, "the provider timed out"),
             user("next"),
         ];
         assert_eq!(texts(model_view(&history)), ["summary", "/compact", "next"]);
     }
 
-    /// The rule keys on the declared visibility, not on any particular kind:
-    /// an ordinary custom message stays in the view.
+    /// The rule keys on the role, not on any particular kind: a custom message
+    /// with a role stays in the view.
     #[test]
-    fn a_custom_message_without_visibility_restriction_stays_visible() {
+    fn a_custom_message_with_a_role_stays_visible() {
         let history = vec![user("old"), custom("note", "a plain custom record")];
         assert_eq!(
             texts(model_view(&history)),
