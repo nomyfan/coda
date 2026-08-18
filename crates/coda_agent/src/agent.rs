@@ -601,7 +601,7 @@ impl Agent {
         messages.push(RequestMessage::System(SystemMessage(
             self.system_prompt.resolve(),
         )));
-        messages.extend(visible.map(|entry| RequestMessage::from(&entry.message)));
+        messages.extend(visible.filter_map(|entry| (&entry.message).into()));
         messages
     }
 

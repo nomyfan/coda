@@ -555,20 +555,23 @@ pub enum RequestMessage {
     Tool(ToolMessage),
 }
 
-impl From<&Message> for RequestMessage {
+impl From<&Message> for Option<RequestMessage> {
     fn from(message: &Message) -> Self {
         match message {
-            Message::User(message) => RequestMessage::User(message.clone()),
-            Message::Assistant(message) => RequestMessage::Assistant(message.clone()),
-            Message::Tool(message) => RequestMessage::Tool(message.clone()),
+            Message::User(message) => Some(RequestMessage::User(message.clone())),
+            Message::Assistant(message) => Some(RequestMessage::Assistant(message.clone())),
+            Message::Tool(message) => Some(RequestMessage::Tool(message.clone())),
             // The request vector is discarded after the call, so reusing the
-            // custom message's own id costs nothing and keeps this total.
+            // custom message's own id costs nothing. The `None` arm is not a
+            // tripwire: a role-less custom message is transcript-only by
+            // definition, so skipping it at the lowering is the correct
+            // behavior even if a caller forgot to filter the model view.
             Message::Custom(message) => match message.role {
-                Some(CustomRole::User) => RequestMessage::User(UserMessage::text(
+                Some(CustomRole::User) => Some(RequestMessage::User(UserMessage::text(
                     message.message_id,
                     message.content.clone(),
-                )),
-                Some(CustomRole::Assistant) => RequestMessage::Assistant(AssistantMessage {
+                ))),
+                Some(CustomRole::Assistant) => Some(RequestMessage::Assistant(AssistantMessage {
                     message_id: message.message_id,
                     content: message.content.clone(),
                     tool_calls: Vec::new(),
@@ -579,13 +582,8 @@ impl From<&Message> for RequestMessage {
                     aborted: false,
                     started_at: message.created_at,
                     ended_at: message.created_at,
-                }),
-                // Transcript-only messages are filtered out of the model view
-                // before anything lowers, so this arm is a tripwire, not a
-                // path: a role-less custom message has no request shape.
-                None => {
-                    unreachable!("transcript-only custom messages never reach the request path")
-                }
+                })),
+                None => None,
             },
         }
     }
