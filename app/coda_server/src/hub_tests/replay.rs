@@ -630,6 +630,8 @@ async fn lagged_stream_drains_session_and_closes_client() {
         rx,
         "coda".into(),
         0,
+        hub.opener.clone(),
+        hub.status_tx.clone(),
     ));
     tx.send(SessionStreamItem::Lagged(42)).expect("inject lag");
 

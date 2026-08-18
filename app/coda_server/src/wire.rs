@@ -507,6 +507,31 @@ pub struct SessionSummaryWire {
     pub first_user_message: Option<String>,
     #[serde(default)]
     pub has_pending_approval: bool,
+    /// `"completed"` / `"failed"`, set when the session's turn last ended
+    /// with nobody attached; cleared on the next attach. See
+    /// [`crate::storage::UnseenOutcome`].
+    #[serde(default)]
+    pub unseen_outcome: Option<String>,
+}
+
+/// Pushed live when a session's `unseen_outcome` changes, so a connection
+/// currently viewing a different session learns about it without a
+/// `list_workspaces` refetch. See [`crate::hub::SessionStatusEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusWire {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub outcome: String,
+}
+
+impl From<crate::hub::SessionStatusEvent> for SessionStatusWire {
+    fn from(event: crate::hub::SessionStatusEvent) -> Self {
+        Self {
+            workspace_id: event.workspace_id,
+            session_id: event.session_id,
+            outcome: event.outcome.as_str().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

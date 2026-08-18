@@ -138,6 +138,26 @@ impl LLMProvider for TestProvider {
                     Self::completed(msg)
                 }
             }
+            // Like "approval", but blocks before returning the tool call, so a
+            // test can detach mid-turn and have the suspension itself settle
+            // while genuinely unattended.
+            "approval_hold" => {
+                let gate = self.gate.clone();
+                Box::pin(
+                    stream::iter(vec![Ok(LLMStreamEvent::ContentChunk("partial".into()))]).chain(
+                        stream::once(async move {
+                            gate.notified().await;
+                            let mut msg = assistant("");
+                            msg.tool_calls = vec![ToolCall {
+                                id: "call_todos".into(),
+                                name: "read_todos".into(),
+                                arguments: Some("{}".into()),
+                            }];
+                            Ok(LLMStreamEvent::Completed(Box::new(msg)))
+                        }),
+                    ),
+                )
+            }
             other => panic!("unexpected system prompt: {other}"),
         }
     }
@@ -244,6 +264,10 @@ impl SessionStorage for SlowStorage {
     }
 }
 
+/// Every `mark_unseen_outcome` / `clear_unseen_outcome` call a `TestOpener`
+/// recorded, in order: `Some(outcome)` for a mark, `None` for a clear.
+pub(super) type UnseenOutcomeCalls = Vec<(SessionKey, Option<UnseenOutcome>)>;
+
 pub(super) struct TestOpener {
     pub(super) storage: SlowStorage,
     provider: TestProvider,
@@ -272,12 +296,20 @@ pub(super) struct TestOpener {
     /// What `compact` reports. `Ok(true)` is a summary that moved the boundary,
     /// `Ok(false)` a recorded failure that did not.
     pub(super) compact_result: Result<bool, CompactError>,
+    pub(super) unseen_outcomes: Arc<std::sync::Mutex<UnseenOutcomeCalls>>,
+    /// Holds `mark_unseen_outcome` until released, so a test can drive a
+    /// concurrent `attach` while the entry lock is still held across it.
+    pub(super) mark_unseen_gate: Option<Arc<Notify>>,
+    /// Notified the instant `mark_unseen_outcome` is entered (before it waits
+    /// on `mark_unseen_gate`), so a test can rendezvous with "the forwarder is
+    /// now stalled, holding the entry lock" instead of guessing at timing.
+    pub(super) mark_unseen_entered: Arc<Notify>,
 }
 
 impl TestOpener {
     pub(super) fn new(system_prompt: &str, approval: ToolApprovalMode) -> Self {
         let tools: Vec<Box<dyn coda_tools::ToolSpec>> =
-            if matches!(system_prompt, "approval" | "runaway") {
+            if matches!(system_prompt, "approval" | "approval_hold" | "runaway") {
                 vec![Box::new(ReadTodosToolSpec)]
             } else {
                 vec![]
@@ -350,6 +382,9 @@ impl TestOpener {
             opened_modes: Arc::new(std::sync::Mutex::new(Vec::new())),
             compact_gate: None,
             compact_result: Ok(true),
+            unseen_outcomes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mark_unseen_gate: None,
+            mark_unseen_entered: Arc::new(Notify::new()),
         }
     }
 }
@@ -560,6 +595,35 @@ impl SessionOpener for TestOpener {
             }
         })
     }
+
+    fn mark_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        outcome: UnseenOutcome,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.mark_unseen_entered.notify_one();
+            if let Some(gate) = &self.mark_unseen_gate {
+                gate.notified().await;
+            }
+            self.unseen_outcomes
+                .lock()
+                .expect("unseen_outcomes mutex poisoned")
+                .push((key.clone(), Some(outcome)));
+        })
+    }
+
+    fn clear_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.unseen_outcomes
+                .lock()
+                .expect("unseen_outcomes mutex poisoned")
+                .push((key.clone(), None));
+        })
+    }
 }
 
 pub(super) fn hub_with(
@@ -589,6 +653,17 @@ pub(super) fn hub_and_opener(opener: TestOpener) -> (Arc<SessionHub>, Arc<TestOp
         Arc::new(SessionHub::new(opener.clone(), RelayConfig::default())),
         opener,
     )
+}
+
+/// Like `hub_and_opener`, but also hands back the provider's `hold` gate —
+/// for tests that need both (e.g. inspecting `unseen_outcomes` while a
+/// "hold" turn is deliberately kept in flight).
+pub(super) fn hub_opener_and_gate(
+    opener: TestOpener,
+) -> (Arc<SessionHub>, Arc<TestOpener>, Arc<Notify>) {
+    let gate = opener.provider.gate.clone();
+    let (hub, opener) = hub_and_opener(opener);
+    (hub, opener, gate)
 }
 
 /// Reach into the live state. Some of the windows these tests are about are

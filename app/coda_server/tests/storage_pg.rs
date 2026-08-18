@@ -22,7 +22,7 @@ use coda_core::llm::{
 use coda_server::storage::DbPool;
 use coda_server::storage::{
     CompactionError, ForkCut, ForkError, ForkSource, PgSessionStorage, RenameSessionError,
-    RewindError, SessionMetadataError, SessionModelBinding, WorkspaceStorage,
+    RewindError, SessionMetadataError, SessionModelBinding, UnseenOutcome, WorkspaceStorage,
 };
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
@@ -1166,6 +1166,55 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
     let sessions = storage.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
     assert!(sessions[0].has_pending_approval);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unseen_outcome_can_be_marked_and_cleared() {
+    let pool = pool().await;
+    let workspace = workspace_id("unseen");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0].unseen_outcome,
+        None
+    );
+
+    storage
+        .mark_unseen_outcome("session-1", UnseenOutcome::Failed)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0]
+            .unseen_outcome
+            .as_deref(),
+        Some("failed")
+    );
+
+    storage.clear_unseen_outcome("session-1").await.unwrap();
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0].unseen_outcome,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_an_unseen_outcome_that_was_never_set_is_a_no_op() {
+    let pool = pool().await;
+    let workspace = workspace_id("unseen-noop");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("session-1", test_binding())
+        .await
+        .unwrap();
+
+    storage.clear_unseen_outcome("session-1").await.unwrap();
+    assert_eq!(
+        storage.list_sessions().await.unwrap()[0].unseen_outcome,
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

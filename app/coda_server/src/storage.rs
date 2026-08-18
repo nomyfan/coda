@@ -158,6 +158,24 @@ pub enum RenameSessionError {
     Persistence(String),
 }
 
+/// How a session's turn last ended while nobody was attached to see it.
+/// Cleared the next time a client attaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnseenOutcome {
+    Completed,
+    Failed,
+}
+
+impl UnseenOutcome {
+    /// The canonical string form, shared by the DB column and the wire.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// One row of the session list.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SessionSummary {
@@ -166,6 +184,11 @@ pub struct SessionSummary {
     pub updated_at_ms: u64,
     pub first_user_message: Option<String>,
     pub has_pending_approval: bool,
+    /// `"completed"` / `"failed"`, straight from the DB's `unseen_outcome`
+    /// column — never parsed into [`UnseenOutcome`] here, since the write
+    /// path (`mark_unseen_outcome`) is the only writer and already restricts
+    /// the value via the column's `check` constraint.
+    pub unseen_outcome: Option<String>,
 }
 
 fn normalize_session_name(
@@ -289,6 +312,42 @@ impl WorkspaceStorage {
             return Err(RenameSessionError::SessionNotFound);
         }
         Ok(name)
+    }
+
+    /// Record that `session_id`'s turn just settled with nobody attached.
+    pub async fn mark_unseen_outcome(
+        &self,
+        session_id: &str,
+        outcome: UnseenOutcome,
+    ) -> Result<(), String> {
+        let mut conn = self.conn().await?;
+        diesel::update(sessions::table.find((&self.workspace_id, session_id)))
+            .set(sessions::unseen_outcome.eq(outcome.as_str()))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                format!("failed to record the unseen outcome of session {session_id}: {err}")
+            })?;
+        Ok(())
+    }
+
+    /// Clear any unseen outcome recorded for `session_id`. A no-op write when
+    /// there was nothing to clear — attach is a hot path and the overwhelming
+    /// majority of attaches have nothing to clear.
+    pub async fn clear_unseen_outcome(&self, session_id: &str) -> Result<(), String> {
+        let mut conn = self.conn().await?;
+        diesel::update(
+            sessions::table
+                .find((&self.workspace_id, session_id))
+                .filter(sessions::unseen_outcome.is_not_null()),
+        )
+        .set(sessions::unseen_outcome.eq(None::<&str>))
+        .execute(&mut conn)
+        .await
+        .map_err(|err| {
+            format!("failed to clear the unseen outcome of session {session_id}: {err}")
+        })?;
+        Ok(())
     }
 
     /// Change a session's reasoning effort, but only while it is still on the
@@ -722,6 +781,7 @@ impl WorkspaceStorage {
                 sessions::updated_at,
                 has_pending_approval,
                 first_user_message,
+                sessions::unseen_outcome,
             ))
             .order((sessions::updated_at.desc(), sessions::session_id.asc()))
             .load::<(
@@ -730,6 +790,7 @@ impl WorkspaceStorage {
                 jiff_diesel::Timestamp,
                 bool,
                 Option<Json<Message>>,
+                Option<String>,
             )>(&mut conn)
             .await
             .map_err(|err| format!("failed to list sessions: {err}"))?;
@@ -737,7 +798,14 @@ impl WorkspaceStorage {
         Ok(rows
             .into_iter()
             .map(
-                |(session_id, name, updated_at, has_pending_approval, first_user_message)| {
+                |(
+                    session_id,
+                    name,
+                    updated_at,
+                    has_pending_approval,
+                    first_user_message,
+                    unseen_outcome,
+                )| {
                     SessionSummary {
                         session_id,
                         name,
@@ -745,6 +813,7 @@ impl WorkspaceStorage {
                         first_user_message: first_user_message
                             .and_then(|message| session_preview(&message.0)),
                         has_pending_approval,
+                        unseen_outcome,
                     }
                 },
             )

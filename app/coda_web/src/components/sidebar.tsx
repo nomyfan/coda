@@ -448,6 +448,20 @@ function SessionRow({
             <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
               <StatusDot tone="busy" motion="breathe" />
             </span>
+          ) : session.unseen_outcome === "completed" ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              title="Finished while you were away"
+            >
+              <StatusDot tone="success" motion="static" />
+            </span>
+          ) : session.unseen_outcome === "failed" ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              title="Stopped with an error while you were away"
+            >
+              <StatusDot tone="error" motion="static" />
+            </span>
           ) : null}
           <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
         </Button>

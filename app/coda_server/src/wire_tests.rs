@@ -313,6 +313,7 @@ fn workspace_catalog_roundtrips() {
                 updated_at_ms: Some(42),
                 first_user_message: Some("inspect the repo".into()),
                 has_pending_approval: true,
+                unseen_outcome: Some("failed".into()),
             }],
         }],
     };
@@ -325,6 +326,10 @@ fn workspace_catalog_roundtrips() {
         Some("Investigation")
     );
     assert!(back.workspaces[0].sessions[0].has_pending_approval);
+    assert_eq!(
+        back.workspaces[0].sessions[0].unseen_outcome.as_deref(),
+        Some("failed")
+    );
 }
 
 #[test]

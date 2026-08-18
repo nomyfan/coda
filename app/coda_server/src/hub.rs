@@ -24,13 +24,19 @@ use coda_agent::{
 use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc, watch};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};
+use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tracing::{error, info, warn};
 
 use crate::config::{PermissionMode, PermissionModeCell, RelayConfig};
-use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError};
+use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError, UnseenOutcome};
 use crate::wire::WireEvent;
+
+/// How many unseen-outcome changes the status broadcast buffers per lagging
+/// subscriber before dropping the oldest. Generous on purpose: a dropped event
+/// only delays a live update, it never causes an incorrect one — the catalog
+/// (backed by the same DB write) is the source of truth either way.
+const STATUS_BROADCAST_CAPACITY: usize = 256;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
 pub type ConnId = u64;
@@ -125,6 +131,16 @@ pub struct AttachSession {
     /// after [`RelayEvent::Evicted`] / [`RelayEvent::Closed`], or silently on
     /// detach/release.
     pub events: BoxStream<'static, RelayEvent>,
+}
+
+/// A session's unseen outcome just changed. Broadcast process-wide (not
+/// scoped to `key`'s own attachment) so a connection currently viewing a
+/// different session can still learn about it live; see [`SessionRelay::subscribe_status`].
+#[derive(Debug, Clone)]
+pub struct SessionStatusEvent {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub outcome: UnseenOutcome,
 }
 
 /// Result of [`SessionRelay::command`], driving the connection layer's
@@ -311,6 +327,21 @@ pub trait SessionOpener: Send + Sync + 'static {
         provider_id: &'a str,
         reasoning_effort: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Record that `key`'s turn just settled with nobody attached. Best-effort:
+    /// a failed write is logged and swallowed, never blocks the settle path.
+    fn mark_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        outcome: UnseenOutcome,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Clear any unseen outcome recorded for `key`. Called on every successful
+    /// attach; a no-op when there was nothing to clear.
+    fn clear_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 /// Why an attach was not served.
@@ -400,6 +431,12 @@ pub trait SessionRelay: Send + Sync {
 
     /// Gracefully stop every session (process shutdown).
     fn shutdown_all<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// A live feed of unseen-outcome changes across every session on this
+    /// process, for connections to forward to their client. Broadcast and
+    /// best-effort: a lagging receiver misses events; the catalog (backed by
+    /// the same write) stays correct regardless.
+    fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent>;
 }
 
 /// True when `event` ends the current turn: the root agent's final `LlmEnd`
@@ -421,6 +458,17 @@ pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
             agent_name == root_name
         }
         _ => false,
+    }
+}
+
+/// How a settling `event` (one `event_settles_turn` already accepted) should
+/// be recorded if it turns out to have settled unattended. Suspensions are
+/// not classified here — the caller skips them entirely, since
+/// `has_pending_approval` already covers that case.
+fn unseen_outcome_for(event: &WireEvent) -> UnseenOutcome {
+    match event {
+        WireEvent::Aborted { .. } | WireEvent::Error { .. } => UnseenOutcome::Failed,
+        _ => UnseenOutcome::Completed,
     }
 }
 
@@ -657,14 +705,17 @@ pub struct SessionHub {
     opener: Arc<dyn SessionOpener>,
     entries: Entries,
     limits: RelayConfig,
+    status_tx: broadcast::Sender<SessionStatusEvent>,
 }
 
 impl SessionHub {
     pub fn new(opener: Arc<dyn SessionOpener>, limits: RelayConfig) -> Self {
+        let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
         Self {
             opener,
             entries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             limits,
+            status_tx,
         }
     }
 
@@ -871,6 +922,8 @@ impl SessionHub {
             session.clone(),
             root_name,
             generation,
+            self.opener.clone(),
+            self.status_tx.clone(),
         );
         Box::new(LiveState {
             session,
@@ -1417,6 +1470,11 @@ impl SessionRelay for SessionHub {
                 }
             }
             state.attached = Some(Attachment { conn_id, tx });
+            // Someone is looking now; whatever happened while nobody was is
+            // no longer unseen. Cheap when there was nothing to clear (see
+            // `WorkspaceStorage::clear_unseen_outcome`), so unconditional here
+            // is fine even though most attaches have nothing to do.
+            self.opener.clear_unseen_outcome(&key).await;
 
             Ok(AttachSession {
                 snapshot,
@@ -1697,6 +1755,15 @@ impl SessionRelay for SessionHub {
             }
         })
     }
+
+    fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent> {
+        // A lagging subscriber only misses a freshness optimization: the DB
+        // write behind every event already happened, so a dropped event here
+        // is silently skipped rather than surfaced as an error.
+        BroadcastStream::new(self.status_tx.subscribe())
+            .filter_map(|event| async move { event.ok() })
+            .boxed()
+    }
 }
 
 impl SessionHub {
@@ -1780,6 +1847,8 @@ fn spawn_event_pipeline(
     session: Session,
     root_name: String,
     generation: u64,
+    opener: Arc<dyn SessionOpener>,
+    status_tx: broadcast::Sender<SessionStatusEvent>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
     {
@@ -1795,7 +1864,9 @@ fn spawn_event_pipeline(
             info!(workspace_id = %workspace_id, session_id = %session_id, generation, "event pump stopped");
         });
     }
-    tokio::spawn(run_forwarder(entries, entry, rx, root_name, generation));
+    tokio::spawn(run_forwarder(
+        entries, entry, rx, root_name, generation, opener, status_tx,
+    ));
 }
 
 /// Force the entry to drain and resync from the persisted state: used when
@@ -1833,6 +1904,8 @@ async fn run_forwarder(
     mut rx: mpsc::UnboundedReceiver<SessionStreamItem>,
     root_name: String,
     generation: u64,
+    opener: Arc<dyn SessionOpener>,
+    status_tx: broadcast::Sender<SessionStatusEvent>,
 ) {
     info!(workspace_id = %entry.key.0, session_id = %entry.key.1, generation, "event forwarder started");
     while let Some(item) = rx.recv().await {
@@ -1902,6 +1975,8 @@ async fn run_forwarder(
                     return;
                 }
                 if event_settles_turn(&wire, &root_name) {
+                    // `suspended` is moved by the match below; read before it.
+                    let awaits_approval = suspended.is_some();
                     match suspended {
                         Some(approval) => live.pending_approvals.push(approval),
                         // Any other settlement is final: the turn those
@@ -1917,6 +1992,22 @@ async fn run_forwarder(
                         &root_name,
                         turn_id,
                     );
+                    // A suspension awaiting approval already has its own
+                    // indicator (`has_pending_approval`); everything else that
+                    // stops the turn while nobody is attached is new here.
+                    // Persisting and broadcasting *before* `maybe_release`
+                    // matters: both still run under `guard`, so no attach can
+                    // land between "nobody's here" and "we recorded that" —
+                    // see the design brief's Load-Bearing Decisions.
+                    if !live.turn_running && !awaits_approval && state.attached.is_none() {
+                        let outcome = unseen_outcome_for(&wire);
+                        opener.mark_unseen_outcome(&entry.key, outcome).await;
+                        let _ = status_tx.send(SessionStatusEvent {
+                            workspace_id: entry.key.0.clone(),
+                            session_id: entry.key.1.clone(),
+                            outcome,
+                        });
+                    }
                     if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
                         drop(guard);
                         release.await;

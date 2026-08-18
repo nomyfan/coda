@@ -1251,8 +1251,17 @@ function setCatalog(
 ) {
   updateState(store, (state) => {
     const current = state.servers[server];
-    if (current) {
-      current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
+    if (!current) {
+      return;
+    }
+    current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
+    // A dropped `session_status` push (broadcast lag, or a reconnect) still
+    // self-heals here: every fetched row with an unseen outcome corrects a
+    // stale `running` the same way the push would have.
+    for (const workspace of workspaces) {
+      for (const session of workspace.sessions) {
+        clearRunningIfUnseen(state, server, workspace.id, session.id, session.unseen_outcome);
+      }
     }
   });
 }
@@ -1622,6 +1631,61 @@ function applyHeldElsewhere(
           ? "Another window took this session over."
           : "Another window is driving this session.",
     });
+  });
+}
+
+/** What a catalog row's `unseen_outcome` implies for a session's cached
+ * `running`: if it carries one, the turn is not running, whatever a stale
+ * local event last said. This is the one place that self-heals a `running`
+ * left `true` by a session that was opened in this tab and then backgrounded
+ * — the sidebar's running dot has no other fallback to the catalog (unlike
+ * `awaitingApproval`), so without this a dropped `session_status` push would
+ * leave it stuck exactly like the bug this exists to fix. */
+export function reconcileRunningWithUnseenOutcome(
+  session: OpenedSession,
+  unseenOutcome: "completed" | "failed" | null | undefined,
+): OpenedSession {
+  return unseenOutcome && session.running ? { ...session, running: false } : session;
+}
+
+function clearRunningIfUnseen(
+  state: CodaDraft,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  unseenOutcome: "completed" | "failed" | null | undefined,
+) {
+  if (!unseenOutcome) {
+    return;
+  }
+  const current = state.servers[server];
+  const key = sessionKey(workspaceId, sessionId);
+  const session = current?.sessions[key];
+  if (current && session) {
+    current.sessions[key] = reconcileRunningWithUnseenOutcome(session, unseenOutcome);
+  }
+}
+
+/** A session's turn just settled with nobody attached (`session_status` push).
+ * Best-effort and may never arrive — `setCatalog` applies the same correction
+ * from the next `list_workspaces` fetch, so this is a freshness optimization,
+ * not the only path to correctness. */
+function applySessionStatus(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  outcome: "completed" | "failed",
+) {
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, {
+      unseen_outcome: outcome,
+    });
+    clearRunningIfUnseen(state, server, workspaceId, sessionId, outcome);
   });
 }
 
@@ -2308,6 +2372,9 @@ export function connectServer(rawUrl: string) {
   rpc.addMethod("session_evicted", (params) => {
     applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
   });
+  rpc.addMethod("session_status", (params) => {
+    applySessionStatus(codaStore, server, params.workspace_id, params.session_id, params.outcome);
+  });
 
   socket.onopen = () => {
     setServerStatus(codaStore, server, "connected");
@@ -2660,6 +2727,17 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
   closeActiveSession(server, key);
   selectSession(codaStore, server, workspace, session);
+  // Optimistic mirror of the server's clear-on-attach: opening it now is what
+  // makes any "finished while you were away" marker stale, and there's no
+  // reason to wait for the round trip to say so.
+  updateState(codaStore, (state) => {
+    const current = state.servers[server];
+    if (current) {
+      current.catalog = patchCatalogSession(current.catalog, workspace, session, {
+        unseen_outcome: null,
+      });
+    }
+  });
   if (!local?.draft) {
     const opened = codaStore.getState().servers[server]?.sessions[key];
     if (opened) {

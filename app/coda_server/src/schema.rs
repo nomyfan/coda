@@ -32,6 +32,7 @@ diesel::table! {
         model_binding -> Jsonb,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        unseen_outcome -> Nullable<Text>,
     }
 }
 
