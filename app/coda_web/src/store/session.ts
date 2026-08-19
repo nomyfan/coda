@@ -1251,8 +1251,16 @@ function setCatalog(
 ) {
   updateState(store, (state) => {
     const current = state.servers[server];
-    if (current) {
-      current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
+    if (!current) {
+      return;
+    }
+    current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
+    // Self-heals a dropped `session_status` push: every fetched row
+    // reconciles a stale `running` in either direction.
+    for (const workspace of workspaces) {
+      for (const session of workspace.sessions) {
+        reconcileOpenedSessionRunning(state, server, workspace.id, session.id, session.status);
+      }
     }
   });
 }
@@ -1622,6 +1630,60 @@ function applyHeldElsewhere(
           ? "Another window took this session over."
           : "Another window is driving this session.",
     });
+  });
+}
+
+/** Reconciles `running` to match a catalog row's `status` in *either*
+ * direction — a one-directional version left a session that starts running
+ * again from another tab stuck showing idle. `undefined` (no real catalog
+ * data yet, e.g. a locally-synthesized `mergeCatalog` entry) is the only
+ * value that leaves `running` untouched; an explicit `null` is treated as
+ * confirmed-idle, same as a settled outcome. */
+export function reconcileRunningWithStatus(
+  session: OpenedSession,
+  status: "running" | "completed" | "failed" | null | undefined,
+): OpenedSession {
+  if (status === undefined) {
+    return session;
+  }
+  const running = status === "running";
+  return session.running === running ? session : { ...session, running };
+}
+
+function reconcileOpenedSessionRunning(
+  state: CodaDraft,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  status: "running" | "completed" | "failed" | null | undefined,
+) {
+  const current = state.servers[server];
+  const key = sessionKey(workspaceId, sessionId);
+  const session = current?.sessions[key];
+  if (current && session) {
+    current.sessions[key] = reconcileRunningWithStatus(session, status);
+  }
+}
+
+/** A session's turn just settled with nobody attached (`session_status` push).
+ * A freshness optimization, not the only path to correctness — `setCatalog`
+ * applies the same correction from the next `list_workspaces` fetch. */
+function applySessionStatus(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  outcome: "completed" | "failed",
+) {
+  updateState(store, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, {
+      status: outcome,
+    });
+    reconcileOpenedSessionRunning(state, server, workspaceId, sessionId, outcome);
   });
 }
 
@@ -2308,6 +2370,9 @@ export function connectServer(rawUrl: string) {
   rpc.addMethod("session_evicted", (params) => {
     applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
   });
+  rpc.addMethod("session_status", (params) => {
+    applySessionStatus(codaStore, server, params.workspace_id, params.session_id, params.outcome);
+  });
 
   socket.onopen = () => {
     setServerStatus(codaStore, server, "connected");
@@ -2660,6 +2725,22 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
   closeActiveSession(server, key);
   selectSession(codaStore, server, workspace, session);
+  // Optimistic mirror of the server's clear-on-attach; skip when the catalog
+  // already says "running", since attach doesn't change that.
+  updateState(codaStore, (state) => {
+    const current = state.servers[server];
+    if (!current) {
+      return;
+    }
+    const workspaceSummary = current.catalog.find((item) => item.id === workspace);
+    const sessionSummary = workspaceSummary?.sessions.find((item) => item.id === session);
+    if (sessionSummary?.status === "running") {
+      return;
+    }
+    current.catalog = patchCatalogSession(current.catalog, workspace, session, {
+      status: null,
+    });
+  });
   if (!local?.draft) {
     const opened = codaStore.getState().servers[server]?.sessions[key];
     if (opened) {

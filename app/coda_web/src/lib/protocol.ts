@@ -124,6 +124,10 @@ export type WorkspaceSession = {
   updated_at_ms?: number | null;
   first_user_message?: string | null;
   has_pending_approval: boolean;
+  /** `"running"`: a turn is in flight, read live regardless of attachment.
+   * `"completed"` / `"failed"`: the turn ended with nobody attached; cleared
+   * on the next attach. `null`/absent: neither applies. */
+  status?: "running" | "completed" | "failed" | null;
 };
 
 export type WorkspaceSummary = {
@@ -278,6 +282,11 @@ type EventPush = { workspace_id: string; session_id: string; event: WireEvent };
  * notifications and of the `session_evicted` push. */
 type SessionRef = { workspace_id: string; session_id: string };
 
+/** Params of a `session_status` push: a session's turn just settled with
+ * nobody attached (`"completed"`) or ended in an abort/error (`"failed"`).
+ * Never fires for `"running"`, which is read live off the hub instead. */
+type SessionStatusPush = SessionRef & { outcome: "completed" | "failed" };
+
 // --- Request / notification params (client → server) -------------------------
 // Mirror the server's `wire.rs` param structs. Together with the result types
 // above they form the `RpcRequests` / `RpcNotifications` schema maps that type
@@ -397,6 +406,7 @@ export type RpcPushes = {
   event: EventPush;
   snapshot: Snapshot;
   session_evicted: SessionRef;
+  session_status: SessionStatusPush;
 };
 
 export type WireEvent =

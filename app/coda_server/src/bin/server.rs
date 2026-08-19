@@ -37,7 +37,8 @@ use coda_server::{
     mcp::McpServers,
     rpc::{self, RpcError, RpcId, RpcOutgoing},
     storage::{
-        RenameSessionError, RewindError, SessionModelBinding, WorkspaceStorage, validate_session_id,
+        RenameSessionError, RewindError, SessionModelBinding, UnseenOutcome, WorkspaceStorage,
+        validate_session_id,
     },
     transport::{Transport, WebSocketTransport},
     wire::{
@@ -45,9 +46,9 @@ use coda_server::{
         FileCatalog, ForkAccepted, ForkSessionParams, ListFilesParams, ListSkillsParams,
         ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
         ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
-        RewindParams, SessionName, SessionRef, SessionSummaryWire, SetModelParams,
-        SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskParams,
-        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        RewindParams, SessionName, SessionRef, SessionStatusWire, SessionSummaryWire,
+        SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot,
+        TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -455,6 +456,35 @@ impl SessionOpener for AppOpener {
                 .map_err(|error| error.to_string())
         })
     }
+
+    fn mark_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        outcome: UnseenOutcome,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(workspace) = self.workspaces.get(&key.0) else {
+                return;
+            };
+            if let Err(err) = workspace.storage.mark_unseen_outcome(&key.1, outcome).await {
+                warn!(workspace_id = %key.0, session_id = %key.1, "failed to record unseen outcome: {err}");
+            }
+        })
+    }
+
+    fn clear_unseen_outcome<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(workspace) = self.workspaces.get(&key.0) else {
+                return;
+            };
+            if let Err(err) = workspace.storage.clear_unseen_outcome(&key.1).await {
+                warn!(workspace_id = %key.0, session_id = %key.1, "failed to clear unseen outcome: {err}");
+            }
+        })
+    }
 }
 
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
@@ -599,15 +629,30 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
             .workspaces
             .get(&id)
             .expect("workspace id came from workspace map");
-        let sessions = match workspace.storage.list_sessions().await {
+        // Independent reads, run concurrently; not transactional, so a turn
+        // settling in the gap can make one response stale, self-healing on
+        // the next fetch or `session_status` push.
+        let (running, sessions_result) = tokio::join!(
+            app.relay.running_sessions(&workspace.id),
+            workspace.storage.list_sessions(),
+        );
+        let sessions = match sessions_result {
             Ok(sessions) => sessions
                 .into_iter()
-                .map(|session| SessionSummaryWire {
-                    id: session.session_id,
-                    name: session.name,
-                    updated_at_ms: Some(session.updated_at_ms),
-                    first_user_message: session.first_user_message,
-                    has_pending_approval: session.has_pending_approval,
+                .map(|session| {
+                    let status = if running.contains(&session.session_id) {
+                        Some("running".to_string())
+                    } else {
+                        session.unseen_outcome
+                    };
+                    SessionSummaryWire {
+                        id: session.session_id,
+                        name: session.name,
+                        updated_at_ms: Some(session.updated_at_ms),
+                        first_user_message: session.first_user_message,
+                        has_pending_approval: session.has_pending_approval,
+                        status,
+                    }
                 })
                 .collect(),
             Err(err) => {
@@ -1820,6 +1865,8 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
     // Keys re-attached after a `Closed` that have produced no event since:
     // a session that closes again right away is not retried (no reopen loop).
     let mut reattached: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
+    // Unscoped: forwards every session's status changes to this connection.
+    let mut status_stream = app.relay.subscribe_status();
 
     // No eager catalog pushes: the client requests `list_workspaces` and
     // `list_providers` on connect and applies the results at the call site.
@@ -1827,6 +1874,11 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
+            Some(status) = status_stream.next() => {
+                if !send_notify(&transport, "session_status", &SessionStatusWire::from(status)).await {
+                    break;
+                }
+            }
             frame = transport.recv() => {
                 match frame {
                     Some(frame) => {

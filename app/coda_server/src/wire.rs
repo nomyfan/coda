@@ -507,6 +507,30 @@ pub struct SessionSummaryWire {
     pub first_user_message: Option<String>,
     #[serde(default)]
     pub has_pending_approval: bool,
+    /// `"running"` (in flight, read live from the hub), `"completed"` /
+    /// `"failed"` (see [`crate::storage::UnseenOutcome`]), or absent/`null`.
+    /// Computed in `workspace_catalog`, not a passthrough of one column.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Pushed live when a session's `unseen_outcome` changes. See
+/// [`crate::hub::SessionStatusEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusWire {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub outcome: String,
+}
+
+impl From<crate::hub::SessionStatusEvent> for SessionStatusWire {
+    fn from(event: crate::hub::SessionStatusEvent) -> Self {
+        Self {
+            workspace_id: event.workspace_id,
+            session_id: event.session_id,
+            outcome: event.outcome.as_str().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

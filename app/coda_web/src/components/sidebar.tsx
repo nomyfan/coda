@@ -448,6 +448,20 @@ function SessionRow({
             <span className="flex size-4 shrink-0 items-center justify-center" title="Running">
               <StatusDot tone="busy" motion="breathe" />
             </span>
+          ) : session.status === "completed" ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              title="Finished while you were away"
+            >
+              <StatusDot tone="success" motion="static" />
+            </span>
+          ) : session.status === "failed" ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center"
+              title="Stopped with an error while you were away"
+            >
+              <StatusDot tone="error" motion="static" />
+            </span>
           ) : null}
           <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
         </Button>
@@ -602,7 +616,7 @@ function WorkspaceNode({
                 workspaceId={workspace.id}
                 session={session}
                 isActive={activeServer === serverUrl && key === activeKey}
-                running={opened?.running ?? false}
+                running={opened?.running ?? session.status === "running"}
                 awaitingApproval={opened ? opened.approvalCount > 0 : session.has_pending_approval}
                 disabled={status !== "connected"}
                 onOpen={onOpenSession}
