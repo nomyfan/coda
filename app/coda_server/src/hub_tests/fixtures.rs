@@ -486,6 +486,7 @@ impl SessionOpener for TestOpener {
                     },
                     content: "a summary".into(),
                     created_at: jiff::Timestamp::now(),
+                    cutoff: applied.then(MessageId::new),
                 }),
                 applied,
             })

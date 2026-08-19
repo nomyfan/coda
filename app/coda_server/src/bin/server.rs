@@ -8,9 +8,11 @@ use clap::Parser;
 use coda_agent::HistoryEntry;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
-    runtime::SessionStorage,
+    compaction, runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
+use coda_core::llm::{
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId, Modality, TurnId,
+};
 use coda_openai::OpenAICompatible;
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
@@ -22,7 +24,7 @@ use coda_server::{
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_workspace_custom_instructions, compaction,
+    build_workspace_custom_instructions,
     config::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
@@ -250,20 +252,27 @@ impl AppOpener {
         provider_id: &str,
         reasoning_effort: Option<&str>,
         history: &[HistoryEntry],
+        cutoff_id: MessageId,
         instructions: &str,
     ) -> Result<String, String> {
         let handle = self
             .providers
             .get(provider_id)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+        // `cutoff_id` always names a message in `history` — `compaction::cutoff`
+        // only ever returns an id it read out of the same slice being passed here.
+        let cutoff_idx = history
+            .iter()
+            .position(|entry| entry.message.message_id() == cutoff_id)
+            .expect("cutoff_id is a message id from this same history");
         let request = compaction::summary_request(
             handle.model_id.clone(),
             handle.max_completion_tokens,
             reasoning_effort.map(str::to_string),
-            // The same rule the runtime slices by, so the summary covers
-            // exactly what the model can currently see: everything since the
-            // last compaction, that summary included.
-            coda_agent::message_view::model_view(history),
+            // The same rule the runtime slices by, truncated at `cutoff_id`, so
+            // the summary covers exactly what this compaction targets: nothing
+            // it protects reaches the summarizer.
+            coda_agent::message_view::model_view(&history[..=cutoff_idx]),
             instructions,
         );
 
@@ -359,9 +368,11 @@ impl SessionOpener for AppOpener {
                 .await
                 .map_err(CompactError::Storage)?
                 .ok_or(CompactError::Empty)?;
-            if checkpoint.messages.is_empty() {
+            // `None` covers an empty thread and "nothing new since the last
+            // compaction" alike — both mean there is nothing this call can do.
+            let Some(cutoff_id) = compaction::cutoff(&checkpoint.messages, None) else {
                 return Err(CompactError::Empty);
-            }
+            };
 
             // Read before the round-trip and handed back to the commit, where
             // it is the compare-and-swap that catches the thread having grown
@@ -372,13 +383,21 @@ impl SessionOpener for AppOpener {
                     provider_id,
                     reasoning_effort,
                     &checkpoint.messages,
+                    cutoff_id,
                     instructions,
                 )
                 .await;
 
             let command = compaction::command_message(instructions);
             let (outcome, applied) = match &summary {
-                Ok(summary) => (compaction::summary_message(instructions, summary), true),
+                Ok(summary) => (
+                    compaction::summary_message(
+                        cutoff_id,
+                        compaction::Trigger::Manual { instructions },
+                        summary,
+                    ),
+                    true,
+                ),
                 Err(reason) => {
                     warn!(workspace_id = %key.0, session_id = %key.1, "could not summarize: {reason}");
                     (compaction::failure_message(reason), false)

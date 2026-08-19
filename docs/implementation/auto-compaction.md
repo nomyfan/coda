@@ -148,15 +148,15 @@ Trust boundary: none newly introduced. The auto-compact threshold is operator-co
 
 ## Implementation Roadmap
 
-- [ ] [core logic] Move `compaction.rs`'s message/request-building functions into a new `coda_agent::compaction` module; add `cutoff: Option<MessageId>` to `CustomMessage`; generalize `message_view::model_view` to resolve the boundary via the summary's recorded `cutoff`, reordering the view (summary leading, then everything the cutoff excludes, in original order), with a fallback to today's physical-position rule when `cutoff` is absent.
+- [x] [core logic] Move `compaction.rs`'s message/request-building functions into a new `coda_agent::compaction` module; add `cutoff: Option<MessageId>` to `CustomMessage`; generalize `message_view::model_view` to resolve the boundary via the summary's recorded `cutoff`, reordering the view (summary leading, then everything the cutoff excludes, in original order), with a fallback to today's physical-position rule when `cutoff` is absent.
       Purpose: establishes the single, crate-shared boundary rule both triggers will call.
-      Verification: extend `message_view.rs`'s existing unit tests to cover a cutoff before the summary's own physical position, the reordering, and the no-`cutoff`-recorded legacy fallback.
-- [ ] [core logic] Add `compaction::cutoff(messages, protect: Option<TurnId>) -> Option<MessageId>`.
+      Verification: extended `message_view.rs`'s existing unit tests to cover a cutoff before the summary's own physical position, the reordering, a second cutoff-carrying summary narrowing the tail further, and the no-`cutoff`-recorded legacy fallback. `cargo test -p coda_agent` green.
+- [x] [core logic] Add `compaction::cutoff(messages, protect: Option<TurnId>) -> Option<MessageId>`.
       Purpose: the shared decision function; eliminates the repeat-trigger risk structurally rather than by a separate guard each caller has to remember.
-      Verification: unit tests — no-protect returns the last message; a protected turn with a predecessor returns the previous turn's last message; a protected turn with no predecessor (thread's very first turn) returns `None`; a cutoff at or before the existing boundary returns `None`.
-- [ ] [integration] Point `server.rs`'s `compact()` and `hub.rs`'s `handle_compact` at the moved `coda_agent::compaction` functions (`cutoff(messages, None)` for the idle case); `summary_message` now takes the resolved cutoff.
+      Verification: unit tests — no-protect returns the last message; a protected turn with a predecessor returns the previous turn's last message; a protected turn with no predecessor (thread's very first turn) returns `None`; a cutoff at or before the existing boundary returns `None`; a turn compacts at most once; a failed attempt does not suppress a later retry.
+- [x] [integration] Point `server.rs`'s `compact()` and `hub.rs`'s `handle_compact` at the moved `coda_agent::compaction` functions (`cutoff(messages, None)` for the idle case); `summary_message` now takes the resolved cutoff and a `Trigger`.
       Purpose: proves the shared logic is a drop-in replacement for the existing, tested manual path before any new behavior is added on top.
-      Verification: existing manual-compaction tests pass, except the documented "nothing new" no-op case, which gets its own updated test.
+      Verification: existing manual-compaction tests (`hub::tests::compaction::*`) pass unchanged. `cargo test -p coda_server --lib --bins` and `cargo clippy -p coda_agent -p coda_server --all-targets` both green.
 - [ ] [config] Add `auto_compact_threshold: Option<u32>` to `ModelConfig`/TOML parsing (validated against `context_window`, mirroring `parse_max_completion_tokens`); resolve it on `ProviderHandle` (configured value, or 80% of `context_window`); thread it to `ModelProfile.auto_compact_threshold_tokens` in `open_session`.
       Purpose: gets the threshold from TOML to where the driver can read it, keeping the 80%-default policy in `coda_server`.
       Verification: config-parsing tests for unset (→ 80%), explicit value, and the exceeds-`context_window` validation error.
