@@ -313,7 +313,7 @@ fn workspace_catalog_roundtrips() {
                 updated_at_ms: Some(42),
                 first_user_message: Some("inspect the repo".into()),
                 has_pending_approval: true,
-                unseen_outcome: Some("failed".into()),
+                status: Some("failed".into()),
             }],
         }],
     };
@@ -327,9 +327,24 @@ fn workspace_catalog_roundtrips() {
     );
     assert!(back.workspaces[0].sessions[0].has_pending_approval);
     assert_eq!(
-        back.workspaces[0].sessions[0].unseen_outcome.as_deref(),
+        back.workspaces[0].sessions[0].status.as_deref(),
         Some("failed")
     );
+}
+
+#[test]
+fn a_session_summary_can_carry_a_live_running_status() {
+    let msg = SessionSummaryWire {
+        id: "s1".into(),
+        name: None,
+        updated_at_ms: None,
+        first_user_message: None,
+        has_pending_approval: false,
+        status: Some("running".into()),
+    };
+    let back: SessionSummaryWire =
+        serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+    assert_eq!(back.status.as_deref(), Some("running"));
 }
 
 #[test]

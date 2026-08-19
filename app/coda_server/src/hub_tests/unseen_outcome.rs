@@ -1,7 +1,8 @@
 //! The unseen-outcome mechanism: classifying which wire event produced the
 //! settle, marking only when nobody was attached to see it, skipping
 //! suspensions (already covered by `has_pending_approval`), and clearing on
-//! the next attach without racing a settle already in flight.
+//! the next attach without racing a settle already in flight. Also covers
+//! `running_sessions`, the live counterpart the catalog merges it with.
 
 use super::super::*;
 use super::fixtures::*;
@@ -246,4 +247,57 @@ async fn attach_cannot_land_between_the_unattended_check_and_the_write() {
             (key(), None),                           // attach 2's clear
         ],
     );
+}
+
+// --- running_sessions ----------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_sessions_reports_only_running_sessions_in_the_given_workspace() {
+    let (hub, _, gate) = hub_opener_and_gate(TestOpener::new("hold", ToolApprovalMode::Auto));
+    let running: SessionKey = ("ws-a".into(), "running".into());
+    let idle: SessionKey = ("ws-a".into(), "idle".into());
+
+    let attach_running = hub
+        .attach(
+            running.clone(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .expect("attach");
+    let mut running_events = attach_running.events;
+    hub.command(
+        running.clone(),
+        1,
+        SessionCommand::Task {
+            task: "go".into(),
+            images: vec![],
+        },
+    )
+    .await;
+    next_matching(&mut running_events, content_chunk).await;
+
+    hub.attach(
+        idle.clone(),
+        2,
+        "prov".into(),
+        None,
+        PermissionMode::default(),
+        false,
+    )
+    .await
+    .expect("attach");
+
+    assert_eq!(
+        hub.running_sessions("ws-a").await,
+        HashSet::from(["running".to_string()]),
+    );
+    // Same session id, different workspace: not the same session.
+    assert!(hub.running_sessions("ws-b").await.is_empty());
+
+    gate.notify_one();
+    hub.shutdown_all().await;
 }

@@ -507,11 +507,14 @@ pub struct SessionSummaryWire {
     pub first_user_message: Option<String>,
     #[serde(default)]
     pub has_pending_approval: bool,
-    /// `"completed"` / `"failed"`, set when the session's turn last ended
-    /// with nobody attached; cleared on the next attach. See
-    /// [`crate::storage::UnseenOutcome`].
+    /// `"running"` (a turn is currently in flight, read live from the hub,
+    /// regardless of attachment), or `"completed"` / `"failed"` (the turn
+    /// last ended with nobody attached; cleared on the next attach — see
+    /// [`crate::storage::UnseenOutcome`]), or absent/`null` when neither
+    /// applies. Computed in `workspace_catalog`, not a passthrough of any one
+    /// stored column.
     #[serde(default)]
-    pub unseen_outcome: Option<String>,
+    pub status: Option<String>,
 }
 
 /// Pushed live when a session's `unseen_outcome` changes, so a connection

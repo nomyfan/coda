@@ -437,6 +437,15 @@ pub trait SessionRelay: Send + Sync {
     /// best-effort: a lagging receiver misses events; the catalog (backed by
     /// the same write) stays correct regardless.
     fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent>;
+
+    /// Session ids in `workspace_id` with a turn currently in flight,
+    /// regardless of attachment. A point-in-time read of the hub, not a
+    /// subscription — used by the catalog so "running" survives a reconnect
+    /// that starts with no attachment at all (e.g. a hard page refresh).
+    fn running_sessions<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HashSet<String>> + Send + 'a>>;
 }
 
 /// True when `event` ends the current turn: the root agent's final `LlmEnd`
@@ -1763,6 +1772,34 @@ impl SessionRelay for SessionHub {
         BroadcastStream::new(self.status_tx.subscribe())
             .filter_map(|event| async move { event.ok() })
             .boxed()
+    }
+
+    fn running_sessions<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HashSet<String>> + Send + 'a>> {
+        Box::pin(async move {
+            // Collect the candidate entries under the (cheap, synchronous)
+            // outer lock, then check each one's `turn_running` without
+            // holding it — an entry's own lock can be held for a while (e.g.
+            // a stalled settle write), and this must not block on that.
+            let candidates: Vec<Arc<SessionEntry>> = self
+                .entries
+                .lock()
+                .expect("entries mutex poisoned")
+                .iter()
+                .filter(|(key, _)| key.0 == workspace_id)
+                .map(|(_, entry)| entry.clone())
+                .collect();
+            let mut running = HashSet::new();
+            for entry in candidates {
+                let guard = entry.inner.clone().lock_owned().await;
+                if matches!(&guard.phase, EntryPhase::Live(live) if live.turn_running) {
+                    running.insert(entry.key.1.clone());
+                }
+            }
+            running
+        })
     }
 }
 

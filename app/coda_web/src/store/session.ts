@@ -1255,12 +1255,12 @@ function setCatalog(
       return;
     }
     current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
-    // A dropped `session_status` push (broadcast lag, or a reconnect) still
-    // self-heals here: every fetched row with an unseen outcome corrects a
-    // stale `running` the same way the push would have.
+    // A dropped `session_status` push (broadcast lag, or a reconnect that
+    // never fully reopens every session) still self-heals here: every
+    // fetched row reconciles a stale `running` in either direction.
     for (const workspace of workspaces) {
       for (const session of workspace.sessions) {
-        clearRunningIfUnseen(state, server, workspace.id, session.id, session.unseen_outcome);
+        reconcileOpenedSessionRunning(state, server, workspace.id, session.id, session.status);
       }
     }
   });
@@ -1634,42 +1634,55 @@ function applyHeldElsewhere(
   });
 }
 
-/** What a catalog row's `unseen_outcome` implies for a session's cached
- * `running`: if it carries one, the turn is not running, whatever a stale
- * local event last said. This is the one place that self-heals a `running`
- * left `true` by a session that was opened in this tab and then backgrounded
- * — the sidebar's running dot has no other fallback to the catalog (unlike
- * `awaitingApproval`), so without this a dropped `session_status` push would
- * leave it stuck exactly like the bug this exists to fix. */
-export function reconcileRunningWithUnseenOutcome(
+/** What a catalog row's `status` implies for a session's cached `running`:
+ * `"running"` means a turn is in flight right now; `"completed"`/`"failed"`
+ * means it isn't — either way, this overrides whatever a stale local event
+ * last said. `undefined` (no real catalog data for this row yet — e.g. a
+ * locally-synthesized "extras" entry in `mergeCatalog`) is the only value
+ * that leaves `running` alone; an explicit `null` from the server is a real
+ * "confirmed idle" fact and is treated the same as a settled outcome.
+ *
+ * This is the one place that self-heals `running` in *either* direction for
+ * a session that was opened in this tab and then backgrounded — the sidebar
+ * has no other fallback to the catalog for an *already-opened* session
+ * (unlike `awaitingApproval`), so a one-directional version of this left a
+ * session that starts running again (e.g. from another tab) stuck showing
+ * idle across every future reconnect that doesn't fully reopen it. A
+ * momentarily-stale catalog read racing a *currently attached* session's own
+ * live stream is possible but self-corrects on that stream's very next
+ * event — accepted for the same reason `workspace_catalog`'s DB/hub read
+ * race is: a freshness gap, not a correctness one. */
+export function reconcileRunningWithStatus(
   session: OpenedSession,
-  unseenOutcome: "completed" | "failed" | null | undefined,
+  status: "running" | "completed" | "failed" | null | undefined,
 ): OpenedSession {
-  return unseenOutcome && session.running ? { ...session, running: false } : session;
+  if (status === undefined) {
+    return session;
+  }
+  const running = status === "running";
+  return session.running === running ? session : { ...session, running };
 }
 
-function clearRunningIfUnseen(
+function reconcileOpenedSessionRunning(
   state: CodaDraft,
   server: string,
   workspaceId: string,
   sessionId: string,
-  unseenOutcome: "completed" | "failed" | null | undefined,
+  status: "running" | "completed" | "failed" | null | undefined,
 ) {
-  if (!unseenOutcome) {
-    return;
-  }
   const current = state.servers[server];
   const key = sessionKey(workspaceId, sessionId);
   const session = current?.sessions[key];
   if (current && session) {
-    current.sessions[key] = reconcileRunningWithUnseenOutcome(session, unseenOutcome);
+    current.sessions[key] = reconcileRunningWithStatus(session, status);
   }
 }
 
 /** A session's turn just settled with nobody attached (`session_status` push).
  * Best-effort and may never arrive — `setCatalog` applies the same correction
  * from the next `list_workspaces` fetch, so this is a freshness optimization,
- * not the only path to correctness. */
+ * not the only path to correctness. Never fires for `"running"` — see
+ * `SessionStatusPush` in `protocol.ts`. */
 function applySessionStatus(
   store: CodaStore,
   server: string,
@@ -1683,9 +1696,9 @@ function applySessionStatus(
       return;
     }
     current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, {
-      unseen_outcome: outcome,
+      status: outcome,
     });
-    clearRunningIfUnseen(state, server, workspaceId, sessionId, outcome);
+    reconcileOpenedSessionRunning(state, server, workspaceId, sessionId, outcome);
   });
 }
 
@@ -2729,14 +2742,23 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   selectSession(codaStore, server, workspace, session);
   // Optimistic mirror of the server's clear-on-attach: opening it now is what
   // makes any "finished while you were away" marker stale, and there's no
-  // reason to wait for the round trip to say so.
+  // reason to wait for the round trip to say so. Attach only clears a settled
+  // outcome — it never changes whether the session is actually running — so
+  // skip the patch when the catalog already says "running" rather than
+  // stomping it to null.
   updateState(codaStore, (state) => {
     const current = state.servers[server];
-    if (current) {
-      current.catalog = patchCatalogSession(current.catalog, workspace, session, {
-        unseen_outcome: null,
-      });
+    if (!current) {
+      return;
     }
+    const workspaceSummary = current.catalog.find((item) => item.id === workspace);
+    const sessionSummary = workspaceSummary?.sessions.find((item) => item.id === session);
+    if (sessionSummary?.status === "running") {
+      return;
+    }
+    current.catalog = patchCatalogSession(current.catalog, workspace, session, {
+      status: null,
+    });
   });
   if (!local?.draft) {
     const opened = codaStore.getState().servers[server]?.sessions[key];

@@ -629,16 +629,32 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
             .workspaces
             .get(&id)
             .expect("workspace id came from workspace map");
-        let sessions = match workspace.storage.list_sessions().await {
+        // Two independent reads (DB, hub) run concurrently — neither depends
+        // on the other's result. Not a transaction between them either way: a
+        // turn that settles in the gap can make one response stale for one
+        // fetch — see the design brief's Load-Bearing Decisions. Self-heals
+        // on the next fetch or via the `session_status` push for that session.
+        let (running, sessions_result) = tokio::join!(
+            app.relay.running_sessions(&workspace.id),
+            workspace.storage.list_sessions(),
+        );
+        let sessions = match sessions_result {
             Ok(sessions) => sessions
                 .into_iter()
-                .map(|session| SessionSummaryWire {
-                    id: session.session_id,
-                    name: session.name,
-                    updated_at_ms: Some(session.updated_at_ms),
-                    first_user_message: session.first_user_message,
-                    has_pending_approval: session.has_pending_approval,
-                    unseen_outcome: session.unseen_outcome,
+                .map(|session| {
+                    let status = if running.contains(&session.session_id) {
+                        Some("running".to_string())
+                    } else {
+                        session.unseen_outcome
+                    };
+                    SessionSummaryWire {
+                        id: session.session_id,
+                        name: session.name,
+                        updated_at_ms: Some(session.updated_at_ms),
+                        first_user_message: session.first_user_message,
+                        has_pending_approval: session.has_pending_approval,
+                        status,
+                    }
                 })
                 .collect(),
             Err(err) => {
