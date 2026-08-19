@@ -548,6 +548,48 @@ impl LLMProvider for TestProvider {
                 }),
                 other => panic!("unexpected user state: {other:?}"),
             },
+            // Like "auto-compact-main", but the generation right after the
+            // compaction attempt fails outright (no partial message, unlike
+            // an abort) — so a test can drive the turn to an error ending and
+            // then send a fresh task, to check that the next turn's own
+            // auto-compaction check does not repeat what already succeeded,
+            // and that its request is built from the compacted view.
+            "auto-compact-fail-then-continue-main" => match last_user(&request.messages) {
+                Some("first") => Self::completed(AssistantMessage {
+                    content: "first done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 100,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                Some("second") if tool_message(&request.messages, "call_1").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_1".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 5_000,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some("second") => Self::errored(StreamError::InvalidResponse(
+                    "simulated provider failure".into(),
+                )),
+                Some("third") => Self::completed(AssistantMessage {
+                    content: "third done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 100,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                other => panic!("unexpected user state: {other:?}"),
+            },
             // A root that delegates once per turn to a stateful "explore",
             // which itself goes over threshold on its second invocation
             // (spanning the root's first and second turns) — proving
