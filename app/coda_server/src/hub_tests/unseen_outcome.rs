@@ -1,8 +1,5 @@
-//! The unseen-outcome mechanism: classifying which wire event produced the
-//! settle, marking only when nobody was attached to see it, skipping
-//! suspensions (already covered by `has_pending_approval`), and clearing on
-//! the next attach without racing a settle already in flight. Also covers
-//! `running_sessions`, the live counterpart the catalog merges it with.
+//! The unseen-outcome mechanism, and `running_sessions`, the live counterpart
+//! the catalog merges it with.
 
 use super::super::*;
 use super::fixtures::*;
@@ -170,11 +167,8 @@ async fn suspending_while_unattended_does_not_mark() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_cannot_land_between_the_unattended_check_and_the_write() {
-    // The entry lock is held across `mark_unseen_outcome`'s write, so an
-    // attach racing a settle already in flight cannot observe (or produce) a
-    // session that is briefly "attached but marked unseen". Proven by
-    // stalling the write behind a gate: a concurrent attach must wait for it,
-    // and the recorded order must be mark-then-clear, never the reverse.
+    // The entry lock is held across `mark_unseen_outcome`'s write, so a
+    // concurrent attach must wait for it and the order must be mark-then-clear.
     let mark_gate = Arc::new(Notify::new());
     let mut opener = TestOpener::new("hold", ToolApprovalMode::Auto);
     opener.mark_unseen_gate = Some(mark_gate.clone());
@@ -204,11 +198,8 @@ async fn attach_cannot_land_between_the_unattended_check_and_the_write() {
     next_matching(&mut events1, content_chunk).await;
     hub.detach(key(), 1).await;
 
-    // Let the turn settle. `mark_unseen_entered` fires the instant the
-    // forwarder reaches the write and stalls on `mark_gate` — waiting for it
-    // (rather than guessing at timing) is what makes the race below
-    // deterministic: the forwarder is provably still holding the entry lock
-    // once this returns.
+    // `mark_unseen_entered` fires once the forwarder reaches the write and
+    // stalls on `mark_gate`, proving it still holds the entry lock.
     hold_gate.notify_one();
     opener.mark_unseen_entered.notified().await;
 

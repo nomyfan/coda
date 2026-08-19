@@ -629,11 +629,9 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
             .workspaces
             .get(&id)
             .expect("workspace id came from workspace map");
-        // Two independent reads (DB, hub) run concurrently — neither depends
-        // on the other's result. Not a transaction between them either way: a
-        // turn that settles in the gap can make one response stale for one
-        // fetch — see the design brief's Load-Bearing Decisions. Self-heals
-        // on the next fetch or via the `session_status` push for that session.
+        // Independent reads, run concurrently; not transactional, so a turn
+        // settling in the gap can make one response stale, self-healing on
+        // the next fetch or `session_status` push.
         let (running, sessions_result) = tokio::join!(
             app.relay.running_sessions(&workspace.id),
             workspace.storage.list_sessions(),
@@ -1867,9 +1865,7 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
     // Keys re-attached after a `Closed` that have produced no event since:
     // a session that closes again right away is not retried (no reopen loop).
     let mut reattached: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
-    // Process-wide, unscoped by workspace or attachment: every connection
-    // forwards every unseen-outcome change so a client watching a different
-    // session can still learn one finished without a catalog refetch.
+    // Unscoped: forwards every session's status changes to this connection.
     let mut status_stream = app.relay.subscribe_status();
 
     // No eager catalog pushes: the client requests `list_workspaces` and

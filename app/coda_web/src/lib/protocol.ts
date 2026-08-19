@@ -124,13 +124,9 @@ export type WorkspaceSession = {
   updated_at_ms?: number | null;
   first_user_message?: string | null;
   has_pending_approval: boolean;
-  /** `"running"`: a turn is currently in flight, read live from the server's
-   * hub regardless of attachment — this is what survives a page refresh that
-   * a locally-cached `running` flag alone cannot.
-   * `"completed"` / `"failed"`: the turn last ended with nobody attached;
-   * cleared on the next attach. `"failed"` covers both an abort and an
-   * error — the sidebar doesn't distinguish them.
-   * `null`/absent: neither applies. */
+  /** `"running"`: a turn is in flight, read live regardless of attachment.
+   * `"completed"` / `"failed"`: the turn ended with nobody attached; cleared
+   * on the next attach. `null`/absent: neither applies. */
   status?: "running" | "completed" | "failed" | null;
 };
 
@@ -288,9 +284,7 @@ type SessionRef = { workspace_id: string; session_id: string };
 
 /** Params of a `session_status` push: a session's turn just settled with
  * nobody attached (`"completed"`) or ended in an abort/error (`"failed"`).
- * Best-effort and process-wide — the durable copy this push is a live echo
- * of is one of the two inputs behind `WorkspaceSession.status`; this push
- * never fires for `"running"`, which is read live off the hub instead. */
+ * Never fires for `"running"`, which is read live off the hub instead. */
 type SessionStatusPush = SessionRef & { outcome: "completed" | "failed" };
 
 // --- Request / notification params (client → server) -------------------------

@@ -32,10 +32,8 @@ use crate::config::{PermissionMode, PermissionModeCell, RelayConfig};
 use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError, UnseenOutcome};
 use crate::wire::WireEvent;
 
-/// How many unseen-outcome changes the status broadcast buffers per lagging
-/// subscriber before dropping the oldest. Generous on purpose: a dropped event
-/// only delays a live update, it never causes an incorrect one — the catalog
-/// (backed by the same DB write) is the source of truth either way.
+/// Buffer size per lagging status-broadcast subscriber. A dropped event only
+/// delays a live update; the catalog remains the source of truth.
 const STATUS_BROADCAST_CAPACITY: usize = 256;
 
 pub type SessionKey = (String, String); // (workspace_id, session_id)
@@ -133,9 +131,7 @@ pub struct AttachSession {
     pub events: BoxStream<'static, RelayEvent>,
 }
 
-/// A session's unseen outcome just changed. Broadcast process-wide (not
-/// scoped to `key`'s own attachment) so a connection currently viewing a
-/// different session can still learn about it live; see [`SessionRelay::subscribe_status`].
+/// A session's unseen outcome just changed; see [`SessionRelay::subscribe_status`].
 #[derive(Debug, Clone)]
 pub struct SessionStatusEvent {
     pub workspace_id: String,
@@ -328,16 +324,14 @@ pub trait SessionOpener: Send + Sync + 'static {
         reasoning_effort: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-    /// Record that `key`'s turn just settled with nobody attached. Best-effort:
-    /// a failed write is logged and swallowed, never blocks the settle path.
+    /// Record that `key`'s turn just settled with nobody attached. Best-effort.
     fn mark_unseen_outcome<'a>(
         &'a self,
         key: &'a SessionKey,
         outcome: UnseenOutcome,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-    /// Clear any unseen outcome recorded for `key`. Called on every successful
-    /// attach; a no-op when there was nothing to clear.
+    /// Clear any unseen outcome recorded for `key`. Called on every attach.
     fn clear_unseen_outcome<'a>(
         &'a self,
         key: &'a SessionKey,
@@ -433,15 +427,12 @@ pub trait SessionRelay: Send + Sync {
     fn shutdown_all<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// A live feed of unseen-outcome changes across every session on this
-    /// process, for connections to forward to their client. Broadcast and
-    /// best-effort: a lagging receiver misses events; the catalog (backed by
-    /// the same write) stays correct regardless.
+    /// process. Broadcast and best-effort: a lagging receiver misses events,
+    /// but the catalog stays correct regardless.
     fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent>;
 
     /// Session ids in `workspace_id` with a turn currently in flight,
-    /// regardless of attachment. A point-in-time read of the hub, not a
-    /// subscription — used by the catalog so "running" survives a reconnect
-    /// that starts with no attachment at all (e.g. a hard page refresh).
+    /// regardless of attachment. A point-in-time read, not a subscription.
     fn running_sessions<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -1479,10 +1470,6 @@ impl SessionRelay for SessionHub {
                 }
             }
             state.attached = Some(Attachment { conn_id, tx });
-            // Someone is looking now; whatever happened while nobody was is
-            // no longer unseen. Cheap when there was nothing to clear (see
-            // `WorkspaceStorage::clear_unseen_outcome`), so unconditional here
-            // is fine even though most attaches have nothing to do.
             self.opener.clear_unseen_outcome(&key).await;
 
             Ok(AttachSession {
@@ -1766,9 +1753,7 @@ impl SessionRelay for SessionHub {
     }
 
     fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent> {
-        // A lagging subscriber only misses a freshness optimization: the DB
-        // write behind every event already happened, so a dropped event here
-        // is silently skipped rather than surfaced as an error.
+        // Drop lag errors; a missed event is a freshness gap, not a fault.
         BroadcastStream::new(self.status_tx.subscribe())
             .filter_map(|event| async move { event.ok() })
             .boxed()
@@ -1779,10 +1764,8 @@ impl SessionRelay for SessionHub {
         workspace_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HashSet<String>> + Send + 'a>> {
         Box::pin(async move {
-            // Collect the candidate entries under the (cheap, synchronous)
-            // outer lock, then check each one's `turn_running` without
-            // holding it — an entry's own lock can be held for a while (e.g.
-            // a stalled settle write), and this must not block on that.
+            // Release the outer lock before awaiting each entry's own lock,
+            // which can be held for a while (e.g. a stalled settle write).
             let candidates: Vec<Arc<SessionEntry>> = self
                 .entries
                 .lock()
@@ -2029,13 +2012,9 @@ async fn run_forwarder(
                         &root_name,
                         turn_id,
                     );
-                    // A suspension awaiting approval already has its own
-                    // indicator (`has_pending_approval`); everything else that
-                    // stops the turn while nobody is attached is new here.
-                    // Persisting and broadcasting *before* `maybe_release`
-                    // matters: both still run under `guard`, so no attach can
-                    // land between "nobody's here" and "we recorded that" —
-                    // see the design brief's Load-Bearing Decisions.
+                    // Suspensions awaiting approval already have their own
+                    // indicator. Still under `guard`, so no attach can land
+                    // between "nobody's here" and "we recorded that".
                     if !live.turn_running && !awaits_approval && state.attached.is_none() {
                         let outcome = unseen_outcome_for(&wire);
                         opener.mark_unseen_outcome(&entry.key, outcome).await;

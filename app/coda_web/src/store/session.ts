@@ -1255,9 +1255,8 @@ function setCatalog(
       return;
     }
     current.catalog = mergeLocal ? mergeCatalog(workspaces, current.sessions) : workspaces;
-    // A dropped `session_status` push (broadcast lag, or a reconnect that
-    // never fully reopens every session) still self-heals here: every
-    // fetched row reconciles a stale `running` in either direction.
+    // Self-heals a dropped `session_status` push: every fetched row
+    // reconciles a stale `running` in either direction.
     for (const workspace of workspaces) {
       for (const session of workspace.sessions) {
         reconcileOpenedSessionRunning(state, server, workspace.id, session.id, session.status);
@@ -1634,24 +1633,12 @@ function applyHeldElsewhere(
   });
 }
 
-/** What a catalog row's `status` implies for a session's cached `running`:
- * `"running"` means a turn is in flight right now; `"completed"`/`"failed"`
- * means it isn't — either way, this overrides whatever a stale local event
- * last said. `undefined` (no real catalog data for this row yet — e.g. a
- * locally-synthesized "extras" entry in `mergeCatalog`) is the only value
- * that leaves `running` alone; an explicit `null` from the server is a real
- * "confirmed idle" fact and is treated the same as a settled outcome.
- *
- * This is the one place that self-heals `running` in *either* direction for
- * a session that was opened in this tab and then backgrounded — the sidebar
- * has no other fallback to the catalog for an *already-opened* session
- * (unlike `awaitingApproval`), so a one-directional version of this left a
- * session that starts running again (e.g. from another tab) stuck showing
- * idle across every future reconnect that doesn't fully reopen it. A
- * momentarily-stale catalog read racing a *currently attached* session's own
- * live stream is possible but self-corrects on that stream's very next
- * event — accepted for the same reason `workspace_catalog`'s DB/hub read
- * race is: a freshness gap, not a correctness one. */
+/** Reconciles `running` to match a catalog row's `status` in *either*
+ * direction — a one-directional version left a session that starts running
+ * again from another tab stuck showing idle. `undefined` (no real catalog
+ * data yet, e.g. a locally-synthesized `mergeCatalog` entry) is the only
+ * value that leaves `running` untouched; an explicit `null` is treated as
+ * confirmed-idle, same as a settled outcome. */
 export function reconcileRunningWithStatus(
   session: OpenedSession,
   status: "running" | "completed" | "failed" | null | undefined,
@@ -1679,10 +1666,8 @@ function reconcileOpenedSessionRunning(
 }
 
 /** A session's turn just settled with nobody attached (`session_status` push).
- * Best-effort and may never arrive — `setCatalog` applies the same correction
- * from the next `list_workspaces` fetch, so this is a freshness optimization,
- * not the only path to correctness. Never fires for `"running"` — see
- * `SessionStatusPush` in `protocol.ts`. */
+ * A freshness optimization, not the only path to correctness — `setCatalog`
+ * applies the same correction from the next `list_workspaces` fetch. */
 function applySessionStatus(
   store: CodaStore,
   server: string,
@@ -2740,12 +2725,8 @@ export function openSession(server: string, workspaceId: string, sessionId: stri
   }
   closeActiveSession(server, key);
   selectSession(codaStore, server, workspace, session);
-  // Optimistic mirror of the server's clear-on-attach: opening it now is what
-  // makes any "finished while you were away" marker stale, and there's no
-  // reason to wait for the round trip to say so. Attach only clears a settled
-  // outcome — it never changes whether the session is actually running — so
-  // skip the patch when the catalog already says "running" rather than
-  // stomping it to null.
+  // Optimistic mirror of the server's clear-on-attach; skip when the catalog
+  // already says "running", since attach doesn't change that.
   updateState(codaStore, (state) => {
     const current = state.servers[server];
     if (!current) {

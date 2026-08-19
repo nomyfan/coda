@@ -185,9 +185,8 @@ pub struct SessionSummary {
     pub first_user_message: Option<String>,
     pub has_pending_approval: bool,
     /// `"completed"` / `"failed"`, straight from the DB's `unseen_outcome`
-    /// column — never parsed into [`UnseenOutcome`] here, since the write
-    /// path (`mark_unseen_outcome`) is the only writer and already restricts
-    /// the value via the column's `check` constraint.
+    /// column — not parsed into [`UnseenOutcome`], since the column's `check`
+    /// constraint already restricts the value.
     pub unseen_outcome: Option<String>,
 }
 
@@ -331,9 +330,8 @@ impl WorkspaceStorage {
         Ok(())
     }
 
-    /// Clear any unseen outcome recorded for `session_id`. A no-op write when
-    /// there was nothing to clear — attach is a hot path and the overwhelming
-    /// majority of attaches have nothing to clear.
+    /// Clear any unseen outcome recorded for `session_id`. Filtered to skip
+    /// the write when there's nothing to clear, since attach is a hot path.
     pub async fn clear_unseen_outcome(&self, session_id: &str) -> Result<(), String> {
         let mut conn = self.conn().await?;
         diesel::update(

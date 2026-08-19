@@ -300,9 +300,8 @@ pub(super) struct TestOpener {
     /// Holds `mark_unseen_outcome` until released, so a test can drive a
     /// concurrent `attach` while the entry lock is still held across it.
     pub(super) mark_unseen_gate: Option<Arc<Notify>>,
-    /// Notified the instant `mark_unseen_outcome` is entered (before it waits
-    /// on `mark_unseen_gate`), so a test can rendezvous with "the forwarder is
-    /// now stalled, holding the entry lock" instead of guessing at timing.
+    /// Notified as soon as `mark_unseen_outcome` is entered, before it waits
+    /// on `mark_unseen_gate` — a rendezvous point for tests.
     pub(super) mark_unseen_entered: Arc<Notify>,
 }
 
