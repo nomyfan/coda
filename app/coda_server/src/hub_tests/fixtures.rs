@@ -423,6 +423,9 @@ impl SessionOpener for TestOpener {
                         temperature: None,
                         max_completion_tokens: None,
                         reasoning_effort: None,
+                        // Effectively disabled: these tests exercise hub
+                        // command gating, not auto-compaction.
+                        auto_compact_threshold_tokens: u32::MAX,
                     },
                     agent_models: HashMap::new(),
                     tool_approval: self.approval.clone(),

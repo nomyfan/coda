@@ -464,6 +464,10 @@ pub struct ModelProfile<P> {
     /// Reasoning effort sent on each generation request. `None` leaves the
     /// provider default untouched; `Some("off")` turns thinking off.
     pub reasoning_effort: Option<String>,
+    /// The token count at which the root thread automatically compacts
+    /// context mid-turn. Already resolved to a concrete value by the caller —
+    /// this type carries no default policy of its own.
+    pub auto_compact_threshold_tokens: u32,
 }
 
 impl<P: Clone> Clone for ModelProfile<P> {
@@ -475,6 +479,7 @@ impl<P: Clone> Clone for ModelProfile<P> {
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
             reasoning_effort: self.reasoning_effort.clone(),
+            auto_compact_threshold_tokens: self.auto_compact_threshold_tokens,
         }
     }
 }

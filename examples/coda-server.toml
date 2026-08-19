@@ -13,12 +13,15 @@
 #   "openrouter" — OpenRouter reasoning details and continuation protocol
 # `api_key` / `base_url` may reference an environment variable as `${VAR}`.
 # Each model needs an `id` (the API model name) and a `context_window`; `name`,
-# `reasoning_efforts`, `input_modalities`, and `max_completion_tokens` are optional.
+# `reasoning_efforts`, `input_modalities`, `max_completion_tokens`, and
+# `auto_compact_threshold` are optional.
 # `reasoning_efforts` is an array of arbitrary strings passed to the provider API;
 # `"off"` is reserved for turning thinking off (omit it if the model doesn't
 # support disabling thinking). `default_reasoning_effort` optionally names the
 # recommended initial level (must be one of `reasoning_efforts`; defaults to
-# the first entry when absent).
+# the first entry when absent). `auto_compact_threshold` is the token count at
+# which a session on this model automatically compacts context; when absent it
+# defaults to 80% of `context_window`.
 
 [[providers]]
 id = "deepseek"

@@ -136,6 +136,7 @@ path = "/tmp/scratch"
                 ],
                 default_reasoning_effort: None,
                 input_modalities: vec![Modality::Text],
+                auto_compact_threshold: None,
             }],
         }]
     );
@@ -471,6 +472,65 @@ path = "/tmp/coda"
         );
         let error = parse_server_config(&config, Path::new("/srv")).unwrap_err();
         assert!(error.to_string().contains("max_completion_tokens"));
+    }
+}
+
+#[test]
+fn parse_server_config_accepts_optional_auto_compact_threshold() {
+    let config = parse_server_config(
+        r#"
+[database]
+url = "postgres://localhost/coda"
+
+[[providers]]
+id = "openrouter"
+kind = "openrouter"
+api_key = "sk-test"
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  { id = "x-ai/grok-4.5", context_window = 500000, auto_compact_threshold = 400000 },
+  { id = "z-ai/glm-5.2", context_window = 1048576 },
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#,
+        Path::new("/srv"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.providers[0].models[0].auto_compact_threshold,
+        Some(400_000)
+    );
+    assert_eq!(config.providers[0].models[1].auto_compact_threshold, None);
+}
+
+#[test]
+fn parse_server_config_rejects_invalid_auto_compact_threshold() {
+    for value in ["0", "-1", "1001", "\"large\""] {
+        let config = format!(
+            r#"
+[database]
+url = "postgres://localhost/coda"
+
+[[providers]]
+id = "openrouter"
+kind = "openrouter"
+api_key = "sk-test"
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  {{ id = "test", context_window = 1000, auto_compact_threshold = {value} }},
+]
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        );
+        let error = parse_server_config(&config, Path::new("/srv")).unwrap_err();
+        assert!(error.to_string().contains("auto_compact_threshold"));
     }
 }
 

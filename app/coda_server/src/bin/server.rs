@@ -117,6 +117,11 @@ struct ProviderHandle {
     model_name: String,
     context_window: u32,
     max_completion_tokens: Option<u32>,
+    /// The token count at which a session on this model auto-compacts,
+    /// resolved once here so nothing downstream needs to know the 80%
+    /// default policy: `ModelConfig::auto_compact_threshold` when configured,
+    /// otherwise 80% of `context_window`.
+    auto_compact_threshold_tokens: u32,
     /// The configured provider's id.
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
@@ -531,6 +536,7 @@ async fn open_session(
         temperature: None,
         max_completion_tokens: provider.max_completion_tokens,
         reasoning_effort,
+        auto_compact_threshold_tokens: provider.auto_compact_threshold_tokens,
     };
     // Sub-agents with a configured `model` run on their own provider/model. The
     // selections were validated against the catalog at startup, so every lookup
@@ -549,6 +555,7 @@ async fn open_session(
                 temperature: None,
                 max_completion_tokens: handle.max_completion_tokens,
                 reasoning_effort: selection.reasoning_effort.clone(),
+                auto_compact_threshold_tokens: handle.auto_compact_threshold_tokens,
             };
             (name.clone(), profile)
         })
@@ -2296,6 +2303,9 @@ async fn main() {
                     model_name: m.name,
                     context_window: m.context_window,
                     max_completion_tokens: m.max_completion_tokens,
+                    auto_compact_threshold_tokens: m
+                        .auto_compact_threshold
+                        .unwrap_or(m.context_window / 5 * 4),
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                     default_reasoning_effort: m.default_reasoning_effort,
