@@ -12,8 +12,8 @@ use crate::{
 };
 use coda_core::{
     llm::{
-        AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, MessageId,
-        ReasoningContinuation, RequestMessage, StreamError, ToolCall, ToolMessage,
+        AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMStreamEvent,
+        MessageId, ReasoningContinuation, RequestMessage, StreamError, ToolCall, ToolMessage,
     },
     tool::{Tool, ToolCallContext, ToolObject, ToolResult, ToolWrapper},
 };
@@ -388,20 +388,31 @@ impl ToolSpec for CancelAwareToolSpec {
 pub(super) struct TestProvider {
     hold_subagent: Option<Arc<Notify>>,
     hold_generation: Option<Arc<Notify>>,
+    /// When set and `true`, the next compaction request fails instead of
+    /// returning a summary, and the flag flips back to `false` — so a test
+    /// can script exactly one failure before later attempts succeed.
+    fail_next_compaction: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TestProvider {
     pub(super) fn with_hold_subagent(hold_subagent: Arc<Notify>) -> Self {
         Self {
             hold_subagent: Some(hold_subagent),
-            hold_generation: None,
+            ..Self::default()
         }
     }
 
     pub(super) fn with_hold_generation(hold_generation: Arc<Notify>) -> Self {
         Self {
             hold_generation: Some(hold_generation),
-            hold_subagent: None,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_fail_next_compaction(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            fail_next_compaction: Some(flag),
+            ..Self::default()
         }
     }
 
@@ -464,7 +475,172 @@ impl LLMProvider for TestProvider {
             })
             .unwrap_or_default();
 
+        // An auto- or manual-compaction request, not a turn: its system
+        // message is the compaction prompt, not one of the scripts below.
+        if system_prompt.starts_with("You are compacting") {
+            if let Some(flag) = &self.fail_next_compaction
+                && flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Self::errored(StreamError::InvalidResponse(
+                    "scripted compaction failure".into(),
+                ));
+            }
+            return Self::completed(AssistantMessage {
+                content: "gist of the earlier turn".into(),
+                ..assistant()
+            });
+        }
+
         match system_prompt {
+            // Answers "first" directly (no tool call, low usage), then on
+            // "second" makes two tool calls in sequence — each over threshold
+            // — before answering. This gives a test three `Generation` entries
+            // in the "second" turn to check auto-compaction against: the one
+            // before the first tool call (still low usage, from "first"), the
+            // one after it (over threshold — the compaction attempt), and the
+            // one after the second (over threshold again — where a repeat or a
+            // retry, depending on whether the first attempt succeeded, would
+            // show up).
+            "auto-compact-main" => match last_user(&request.messages) {
+                Some("first") => Self::completed(AssistantMessage {
+                    content: "first done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 100,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                Some("second") if tool_message(&request.messages, "call_1").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_1".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 5_000,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some("second") if tool_message(&request.messages, "call_2").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_2".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 6_000,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some("second") => Self::completed(AssistantMessage {
+                    content: "second done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 200,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                other => panic!("unexpected user state: {other:?}"),
+            },
+            // A root that delegates once per turn to a stateful "explore",
+            // which itself goes over threshold on its second invocation
+            // (spanning the root's first and second turns) — proving
+            // auto-compaction never fires on a non-root thread, since without
+            // that guard `explore`'s own turn-1-tagged messages would be a
+            // legal compaction target for its turn-2 work.
+            "auto-compact-subagent-main" => match last_user(&request.messages) {
+                Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_explore_1".into(),
+                            name: "agent__explore".into(),
+                            arguments: Some(r#"{"task":"first"}"#.into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some("first") => Self::completed(AssistantMessage {
+                    content: "first done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 100,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                Some("second") if tool_message(&request.messages, "call_explore_2").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_explore_2".into(),
+                            name: "agent__explore".into(),
+                            arguments: Some(r#"{"task":"second"}"#.into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some("second") => Self::completed(AssistantMessage {
+                    content: "second done".into(),
+                    usage: Some(CompletionUsage {
+                        total_tokens: 100,
+                        ..Default::default()
+                    }),
+                    ..assistant()
+                }),
+                other => panic!("unexpected user state: {other:?}"),
+            },
+            "auto-compact-subagent-explore" => {
+                let invocation = request
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, RequestMessage::User(_)))
+                    .count();
+                match invocation {
+                    1 => Self::completed(AssistantMessage {
+                        content: "explore round 1 done".into(),
+                        usage: Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    }),
+                    2 if tool_message(&request.messages, "call_sub").is_none() => {
+                        Self::completed(AssistantMessage {
+                            tool_calls: vec![ToolCall {
+                                id: "call_sub".into(),
+                                name: "read_todos".into(),
+                                arguments: Some("{}".into()),
+                            }],
+                            usage: Some(CompletionUsage {
+                                total_tokens: 5_000,
+                                ..Default::default()
+                            }),
+                            ..assistant()
+                        })
+                    }
+                    2 => Self::completed(AssistantMessage {
+                        content: "explore round 2 done".into(),
+                        usage: Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    }),
+                    other => panic!("unexpected explore invocation count: {other}"),
+                }
+            }
             "main-system" => {
                 let has_explore_result = request.messages.iter().any(
                     |message| matches!(message, RequestMessage::Tool(tool) if tool.name == "explore"),
@@ -938,8 +1114,24 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let config = test_config(provider, approval);
+        Self::start_with_config(
+            storage,
+            agents,
+            test_config(provider, approval),
+            initial_task,
+        )
+        .await
+    }
 
+    /// Like [`Self::start_agents`], but for a test that needs to shape the
+    /// `RunConfig` itself — an auto-compaction threshold, say — rather than
+    /// just the provider and approval mode `test_config` already covers.
+    pub(super) async fn start_with_config(
+        storage: S,
+        agents: HashMap<String, Agent>,
+        config: RunConfig<TestProvider>,
+        initial_task: &str,
+    ) -> Self {
         let thread_id = ThreadId::new();
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
         runtime

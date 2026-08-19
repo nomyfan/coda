@@ -7,8 +7,9 @@ use std::{
 use serde_json::Value;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
-    MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMStreamEvent, Message,
+    MessageId, MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId,
+    UserMessage,
 };
 use coda_core::tool::{ThreadState, ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -18,12 +19,13 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, Sender,
-    SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, Agent, AgentEvent, Envelope, HistoryEntry, PendingApproval, ResumeDecision,
+    Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget,
         ResumePoint, ToolExecutionState,
     },
+    compaction, message_view,
     persist::StoredCheckpoint,
     runtime::AgentRuntime,
 };
@@ -624,18 +626,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
             let current = std::mem::take(&mut resume_point);
             match current {
-                ResumePoint::Generation => match self.handle_generation().await {
-                    AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
-                        suspended_at = jiff::Timestamp::now();
-                        resume_point = rp;
+                ResumePoint::Generation => {
+                    self.maybe_auto_compact().await;
+                    match self.handle_generation().await {
+                        AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
+                            suspended_at = jiff::Timestamp::now();
+                            resume_point = rp;
+                        }
+                        AgentLoopState::Next(rp) => resume_point = rp,
+                        AgentLoopState::Done(rp, end) => {
+                            resume_point = rp;
+                            owed = *end;
+                            break;
+                        }
                     }
-                    AgentLoopState::Next(rp) => resume_point = rp,
-                    AgentLoopState::Done(rp, end) => {
-                        resume_point = rp;
-                        owed = *end;
-                        break;
-                    }
-                },
+                }
                 ResumePoint::ToolExecution(tool_execution_state) => {
                     match self.handle_tool_execution(tool_execution_state).await {
                         AgentLoopState::Next(rp @ ResumePoint::ToolExecution(_)) => {
@@ -1214,6 +1219,82 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
     }
 
+    /// Checked once per entry into [`ResumePoint::Generation`], root thread
+    /// only. Compares the last recorded usage against the profile's
+    /// threshold; on exceed, asks [`compaction::cutoff`] whether there's
+    /// anything new to summarize — protecting this thread's current turn —
+    /// and, if so, runs the summarization request before the next LLM request
+    /// goes out. Appends the resulting message the same way any other
+    /// mid-turn message is appended; nothing about it is announced as an
+    /// event.
+    ///
+    /// On failure, appends only a failure record: no boundary moves and
+    /// nothing is recorded to suppress a later attempt in this same turn — a
+    /// later over-threshold check will try again, since `cutoff` only ever
+    /// refuses once something has actually moved the boundary.
+    async fn maybe_auto_compact(&mut self) {
+        if !self.runtime.is_root_thread(&self.thread_id) {
+            return;
+        }
+        let history = self.agent.history().await;
+        let Some(usage) = last_usage(&history) else {
+            return;
+        };
+        if usage.total_tokens < self.config.profile.auto_compact_threshold_tokens {
+            return;
+        }
+        let current_turn = self.thread_turn().await;
+        let Some(cutoff_id) = compaction::cutoff(&history, Some(current_turn)) else {
+            return;
+        };
+        let cutoff_idx = history
+            .iter()
+            .position(|entry| entry.message.message_id() == cutoff_id)
+            .expect("compaction::cutoff returns a message id from this same history");
+        let request = compaction::summary_request(
+            self.config.profile.model.clone(),
+            self.config.profile.max_completion_tokens,
+            self.config.profile.reasoning_effort.clone(),
+            message_view::model_view(&history[..=cutoff_idx]),
+            "",
+        );
+
+        let outcome = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return,
+            outcome = self.summarize(request) => outcome,
+        };
+        let message = match outcome {
+            Ok(summary) => {
+                compaction::summary_message(cutoff_id, compaction::Trigger::Auto, &summary)
+            }
+            Err(reason) => {
+                warn!("auto-compaction failed: {reason}");
+                compaction::failure_message(&reason)
+            }
+        };
+        self.agent.add_message(message).await;
+    }
+
+    /// One provider round-trip turning `request` into a summary, with no
+    /// intermediate chunks announced — a compaction is silent by design.
+    async fn summarize(&self, request: ChatCompletionRequest) -> Result<String, String> {
+        let mut stream = std::pin::pin!(self.config.profile.provider.stream(request));
+        while let Some(event) = stream.next().await {
+            match event.map_err(|err| err.to_string())? {
+                LLMStreamEvent::Completed(message) => {
+                    return if message.content.trim().is_empty() {
+                        Err("the provider returned an empty summary".to_string())
+                    } else {
+                        Ok(message.content.clone())
+                    };
+                }
+                LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+            }
+        }
+        Err("the provider closed the stream without a summary".to_string())
+    }
+
     async fn handle_generation(&mut self) -> AgentLoopState {
         let thread_id = self.thread_id.clone();
         let request = ChatCompletionRequest {
@@ -1676,6 +1757,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 /// envelopes that continue existing work (`Reply`, `Resume`) rather than start
 /// any.
 ///
+/// The most recent usage this thread's history recorded — the last assistant
+/// message, working backward, that has one. An aborted generation leaves its
+/// partial message with `usage: None`, so this can skip past it to an older
+/// completion rather than reporting no usage at all.
+fn last_usage(history: &[HistoryEntry]) -> Option<&CompletionUsage> {
+    history.iter().rev().find_map(|entry| match &entry.message {
+        Message::Assistant(assistant) => assistant.usage.as_ref(),
+        _ => None,
+    })
+}
+
 /// A root task carries the id minted at the request boundary, and that id also
 /// names the turn it begins. A sub-agent invocation mints its own message id
 /// here — this is that message's only construction point, so there is no second
