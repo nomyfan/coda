@@ -1,6 +1,5 @@
-//! Auto-compaction: triggered mid-turn on any thread, protecting the turn in
-//! progress, compacting at most once per turn on success, and retrying on a
-//! later over-threshold check after a failed attempt.
+//! Auto-compaction across turn and tool-batch boundaries, including repeated
+//! compaction in one turn and retries after a failed summary attempt.
 
 use super::super::*;
 use super::fixtures::*;
@@ -471,7 +470,11 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
 /// request from the newer compacted view rather than stale raw history.
 #[tokio::test]
 async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
-    let config = config_with_threshold(TestProvider::default(), 1_000);
+    let compaction_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = config_with_threshold(
+        TestProvider::with_recorded_compactions(Arc::clone(&compaction_requests)),
+        1_000,
+    );
     let agents = AgentTeam::new(
         coda_spec("auto-compact-fail-then-continue-main", vec![]),
         vec![],
@@ -508,11 +511,29 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
     wait_for_root_answer(&mut harness, "third done").await;
     harness.shutdown().await;
 
+    {
+        let compaction_requests = compaction_requests
+            .lock()
+            .expect("recorded compaction mutex poisoned");
+        assert_eq!(compaction_requests.len(), 2);
+        assert!(compaction_requests[1].contains("gist of the earlier turn"));
+        assert!(
+            !compaction_requests[1].contains("first done"),
+            "the replacement summary request must use the previous summary instead of raw replaced history: {}",
+            compaction_requests[1]
+        );
+    }
+
     // Turn 3 sees the compacted view, not the raw pre-compaction history.
     let sent = format!("{third_request:?}");
     assert!(
         sent.contains("gist of the earlier turn"),
         "turn 3's request should carry the summary: {sent}"
+    );
+    assert_eq!(
+        sent.matches("gist of the earlier turn").count(),
+        1,
+        "the replacement summary must not retain the old summary behind it: {sent}"
     );
     assert!(
         !sent.contains("first done"),

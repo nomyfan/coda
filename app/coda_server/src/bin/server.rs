@@ -265,9 +265,7 @@ impl AppOpener {
             handle.model_id.clone(),
             handle.max_completion_tokens,
             reasoning_effort.map(str::to_string),
-            // Truncated at the cutoff: nothing this compaction protects
-            // reaches the summarizer.
-            coda_agent::message_view::model_view(&history[..=cutoff.history_index]),
+            coda_agent::message_view::model_view(history).take(cutoff.model_view_len),
             instructions,
         );
 

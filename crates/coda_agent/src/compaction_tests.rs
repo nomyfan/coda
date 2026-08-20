@@ -235,7 +235,7 @@ fn a_failure_is_not_a_summary() {
 fn no_protection_targets_the_last_message() {
     let history = vec![user("a"), user("b"), user("c")];
     assert_eq!(
-        planned_cutoff(&history, None, None, None).map(|cutoff| cutoff.message_id),
+        planned_cutoff(&history, None, None, None).map(|cutoff| cutoff.coverage_message_id),
         Some(history[2].message.message_id()),
     );
 }
@@ -257,7 +257,7 @@ fn a_protected_turn_with_a_predecessor_targets_the_predecessors_last_message() {
     ];
     assert_eq!(
         planned_cutoff(&history, Some(current_turn), None, Some(u32::MAX))
-            .map(|cutoff| cutoff.message_id),
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(history[1].message.message_id())
     );
 }
@@ -284,7 +284,8 @@ fn a_first_turn_with_a_completed_batch_falls_back_inside_the_turn() {
         tool_in(turn, "call"),
     ];
     assert_eq!(
-        planned_cutoff(&history, Some(turn), None, Some(800)).map(|cutoff| cutoff.message_id),
+        planned_cutoff(&history, Some(turn), None, Some(800))
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(history[2].message.message_id())
     );
 }
@@ -301,7 +302,7 @@ fn a_previous_turn_is_preferred_when_current_growth_is_below_threshold() {
     ];
     assert_eq!(
         planned_cutoff(&history, Some(current_turn), None, Some(800))
-            .map(|cutoff| cutoff.message_id),
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(history[0].message.message_id())
     );
 }
@@ -322,7 +323,7 @@ fn measured_current_turn_growth_can_force_the_intra_turn_fallback() {
     ];
     assert_eq!(
         planned_cutoff(&history, Some(current_turn), None, Some(1_000))
-            .map(|cutoff| cutoff.message_id),
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(history[7].message.message_id())
     );
 }
@@ -371,7 +372,7 @@ fn missing_or_non_monotonic_usage_does_not_override_the_turn_boundary() {
         ];
         assert_eq!(
             planned_cutoff(&history, Some(current_turn), None, Some(1))
-                .map(|cutoff| cutoff.message_id),
+                .map(|cutoff| cutoff.coverage_message_id),
             Some(history[0].message.message_id())
         );
     }
@@ -444,9 +445,72 @@ fn a_long_turn_can_compact_again_after_new_work() {
     ];
     assert_eq!(
         planned_cutoff(&history, Some(current_turn), None, Some(800))
-            .map(|cutoff| cutoff.message_id),
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(expected)
     );
+}
+
+#[test]
+fn a_reordered_summary_uses_separate_logical_extent_and_physical_coverage() {
+    let previous_turn = TurnId::from(MessageId::new());
+    let compacted_turn = TurnId::from(MessageId::new());
+    let next_turn = TurnId::from(MessageId::new());
+    let previous = user_in(previous_turn, "RAW_REPLACED_MARKER");
+    let opening = user_in(compacted_turn, "task");
+    let assistant = assistant_in(compacted_turn, "call", Some(1_000));
+    let tool = tool_in(compacted_turn, "call");
+    let first_summary = entry_in(
+        compacted_turn,
+        summary_message(
+            previous.message.message_id(),
+            Trigger::Auto,
+            "EARLIER_SUMMARY_MARKER",
+        ),
+    );
+    let first_summary_id = first_summary.message.message_id();
+    let fresh_task = user_in(next_turn, "next task");
+    let fresh_task_id = fresh_task.message.message_id();
+    let history = vec![
+        previous,
+        opening,
+        assistant,
+        tool,
+        first_summary,
+        fresh_task,
+    ];
+
+    let cutoff = planned_cutoff(
+        &history,
+        Some(next_turn),
+        Some(fresh_task_id),
+        Some(u32::MAX),
+    )
+    .expect("the completed turn is compactable");
+    assert_eq!(cutoff.model_view_len, 4);
+    assert_eq!(cutoff.coverage_message_id, first_summary_id);
+
+    let request = summary_request(
+        "model".to_string(),
+        None,
+        None,
+        message_view::model_view(&history).take(cutoff.model_view_len),
+        "",
+    );
+    let transcript = request_text(&request);
+    assert!(transcript.contains("EARLIER_SUMMARY_MARKER"));
+    assert!(!transcript.contains("RAW_REPLACED_MARKER"));
+
+    let replacement = entry_in(
+        next_turn,
+        summary_message(cutoff.coverage_message_id, Trigger::Auto, "replacement"),
+    );
+    let replacement_id = replacement.message.message_id();
+    let mut committed = history;
+    committed.push(replacement);
+    let visible_ids: Vec<_> = message_view::model_view(&committed)
+        .map(|entry| entry.message.message_id())
+        .collect();
+    assert_eq!(visible_ids, [replacement_id, fresh_task_id]);
 }
 
 #[test]
@@ -482,7 +546,7 @@ fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
     let history = vec![user("old")];
     let cutoff_id = planned_cutoff(&history, None, None, None)
         .expect("something to compact")
-        .message_id;
+        .coverage_message_id;
 
     let command = entry(command_message("keep the plan"));
     let outcome = entry(summary_message(
@@ -527,7 +591,7 @@ fn a_failed_attempt_does_not_suppress_a_later_retry() {
     ];
     assert_eq!(
         planned_cutoff(&history, Some(current_turn), None, Some(u32::MAX))
-            .map(|cutoff| cutoff.message_id),
+            .map(|cutoff| cutoff.coverage_message_id),
         Some(previous_id)
     );
 }

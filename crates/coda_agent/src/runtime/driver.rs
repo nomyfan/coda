@@ -1274,7 +1274,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             self.config.profile.model.clone(),
             self.config.profile.max_completion_tokens,
             self.config.profile.reasoning_effort.clone(),
-            message_view::model_view(&history[..=cutoff.history_index]),
+            message_view::model_view(&history).take(cutoff.model_view_len),
             "",
         );
 
@@ -1290,9 +1290,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
         };
         let message = match outcome {
-            Ok(summary) => {
-                compaction::summary_message(cutoff.message_id, compaction::Trigger::Auto, &summary)
-            }
+            Ok(summary) => compaction::summary_message(
+                cutoff.coverage_message_id,
+                compaction::Trigger::Auto,
+                &summary,
+            ),
             Err(reason) => {
                 warn!(thread_id = %self.thread_id.as_ref(), "auto-compaction failed: {reason}");
                 compaction::failure_message(&reason)

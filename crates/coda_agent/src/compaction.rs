@@ -26,8 +26,10 @@ pub const MAX_INSTRUCTIONS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cutoff {
-    pub message_id: MessageId,
-    pub history_index: usize,
+    /// Entries to take from the full model view of the same history snapshot.
+    pub model_view_len: usize,
+    /// Physically latest included message; persisted as the summary boundary.
+    pub coverage_message_id: MessageId,
 }
 
 /// Chooses what a compaction may summarize without leaving an invalid tool
@@ -60,10 +62,13 @@ pub fn cutoff(
         .is_some_and(|(_, entry)| message_view::is_compaction_summary(&entry.message))
         as usize;
     let cutoff_at = |position: usize| {
-        let (history_index, entry) = visible[position];
+        let (_, coverage) = visible[..=position]
+            .iter()
+            .max_by_key(|(history_index, _)| history_index)
+            .expect("a cutoff position includes at least one message");
         Cutoff {
-            message_id: entry.message.message_id(),
-            history_index,
+            model_view_len: position + 1,
+            coverage_message_id: coverage.message.message_id(),
         }
     };
     let leaves_valid_suffix = |position: usize| {

@@ -388,6 +388,7 @@ impl ToolSpec for CancelAwareToolSpec {
 pub(super) struct TestProvider {
     hold_subagent: Option<Arc<Notify>>,
     hold_generation: Option<Arc<Notify>>,
+    recorded_compactions: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// When `true`, the next compaction request fails and the flag flips
     /// back to `false` — scripts exactly one failure before later attempts
     /// succeed.
@@ -412,6 +413,13 @@ impl TestProvider {
     pub(super) fn with_fail_next_compaction(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             fail_next_compaction: Some(flag),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_recorded_compactions(requests: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self {
+            recorded_compactions: Some(requests),
             ..Self::default()
         }
     }
@@ -478,6 +486,12 @@ impl LLMProvider for TestProvider {
         // A compaction request, not a turn: its system message is the
         // compaction prompt.
         if system_prompt.starts_with("You are compacting") {
+            if let Some(requests) = &self.recorded_compactions {
+                requests
+                    .lock()
+                    .expect("recorded compaction mutex poisoned")
+                    .push(format!("{request:?}"));
+            }
             if let Some(flag) = &self.fail_next_compaction
                 && flag.swap(false, std::sync::atomic::Ordering::SeqCst)
             {

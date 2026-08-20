@@ -75,6 +75,16 @@ Out of scope:
   planner. Implication: history validation cannot be owned only by compaction;
   normal request construction must validate independently before every
   `LLMStart`.
+- Question: can one physical history index identify both the model-view prefix
+  to summarize and the persisted coverage boundary? Method: traced a turn
+  boundary compaction followed by a failed generation and a new task. Result:
+  the existing summary is physically after the retained current-turn messages,
+  so a later cutoff can follow that summary in model-view order while having a
+  smaller physical index. Slicing physical history at that index omits the
+  summary and recording the selected message ID retains the old summary after
+  its replacement. Implication: cutoff planning must return a model-view prefix
+  length separately from the physical coverage watermark persisted in
+  `CustomMessage.cutoff`.
 
 ## Alternatives Considered
 
@@ -120,6 +130,15 @@ cutoff, but the usage fast path skips the planner when usage is absent or below
 threshold. Rejected because validation must guard provider requests, not only
 compaction attempts.
 
+### Use the selected message's physical history index for both purposes
+
+This avoids materializing the model view again at the caller, but model-view
+order is intentionally different from physical history order after a mid-turn
+summary. A physical prefix can therefore omit an earlier logical summary, and
+the selected message may not cover that summary in storage. Rejected in favor
+of carrying the logical prefix length and physical coverage watermark as
+separate values.
+
 ## Components
 
 - `compaction` cutoff planner: first tries the safe boundary preceding the
@@ -139,8 +158,10 @@ The exact Rust names may be adapted during implementation, but the boundary shou
 
 ```rust
 pub struct Cutoff {
-    pub message_id: MessageId,
-    pub history_index: usize,
+    /// Entries to take from the full model view of the same history snapshot.
+    pub model_view_len: usize,
+    /// Physically latest included message; persisted in `CustomMessage.cutoff`.
+    pub coverage_message_id: MessageId,
 }
 
 #[derive(Debug)]
@@ -180,7 +201,11 @@ impl Agent {
 }
 ```
 
-Returning the index with the ID removes the current second lookup and guarantees that the summary request and recorded boundary refer to the same history snapshot.
+The two fields deliberately describe different orders. Callers build summary
+input with `model_view(messages).take(model_view_len)`. The planner derives
+`coverage_message_id` from the included model-view prefix by choosing its
+physically latest entry, so persisting it removes every included entry even
+when the latest summary was physically appended after the selected candidate.
 
 Selection is ordered:
 
@@ -202,7 +227,9 @@ Selection is ordered:
    too large.
 4. Otherwise find the newest candidate boundary before `protect_from`, applying
    the same retained-suffix validation. This is the intra-turn fallback.
-5. Return `Ok(None)` when neither candidate contains new content.
+5. For the selected model-view prefix, return its length and the message ID
+   whose physical history index is greatest. Return `Ok(None)` when neither
+   candidate contains new content.
 
 At the runtime call site:
 
@@ -214,6 +241,9 @@ At the runtime call site:
   summarizing a task that has not started.
 - Otherwise pass `None`; if the preferred turn boundary is unavailable, the
   planner may select the latest completed tool batch inside the current turn.
+- Build the summary transcript from the complete model view and truncate it
+  with `take(cutoff.model_view_len)`; never truncate physical history first.
+- Record `cutoff.coverage_message_id` in the successful auto summary.
 - On `Err(InvalidHistory)`, do not call `handle_generation`: end the current
   root turn with `AgentEvent::Error`, or return the equivalent failed tool reply
   for a sub-agent. The diagnostic identifies the offending message/call.
@@ -228,16 +258,22 @@ summarizer.
 
 ## Data Model
 
-No persisted data changes. A successful summary continues to store the selected message ID in `CustomMessage.cutoff`. Successive summaries in one turn form a logical chain: the new summary request sees the previous summary plus the newly completed tail, and the new summary supersedes the previous one in `message_view`.
+No persisted format changes. A successful summary stores the physically latest
+message covered by its model-view prefix in `CustomMessage.cutoff`; this may be
+an earlier summary rather than the candidate ending that logical prefix.
+Successive summaries in one turn form a logical chain: the new summary request
+sees the previous summary plus the newly completed tail, and the new summary
+supersedes every entry it covered in `message_view`.
 
 The cutoff planner derives transient state while scanning the current model view:
 
 - A validation state with either no open batch or one assistant batch carrying
   its message ID, expected call IDs, and results already seen. A non-tool
   message may follow only after every expected result has arrived.
-- Candidate boundaries paired with their physical history indices. Candidate
+- Candidate boundaries paired with their model-view positions. Candidate
   safety is decided by validating `summary + retained suffix`, not by assuming
-  that the summarized prefix was complete.
+  that the summarized prefix was complete. Physical indices are used only to
+  derive the coverage watermark across the selected prefix.
 - The latest summary boundary and optional protected-tail position.
 - The last safe boundary before the current turn, when one exists.
 - Per-batch token estimates derived from adjacent provider-reported
@@ -273,6 +309,10 @@ The cutoff planner derives transient state while scanning the current model view
   assistant-message deltas may force the intra-turn fallback when the known
   current-turn batch growth reaches the threshold; they never choose the
   preferred turn boundary merely because measured growth is small.
+- Logical truncation and persisted coverage use separate coordinates. Summary
+  input is bounded in model-view order, while `CustomMessage.cutoff` records
+  the physically latest included message so reordered summaries cannot leak
+  back into a later model view.
 
 ## Risks / Open Questions
 
@@ -305,3 +345,9 @@ The cutoff planner derives transient state while scanning the current model view
 - [x] [regression] run the full Rust checks required by the workspace
       Purpose: catch request-shape, persistence, and runtime regressions
       Verification: `cargo clippy` and `cargo test` pass
+- [x] [review fix] split logical summary extent from persisted physical coverage
+      Purpose: ensure repeated compaction preserves the previous summary even when its selected logical cutoff is physically earlier
+      Verification: planner tests assert the model-view prefix includes the old summary and the coverage watermark points at the physically latest included entry
+- [x] [review regression] cover compaction after a post-summary generation failure
+      Purpose: reproduce the review finding through the runtime boundary
+      Verification: the next summary request contains the previous summary instead of replaced raw history, and the resulting provider request contains exactly one summary
