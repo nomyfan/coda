@@ -1,17 +1,14 @@
 //! What a compaction may summarize, and the messages its answer becomes.
 //!
 //! The conversation is flattened to plain text rather than replayed as a
-//! conversation. That drops three provider-compatibility problems at once — the
-//! request would otherwise have to carry the full tool definitions behind every
-//! `tool_calls` in the history, preserve truncated reasoning continuations, and
-//! guarantee no tool result is left without its call. None of it earns its keep
-//! for what is really a single instruction: summarize this record.
+//! conversation — that avoids carrying tool definitions, truncated reasoning
+//! continuations, and orphan tool results, for what is really a single
+//! instruction: summarize this record.
 //!
-//! [`cutoff`] is the one rule both a manual (idle) and an automatic (mid-turn)
-//! compaction call to decide what's new since the last compaction — the manual
-//! caller passes `protect: None` (the whole history is fair game), the
-//! automatic one passes the in-progress turn. Neither caller re-derives the
-//! answer, so they can never disagree about a boundary.
+//! [`cutoff`] is the one rule both manual (idle) and automatic (mid-turn)
+//! compaction use to decide what's new since the last one — manual passes
+//! `protect: None` (whole history is fair game), automatic passes the
+//! in-progress turn. Neither re-derives the answer, so they can't disagree.
 
 use crate::agent::HistoryEntry;
 use crate::message_view::{self, COMPACTION_FAILED_KIND, COMPACTION_KIND};
@@ -27,21 +24,18 @@ static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 pub const MAX_INSTRUCTIONS: usize = 4096;
 
 /// What a compaction may summarize right now, or `None` when there is nothing
-/// new to summarize since the last one.
+/// new since the last one.
 ///
-/// `protect` names the turn whose own messages must stay out of the summary —
-/// the in-progress turn, for a mid-turn/automatic compaction — or `None` when
-/// nothing needs protecting (the idle/manual case, where the whole history is
-/// fair game).
+/// `protect` names the turn whose own messages must stay out of the summary
+/// (the in-progress turn, for a mid-turn/automatic compaction), or `None`
+/// when the whole history is fair game (idle/manual).
 ///
-/// "Nothing new" covers three shapes: an empty thread; a protected turn with
-/// no predecessor turn at all (the thread's very first turn); and a target
-/// that does not fall after the last successful compaction. That last one is
-/// also why a turn can compact at most once: `protect` pins the target to the
-/// same message for as long as the turn is current, so once a compaction
-/// succeeds past it, nothing later in the same turn re-qualifies. A *failed*
-/// attempt does not move that boundary — it isn't recorded as [`COMPACTION_KIND`]
-/// — so a later detection point in the same turn will try again.
+/// "Nothing new" covers an empty thread, a protected turn with no predecessor,
+/// or a target at/before the existing boundary. That last case is also why a
+/// turn compacts at most once: `protect` pins the target to the same message
+/// while the turn is current, so a successful compaction past it disqualifies
+/// the rest of the turn. A *failed* attempt doesn't move the boundary — it
+/// isn't [`COMPACTION_KIND`] — so a later check in the same turn retries.
 pub fn cutoff(messages: &[HistoryEntry], protect: Option<TurnId>) -> Option<MessageId> {
     let target_idx = match protect {
         None => messages.len().checked_sub(1)?,
@@ -57,8 +51,7 @@ pub fn cutoff(messages: &[HistoryEntry], protect: Option<TurnId>) -> Option<Mess
 }
 
 /// Resolves a [`cutoff`] result back to its index in the same slice it was
-/// read from — shared so neither caller re-implements the lookup `cutoff`
-/// already performed internally to compute the id in the first place.
+/// read from.
 pub fn resolve_cutoff_idx(messages: &[HistoryEntry], cutoff_id: MessageId) -> usize {
     messages
         .iter()
@@ -66,22 +59,18 @@ pub fn resolve_cutoff_idx(messages: &[HistoryEntry], cutoff_id: MessageId) -> us
         .expect("cutoff always names a message id from the same slice it was read from")
 }
 
-/// What prompted a compaction, and how the summary should say so. The prompt
-/// sent to the model is identical either way — only the human-facing wrapper
-/// differs, the same way a manual compaction already wraps the summary in a
-/// note when the user typed instructions.
+/// What prompted a compaction — only the human-facing wrapper text differs;
+/// the prompt sent to the model is identical either way.
 pub enum Trigger<'a> {
-    /// A user-typed `/compact`, with whatever instructions (possibly empty)
-    /// they added.
+    /// A user-typed `/compact`, with whatever instructions they added.
     Manual { instructions: &'a str },
     /// The token-usage threshold was crossed; nobody asked for this.
     Auto,
 }
 
-/// The request that asks `model` to summarize `messages`. `messages` is a
-/// model view — [`message_view::model_view`] output, truncated at whatever
-/// `cutoff` this compaction targets — so failure records, which are
-/// transcript-only, never reach the summarizer.
+/// The request that asks `model` to summarize `messages` — a model view
+/// ([`message_view::model_view`] output) truncated at this compaction's
+/// `cutoff`, so failure records never reach the summarizer.
 pub fn summary_request<'a>(
     model: String,
     max_completion_tokens: Option<u32>,
@@ -115,10 +104,9 @@ pub fn summary_request<'a>(
     }
 }
 
-/// The `/compact` line as the transcript records it. This is the only trace of
-/// what the user typed: it falls before the new boundary, so the model never
-/// sees it — the summary carries the instructions instead. Manual triggers
-/// only; an automatic compaction has no typed line to record.
+/// The `/compact` line as the transcript records it — falls before the new
+/// boundary, so the model never sees it; the summary carries the
+/// instructions instead. Manual triggers only.
 pub fn command_message(instructions: &str) -> Message {
     let text = if instructions.is_empty() {
         "/compact".to_string()
@@ -129,8 +117,8 @@ pub fn command_message(instructions: &str) -> Message {
 }
 
 /// The summary, which is also the new boundary: it records `cutoff` — the
-/// last message it covers — so a later [`message_view::model_view`] call
-/// knows what this summary does and does not protect.
+/// last message it covers — so a later [`message_view::model_view`] knows
+/// what it does and doesn't protect.
 pub fn summary_message(cutoff: MessageId, trigger: Trigger, summary: &str) -> Message {
     let content = match trigger {
         Trigger::Manual { instructions } if !instructions.is_empty() => {
@@ -151,9 +139,8 @@ pub fn summary_message(cutoff: MessageId, trigger: Trigger, summary: &str) -> Me
     )
 }
 
-/// What is recorded when no summary could be produced. It is *not* a boundary
-/// and it is transcript-only (no role), so the model view is untouched — the
-/// transcript keeps it as an honest account of why nothing happened.
+/// Recorded when no summary could be produced. Not a boundary, and
+/// transcript-only (no role), so the model view is untouched.
 pub fn failure_message(reason: &str) -> Message {
     custom(
         COMPACTION_FAILED_KIND,

@@ -466,8 +466,7 @@ pub struct ModelProfile<P> {
     /// provider default untouched; `Some("off")` turns thinking off.
     pub reasoning_effort: Option<String>,
     /// The token count at which the root thread automatically compacts
-    /// context mid-turn. Already resolved to a concrete value by the caller —
-    /// this type carries no default policy of its own.
+    /// context mid-turn. Already resolved by the caller — no default here.
     pub auto_compact_threshold_tokens: u32,
 }
 
@@ -617,8 +616,7 @@ impl Agent {
     }
 
     /// The most recent recorded token usage on this thread, read without
-    /// cloning the transcript — the cheap check to run before deciding
-    /// whether [`Agent::history`]'s full clone is worth paying for.
+    /// cloning the transcript.
     pub async fn last_usage(&self) -> Option<CompletionUsage> {
         let state = self.state.lock().await;
         state

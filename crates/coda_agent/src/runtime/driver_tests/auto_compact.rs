@@ -82,11 +82,9 @@ async fn wait_for_root_answer(harness: &mut Harness<MemoryStorage>, expected: &s
     .expect("timed out waiting for the root to answer");
 }
 
-/// The flagship scenario: a long-running "second" turn crosses the threshold
-/// mid-flight (after its first tool call), auto-compacts the *previous* turn
-/// while leaving everything the current turn already produced untouched, and
-/// does not compact a second time even though usage stays over threshold for
-/// the rest of the turn.
+/// A "second" turn crosses the threshold mid-flight, auto-compacts the
+/// *previous* turn while leaving the current turn untouched, and does not
+/// compact again even though usage stays over threshold.
 #[tokio::test]
 async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
@@ -165,11 +163,10 @@ async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() 
     );
 }
 
-/// Auto-compaction never runs on a sub-agent thread. `explore` is invoked
-/// once per root turn and is itself stateful, so its own history carries two
-/// turn tags by its second invocation — a legal compaction target if the
-/// root-thread guard were missing, since its second invocation goes over
-/// threshold too.
+/// Auto-compaction never runs on a sub-agent thread. `explore` is stateful and
+/// invoked once per root turn, so its history carries two turn tags by its
+/// second (also over-threshold) invocation — a legal target without the
+/// root-thread guard.
 #[tokio::test]
 async fn auto_compaction_never_runs_on_a_subagent_thread() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
@@ -211,9 +208,8 @@ async fn auto_compaction_never_runs_on_a_subagent_thread() {
     );
 }
 
-/// A failed attempt does not move the boundary, so the next over-threshold
-/// check in the same turn retries against the same target rather than being
-/// permanently suppressed.
+/// A failed attempt doesn't move the boundary, so the next over-threshold
+/// check in the same turn retries against the same target.
 #[tokio::test]
 async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -261,13 +257,11 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
     );
 }
 
-/// A compaction can succeed and then the *real* generation right after it —
-/// the one it made room for — can still fail on its own (a provider error,
-/// unrelated to the compaction). The turn ends on that error, not on the
-/// compaction. A later turn must not re-attempt the compaction (the summary
-/// is already that turn's last message, so `compaction::cutoff` sees nothing
-/// new) and must build its request from the already-compacted view rather
-/// than the stale, over-threshold one the failed turn saw.
+/// A compaction can succeed and then the generation it made room for can
+/// still fail on its own (a provider error, unrelated to the compaction). A
+/// later turn must not re-attempt the compaction (`compaction::cutoff` sees
+/// nothing new) and must build its request from the compacted view, not the
+/// stale one the failed turn saw.
 #[tokio::test]
 async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
@@ -307,10 +301,7 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
     wait_for_root_answer(&mut harness, "third done").await;
     harness.shutdown().await;
 
-    // Turn 3 sees the compacted view, not the raw pre-compaction history —
-    // the failed generation's own request (never captured here) would have
-    // been the one built from the full, over-threshold history; this one,
-    // built after the compaction that already happened, must not repeat it.
+    // Turn 3 sees the compacted view, not the raw pre-compaction history.
     let sent = format!("{third_request:?}");
     assert!(
         sent.contains("gist of the earlier turn"),

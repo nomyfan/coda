@@ -388,9 +388,9 @@ impl ToolSpec for CancelAwareToolSpec {
 pub(super) struct TestProvider {
     hold_subagent: Option<Arc<Notify>>,
     hold_generation: Option<Arc<Notify>>,
-    /// When set and `true`, the next compaction request fails instead of
-    /// returning a summary, and the flag flips back to `false` — so a test
-    /// can script exactly one failure before later attempts succeed.
+    /// When `true`, the next compaction request fails and the flag flips
+    /// back to `false` — scripts exactly one failure before later attempts
+    /// succeed.
     fail_next_compaction: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -475,8 +475,8 @@ impl LLMProvider for TestProvider {
             })
             .unwrap_or_default();
 
-        // An auto- or manual-compaction request, not a turn: its system
-        // message is the compaction prompt, not one of the scripts below.
+        // A compaction request, not a turn: its system message is the
+        // compaction prompt.
         if system_prompt.starts_with("You are compacting") {
             if let Some(flag) = &self.fail_next_compaction
                 && flag.swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -492,15 +492,9 @@ impl LLMProvider for TestProvider {
         }
 
         match system_prompt {
-            // Answers "first" directly (no tool call, low usage), then on
-            // "second" makes two tool calls in sequence — each over threshold
-            // — before answering. This gives a test three `Generation` entries
-            // in the "second" turn to check auto-compaction against: the one
-            // before the first tool call (still low usage, from "first"), the
-            // one after it (over threshold — the compaction attempt), and the
-            // one after the second (over threshold again — where a repeat or a
-            // retry, depending on whether the first attempt succeeded, would
-            // show up).
+            // Answers "first" directly (low usage), then on "second" makes
+            // two over-threshold tool calls before answering — giving a test
+            // three `Generation` entries to check auto-compaction against.
             "auto-compact-main" => match last_user(&request.messages) {
                 Some("first") => Self::completed(AssistantMessage {
                     content: "first done".into(),
@@ -549,11 +543,9 @@ impl LLMProvider for TestProvider {
                 other => panic!("unexpected user state: {other:?}"),
             },
             // Like "auto-compact-main", but the generation right after the
-            // compaction attempt fails outright (no partial message, unlike
-            // an abort) — so a test can drive the turn to an error ending and
-            // then send a fresh task, to check that the next turn's own
-            // auto-compaction check does not repeat what already succeeded,
-            // and that its request is built from the compacted view.
+            // compaction attempt fails outright, so a test can check that the
+            // next turn's auto-compaction check doesn't repeat what already
+            // succeeded.
             "auto-compact-fail-then-continue-main" => match last_user(&request.messages) {
                 Some("first") => Self::completed(AssistantMessage {
                     content: "first done".into(),
@@ -591,11 +583,8 @@ impl LLMProvider for TestProvider {
                 other => panic!("unexpected user state: {other:?}"),
             },
             // A root that delegates once per turn to a stateful "explore",
-            // which itself goes over threshold on its second invocation
-            // (spanning the root's first and second turns) — proving
-            // auto-compaction never fires on a non-root thread, since without
-            // that guard `explore`'s own turn-1-tagged messages would be a
-            // legal compaction target for its turn-2 work.
+            // which itself goes over threshold on its second invocation —
+            // proves auto-compaction never fires on a non-root thread.
             "auto-compact-subagent-main" => match last_user(&request.messages) {
                 Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
                     Self::completed(AssistantMessage {
@@ -1104,8 +1093,7 @@ pub(super) fn test_config(
             temperature: None,
             max_completion_tokens: None,
             reasoning_effort: None,
-            // Effectively disabled: only the auto-compaction tests need this
-            // low, and they build their own profile for it.
+            // Effectively disabled; auto-compaction tests build their own.
             auto_compact_threshold_tokens: u32::MAX,
         },
         agent_models: HashMap::new(),
@@ -1166,8 +1154,7 @@ where
     }
 
     /// Like [`Self::start_agents`], but for a test that needs to shape the
-    /// `RunConfig` itself — an auto-compaction threshold, say — rather than
-    /// just the provider and approval mode `test_config` already covers.
+    /// `RunConfig` itself (an auto-compaction threshold, say).
     pub(super) async fn start_with_config(
         storage: S,
         agents: HashMap<String, Agent>,

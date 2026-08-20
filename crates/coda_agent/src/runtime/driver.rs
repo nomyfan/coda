@@ -39,11 +39,9 @@ const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// How long an auto-compaction's summarization call waits on its provider —
-/// mirrors `SUMMARY_TIMEOUT` in the manual path
-/// (`app/coda_server/src/bin/server.rs`). Unlike the main generation call,
-/// this step is silent and raced only against user-initiated cancellation, so
-/// without a bound a hung provider would stall the turn forever with no
-/// visible cue for the user to cancel it.
+/// mirrors `SUMMARY_TIMEOUT` in the manual path. Unlike the main generation
+/// call this step is silent, so without a bound a hung provider would stall
+/// the turn with no visible cue to cancel it.
 const AUTO_COMPACT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the root waits for a cancelled turn's sub-agents to answer before
@@ -1229,22 +1227,18 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     /// Checked once per entry into [`ResumePoint::Generation`], root thread
     /// only. Compares the last recorded usage against the profile's
     /// threshold; on exceed, asks [`compaction::cutoff`] whether there's
-    /// anything new to summarize — protecting this thread's current turn —
-    /// and, if so, runs the summarization request before the next LLM request
-    /// goes out. Appends the resulting message the same way any other
-    /// mid-turn message is appended; nothing about it is announced as an
-    /// event.
+    /// anything new to summarize — protecting the current turn — and if so
+    /// runs the summarization request before the next LLM call. The result is
+    /// appended silently, like any other mid-turn message.
     ///
-    /// On failure, appends only a failure record: no boundary moves and
-    /// nothing is recorded to suppress a later attempt in this same turn — a
-    /// later over-threshold check will try again, since `cutoff` only ever
-    /// refuses once something has actually moved the boundary.
+    /// On failure, appends only a failure record — no boundary moves, so a
+    /// later over-threshold check in the same turn retries.
     async fn maybe_auto_compact(&mut self) {
         if !self.runtime.is_root_thread(&self.thread_id) {
             return;
         }
-        // Cheap check first: avoids `Agent::history`'s full transcript clone
-        // on the overwhelmingly common case of usage nowhere near threshold.
+        // Cheap check first: avoids `Agent::history`'s full clone when usage
+        // is nowhere near threshold, the overwhelmingly common case.
         let Some(usage) = self.agent.last_usage().await else {
             return;
         };
@@ -1288,8 +1282,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         self.agent.add_message(message).await;
     }
 
-    /// One provider round-trip turning `request` into a summary, with no
-    /// intermediate chunks announced — a compaction is silent by design.
+    /// One provider round-trip turning `request` into a summary; no
+    /// intermediate chunks are announced.
     async fn summarize(&self, request: ChatCompletionRequest) -> Result<String, String> {
         let mut stream = std::pin::pin!(self.config.profile.provider.stream(request));
         while let Some(event) = stream.next().await {

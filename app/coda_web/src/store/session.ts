@@ -510,11 +510,8 @@ function messageIdOf(message: HistoryMessage): string {
 }
 
 /** Mirrors the backend's `message_view::last_summary`: a recorded `cutoff`
- * names where a compaction summary's coverage actually ends, which can differ
- * from the summary's own physical position for a mid-turn compaction — some
- * of the current turn's own messages can sit between the two. Falls back to
- * the summary's own index (today's behavior) when no `cutoff` is recorded,
- * e.g. an already-persisted legacy summary. */
+ * can differ from the summary's physical position for a mid-turn compaction.
+ * Falls back to the summary's own index when no `cutoff` is recorded. */
 function resolveCutoffIdx(messages: HistoryMessage[], summaryIdx: number, cutoff?: string): number {
   if (cutoff) {
     for (let index = summaryIdx - 1; index >= 0; index -= 1) {

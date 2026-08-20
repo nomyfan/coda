@@ -78,8 +78,8 @@ fn the_transcript_carries_calls_and_their_results() {
     assert!(text.contains("[database]"));
 }
 
-/// The request is one instruction over a record, not a conversation — so it
-/// carries no tools, and nothing in it can be an orphan tool result.
+/// One instruction over a record, not a conversation — no tools, no orphan
+/// tool results.
 #[test]
 fn the_summary_request_replays_nothing() {
     let request = summary_request(
@@ -154,8 +154,8 @@ fn a_bare_compact_adds_no_instruction_framing() {
     assert_eq!(summary.cutoff, Some(cutoff_id));
 }
 
-/// An automatic trigger has no typed instructions, but still says (to a human
-/// reading the transcript) that nobody asked for it.
+/// An automatic trigger has no typed instructions, but still says nobody
+/// asked for it.
 #[test]
 fn an_automatic_compaction_notes_it_was_not_requested() {
     let cutoff_id = MessageId::new();
@@ -167,9 +167,8 @@ fn an_automatic_compaction_notes_it_was_not_requested() {
     assert_eq!(summary.cutoff, Some(cutoff_id));
 }
 
-/// A failure is recorded but must not become a boundary, or a compaction that
-/// did not happen would hide the conversation anyway. It is transcript-only
-/// (no role), so the model view never pays for it.
+/// A failure is recorded but must not become a boundary, and is
+/// transcript-only (no role).
 #[test]
 fn a_failure_is_not_a_summary() {
     let Message::Custom(failure) = failure_message("the provider timed out") else {
@@ -212,8 +211,7 @@ fn a_protected_turn_with_a_predecessor_targets_the_predecessors_last_message() {
     );
 }
 
-/// A turn with no predecessor — the thread's very first turn — has nothing
-/// before it a protecting compaction is allowed to touch.
+/// The thread's very first turn has no predecessor to compact.
 #[test]
 fn a_protected_turn_with_no_predecessor_has_nothing_to_compact() {
     let only_turn = TurnId::from(MessageId::new());
@@ -221,8 +219,8 @@ fn a_protected_turn_with_no_predecessor_has_nothing_to_compact() {
     assert_eq!(cutoff(&history, Some(only_turn)), None);
 }
 
-/// Nothing has happened since the last compaction, so compacting again would
-/// only summarize the summary — `cutoff` refuses rather than doing that.
+/// Nothing has happened since the last compaction — `cutoff` refuses rather
+/// than summarizing the summary.
 #[test]
 fn a_target_at_or_before_the_existing_boundary_is_nothing_new() {
     let root = user("root");
@@ -236,10 +234,9 @@ fn a_target_at_or_before_the_existing_boundary_is_nothing_new() {
     assert_eq!(cutoff(&history, None), None);
 }
 
-/// Once a compaction has succeeded past the boundary a protected turn targets,
-/// the same turn cannot compact again — `protect` pins the target to the same
-/// message for as long as the turn is current, and that message now falls at
-/// or before the existing boundary.
+/// Once a compaction succeeds past the boundary a protected turn targets, the
+/// same turn can't compact again — its target now falls at or before the
+/// existing boundary.
 #[test]
 fn a_turn_compacts_at_most_once() {
     let previous_turn = TurnId::from(MessageId::new());
@@ -258,14 +255,11 @@ fn a_turn_compacts_at_most_once() {
     assert_eq!(cutoff(&history, Some(current_turn)), None);
 }
 
-/// Reproduces the manual `/compact` commit shape end to end: `cutoff` is
-/// computed before `command` exists, then `command` and the summary are
-/// appended together in one commit, physically landing `command` between
-/// `cutoff`'s target and the summary. The summary must still record a
-/// boundary that excludes `command` — the model was never meant to see the
-/// raw "/compact ..." line — which only holds if the recorded `cutoff` is
-/// `command`'s own id, not the pre-command target `compaction::cutoff`
-/// returned.
+/// Reproduces the manual `/compact` commit shape: `cutoff` is computed before
+/// `command` exists, then both are appended together, landing `command`
+/// between `cutoff`'s target and the summary. The recorded boundary must
+/// still exclude `command`, which only holds if it's `command`'s own id, not
+/// the pre-command target `compaction::cutoff` returned.
 #[test]
 fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
     let history = vec![user("old")];
@@ -299,9 +293,8 @@ fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
     );
 }
 
-/// A failed attempt does not move the boundary — it isn't `COMPACTION_KIND` —
-/// so the next detection point in the same turn targets the same message
-/// again rather than being permanently suppressed.
+/// A failed attempt isn't `COMPACTION_KIND`, so it doesn't move the boundary
+/// — the next check in the same turn retries the same target.
 #[test]
 fn a_failed_attempt_does_not_suppress_a_later_retry() {
     let previous_turn = TurnId::from(MessageId::new());

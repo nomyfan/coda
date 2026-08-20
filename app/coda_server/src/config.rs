@@ -40,8 +40,7 @@ impl From<std::io::Error> for ConfigError {
 /// accepts text, and `image` additionally enables image attachments.
 /// `auto_compact_threshold` is the token count at which a session on this
 /// model automatically compacts context mid-conversation; `None` means the
-/// caller should default to 80% of `context_window` — this type only carries
-/// what was configured, not the resolved default.
+/// caller defaults to 80% of `context_window`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub id: String,
@@ -371,8 +370,8 @@ fn parse_auto_compact_threshold(
     )
 }
 
-/// A positive integer field that must not exceed `context_window` — the
-/// shape both `max_completion_tokens` and `auto_compact_threshold` share.
+/// A positive integer that must not exceed `context_window` — the shape
+/// `max_completion_tokens` and `auto_compact_threshold` share.
 fn parse_bounded_token_field(
     model: &toml_edit::InlineTable,
     provider_id: &str,
