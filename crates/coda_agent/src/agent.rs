@@ -300,6 +300,9 @@ pub enum AgentEvent {
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
+    /// An auto-compaction has begun. Live-only cue, like `LLMStart` — nothing
+    /// is persisted until `Custom` reports the outcome.
+    CompactionStart,
     /// A message appended outside the normal flow — today, only an
     /// auto-compaction summary or failure record.
     Custom(CustomMessage),

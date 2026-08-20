@@ -361,6 +361,11 @@ function reasoningLiveKey(agentName: string, threadId: string) {
   return `reasoning:${liveKey(agentName, threadId)}`;
 }
 
+/** An in-flight auto-compaction, under its own live key for the same reason. */
+function compactionLiveKey(agentName: string, threadId: string) {
+  return `compaction:${liveKey(agentName, threadId)}`;
+}
+
 function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): OpenedSession {
   return {
     ...session,
@@ -781,6 +786,24 @@ function finishLiveEntry(
   return { ...session, entries };
 }
 
+/** Drop the pending compaction shimmer, if any: `compaction_start` has no
+ * paired terminal event on this path (an aborted summarize call returns with
+ * nothing to report), so `aborted` is what clears it instead. */
+function discardCompactionLiveEntry(
+  session: OpenedSession,
+  agentName: string,
+  threadId: string,
+): OpenedSession {
+  const key = compactionLiveKey(agentName, threadId);
+  if (!session.entries.some((entry) => entry.liveKey === key)) {
+    return session;
+  }
+  return {
+    ...session,
+    entries: session.entries.filter((entry) => entry.liveKey !== key),
+  };
+}
+
 function finishAssistant(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "llm_end" }>,
@@ -945,13 +968,45 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           detail: subAgentDisplayName(event.message.name),
         }),
       };
+    case "compaction_start":
+      // Only the root thread's own compaction belongs in the transcript — a
+      // sub-agent's is invisible there today, same as its checkpoint never
+      // reaching the root's snapshot (`fold_settled_turn`, server-side).
+      if (event.agent_name !== rootName) {
+        return session;
+      }
+      return {
+        ...session,
+        entries: [
+          ...session.entries,
+          {
+            id: newId("compaction"),
+            kind: "compaction",
+            agentName: event.agent_name,
+            threadId: event.thread_id,
+            content: "",
+            status: "compacting",
+            liveKey: compactionLiveKey(event.agent_name, event.thread_id),
+          },
+        ],
+      };
     case "custom": {
+      if (event.agent_name !== rootName) {
+        return session;
+      }
       const failed = event.message.kind === "compaction_failed";
+      const [finished] = historyToEntries({ Custom: event.message }, {}, {});
+      const key = compactionLiveKey(event.agent_name, event.thread_id);
+      const index = session.entries.findIndex((entry) => entry.liveKey === key);
+      // Replace the pending shimmer entry in place when its `compaction_start`
+      // was seen; otherwise append fresh (e.g. that event was chunk-tier and
+      // got dropped under log pressure).
+      const entries =
+        index >= 0
+          ? session.entries.map((entry, i) => (i === index ? finished : entry))
+          : [...session.entries, ...(finished ? [finished] : [])];
       return addActivity(
-        {
-          ...session,
-          entries: [...session.entries, ...historyToEntries({ Custom: event.message }, {}, {})],
-        },
+        { ...session, entries },
         {
           tone: failed ? "warning" : "neutral",
           label: failed ? "compaction failed" : "context compacted",
@@ -972,8 +1027,12 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
       };
     case "aborted": {
       const updated = addActivity(
-        finishLiveEntry(
-          finishReasoning(session, event.agent_name, event.thread_id),
+        discardCompactionLiveEntry(
+          finishLiveEntry(
+            finishReasoning(session, event.agent_name, event.thread_id),
+            event.agent_name,
+            event.thread_id,
+          ),
           event.agent_name,
           event.thread_id,
         ),

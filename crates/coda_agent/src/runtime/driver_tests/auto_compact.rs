@@ -163,6 +163,43 @@ async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() 
     );
 }
 
+/// A live client sees `CompactionStart` before the summary/failure it
+/// precedes — the cue an attached UI shows something is happening, rather
+/// than the result just appearing.
+#[tokio::test]
+async fn auto_compaction_emits_a_start_event_before_the_result() {
+    let config = config_with_threshold(TestProvider::default(), 1_000);
+    let agents = AgentTeam::new(coda_spec("auto-compact-main", vec![]), vec![])
+        .expect("valid team")
+        .build(".", coda_tools::shared_file_locks());
+    let mut harness =
+        Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
+    wait_for_root_answer(&mut harness, "first done").await;
+
+    harness.send_task("second").await;
+    timeout(Duration::from_secs(2), async {
+        let mut saw_start = false;
+        loop {
+            let (agent_name, _, event) = harness.next_event().await;
+            if agent_name != "coda" {
+                continue;
+            }
+            match event {
+                AgentEvent::CompactionStart => saw_start = true,
+                AgentEvent::Custom(_) => {
+                    assert!(saw_start, "the start event should precede the result");
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the compaction events");
+    wait_for_root_answer(&mut harness, "second done").await;
+    harness.shutdown().await;
+}
+
 /// Auto-compaction runs on a sub-agent thread exactly the same way it runs on
 /// the root: `explore` is stateful and invoked once per root turn, so its own
 /// history carries two turn tags by its second invocation — its second

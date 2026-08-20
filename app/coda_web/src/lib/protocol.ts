@@ -450,6 +450,12 @@ export type WireEvent =
       thread_id: string;
       message: ToolMessage;
     }
+  /** An auto-compaction has begun. Live-only, like `tool_start`. */
+  | {
+      type: "compaction_start";
+      agent_name: string;
+      thread_id: string;
+    }
   /** An auto-compaction summary or failure record. */
   | {
       type: "custom";

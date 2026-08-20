@@ -46,6 +46,12 @@ pub enum WireEvent {
         thread_id: String,
         message: ToolMessage,
     },
+    /// An auto-compaction has begun. Live-only, like `tool_start`.
+    #[serde(rename = "compaction_start")]
+    CompactionStart {
+        agent_name: String,
+        thread_id: String,
+    },
     /// An auto-compaction summary or failure record.
     #[serde(rename = "custom")]
     Custom {
@@ -138,6 +144,10 @@ impl WireEvent {
                 agent_name,
                 thread_id,
                 message,
+            },
+            AgentEvent::CompactionStart => WireEvent::CompactionStart {
+                agent_name,
+                thread_id,
             },
             AgentEvent::Custom(message) => WireEvent::Custom {
                 agent_name,

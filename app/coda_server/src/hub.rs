@@ -490,6 +490,7 @@ fn is_chunk_tier(event: &WireEvent) -> bool {
             | WireEvent::LlmContentChunk { .. }
             | WireEvent::LlmReasoningChunk { .. }
             | WireEvent::ToolCallStart { .. }
+            | WireEvent::CompactionStart { .. }
     )
 }
 

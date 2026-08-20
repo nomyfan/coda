@@ -1247,6 +1247,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let Some(cutoff_id) = compaction::cutoff(&history, Some(current_turn)) else {
             return;
         };
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                self.thread_id.clone(),
+                self.turn,
+                AgentEvent::CompactionStart,
+            )
+            .await;
         let cutoff_idx = compaction::resolve_cutoff_idx(&history, cutoff_id);
         let request = compaction::summary_request(
             self.config.profile.model.clone(),
