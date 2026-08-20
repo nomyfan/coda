@@ -1276,7 +1276,19 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 compaction::failure_message(&reason)
             }
         };
+        let Message::Custom(custom) = message.clone() else {
+            unreachable!("compaction messages are always Message::Custom")
+        };
         self.agent.add_message(message).await;
+        // Lets the hub fold this into the live snapshot at turn settle.
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                self.thread_id.clone(),
+                self.turn,
+                AgentEvent::Custom(custom),
+            )
+            .await;
     }
 
     /// One provider round-trip turning `request` into a summary; no

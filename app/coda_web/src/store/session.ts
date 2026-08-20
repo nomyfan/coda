@@ -945,6 +945,20 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           detail: subAgentDisplayName(event.message.name),
         }),
       };
+    case "custom": {
+      const failed = event.message.kind === "compaction_failed";
+      return addActivity(
+        {
+          ...session,
+          entries: [...session.entries, ...historyToEntries({ Custom: event.message }, {}, {})],
+        },
+        {
+          tone: failed ? "warning" : "neutral",
+          label: failed ? "compaction failed" : "context compacted",
+          detail: event.agent_name,
+        },
+      );
+    }
     case "suspended":
       return {
         ...addActivity(session, {

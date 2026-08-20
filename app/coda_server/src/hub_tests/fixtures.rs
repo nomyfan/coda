@@ -10,8 +10,8 @@ use coda_agent::{
     AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ThreadId, ToolApprovalMode,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CustomMessage, CustomRole, LLMProvider,
-    LLMStreamEvent, RequestMessage, StreamError, ToolCall,
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, CustomMessage, CustomRole,
+    LLMProvider, LLMStreamEvent, RequestMessage, StreamError, ToolCall,
 };
 use coda_tools::ReadTodosToolSpec;
 use futures::{Stream, StreamExt, stream};
@@ -47,6 +47,10 @@ impl LLMProvider for TestProvider {
                 _ => None,
             })
             .unwrap_or_default();
+        // A compaction request, not a turn: system message is the compaction prompt.
+        if system.starts_with("You are compacting") {
+            return Self::completed(assistant("gist of the earlier turn"));
+        }
         match system.as_str() {
             "reply" => Self::completed(assistant("done")),
             "hold" => {
@@ -136,6 +140,50 @@ impl LLMProvider for TestProvider {
                         arguments: Some("{}".into()),
                     }];
                     Self::completed(msg)
+                }
+            }
+            // Turn 2 crosses threshold after its own tool call, compacting turn 1.
+            "auto-compact" => {
+                let user_count = request
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, RequestMessage::User(_)))
+                    .count();
+                let has_tool_result = request
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, RequestMessage::Tool(_)));
+                match (user_count, has_tool_result) {
+                    (1, _) => {
+                        let mut msg = assistant("first done");
+                        msg.usage = Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        });
+                        Self::completed(msg)
+                    }
+                    (2, false) => {
+                        let mut msg = assistant("");
+                        msg.tool_calls = vec![ToolCall {
+                            id: "call_1".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }];
+                        msg.usage = Some(CompletionUsage {
+                            total_tokens: 5_000,
+                            ..Default::default()
+                        });
+                        Self::completed(msg)
+                    }
+                    (2, true) => {
+                        let mut msg = assistant("second done");
+                        msg.usage = Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        });
+                        Self::completed(msg)
+                    }
+                    other => panic!("unexpected auto-compact request shape: {other:?}"),
                 }
             }
             // Like "approval", but blocks before returning the tool call, so a
@@ -303,16 +351,20 @@ pub(super) struct TestOpener {
     /// Notified as soon as `mark_unseen_outcome` is entered, before it waits
     /// on `mark_unseen_gate` — a rendezvous point for tests.
     pub(super) mark_unseen_entered: Arc<Notify>,
+    /// Effectively disabled by default; lowered by tests that need it.
+    pub(super) auto_compact_threshold_tokens: u32,
 }
 
 impl TestOpener {
     pub(super) fn new(system_prompt: &str, approval: ToolApprovalMode) -> Self {
-        let tools: Vec<Box<dyn coda_tools::ToolSpec>> =
-            if matches!(system_prompt, "approval" | "approval_hold" | "runaway") {
-                vec![Box::new(ReadTodosToolSpec)]
-            } else {
-                vec![]
-            };
+        let tools: Vec<Box<dyn coda_tools::ToolSpec>> = if matches!(
+            system_prompt,
+            "approval" | "approval_hold" | "runaway" | "auto-compact"
+        ) {
+            vec![Box::new(ReadTodosToolSpec)]
+        } else {
+            vec![]
+        };
         Self::with_team(
             AgentTeam::new(
                 AgentSpec {
@@ -384,6 +436,7 @@ impl TestOpener {
             unseen_outcomes: Arc::new(std::sync::Mutex::new(Vec::new())),
             mark_unseen_gate: None,
             mark_unseen_entered: Arc::new(Notify::new()),
+            auto_compact_threshold_tokens: u32::MAX,
         }
     }
 }
@@ -423,9 +476,7 @@ impl SessionOpener for TestOpener {
                         temperature: None,
                         max_completion_tokens: None,
                         reasoning_effort: None,
-                        // Effectively disabled: these tests exercise hub
-                        // command gating, not auto-compaction.
-                        auto_compact_threshold_tokens: u32::MAX,
+                        auto_compact_threshold_tokens: self.auto_compact_threshold_tokens,
                     },
                     agent_models: HashMap::new(),
                     tool_approval: self.approval.clone(),

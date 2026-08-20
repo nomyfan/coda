@@ -450,6 +450,13 @@ export type WireEvent =
       thread_id: string;
       message: ToolMessage;
     }
+  /** An auto-compaction summary or failure record. */
+  | {
+      type: "custom";
+      agent_name: string;
+      thread_id: string;
+      message: CustomMessage;
+    }
   | {
       type: "suspended";
       agent_name: string;

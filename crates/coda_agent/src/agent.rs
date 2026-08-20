@@ -6,9 +6,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionUsage, Message, MessageId, RequestMessage,
-    SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId,
-    UserMessage,
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, CustomMessage, Message, MessageId,
+    RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage,
+    ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 
@@ -300,6 +300,9 @@ pub enum AgentEvent {
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
+    /// A message appended outside the normal flow — today, only an
+    /// auto-compaction summary or failure record.
+    Custom(CustomMessage),
     /// Emitted when tool calls require human approval. The agent thread exits
     /// after this event. The caller should shut down the session, collect
     /// decisions, and open a new session with `resume_decisions` to continue.
