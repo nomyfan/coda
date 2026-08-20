@@ -1,4 +1,4 @@
-import { CircleStop, CornerDownLeft, ImagePlus, LoaderCircle, Pencil, X } from "lucide-react";
+import { CircleStop, CornerDownLeft, ImagePlus, Pencil, X } from "lucide-react";
 import { LayoutGroup, motion } from "motion/react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -498,11 +498,9 @@ export const Composer = memo(function Composer({
               mentionOpen && highlightedIndex >= 0 ? mentionOptionId(highlightedIndex) : undefined
             }
             placeholder={
-              compacting
-                ? "Compacting context…"
-                : evicted
-                  ? "Session opened in another window — take over to continue"
-                  : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
+              evicted
+                ? "Session opened in another window — take over to continue"
+                : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
             }
             className={[
               "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
@@ -580,17 +578,6 @@ export const Composer = memo(function Composer({
                   title="Abort"
                 >
                   <CircleStop />
-                </Button>
-              ) : compacting ? (
-                <Button
-                  size="icon"
-                  variant="secondary"
-                  className="size-8 rounded-md"
-                  type="button"
-                  disabled
-                  title="Compacting context"
-                >
-                  <LoaderCircle className="animate-spin" />
                 </Button>
               ) : (
                 <Button

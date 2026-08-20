@@ -1533,6 +1533,20 @@ export function applySnapshotToSession(
       isPendingCompactionEntry(entry) &&
       (snapshot.compacting === true || !recordedTexts.has(entry.content)),
   );
+  // The composer no longer shows its own "compacting" indicator; this
+  // transcript entry carries that state instead, then gives way to the real
+  // "Context compacted" entry `historyToEntries` produces once it lands.
+  const pendingCompactionStatus: TranscriptEntry[] = snapshot.compacting
+    ? [
+        {
+          id: "compaction-pending",
+          kind: "compaction",
+          status: "compacting",
+          content: "",
+          startedAt: new Date().toISOString(),
+        },
+      ]
+    : [];
   return {
     ...session,
     // Rebuilt, not merged: the snapshot is the whole history, so a span it
@@ -1562,6 +1576,7 @@ export function applySnapshotToSession(
       ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById, spansById)),
       ...pending,
       ...pendingCompaction,
+      ...pendingCompactionStatus,
     ],
     drafts: {},
     allowDrafts: {},

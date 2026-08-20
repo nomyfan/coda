@@ -332,6 +332,7 @@ test("the start-of-compaction snapshot keeps the optimistic line without running
       pendingCompact: true,
       content: "/compact keep decisions",
     }),
+    expect.objectContaining({ id: "compaction-pending", kind: "compaction", status: "compacting" }),
   ]);
 });
 
@@ -379,6 +380,7 @@ test("a repeated /compact line stays optimistic until its compaction finishes", 
       pendingCompact: true,
       content: "/compact keep decisions",
     }),
+    expect.objectContaining({ id: "compaction-pending", kind: "compaction", status: "compacting" }),
   ]);
 });
 

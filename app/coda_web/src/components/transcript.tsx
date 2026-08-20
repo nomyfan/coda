@@ -1149,6 +1149,15 @@ const TranscriptItem = memo(function TranscriptItem({
   }
 
   if (entry.kind === "compaction") {
+    if (entry.status === "compacting") {
+      return (
+        <div className="flex items-center gap-3 py-2 text-muted-foreground">
+          <div className="h-px flex-1 bg-border" />
+          <span className="shrink-0 px-2 text-xs text-shimmer">Compacting context…</span>
+          <div className="h-px flex-1 bg-border" />
+        </div>
+      );
+    }
     return (
       <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
         <div className="flex items-center gap-3 py-2 text-muted-foreground">
