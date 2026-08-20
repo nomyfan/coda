@@ -38,6 +38,9 @@ impl From<std::io::Error> for ConfigError {
 /// an empty list means the UI shows no reasoning controls for it.
 /// `input_modalities` lists the input kinds the model accepts; every model
 /// accepts text, and `image` additionally enables image attachments.
+/// `auto_compact_threshold` is the token count at which a session on this
+/// model automatically compacts context mid-conversation; `None` means the
+/// caller defaults to 80% of `context_window`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub id: String,
@@ -47,6 +50,7 @@ pub struct ModelConfig {
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
     pub input_modalities: Vec<Modality>,
+    pub auto_compact_threshold: Option<u32>,
 }
 
 /// A configured LLM provider with one or more models. `api_key`, `base_url`,
@@ -319,6 +323,8 @@ fn parse_models(
         let input_modalities = parse_model_input_modalities(table, provider_id, &id)?;
         let max_completion_tokens =
             parse_max_completion_tokens(table, provider_id, &id, context_window)?;
+        let auto_compact_threshold =
+            parse_auto_compact_threshold(table, provider_id, &id, context_window)?;
         models.push(ModelConfig {
             id,
             name,
@@ -327,6 +333,7 @@ fn parse_models(
             reasoning_efforts,
             default_reasoning_effort,
             input_modalities,
+            auto_compact_threshold,
         });
     }
 
@@ -339,24 +346,57 @@ fn parse_max_completion_tokens(
     model_name: &str,
     context_window: u32,
 ) -> Result<Option<u32>, ConfigError> {
-    let Some(value) = model.get("max_completion_tokens") else {
+    parse_bounded_token_field(
+        model,
+        provider_id,
+        model_name,
+        context_window,
+        "max_completion_tokens",
+    )
+}
+
+fn parse_auto_compact_threshold(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+    context_window: u32,
+) -> Result<Option<u32>, ConfigError> {
+    parse_bounded_token_field(
+        model,
+        provider_id,
+        model_name,
+        context_window,
+        "auto_compact_threshold",
+    )
+}
+
+/// A positive integer that must not exceed `context_window` — the shape
+/// `max_completion_tokens` and `auto_compact_threshold` share.
+fn parse_bounded_token_field(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+    context_window: u32,
+    field_name: &str,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = model.get(field_name) else {
         return Ok(None);
     };
-    let max_completion_tokens = value
+    let parsed = value
         .as_integer()
         .filter(|value| *value > 0)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| {
             ConfigError::Parse(format!(
-                "provider '{provider_id}' model '{model_name}' max_completion_tokens must be a positive integer"
+                "provider '{provider_id}' model '{model_name}' {field_name} must be a positive integer"
             ))
         })?;
-    if max_completion_tokens > context_window {
+    if parsed > context_window {
         return Err(ConfigError::Parse(format!(
-            "provider '{provider_id}' model '{model_name}' max_completion_tokens ({max_completion_tokens}) must not exceed context_window ({context_window})"
+            "provider '{provider_id}' model '{model_name}' {field_name} ({parsed}) must not exceed context_window ({context_window})"
         )));
     }
-    Ok(Some(max_completion_tokens))
+    Ok(Some(parsed))
 }
 
 fn parse_model_reasoning_efforts(

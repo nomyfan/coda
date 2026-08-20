@@ -6,8 +6,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, MessageId, RequestMessage, SystemMessage,
-    ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, CustomMessage, Message, MessageId,
+    RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage,
+    ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 
@@ -299,6 +300,12 @@ pub enum AgentEvent {
     LLMEnd(AssistantMessage),
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
+    /// An auto-compaction has begun. Live-only cue, like `LLMStart` — nothing
+    /// is persisted until `Custom` reports the outcome.
+    CompactionStart,
+    /// A message appended outside the normal flow — today, only an
+    /// auto-compaction summary or failure record.
+    Custom(CustomMessage),
     /// Emitted when tool calls require human approval. The agent thread exits
     /// after this event. The caller should shut down the session, collect
     /// decisions, and open a new session with `resume_decisions` to continue.
@@ -464,6 +471,9 @@ pub struct ModelProfile<P> {
     /// Reasoning effort sent on each generation request. `None` leaves the
     /// provider default untouched; `Some("off")` turns thinking off.
     pub reasoning_effort: Option<String>,
+    /// The token count at which the root thread automatically compacts
+    /// context mid-turn. Already resolved by the caller — no default here.
+    pub auto_compact_threshold_tokens: u32,
 }
 
 impl<P: Clone> Clone for ModelProfile<P> {
@@ -475,6 +485,7 @@ impl<P: Clone> Clone for ModelProfile<P> {
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
             reasoning_effort: self.reasoning_effort.clone(),
+            auto_compact_threshold_tokens: self.auto_compact_threshold_tokens,
         }
     }
 }
@@ -608,6 +619,20 @@ impl Agent {
     /// Returns conversation history without the system prompt (suitable for checkpointing).
     pub async fn history(&self) -> Vec<HistoryEntry> {
         self.state.lock().await.messages.clone()
+    }
+
+    /// The most recent recorded token usage on this thread, read without
+    /// cloning the transcript.
+    pub async fn last_usage(&self) -> Option<CompletionUsage> {
+        let state = self.state.lock().await;
+        state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.message {
+                Message::Assistant(assistant) => assistant.usage.clone(),
+                _ => None,
+            })
     }
 
     /// Restore a stored thread's conversation and anchored tool state, replacing

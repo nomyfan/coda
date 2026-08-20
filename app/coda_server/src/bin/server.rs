@@ -8,9 +8,11 @@ use clap::Parser;
 use coda_agent::HistoryEntry;
 use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
-    runtime::SessionStorage,
+    compaction, runtime::SessionStorage,
 };
-use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
+use coda_core::llm::{
+    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId, Modality, TurnId,
+};
 use coda_openai::OpenAICompatible;
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
@@ -22,7 +24,7 @@ use coda_server::{
         resolve_agent_workspace,
     },
     ask_user::AskUserToolSpec,
-    build_workspace_custom_instructions, compaction,
+    build_workspace_custom_instructions,
     config::{
         KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
         load_server_config,
@@ -115,6 +117,10 @@ struct ProviderHandle {
     model_name: String,
     context_window: u32,
     max_completion_tokens: Option<u32>,
+    /// The token count at which a session on this model auto-compacts:
+    /// `ModelConfig::auto_compact_threshold` when configured, otherwise 80%
+    /// of `context_window`.
+    auto_compact_threshold_tokens: u32,
     /// The configured provider's id.
     provider_id: String,
     /// Effort levels surfaced to the dashboard so it can render reasoning controls.
@@ -250,20 +256,21 @@ impl AppOpener {
         provider_id: &str,
         reasoning_effort: Option<&str>,
         history: &[HistoryEntry],
+        cutoff_id: MessageId,
         instructions: &str,
     ) -> Result<String, String> {
         let handle = self
             .providers
             .get(provider_id)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+        let cutoff_idx = compaction::resolve_cutoff_idx(history, cutoff_id);
         let request = compaction::summary_request(
             handle.model_id.clone(),
             handle.max_completion_tokens,
             reasoning_effort.map(str::to_string),
-            // The same rule the runtime slices by, so the summary covers
-            // exactly what the model can currently see: everything since the
-            // last compaction, that summary included.
-            coda_agent::message_view::model_view(history),
+            // Truncated at `cutoff_id`: nothing this compaction protects
+            // reaches the summarizer.
+            coda_agent::message_view::model_view(&history[..=cutoff_idx]),
             instructions,
         );
 
@@ -359,9 +366,10 @@ impl SessionOpener for AppOpener {
                 .await
                 .map_err(CompactError::Storage)?
                 .ok_or(CompactError::Empty)?;
-            if checkpoint.messages.is_empty() {
+            // `None` covers both an empty thread and "nothing new to compact".
+            let Some(cutoff_id) = compaction::cutoff(&checkpoint.messages, None) else {
                 return Err(CompactError::Empty);
-            }
+            };
 
             // Read before the round-trip and handed back to the commit, where
             // it is the compare-and-swap that catches the thread having grown
@@ -372,13 +380,24 @@ impl SessionOpener for AppOpener {
                     provider_id,
                     reasoning_effort,
                     &checkpoint.messages,
+                    cutoff_id,
                     instructions,
                 )
                 .await;
 
             let command = compaction::command_message(instructions);
             let (outcome, applied) = match &summary {
-                Ok(summary) => (compaction::summary_message(instructions, summary), true),
+                Ok(summary) => (
+                    // Covers through `command`, not `cutoff_id`: `command`
+                    // lands between them in this same commit, so the model
+                    // must never see the raw "/compact ..." line.
+                    compaction::summary_message(
+                        command.message_id(),
+                        compaction::Trigger::Manual { instructions },
+                        summary,
+                    ),
+                    true,
+                ),
                 Err(reason) => {
                     warn!(workspace_id = %key.0, session_id = %key.1, "could not summarize: {reason}");
                     (compaction::failure_message(reason), false)
@@ -512,6 +531,7 @@ async fn open_session(
         temperature: None,
         max_completion_tokens: provider.max_completion_tokens,
         reasoning_effort,
+        auto_compact_threshold_tokens: provider.auto_compact_threshold_tokens,
     };
     // Sub-agents with a configured `model` run on their own provider/model. The
     // selections were validated against the catalog at startup, so every lookup
@@ -530,6 +550,7 @@ async fn open_session(
                 temperature: None,
                 max_completion_tokens: handle.max_completion_tokens,
                 reasoning_effort: selection.reasoning_effort.clone(),
+                auto_compact_threshold_tokens: handle.auto_compact_threshold_tokens,
             };
             (name.clone(), profile)
         })
@@ -2277,6 +2298,11 @@ async fn main() {
                     model_name: m.name,
                     context_window: m.context_window,
                     max_completion_tokens: m.max_completion_tokens,
+                    // `u64` intermediate avoids overflow before `/ 5` brings
+                    // it back into `u32` range.
+                    auto_compact_threshold_tokens: m
+                        .auto_compact_threshold
+                        .unwrap_or((u64::from(m.context_window) * 4 / 5) as u32),
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                     default_reasoning_effort: m.default_reasoning_effort,

@@ -168,6 +168,84 @@ fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
         .collect()
 }
 
+/// Mid-turn auto-compaction appends a `Custom` message straight to the
+/// driver's history, outside the hub's `compact` command — it only reaches
+/// the live snapshot if it also travels the event pipeline. Without that, a
+/// client that never disconnects would never see it.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_compaction_reaches_the_live_snapshot_without_a_reattach() {
+    let mut opener = TestOpener::new("auto-compact", ToolApprovalMode::Auto);
+    opener.auto_compact_threshold_tokens = 1_000;
+    let storage = opener.storage.clone();
+    let hub = SessionHub::new(Arc::new(opener), RelayConfig::default());
+
+    let attach = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            }
+        )
+        .await,
+        CommandOutcome::TaskAccepted { .. }
+    ));
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: "go".into(),
+                images: vec![],
+            }
+        )
+        .await,
+        CommandOutcome::TaskAccepted { .. }
+    ));
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    // The live snapshot as an already-attached client would see it: no
+    // reattach, no takeover, no reload from storage.
+    let snapshot = with_live(&hub, |live| live.snapshot.clone()).await;
+
+    hub.shutdown_all().await;
+    let persisted = storage
+        .load_checkpoint(&key().1)
+        .await
+        .expect("load checkpoint")
+        .expect("root thread checkpoint was written")
+        .messages
+        .into_iter()
+        .map(|entry| entry.message)
+        .collect::<Vec<_>>();
+
+    assert!(
+        ids_by_role(&persisted)
+            .iter()
+            .any(|(role, _)| *role == "custom"),
+        "the scripted second turn should have crossed the auto-compact \
+         threshold: {:?}",
+        ids_by_role(&persisted)
+    );
+    assert_eq!(ids_by_role(&snapshot), ids_by_role(&persisted));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn midturn_attach_replays_chunks_and_evicts_previous() {
     let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);

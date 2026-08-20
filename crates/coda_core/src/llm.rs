@@ -485,6 +485,12 @@ pub struct CustomMessage {
     pub role: Option<CustomRole>,
     pub content: String,
     pub created_at: jiff::Timestamp,
+    /// For a compaction summary: the last message this summary covers. `None`
+    /// for every other kind, and for a summary written before this field
+    /// existed — the model view falls back to that summary's own position in
+    /// that case, which is what it always meant before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutoff: Option<MessageId>,
 }
 
 /// What a [`CustomMessage`] becomes on its way to the provider.

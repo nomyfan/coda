@@ -444,6 +444,7 @@ fn fake_profile() -> ModelProfile<FakeProvider> {
         temperature: None,
         max_completion_tokens: None,
         reasoning_effort: None,
+        auto_compact_threshold_tokens: u32::MAX,
     }
 }
 

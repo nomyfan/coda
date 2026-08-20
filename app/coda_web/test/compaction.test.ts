@@ -8,6 +8,7 @@ import {
   codaStore,
   compactActiveSession,
   deleteSession,
+  reduceEvent,
   type OpenedSession,
 } from "../src/store/session.ts";
 
@@ -332,6 +333,7 @@ test("the start-of-compaction snapshot keeps the optimistic line without running
       pendingCompact: true,
       content: "/compact keep decisions",
     }),
+    expect.objectContaining({ id: "compaction-pending", kind: "compaction", status: "compacting" }),
   ]);
 });
 
@@ -379,6 +381,7 @@ test("a repeated /compact line stays optimistic until its compaction finishes", 
       pendingCompact: true,
       content: "/compact keep decisions",
     }),
+    expect.objectContaining({ id: "compaction-pending", kind: "compaction", status: "compacting" }),
   ]);
 });
 
@@ -559,4 +562,64 @@ test("a /compact user message cannot be pulled back into the composer", () => {
     state.activeServer = undefined;
     state.activeKey = undefined;
   });
+});
+
+test("compaction_start shows a pending shimmer entry that custom replaces in place", () => {
+  const started = reduceEvent(session(), {
+    type: "compaction_start",
+    agent_name: "coda",
+    thread_id: "s1",
+  });
+  expect(started.entries).toHaveLength(1);
+  expect(started.entries[0]).toMatchObject({ kind: "compaction", status: "compacting" });
+
+  const finished = reduceEvent(started, {
+    type: "custom",
+    agent_name: "coda",
+    thread_id: "s1",
+    message: {
+      message_id: "summary-1",
+      kind: "compaction",
+      role: "User",
+      content: "the gist",
+      created_at: "2026-08-16T00:00:00Z",
+    },
+  });
+  // Same position, not appended alongside the shimmer.
+  expect(finished.entries).toHaveLength(1);
+  expect(finished.entries[0]).toMatchObject({
+    id: "compaction:summary-1",
+    kind: "compaction",
+    content: "the gist",
+  });
+  expect(finished.entries[0].status).toBeUndefined();
+});
+
+test("a sub-agent's compaction never reaches the transcript", () => {
+  const started = reduceEvent(session(), {
+    type: "compaction_start",
+    agent_name: "explore",
+    thread_id: "child-thread",
+  });
+  expect(started.entries).toEqual([]);
+});
+
+// Reproduces the P2 finding: the summarize call was cancelled mid-flight, so
+// nothing ever reports what `compaction_start` began — `aborted` is the only
+// event left to clear the shimmer, or it would sit in the transcript forever.
+test("an abort after compaction_start clears the pending shimmer", () => {
+  const started = reduceEvent(session(), {
+    type: "compaction_start",
+    agent_name: "coda",
+    thread_id: "s1",
+  });
+  expect(started.entries).toHaveLength(1);
+
+  const aborted = reduceEvent(started, {
+    type: "aborted",
+    agent_name: "coda",
+    thread_id: "s1",
+    target: { reason: "generation" },
+  });
+  expect(aborted.entries.some((entry) => entry.kind === "compaction")).toBe(false);
 });

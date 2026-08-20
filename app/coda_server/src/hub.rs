@@ -490,6 +490,7 @@ fn is_chunk_tier(event: &WireEvent) -> bool {
             | WireEvent::LlmContentChunk { .. }
             | WireEvent::LlmReasoningChunk { .. }
             | WireEvent::ToolCallStart { .. }
+            | WireEvent::CompactionStart { .. }
     )
 }
 
@@ -550,7 +551,7 @@ impl EventLog {
 /// 1. Leading root `ToolCallEnd`s — stale-envelope cleanups or resume
 ///    resolutions, which the driver writes *before* the user message.
 /// 2. The turn's user message (`unsettled_user_message`; absent for resumed turns).
-/// 3. The remaining root `LlmEnd`/`ToolCallEnd` messages, in order.
+/// 3. The remaining root `LlmEnd`/`ToolCallEnd`/`Custom` messages, in order.
 ///
 /// Sub-agent events and chunk-tier events are skipped (matching what the
 /// checkpoint history holds). The log is cleared afterwards. Returns whether a
@@ -594,6 +595,11 @@ fn fold_settled_turn(
                 message,
                 ..
             } if agent_name == root_name => snapshot.push(Message::Tool(message.clone())),
+            WireEvent::Custom {
+                agent_name,
+                message,
+                ..
+            } if agent_name == root_name => snapshot.push(Message::Custom(message.clone())),
             _ => {}
         }
     }

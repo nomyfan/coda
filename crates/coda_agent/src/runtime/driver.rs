@@ -24,6 +24,7 @@ use crate::{
         AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget,
         ResumePoint, ToolExecutionState,
     },
+    compaction, message_view,
     persist::StoredCheckpoint,
     runtime::AgentRuntime,
 };
@@ -36,6 +37,12 @@ use crate::{
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long an auto-compaction's summarization call waits on its provider —
+/// mirrors `SUMMARY_TIMEOUT` in the manual path. Unlike the main generation
+/// call this step is silent, so without a bound a hung provider would stall
+/// the turn with no visible cue to cancel it.
+const AUTO_COMPACT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the root waits for a cancelled turn's sub-agents to answer before
 /// giving up on them.
@@ -624,18 +631,21 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
             let current = std::mem::take(&mut resume_point);
             match current {
-                ResumePoint::Generation => match self.handle_generation().await {
-                    AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
-                        suspended_at = jiff::Timestamp::now();
-                        resume_point = rp;
+                ResumePoint::Generation => {
+                    self.maybe_auto_compact().await;
+                    match self.handle_generation().await {
+                        AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
+                            suspended_at = jiff::Timestamp::now();
+                            resume_point = rp;
+                        }
+                        AgentLoopState::Next(rp) => resume_point = rp,
+                        AgentLoopState::Done(rp, end) => {
+                            resume_point = rp;
+                            owed = *end;
+                            break;
+                        }
                     }
-                    AgentLoopState::Next(rp) => resume_point = rp,
-                    AgentLoopState::Done(rp, end) => {
-                        resume_point = rp;
-                        owed = *end;
-                        break;
-                    }
-                },
+                }
                 ResumePoint::ToolExecution(tool_execution_state) => {
                     match self.handle_tool_execution(tool_execution_state).await {
                         AgentLoopState::Next(rp @ ResumePoint::ToolExecution(_)) => {
@@ -1212,6 +1222,100 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 }
             }
         }
+    }
+
+    /// Checked once per entry into [`ResumePoint::Generation`], on every
+    /// thread. Compares the last recorded usage against the profile's
+    /// threshold; on exceed, asks [`compaction::cutoff`] whether there's
+    /// anything new to summarize — protecting the current turn — and if so
+    /// runs the summarization request before the next LLM call. The result is
+    /// appended silently, like any other mid-turn message.
+    ///
+    /// On failure, appends only a failure record — no boundary moves, so a
+    /// later over-threshold check in the same turn retries.
+    async fn maybe_auto_compact(&mut self) {
+        // Cheap check first: avoids `Agent::history`'s full clone when usage
+        // is nowhere near threshold, the overwhelmingly common case.
+        let Some(usage) = self.agent.last_usage().await else {
+            return;
+        };
+        if usage.total_tokens < self.config.profile.auto_compact_threshold_tokens {
+            return;
+        }
+        let history = self.agent.history().await;
+        let current_turn = self.thread_turn().await;
+        let Some(cutoff_id) = compaction::cutoff(&history, Some(current_turn)) else {
+            return;
+        };
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                self.thread_id.clone(),
+                self.turn,
+                AgentEvent::CompactionStart,
+            )
+            .await;
+        let cutoff_idx = compaction::resolve_cutoff_idx(&history, cutoff_id);
+        let request = compaction::summary_request(
+            self.config.profile.model.clone(),
+            self.config.profile.max_completion_tokens,
+            self.config.profile.reasoning_effort.clone(),
+            message_view::model_view(&history[..=cutoff_idx]),
+            "",
+        );
+
+        let outcome = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return,
+            outcome = tokio::time::timeout(AUTO_COMPACT_SUMMARY_TIMEOUT, self.summarize(request)) => {
+                outcome.unwrap_or_else(|_| {
+                    Err(format!(
+                        "the provider did not answer within {AUTO_COMPACT_SUMMARY_TIMEOUT:?}"
+                    ))
+                })
+            }
+        };
+        let message = match outcome {
+            Ok(summary) => {
+                compaction::summary_message(cutoff_id, compaction::Trigger::Auto, &summary)
+            }
+            Err(reason) => {
+                warn!(thread_id = %self.thread_id.as_ref(), "auto-compaction failed: {reason}");
+                compaction::failure_message(&reason)
+            }
+        };
+        let Message::Custom(custom) = message.clone() else {
+            unreachable!("compaction messages are always Message::Custom")
+        };
+        self.agent.add_message(message).await;
+        // Lets the hub fold this into the live snapshot at turn settle.
+        self.runtime
+            .emit_event(
+                self.agent.name.clone(),
+                self.thread_id.clone(),
+                self.turn,
+                AgentEvent::Custom(custom),
+            )
+            .await;
+    }
+
+    /// One provider round-trip turning `request` into a summary; no
+    /// intermediate chunks are announced.
+    async fn summarize(&self, request: ChatCompletionRequest) -> Result<String, String> {
+        let mut stream = std::pin::pin!(self.config.profile.provider.stream(request));
+        while let Some(event) = stream.next().await {
+            match event.map_err(|err| err.to_string())? {
+                LLMStreamEvent::Completed(message) => {
+                    return if message.content.trim().is_empty() {
+                        Err("the provider returned an empty summary".to_string())
+                    } else {
+                        Ok(message.content.clone())
+                    };
+                }
+                LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+            }
+        }
+        Err("the provider closed the stream without a summary".to_string())
     }
 
     async fn handle_generation(&mut self) -> AgentLoopState {

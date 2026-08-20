@@ -86,6 +86,10 @@ export type CustomMessage = {
   role: "User" | "Assistant" | null;
   content: string;
   created_at: string;
+  /** For a `kind: "compaction"` summary: the id of the last message it
+   * covers. Omitted (not `null`) on the wire when absent — a summary written
+   * before this field existed, or any other `kind`. */
+  cutoff?: string;
 };
 
 export type HistoryMessage =
@@ -445,6 +449,19 @@ export type WireEvent =
       agent_name: string;
       thread_id: string;
       message: ToolMessage;
+    }
+  /** An auto-compaction has begun. Live-only, like `tool_start`. */
+  | {
+      type: "compaction_start";
+      agent_name: string;
+      thread_id: string;
+    }
+  /** An auto-compaction summary or failure record. */
+  | {
+      type: "custom";
+      agent_name: string;
+      thread_id: string;
+      message: CustomMessage;
     }
   | {
       type: "suspended";

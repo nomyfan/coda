@@ -361,6 +361,11 @@ function reasoningLiveKey(agentName: string, threadId: string) {
   return `reasoning:${liveKey(agentName, threadId)}`;
 }
 
+/** An in-flight auto-compaction, under its own live key for the same reason. */
+function compactionLiveKey(agentName: string, threadId: string) {
+  return `compaction:${liveKey(agentName, threadId)}`;
+}
+
 function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): OpenedSession {
   return {
     ...session,
@@ -502,12 +507,33 @@ function historyToEntries(
   return [];
 }
 
+function messageIdOf(message: HistoryMessage): string {
+  if ("User" in message) return message.User.message_id;
+  if ("Assistant" in message) return message.Assistant.message_id;
+  if ("Tool" in message) return message.Tool.message_id;
+  return message.Custom.message_id;
+}
+
+/** Mirrors the backend's `message_view::last_summary`: a recorded `cutoff`
+ * can differ from the summary's physical position for a mid-turn compaction.
+ * Falls back to the summary's own index when no `cutoff` is recorded. */
+function resolveCutoffIdx(messages: HistoryMessage[], summaryIdx: number, cutoff?: string): number {
+  if (cutoff) {
+    for (let index = summaryIdx - 1; index >= 0; index -= 1) {
+      if (messageIdOf(messages[index]) === cutoff) {
+        return index + 1;
+      }
+    }
+  }
+  return summaryIdx + 1;
+}
+
 function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
   let boundary = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if ("Custom" in message && message.Custom.kind === "compaction") {
-      boundary = index + 1;
+      boundary = resolveCutoffIdx(messages, index, message.Custom.cutoff);
       break;
     }
   }
@@ -760,6 +786,24 @@ function finishLiveEntry(
   return { ...session, entries };
 }
 
+/** Drop the pending compaction shimmer, if any: `compaction_start` has no
+ * paired terminal event on this path (an aborted summarize call returns with
+ * nothing to report), so `aborted` is what clears it instead. */
+function discardCompactionLiveEntry(
+  session: OpenedSession,
+  agentName: string,
+  threadId: string,
+): OpenedSession {
+  const key = compactionLiveKey(agentName, threadId);
+  if (!session.entries.some((entry) => entry.liveKey === key)) {
+    return session;
+  }
+  return {
+    ...session,
+    entries: session.entries.filter((entry) => entry.liveKey !== key),
+  };
+}
+
 function finishAssistant(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "llm_end" }>,
@@ -924,6 +968,52 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           detail: subAgentDisplayName(event.message.name),
         }),
       };
+    case "compaction_start":
+      // Only the root thread's own compaction belongs in the transcript — a
+      // sub-agent's is invisible there today, same as its checkpoint never
+      // reaching the root's snapshot (`fold_settled_turn`, server-side).
+      if (event.agent_name !== rootName) {
+        return session;
+      }
+      return {
+        ...session,
+        entries: [
+          ...session.entries,
+          {
+            id: newId("compaction"),
+            kind: "compaction",
+            agentName: event.agent_name,
+            threadId: event.thread_id,
+            content: "",
+            status: "compacting",
+            liveKey: compactionLiveKey(event.agent_name, event.thread_id),
+          },
+        ],
+      };
+    case "custom": {
+      if (event.agent_name !== rootName) {
+        return session;
+      }
+      const failed = event.message.kind === "compaction_failed";
+      const [finished] = historyToEntries({ Custom: event.message }, {}, {});
+      const key = compactionLiveKey(event.agent_name, event.thread_id);
+      const index = session.entries.findIndex((entry) => entry.liveKey === key);
+      // Replace the pending shimmer entry in place when its `compaction_start`
+      // was seen; otherwise append fresh (e.g. that event was chunk-tier and
+      // got dropped under log pressure).
+      const entries =
+        index >= 0
+          ? session.entries.map((entry, i) => (i === index ? finished : entry))
+          : [...session.entries, ...(finished ? [finished] : [])];
+      return addActivity(
+        { ...session, entries },
+        {
+          tone: failed ? "warning" : "neutral",
+          label: failed ? "compaction failed" : "context compacted",
+          detail: event.agent_name,
+        },
+      );
+    }
     case "suspended":
       return {
         ...addActivity(session, {
@@ -937,8 +1027,12 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
       };
     case "aborted": {
       const updated = addActivity(
-        finishLiveEntry(
-          finishReasoning(session, event.agent_name, event.thread_id),
+        discardCompactionLiveEntry(
+          finishLiveEntry(
+            finishReasoning(session, event.agent_name, event.thread_id),
+            event.agent_name,
+            event.thread_id,
+          ),
           event.agent_name,
           event.thread_id,
         ),
@@ -1498,6 +1592,20 @@ export function applySnapshotToSession(
       isPendingCompactionEntry(entry) &&
       (snapshot.compacting === true || !recordedTexts.has(entry.content)),
   );
+  // The composer no longer shows its own "compacting" indicator; this
+  // transcript entry carries that state instead, then gives way to the real
+  // "Context compacted" entry `historyToEntries` produces once it lands.
+  const pendingCompactionStatus: TranscriptEntry[] = snapshot.compacting
+    ? [
+        {
+          id: "compaction-pending",
+          kind: "compaction",
+          status: "compacting",
+          content: "",
+          startedAt: new Date().toISOString(),
+        },
+      ]
+    : [];
   return {
     ...session,
     // Rebuilt, not merged: the snapshot is the whole history, so a span it
@@ -1527,6 +1635,7 @@ export function applySnapshotToSession(
       ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById, spansById)),
       ...pending,
       ...pendingCompaction,
+      ...pendingCompactionStatus,
     ],
     drafts: {},
     allowDrafts: {},
