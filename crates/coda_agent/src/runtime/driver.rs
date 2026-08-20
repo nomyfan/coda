@@ -632,8 +632,11 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             let current = std::mem::take(&mut resume_point);
             match current {
                 ResumePoint::Generation => {
-                    self.maybe_auto_compact().await;
-                    match self.handle_generation().await {
+                    let generation = match self.maybe_auto_compact().await {
+                        Ok(()) => self.handle_generation().await,
+                        Err(error) => self.generation_failed(error.to_string()),
+                    };
+                    match generation {
                         AgentLoopState::Next(rp @ ResumePoint::PendingApproval { .. }) => {
                             suspended_at = jiff::Timestamp::now();
                             resume_point = rp;
@@ -1225,27 +1228,39 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     }
 
     /// Checked once per entry into [`ResumePoint::Generation`], on every
-    /// thread. Compares the last recorded usage against the profile's
-    /// threshold; on exceed, asks [`compaction::cutoff`] whether there's
-    /// anything new to summarize — protecting the current turn — and if so
-    /// runs the summarization request before the next LLM call. The result is
-    /// appended silently, like any other mid-turn message.
+    /// thread. Once the last recorded usage reaches the profile's threshold,
+    /// asks [`compaction::cutoff`] for a complete turn boundary or, when the
+    /// current turn itself has grown too large, a complete tool-batch boundary.
+    /// A fresh task-opening user message remains protected until the agent has
+    /// made progress. The result is appended silently before the next LLM call.
     ///
     /// On failure, appends only a failure record — no boundary moves, so a
     /// later over-threshold check in the same turn retries.
-    async fn maybe_auto_compact(&mut self) {
+    async fn maybe_auto_compact(&mut self) -> Result<(), message_view::InvalidHistory> {
         // Cheap check first: avoids `Agent::history`'s full clone when usage
         // is nowhere near threshold, the overwhelmingly common case.
         let Some(usage) = self.agent.last_usage().await else {
-            return;
+            return Ok(());
         };
         if usage.total_tokens < self.config.profile.auto_compact_threshold_tokens {
-            return;
+            return Ok(());
         }
         let history = self.agent.history().await;
         let current_turn = self.thread_turn().await;
-        let Some(cutoff_id) = compaction::cutoff(&history, Some(current_turn)) else {
-            return;
+        let protect_from = message_view::model_view(&history)
+            .last()
+            .filter(|entry| {
+                entry.turn_id == current_turn && matches!(entry.message, Message::User(_))
+            })
+            .map(|entry| entry.message.message_id());
+        let Some(cutoff) = compaction::cutoff(
+            &history,
+            Some(current_turn),
+            protect_from,
+            Some(self.config.profile.auto_compact_threshold_tokens),
+        )?
+        else {
+            return Ok(());
         };
         self.runtime
             .emit_event(
@@ -1255,18 +1270,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 AgentEvent::CompactionStart,
             )
             .await;
-        let cutoff_idx = compaction::resolve_cutoff_idx(&history, cutoff_id);
         let request = compaction::summary_request(
             self.config.profile.model.clone(),
             self.config.profile.max_completion_tokens,
             self.config.profile.reasoning_effort.clone(),
-            message_view::model_view(&history[..=cutoff_idx]),
+            message_view::model_view(&history[..=cutoff.history_index]),
             "",
         );
 
         let outcome = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return,
+            _ = self.cancel.cancelled() => return Ok(()),
             outcome = tokio::time::timeout(AUTO_COMPACT_SUMMARY_TIMEOUT, self.summarize(request)) => {
                 outcome.unwrap_or_else(|_| {
                     Err(format!(
@@ -1277,7 +1291,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         };
         let message = match outcome {
             Ok(summary) => {
-                compaction::summary_message(cutoff_id, compaction::Trigger::Auto, &summary)
+                compaction::summary_message(cutoff.message_id, compaction::Trigger::Auto, &summary)
             }
             Err(reason) => {
                 warn!(thread_id = %self.thread_id.as_ref(), "auto-compaction failed: {reason}");
@@ -1297,6 +1311,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 AgentEvent::Custom(custom),
             )
             .await;
+        Ok(())
     }
 
     /// One provider round-trip turning `request` into a summary; no
@@ -1320,12 +1335,16 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 
     async fn handle_generation(&mut self) -> AgentLoopState {
         let thread_id = self.thread_id.clone();
+        let messages = match self.agent.messages().await {
+            Ok(messages) => messages,
+            Err(error) => return self.generation_failed(error.to_string()),
+        };
         let request = ChatCompletionRequest {
             model: self.config.profile.model.clone(),
             max_completion_tokens: self.config.profile.max_completion_tokens,
             temperature: self.config.profile.temperature,
             reasoning_effort: self.config.profile.reasoning_effort.clone(),
-            messages: self.agent.messages().await,
+            messages,
             tools: {
                 let mut tools = self.agent.tools.descriptors();
                 tools.extend(self.agent.subagents.descriptors());
@@ -1342,7 +1361,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             )
             .await;
 
-        let mut llm_stream = std::pin::pin!(self.config.profile.provider.stream(request));
+        let provider = self.config.profile.provider.clone();
+        let mut llm_stream = std::pin::pin!(provider.stream(request));
         let mut partial_content = String::new();
         let mut partial_reasoning = String::new();
         let mut reasoning_ended_at: Option<jiff::Timestamp> = None;
@@ -1417,14 +1437,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             }
             GenerationOutcome::Failed(err) => {
                 error!("LLM generation error: {}", err);
-                let target = self.reply_target.take();
-                // A sub-agent's failure travels as its reply; only a root agent,
-                // with nobody to answer, announces it as an event.
-                let event = target.is_none().then(|| AgentEvent::Error(err.clone()));
-                return AgentLoopState::Done(
-                    ResumePoint::Generation,
-                    Box::new(self.turn_end(target, event, ToolOutput::Err(err), false)),
-                );
+                return self.generation_failed(err);
             }
         };
 
@@ -1528,6 +1541,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 })
             }),
         }
+    }
+
+    fn generation_failed(&mut self, error: String) -> AgentLoopState {
+        let target = self.reply_target.take();
+        // A sub-agent's failure travels as its reply; only a root agent, with
+        // nobody to answer, announces it as an event.
+        let event = target.is_none().then(|| AgentEvent::Error(error.clone()));
+        AgentLoopState::Done(
+            ResumePoint::Generation,
+            Box::new(self.turn_end(target, event, ToolOutput::Err(error), false)),
+        )
     }
 
     async fn handle_tool_execution(

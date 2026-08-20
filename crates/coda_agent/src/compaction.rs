@@ -6,9 +6,9 @@
 //! instruction: summarize this record.
 //!
 //! [`cutoff`] is the one rule both manual (idle) and automatic (mid-turn)
-//! compaction use to decide what's new since the last one — manual passes
-//! `protect: None` (whole history is fair game), automatic passes the
-//! in-progress turn. Neither re-derives the answer, so they can't disagree.
+//! compaction use to decide what's new since the last one. Automatic
+//! compaction prefers a complete turn boundary, then falls back to a complete
+//! tool-batch boundary when the current turn itself has grown too large.
 
 use crate::agent::HistoryEntry;
 use crate::message_view::{self, COMPACTION_FAILED_KIND, COMPACTION_KIND};
@@ -16,6 +16,7 @@ use coda_core::llm::{
     ChatCompletionRequest, ContentPart, CustomMessage, CustomRole, Message, MessageId,
     RequestMessage, SystemMessage, ToolOutput, TurnId, UserMessage,
 };
+use std::collections::HashMap;
 
 static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 
@@ -23,40 +24,102 @@ static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 /// a composer, and small enough that it cannot crowd out the transcript.
 pub const MAX_INSTRUCTIONS: usize = 4096;
 
-/// What a compaction may summarize right now, or `None` when there is nothing
-/// new since the last one.
-///
-/// `protect` names the turn whose own messages must stay out of the summary
-/// (the in-progress turn, for a mid-turn/automatic compaction), or `None`
-/// when the whole history is fair game (idle/manual).
-///
-/// "Nothing new" covers an empty thread, a protected turn with no predecessor,
-/// or a target at/before the existing boundary. That last case is also why a
-/// turn compacts at most once: `protect` pins the target to the same message
-/// while the turn is current, so a successful compaction past it disqualifies
-/// the rest of the turn. A *failed* attempt doesn't move the boundary — it
-/// isn't [`COMPACTION_KIND`] — so a later check in the same turn retries.
-pub fn cutoff(messages: &[HistoryEntry], protect: Option<TurnId>) -> Option<MessageId> {
-    let target_idx = match protect {
-        None => messages.len().checked_sub(1)?,
-        Some(turn) => messages.iter().rposition(|entry| entry.turn_id != turn)?,
-    };
-    let boundary_idx = messages
-        .iter()
-        .rposition(|entry| message_view::is_compaction_summary(&entry.message));
-    if boundary_idx.is_some_and(|boundary_idx| target_idx <= boundary_idx) {
-        return None;
-    }
-    Some(messages[target_idx].message.message_id())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cutoff {
+    pub message_id: MessageId,
+    pub history_index: usize,
 }
 
-/// Resolves a [`cutoff`] result back to its index in the same slice it was
-/// read from.
-pub fn resolve_cutoff_idx(messages: &[HistoryEntry], cutoff_id: MessageId) -> usize {
-    messages
+/// Chooses what a compaction may summarize without leaving an invalid tool
+/// sequence behind. Automatic compaction prefers the boundary before
+/// `prefer_before_turn`, unless measured growth within that turn already
+/// reaches `auto_compact_threshold_tokens`; it then falls back to the newest
+/// safe boundary before `protect_from`. Manual compaction omits all three
+/// policy inputs.
+pub fn cutoff(
+    messages: &[HistoryEntry],
+    prefer_before_turn: Option<TurnId>,
+    protect_from: Option<MessageId>,
+    auto_compact_threshold_tokens: Option<u32>,
+) -> Result<Option<Cutoff>, message_view::InvalidHistory> {
+    let history_indices: HashMap<_, _> = messages
         .iter()
-        .position(|entry| entry.message.message_id() == cutoff_id)
-        .expect("cutoff always names a message id from the same slice it was read from")
+        .enumerate()
+        .map(|(index, entry)| (entry.message.message_id(), index))
+        .collect();
+    let visible: Vec<_> = message_view::model_view(messages)
+        .map(|entry| {
+            let index = history_indices[&entry.message.message_id()];
+            (index, entry)
+        })
+        .collect();
+    message_view::validate_messages(visible.iter().map(|(_, entry)| &entry.message))?;
+
+    let first_new = visible
+        .first()
+        .is_some_and(|(_, entry)| message_view::is_compaction_summary(&entry.message))
+        as usize;
+    let cutoff_at = |position: usize| {
+        let (history_index, entry) = visible[position];
+        Cutoff {
+            message_id: entry.message.message_id(),
+            history_index,
+        }
+    };
+    let leaves_valid_suffix = |position: usize| {
+        message_view::validate_messages(
+            visible[position + 1..]
+                .iter()
+                .map(|(_, entry)| &entry.message),
+        )
+        .is_ok()
+    };
+
+    if let Some(turn) = prefer_before_turn
+        && let Some(position) = visible.iter().rposition(|(_, entry)| entry.turn_id != turn)
+        && position >= first_new
+        && leaves_valid_suffix(position)
+    {
+        let retaining_turn_is_too_large = auto_compact_threshold_tokens
+            .zip(prompt_growth(&visible, turn))
+            .is_some_and(|(threshold, growth)| growth >= u64::from(threshold));
+        if !retaining_turn_is_too_large {
+            return Ok(Some(cutoff_at(position)));
+        }
+    }
+
+    let protected_position = protect_from.map(|message_id| {
+        visible
+            .iter()
+            .position(|(_, entry)| entry.message.message_id() == message_id)
+            .expect("protected messages come from the same model view")
+    });
+    let limit = protected_position.unwrap_or(visible.len());
+    for position in (first_new..limit).rev() {
+        if leaves_valid_suffix(position) {
+            return Ok(Some(cutoff_at(position)));
+        }
+    }
+    Ok(None)
+}
+
+fn prompt_growth(visible: &[(usize, &HistoryEntry)], turn: TurnId) -> Option<u64> {
+    let mut previous = None;
+    let mut growth = 0_u64;
+    for (_, entry) in visible {
+        if entry.turn_id != turn {
+            continue;
+        }
+        let Message::Assistant(assistant) = &entry.message else {
+            continue;
+        };
+        let prompt_tokens = assistant.usage.as_ref()?.prompt_tokens;
+        if let Some(previous) = previous {
+            growth = growth.checked_add(u64::from(prompt_tokens.checked_sub(previous)?))?;
+        }
+        previous = Some(prompt_tokens);
+    }
+    Some(growth)
 }
 
 /// What prompted a compaction — only the human-facing wrapper text differs;

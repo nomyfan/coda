@@ -5,11 +5,14 @@
 use super::super::*;
 use super::fixtures::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, RunConfig, SubAgentMode, ToolApprovalMode,
+    AgentEvent, AgentSpec, AgentTeam, RunConfig, StoredCheckpoint, SubAgentMode, ToolApprovalMode,
     agent::HistoryEntry,
-    runtime::{MemoryStorage, SessionStorage},
+    runtime::{MemoryStorage, SessionStorage, StoredResumePoint},
 };
-use coda_core::llm::Message;
+use coda_core::llm::{
+    CompletionUsage, Message, MessageId, ToolCall, ToolCallOutcome, ToolMessage, ToolOutput,
+    UserMessage,
+};
 use coda_tools::ReadTodosToolSpec;
 use std::sync::{
     Arc,
@@ -82,11 +85,145 @@ async fn wait_for_root_answer(harness: &mut Harness<MemoryStorage>, expected: &s
     .expect("timed out waiting for the root to answer");
 }
 
-/// A "second" turn crosses the threshold mid-flight, auto-compacts the
-/// *previous* turn while leaving the current turn untouched, and does not
-/// compact again even though usage stays over threshold.
 #[tokio::test]
-async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() {
+async fn a_first_turn_can_compact_after_its_completed_tool_batch() {
+    let config = config_with_threshold(TestProvider::default(), 1_000);
+    let agents = AgentTeam::new(coda_spec("auto-compact-first-turn-main", vec![]), vec![])
+        .expect("valid team")
+        .build(".", coda_tools::shared_file_locks());
+    let mut harness =
+        Harness::start_with_config(MemoryStorage::default(), agents, config, "only").await;
+    wait_for_root_answer(&mut harness, "only done").await;
+    harness.shutdown().await;
+
+    let history = harness
+        .storage
+        .load_checkpoint(harness.thread_id.as_ref())
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint exists")
+        .messages;
+    let result = history
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::Tool(tool) if tool.id == "call_first"))
+        .expect("first-turn tool result");
+    let summary = history
+        .iter()
+        .find_map(|entry| match &entry.message {
+            Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND => Some(custom),
+            _ => None,
+        })
+        .expect("first-turn compaction");
+    assert_eq!(summary.cutoff, Some(result.message.message_id()));
+    assert_eq!(
+        labels(message_view::model_view(&history)),
+        ["custom:compaction", "assistant:only done"]
+    );
+}
+
+fn malformed_history(usage: Option<CompletionUsage>) -> Vec<HistoryEntry> {
+    let turn = TurnId::from(MessageId::new());
+    let assistant = Message::Assistant(coda_core::llm::AssistantMessage {
+        tool_calls: vec![
+            ToolCall {
+                id: "finished".to_string(),
+                name: "read_todos".to_string(),
+                arguments: Some("{}".to_string()),
+            },
+            ToolCall {
+                id: "missing".to_string(),
+                name: "read_todos".to_string(),
+                arguments: Some("{}".to_string()),
+            },
+        ],
+        usage,
+        ..assistant()
+    });
+    vec![
+        HistoryEntry {
+            turn_id: turn,
+            message: Message::User(UserMessage::text(MessageId::new(), "old task")),
+        },
+        HistoryEntry {
+            turn_id: turn,
+            message: assistant,
+        },
+        HistoryEntry {
+            turn_id: turn,
+            message: Message::Tool(ToolMessage::new(
+                "finished",
+                "read_todos",
+                ToolOutput::Ok("done".to_string()),
+                ToolCallOutcome::Auto,
+                None,
+            )),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
+    for usage in [
+        None,
+        Some(CompletionUsage {
+            total_tokens: 100,
+            ..Default::default()
+        }),
+    ] {
+        let config = config_with_threshold(TestProvider::default(), 1_000);
+        let storage = MemoryStorage::default();
+        let thread_id = ThreadId::new();
+        storage
+            .save_checkpoint(
+                thread_id.as_ref().to_string(),
+                StoredCheckpoint {
+                    thread_id: thread_id.as_ref().to_string(),
+                    agent_name: "coda".to_string(),
+                    parent_thread_id: None,
+                    derivation_key: None,
+                    reply_target: None,
+                    messages: malformed_history(usage),
+                    state: vec![],
+                    resume_point: StoredResumePoint::Generation,
+                    suspended_at: jiff::Timestamp::default(),
+                },
+            )
+            .await
+            .expect("seed malformed checkpoint");
+        let agents = AgentTeam::new(coda_spec("main-system", vec![]), vec![])
+            .expect("valid team")
+            .build(".", coda_tools::shared_file_locks());
+        let mut harness =
+            Harness::start_with_config_at(storage, agents, config, thread_id, "new task").await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let (agent_name, _, event) = harness.next_event().await;
+                if agent_name != "coda" {
+                    continue;
+                }
+                match event {
+                    AgentEvent::LLMStart(request) => {
+                        panic!("malformed history reached the provider: {request:?}")
+                    }
+                    AgentEvent::Error(error) => {
+                        assert!(error.contains("missing results"), "{error}");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for invalid-history error");
+        harness.shutdown().await;
+    }
+}
+
+/// A "second" turn first compacts the previous turn, then uses an intra-turn
+/// boundary when its actual post-compaction usage remains over threshold.
+#[tokio::test]
+async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let agents = AgentTeam::new(coda_spec("auto-compact-main", vec![]), vec![])
         .expect("valid team")
@@ -113,8 +250,8 @@ async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() 
         .collect();
     assert_eq!(
         summaries.len(),
-        1,
-        "compaction should not repeat once it has succeeded for this turn: {:?}",
+        2,
+        "the second over-threshold check should compact new current-turn work: {:?}",
         labels(&history)
     );
     assert!(
@@ -132,32 +269,39 @@ async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() 
             |entry| matches!(&entry.message, Message::User(u) if u.first_text() == Some("second")),
         )
         .expect("turn 2's opening message");
-    let Message::Custom(summary) = &summaries[0].message else {
+    let Message::Custom(first_summary) = &summaries[0].message else {
         unreachable!("filtered to Custom above");
     };
     assert_eq!(
-        summary.cutoff,
+        first_summary.cutoff,
         Some(first_done.message.message_id()),
         "the summary should cover exactly through turn 1's last message"
     );
     assert_eq!(
         summaries[0].turn_id, second_user.turn_id,
         "the summary is appended during turn 2, so it carries turn 2's tag, \
-         even though its cutoff protects turn 2's own content"
+        even though its cutoff protects turn 2's own content"
     );
 
-    // The model's view leads with the summary, then shows every one of turn
-    // 2's own messages in original order — reordered ahead of nothing it
-    // wasn't already behind, and with none of them lost to the boundary.
+    let call_2_result = history
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::Tool(tool) if tool.id == "call_2"))
+        .expect("turn 2's second tool result");
+    let Message::Custom(second_summary) = &summaries[1].message else {
+        unreachable!("filtered to Custom above");
+    };
+    assert_eq!(
+        second_summary.cutoff,
+        Some(call_2_result.message.message_id()),
+        "the fallback should cover the latest complete tool batch"
+    );
+
+    // The second summary replaces all completed work; only the final answer
+    // produced after it remains raw.
     assert_eq!(
         labels(message_view::model_view(&history)),
         vec![
             "custom:compaction".to_string(),
-            "user:second".to_string(),
-            "assistant-calls:call_1".to_string(),
-            "tool:call_1".to_string(),
-            "assistant-calls:call_2".to_string(),
-            "tool:call_2".to_string(),
             "assistant:second done".to_string(),
         ]
     );
@@ -323,9 +467,8 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
 
 /// A compaction can succeed and then the generation it made room for can
 /// still fail on its own (a provider error, unrelated to the compaction). A
-/// later turn must not re-attempt the compaction (`compaction::cutoff` sees
-/// nothing new) and must build its request from the compacted view, not the
-/// stale one the failed turn saw.
+/// later turn compacts the failed turn's newly retained work, then builds its
+/// request from the newer compacted view rather than stale raw history.
 #[tokio::test]
 async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
@@ -390,8 +533,8 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
         .count();
     assert_eq!(
         summaries,
-        1,
-        "turn 3 must not have attempted a second compaction: {:?}",
+        2,
+        "turn 3 should compact the failed turn's work as a new prefix: {:?}",
         labels(&history)
     );
 }

@@ -492,6 +492,33 @@ impl LLMProvider for TestProvider {
         }
 
         match system_prompt {
+            "auto-compact-first-turn-main" => match last_user(&request.messages) {
+                Some("only") if tool_message(&request.messages, "call_first").is_none() => {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "call_first".into(),
+                            name: "read_todos".into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        usage: Some(CompletionUsage {
+                            total_tokens: 5_000,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                Some(summary) if summary.starts_with("[compacted automatically:") => {
+                    Self::completed(AssistantMessage {
+                        content: "only done".into(),
+                        usage: Some(CompletionUsage {
+                            total_tokens: 100,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
+                other => panic!("unexpected first-turn user state: {other:?}"),
+            },
             // Answers "first" directly (low usage), then on "second" makes
             // two over-threshold tool calls before answering — giving a test
             // three `Generation` entries to check auto-compaction against.
@@ -540,6 +567,16 @@ impl LLMProvider for TestProvider {
                     }),
                     ..assistant()
                 }),
+                Some(summary) if summary.starts_with("[compacted automatically:") => {
+                    Self::completed(AssistantMessage {
+                        content: "second done".into(),
+                        usage: Some(CompletionUsage {
+                            total_tokens: 200,
+                            ..Default::default()
+                        }),
+                        ..assistant()
+                    })
+                }
                 other => panic!("unexpected user state: {other:?}"),
             },
             // Like "auto-compact-main", but the generation right after the
@@ -1161,7 +1198,16 @@ where
         config: RunConfig<TestProvider>,
         initial_task: &str,
     ) -> Self {
-        let thread_id = ThreadId::new();
+        Self::start_with_config_at(storage, agents, config, ThreadId::new(), initial_task).await
+    }
+
+    pub(super) async fn start_with_config_at(
+        storage: S,
+        agents: HashMap<String, Agent>,
+        config: RunConfig<TestProvider>,
+        thread_id: ThreadId,
+        initial_task: &str,
+    ) -> Self {
         let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
         runtime
             .bootstrap(agents, None, HashMap::new(), config)

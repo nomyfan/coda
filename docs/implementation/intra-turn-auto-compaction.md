@@ -293,15 +293,15 @@ The cutoff planner derives transient state while scanning the current model view
 
 ## Implementation Roadmap
 
-- [ ] [risk validation] add a runtime test for a thread whose first turn crosses the threshold after a completed tool batch and must continue generating
+- [x] [risk validation] add a runtime test for a thread whose first turn crosses the threshold after a completed tool batch and must continue generating
       Purpose: reproduce the currently unhandled case and prove that resuming from a current-turn summary works
       Verification: the next request starts with the summary, contains no orphan tool result, and the same turn reaches its final answer
-- [ ] [core logic] add a shared model-view validator, then replace turn-only cutoff selection with a usage-assisted, turn-first safe-prefix planner, retained-suffix validation, and an explicit invalid-history result
+- [x] [core logic] add a shared model-view validator, then replace turn-only cutoff selection with a usage-assisted, turn-first safe-prefix planner, retained-suffix validation, and an explicit invalid-history result
       Purpose: preserve the existing preferred boundary while making message validity, provably insufficient turn retention, fallback, “nothing new”, and malformed history distinct and testable in isolation
       Verification: shared-validator tests cover valid single and parallel batches plus missing/duplicate/orphan/cross-batch tool results; planner tests cover preference for a previous turn, aggregation of adjacent assistant usage deltas, forced fallback when known batch growth reaches the threshold, missing/non-monotonic usage, reset across a summary, first-turn fallback, a fresh protected user message, candidate suffix validation, an existing summary, and repeated same-turn cutoffs
-- [ ] [integration] make provider request construction validate unconditionally, then make the driver supply the preferred current-turn boundary and protect only a task-opening user message from fallback
+- [x] [integration] make provider request construction validate unconditionally, then make the driver supply the preferred current-turn boundary and protect only a task-opening user message from fallback
       Purpose: enable intra-turn and repeated automatic compaction without discarding the current turn when an earlier boundary is useful
       Verification: runtime tests cover previous-turn preference, usage forcing an intra-turn cutoff, actual post-compaction usage causing a later fallback, first-turn compaction, a new turn retaining its raw opening task, two successful compactions in one long turn, and malformed histories with missing and below-threshold usage both ending before `LLMStart`
-- [ ] [regression] run the full Rust checks required by the workspace
+- [x] [regression] run the full Rust checks required by the workspace
       Purpose: catch request-shape, persistence, and runtime regressions
       Verification: `cargo clippy` and `cargo test` pass
