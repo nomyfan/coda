@@ -1224,8 +1224,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         }
     }
 
-    /// Checked once per entry into [`ResumePoint::Generation`], root thread
-    /// only. Compares the last recorded usage against the profile's
+    /// Checked once per entry into [`ResumePoint::Generation`], on every
+    /// thread. Compares the last recorded usage against the profile's
     /// threshold; on exceed, asks [`compaction::cutoff`] whether there's
     /// anything new to summarize — protecting the current turn — and if so
     /// runs the summarization request before the next LLM call. The result is
@@ -1234,9 +1234,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     /// On failure, appends only a failure record — no boundary moves, so a
     /// later over-threshold check in the same turn retries.
     async fn maybe_auto_compact(&mut self) {
-        if !self.runtime.is_root_thread(&self.thread_id) {
-            return;
-        }
         // Cheap check first: avoids `Agent::history`'s full clone when usage
         // is nowhere near threshold, the overwhelmingly common case.
         let Some(usage) = self.agent.last_usage().await else {

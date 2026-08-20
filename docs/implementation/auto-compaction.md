@@ -6,12 +6,12 @@ Trigger context compaction automatically when a model's token usage crosses a th
 
 **In**
 - A shared, crate-level (`coda_agent`) compaction-boundary rule that both the existing manual `/compact` (idle, storage-driven) and a new automatic trigger (mid-turn, live-agent-driven) call for exactly the same "what counts as new since the last compaction" decision.
-- The automatic trigger itself: checked on the root thread only, right before every LLM call, comparing the last known `CompletionUsage.total_tokens` against a per-model threshold.
+- The automatic trigger itself: checked on every thread (root and sub-agent alike), right before every LLM call, comparing the last known `CompletionUsage.total_tokens` against a per-model threshold.
 - A per-model `auto_compact_threshold` config field (`coda-server.toml`), defaulting to 80% of `context_window` when unset.
 - Extending the compaction summary message to carry an explicit cutoff, so a summary written mid-turn can protect the in-progress turn's own messages while still being appended (as it must be) after them.
 
 **Out**
-- Everything already out of scope per the requirement doc: an on/off toggle, custom auto-compaction prompts, handling a still-over-threshold turn after one compaction attempt, and sub-agent threads.
+- Everything already out of scope per the requirement doc: an on/off toggle, custom auto-compaction prompts, and handling a still-over-threshold turn after one compaction attempt.
 - Any change to the compaction summarization prompt itself (`compaction-prompt.md`) or to what the LLM is asked to do — only *which messages* it's asked to summarize, and *how the result is recorded*, change.
 - Web dashboard changes. The existing context-usage indicator keeps working via the same wire shape; see Risks for the one edge case this leaves unpolished.
 
@@ -46,7 +46,7 @@ Trigger context compaction automatically when a model's token usage crosses a th
 
 - **`coda_agent::compaction`** (new module, moved from `app/coda_server/src/compaction.rs`) — decides what a compaction may summarize and builds the messages that record it. Owns the one rule ("what's new since the last compaction, given what must stay protected") that both triggers call, so they can never disagree about a boundary.
 - **`coda_agent::message_view`** (extended) — the model's window onto a thread's history. Generalizes from "everything physically after the last compaction message" to "everything the last compaction message's recorded cutoff excludes", reordering so the summary always leads the view it belongs to regardless of where it was actually appended.
-- **`coda_agent::runtime::driver::AgentLoop`** (extended) — where the automatic trigger lives: a check inserted before every LLM call on the root thread, using data the loop already has (history, current turn, model profile).
+- **`coda_agent::runtime::driver::AgentLoop`** (extended) — where the automatic trigger lives: a check inserted before every LLM call on every thread, using data the loop already has (history, current turn, model profile — the latter two already resolved per-thread via `RunConfig::resolve`).
 - **`app/coda_server` config + session wiring** (extended) — resolves the per-model threshold from TOML (with the 80% default) once, and threads it down to `ModelProfile` alongside the fields it already carries.
 - **`app/coda_server::compaction`/`hub.rs`/`server.rs`** (thinned) — keeps only what's genuinely server-specific: reading the workspace's provider handle, the storage compare-and-swap commit, and the idle gate. Everything about *what to summarize* delegates to `coda_agent::compaction`.
 
@@ -107,7 +107,7 @@ pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEnt
 ```rust
 // coda_agent::runtime::driver::AgentLoop (private)
 
-/// Checked once per entry into `ResumePoint::Generation`, root thread only.
+/// Checked once per entry into `ResumePoint::Generation`, on every thread.
 /// Compares the last recorded usage — found by scanning `self.agent.history()`
 /// backward for the most recent `Message::Assistant` carrying `usage` — against
 /// the profile's threshold; on exceed, asks `compaction::cutoff` whether
@@ -173,3 +173,4 @@ Trust boundary: none newly introduced. The auto-compact threshold is operator-co
 - **Reversed (accepted, not load-bearing): the web dashboard's context-usage boundary.** Flagged in Risks as an accepted gap — `historyUsage()`'s backward scan used the compaction marker's physical position, which would misjudge the boundary after a mid-turn auto-compaction. Fixed instead of left as a gap: `session.ts` gained `resolveCutoffIdx`, a TS port of `message_view::last_summary`'s cutoff resolution (falls back to physical position when no `cutoff` is on the wire, same as the Rust side). Simpler than the Rust version since the frontend only needs a boundary index for a usage sum, not a reordered iterator.
 - **Added (minor, efficiency): `Agent::last_usage()`.** `maybe_auto_compact` originally called `Agent::history()` (a full clone of the thread's messages) before checking whether usage was even near threshold — paid on every `ResumePoint::Generation` entry regardless of outcome. `Agent::last_usage()` reads the last usage under the state lock without cloning the transcript; the full `history()` clone now only happens once usage is confirmed over threshold.
 - **Added (minor, robustness): a timeout on the auto-compaction summarization call.** The design didn't propose one, reasoning that the main generation call has none either and relies on user-initiated abort. On reflection that reasoning doesn't transfer: the main call streams visible output the user can watch and choose to abort, while auto-compaction is silent by design — a hung provider there would stall the turn with no visible cue to abort. Added `AUTO_COMPACT_SUMMARY_TIMEOUT` (600s, matching the manual path's `SUMMARY_TIMEOUT`).
+- **Reversed (deliberate, post-review): the root-thread restriction.** The original brief scoped the automatic trigger to the root thread only, treating sub-agent threads as out of scope. On reconsideration there was no actual reason to special-case them: `compaction::cutoff`, `message_view::model_view`, and `maybe_auto_compact`'s usage/threshold check were already thread-agnostic — the model profile (and its `auto_compact_threshold_tokens`) is already resolved per-agent via `RunConfig::resolve(agent_name)`, so a sub-agent thread reads its own threshold, not the root's. The only root-specific code was the `is_root_thread` guard itself, removed from `maybe_auto_compact`. The driver-level test that had proven the guard (`auto_compaction_never_runs_on_a_subagent_thread`) was replaced with `auto_compaction_runs_on_a_subagent_thread_too`, which drives a stateful sub-agent (`explore`) over threshold across two invocations and asserts it gets exactly one compaction summary, structured the same way the root-thread flagship test does.

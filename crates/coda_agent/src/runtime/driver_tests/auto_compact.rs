@@ -1,6 +1,6 @@
-//! Auto-compaction: triggered mid-turn on the root thread only, protecting
-//! the turn in progress, compacting at most once per turn on success, and
-//! retrying on a later over-threshold check after a failed attempt.
+//! Auto-compaction: triggered mid-turn on any thread, protecting the turn in
+//! progress, compacting at most once per turn on success, and retrying on a
+//! later over-threshold check after a failed attempt.
 
 use super::super::*;
 use super::fixtures::*;
@@ -163,12 +163,13 @@ async fn mid_turn_auto_compaction_protects_the_current_turn_and_compacts_once() 
     );
 }
 
-/// Auto-compaction never runs on a sub-agent thread. `explore` is stateful and
-/// invoked once per root turn, so its history carries two turn tags by its
-/// second (also over-threshold) invocation — a legal target without the
-/// root-thread guard.
+/// Auto-compaction runs on a sub-agent thread exactly the same way it runs on
+/// the root: `explore` is stateful and invoked once per root turn, so its own
+/// history carries two turn tags by its second invocation — its second
+/// invocation crosses threshold after its own tool call, compacting through
+/// its first invocation's answer and protecting the second's own content.
 #[tokio::test]
-async fn auto_compaction_never_runs_on_a_subagent_thread() {
+async fn auto_compaction_runs_on_a_subagent_thread_too() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let root = coda_spec("auto-compact-subagent-main", vec!["explore".into()]);
     let explore = AgentSpec {
@@ -198,13 +199,39 @@ async fn auto_compaction_never_runs_on_a_subagent_thread() {
         .expect("load explore's checkpoint")
         .expect("explore's checkpoint exists")
         .messages;
-    assert!(
-        !explore_history
-            .iter()
-            .any(|entry| matches!(&entry.message, Message::Custom(_))),
-        "explore's own over-threshold second invocation must not have \
-         attempted a compaction of any kind: {:?}",
+
+    let summaries: Vec<_> = explore_history
+        .iter()
+        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND))
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "explore's own over-threshold second invocation should have compacted \
+         exactly once: {:?}",
         labels(&explore_history)
+    );
+
+    let round_1_done = explore_history
+        .iter()
+        .find(|entry| matches!(&entry.message, Message::Assistant(a) if a.content == "explore round 1 done"))
+        .expect("explore's first invocation answer");
+    let Message::Custom(summary) = &summaries[0].message else {
+        unreachable!("filtered to Custom above");
+    };
+    assert_eq!(
+        summary.cutoff,
+        Some(round_1_done.message.message_id()),
+        "the summary should cover exactly through explore's first invocation"
+    );
+
+    let view_labels = labels(message_view::model_view(&explore_history));
+    assert_eq!(view_labels.first(), Some(&"custom:compaction".to_string()));
+    assert_eq!(
+        view_labels.last(),
+        Some(&"assistant:explore round 2 done".to_string()),
+        "explore's own second-invocation content must survive the boundary \
+         its own compaction created: {view_labels:?}"
     );
 }
 

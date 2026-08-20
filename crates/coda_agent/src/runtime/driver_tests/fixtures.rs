@@ -584,7 +584,7 @@ impl LLMProvider for TestProvider {
             },
             // A root that delegates once per turn to a stateful "explore",
             // which itself goes over threshold on its second invocation —
-            // proves auto-compaction never fires on a non-root thread.
+            // exercises auto-compaction on a sub-agent thread too.
             "auto-compact-subagent-main" => match last_user(&request.messages) {
                 Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
                     Self::completed(AssistantMessage {
