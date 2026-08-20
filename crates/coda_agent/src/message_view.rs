@@ -37,20 +37,21 @@ pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// thread and every root thread before its first compaction, with no need to
 /// ask which kind of thread this is.
 pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
-    let ordered: Vec<&HistoryEntry> = match last_summary(messages) {
-        None => messages.iter().collect(),
+    let ordered: Box<dyn Iterator<Item = &HistoryEntry> + '_> = match last_summary(messages) {
+        // No allocation for the common case: a thread with no summary yet
+        // (every sub-agent thread, and every root thread before its first
+        // compaction) is shown whole via a plain iterator over the slice.
+        None => Box::new(messages.iter()),
         Some((summary_idx, tail_start)) => {
             let summary = &messages[summary_idx];
-            std::iter::once(summary)
-                .chain(messages[tail_start..].iter().filter(move |entry| {
+            Box::new(std::iter::once(summary).chain(
+                messages[tail_start..].iter().filter(move |entry| {
                     entry.message.message_id() != summary.message.message_id()
-                }))
-                .collect()
+                }),
+            ))
         }
     };
-    ordered
-        .into_iter()
-        .filter(|entry| entry.message.visible_to_model())
+    ordered.filter(|entry| entry.message.visible_to_model())
 }
 
 /// The last compaction summary's own index, paired with where its protected

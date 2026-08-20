@@ -6,6 +6,7 @@ use super::super::*;
 use super::fixtures::*;
 use crate::{
     AgentEvent, AgentSpec, AgentTeam, RunConfig, SubAgentMode, ToolApprovalMode,
+    agent::HistoryEntry,
     runtime::{MemoryStorage, SessionStorage},
 };
 use coda_core::llm::Message;

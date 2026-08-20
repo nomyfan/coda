@@ -6,8 +6,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, Message, MessageId, RequestMessage, SystemMessage,
-    ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, CompletionUsage, Message, MessageId, RequestMessage,
+    SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput, TurnId,
+    UserMessage,
 };
 use coda_core::tool::Tools;
 
@@ -613,6 +614,21 @@ impl Agent {
     /// Returns conversation history without the system prompt (suitable for checkpointing).
     pub async fn history(&self) -> Vec<HistoryEntry> {
         self.state.lock().await.messages.clone()
+    }
+
+    /// The most recent recorded token usage on this thread, read without
+    /// cloning the transcript — the cheap check to run before deciding
+    /// whether [`Agent::history`]'s full clone is worth paying for.
+    pub async fn last_usage(&self) -> Option<CompletionUsage> {
+        let state = self.state.lock().await;
+        state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.message {
+                Message::Assistant(assistant) => assistant.usage.clone(),
+                _ => None,
+            })
     }
 
     /// Restore a stored thread's conversation and anchored tool state, replacing

@@ -347,24 +347,13 @@ fn parse_max_completion_tokens(
     model_name: &str,
     context_window: u32,
 ) -> Result<Option<u32>, ConfigError> {
-    let Some(value) = model.get("max_completion_tokens") else {
-        return Ok(None);
-    };
-    let max_completion_tokens = value
-        .as_integer()
-        .filter(|value| *value > 0)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            ConfigError::Parse(format!(
-                "provider '{provider_id}' model '{model_name}' max_completion_tokens must be a positive integer"
-            ))
-        })?;
-    if max_completion_tokens > context_window {
-        return Err(ConfigError::Parse(format!(
-            "provider '{provider_id}' model '{model_name}' max_completion_tokens ({max_completion_tokens}) must not exceed context_window ({context_window})"
-        )));
-    }
-    Ok(Some(max_completion_tokens))
+    parse_bounded_token_field(
+        model,
+        provider_id,
+        model_name,
+        context_window,
+        "max_completion_tokens",
+    )
 }
 
 fn parse_auto_compact_threshold(
@@ -373,24 +362,42 @@ fn parse_auto_compact_threshold(
     model_name: &str,
     context_window: u32,
 ) -> Result<Option<u32>, ConfigError> {
-    let Some(value) = model.get("auto_compact_threshold") else {
+    parse_bounded_token_field(
+        model,
+        provider_id,
+        model_name,
+        context_window,
+        "auto_compact_threshold",
+    )
+}
+
+/// A positive integer field that must not exceed `context_window` — the
+/// shape both `max_completion_tokens` and `auto_compact_threshold` share.
+fn parse_bounded_token_field(
+    model: &toml_edit::InlineTable,
+    provider_id: &str,
+    model_name: &str,
+    context_window: u32,
+    field_name: &str,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = model.get(field_name) else {
         return Ok(None);
     };
-    let auto_compact_threshold = value
+    let parsed = value
         .as_integer()
         .filter(|value| *value > 0)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| {
             ConfigError::Parse(format!(
-                "provider '{provider_id}' model '{model_name}' auto_compact_threshold must be a positive integer"
+                "provider '{provider_id}' model '{model_name}' {field_name} must be a positive integer"
             ))
         })?;
-    if auto_compact_threshold > context_window {
+    if parsed > context_window {
         return Err(ConfigError::Parse(format!(
-            "provider '{provider_id}' model '{model_name}' auto_compact_threshold ({auto_compact_threshold}) must not exceed context_window ({context_window})"
+            "provider '{provider_id}' model '{model_name}' {field_name} ({parsed}) must not exceed context_window ({context_window})"
         )));
     }
-    Ok(Some(auto_compact_threshold))
+    Ok(Some(parsed))
 }
 
 fn parse_model_reasoning_efforts(

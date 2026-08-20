@@ -264,12 +264,7 @@ impl AppOpener {
             .providers
             .get(provider_id)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
-        // `cutoff_id` always names a message in `history` — `compaction::cutoff`
-        // only ever returns an id it read out of the same slice being passed here.
-        let cutoff_idx = history
-            .iter()
-            .position(|entry| entry.message.message_id() == cutoff_id)
-            .expect("cutoff_id is a message id from this same history");
+        let cutoff_idx = compaction::resolve_cutoff_idx(history, cutoff_id);
         let request = compaction::summary_request(
             handle.model_id.clone(),
             handle.max_completion_tokens,
@@ -396,8 +391,13 @@ impl SessionOpener for AppOpener {
             let command = compaction::command_message(instructions);
             let (outcome, applied) = match &summary {
                 Ok(summary) => (
+                    // Recorded as covering through `command`, not `cutoff_id`:
+                    // `command` lands physically between `cutoff_id` and the
+                    // summary in this same commit, so the boundary must fall
+                    // after it too, or `model_view` would show the raw
+                    // "/compact ..." line the model was never meant to see.
                     compaction::summary_message(
-                        cutoff_id,
+                        command.message_id(),
                         compaction::Trigger::Manual { instructions },
                         summary,
                     ),
@@ -2303,9 +2303,11 @@ async fn main() {
                     model_name: m.name,
                     context_window: m.context_window,
                     max_completion_tokens: m.max_completion_tokens,
-                    auto_compact_threshold_tokens: m
-                        .auto_compact_threshold
-                        .unwrap_or(m.context_window / 5 * 4),
+                    auto_compact_threshold_tokens: m.auto_compact_threshold.unwrap_or(
+                        // `u64` intermediate: `context_window * 4` alone could
+                        // overflow `u32` before the `/ 5` brings it back down.
+                        (u64::from(m.context_window) * 4 / 5) as u32,
+                    ),
                     provider_id: p.id.clone(),
                     reasoning_efforts: m.reasoning_efforts,
                     default_reasoning_effort: m.default_reasoning_effort,

@@ -258,6 +258,47 @@ fn a_turn_compacts_at_most_once() {
     assert_eq!(cutoff(&history, Some(current_turn)), None);
 }
 
+/// Reproduces the manual `/compact` commit shape end to end: `cutoff` is
+/// computed before `command` exists, then `command` and the summary are
+/// appended together in one commit, physically landing `command` between
+/// `cutoff`'s target and the summary. The summary must still record a
+/// boundary that excludes `command` — the model was never meant to see the
+/// raw "/compact ..." line — which only holds if the recorded `cutoff` is
+/// `command`'s own id, not the pre-command target `compaction::cutoff`
+/// returned.
+#[test]
+fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
+    let history = vec![user("old")];
+    let cutoff_id = cutoff(&history, None).expect("something to compact");
+
+    let command = entry(command_message("keep the plan"));
+    let outcome = entry(summary_message(
+        command.message.message_id(),
+        Trigger::Manual {
+            instructions: "keep the plan",
+        },
+        "the gist",
+    ));
+
+    let mut committed = history;
+    committed.push(command);
+    committed.push(outcome);
+
+    let texts: Vec<_> = message_view::model_view(&committed)
+        .filter_map(|entry| match &entry.message {
+            Message::Custom(custom) => Some(custom.content.clone()),
+            Message::User(user) => user.first_text().map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["[compacted at the user's request: keep the plan]\n\nthe gist".to_string()],
+        "the command line must stay out of the model's view, same as {cutoff_id:?} \
+         being superseded by the command's own id"
+    );
+}
+
 /// A failed attempt does not move the boundary — it isn't `COMPACTION_KIND` —
 /// so the next detection point in the same turn targets the same message
 /// again rather than being permanently suppressed.

@@ -56,6 +56,16 @@ pub fn cutoff(messages: &[HistoryEntry], protect: Option<TurnId>) -> Option<Mess
     Some(messages[target_idx].message.message_id())
 }
 
+/// Resolves a [`cutoff`] result back to its index in the same slice it was
+/// read from — shared so neither caller re-implements the lookup `cutoff`
+/// already performed internally to compute the id in the first place.
+pub fn resolve_cutoff_idx(messages: &[HistoryEntry], cutoff_id: MessageId) -> usize {
+    messages
+        .iter()
+        .position(|entry| entry.message.message_id() == cutoff_id)
+        .expect("cutoff always names a message id from the same slice it was read from")
+}
+
 /// What prompted a compaction, and how the summary should say so. The prompt
 /// sent to the model is identical either way — only the human-facing wrapper
 /// differs, the same way a manual compaction already wraps the summary in a

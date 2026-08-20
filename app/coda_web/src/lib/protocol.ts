@@ -86,6 +86,10 @@ export type CustomMessage = {
   role: "User" | "Assistant" | null;
   content: string;
   created_at: string;
+  /** For a `kind: "compaction"` summary: the id of the last message it
+   * covers. Omitted (not `null`) on the wire when absent — a summary written
+   * before this field existed, or any other `kind`. */
+  cutoff?: string;
 };
 
 export type HistoryMessage =

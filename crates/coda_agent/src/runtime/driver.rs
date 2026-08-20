@@ -7,9 +7,8 @@ use std::{
 use serde_json::Value;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionUsage, LLMProvider, LLMStreamEvent, Message,
-    MessageId, MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId,
-    UserMessage,
+    AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
+    MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::{ThreadState, ToolCallContext, ToolError, ToolResult};
 use futures::StreamExt;
@@ -19,8 +18,8 @@ use tracing::{error, info, instrument, warn};
 
 use super::AgentControl;
 use crate::{
-    AbortedTarget, Agent, AgentEvent, Envelope, HistoryEntry, PendingApproval, ResumeDecision,
-    Sender, SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
+    AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, Sender,
+    SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget,
         ResumePoint, ToolExecutionState,
@@ -38,6 +37,14 @@ use crate::{
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long an auto-compaction's summarization call waits on its provider —
+/// mirrors `SUMMARY_TIMEOUT` in the manual path
+/// (`app/coda_server/src/bin/server.rs`). Unlike the main generation call,
+/// this step is silent and raced only against user-initiated cancellation, so
+/// without a bound a hung provider would stall the turn forever with no
+/// visible cue for the user to cancel it.
+const AUTO_COMPACT_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the root waits for a cancelled turn's sub-agents to answer before
 /// giving up on them.
@@ -1236,21 +1243,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         if !self.runtime.is_root_thread(&self.thread_id) {
             return;
         }
-        let history = self.agent.history().await;
-        let Some(usage) = last_usage(&history) else {
+        // Cheap check first: avoids `Agent::history`'s full transcript clone
+        // on the overwhelmingly common case of usage nowhere near threshold.
+        let Some(usage) = self.agent.last_usage().await else {
             return;
         };
         if usage.total_tokens < self.config.profile.auto_compact_threshold_tokens {
             return;
         }
+        let history = self.agent.history().await;
         let current_turn = self.thread_turn().await;
         let Some(cutoff_id) = compaction::cutoff(&history, Some(current_turn)) else {
             return;
         };
-        let cutoff_idx = history
-            .iter()
-            .position(|entry| entry.message.message_id() == cutoff_id)
-            .expect("compaction::cutoff returns a message id from this same history");
+        let cutoff_idx = compaction::resolve_cutoff_idx(&history, cutoff_id);
         let request = compaction::summary_request(
             self.config.profile.model.clone(),
             self.config.profile.max_completion_tokens,
@@ -1262,14 +1268,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let outcome = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return,
-            outcome = self.summarize(request) => outcome,
+            outcome = tokio::time::timeout(AUTO_COMPACT_SUMMARY_TIMEOUT, self.summarize(request)) => {
+                outcome.unwrap_or_else(|_| {
+                    Err(format!(
+                        "the provider did not answer within {AUTO_COMPACT_SUMMARY_TIMEOUT:?}"
+                    ))
+                })
+            }
         };
         let message = match outcome {
             Ok(summary) => {
                 compaction::summary_message(cutoff_id, compaction::Trigger::Auto, &summary)
             }
             Err(reason) => {
-                warn!("auto-compaction failed: {reason}");
+                warn!(thread_id = %self.thread_id.as_ref(), "auto-compaction failed: {reason}");
                 compaction::failure_message(&reason)
             }
         };
@@ -1757,17 +1769,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 /// envelopes that continue existing work (`Reply`, `Resume`) rather than start
 /// any.
 ///
-/// The most recent usage this thread's history recorded — the last assistant
-/// message, working backward, that has one. An aborted generation leaves its
-/// partial message with `usage: None`, so this can skip past it to an older
-/// completion rather than reporting no usage at all.
-fn last_usage(history: &[HistoryEntry]) -> Option<&CompletionUsage> {
-    history.iter().rev().find_map(|entry| match &entry.message {
-        Message::Assistant(assistant) => assistant.usage.as_ref(),
-        _ => None,
-    })
-}
-
 /// A root task carries the id minted at the request boundary, and that id also
 /// names the turn it begins. A sub-agent invocation mints its own message id
 /// here — this is that message's only construction point, so there is no second

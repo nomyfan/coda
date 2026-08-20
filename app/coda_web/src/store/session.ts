@@ -502,12 +502,36 @@ function historyToEntries(
   return [];
 }
 
+function messageIdOf(message: HistoryMessage): string {
+  if ("User" in message) return message.User.message_id;
+  if ("Assistant" in message) return message.Assistant.message_id;
+  if ("Tool" in message) return message.Tool.message_id;
+  return message.Custom.message_id;
+}
+
+/** Mirrors the backend's `message_view::last_summary`: a recorded `cutoff`
+ * names where a compaction summary's coverage actually ends, which can differ
+ * from the summary's own physical position for a mid-turn compaction — some
+ * of the current turn's own messages can sit between the two. Falls back to
+ * the summary's own index (today's behavior) when no `cutoff` is recorded,
+ * e.g. an already-persisted legacy summary. */
+function resolveCutoffIdx(messages: HistoryMessage[], summaryIdx: number, cutoff?: string): number {
+  if (cutoff) {
+    for (let index = summaryIdx - 1; index >= 0; index -= 1) {
+      if (messageIdOf(messages[index]) === cutoff) {
+        return index + 1;
+      }
+    }
+  }
+  return summaryIdx + 1;
+}
+
 function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
   let boundary = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if ("Custom" in message && message.Custom.kind === "compaction") {
-      boundary = index + 1;
+      boundary = resolveCutoffIdx(messages, index, message.Custom.cutoff);
       break;
     }
   }
