@@ -205,7 +205,7 @@
 
   --animate-breathe: breathe 2s ease-in-out infinite;
   --animate-ping-soft: ping-soft 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
-  --animate-text-shimmer: text-shimmer 1.4s linear infinite;
+  --animate-text-shimmer: text-shimmer 2.2s linear infinite;
 }
 
 @keyframes breathe {

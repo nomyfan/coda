@@ -1647,6 +1647,66 @@ export function applySnapshotToSession(
   };
 }
 
+/** Streamed chunk events can arrive many times a second; coalesce them into
+ * one store update per animation frame instead of one per event. rAF pauses
+ * in a hidden/minimized tab, so a self-rescheduling timeout drains the queue
+ * there instead — re-arming only when a new event needs it, not a standing
+ * poll. Snapshot/eviction handlers (and `visibilitychange`, on refocus) flush
+ * the FIFO queue first to stay ordered relative to a resync. */
+const HIDDEN_FLUSH_INTERVAL_MS = 500;
+
+type PendingEvent = {
+  server: string;
+  workspaceId: string;
+  sessionId: string;
+  event: WireEvent;
+};
+
+let pendingEvents: PendingEvent[] = [];
+let rafHandle: number | undefined;
+let hiddenTimeoutHandle: number | undefined;
+
+function flushPendingEvents() {
+  if (rafHandle !== undefined) {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = undefined;
+  }
+  if (hiddenTimeoutHandle !== undefined) {
+    window.clearTimeout(hiddenTimeoutHandle);
+    hiddenTimeoutHandle = undefined;
+  }
+  if (pendingEvents.length === 0) {
+    return;
+  }
+  const batch = pendingEvents;
+  pendingEvents = [];
+  updateState(codaStore, (state) => {
+    for (const { server, workspaceId, sessionId, event } of batch) {
+      const key = sessionKey(workspaceId, sessionId);
+      const session = draftSession(state, server, key);
+      if (session) {
+        state.servers[server].sessions[key] = reduceEvent(session, event);
+      }
+    }
+  });
+}
+
+function scheduleFlush() {
+  if (typeof document !== "undefined" && document.hidden) {
+    hiddenTimeoutHandle ??= window.setTimeout(flushPendingEvents, HIDDEN_FLUSH_INTERVAL_MS);
+    return;
+  }
+  rafHandle ??= requestAnimationFrame(flushPendingEvents);
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      flushPendingEvents();
+    }
+  });
+}
+
 function applySnapshot(
   store: CodaStore,
   server: string,
@@ -1660,6 +1720,7 @@ function applySnapshot(
   turnRunning: boolean,
   compacting: boolean,
 ) {
+  flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
     const current = state.servers[server];
@@ -1723,6 +1784,7 @@ function applyHeldElsewhere(
   sessionId: string,
   reason: "evicted" | "busy",
 ) {
+  flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1784,6 +1846,7 @@ function applySessionStatus(
   sessionId: string,
   outcome: "completed" | "failed",
 ) {
+  flushPendingEvents();
   updateState(store, (state) => {
     const current = state.servers[server];
     if (!current) {
@@ -1796,20 +1859,9 @@ function applySessionStatus(
   });
 }
 
-function applyEvent(
-  store: CodaStore,
-  server: string,
-  workspaceId: string,
-  sessionId: string,
-  event: WireEvent,
-) {
-  const key = sessionKey(workspaceId, sessionId);
-  updateState(store, (state) => {
-    const session = draftSession(state, server, key);
-    if (session) {
-      state.servers[server].sessions[key] = reduceEvent(session, event);
-    }
-  });
+function applyEvent(server: string, workspaceId: string, sessionId: string, event: WireEvent) {
+  pendingEvents.push({ server, workspaceId, sessionId, event });
+  scheduleFlush();
 }
 
 function addAllowResultActivity(
@@ -2459,7 +2511,7 @@ export function connectServer(rawUrl: string) {
   // whether a snapshot is solicited (an `open_session` result) or pushed here
   // (a hub re-attach).
   rpc.addMethod("event", (params) => {
-    applyEvent(codaStore, server, params.workspace_id, params.session_id, params.event);
+    applyEvent(server, params.workspace_id, params.session_id, params.event);
   });
   rpc.addMethod("snapshot", (params) => {
     applySnapshot(
