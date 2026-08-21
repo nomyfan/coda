@@ -10,9 +10,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     compaction, runtime::SessionStorage,
 };
-use coda_core::llm::{
-    LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, MessageId, Modality, TurnId,
-};
+use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
@@ -256,21 +254,18 @@ impl AppOpener {
         provider_id: &str,
         reasoning_effort: Option<&str>,
         history: &[HistoryEntry],
-        cutoff_id: MessageId,
+        cutoff: compaction::Cutoff,
         instructions: &str,
     ) -> Result<String, String> {
         let handle = self
             .providers
             .get(provider_id)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
-        let cutoff_idx = compaction::resolve_cutoff_idx(history, cutoff_id);
         let request = compaction::summary_request(
             handle.model_id.clone(),
             handle.max_completion_tokens,
             reasoning_effort.map(str::to_string),
-            // Truncated at `cutoff_id`: nothing this compaction protects
-            // reaches the summarizer.
-            coda_agent::message_view::model_view(&history[..=cutoff_idx]),
+            coda_agent::message_view::model_view(history).take(cutoff.model_view_len),
             instructions,
         );
 
@@ -367,7 +362,9 @@ impl SessionOpener for AppOpener {
                 .map_err(CompactError::Storage)?
                 .ok_or(CompactError::Empty)?;
             // `None` covers both an empty thread and "nothing new to compact".
-            let Some(cutoff_id) = compaction::cutoff(&checkpoint.messages, None) else {
+            let Some(cutoff) = compaction::cutoff(&checkpoint.messages, None, None, None)
+                .map_err(|error| CompactError::InvalidHistory(error.to_string()))?
+            else {
                 return Err(CompactError::Empty);
             };
 
@@ -380,7 +377,7 @@ impl SessionOpener for AppOpener {
                     provider_id,
                     reasoning_effort,
                     &checkpoint.messages,
-                    cutoff_id,
+                    cutoff,
                     instructions,
                 )
                 .await;
@@ -388,7 +385,7 @@ impl SessionOpener for AppOpener {
             let command = compaction::command_message(instructions);
             let (outcome, applied) = match &summary {
                 Ok(summary) => (
-                    // Covers through `command`, not `cutoff_id`: `command`
+                    // Covers through `command`, not the planned cutoff: `command`
                     // lands between them in this same commit, so the model
                     // must never see the raw "/compact ..." line.
                     compaction::summary_message(

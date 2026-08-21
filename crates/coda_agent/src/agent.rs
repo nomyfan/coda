@@ -605,15 +605,20 @@ impl Agent {
     /// The request this thread's history makes: the system prompt, then the
     /// part of history a compaction left visible, lowered to what a provider
     /// accepts.
-    pub async fn messages(&self) -> Vec<RequestMessage> {
+    pub async fn messages(&self) -> Result<Vec<RequestMessage>, message_view::InvalidHistory> {
         let history = self.state.lock().await;
-        let visible = message_view::model_view(&history.messages);
+        let visible: Vec<_> = message_view::model_view(&history.messages).collect();
+        message_view::validate_messages(visible.iter().map(|entry| &entry.message))?;
         let mut messages = Vec::with_capacity(history.messages.len() + 1);
         messages.push(RequestMessage::System(SystemMessage(
             self.system_prompt.resolve(),
         )));
-        messages.extend(visible.filter_map(|entry| (&entry.message).into()));
-        messages
+        messages.extend(
+            visible
+                .into_iter()
+                .filter_map(|entry| (&entry.message).into()),
+        );
+        Ok(messages)
     }
 
     /// Returns conversation history without the system prompt (suitable for checkpointing).

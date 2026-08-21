@@ -512,6 +512,9 @@ impl SessionOpener for TestOpener {
                 Ok(applied) => *applied,
                 Err(CompactError::Stale) => return Err(CompactError::Stale),
                 Err(CompactError::Empty) => return Err(CompactError::Empty),
+                Err(CompactError::InvalidHistory(reason)) => {
+                    return Err(CompactError::InvalidHistory(reason.clone()));
+                }
                 Err(CompactError::Storage(reason)) => {
                     return Err(CompactError::Storage(reason.clone()));
                 }

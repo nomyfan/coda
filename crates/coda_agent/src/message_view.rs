@@ -10,7 +10,8 @@
 //! position. Transcript-only records (a failed compaction) are filtered out.
 
 use crate::agent::HistoryEntry;
-use coda_core::llm::Message;
+use coda_core::llm::{Message, MessageId};
+use std::collections::HashMap;
 
 /// The `kind` of the summary a successful compaction writes. Only this kind
 /// moves the boundary.
@@ -25,19 +26,170 @@ pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// leading, then everything after its `cutoff`, minus transcript-only
 /// records. A thread with no summary yet is shown whole.
 pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
-    let ordered: Box<dyn Iterator<Item = &HistoryEntry> + '_> = match last_summary(messages) {
-        // No allocation for the common (no-summary-yet) case.
-        None => Box::new(messages.iter()),
-        Some((summary_idx, tail_start)) => {
-            let summary = &messages[summary_idx];
-            Box::new(std::iter::once(summary).chain(
-                messages[tail_start..].iter().filter(move |entry| {
-                    entry.message.message_id() != summary.message.message_id()
-                }),
-            ))
+    let (summary, tail) = model_view_parts_indexed(messages);
+    summary.into_iter().chain(tail).map(|(_, entry)| entry)
+}
+
+/// Splits the model view into the active summary and the uncompressed tail.
+/// Both retain their physical index in `messages`, which compaction needs for
+/// its persisted coverage watermark.
+pub(crate) fn model_view_parts_indexed(
+    messages: &[HistoryEntry],
+) -> (
+    Option<(usize, &HistoryEntry)>,
+    impl Iterator<Item = (usize, &HistoryEntry)> + '_,
+) {
+    let boundary = last_summary(messages);
+    let tail_start = boundary.map_or(0, |(_, tail_start)| tail_start);
+    let summary = boundary.map(|(summary_idx, _)| (summary_idx, &messages[summary_idx]));
+    let summary_id = summary.map(|(_, entry)| entry.message.message_id());
+    let visible_summary = summary.filter(|(_, entry)| entry.message.visible_to_model());
+    let tail = messages[tail_start..]
+        .iter()
+        .enumerate()
+        .map(move |(offset, entry)| (tail_start + offset, entry))
+        .filter(move |(_, entry)| Some(entry.message.message_id()) != summary_id)
+        .filter(|(_, entry)| entry.message.visible_to_model());
+    (visible_summary, tail)
+}
+
+/// A tool-call/result protocol violation in the messages visible to a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidHistory {
+    OrphanToolResult {
+        message_id: MessageId,
+        call_id: String,
+    },
+    DuplicateToolCall {
+        message_id: MessageId,
+        call_id: String,
+    },
+    DuplicateToolResult {
+        message_id: MessageId,
+        call_id: String,
+    },
+    IncompleteToolBatch {
+        assistant_message_id: MessageId,
+        missing_call_ids: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for InvalidHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrphanToolResult {
+                message_id,
+                call_id,
+            } => write!(
+                f,
+                "tool result {message_id} references call '{call_id}' without a matching assistant batch"
+            ),
+            Self::DuplicateToolCall {
+                message_id,
+                call_id,
+            } => write!(
+                f,
+                "assistant message {message_id} declares tool call '{call_id}' more than once"
+            ),
+            Self::DuplicateToolResult {
+                message_id,
+                call_id,
+            } => write!(
+                f,
+                "tool result {message_id} answers call '{call_id}' more than once"
+            ),
+            Self::IncompleteToolBatch {
+                assistant_message_id,
+                missing_call_ids,
+            } => write!(
+                f,
+                "assistant message {assistant_message_id} is missing results for calls: {}",
+                missing_call_ids.join(", ")
+            ),
         }
-    };
-    ordered.filter(|entry| entry.message.visible_to_model())
+    }
+}
+
+impl std::error::Error for InvalidHistory {}
+
+/// Validates the exact history sequence an ordinary provider request sees.
+pub fn validate_model_view(messages: &[HistoryEntry]) -> Result<(), InvalidHistory> {
+    validate_messages(model_view(messages).map(|entry| &entry.message))
+}
+
+pub(crate) fn validate_messages<'a>(
+    messages: impl IntoIterator<Item = &'a Message>,
+) -> Result<(), InvalidHistory> {
+    struct Batch {
+        assistant_message_id: MessageId,
+        expected: HashMap<String, bool>,
+    }
+
+    fn finish_batch(batch: &mut Option<Batch>) -> Result<(), InvalidHistory> {
+        let Some(open) = batch.take() else {
+            return Ok(());
+        };
+        let mut missing_call_ids: Vec<_> = open
+            .expected
+            .into_iter()
+            .filter_map(|(id, answered)| (!answered).then_some(id))
+            .collect();
+        if missing_call_ids.is_empty() {
+            return Ok(());
+        }
+        missing_call_ids.sort();
+        Err(InvalidHistory::IncompleteToolBatch {
+            assistant_message_id: open.assistant_message_id,
+            missing_call_ids,
+        })
+    }
+
+    let mut batch: Option<Batch> = None;
+    for message in messages {
+        match message {
+            Message::Tool(tool) => {
+                let Some(open) = &mut batch else {
+                    return Err(InvalidHistory::OrphanToolResult {
+                        message_id: tool.message_id,
+                        call_id: tool.id.clone(),
+                    });
+                };
+                let Some(answered) = open.expected.get_mut(&tool.id) else {
+                    return Err(InvalidHistory::OrphanToolResult {
+                        message_id: tool.message_id,
+                        call_id: tool.id.clone(),
+                    });
+                };
+                if *answered {
+                    return Err(InvalidHistory::DuplicateToolResult {
+                        message_id: tool.message_id,
+                        call_id: tool.id.clone(),
+                    });
+                }
+                *answered = true;
+            }
+            Message::Assistant(assistant) if !assistant.tool_calls.is_empty() => {
+                finish_batch(&mut batch)?;
+                let mut expected = HashMap::with_capacity(assistant.tool_calls.len());
+                for call in &assistant.tool_calls {
+                    if expected.insert(call.id.clone(), false).is_some() {
+                        return Err(InvalidHistory::DuplicateToolCall {
+                            message_id: assistant.message_id,
+                            call_id: call.id.clone(),
+                        });
+                    }
+                }
+                batch = Some(Batch {
+                    assistant_message_id: assistant.message_id,
+                    expected,
+                });
+            }
+            Message::User(_) | Message::Assistant(_) | Message::Custom(_) => {
+                finish_batch(&mut batch)?;
+            }
+        }
+    }
+    finish_batch(&mut batch)
 }
 
 /// The last summary's index, paired with where its protected tail begins —
@@ -72,7 +224,8 @@ mod tests {
     use super::*;
     use coda_core::llm::{CustomMessage, CustomRole, MessageId, TurnId, UserMessage};
 
-    fn entry(message: Message) -> HistoryEntry {
+    // `pub(super)`: shared with `validation_tests`, a sibling module.
+    pub(super) fn entry(message: Message) -> HistoryEntry {
         HistoryEntry {
             turn_id: TurnId::from(MessageId::new()),
             message,
@@ -276,3 +429,7 @@ mod tests {
         assert_eq!(texts(model_view(&history)), ["a", "b"]);
     }
 }
+
+#[cfg(test)]
+#[path = "message_view_validation_tests.rs"]
+mod validation_tests;
