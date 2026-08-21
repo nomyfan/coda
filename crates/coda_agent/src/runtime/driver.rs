@@ -1437,10 +1437,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     )),
                 );
             }
-            GenerationOutcome::Failed(err) => {
-                error!("LLM generation error: {}", err);
-                return self.generation_failed(err);
-            }
+            GenerationOutcome::Failed(err) => return self.generation_failed(err),
         };
 
         let ended_at = jiff::Timestamp::now();
@@ -1546,6 +1543,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
     }
 
     fn generation_failed(&mut self, error: String) -> AgentLoopState {
+        error!(thread_id = %self.thread_id.as_ref(), "generation failed: {error}");
         let target = self.reply_target.take();
         // A sub-agent's failure travels as its reply; only a root agent, with
         // nobody to answer, announces it as an event.

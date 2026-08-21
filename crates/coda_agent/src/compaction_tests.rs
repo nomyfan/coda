@@ -345,14 +345,7 @@ fn prompt_growth_starts_over_at_the_latest_summary() {
         assistant_in(turn, "second", Some(1_200)),
         tool_in(turn, "second"),
     ];
-    let history_indices: HashMap<_, _> = history
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.message.message_id(), index))
-        .collect();
-    let visible: Vec<_> = message_view::model_view(&history)
-        .map(|entry| (history_indices[&entry.message.message_id()], entry))
-        .collect();
+    let visible: Vec<_> = message_view::model_view_indexed(&history).collect();
 
     assert_eq!(prompt_growth(&visible, turn), Some(0));
 }

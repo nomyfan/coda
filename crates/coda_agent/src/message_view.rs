@@ -26,19 +26,35 @@ pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// leading, then everything after its `cutoff`, minus transcript-only
 /// records. A thread with no summary yet is shown whole.
 pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
-    let ordered: Box<dyn Iterator<Item = &HistoryEntry> + '_> = match last_summary(messages) {
-        // No allocation for the common (no-summary-yet) case.
-        None => Box::new(messages.iter()),
-        Some((summary_idx, tail_start)) => {
-            let summary = &messages[summary_idx];
-            Box::new(std::iter::once(summary).chain(
-                messages[tail_start..].iter().filter(move |entry| {
-                    entry.message.message_id() != summary.message.message_id()
-                }),
-            ))
-        }
-    };
-    ordered.filter(|entry| entry.message.visible_to_model())
+    model_view_indexed(messages).map(|(_, entry)| entry)
+}
+
+/// Like [`model_view`], but paired with each entry's index in `messages` —
+/// callers that need physical position (e.g. [`crate::compaction::cutoff`])
+/// get it for free instead of re-deriving it with a separate lookup.
+pub(crate) fn model_view_indexed(
+    messages: &[HistoryEntry],
+) -> impl Iterator<Item = (usize, &HistoryEntry)> + '_ {
+    let ordered: Box<dyn Iterator<Item = (usize, &HistoryEntry)> + '_> =
+        match last_summary(messages) {
+            // No allocation for the common (no-summary-yet) case.
+            None => Box::new(messages.iter().enumerate()),
+            Some((summary_idx, tail_start)) => {
+                let summary = &messages[summary_idx];
+                Box::new(
+                    std::iter::once((summary_idx, summary)).chain(
+                        messages[tail_start..]
+                            .iter()
+                            .enumerate()
+                            .map(move |(offset, entry)| (tail_start + offset, entry))
+                            .filter(move |(_, entry)| {
+                                entry.message.message_id() != summary.message.message_id()
+                            }),
+                    ),
+                )
+            }
+        };
+    ordered.filter(|(_, entry)| entry.message.visible_to_model())
 }
 
 /// A tool-call/result protocol violation in the messages visible to a provider.
@@ -212,7 +228,8 @@ mod tests {
     use super::*;
     use coda_core::llm::{CustomMessage, CustomRole, MessageId, TurnId, UserMessage};
 
-    fn entry(message: Message) -> HistoryEntry {
+    // `pub(super)`: shared with `validation_tests`, a sibling module.
+    pub(super) fn entry(message: Message) -> HistoryEntry {
         HistoryEntry {
             turn_id: TurnId::from(MessageId::new()),
             message,

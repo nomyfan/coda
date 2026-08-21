@@ -1068,10 +1068,13 @@ impl SessionHub {
                 reason: "the conversation changed while it was being summarized".to_string(),
             },
             Err(CompactError::Empty) => CommandOutcome::CompactionEmpty,
-            Err(CompactError::InvalidHistory(reason)) => CommandOutcome::CompactionAbandoned {
-                stale: false,
-                reason,
-            },
+            Err(CompactError::InvalidHistory(reason)) => {
+                warn!(workspace_id = %key.0, session_id = %key.1, "compaction found an invalid history: {reason}");
+                CommandOutcome::CompactionAbandoned {
+                    stale: false,
+                    reason,
+                }
+            }
             Err(CompactError::Storage(reason)) => {
                 warn!(workspace_id = %key.0, session_id = %key.1, "compaction failed to persist: {reason}");
                 CommandOutcome::CompactionAbandoned {

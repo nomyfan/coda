@@ -16,7 +16,6 @@ use coda_core::llm::{
     ChatCompletionRequest, ContentPart, CustomMessage, CustomRole, Message, MessageId,
     RequestMessage, SystemMessage, ToolOutput, TurnId, UserMessage,
 };
-use std::collections::HashMap;
 
 static COMPACTION_PROMPT: &str = include_str!("compaction-prompt.md");
 
@@ -44,17 +43,7 @@ pub fn cutoff(
     protect_from: Option<MessageId>,
     auto_compact_threshold_tokens: Option<u32>,
 ) -> Result<Option<Cutoff>, message_view::InvalidHistory> {
-    let history_indices: HashMap<_, _> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.message.message_id(), index))
-        .collect();
-    let visible: Vec<_> = message_view::model_view(messages)
-        .map(|entry| {
-            let index = history_indices[&entry.message.message_id()];
-            (index, entry)
-        })
-        .collect();
+    let visible: Vec<_> = message_view::model_view_indexed(messages).collect();
     message_view::validate_messages(visible.iter().map(|(_, entry)| &entry.message))?;
 
     let first_new = visible
@@ -71,13 +60,27 @@ pub fn cutoff(
             coverage_message_id: coverage.message.message_id(),
         }
     };
+    // A candidate position is only safe when the physically-latest message it
+    // covers (the watermark `cutoff_at` will persist) still precedes every
+    // message the retained suffix keeps. Without this, a reordered summary
+    // included in the covered set — always physically newer than the
+    // "leftover" messages it protects — could outrank an *excluded* leftover
+    // still sitting in the suffix, and `model_view`'s tail search would then
+    // sweep that leftover away too, though it was never actually summarized.
     let leaves_valid_suffix = |position: usize| {
-        message_view::validate_messages(
-            visible[position + 1..]
-                .iter()
-                .map(|(_, entry)| &entry.message),
-        )
-        .is_ok()
+        let suffix = &visible[position + 1..];
+        if message_view::validate_messages(suffix.iter().map(|(_, entry)| &entry.message)).is_err()
+        {
+            return false;
+        }
+        let covered_max = visible[..=position]
+            .iter()
+            .map(|(history_index, _)| *history_index)
+            .max();
+        let suffix_min = suffix.iter().map(|(history_index, _)| *history_index).min();
+        covered_max
+            .zip(suffix_min)
+            .is_none_or(|(covered, retained)| covered < retained)
     };
 
     if let Some(turn) = prefer_before_turn
@@ -93,13 +96,17 @@ pub fn cutoff(
         }
     }
 
-    let protected_position = protect_from.map(|message_id| {
-        visible
+    // Fails closed: `protect_from` should always resolve against `visible`
+    // (both are drawn from `messages`), but if it doesn't — a caller passing
+    // a stale or foreign id — treat it as "everything is protected" rather
+    // than panicking or silently falling back to unprotected.
+    let limit = match protect_from {
+        None => visible.len(),
+        Some(message_id) => visible
             .iter()
             .position(|(_, entry)| entry.message.message_id() == message_id)
-            .expect("protected messages come from the same model view")
-    });
-    let limit = protected_position.unwrap_or(visible.len());
+            .unwrap_or(first_new),
+    };
     for position in (first_new..limit).rev() {
         if leaves_valid_suffix(position) {
             return Ok(Some(cutoff_at(position)));

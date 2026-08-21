@@ -1,15 +1,8 @@
+use super::tests::entry;
 use super::*;
 use coda_core::llm::{
-    AssistantMessage, MessageId, ToolCall, ToolCallOutcome, ToolMessage, ToolOutput, TurnId,
-    UserMessage,
+    AssistantMessage, MessageId, ToolCall, ToolCallOutcome, ToolMessage, ToolOutput, UserMessage,
 };
-
-fn entry(message: Message) -> HistoryEntry {
-    HistoryEntry {
-        turn_id: TurnId::from(MessageId::new()),
-        message,
-    }
-}
 
 fn user() -> HistoryEntry {
     entry(Message::User(UserMessage::text(MessageId::new(), "task")))
