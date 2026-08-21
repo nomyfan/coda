@@ -31,98 +31,28 @@ pub struct Cutoff {
     pub coverage_message_id: MessageId,
 }
 
-/// Chooses what a compaction may summarize without leaving an invalid tool
-/// sequence behind. Automatic compaction prefers the boundary before
-/// `prefer_before_turn`, unless measured growth within that turn already
-/// reaches `auto_compact_threshold_tokens`; it then falls back to the newest
-/// safe boundary before `protect_from`. Manual compaction omits all three
-/// policy inputs.
-pub fn cutoff(
-    messages: &[HistoryEntry],
-    prefer_before_turn: Option<TurnId>,
-    protect_from: Option<MessageId>,
-    auto_compact_threshold_tokens: Option<u32>,
-) -> Result<Option<Cutoff>, message_view::InvalidHistory> {
-    let visible: Vec<_> = message_view::model_view_indexed(messages).collect();
-    message_view::validate_messages(visible.iter().map(|(_, entry)| &entry.message))?;
-
-    let first_new = visible
-        .first()
-        .is_some_and(|(_, entry)| message_view::is_compaction_summary(&entry.message))
-        as usize;
-    let cutoff_at = |position: usize| {
-        let (_, coverage) = visible[..=position]
-            .iter()
-            .max_by_key(|(history_index, _)| history_index)
-            .expect("a cutoff position includes at least one message");
-        Cutoff {
-            model_view_len: position + 1,
-            coverage_message_id: coverage.message.message_id(),
-        }
-    };
-    // A candidate position is only safe when the physically-latest message it
-    // covers (the watermark `cutoff_at` will persist) still precedes every
-    // message the retained suffix keeps. Without this, a reordered summary
-    // included in the covered set — always physically newer than the
-    // "leftover" messages it protects — could outrank an *excluded* leftover
-    // still sitting in the suffix, and `model_view`'s tail search would then
-    // sweep that leftover away too, though it was never actually summarized.
-    let leaves_valid_suffix = |position: usize| {
-        let suffix = &visible[position + 1..];
-        if message_view::validate_messages(suffix.iter().map(|(_, entry)| &entry.message)).is_err()
-        {
-            return false;
-        }
-        let covered_max = visible[..=position]
-            .iter()
-            .map(|(history_index, _)| *history_index)
-            .max();
-        let suffix_min = suffix.iter().map(|(history_index, _)| *history_index).min();
-        covered_max
-            .zip(suffix_min)
-            .is_none_or(|(covered, retained)| covered < retained)
-    };
-
-    if let Some(turn) = prefer_before_turn
-        && let Some(position) = visible.iter().rposition(|(_, entry)| entry.turn_id != turn)
-        && position >= first_new
-        && leaves_valid_suffix(position)
-    {
-        let retaining_turn_is_too_large = auto_compact_threshold_tokens
-            .zip(prompt_growth(&visible, turn))
-            .is_some_and(|(threshold, growth)| growth >= u64::from(threshold));
-        if !retaining_turn_is_too_large {
-            return Ok(Some(cutoff_at(position)));
-        }
-    }
-
-    // Fails closed: `protect_from` should always resolve against `visible`
-    // (both are drawn from `messages`), but if it doesn't — a caller passing
-    // a stale or foreign id — treat it as "everything is protected" rather
-    // than panicking or silently falling back to unprotected.
-    let limit = match protect_from {
-        None => visible.len(),
-        Some(message_id) => visible
-            .iter()
-            .position(|(_, entry)| entry.message.message_id() == message_id)
-            .unwrap_or(first_new),
-    };
-    for position in (first_new..limit).rev() {
-        if leaves_valid_suffix(position) {
-            return Ok(Some(cutoff_at(position)));
-        }
-    }
-    Ok(None)
+struct VisibleEntry<'a> {
+    history_index: usize,
+    entry: &'a HistoryEntry,
 }
 
-fn prompt_growth(visible: &[(usize, &HistoryEntry)], turn: TurnId) -> Option<u64> {
+impl<'a> From<(usize, &'a HistoryEntry)> for VisibleEntry<'a> {
+    fn from((history_index, entry): (usize, &'a HistoryEntry)) -> Self {
+        Self {
+            history_index,
+            entry,
+        }
+    }
+}
+
+fn prompt_growth(visible: &[VisibleEntry<'_>], turn: TurnId) -> Option<u64> {
     let mut previous = None;
     let mut growth = 0_u64;
-    for (_, entry) in visible {
-        if entry.turn_id != turn {
+    for item in visible {
+        if item.entry.turn_id != turn {
             continue;
         }
-        let Message::Assistant(assistant) = &entry.message else {
+        let Message::Assistant(assistant) = &item.entry.message else {
             continue;
         };
         let prompt_tokens = assistant.usage.as_ref()?.prompt_tokens;
@@ -132,6 +62,85 @@ fn prompt_growth(visible: &[(usize, &HistoryEntry)], turn: TurnId) -> Option<u64
         previous = Some(prompt_tokens);
     }
     Some(growth)
+}
+
+/// Chooses what a compaction may summarize without leaving an invalid tool
+/// sequence behind. Automatic compaction prefers the boundary immediately
+/// before the first visible message in `prefer_before_turn`, unless measured
+/// growth within that turn already reaches `auto_compact_threshold_tokens`;
+/// it then falls back to the newest safe boundary before `protect_from`.
+/// Manual compaction omits all three policy inputs.
+pub fn cutoff(
+    messages: &[HistoryEntry],
+    prefer_before_turn: Option<TurnId>,
+    protect_from: Option<MessageId>,
+    auto_compact_threshold_tokens: Option<u32>,
+) -> Result<Option<Cutoff>, message_view::InvalidHistory> {
+    let (summary, tail) = message_view::model_view_parts_indexed(messages);
+    let summary = summary.map(VisibleEntry::from);
+    let tail: Vec<_> = tail.map(VisibleEntry::from).collect();
+    message_view::validate_messages(
+        summary
+            .iter()
+            .chain(&tail)
+            .map(|visible| &visible.entry.message),
+    )?;
+
+    let safe_cutoff_at = |position: usize| {
+        let suffix = &tail[position + 1..];
+        if message_view::validate_messages(suffix.iter().map(|visible| &visible.entry.message))
+            .is_err()
+        {
+            return None;
+        }
+
+        let coverage = summary
+            .iter()
+            .chain(&tail[..=position])
+            .max_by_key(|visible| visible.history_index)
+            .expect("a cutoff position includes at least one message");
+        let retained_from = suffix.iter().map(|visible| visible.history_index).min();
+        // A reordered summary is always physically newer than the leftover
+        // messages it protects; without this check, a later model_view tail
+        // search could sweep an excluded leftover away too.
+        if retained_from.is_some_and(|retained| coverage.history_index >= retained) {
+            return None;
+        }
+
+        Some(Cutoff {
+            model_view_len: usize::from(summary.is_some()) + position + 1,
+            coverage_message_id: coverage.entry.message.message_id(),
+        })
+    };
+
+    // Skip when the summary already covers this turn, or the turn starts at
+    // the first tail entry (no position exists before the summary itself).
+    if let Some(turn) = prefer_before_turn
+        && summary.as_ref().is_none_or(|s| s.entry.turn_id != turn)
+        && let Some(turn_start) = tail
+            .iter()
+            .position(|visible| visible.entry.turn_id == turn)
+        && let Some(position) = turn_start.checked_sub(1)
+        && let Some(candidate) = safe_cutoff_at(position)
+    {
+        let retaining_turn_is_too_large = auto_compact_threshold_tokens
+            .zip(prompt_growth(&tail, turn))
+            .is_some_and(|(threshold, growth)| growth >= u64::from(threshold));
+        if !retaining_turn_is_too_large {
+            return Ok(Some(candidate));
+        }
+    }
+
+    let fallback_limit = match protect_from {
+        None => tail.len(),
+        // A stale or foreign id protects everything instead of silently
+        // widening the prefix that compaction may replace.
+        Some(message_id) => tail
+            .iter()
+            .position(|visible| visible.entry.message.message_id() == message_id)
+            .unwrap_or(0),
+    };
+    Ok((0..fallback_limit).rev().find_map(safe_cutoff_at))
 }
 
 /// What prompted a compaction — only the human-facing wrapper text differs;

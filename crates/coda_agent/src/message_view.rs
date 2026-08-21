@@ -26,35 +26,31 @@ pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 /// leading, then everything after its `cutoff`, minus transcript-only
 /// records. A thread with no summary yet is shown whole.
 pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
-    model_view_indexed(messages).map(|(_, entry)| entry)
+    let (summary, tail) = model_view_parts_indexed(messages);
+    summary.into_iter().chain(tail).map(|(_, entry)| entry)
 }
 
-/// Like [`model_view`], but paired with each entry's index in `messages` —
-/// callers that need physical position (e.g. [`crate::compaction::cutoff`])
-/// get it for free instead of re-deriving it with a separate lookup.
-pub(crate) fn model_view_indexed(
+/// Splits the model view into the active summary and the uncompressed tail.
+/// Both retain their physical index in `messages`, which compaction needs for
+/// its persisted coverage watermark.
+pub(crate) fn model_view_parts_indexed(
     messages: &[HistoryEntry],
-) -> impl Iterator<Item = (usize, &HistoryEntry)> + '_ {
-    let ordered: Box<dyn Iterator<Item = (usize, &HistoryEntry)> + '_> =
-        match last_summary(messages) {
-            // No allocation for the common (no-summary-yet) case.
-            None => Box::new(messages.iter().enumerate()),
-            Some((summary_idx, tail_start)) => {
-                let summary = &messages[summary_idx];
-                Box::new(
-                    std::iter::once((summary_idx, summary)).chain(
-                        messages[tail_start..]
-                            .iter()
-                            .enumerate()
-                            .map(move |(offset, entry)| (tail_start + offset, entry))
-                            .filter(move |(_, entry)| {
-                                entry.message.message_id() != summary.message.message_id()
-                            }),
-                    ),
-                )
-            }
-        };
-    ordered.filter(|(_, entry)| entry.message.visible_to_model())
+) -> (
+    Option<(usize, &HistoryEntry)>,
+    impl Iterator<Item = (usize, &HistoryEntry)> + '_,
+) {
+    let boundary = last_summary(messages);
+    let tail_start = boundary.map_or(0, |(_, tail_start)| tail_start);
+    let summary = boundary.map(|(summary_idx, _)| (summary_idx, &messages[summary_idx]));
+    let summary_id = summary.map(|(_, entry)| entry.message.message_id());
+    let visible_summary = summary.filter(|(_, entry)| entry.message.visible_to_model());
+    let tail = messages[tail_start..]
+        .iter()
+        .enumerate()
+        .map(move |(offset, entry)| (tail_start + offset, entry))
+        .filter(move |(_, entry)| Some(entry.message.message_id()) != summary_id)
+        .filter(|(_, entry)| entry.message.visible_to_model());
+    (visible_summary, tail)
 }
 
 /// A tool-call/result protocol violation in the messages visible to a provider.

@@ -262,6 +262,24 @@ fn a_protected_turn_with_a_predecessor_targets_the_predecessors_last_message() {
     );
 }
 
+#[test]
+fn a_preferred_boundary_is_before_the_named_turn_even_when_it_is_not_last() {
+    let first_turn = TurnId::from(MessageId::new());
+    let preferred_turn = TurnId::from(MessageId::new());
+    let later_turn = TurnId::from(MessageId::new());
+    let history = vec![
+        user_in(first_turn, "first"),
+        user_in(preferred_turn, "preferred"),
+        user_in(later_turn, "later"),
+    ];
+
+    assert_eq!(
+        planned_cutoff(&history, Some(preferred_turn), None, Some(u32::MAX))
+            .map(|cutoff| cutoff.coverage_message_id),
+        Some(history[0].message.message_id())
+    );
+}
+
 /// The thread's very first task is protected before its first generation.
 #[test]
 fn a_protected_opening_message_with_no_predecessor_has_nothing_to_compact() {
@@ -345,7 +363,8 @@ fn prompt_growth_starts_over_at_the_latest_summary() {
         assistant_in(turn, "second", Some(1_200)),
         tool_in(turn, "second"),
     ];
-    let visible: Vec<_> = message_view::model_view_indexed(&history).collect();
+    let (_, tail) = message_view::model_view_parts_indexed(&history);
+    let visible: Vec<_> = tail.map(VisibleEntry::from).collect();
 
     assert_eq!(prompt_growth(&visible, turn), Some(0));
 }

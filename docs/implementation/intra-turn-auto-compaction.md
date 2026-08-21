@@ -213,11 +213,11 @@ Selection is ordered:
    would send and validate its tool protocol. An orphan or duplicate tool
    result, duplicate call ID within a batch, a non-tool message before all
    results arrive, or end-of-view with missing results returns `Err`.
-2. Find the newest candidate boundary before `prefer_before_turn`. Validate the
-   provider-facing retained sequence formed by the proposed summary as a user
-   message followed by every model-visible message after the candidate. A
-   candidate is eligible only when this suffix contains complete tool batches
-   and no orphan result.
+2. Find the boundary immediately before the first model-visible message in
+   `prefer_before_turn`. Validate the provider-facing retained sequence formed
+   by the proposed summary as a user message followed by every model-visible
+   message after the candidate. A candidate is eligible only when this suffix
+   contains complete tool batches and no orphan result.
 3. When that boundary contains new content, walk adjacent assistant messages
    in the uncompacted part of the current turn. Sum each monotonic
    `prompt_tokens` difference; missing or decreasing usage breaks that estimate
