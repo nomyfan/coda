@@ -24,8 +24,8 @@ use coda_server::{
     ask_user::AskUserToolSpec,
     build_workspace_custom_instructions,
     config::{
-        KeepaliveConfig, PermissionMode, PermissionModeCell, ToolApprovalConfig, WorkspaceConfig,
-        load_server_config,
+        KeepaliveConfig, PermissionMode, PermissionModeCell, ProviderConfig, ToolApprovalConfig,
+        WorkspaceConfig, load_server_config,
     },
     files::{DEFAULT_LIMIT, FileIndex},
     hub::{
@@ -94,6 +94,8 @@ struct AppState {
     /// All configured providers, keyed by id. The dashboard chooses which one a
     /// session uses; `default_provider` is the fallback until it selects.
     providers: HashMap<String, Arc<ProviderHandle>>,
+    /// Models in the order declared by the server configuration.
+    provider_catalog: Vec<ProviderInfoWire>,
     default_provider: String,
     shutdown: CancellationToken,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
@@ -743,24 +745,63 @@ fn normalize_provider_selection(
     normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
 }
 
-/// The selectable models, sorted by id for a stable dashboard ordering. Each
-/// entry's `id` is `{provider_id}:{model_id}`; `model` is the display name.
-fn provider_infos(app: &AppState) -> Vec<ProviderInfoWire> {
-    let mut infos: Vec<ProviderInfoWire> = app
-        .providers
-        .iter()
-        .map(|(id, handle)| ProviderInfoWire {
-            id: id.clone(),
-            provider: handle.provider_id.clone(),
-            model: handle.model_name.clone(),
-            context_window: handle.context_window,
-            reasoning_efforts: handle.reasoning_efforts.clone(),
-            default_reasoning_effort: handle.default_reasoning_effort.clone(),
-            input_modalities: handle.input_modalities.clone(),
-        })
-        .collect();
-    infos.sort_by(|a, b| a.id.cmp(&b.id));
-    infos
+fn build_providers(
+    configs: Vec<ProviderConfig>,
+) -> (HashMap<String, Arc<ProviderHandle>>, Vec<ProviderInfoWire>) {
+    let mut providers = HashMap::new();
+    let mut catalog = Vec::new();
+
+    for config in configs {
+        let ProviderConfig {
+            id: provider_id,
+            kind,
+            api_key,
+            base_url,
+            include_usage,
+            models,
+        } = config;
+        let shared_provider = Arc::new(OpenAICompatible::new(
+            LLMProviderConfig {
+                api_key,
+                base_url,
+                include_usage,
+            },
+            kind,
+            provider_id.clone(),
+        ));
+
+        for model in models {
+            let id = format!("{}:{}", provider_id, model.id);
+            let handle = Arc::new(ProviderHandle {
+                provider: shared_provider.clone(),
+                model_id: model.id,
+                model_name: model.name,
+                context_window: model.context_window,
+                max_completion_tokens: model.max_completion_tokens,
+                // `u64` intermediate avoids overflow before `/ 5` brings
+                // it back into `u32` range.
+                auto_compact_threshold_tokens: model
+                    .auto_compact_threshold
+                    .unwrap_or((u64::from(model.context_window) * 4 / 5) as u32),
+                provider_id: provider_id.clone(),
+                reasoning_efforts: model.reasoning_efforts,
+                default_reasoning_effort: model.default_reasoning_effort,
+                input_modalities: model.input_modalities,
+            });
+            catalog.push(ProviderInfoWire {
+                id: id.clone(),
+                provider: handle.provider_id.clone(),
+                model: handle.model_name.clone(),
+                context_window: handle.context_window,
+                reasoning_efforts: handle.reasoning_efforts.clone(),
+                default_reasoning_effort: handle.default_reasoning_effort.clone(),
+                input_modalities: handle.input_modalities.clone(),
+            });
+            providers.insert(id, handle);
+        }
+    }
+
+    (providers, catalog)
 }
 
 async fn send_pending_approval_events<T: Transport>(
@@ -1017,7 +1058,7 @@ async fn dispatch_request(
         "list_providers" => (
             id,
             &ProviderCatalog {
-                providers: provider_infos(app),
+                providers: app.provider_catalog.clone(),
                 default_provider: app.default_provider.clone(),
             },
         )
@@ -2274,41 +2315,7 @@ async fn main() {
         let first = &server_config.providers[0];
         format!("{}:{}", first.id, first.models[0].id)
     };
-    let providers: HashMap<String, Arc<ProviderHandle>> = server_config
-        .providers
-        .into_iter()
-        .flat_map(|p| {
-            let shared_provider = Arc::new(OpenAICompatible::new(
-                LLMProviderConfig {
-                    api_key: p.api_key,
-                    base_url: p.base_url,
-                    include_usage: p.include_usage,
-                },
-                p.kind,
-                p.id.clone(),
-            ));
-            p.models.into_iter().map(move |m| {
-                let id = format!("{}:{}", p.id, m.id);
-                let handle = ProviderHandle {
-                    provider: shared_provider.clone(),
-                    model_id: m.id,
-                    model_name: m.name,
-                    context_window: m.context_window,
-                    max_completion_tokens: m.max_completion_tokens,
-                    // `u64` intermediate avoids overflow before `/ 5` brings
-                    // it back into `u32` range.
-                    auto_compact_threshold_tokens: m
-                        .auto_compact_threshold
-                        .unwrap_or((u64::from(m.context_window) * 4 / 5) as u32),
-                    provider_id: p.id.clone(),
-                    reasoning_efforts: m.reasoning_efforts,
-                    default_reasoning_effort: m.default_reasoning_effort,
-                    input_modalities: m.input_modalities,
-                };
-                (id, Arc::new(handle))
-            })
-        })
-        .collect();
+    let (providers, provider_catalog) = build_providers(server_config.providers);
 
     // One pool for the whole process; the schema is brought up to date here, so
     // deploying the binary is all it takes to create or migrate it.
@@ -2343,6 +2350,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         providers,
+        provider_catalog,
         default_provider,
         shutdown: shutdown.clone(),
         workspaces,
@@ -2404,6 +2412,51 @@ async fn main() {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    fn model_config(id: &str) -> coda_server::config::ModelConfig {
+        coda_server::config::ModelConfig {
+            id: id.into(),
+            name: id.into(),
+            context_window: 100_000,
+            max_completion_tokens: None,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            input_modalities: vec![Modality::Text],
+            auto_compact_threshold: None,
+        }
+    }
+
+    #[test]
+    fn provider_catalog_preserves_config_order() {
+        let configs = vec![
+            ProviderConfig {
+                id: "zeta".into(),
+                kind: coda_openai::ProviderKind::Generic,
+                api_key: "test".into(),
+                base_url: "https://example.com".into(),
+                include_usage: true,
+                models: vec![model_config("model-z"), model_config("model-a")],
+            },
+            ProviderConfig {
+                id: "alpha".into(),
+                kind: coda_openai::ProviderKind::Generic,
+                api_key: "test".into(),
+                base_url: "https://example.com".into(),
+                include_usage: true,
+                models: vec![model_config("model-b")],
+            },
+        ];
+
+        let (_, catalog) = build_providers(configs);
+
+        assert_eq!(
+            catalog
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec!["zeta:model-z", "zeta:model-a", "alpha:model-b"]
+        );
+    }
 
     #[test]
     fn no_reasoning_controls_keep_none() {

@@ -17,15 +17,18 @@ function effortLabel(effort: ReasoningEffort) {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
-/** Map of provider name → list of its models, as received from the server. */
-type ProviderGroups = Record<string, ProviderInfo[]>;
-
-function groupProviders(providers: ProviderInfo[]): ProviderGroups {
-  const groups: ProviderGroups = {};
+/** Group providers without changing the catalog order received from the server. */
+export function groupProviders(providers: ProviderInfo[]): Array<[string, ProviderInfo[]]> {
+  const groups = new Map<string, ProviderInfo[]>();
   for (const info of providers) {
-    (groups[info.provider] ??= []).push(info);
+    const models = groups.get(info.provider);
+    if (models) {
+      models.push(info);
+    } else {
+      groups.set(info.provider, [info]);
+    }
   }
-  return groups;
+  return [...groups.entries()];
 }
 
 export function ModelSelector({
@@ -54,7 +57,6 @@ export function ModelSelector({
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
 }) {
   const groups = useMemo(() => groupProviders(providers), [providers]);
-  const providerNames = useMemo(() => Object.keys(groups).sort(), [groups]);
   const selected = providers.find((info) => info.id === providerId);
   const efforts = selected?.reasoning_efforts ?? [];
 
@@ -65,8 +67,7 @@ export function ModelSelector({
   const catalog = { url: serverUrl, providers };
 
   // Build a flat list of elements so Radix viewport receives only valid children.
-  const dropdownItems = providerNames.flatMap((providerName, groupIndex) => {
-    const models = groups[providerName];
+  const dropdownItems = groups.flatMap(([providerName, models], groupIndex) => {
     return [
       ...(groupIndex > 0 ? [<SelectSeparator key={`sep-${providerName}`} />] : []),
       <SelectGroup key={providerName}>
