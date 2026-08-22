@@ -247,7 +247,7 @@ crates/coda_ptc/
 
 ### `RunJavaScriptTool`（`coda_ptc`）
 
-定义 `run_javascript({code})`、校验源码大小、从外层 `ToolCallContext` 取得 invoker、创建有预算的 `NestedCallScope` 并调用 executor，最后把 report 作为外层工具结果返回。每个 bridge call 都从 scope 派生不含 invoker 的 child context；成功 child 只合并进 scope，失败 child effects 丢弃。`RunJavaScriptTool` 即将返回 `ToolResult::Ok(report)` 时才调用一次 `scope.commit_into_outer()`；返回任何 outer `ToolError` 时直接 drop scope。
+定义 `run_javascript({code})`、校验源码大小、从外层 `ToolCallContext` 取得 invoker、创建有预算的 `HostCallScope` 并调用 executor，最后把 report 作为外层工具结果返回。每个 bridge call 都从 scope 派生不含 invoker 的 child context；成功 child 只合并进 scope，失败 child effects 丢弃。`RunJavaScriptTool` 即将返回 `ToolResult::Ok(report)` 时才调用一次 `scope.commit_into_outer()`；返回任何 outer `ToolError` 时直接 drop scope。
 
 ### `JsExecutor`（`coda_ptc::engine`）
 
@@ -292,7 +292,7 @@ pub trait HostToolInvoker: Send + Sync {
         &self,
         name: String,
         arguments_json: String,
-        // Created by NestedCallScope: shares staged state/artifacts and budget,
+        // Created by HostCallScope: shares staged state/artifacts and budget,
         // uses a child token, and always has invoker = None.
         ctx: ToolCallContext,
     ) -> Pin<Box<dyn Future<Output = HostToolCallResult> + Send>>;
@@ -305,11 +305,11 @@ pub struct HostEffectLimits {
 
 /// Owns one script's cumulative host-effect accounting. It references the
 /// outer context's state/artifact sinks but never carries an invoker.
-pub struct NestedCallScope { /* private */ }
+pub struct HostCallScope { /* private */ }
 
-/// One nested call's isolated effects. Drop rolls them back and releases its
+/// One host tool call's isolated effects. Drop rolls them back and releases its
 /// reservations; commit merges them into the script scope.
-pub struct NestedToolCall {
+pub struct StagedToolCall {
     context: ToolCallContext,
     /* private commit guard */
 }
@@ -318,22 +318,22 @@ impl ToolCallContext {
     /// Driver-only construction path for the outer run_javascript call.
     pub fn with_host_invoker(self, invoker: Arc<dyn HostToolInvoker>) -> Self;
 
-    /// Returns None for every ordinary and nested tool context.
+    /// Returns None for every ordinary and host tool context.
     pub fn host_invoker(&self) -> Option<Arc<dyn HostToolInvoker>>;
 
     /// Extracts only state/artifact sinks into the scope; it does not clone the
     /// outer context or its invoker.
-    pub fn nested_call_scope(&self, limits: HostEffectLimits) -> NestedCallScope;
+    pub fn host_call_scope(&self, limits: HostEffectLimits) -> HostCallScope;
 
     /// Atomically reserves the exact retained size and stages the artifact.
     /// The context returns ResourceLimit without recording it when over budget.
     pub fn record_artifact(&self, artifact: ToolArtifact) -> ToolResult<()>;
 }
 
-impl NestedCallScope {
+impl HostCallScope {
     /// Shares the scope's successful state/artifact view and cumulative budget,
     /// uses `cancel`, and deliberately strips the parent's invoker capability.
-    pub fn for_nested_call(&self, cancel: CancellationToken) -> NestedToolCall;
+    pub fn begin_tool_call(&self, cancel: CancellationToken) -> StagedToolCall;
 
     /// Drains the scope's final state map and accumulated artifacts into the
     /// outer context exactly once. Infallible after successful reservations;
@@ -341,7 +341,7 @@ impl NestedCallScope {
     pub fn commit_into_outer(self);
 }
 
-impl NestedToolCall {
+impl StagedToolCall {
     /// A clone passed by value to HostToolInvoker::call while this guard stays
     /// with the bridge until the future settles.
     pub fn context(&self) -> ToolCallContext;
@@ -353,7 +353,7 @@ impl NestedToolCall {
 
 pub trait ThreadState: Send + Sync {
     fn get(&self, kind: &str) -> Option<serde_json::Value>;
-    /// PTC's nested implementation enforces the state byte budget here and
+    /// PTC's staged implementation enforces the state byte budget here and
     /// stores only the latest value per key.
     fn set(&self, kind: &str, value: serde_json::Value) -> ToolResult<()>;
 }
@@ -392,7 +392,7 @@ pub enum JsRunError {
 }
 ```
 
-bridge 的单次调用顺序固定为：`scope.for_nested_call(child_token)` → `host.call(name, args, pending.context()).await` → 校验单次及累计 result budget → 仅在全部成功时 `pending.commit()`。这里的 commit 只写入 scope，不触达外层 `CallState`/artifact sink；host 返回错误或 result 超限都会 drop guard，丢弃该 child 的 staged effects。executor 结束后，`RunJavaScriptTool` 根据准备返回的外层 `ToolResult` 决定是否调用一次 `scope.commit_into_outer()`。`AgentToolInvoker` 从不持有 `pending`、scope 或父 context，也无权决定 commit；worker/bridge 持有 child commit guard，host Future 只拿受限 context clone，因此所有权关系闭合且没有递归 capability。
+bridge 的单次调用顺序固定为：`scope.begin_tool_call(child_token)` → `host.call(name, args, staged_call.context()).await` → 校验单次及累计 result budget → 仅在全部成功时 `staged_call.commit()`。这里的 commit 只写入 scope，不触达外层 `CallState`/artifact sink；host 返回错误或 result 超限都会 drop guard，丢弃该 child 的 staged effects。executor 结束后，`RunJavaScriptTool` 根据准备返回的外层 `ToolResult` 决定是否调用一次 `scope.commit_into_outer()`。`AgentToolInvoker` 从不持有 `staged_call`、scope 或父 context，也无权决定 commit；worker/bridge 持有 child commit guard，host Future 只拿受限 context clone，因此所有权关系闭合且没有递归 capability。
 
 `JavaScriptTool::execute` 对普通语法错误、JS exception、deadline 和工具错误返回一个可解析的文本 report，并明确已经完成多少次嵌套调用。只有用户取消映射为 `ToolError::Aborted`，与现有 turn cancellation 语义一致。
 
@@ -434,10 +434,10 @@ pub struct PendingToolCall {
 
 ### State 和 artifacts
 
-`RunJavaScriptTool` 从外层 context 建立一个 script-scoped `NestedCallScope`。它拥有累计预算和对外层 state/artifact sinks 的引用，但不含 invoker。每个 bridge call 再得到独立的 `NestedToolCall`：
+`RunJavaScriptTool` 从外层 context 建立一个 script-scoped `HostCallScope`。它拥有累计预算和对外层 state/artifact sinks 的引用，但不含 invoker。每个 bridge call 再得到独立的 `StagedToolCall`：
 
 - child context 使用 host-call child token，`invoker = None`，因此普通嵌套工具不能递归调用工具，也不存在 `context → invoker → context` 的引用环。
-- child state/artifacts 先隔离暂存。host tool 成功后 bridge 调用 `NestedToolCall::commit()`，只把 effects 合并进 scope；验证失败、执行失败、超时或取消时 drop guard，丢弃该 child effects 并释放预留预算。
+- child state/artifacts 先隔离暂存。host tool 成功后 bridge 调用 `StagedToolCall::commit()`，只把 effects 合并进 scope；验证失败、执行失败、超时或取消时 drop guard，丢弃该 child effects 并释放预留预算。
 - scope 内部用 map 保存 state 的最终值并用 vector 累积 artifacts；它在整个脚本期间不调用外层 `ThreadState::set` 或 `record_artifact`。已成功 child commit 的顺序调用对下一次可见；同一个 state key 只保留最后一个完整值，并发写同 key 仍按实际 child commit 顺序决定最终值，不承诺确定顺序。
 - artifact 和 state 在暂存时就原子预留 script 累计预算；commit 因此不再失败。并发 child 的在途 reservation 也计入预算，避免 16 个调用同时越界。
 - `RunJavaScriptTool` 返回 `ToolResult::Ok(report)` 前调用一次 `scope.commit_into_outer()`，把最终 state map 的每个 key 只写一次，并批量转移 artifacts。语法错误、普通 JS exception、deadline、bridge/tool error 等若按可解析的 `JsRunReport` 返回，仍属于 `Ok(report)`，所以保留此前已完成调用的 effects。
@@ -479,7 +479,7 @@ QuickJS 专用线程只解释 JS，通过有界 channel 发 `ProgrammaticCallReq
 
 ### host effects 使用独立预算和 child transaction
 
-QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artifacts。选择 script-scoped budget + per-nested-call staging + single final commit：artifact/state 在产生外部副作用前或成功返回前预留，host call 成功只 commit 到 scope；scope 内同 key state 只保留最新值。只有外层 runner 即将返回 `Ok(report)` 时，`commit_into_outer()` 才把每个最终 key 写入一次并批量转移 artifacts。相比每个 child 直接写外层 context，这需要修改 `ThreadState::set`、artifact API 和 file tool 的操作顺序，但能在内存已经膨胀或文件已经写入之前 fail closed，避免外层 `CallState` 重新累计同 key 历史值，并保留 outer error 不提交 effects 的现有语义。
+QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artifacts。选择 script-scoped budget + per-host-call staging + single final commit：artifact/state 在产生外部副作用前或成功返回前预留，host call 成功只 commit 到 scope；scope 内同 key state 只保留最新值。只有外层 runner 即将返回 `Ok(report)` 时，`commit_into_outer()` 才把每个最终 key 写入一次并批量转移 artifacts。相比每个 child 直接写外层 context，这需要修改 `ThreadState::set`、artifact API 和 file tool 的操作顺序，但能在内存已经膨胀或文件已经写入之前 fail closed，避免外层 `CallState` 重新累计同 key 历史值，并保留 outer error 不提交 effects 的现有语义。
 
 ### 中间结果不进入 Message history
 
@@ -531,7 +531,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
       Purpose: 先固定依赖方向，避免 engine 实现扩散到普通工具和 policy 层。
       Verification: `cargo tree -p coda_ptc` 不出现 `coda_agent`、`coda_tools` 或 `coda_server`。
 
-- [x] **[core API]** 在 `coda_core` 增加中性的 `HostToolInvoker`、`HostToolCallResult`、`HostToolCallError`、`NestedCallScope` 和 `NestedToolCall`；`ToolCallContext` 默认不携带 invoker，由 `NestedCallScope::for_nested_call` 派生共享预算但剥离 invoker 的 child context。`NestedToolCall::commit` 只写 scope，`NestedCallScope::commit_into_outer` 消费 scope 并执行唯一一次最终提交。让 `ThreadState::set` 和 `record_artifact` 返回可传播的 resource-limit error。JS limits/report/engine error 和 host-error-to-JS 映射留在 `coda_ptc`。
+- [x] **[core API]** 在 `coda_core` 增加中性的 `HostToolInvoker`、`HostToolCallResult`、`HostToolCallError`、`HostCallScope` 和 `StagedToolCall`；`ToolCallContext` 默认不携带 invoker，由 `HostCallScope::begin_tool_call` 派生共享预算但剥离 invoker 的 child context。`StagedToolCall::commit` 只写 scope，`HostCallScope::commit_into_outer` 消费 scope 并执行唯一一次最终提交。让 `ThreadState::set` 和 `record_artifact` 返回可传播的 resource-limit error。JS limits/report/engine error 和 host-error-to-JS 映射留在 `coda_ptc`。
       Purpose: 给 PTC 一个窄的 host trust boundary，同时避免普通工具默认获得调用其他工具的能力。
       Verification: invoker 缺失、调用成功、typed error 和 cancellation 单元测试；weak-reference/drop test 证明无 `context → invoker → context` 环；child context 的 invoker 恒为 `None`，失败 child 不合并 effects；final commit 只能消费 scope 一次。
 
@@ -555,7 +555,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
       Purpose: 让默认 tools、`AGENT.md` 解析和名称冲突校验继续走现有路径。
       Verification: spec name 与 built tool name 一致；显式包含/省略 `run_javascript` 的 agent config tests。
 
-- [x] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时，把带有动态工具列表的 runner descriptor 和隐藏 snapshot 一起构造。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `NestedCallScope` 显式传入的受限 child context。
+- [x] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时，把带有动态工具列表的 runner descriptor 和隐藏 snapshot 一起构造。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `HostCallScope` 显式传入的受限 child context。
       Purpose: 保证 MVP 没有嵌套审批 continuation，同时不绕过 workspace tightening、文件锁、参数校验或 rewind 所依赖的 state anchor。
       Verification: 默认 explore 只暴露四项、accept_edits/yolo 暴露六项；workspace approval_required 只移除命中的内部工具；命中 runner 自身时正常 Suspended，批准后使用原 snapshot；mid-script 收紧 mode 后受影响工具返回 `TOOL_UNAVAILABLE`，放宽不扩权；嵌套普通工具看不到 invoker，并覆盖 abort、deadline、state/artifact budget tests。
 

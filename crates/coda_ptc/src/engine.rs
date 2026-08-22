@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use coda_core::tool::{HostToolCallError, HostToolInvoker, NestedCallScope};
+use coda_core::tool::{HostCallScope, HostToolCallError, HostToolInvoker};
 use rquickjs::{AsyncContext, AsyncRuntime, Function, convert::List, function::Async};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -210,7 +210,7 @@ impl JsExecutor {
         code: String,
         exposed_tools: Arc<[String]>,
         invoker: Arc<dyn HostToolInvoker>,
-        scope: NestedCallScope,
+        scope: HostCallScope,
         cancel: CancellationToken,
     ) -> Result<JsRunReport, JsEngineError> {
         let deadline_at = tokio::time::Instant::now() + self.limits.wall_time;
@@ -295,7 +295,7 @@ impl JsExecutor {
                     if started_calls >= limits.max_calls {
                         let _ = request.reply.send(Err(BridgeCallError::new(
                             "CALL_LIMIT",
-                            "maximum nested tool calls exceeded",
+                            "maximum host tool calls exceeded",
                         )));
                         continue;
                     }
@@ -314,9 +314,9 @@ impl JsExecutor {
                             )));
                             return;
                         };
-                        let nested = scope.for_nested_call(call_cancel);
+                        let staged_call = scope.begin_tool_call(call_cancel);
                         let result = invoker
-                            .call(request.name, request.arguments, nested.context())
+                            .call(request.name, request.arguments, staged_call.context())
                             .await;
                         let response = match result {
                             Ok(result) if result.output.len() > limits.result_bytes => {
@@ -341,7 +341,7 @@ impl JsExecutor {
                                     ))
                                 } else {
                                     *total = next;
-                                    nested.commit();
+                                    staged_call.commit();
                                     Ok(result.output)
                                 }
                             }

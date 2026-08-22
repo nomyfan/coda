@@ -47,7 +47,9 @@ impl ThreadState for NoState {
 /// A retained host-side effect would exceed the budget assigned to this call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEffectError {
+    /// Retained effect category that exceeded its assigned budget.
     pub resource: &'static str,
+    /// Maximum number of retained bytes allowed for that category.
     pub limit_bytes: usize,
 }
 
@@ -66,6 +68,7 @@ impl std::error::Error for HostEffectError {}
 /// Result returned by a tool invoked through a programmatic host bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostToolCallResult {
+    /// Raw tool output returned to the programmatic caller.
     pub output: String,
 }
 
@@ -82,7 +85,7 @@ pub enum HostToolCallError {
 /// The only capability that lets a tool call another registered tool.
 ///
 /// Normal [`ToolCallContext`] values do not carry one. The agent integration
-/// installs it only for `run_javascript`, and each nested call receives a child
+/// installs it only for `run_javascript`, and each host call receives a child
 /// context with the invoker removed.
 pub trait HostToolInvoker: Send + Sync {
     /// Frozen generation-time capability snapshot, in descriptor order.
@@ -102,7 +105,10 @@ trait ArtifactSink: Send + Sync {
 }
 
 #[derive(Default)]
-struct UnboundedArtifactSink(std::sync::Mutex<Vec<ToolArtifact>>);
+struct UnboundedArtifactSink(
+    /// Artifacts retained by ordinary tool calls that have no script budget.
+    std::sync::Mutex<Vec<ToolArtifact>>,
+);
 
 impl ArtifactSink for UnboundedArtifactSink {
     fn record(&self, artifact: ToolArtifact) -> Result<(), HostEffectError> {
@@ -127,7 +133,9 @@ pub struct ToolCallContext {
     /// Where a tool keeps anything that has to outlive the call — see
     /// [`ThreadState`].
     pub state: Arc<dyn ThreadState>,
+    /// Destination for presentation artifacts produced by this call.
     artifacts: Arc<dyn ArtifactSink>,
+    /// Optional capability installed only for a programmatic runner call.
     invoker: Option<Arc<dyn HostToolInvoker>>,
 }
 
@@ -206,31 +214,44 @@ impl From<HostEffectError> for ToolError {
 /// Limits for effects retained by one programmatic script.
 #[derive(Debug, Clone, Copy)]
 pub struct HostEffectLimits {
+    /// Maximum bytes retained for script-scoped thread state.
     pub state_bytes: usize,
+    /// Maximum bytes retained for script-scoped presentation artifacts.
     pub artifact_bytes: usize,
 }
 
 struct ScopedEffects {
+    /// Final value and retained size for each state key committed by child calls.
     state: BTreeMap<String, (serde_json::Value, usize)>,
+    /// Artifacts committed by completed child calls in completion order.
     artifacts: Vec<ToolArtifact>,
+    /// State bytes reserved by both committed effects and in-flight children.
     reserved_state_bytes: usize,
+    /// Artifact bytes reserved by both committed effects and in-flight children.
     reserved_artifact_bytes: usize,
+    /// Whether the staged effects have already been consumed by the outer call.
     finalized: bool,
 }
 
-struct NestedScopeInner {
+struct HostCallScopeInner {
+    /// Destination that receives the script's effects after successful execution.
     outer: ToolCallContext,
+    /// Shared limits enforced across every child call in this script.
     limits: HostEffectLimits,
+    /// Script-wide effects and reservations protected for concurrent child calls.
     effects: std::sync::Mutex<ScopedEffects>,
 }
 
-/// Script-wide staging area for nested tool effects.
+/// Script-wide staging area for effects produced by host tool calls.
 #[derive(Clone)]
-pub struct NestedCallScope(Arc<NestedScopeInner>);
+pub struct HostCallScope(
+    /// Shared scope state used by the runner and all of its child calls.
+    Arc<HostCallScopeInner>,
+);
 
-impl NestedCallScope {
+impl HostCallScope {
     pub fn new(outer: ToolCallContext, limits: HostEffectLimits) -> Self {
-        Self(Arc::new(NestedScopeInner {
+        Self(Arc::new(HostCallScopeInner {
             outer,
             limits,
             effects: std::sync::Mutex::new(ScopedEffects {
@@ -244,12 +265,12 @@ impl NestedCallScope {
     }
 
     /// Create an isolated child call. Its context deliberately has no invoker.
-    pub fn for_nested_call(&self, cancel: CancellationToken) -> NestedToolCall {
-        let state = Arc::new(NestedThreadState {
+    pub fn begin_tool_call(&self, cancel: CancellationToken) -> StagedToolCall {
+        let state = Arc::new(StagedThreadState {
             scope: self.0.clone(),
             writes: std::sync::Mutex::new(BTreeMap::new()),
         });
-        let artifacts = Arc::new(NestedArtifactSink {
+        let artifacts = Arc::new(StagedArtifactSink {
             scope: self.0.clone(),
             artifacts: std::sync::Mutex::new(Vec::new()),
         });
@@ -259,7 +280,7 @@ impl NestedCallScope {
             artifacts: artifacts.clone(),
             invoker: None,
         };
-        NestedToolCall {
+        StagedToolCall {
             scope: self.clone(),
             state,
             artifacts,
@@ -292,12 +313,14 @@ impl NestedCallScope {
     }
 }
 
-struct NestedThreadState {
-    scope: Arc<NestedScopeInner>,
+struct StagedThreadState {
+    /// Script scope used for committed reads and shared budget reservations.
+    scope: Arc<HostCallScopeInner>,
+    /// Last write per key staged by this child until it commits.
     writes: std::sync::Mutex<BTreeMap<String, (serde_json::Value, usize)>>,
 }
 
-impl NestedThreadState {
+impl StagedThreadState {
     fn discard(&self) {
         let mut writes = self.writes.lock().unwrap();
         let released = writes.values().map(|(_, bytes)| *bytes).sum::<usize>();
@@ -307,7 +330,7 @@ impl NestedThreadState {
     }
 }
 
-impl ThreadState for NestedThreadState {
+impl ThreadState for StagedThreadState {
     fn get(&self, kind: &str) -> Option<serde_json::Value> {
         if let Some((value, _)) = self.writes.lock().unwrap().get(kind) {
             return Some(value.clone());
@@ -327,7 +350,7 @@ impl ThreadState for NestedThreadState {
         let mut effects = self.scope.effects.lock().unwrap();
         if effects.finalized {
             return Err(HostEffectError {
-                resource: "finalized nested call scope",
+                resource: "finalized host call scope",
                 limit_bytes: 0,
             });
         }
@@ -337,7 +360,7 @@ impl ThreadState for NestedThreadState {
             .saturating_add(bytes);
         if next > self.scope.limits.state_bytes {
             return Err(HostEffectError {
-                resource: "nested tool state",
+                resource: "host tool state",
                 limit_bytes: self.scope.limits.state_bytes,
             });
         }
@@ -347,12 +370,14 @@ impl ThreadState for NestedThreadState {
     }
 }
 
-struct NestedArtifactSink {
-    scope: Arc<NestedScopeInner>,
+struct StagedArtifactSink {
+    /// Script scope that owns the shared artifact byte reservation.
+    scope: Arc<HostCallScopeInner>,
+    /// Artifacts and retained sizes staged by this child until it commits.
     artifacts: std::sync::Mutex<Vec<(ToolArtifact, usize)>>,
 }
 
-impl NestedArtifactSink {
+impl StagedArtifactSink {
     fn discard(&self) {
         let mut artifacts = self.artifacts.lock().unwrap();
         let released = artifacts.iter().map(|(_, bytes)| *bytes).sum::<usize>();
@@ -366,21 +391,21 @@ impl NestedArtifactSink {
     }
 }
 
-impl ArtifactSink for NestedArtifactSink {
+impl ArtifactSink for StagedArtifactSink {
     fn record(&self, artifact: ToolArtifact) -> Result<(), HostEffectError> {
         let bytes = artifact_retained_bytes(&artifact);
         let mut artifacts = self.artifacts.lock().unwrap();
         let mut effects = self.scope.effects.lock().unwrap();
         if effects.finalized {
             return Err(HostEffectError {
-                resource: "finalized nested call scope",
+                resource: "finalized host call scope",
                 limit_bytes: 0,
             });
         }
         let next = effects.reserved_artifact_bytes.saturating_add(bytes);
         if next > self.scope.limits.artifact_bytes {
             return Err(HostEffectError {
-                resource: "nested tool artifacts",
+                resource: "host tool artifacts",
                 limit_bytes: self.scope.limits.artifact_bytes,
             });
         }
@@ -406,16 +431,21 @@ fn artifact_retained_bytes(artifact: &ToolArtifact) -> usize {
     }
 }
 
-/// A single nested tool call and its isolated effects.
-pub struct NestedToolCall {
-    scope: NestedCallScope,
-    state: Arc<NestedThreadState>,
-    artifacts: Arc<NestedArtifactSink>,
+/// A single host tool call whose isolated effects are staged until commit.
+pub struct StagedToolCall {
+    /// Script scope that receives this child's effects on commit.
+    scope: HostCallScope,
+    /// Child-local thread-state staging exposed through `context`.
+    state: Arc<StagedThreadState>,
+    /// Child-local artifact staging exposed through `context`.
+    artifacts: Arc<StagedArtifactSink>,
+    /// Restricted context passed to the host tool, with no host invoker.
     context: ToolCallContext,
+    /// Prevents `Drop` from discarding effects after an explicit commit.
     committed: bool,
 }
 
-impl NestedToolCall {
+impl StagedToolCall {
     pub fn context(&self) -> ToolCallContext {
         self.context.clone()
     }
@@ -448,7 +478,7 @@ impl NestedToolCall {
     }
 }
 
-impl Drop for NestedToolCall {
+impl Drop for StagedToolCall {
     fn drop(&mut self) {
         if !self.committed {
             self.state.discard();

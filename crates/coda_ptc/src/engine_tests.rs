@@ -114,8 +114,8 @@ impl HostToolInvoker for EffectInvoker {
     }
 }
 
-fn scope() -> NestedCallScope {
-    NestedCallScope::new(
+fn scope() -> HostCallScope {
+    HostCallScope::new(
         ToolCallContext::default(),
         HostEffectLimits {
             state_bytes: 1024 * 1024,
@@ -305,7 +305,7 @@ return settled;
 }
 
 #[tokio::test]
-async fn nested_call_and_result_limits_reject_inside_javascript() {
+async fn host_call_and_result_limits_reject_inside_javascript() {
     let call_limits = PtcLimits {
         max_calls: 1,
         ..PtcLimits::default()
@@ -340,7 +340,7 @@ async fn result_limit_discards_the_childs_staged_effects() {
     let state = Arc::new(RecordingState::default());
     let outer = ToolCallContext::new(CancellationToken::new(), state.clone());
     let inspect_artifacts = outer.clone();
-    let scope = NestedCallScope::new(
+    let scope = HostCallScope::new(
         outer,
         HostEffectLimits {
             state_bytes: limits.state_bytes,

@@ -90,7 +90,7 @@ impl Tool for RunJavaScriptTool {
                     "run_javascript has no persisted capability snapshot".to_string(),
                 ));
             }
-            let scope = coda_core::tool::NestedCallScope::new(
+            let scope = coda_core::tool::HostCallScope::new(
                 ctx.clone(),
                 HostEffectLimits {
                     state_bytes: limits.state_bytes,

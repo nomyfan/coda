@@ -31,12 +31,12 @@ fn limits() -> HostEffectLimits {
 }
 
 #[test]
-fn nested_state_is_last_write_wins_and_commits_outer_once() {
+fn staged_state_is_last_write_wins_and_commits_outer_once() {
     let state = Arc::new(RecordingState::default());
     let outer = ToolCallContext::new(CancellationToken::new(), state.clone());
-    let scope = NestedCallScope::new(outer, limits());
+    let scope = HostCallScope::new(outer, limits());
 
-    let first = scope.for_nested_call(CancellationToken::new());
+    let first = scope.begin_tool_call(CancellationToken::new());
     first
         .context()
         .state
@@ -50,7 +50,7 @@ fn nested_state_is_last_write_wins_and_commits_outer_once() {
     first.commit();
 
     assert_eq!(state.get("todos"), None);
-    let second = scope.for_nested_call(CancellationToken::new());
+    let second = scope.begin_tool_call(CancellationToken::new());
     assert_eq!(
         second.context().state.get("todos"),
         Some(serde_json::json!([2]))
@@ -73,7 +73,7 @@ fn nested_state_is_last_write_wins_and_commits_outer_once() {
 fn dropped_child_releases_budget_and_does_not_commit() {
     let state = Arc::new(RecordingState::default());
     let outer = ToolCallContext::new(CancellationToken::new(), state.clone());
-    let scope = NestedCallScope::new(
+    let scope = HostCallScope::new(
         outer,
         HostEffectLimits {
             state_bytes: 6,
@@ -81,7 +81,7 @@ fn dropped_child_releases_budget_and_does_not_commit() {
         },
     );
 
-    let discarded = scope.for_nested_call(CancellationToken::new());
+    let discarded = scope.begin_tool_call(CancellationToken::new());
     discarded
         .context()
         .state
@@ -89,7 +89,7 @@ fn dropped_child_releases_budget_and_does_not_commit() {
         .unwrap();
     drop(discarded);
 
-    let kept = scope.for_nested_call(CancellationToken::new());
+    let kept = scope.begin_tool_call(CancellationToken::new());
     kept.context()
         .state
         .set("key", serde_json::json!("b"))
@@ -102,14 +102,14 @@ fn dropped_child_releases_budget_and_does_not_commit() {
 #[test]
 fn artifact_budget_is_checked_before_retention() {
     let outer = ToolCallContext::default();
-    let scope = NestedCallScope::new(
+    let scope = HostCallScope::new(
         outer,
         HostEffectLimits {
             state_bytes: 1024,
             artifact_bytes: 3,
         },
     );
-    let child = scope.for_nested_call(CancellationToken::new());
+    let child = scope.begin_tool_call(CancellationToken::new());
     let error = child
         .context()
         .record_artifact(ToolArtifact::FileDiff {
@@ -118,7 +118,7 @@ fn artifact_budget_is_checked_before_retention() {
             patch: "long".to_string(),
         })
         .unwrap_err();
-    assert_eq!(error.resource, "nested tool artifacts");
+    assert_eq!(error.resource, "host tool artifacts");
 }
 
 #[derive(Clone)]

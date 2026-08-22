@@ -269,7 +269,7 @@ impl Tool for WriteFileTool {
             }
 
             // Reserve retained host memory before creating directories or the
-            // file. A nested PTC call therefore fails closed on budget exceed.
+            // file. A PTC host call therefore fails closed on budget exceed.
             ctx.record_artifact(file_diff_artifact(
                 &params.file_path,
                 FileChangeOperation::Create,
