@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 
-import { showsToolEntryText } from "../src/components/transcript.tsx";
+import { formatPtcResult, showsToolEntryText } from "../src/components/transcript.tsx";
 import { type AssistantMessage, type ToolMessage, toolDisplayName } from "../src/lib/protocol.ts";
 import { applySnapshotToSession, reduceEvent, type OpenedSession } from "../src/store/session.ts";
 
@@ -122,4 +122,23 @@ test("PTC text is hidden while running and retained beside file diffs when compl
       ],
     }),
   ).toBe(true);
+});
+
+test("a JSON PTC report is pretty-printed and plain errors fall back", () => {
+  expect(
+    formatPtcResult({
+      id: "json",
+      kind: "tool_result",
+      content: '{"ok":true,"value":{"count":2}}',
+      script: code,
+    }),
+  ).toBe('{\n  "ok": true,\n  "value": {\n    "count": 2\n  }\n}');
+  expect(
+    formatPtcResult({
+      id: "plain",
+      kind: "tool_result",
+      content: "JavaScript execution aborted",
+      script: code,
+    }),
+  ).toBeUndefined();
 });

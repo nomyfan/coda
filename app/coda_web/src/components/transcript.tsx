@@ -31,6 +31,7 @@ import {
   Suspense,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -476,8 +477,24 @@ export function showsToolEntryText(entry: TranscriptEntry) {
   return entry.script !== undefined ? entry.kind === "tool_result" : !hasFileDiffArtifacts(entry);
 }
 
+export function formatPtcResult(entry: Pick<TranscriptEntry, "content" | "kind" | "script">) {
+  if (entry.script === undefined || entry.kind !== "tool_result") {
+    return undefined;
+  }
+  try {
+    return JSON.stringify(JSON.parse(entry.content), null, 2);
+  } catch {
+    return undefined;
+  }
+}
+
 function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
+  const { content, kind, script } = entry;
   const fileDiffs = entry.artifacts?.filter((artifact) => artifact.type === "file_diff") ?? [];
+  const formattedResult = useMemo(
+    () => formatPtcResult({ content, kind, script }),
+    [content, kind, script],
+  );
   const theme = useSyncExternalStore(subscribeThemeChange, () =>
     resolveTheme(getStoredThemePreference()),
   );
@@ -518,14 +535,18 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
               <CopyContentButton content={entry.content} label="result" />
             </div>
           ) : null}
-          <pre
-            className={cn(
-              "whitespace-pre-wrap break-words font-sans text-sm leading-6",
-              entry.script === undefined && "pr-10",
-            )}
-          >
-            {entry.content}
-          </pre>
+          {formattedResult !== undefined ? (
+            <CodeBlock code={formattedResult} language="json" className="my-0 max-h-80" />
+          ) : (
+            <pre
+              className={cn(
+                "whitespace-pre-wrap break-words font-sans text-sm leading-6",
+                entry.script === undefined && "pr-10",
+              )}
+            >
+              {entry.content}
+            </pre>
+          )}
         </div>
       ) : null}
       {fileDiffs.map((artifact) => (
