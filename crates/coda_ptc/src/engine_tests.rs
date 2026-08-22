@@ -47,6 +47,27 @@ impl HostToolInvoker for FakeInvoker {
     }
 }
 
+struct FailingInvoker;
+
+impl HostToolInvoker for FailingInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".to_string()])
+    }
+
+    fn call(
+        &self,
+        _name: String,
+        _arguments: String,
+        _context: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        Box::pin(async {
+            Err(HostToolCallError::Execution(
+                "Failed to open file: No such file or directory".to_string(),
+            ))
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingState(std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>);
 
@@ -106,6 +127,20 @@ fn scope() -> NestedCallScope {
 async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
     let invoker = Arc::new(FakeInvoker::new(names));
     JsExecutor::new(limits)
+        .run(
+            code.to_string(),
+            invoker.exposed_tools(),
+            invoker,
+            scope(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn run_with_tool_error(code: &str) -> JsRunReport {
+    let invoker = Arc::new(FailingInvoker);
+    JsExecutor::new(PtcLimits::default())
         .run(
             code.to_string(),
             invoker.exposed_tools(),
@@ -187,6 +222,89 @@ async fn syntax_and_runtime_exceptions_are_structured_reports() {
 }
 
 #[tokio::test]
+async fn uncaught_tool_error_preserves_its_code() {
+    let report = run_with_tool_error("await tools.read_file({ file_path: 'missing' });").await;
+
+    assert!(!report.ok);
+    assert_eq!(report.completed_calls, 1);
+    assert_eq!(report.error.as_ref().unwrap().code, "TOOL_ERROR");
+    assert_eq!(
+        report.error.unwrap().message,
+        "Failed to open file: No such file or directory"
+    );
+}
+
+#[tokio::test]
+async fn caught_tool_error_is_typed_and_serializable() {
+    let report = run_with_tool_error(
+        r#"
+try {
+  await tools.read_file({ file_path: "missing" });
+} catch (error) {
+  return {
+    type: typeof error,
+    isError: error instanceof Error,
+    name: error.name,
+    code: error.code,
+    message: error.message,
+    keys: Object.keys(error),
+    serialized: JSON.stringify(error),
+  };
+}
+"#,
+    )
+    .await;
+
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.completed_calls, 1);
+    let value = report.value.unwrap();
+    assert_eq!(value["type"], "object");
+    assert_eq!(value["isError"], true);
+    assert_eq!(value["name"], "ToolError");
+    assert_eq!(value["code"], "TOOL_ERROR");
+    assert_eq!(
+        value["message"],
+        "Failed to open file: No such file or directory"
+    );
+    let keys = value["keys"].as_array().unwrap();
+    assert!(keys.iter().any(|key| key == "message"));
+    assert!(keys.iter().any(|key| key == "name"));
+    assert!(keys.iter().any(|key| key == "code"));
+    let serialized: serde_json::Value =
+        serde_json::from_str(value["serialized"].as_str().unwrap()).unwrap();
+    assert_eq!(serialized["name"], "ToolError");
+    assert_eq!(serialized["code"], "TOOL_ERROR");
+    assert_eq!(
+        serialized["message"],
+        "Failed to open file: No such file or directory"
+    );
+}
+
+#[tokio::test]
+async fn all_settled_keeps_the_tool_error_details() {
+    let report = run_with_tool_error(
+        r#"
+const [settled] = await Promise.allSettled([
+  tools.read_file({ file_path: "missing" }),
+]);
+return settled;
+"#,
+    )
+    .await;
+
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.completed_calls, 1);
+    let value = report.value.unwrap();
+    assert_eq!(value["status"], "rejected");
+    assert_eq!(value["reason"]["name"], "ToolError");
+    assert_eq!(value["reason"]["code"], "TOOL_ERROR");
+    assert_eq!(
+        value["reason"]["message"],
+        "Failed to open file: No such file or directory"
+    );
+}
+
+#[tokio::test]
 async fn nested_call_and_result_limits_reject_inside_javascript() {
     let call_limits = PtcLimits {
         max_calls: 1,
@@ -198,7 +316,7 @@ async fn nested_call_and_result_limits_reject_inside_javascript() {
         call_limits,
     )
     .await;
-    assert!(call_report.error.unwrap().message.contains("CALL_LIMIT"));
+    assert_eq!(call_report.error.unwrap().code, "CALL_LIMIT");
 
     let result_limits = PtcLimits {
         result_bytes: 4,
@@ -210,13 +328,7 @@ async fn nested_call_and_result_limits_reject_inside_javascript() {
         result_limits,
     )
     .await;
-    assert!(
-        result_report
-            .error
-            .unwrap()
-            .message
-            .contains("RESULT_LIMIT")
-    );
+    assert_eq!(result_report.error.unwrap().code, "RESULT_LIMIT");
 }
 
 #[tokio::test]
@@ -248,7 +360,7 @@ async fn result_limit_discards_the_childs_staged_effects() {
         .await
         .unwrap();
 
-    assert!(report.error.unwrap().message.contains("RESULT_LIMIT"));
+    assert_eq!(report.error.unwrap().code, "RESULT_LIMIT");
     commit.commit_into_outer().unwrap();
     assert_eq!(state.get("effect"), None);
     assert!(inspect_artifacts.take_artifacts().is_empty());

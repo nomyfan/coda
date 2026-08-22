@@ -29,6 +29,15 @@
     writable: false,
   });
 
+  class ToolError extends Error {
+    constructor(code, message) {
+      super(message);
+      this.name = "ToolError";
+      this.code = code;
+      Object.defineProperty(this, "message", { enumerable: true });
+    }
+  }
+
   const toolsObject = Object.create(null);
   for (const name of toolNames) {
     Object.defineProperty(toolsObject, name, {
@@ -39,7 +48,9 @@
         if (input === null || typeof input !== "object" || Array.isArray(input)) {
           throw new TypeError(`${name} expects one object argument`);
         }
-        return await callTool(name, JSON.stringify(input));
+        const [ok, value, message] = await callTool(name, JSON.stringify(input));
+        if (!ok) throw new ToolError(value, message);
+        return value;
       },
     });
   }

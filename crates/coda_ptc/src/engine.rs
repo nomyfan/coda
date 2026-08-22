@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use coda_core::tool::{HostToolCallError, HostToolInvoker, NestedCallScope};
-use rquickjs::{AsyncContext, AsyncRuntime, Function, function::Async};
+use rquickjs::{AsyncContext, AsyncRuntime, Function, convert::List, function::Async};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -92,7 +92,21 @@ impl std::error::Error for JsEngineError {}
 struct BridgeRequest {
     name: String,
     arguments: String,
-    reply: oneshot::Sender<Result<String, String>>,
+    reply: oneshot::Sender<Result<String, BridgeCallError>>,
+}
+
+struct BridgeCallError {
+    code: &'static str,
+    message: String,
+}
+
+impl BridgeCallError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 struct WorkerInput {
@@ -279,7 +293,10 @@ impl JsExecutor {
                 }
                 Some(request) = bridge_rx.recv() => {
                     if started_calls >= limits.max_calls {
-                        let _ = request.reply.send(Err("CALL_LIMIT: maximum nested tool calls exceeded".to_string()));
+                        let _ = request.reply.send(Err(BridgeCallError::new(
+                            "CALL_LIMIT",
+                            "maximum nested tool calls exceeded",
+                        )));
                         continue;
                     }
                     started_calls += 1;
@@ -291,7 +308,10 @@ impl JsExecutor {
                     let call_cancel = script_cancel.child_token();
                     host_calls.spawn(async move {
                         let Ok(_permit) = host_limit.acquire_owned().await else {
-                            let _ = request.reply.send(Err("ABORTED: host executor closed".to_string()));
+                            let _ = request.reply.send(Err(BridgeCallError::new(
+                                "ABORTED",
+                                "host executor closed",
+                            )));
                             return;
                         };
                         let nested = scope.for_nested_call(call_cancel);
@@ -299,17 +319,25 @@ impl JsExecutor {
                             .call(request.name, request.arguments, nested.context())
                             .await;
                         let response = match result {
-                            Ok(result) if result.output.len() > limits.result_bytes => Err(format!(
-                                "RESULT_LIMIT: tool result exceeds {} bytes",
-                                limits.result_bytes
-                            )),
+                            Ok(result) if result.output.len() > limits.result_bytes => {
+                                Err(BridgeCallError::new(
+                                    "RESULT_LIMIT",
+                                    format!(
+                                        "tool result exceeds {} bytes",
+                                        limits.result_bytes
+                                    ),
+                                ))
+                            }
                             Ok(result) => {
                                 let mut total = total_result_bytes.lock().unwrap();
                                 let next = total.saturating_add(result.output.len());
                                 if next > limits.total_result_bytes {
-                                    Err(format!(
-                                        "RESULT_LIMIT: cumulative tool results exceed {} bytes",
-                                        limits.total_result_bytes
+                                    Err(BridgeCallError::new(
+                                        "RESULT_LIMIT",
+                                        format!(
+                                            "cumulative tool results exceed {} bytes",
+                                            limits.total_result_bytes
+                                        ),
                                     ))
                                 } else {
                                     *total = next;
@@ -317,7 +345,7 @@ impl JsExecutor {
                                     Ok(result.output)
                                 }
                             }
-                            Err(error) => Err(host_error_message(error)),
+                            Err(error) => Err(bridge_call_error(error)),
                         };
                         completed_calls.fetch_add(1, Ordering::AcqRel);
                         let _ = request.reply.send(response);
@@ -370,15 +398,19 @@ impl JsExecutor {
     }
 }
 
-fn host_error_message(error: HostToolCallError) -> String {
+fn bridge_call_error(error: HostToolCallError) -> BridgeCallError {
     match error {
         HostToolCallError::Unavailable => {
-            "TOOL_UNAVAILABLE: tool is no longer permitted".to_string()
+            BridgeCallError::new("TOOL_UNAVAILABLE", "tool is no longer permitted")
         }
-        HostToolCallError::InvalidParameters(message) => format!("INVALID_PARAMETERS: {message}"),
-        HostToolCallError::Execution(message) => format!("TOOL_ERROR: {message}"),
-        HostToolCallError::ResourceLimit(message) => format!("RESOURCE_LIMIT: {message}"),
-        HostToolCallError::Aborted(message) => format!("ABORTED: {message}"),
+        HostToolCallError::InvalidParameters(message) => {
+            BridgeCallError::new("INVALID_PARAMETERS", message)
+        }
+        HostToolCallError::Execution(message) => BridgeCallError::new("TOOL_ERROR", message),
+        HostToolCallError::ResourceLimit(message) => {
+            BridgeCallError::new("RESOURCE_LIMIT", message)
+        }
+        HostToolCallError::Aborted(message) => BridgeCallError::new("ABORTED", message),
     }
 }
 
@@ -446,28 +478,32 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                         async move {
                             let _outstanding = outstanding;
                             let (reply, response) = oneshot::channel();
-                            bridge_tx
+                            if bridge_tx
                                 .send(BridgeRequest {
                                     name,
                                     arguments,
                                     reply,
                                 })
                                 .await
-                                .map_err(|_| {
-                                    rquickjs::Error::new_from_js("host bridge", "Promise")
-                                })?;
-                            response
-                                .await
-                                .map_err(|_| {
-                                    rquickjs::Error::new_from_js("host response", "string")
-                                })?
-                                .map_err(|message| {
-                                    rquickjs::Error::new_from_js_message(
-                                        "host tool",
-                                        "string",
-                                        message,
-                                    )
-                                })
+                                .is_err()
+                            {
+                                return List((
+                                    false,
+                                    "ABORTED".to_string(),
+                                    "host bridge closed".to_string(),
+                                ));
+                            }
+                            match response.await {
+                                Ok(Ok(output)) => List((true, output, String::new())),
+                                Ok(Err(error)) => {
+                                    List((false, error.code.to_string(), error.message))
+                                }
+                                Err(_) => List((
+                                    false,
+                                    "ABORTED".to_string(),
+                                    "host response dropped".to_string(),
+                                )),
+                            }
                         }
                     }),
                 )
@@ -528,7 +564,10 @@ fn wrap_source(code: &str) -> String {
   }} catch (error) {{
     return JSON.stringify({{
       ok: false,
-      error: {{ code: "JS_EXCEPTION", message: String(error && error.message || error) }}
+      error: {{
+        code: String(error && error.code || "JS_EXCEPTION"),
+        message: String(error && error.message || error)
+      }}
     }});
   }}
 }})()

@@ -263,12 +263,8 @@ async fn live_policy_can_shrink_but_not_bypass_the_snapshot() {
             .expect("runner report");
         let report: serde_json::Value = serde_json::from_str(output).unwrap();
         assert_eq!(report["ok"], false);
-        assert!(
-            report["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("TOOL_UNAVAILABLE")
-        );
+        assert_eq!(report["error"]["code"], "TOOL_UNAVAILABLE");
+        assert_eq!(report["error"]["message"], "tool is no longer permitted");
     }
     harness.shutdown().await;
 }
