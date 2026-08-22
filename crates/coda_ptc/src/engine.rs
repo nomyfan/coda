@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PtcLimits {
     pub source_bytes: usize,
@@ -30,19 +33,19 @@ pub struct PtcLimits {
 impl Default for PtcLimits {
     fn default() -> Self {
         Self {
-            source_bytes: 256 * 1024,
-            heap_bytes: 64 * 1024 * 1024,
-            stack_bytes: 512 * 1024,
+            source_bytes: 256 * KIB,
+            heap_bytes: 64 * MIB,
+            stack_bytes: 512 * KIB,
             wall_time: Duration::from_secs(120),
             join_grace: Duration::from_secs(1),
             max_calls: 128,
             max_concurrent_calls: 16,
-            result_bytes: 4 * 1024 * 1024,
-            total_result_bytes: 16 * 1024 * 1024,
-            state_bytes: 4 * 1024 * 1024,
-            artifact_bytes: 32 * 1024 * 1024,
-            stdout_bytes: 1024 * 1024,
-            final_bytes: 1024 * 1024,
+            result_bytes: 4 * MIB,
+            total_result_bytes: 16 * MIB,
+            state_bytes: 4 * MIB,
+            artifact_bytes: 32 * MIB,
+            stdout_bytes: MIB,
+            final_bytes: MIB,
         }
     }
 }
