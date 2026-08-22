@@ -1300,8 +1300,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 compaction::failure_message(&reason)
             }
         };
-        let Message::Custom(custom) = message.clone() else {
-            unreachable!("compaction messages are always Message::Custom")
+        let Message::Compaction(record) = message.clone() else {
+            unreachable!("compaction writes only Message::Compaction")
         };
         self.agent.add_message(message).await;
         // Lets the hub fold this into the live snapshot at turn settle.
@@ -1310,7 +1310,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.agent.name.clone(),
                 self.thread_id.clone(),
                 self.turn,
-                AgentEvent::Custom(custom),
+                AgentEvent::CompactionEnd(record),
             )
             .await;
         Ok(())

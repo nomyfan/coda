@@ -172,17 +172,19 @@ fn user_instructions_reach_both_the_request_and_the_summary() {
     );
 
     let cutoff_id = MessageId::new();
-    let Message::Custom(summary) = summary_message(
+    let Message::Compaction(summary) = summary_message(
         cutoff_id,
         Trigger::Manual {
             instructions: "keep the architecture decisions",
         },
         "the gist",
     ) else {
-        panic!("a summary is a custom message");
+        panic!("a summary is a compaction message");
     };
-    assert_eq!(summary.kind, COMPACTION_KIND);
-    assert_eq!(summary.cutoff, Some(cutoff_id));
+    assert_eq!(
+        summary.outcome,
+        CompactionOutcome::Summary { cutoff: cutoff_id }
+    );
     assert!(summary.content.contains("keep the architecture decisions"));
     assert!(summary.content.contains("the gist"));
 }
@@ -195,13 +197,13 @@ fn a_bare_compact_adds_no_instruction_framing() {
     assert_eq!(command.first_text(), Some("/compact"));
 
     let cutoff_id = MessageId::new();
-    let Message::Custom(summary) =
+    let Message::Compaction(summary) =
         summary_message(cutoff_id, Trigger::Manual { instructions: "" }, "the gist")
     else {
-        panic!("a summary is a custom message");
+        panic!("a summary is a compaction message");
     };
     assert_eq!(summary.content, "the gist");
-    assert_eq!(summary.cutoff, Some(cutoff_id));
+    assert_eq!(summary.cutoff(), Some(cutoff_id));
 }
 
 /// An automatic trigger has no typed instructions, but still says nobody
@@ -209,25 +211,26 @@ fn a_bare_compact_adds_no_instruction_framing() {
 #[test]
 fn an_automatic_compaction_notes_it_was_not_requested() {
     let cutoff_id = MessageId::new();
-    let Message::Custom(summary) = summary_message(cutoff_id, Trigger::Auto, "the gist") else {
-        panic!("a summary is a custom message");
+    let Message::Compaction(summary) = summary_message(cutoff_id, Trigger::Auto, "the gist") else {
+        panic!("a summary is a compaction message");
     };
     assert!(summary.content.contains("automatically"));
     assert!(summary.content.contains("the gist"));
-    assert_eq!(summary.cutoff, Some(cutoff_id));
+    assert_eq!(summary.cutoff(), Some(cutoff_id));
 }
 
 /// A failure is recorded but must not become a boundary, and is
-/// transcript-only (no role).
+/// transcript-only.
 #[test]
 fn a_failure_is_not_a_summary() {
-    let Message::Custom(failure) = failure_message("the provider timed out") else {
-        panic!("a failure record is a custom message");
+    let failure = failure_message("the provider timed out");
+    assert!(!failure.visible_to_model());
+    let Message::Compaction(failure) = failure else {
+        panic!("a failure record is a compaction message");
     };
-    assert_eq!(failure.kind, COMPACTION_FAILED_KIND);
-    assert_ne!(failure.kind, COMPACTION_KIND);
-    assert_eq!(failure.role, None);
-    assert_eq!(failure.cutoff, None);
+    assert_eq!(failure.outcome, CompactionOutcome::Failed);
+    assert!(!failure.is_summary());
+    assert_eq!(failure.cutoff(), None);
     assert!(failure.content.contains("the provider timed out"));
 }
 
@@ -575,7 +578,7 @@ fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
 
     let texts: Vec<_> = message_view::model_view(&committed)
         .filter_map(|entry| match &entry.message {
-            Message::Custom(custom) => Some(custom.content.clone()),
+            Message::Compaction(compaction) => Some(compaction.content.clone()),
             Message::User(user) => user.first_text().map(str::to_string),
             _ => None,
         })
@@ -588,7 +591,7 @@ fn manual_compaction_hides_its_own_command_line_from_the_model_view() {
     );
 }
 
-/// A failed attempt isn't `COMPACTION_KIND`, so it doesn't move the boundary
+/// A failed attempt isn't a summary, so it doesn't move the boundary
 /// — the next check in the same turn retries the same target.
 #[test]
 fn a_failed_attempt_does_not_suppress_a_later_retry() {

@@ -10,7 +10,7 @@ use coda_agent::{
     AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ThreadId, ToolApprovalMode,
 };
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionUsage, CustomMessage, CustomRole,
+    AssistantMessage, ChatCompletionRequest, CompactionMessage, CompactionOutcome, CompletionUsage,
     LLMProvider, LLMStreamEvent, RequestMessage, StreamError, ToolCall,
 };
 use coda_tools::ReadTodosToolSpec;
@@ -528,22 +528,18 @@ impl SessionOpener for TestOpener {
                         format!("/compact {instructions}")
                     },
                 )),
-                outcome: Message::Custom(CustomMessage {
+                outcome: Message::Compaction(CompactionMessage {
                     message_id: MessageId::new(),
-                    kind: if applied {
-                        "compaction".into()
+                    // A failure record is transcript-only, and no boundary.
+                    outcome: if applied {
+                        CompactionOutcome::Summary {
+                            cutoff: MessageId::new(),
+                        }
                     } else {
-                        "compaction_failed".into()
-                    },
-                    // A failure record is transcript-only: no role.
-                    role: if applied {
-                        Some(CustomRole::User)
-                    } else {
-                        None
+                        CompactionOutcome::Failed
                     },
                     content: "a summary".into(),
                     created_at: jiff::Timestamp::now(),
-                    cutoff: applied.then(MessageId::new),
                 }),
                 applied,
             })

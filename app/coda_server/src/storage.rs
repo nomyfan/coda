@@ -848,7 +848,7 @@ fn message_row_identity(message: &Message) -> (MessageId, &'static str) {
         Message::User(_) => "user",
         Message::Assistant(_) => "assistant",
         Message::Tool(_) => "tool",
-        Message::Custom(_) => "custom",
+        Message::Compaction(_) => "compaction",
     };
     (message.message_id(), role)
 }

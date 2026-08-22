@@ -176,7 +176,7 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
         "the prior turn plus the two compaction messages"
     );
     assert!(
-        matches!(finished.messages.last(), Some(Message::Custom(message)) if message.kind == "compaction")
+        matches!(finished.messages.last(), Some(Message::Compaction(message)) if message.is_summary())
     );
 
     // A snapshot event is not terminal: the same stream carries the next turn.
@@ -267,7 +267,7 @@ async fn a_recorded_summary_failure_writes_history_without_moving_the_boundary()
         unreachable!()
     };
     assert!(
-        matches!(finished.messages.last(), Some(Message::Custom(message)) if message.kind == "compaction_failed")
+        matches!(finished.messages.last(), Some(Message::Compaction(message)) if !message.is_summary())
     );
     hub.shutdown_all().await;
 }
@@ -298,7 +298,7 @@ async fn a_stale_compaction_writes_nothing_and_still_clears_busy() {
         !finished
             .messages
             .iter()
-            .any(|message| matches!(message, Message::Custom(_))),
+            .any(|message| matches!(message, Message::Compaction(_))),
         "a stale compaction must not append a marker"
     );
 
@@ -370,7 +370,7 @@ async fn a_turn_in_flight_refuses_compaction_without_writing_a_marker() {
             .snapshot
             .messages
             .iter()
-            .any(|message| matches!(message, Message::Custom(_)))
+            .any(|message| matches!(message, Message::Compaction(_)))
     );
     hub.shutdown_all().await;
 }

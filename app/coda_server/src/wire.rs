@@ -2,7 +2,7 @@ use crate::config::{PermissionMode, ToolApprovalConfig, extract_shell_command};
 use crate::files::FileEntry;
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{
-    AssistantMessage, CustomMessage, Message, MessageId, Modality, ToolCall, ToolMessage,
+    AssistantMessage, CompactionMessage, Message, MessageId, Modality, ToolCall, ToolMessage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,12 +52,13 @@ pub enum WireEvent {
         agent_name: String,
         thread_id: String,
     },
-    /// An auto-compaction summary or failure record.
-    #[serde(rename = "custom")]
-    Custom {
+    /// An auto-compaction's outcome: the summary it wrote, or the record of
+    /// why it wrote none.
+    #[serde(rename = "compaction_end")]
+    CompactionEnd {
         agent_name: String,
         thread_id: String,
-        message: CustomMessage,
+        message: CompactionMessage,
     },
     #[serde(rename = "suspended")]
     Suspended {
@@ -149,7 +150,7 @@ impl WireEvent {
                 agent_name,
                 thread_id,
             },
-            AgentEvent::Custom(message) => WireEvent::Custom {
+            AgentEvent::CompactionEnd(message) => WireEvent::CompactionEnd {
                 agent_name,
                 thread_id,
                 message,

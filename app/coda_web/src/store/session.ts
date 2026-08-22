@@ -479,28 +479,28 @@ function historyToEntries(
       ),
     ];
   }
-  if ("Custom" in message) {
-    const custom = message.Custom;
-    if (custom.kind === "compaction") {
+  if ("Compaction" in message) {
+    const compaction = message.Compaction;
+    if (compaction.outcome.type === "summary") {
       return [
         {
-          id: `compaction:${custom.message_id}`,
-          messageId: custom.message_id,
+          id: `compaction:${compaction.message_id}`,
+          messageId: compaction.message_id,
           kind: "compaction",
           title: "Context compacted",
-          content: custom.content,
-          startedAt: custom.created_at,
+          content: compaction.content,
+          startedAt: compaction.created_at,
         },
       ];
     }
     return [
       {
-        id: `custom:${custom.message_id}`,
-        messageId: custom.message_id,
-        kind: custom.kind === "compaction_failed" ? "error" : "system",
-        title: custom.kind === "compaction_failed" ? "Compaction failed" : custom.kind,
-        content: custom.content,
-        startedAt: custom.created_at,
+        id: `compaction-failed:${compaction.message_id}`,
+        messageId: compaction.message_id,
+        kind: "error",
+        title: "Compaction failed",
+        content: compaction.content,
+        startedAt: compaction.created_at,
       },
     ];
   }
@@ -511,18 +511,17 @@ function messageIdOf(message: HistoryMessage): string {
   if ("User" in message) return message.User.message_id;
   if ("Assistant" in message) return message.Assistant.message_id;
   if ("Tool" in message) return message.Tool.message_id;
-  return message.Custom.message_id;
+  return message.Compaction.message_id;
 }
 
 /** Mirrors the backend's `message_view::last_summary`: a recorded `cutoff`
  * can differ from the summary's physical position for a mid-turn compaction.
- * Falls back to the summary's own index when no `cutoff` is recorded. */
-function resolveCutoffIdx(messages: HistoryMessage[], summaryIdx: number, cutoff?: string): number {
-  if (cutoff) {
-    for (let index = summaryIdx - 1; index >= 0; index -= 1) {
-      if (messageIdOf(messages[index]) === cutoff) {
-        return index + 1;
-      }
+ * Falls back to the summary's own index when the cutoff message is no longer
+ * in the history. */
+function resolveCutoffIdx(messages: HistoryMessage[], summaryIdx: number, cutoff: string): number {
+  for (let index = summaryIdx - 1; index >= 0; index -= 1) {
+    if (messageIdOf(messages[index]) === cutoff) {
+      return index + 1;
     }
   }
   return summaryIdx + 1;
@@ -532,8 +531,8 @@ function historyUsage(messages: HistoryMessage[]): UsageRecord[] {
   let boundary = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if ("Custom" in message && message.Custom.kind === "compaction") {
-      boundary = resolveCutoffIdx(messages, index, message.Custom.cutoff);
+    if ("Compaction" in message && message.Compaction.outcome.type === "summary") {
+      boundary = resolveCutoffIdx(messages, index, message.Compaction.outcome.cutoff);
       break;
     }
   }
@@ -990,12 +989,12 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           },
         ],
       };
-    case "custom": {
+    case "compaction_end": {
       if (event.agent_name !== rootName) {
         return session;
       }
-      const failed = event.message.kind === "compaction_failed";
-      const [finished] = historyToEntries({ Custom: event.message }, {}, {});
+      const failed = event.message.outcome.type === "failed";
+      const [finished] = historyToEntries({ Compaction: event.message }, {}, {});
       const key = compactionLiveKey(event.agent_name, event.thread_id);
       const index = session.entries.findIndex((entry) => entry.liveKey === key);
       // Replace the pending shimmer entry in place when its `compaction_start`
