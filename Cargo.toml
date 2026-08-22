@@ -6,6 +6,7 @@ members = [
   "crates/coda_skills",
   "crates/coda_mcp",
   "crates/coda_tools",
+  "crates/coda_ptc",
   "app/coda_server",
 ]
 resolver = "3"
@@ -17,6 +18,7 @@ coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
 coda_skills = { path = "crates/coda_skills" }
 coda_tools = { path = "crates/coda_tools" }
+coda_ptc = { path = "crates/coda_ptc" }
 async-stream = "0.3"
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -30,6 +32,7 @@ diffy = "0.4"
 libc = "0.2"
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "futures"] }
 
 [profile.release]
 opt-level = 3

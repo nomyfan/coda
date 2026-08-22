@@ -761,6 +761,7 @@ fn explore_auto_approves_only_read_only_tools() {
         "grep",
         "read_todos",
         "write_todos",
+        "run_javascript",
     ] {
         assert!(
             !config.requires_approval(PermissionMode::Explore, &tool_call(tool)),

@@ -1,4 +1,5 @@
 use super::*;
+use coda_core::tool::{HostEffectLimits, NestedCallScope};
 
 /// A registry per test: none of these exercise sharing, and isolation keeps
 /// them from queueing behind each other.
@@ -434,6 +435,63 @@ async fn write_creates_new_file() {
     );
     assert!(patch.contains("+hello"), "{patch}");
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn write_artifact_budget_failure_does_not_create_parent_or_file() {
+    let parent = tmp_path("write_budget_parent");
+    std::fs::remove_dir_all(&parent).ok();
+    let path = parent.join("nested/file.txt");
+    let scope = NestedCallScope::new(
+        ToolCallContext::default(),
+        HostEffectLimits {
+            state_bytes: 1024,
+            artifact_bytes: 1,
+        },
+    );
+    let child = scope.for_nested_call(Default::default());
+    let error = WriteFileTool::new(test_locks())
+        .execute(
+            WriteFileToolParams {
+                file_path: path.to_string_lossy().into_owned(),
+                content: "hello".to_string(),
+            },
+            child.context(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ToolError::ResourceLimit(_)));
+    assert!(!parent.exists());
+}
+
+#[tokio::test]
+async fn edit_artifact_budget_failure_leaves_file_unchanged() {
+    let path = tmp_file("edit_budget", "before\n");
+    let scope = NestedCallScope::new(
+        ToolCallContext::default(),
+        HostEffectLimits {
+            state_bytes: 1024,
+            artifact_bytes: 1,
+        },
+    );
+    let child = scope.for_nested_call(Default::default());
+    let error = EditFileTool::new(test_locks())
+        .execute(
+            EditFileToolParams {
+                file_path: path.to_string_lossy().into_owned(),
+                old_string: "before".to_string(),
+                new_string: "after".to_string(),
+                replace_all: None,
+            },
+            child.context(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ToolError::ResourceLimit(_)));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+    std::fs::remove_file(path).ok();
 }
 
 #[tokio::test]

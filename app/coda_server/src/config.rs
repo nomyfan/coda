@@ -598,8 +598,9 @@ pub enum PermissionMode {
 }
 
 /// Tools [`PermissionMode::Explore`] runs unattended: they read the workspace
-/// (or, for the todos pair, only the agent's own scratch state) and change
-/// nothing on disk.
+/// (or change only the agent's todo state) and change nothing on disk. The
+/// JavaScript runner is included because its own bridge is independently
+/// narrowed to this same policy-approved subset.
 const EXPLORE_TOOLS: &[&str] = &[
     "ls",
     "read_file",
@@ -607,6 +608,7 @@ const EXPLORE_TOOLS: &[&str] = &[
     "grep",
     "read_todos",
     "write_todos",
+    "run_javascript",
 ];
 
 /// What [`PermissionMode::AcceptEdits`] adds on top of [`EXPLORE_TOOLS`].

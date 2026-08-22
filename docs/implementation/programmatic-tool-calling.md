@@ -172,7 +172,9 @@ context
 
 `__coda_call_tool` 只跨 channel 发送 `{name, arguments_json, sequence}`，不直接在 QuickJS 线程执行 Coda 工具。JS bootstrap 只为持久化的 generation snapshot 建立并冻结 `tools` object；每个属性函数先 `JSON.stringify(input)`，再 await bridge。wrapper 把用户代码的最终值安全地序列化成有界 JSON report，并收集有界 `console.log`。
 
-主 Tokio runtime 上的 supervisor/watchdog 独立于 worker 调度，到达 deadline 或收到用户取消时设置 interrupt flag、取消 script token、停止接收新的 bridge request，并取消所有 in-flight host-call child token。interrupt flag 负责让 CPU 循环交还控制权；worker local select 观察同一个 token，让 pending Promise/bridge await 及时结束。worker 获得一个全局并发 permit，并持有到线程真正退出，所以无法 teardown 的线程不会释放容量、继而无限堆积。
+主 Tokio runtime 上的 supervisor/watchdog 独立于 worker 调度。wall-clock budget 从进入 executor、排队等待 worker permit 时就开始计算；permit 获取本身同时受 deadline 和用户取消约束。取得 permit 后，到达同一个绝对 deadline 或收到用户取消时设置 interrupt flag、取消 script token、停止接收新的 bridge request，并取消所有 in-flight host-call child token。interrupt flag 负责让 CPU 循环交还控制权；worker local select 观察同一个 token，让 pending Promise/bridge await 及时结束。worker 获得一个全局并发 permit，并持有到线程真正退出，所以无法 teardown 的线程不会释放容量、继而无限堆积，但后续调用仍能按 deadline/cancel 从排队中退出。
+
+worker 只接受所有已发起的 tool Promise 都已 settle 的正常返回。脚本返回时若仍有 bridge call 未完成，结果改为 `UNAWAITED_TOOL_CALLS`，随后取消这些调用；不把一个可能留下部分外部副作用、却缺少对应 result/artifact 的执行记为 `ok: true`。
 
 supervisor 只在有限 grace period 内等待 context/runtime drop 和线程 join。超过上限时外层返回 `WORKER_UNRESPONSIVE` 并 detach 线程，记录 error metric；这限制调用方等待时间，但不能强杀卡在 native engine 内的线程。严格的进程级 wall-clock 和资源回收只能由 helper process/OS sandbox 提供。已开始的文件副作用与当前 abort 语义一样不自动回滚，超时后到达的 bridge response 被丢弃。
 
@@ -187,6 +189,10 @@ supervisor 只在有限 grace period 内等待 context/runtime drop 和线程 jo
 ### 把 rquickjs 直接放在 Tokio worker 上并启用 `parallel`
 
 代码更少，但 `parallel` 仍被上游标为 experimental，CPU 密集或死循环脚本也会占住 Tokio worker。
+
+### 脚本返回后继续 drain 未 await 的工具调用
+
+这可以尽量收集已经启动的调用结果与 artifacts，但会让 `return` 不再代表脚本执行结束，还会掩盖模型漏写 `await` 的错误；卡住的调用也会消耗剩余 deadline。选择 fail closed：检测到未完成调用就返回 `UNAWAITED_TOOL_CALLS` 并取消，提示调用方显式 await 每个 Promise。
 
 结论：不用。QuickJS runtime 留在专用 OS 线程；现有工具仍在主 Tokio runtime 执行，两边通过有界 channel + oneshot 通信。
 
@@ -281,7 +287,7 @@ pub trait HostToolInvoker: Send + Sync {
     /// Trust boundary: validates name/JSON/limits/policy, then executes one
     /// existing tool. Success is its raw textual output; failures are typed so
     /// JS can distinguish disabled capability, validation, execution, limit
-    /// and abort.
+    /// and abort. This method never decides whether staged child effects commit.
     fn call(
         &self,
         name: String,
@@ -386,7 +392,7 @@ pub enum JsRunError {
 }
 ```
 
-bridge 的单次调用顺序固定为：`scope.for_nested_call(child_token)` → `host.call(name, args, pending.context()).await` → 仅在 `Ok` 时 `pending.commit()`。这里的 commit 只写入 scope，不触达外层 `CallState`/artifact sink。executor 结束后，`RunJavaScriptTool` 根据准备返回的外层 `ToolResult` 决定是否调用一次 `scope.commit_into_outer()`。`AgentToolInvoker` 从不持有 `pending`、scope 或父 context；worker/bridge 持有 child commit guard，host Future 只拿受限 context clone，因此所有权关系闭合且没有递归 capability。
+bridge 的单次调用顺序固定为：`scope.for_nested_call(child_token)` → `host.call(name, args, pending.context()).await` → 校验单次及累计 result budget → 仅在全部成功时 `pending.commit()`。这里的 commit 只写入 scope，不触达外层 `CallState`/artifact sink；host 返回错误或 result 超限都会 drop guard，丢弃该 child 的 staged effects。executor 结束后，`RunJavaScriptTool` 根据准备返回的外层 `ToolResult` 决定是否调用一次 `scope.commit_into_outer()`。`AgentToolInvoker` 从不持有 `pending`、scope 或父 context，也无权决定 commit；worker/bridge 持有 child commit guard，host Future 只拿受限 context clone，因此所有权关系闭合且没有递归 capability。
 
 `JavaScriptTool::execute` 对普通语法错误、JS exception、deadline 和工具错误返回一个可解析的文本 report，并明确已经完成多少次嵌套调用。只有用户取消映射为 `ToolError::Aborted`，与现有 turn cancellation 语义一致。
 
@@ -486,7 +492,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
 - JS source：256 KiB。
 - QuickJS heap：64 MiB；不得启用让 memory limit 失效的 `rust-alloc`。
 - QuickJS stack：512 KiB。
-- 单次 script wall-clock：120 秒；主 Tokio runtime supervisor 的 timer 是权威 deadline，触发时从 worker 外设置 interrupt flag 并取消 script/host-call token。worker local select 只负责 pending Promise/host await 的响应速度。
+- 单次 script wall-clock：120 秒，从等待全局 worker permit 前开始计算；permit acquisition、主 Tokio runtime supervisor 和 worker 执行共享同一个绝对 deadline。supervisor timer 触发时从 worker 外设置 interrupt flag 并取消 script/host-call token。worker local select 只负责 pending Promise/host await 的响应速度。
 - context/runtime teardown + worker join grace period：1 秒；超时返回 `WORKER_UNRESPONSIVE`、detach 线程且不释放该 worker 持有的全局并发 permit。数值由 spike 校准。
 - 嵌套工具调用：最多 128 次，最多 16 个并发。
 - 单条返回给 JS 的工具结果：4 MiB；本次 bridge 累计结果：16 MiB。
@@ -515,43 +521,45 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
 
 ## Implementation Roadmap
 
-- [ ] **[risk validation]** 在 `.scratchpad/rquickjs-ptc/` 做最小 spike：专用线程的 current-thread executor 内运行 `AsyncRuntime`，JS `await` 通过 channel 调用主 Tokio runtime 的 fake tool；由主 Tokio runtime supervisor 驱动 watchdog，覆盖顺序、`Promise.all`、异常、CPU 死循环、`await new Promise(() => {})`、永不返回的 host call、用户取消、deadline、teardown 和 bounded join。
+实现说明（2026-08-22）：风险验证直接落在 `coda_ptc` 的 engine tests 中，没有保留一份会与正式实现漂移的 `.scratchpad` 副本。覆盖项和验证目标不变；macOS 本地验证已完成，Linux 由 CI 覆盖。
+
+- [x] **[risk validation]** 在 `.scratchpad/rquickjs-ptc/` 做最小 spike：专用线程的 current-thread executor 内运行 `AsyncRuntime`，JS `await` 通过 channel 调用主 Tokio runtime 的 fake tool；由主 Tokio runtime supervisor 驱动 watchdog，覆盖顺序、`Promise.all`、异常、CPU 死循环、`await new Promise(() => {})`、永不返回的 host call、用户取消、deadline、teardown 和 bounded join。
       Purpose: 在改公共接口前证明最关键的 runtime/async 假设。
       Verification: spike tests 在 Rust 1.95 的 macOS/Linux CI 目标通过；worker 完全忙于 CPU 循环时，主 runtime watchdog 仍按 deadline 设置 flag 并触发 interrupt；pending Promise/host call 观察同一 cancel token 结束；正常超时路径无线程泄漏或 runtime drop assertion，并记录 native worker 无法 join 时的 fail-closed 行为。
 
-- [ ] **[crate boundary]** 新建 `crates/coda_ptc` 并加入 Cargo workspace；依赖 `coda_core`、rquickjs、Tokio/futures、serde 和 tracing，不依赖 `coda_agent`/`coda_server`。
+- [x] **[crate boundary]** 新建 `crates/coda_ptc` 并加入 Cargo workspace；依赖 `coda_core`、rquickjs、Tokio/futures、serde 和 tracing，不依赖 `coda_agent`/`coda_server`。
       Purpose: 先固定依赖方向，避免 engine 实现扩散到普通工具和 policy 层。
       Verification: `cargo tree -p coda_ptc` 不出现 `coda_agent`、`coda_tools` 或 `coda_server`。
 
-- [ ] **[core API]** 在 `coda_core` 增加中性的 `HostToolInvoker`、`HostToolCallResult`、`HostToolCallError`、`NestedCallScope` 和 `NestedToolCall`；`ToolCallContext` 默认不携带 invoker，由 `NestedCallScope::for_nested_call` 派生共享预算但剥离 invoker 的 child context。`NestedToolCall::commit` 只写 scope，`NestedCallScope::commit_into_outer` 消费 scope 并执行唯一一次最终提交。让 `ThreadState::set` 和 `record_artifact` 返回可传播的 resource-limit error。JS limits/report/engine error 和 host-error-to-JS 映射留在 `coda_ptc`。
+- [x] **[core API]** 在 `coda_core` 增加中性的 `HostToolInvoker`、`HostToolCallResult`、`HostToolCallError`、`NestedCallScope` 和 `NestedToolCall`；`ToolCallContext` 默认不携带 invoker，由 `NestedCallScope::for_nested_call` 派生共享预算但剥离 invoker 的 child context。`NestedToolCall::commit` 只写 scope，`NestedCallScope::commit_into_outer` 消费 scope 并执行唯一一次最终提交。让 `ThreadState::set` 和 `record_artifact` 返回可传播的 resource-limit error。JS limits/report/engine error 和 host-error-to-JS 映射留在 `coda_ptc`。
       Purpose: 给 PTC 一个窄的 host trust boundary，同时避免普通工具默认获得调用其他工具的能力。
       Verification: invoker 缺失、调用成功、typed error 和 cancellation 单元测试；weak-reference/drop test 证明无 `context → invoker → context` 环；child context 的 invoker 恒为 `None`，失败 child 不合并 effects；final commit 只能消费 scope 一次。
 
-- [ ] **[host effect budgets]** 实现 script-scoped state/artifact 累计预算和 per-child staging。state 按 key last-write-wins；file tools 在 mutation 前构造并记录 artifact，`write_todos` 传播 `state.set` 的预算错误。
+- [x] **[host effect budgets]** 实现 script-scoped state/artifact 累计预算和 per-child staging。state 按 key last-write-wins；file tools 在 mutation 前构造并记录 artifact，`write_todos` 传播 `state.set` 的预算错误。
       Purpose: 让 QuickJS heap 之外的 retained host memory 也有硬上限，并让 budget exceed 在外部副作用前 fail closed。
       Verification: 128 次 todo 替换在 scope 和外层 `CallState` 都只保留最终 key/value；final commit 前外层 state/artifacts 保持不变；并发 reservations 总和不能越界；write/edit 在 artifact 超限时不创建目录、不创建/截断/写入文件；child 失败或取消释放 reservation 且不写 scope；outer abort/error drop scope 且不写外层；普通 JS exception 返回 `Ok(report)` 时已成功 child effects 正常锚定到外层 ToolMessage。
 
-- [ ] **[safe tracing]** 修改 `ToolWrapper::execute` 的 span 字段，不再记录 raw input/output；提供长度、状态、duration、error category 和可选的工具级安全摘要。
+- [x] **[safe tracing]** 修改 `ToolWrapper::execute` 的 span 字段，不再记录 raw input/output；提供长度、状态、duration、error category 和可选的工具级安全摘要。
       Purpose: 在嵌套调用放大调用量之前关闭文件内容和待写内容进入日志的现有路径。
       Verification: tracing capture tests 用 sentinel 覆盖 read/write/edit 的嵌套输入与超限输出，确认日志不含原始内容且摘要有界。
 
-- [ ] **[execution metadata]** 在 agent scheduler 增加 `PreparedToolCall`/`ToolExecutionMetadata` 及对应 `Stored*` 类型，让 generation snapshot 同时经过 auto queue、pending approval、checkpoint 和 resume；公开的 `PendingApproval` 只投影 `ToolCall`。
+- [x] **[execution metadata]** 在 agent scheduler 增加 `PreparedToolCall`/`ToolExecutionMetadata` 及对应 `Stored*` 类型，让 generation snapshot 同时经过 auto queue、pending approval、checkpoint 和 resume；公开的 `PendingApproval` 只投影 `ToolCall`。
       Purpose: 固定模型生成代码时的能力上界，防止暂停或重启期间 policy 放宽造成扩权。
       Verification: 同批普通工具触发审批、runner 自身审批、checkpoint round-trip 和 restart tests 均保持原 snapshot；收紧可移除能力，放宽不能增加能力；无 snapshot 的 runner call fail closed。
 
-- [ ] **[engine]** 在 `coda_ptc` 实现 `RunJavaScriptTool`、JS bootstrap、主 Tokio supervisor/watchdog 和专用线程 executor；只启用 rquickjs `std` + `futures`，组合跨线程 interrupt、worker cancellation select、host cancellation 与 bounded teardown/join。
+- [x] **[engine]** 在 `coda_ptc` 实现 `RunJavaScriptTool`、JS bootstrap、主 Tokio supervisor/watchdog 和专用线程 executor；只启用 rquickjs `std` + `futures`，组合跨线程 interrupt、worker cancellation select、host cancellation 与 bounded teardown/join。
       Purpose: 提供无 ambient authority、可取消且有硬资源限制的 ES2020 运行环境。
-      Verification: 语法错误、throw、Promise、并发、递归、内存、stack、外部 watchdog CPU deadline、pending Promise deadline、host-call cancellation、join grace、stdout/final output 截断测试。
+      Verification: 语法错误、throw、Promise、并发、递归、内存、stack、worker permit 排队 deadline/cancel、外部 watchdog CPU deadline、pending Promise deadline、host-call cancellation、未 await host call、join grace、stdout/final output 截断测试。
 
-- [ ] **[registration]** 在 `coda_tools` 增加只负责 catalog 注册的 `RunJavaScriptToolSpec`，其实现来自 `coda_ptc`。
+- [x] **[registration]** 在 `coda_tools` 增加只负责 catalog 注册的 `RunJavaScriptToolSpec`，其实现来自 `coda_ptc`。
       Purpose: 让默认 tools、`AGENT.md` 解析和名称冲突校验继续走现有路径。
       Verification: spec name 与 built tool name 一致；显式包含/省略 `run_javascript` 的 agent config tests。
 
-- [ ] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时，把带有动态工具列表的 runner descriptor 和隐藏 snapshot 一起构造。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `NestedCallScope` 显式传入的受限 child context。
+- [x] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时，把带有动态工具列表的 runner descriptor 和隐藏 snapshot 一起构造。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `NestedCallScope` 显式传入的受限 child context。
       Purpose: 保证 MVP 没有嵌套审批 continuation，同时不绕过 workspace tightening、文件锁、参数校验或 rewind 所依赖的 state anchor。
       Verification: 默认 explore 只暴露四项、accept_edits/yolo 暴露六项；workspace approval_required 只移除命中的内部工具；命中 runner 自身时正常 Suspended，批准后使用原 snapshot；mid-script 收紧 mode 后受影响工具返回 `TOOL_UNAVAILABLE`，放宽不扩权；嵌套普通工具看不到 invoker，并覆盖 abort、deadline、state/artifact budget tests。
 
-- [ ] **[prompt/tool UX]** 给 `run_javascript` 生成精确描述，只列出本次 eligible subset，说明 `tools.<name>(object) -> Promise<string>`、`JSON.parse`、`Promise.all`、返回值和 `TOOL_UNAVAILABLE`；直接工具 descriptors 保留。
+- [x] **[prompt/tool UX]** 给 `run_javascript` 生成精确描述，只列出本次 eligible subset，说明 `tools.<name>(object) -> Promise<string>`、`JSON.parse`、`Promise.all`、返回值和 `TOOL_UNAVAILABLE`；直接工具 descriptors 保留。
       Purpose: 让模型知道什么时候 PTC 有收益、什么时候直接调用更合适。
       Verification: fixture provider 检查 descriptor；人工/自动任务集确认工具名和参数生成稳定。
 

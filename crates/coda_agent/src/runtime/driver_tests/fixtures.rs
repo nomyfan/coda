@@ -393,6 +393,7 @@ pub(super) struct TestProvider {
     /// back to `false` — scripts exactly one failure before later attempts
     /// succeed.
     fail_next_compaction: Option<Arc<std::sync::atomic::AtomicBool>>,
+    recorded_requests: Option<Arc<std::sync::Mutex<Vec<ChatCompletionRequest>>>>,
 }
 
 impl TestProvider {
@@ -420,6 +421,15 @@ impl TestProvider {
     pub(super) fn with_recorded_compactions(requests: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
         Self {
             recorded_compactions: Some(requests),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_recorded_requests(
+        requests: Arc<std::sync::Mutex<Vec<ChatCompletionRequest>>>,
+    ) -> Self {
+        Self {
+            recorded_requests: Some(requests),
             ..Self::default()
         }
     }
@@ -474,6 +484,9 @@ impl LLMProvider for TestProvider {
         &self,
         request: ChatCompletionRequest,
     ) -> impl Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
+        if let Some(requests) = &self.recorded_requests {
+            requests.lock().unwrap().push(request.clone());
+        }
         let system_prompt = request
             .messages
             .first()
@@ -506,6 +519,32 @@ impl LLMProvider for TestProvider {
         }
 
         match system_prompt {
+            "ptc-descriptor" => Self::completed(AssistantMessage {
+                content: "done".into(),
+                ..assistant()
+            }),
+            "ptc-run" => {
+                if tool_message(&request.messages, "ptc_call").is_none() {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "ptc_call".into(),
+                            name: coda_tools::RUN_JAVASCRIPT_TOOL_NAME.into(),
+                            arguments: Some(
+                                serde_json::json!({
+                                    "code": "return await tools.read_todos({});"
+                                })
+                                .to_string(),
+                            ),
+                        }],
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        content: "done".into(),
+                        ..assistant()
+                    })
+                }
+            }
             "auto-compact-first-turn-main" => match last_user(&request.messages) {
                 Some("only") if tool_message(&request.messages, "call_first").is_none() => {
                     Self::completed(AssistantMessage {

@@ -268,6 +268,15 @@ impl Tool for WriteFileTool {
                 )));
             }
 
+            // Reserve retained host memory before creating directories or the
+            // file. A nested PTC call therefore fails closed on budget exceed.
+            ctx.record_artifact(file_diff_artifact(
+                &params.file_path,
+                FileChangeOperation::Create,
+                "",
+                &params.content,
+            ))?;
+
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     ToolError::ExecutionError(format!("Failed to create parent directories: {}", e))
@@ -304,13 +313,6 @@ impl Tool for WriteFileTool {
             file.flush()
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
-
-            ctx.record_artifact(file_diff_artifact(
-                &params.file_path,
-                FileChangeOperation::Create,
-                "",
-                &params.content,
-            ));
 
             Ok(format!(
                 "Successfully wrote {} bytes to {}",
@@ -436,6 +438,15 @@ impl Tool for EditFileTool {
                 )
             };
 
+            // The file lock is still held, but no mutation has happened yet.
+            // Reserve the complete retained patch before seek/truncate/write.
+            ctx.record_artifact(file_diff_artifact(
+                &params.file_path,
+                FileChangeOperation::Modify,
+                &content,
+                &updated,
+            ))?;
+
             file.seek(std::io::SeekFrom::Start(0))
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
@@ -448,13 +459,6 @@ impl Tool for EditFileTool {
             file.flush()
                 .await
                 .map_err(|e| ToolError::ExecutionError(format!("Failed to write file: {}", e)))?;
-
-            ctx.record_artifact(file_diff_artifact(
-                &params.file_path,
-                FileChangeOperation::Modify,
-                &content,
-                &updated,
-            ));
 
             Ok(format!(
                 "Successfully replaced {} occurrence(s) in {}",

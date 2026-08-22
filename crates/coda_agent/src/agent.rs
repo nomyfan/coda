@@ -111,6 +111,20 @@ pub struct ToolExecutionState {
 pub struct PendingToolCall {
     pub tool_call: ToolCall,
     pub outcome: ToolCallOutcome,
+    pub metadata: Option<ToolExecutionMetadata>,
+}
+
+/// Hidden execution data fixed when the model request is constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolExecutionMetadata {
+    ProgrammaticToolCalling { exposed_tools: Vec<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedToolCall {
+    pub tool_call: ToolCall,
+    pub metadata: Option<ToolExecutionMetadata>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,7 +139,7 @@ pub enum ResumePoint {
         /// what triggered it, even across a process restart.
         parent_message_id: MessageId,
         /// Tool calls waiting for approval.
-        pending_approval_calls: VecDeque<ToolCall>,
+        pending_approval_calls: VecDeque<PreparedToolCall>,
         /// Tool calls to execute.
         pending_calls: VecDeque<PendingToolCall>,
     },
