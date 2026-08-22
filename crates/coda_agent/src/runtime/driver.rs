@@ -482,7 +482,7 @@ fn execute_javascript_tool_discovery(
             info!("executing tool");
             let result = match serde_json::from_str::<Value>(&input) {
                 Ok(Value::Object(object)) if object.is_empty() => match invoker {
-                    Some(invoker) => coda_tools::available_tools_result(
+                    Some(invoker) => coda_tools::available_tools_message(
                         &invoker.currently_available_tools(),
                     )
                     .map_err(|error| ToolError::ResourceLimit(error.to_string())),
@@ -1577,7 +1577,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .max_by_key(|name| name.len())
                 .expect("nonempty capability snapshot");
             match (
-                coda_tools::available_tools_result(&names),
+                coda_tools::available_tools_message(&names),
                 coda_tools::tool_unavailable_message(longest, &names),
             ) {
                 (Ok(_), Ok(_)) => Some(names),

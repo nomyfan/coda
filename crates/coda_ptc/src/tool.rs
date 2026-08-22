@@ -8,8 +8,8 @@ use crate::engine::{JsExecutor, PtcLimits};
 pub const RUN_JAVASCRIPT_TOOL_NAME: &str = "run_javascript";
 /// Provider-visible synthetic tool used to discover script capabilities.
 pub const LIST_JAVASCRIPT_TOOLS_TOOL_NAME: &str = "list_javascript_tools";
-/// Maximum UTF-8 size of one capability discovery result.
-pub const DISCOVERY_RESULT_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 size of one capability discovery message.
+pub const DISCOVERY_MESSAGE_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 size of one `TOOL_UNAVAILABLE` message.
 pub const TOOL_UNAVAILABLE_MESSAGE_BYTES: usize = 16 * 1024;
 pub const PROGRAMMATIC_TOOL_NAMES: &[&str] = &[
@@ -157,7 +157,7 @@ pub fn run_javascript_definition() -> ToolDefinition {
 pub fn list_javascript_tools_definition() -> ToolDefinition {
     ToolDefinition {
         name: LIST_JAVASCRIPT_TOOLS_TOOL_NAME.to_string(),
-        description: "List the tool names currently available inside run_javascript. The matching direct tool descriptors in this request contain their parameter schemas. Call with an empty object."
+        description: "List the tool names currently available inside run_javascript as a bracketed, comma-separated string such as [read_file, ls]. The matching direct tool descriptors in this request contain their parameter schemas. Call with an empty object."
             .to_string(),
         parameter_schema: json!({
             "type": "object",
@@ -188,13 +188,15 @@ impl std::fmt::Display for CapabilityMessageLimitError {
 
 impl std::error::Error for CapabilityMessageLimitError {}
 
-/// Serialize the ordered names returned by `list_javascript_tools`.
-pub fn available_tools_result(available: &[String]) -> Result<String, CapabilityMessageLimitError> {
-    let result = json!({ "available_tools": available }).to_string();
+/// Format the ordered names returned by `list_javascript_tools`.
+pub fn available_tools_message(
+    available: &[String],
+) -> Result<String, CapabilityMessageLimitError> {
+    let message = format!("[{}]", available.join(", "));
     ensure_message_limit(
-        result,
-        "JavaScript tool discovery result",
-        DISCOVERY_RESULT_BYTES,
+        message,
+        "JavaScript tool discovery message",
+        DISCOVERY_MESSAGE_BYTES,
     )
 }
 
@@ -367,10 +369,8 @@ mod tests {
     fn capability_messages_preserve_order_and_are_bounded() {
         let names = vec!["read_file".to_string(), "ls".to_string()];
 
-        assert_eq!(
-            available_tools_result(&names).unwrap(),
-            r#"{"available_tools":["read_file","ls"]}"#
-        );
+        assert_eq!(available_tools_message(&names).unwrap(), "[read_file, ls]");
+        assert_eq!(available_tools_message(&[]).unwrap(), "[]");
         assert_eq!(
             tool_unavailable_message("write_file", &names).unwrap(),
             r#"tool "write_file" is unavailable; available tools: read_file, ls"#
@@ -389,7 +389,7 @@ mod tests {
         );
 
         let oversized = vec!["x".repeat(128); 256];
-        assert!(available_tools_result(&oversized).is_err());
+        assert!(available_tools_message(&oversized).is_err());
         assert!(tool_unavailable_message("read_file", &oversized).is_err());
     }
 }

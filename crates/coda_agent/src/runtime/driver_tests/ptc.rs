@@ -197,8 +197,7 @@ async fn discovery_uses_the_snapshot_intersected_with_live_policy_and_normal_eve
     assert!(saw_start);
     assert!(matches!(
         result.output,
-        ToolOutput::Ok(output)
-            if output == r#"{"available_tools":["read_todos"]}"#
+        ToolOutput::Ok(output) if output == "[read_todos]"
     ));
     assert!(matches!(
         result.outcome,
@@ -229,7 +228,7 @@ async fn discovery_requires_exactly_an_empty_object() {
         execute_javascript_tool_discovery(" \n { } \t".to_string(), Some(invoker))
             .await
             .unwrap(),
-        r#"{"available_tools":["read_todos"]}"#
+        "[read_todos]"
     );
 
     let error = execute_javascript_tool_discovery("{}".to_string(), None)

@@ -282,7 +282,7 @@ crates/coda_ptc/
 
 ### `list_javascript_tools` synthetic tool（`coda_agent` + `coda_ptc`）
 
-`coda_ptc` 定义固定的 provider-visible descriptor、`{"available_tools":[...]}` result 格式，以及 discovery result 和 `TOOL_UNAVAILABLE` message 各 16 KiB 的上限；`coda_agent` 在当前 agent 配置了 runner 且 capability snapshot 非空时自动注入它，并返回 `snapshot ∩ current policy` 的有序名称。generation 构造 snapshot 时先用两个 formatter 验证完整列表及最长 requested name 都能放入各自上限；超限则 fail closed，记录错误并同时省略 discovery/runner。执行时的可用集合只是 snapshot 子集，因此两种输出都不会意外越界。结果和错误列表都不允许截断，因为不完整列表会误导模型。
+`coda_ptc` 定义固定的 provider-visible descriptor、形如 `[read_file, ls]` 的 bracketed 纯文本名称格式（空集合为 `[]`），以及 discovery message 和 `TOOL_UNAVAILABLE` message 各 16 KiB 的上限；`coda_agent` 在当前 agent 配置了 runner 且 capability snapshot 非空时自动注入它，并返回 `snapshot ∩ current policy` 的有序名称。generation 构造 snapshot 时先用两个 formatter 验证完整列表及最长 requested name 都能放入各自上限；超限则 fail closed，记录错误并同时省略 discovery/runner。执行时的可用集合只是 snapshot 子集，因此两种输出都不会意外越界。结果和错误列表都不允许截断，因为不完整列表会误导模型。
 
 它不是普通 `ToolSpec`，不需要也不允许在 `AGENT.md` 中单独配置，不会被注入 JS bridge。`LIST_JAVASCRIPT_TOOLS_TOOL_NAME` 同时进入 `coda_tools` 导出的全局 synthetic reserved-name 集合；`AgentTeam::new` 对每个 agent 无条件拒绝同名 `ToolSpec`，无论 runner 是否启用。这样同名 prebuilt/custom tool 既不能产生重复 descriptor，也不能借 permission mode 对 synthetic name 的 auto-approve 获得普通工具权限。
 
@@ -404,11 +404,11 @@ pub enum HostToolCallError {
 pub fn run_javascript_definition() -> ToolDefinition;
 pub fn list_javascript_tools_definition() -> ToolDefinition;
 
-pub const DISCOVERY_RESULT_BYTES: usize = 16 * 1024;
+pub const DISCOVERY_MESSAGE_BYTES: usize = 16 * 1024;
 pub const TOOL_UNAVAILABLE_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// Encodes all names or fails without producing a partial capability list.
-pub fn available_tools_result(names: &[String]) -> Result<String, CapabilityMessageLimitError>;
+pub fn available_tools_message(names: &[String]) -> Result<String, CapabilityMessageLimitError>;
 
 /// Includes every currently available name or fails; it never expands beyond
 /// the generation snapshot and never emits a partial list.
@@ -633,7 +633,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
       Purpose: capability/policy 变化不再改写 runner descriptor，同时让新增 allowlisted bridge tool 自动进入可发现名称列表。
       Verification: capability 非空时，不同 permission mode 和 agent tool subset 生成 byte-for-byte 相同的两个 descriptors；discovery 分别返回四项/六项有序名称，且每个名称都在同一 request 中有直接 descriptor；snapshot 经过 approval/checkpoint/restart 后不扩张，执行前收紧会缩小结果；未配置 runner 或空 capability 时两者都不出现；伪造无 snapshot 的 discovery/runner 均 fail closed。
 
-- [x] **[synthetic execution]** 在 driver 增加 discovery special-case executor：只接受空对象，复用 local settlement 产生普通事件、ToolMessage、outcome、duration 和安全 tracing；用 `coda_ptc` formatter 生成 `{"available_tools":[...]}` 和 unavailable message，两者各有 16 KiB 硬上限且禁止部分截断。snapshot 构造时用完整名称集合和最长 requested name 预验证两种格式，上限失败时同时省略 runner/discovery。
+- [x] **[synthetic execution]** 在 driver 增加 discovery special-case executor：只接受空对象，复用 local settlement 产生普通事件、ToolMessage、outcome、duration 和安全 tracing；用 `coda_ptc` formatter 生成 bracketed、以 `, ` 分隔的纯文本名称（空集合为 `[]`）和 unavailable message，两者各有 16 KiB 硬上限且禁止部分截断。snapshot 构造时用完整名称集合和最长 requested name 预验证两种格式，上限失败时同时省略 runner/discovery。
       Purpose: 补回不经过 `ToolWrapper` 后必须显式承担的 trust-boundary、可观测性和 history memory 边界。
       Verification: `{}` 与带空白的对象成功；`null`、array、scalar、malformed JSON、非空对象返回 `InvalidParameters`；start/end event、ToolMessage、outcome 和 duration 与普通工具一致且 tracing 不含 sentinel raw data；两种 formatter 恰好等于各自上限时成功，超过一字节 fail closed 且无部分列表；生成阶段任一格式超限都不提供两个 synthetic descriptors。
 

@@ -537,6 +537,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   grep: "Search",
   shell: "Run",
   run_javascript: "Run code",
+  list_javascript_tools: "List JavaScript tools",
   read_todos: "Read todos",
   write_todos: "Update todos",
 };
