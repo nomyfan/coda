@@ -7,6 +7,7 @@
 /ignoreme
 skills/
 .coda
+.worktrees/
 .claude/worktrees/
 .claude/launch.json
 coda-server.toml
