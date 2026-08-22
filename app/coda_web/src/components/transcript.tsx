@@ -20,6 +20,7 @@ import {
   Pencil,
   Plug,
   Search,
+  SquareFunction,
   SquareTerminal,
   Wrench,
 } from "lucide-react";
@@ -30,6 +31,7 @@ import {
   Suspense,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -43,7 +45,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { CodaMark } from "@/components/logo";
-import { Markdown } from "@/components/markdown";
+import { CodeBlock, Markdown } from "@/components/markdown";
 import {
   beginEdit,
   discardedFrom,
@@ -367,6 +369,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   glob: FileSearch,
   grep: Search,
   shell: SquareTerminal,
+  run_javascript: SquareFunction,
   read_todos: ListTodo,
   write_todos: ListChecks,
 };
@@ -470,13 +473,47 @@ function hasFileDiffArtifacts(entry: TranscriptEntry) {
   return entry.artifacts?.some((artifact) => artifact.type === "file_diff") ?? false;
 }
 
+export function showsToolEntryText(entry: TranscriptEntry) {
+  return entry.script !== undefined ? entry.kind === "tool_result" : !hasFileDiffArtifacts(entry);
+}
+
+export function formatPtcResult(entry: Pick<TranscriptEntry, "content" | "kind" | "script">) {
+  if (entry.script === undefined || entry.kind !== "tool_result") {
+    return undefined;
+  }
+  try {
+    return JSON.stringify(JSON.parse(entry.content), null, 2);
+  } catch {
+    return undefined;
+  }
+}
+
 function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
+  const { content, kind, script } = entry;
   const fileDiffs = entry.artifacts?.filter((artifact) => artifact.type === "file_diff") ?? [];
+  const formattedResult = useMemo(
+    () => formatPtcResult({ content, kind, script }),
+    [content, kind, script],
+  );
   const theme = useSyncExternalStore(subscribeThemeChange, () =>
     resolveTheme(getStoredThemePreference()),
   );
   return (
     <div className="space-y-3">
+      {entry.script !== undefined ? (
+        <div
+          className={cn(
+            "space-y-1",
+            fileDiffs.length > 0 && "rounded-md border border-border/70 bg-background/70 p-3",
+          )}
+        >
+          <div className="flex items-center justify-between gap-2 text-xs font-medium text-muted-foreground">
+            <span>Script</span>
+            <CopyContentButton content={entry.script} label="script" />
+          </div>
+          <CodeBlock code={entry.script} language="javascript" className="my-0 max-h-80" />
+        </div>
+      ) : null}
       {entry.command ? (
         <div className="space-y-1">
           <div className="text-xs font-medium text-muted-foreground">Command</div>
@@ -485,10 +522,32 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
           </pre>
         </div>
       ) : null}
-      {fileDiffs.length === 0 ? (
-        <pre className="whitespace-pre-wrap break-words pr-10 font-sans text-sm leading-6">
-          {entry.content}
-        </pre>
+      {showsToolEntryText(entry) ? (
+        <div
+          className={cn(
+            entry.script !== undefined && "space-y-1",
+            fileDiffs.length > 0 && "rounded-md border border-border/70 bg-background/70 p-3",
+          )}
+        >
+          {entry.script !== undefined ? (
+            <div className="flex items-center justify-between gap-2 text-xs font-medium text-muted-foreground">
+              <span>Result</span>
+              <CopyContentButton content={entry.content} label="result" />
+            </div>
+          ) : null}
+          {formattedResult !== undefined ? (
+            <CodeBlock code={formattedResult} language="json" className="my-0 max-h-80" />
+          ) : (
+            <pre
+              className={cn(
+                "whitespace-pre-wrap break-words font-sans text-sm leading-6",
+                entry.script === undefined && "pr-10",
+              )}
+            >
+              {entry.content}
+            </pre>
+          )}
+        </div>
       ) : null}
       {fileDiffs.map((artifact) => (
         <div
@@ -1041,7 +1100,7 @@ function TranscriptDisclosure({ entry }: { entry: TranscriptEntry }) {
             !hasFileDiff && "border border-border bg-muted/20 p-3",
           )}
         >
-          {entry.kind === "tool_result" && !hasFileDiff ? (
+          {entry.kind === "tool_result" && !hasFileDiff && entry.script === undefined ? (
             <div className="sticky top-0 z-10 h-0">
               <div className="flex justify-end">
                 <CopyContentButton content={entry.content} label="result" />
@@ -1244,7 +1303,7 @@ const TranscriptItem = memo(function TranscriptItem({
                 !hasFileDiff && "border border-border/70 bg-background/70 p-3",
               )}
             >
-              {!hasFileDiff ? (
+              {!hasFileDiff && entry.script === undefined ? (
                 <div className="sticky top-0 z-10 h-0">
                   <div className="flex justify-end">
                     <CopyContentButton content={entry.content} label="result" />

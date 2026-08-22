@@ -15,6 +15,7 @@ import {
   Plug,
   Search,
   ShieldCheck,
+  SquareFunction,
   SquareTerminal,
   Wrench,
 } from "lucide-react";
@@ -69,6 +70,7 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   glob: FileSearch,
   grep: Search,
   shell: SquareTerminal,
+  run_javascript: SquareFunction,
   read_todos: ListTodo,
   write_todos: ListChecks,
 };

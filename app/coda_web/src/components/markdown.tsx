@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 /* Highlighting re-runs on every streamed chunk, so it rides a deferred copy of
  * the text: React can drop stale passes and keep the plain-text render (and
  * typing) responsive while a long block is still growing. */
-function CodeBlock({ code, className }: { code: string; className?: string }) {
+function HighlightedCode({ code, className }: { code: string; className?: string }) {
   const lang = /language-([\w+#-]+)/.exec(className ?? "")?.[1];
   const deferred = useDeferredValue(code);
   const html = useHighlighted(deferred, lang);
@@ -19,6 +19,25 @@ function CodeBlock({ code, className }: { code: string; className?: string }) {
     <code className={cn(className, "shiki-code")} dangerouslySetInnerHTML={{ __html: html }} />
   );
 }
+
+const CODE_BLOCK_CLASS =
+  "my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 text-foreground first:mt-0 last:mb-0 [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit";
+
+export const CodeBlock = memo(function CodeBlock({
+  code,
+  language,
+  className,
+}: {
+  code: string;
+  language?: string;
+  className?: string;
+}) {
+  return (
+    <pre className={cn(CODE_BLOCK_CLASS, className)}>
+      <HighlightedCode code={code} className={language ? `language-${language}` : undefined} />
+    </pre>
+  );
+});
 
 const components: Components = {
   p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
@@ -59,7 +78,7 @@ const components: Components = {
     const isBlock = /language-/.test(className ?? "") || raw.includes("\n");
     if (isBlock) {
       // The fence's trailing newline would otherwise render as a blank line.
-      return <CodeBlock code={raw.replace(/\n$/, "")} className={className} />;
+      return <HighlightedCode code={raw.replace(/\n$/, "")} className={className} />;
     }
     return (
       <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[0.85em] dark:bg-white/10">
@@ -67,11 +86,7 @@ const components: Components = {
       </code>
     );
   },
-  pre: ({ children }) => (
-    <pre className="my-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-5 text-foreground first:mt-0 last:mb-0 [&_code]:rounded-none [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit">
-      {children}
-    </pre>
-  ),
+  pre: ({ children }) => <pre className={CODE_BLOCK_CLASS}>{children}</pre>,
   table: ({ children }) => (
     <div className="my-2 overflow-x-auto first:mt-0 last:mb-0">
       <table className="w-full border-collapse text-sm">{children}</table>

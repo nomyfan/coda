@@ -157,8 +157,10 @@ impl Tool for WriteTodosTool {
         let count = todos.len();
         // A complete list, never a delta — see `ThreadState`. Recorded only if
         // this call reaches here, so a rejected or aborted one records nothing.
-        ctx.state.set(TODOS, serde_json::json!(todos));
-        async move { Ok(format!("Todos updated. {count} items.")) }
+        async move {
+            ctx.state.set(TODOS, serde_json::json!(todos))?;
+            Ok(format!("Todos updated. {count} items."))
+        }
     }
 }
 

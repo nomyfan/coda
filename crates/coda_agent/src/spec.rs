@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_tools::{BuildContext, KeyedLock, ToolSpec};
+use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
 
 use crate::agent::{
     Agent, AgentState, SUBAGENT_TOOL_PREFIX, SubAgentMode, SubAgentTool, SystemPrompt,
@@ -25,6 +25,14 @@ pub enum BuildError {
     /// a name. Tools and sub-agents occupy the same LLM tool namespace, so the
     /// name would be ambiguous at dispatch.
     NameConflict { agent: String, name: String },
+    /// A configured tool claims a name reserved for a provider-visible
+    /// synthetic tool owned by the runtime.
+    ReservedToolName {
+        /// Agent whose configured tools contain the reserved name.
+        agent: String,
+        /// Provider-visible synthetic name claimed by the configured tool.
+        name: String,
+    },
     /// A sub-agent's name, once prefixed for the LLM tool namespace, exceeds the
     /// provider's function-name length limit.
     SubagentNameTooLong { name: String, max: usize },
@@ -52,6 +60,13 @@ impl std::fmt::Display for BuildError {
                     f,
                     "Agent '{}' has two entries named '{}' (tools and sub-agents \
                      share one namespace)",
+                    agent, name
+                )
+            }
+            BuildError::ReservedToolName { agent, name } => {
+                write!(
+                    f,
+                    "Agent '{}' configures tool '{}', but that name is reserved by the runtime",
                     agent, name
                 )
             }
@@ -128,6 +143,12 @@ impl AgentTeam {
             // Tools and sub-agents share one LLM namespace.
             let mut names: HashSet<&str> = HashSet::new();
             for tool in &spec.tools {
+                if SYNTHETIC_RESERVED_TOOL_NAMES.contains(&tool.name()) {
+                    return Err(BuildError::ReservedToolName {
+                        agent: spec.name.clone(),
+                        name: tool.name().to_string(),
+                    });
+                }
                 if !names.insert(tool.name()) {
                     return Err(BuildError::NameConflict {
                         agent: spec.name.clone(),
@@ -322,6 +343,50 @@ mod tests {
             self.seen.lock().unwrap().push(ctx.workspace_dir.clone());
             Box::new(RecordingTool)
         }
+    }
+
+    struct ReservedToolSpec;
+
+    impl ToolSpec for ReservedToolSpec {
+        fn name(&self) -> &str {
+            coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+        }
+
+        fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+            unreachable!("reserved tool names are rejected before build")
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_synthetic_tool_name_without_a_runner() {
+        let root = AgentSpec {
+            tools: vec![Box::new(ReservedToolSpec)],
+            ..spec("coda")
+        };
+
+        assert!(matches!(
+            AgentTeam::new(root, vec![]),
+            Err(BuildError::ReservedToolName { agent, name })
+                if agent == "coda" && name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+        ));
+    }
+
+    #[test]
+    fn rejects_reserved_synthetic_tool_name_on_a_reachable_subagent() {
+        let root = AgentSpec {
+            subagents: vec!["sub".into()],
+            ..spec("coda")
+        };
+        let sub = AgentSpec {
+            tools: vec![Box::new(ReservedToolSpec)],
+            ..spec("sub")
+        };
+
+        assert!(matches!(
+            AgentTeam::new(root, vec![sub]),
+            Err(BuildError::ReservedToolName { agent, name })
+                if agent == "sub" && name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+        ));
     }
 
     #[test]

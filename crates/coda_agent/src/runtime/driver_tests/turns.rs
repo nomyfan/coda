@@ -7,7 +7,7 @@ use crate::{
     AgentEvent, AgentSpec, AgentTeam, ResumeDecision, SubAgentMode, ToolApprovalMode,
     ToolCallResolution,
     agent::HistoryEntry,
-    persist::{StoredCheckpoint, StoredResumePoint},
+    persist::{StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint},
     runtime::{
         AgentRuntimeSnapshot, MemoryStorage, ResumeTarget, SendCommandError, SessionStorage,
     },
@@ -496,7 +496,10 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                 state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id,
-                    pending_approval_calls: vec![call.clone()],
+                    pending_approval_calls: vec![StoredPreparedToolCall {
+                        tool_call: call.clone(),
+                        metadata: None,
+                    }],
                     pending_calls: vec![],
                 },
                 suspended_at: jiff::Timestamp::now(),

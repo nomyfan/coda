@@ -25,10 +25,11 @@ import {
   type WorkspaceSummary,
   callArguments,
   describeTool,
+  extractRunJavaScriptCode,
   extractShellCommand,
   outcomeText,
   outputText,
-  subAgentDisplayName,
+  toolDisplayName,
 } from "@/lib/protocol";
 import { parseCompactCommand } from "@/lib/compact-command";
 import { createRpcClient, isServerError, type RpcClient } from "@/lib/rpc";
@@ -80,6 +81,8 @@ export type TranscriptEntry = {
   detail?: string;
   /** Executed shell command, shown alongside shell results. */
   command?: string;
+  /** Model-generated source executed by run_javascript. */
+  script?: string;
   content: string;
   /** Image URLs attached to a user message (base64 data-URIs or HTTPS URLs). */
   images?: string[];
@@ -463,20 +466,22 @@ function historyToEntries(
   }
   if ("Tool" in message) {
     const argumentsJson = argsById[message.Tool.id];
+    const call = {
+      id: message.Tool.id,
+      name: message.Tool.name,
+      arguments: argumentsJson,
+    };
     return [
-      toolMessageToEntry(
-        message.Tool,
-        `tool:${message.Tool.message_id}`,
-        describeTool(message.Tool.name, argumentsJson),
-        message.Tool.name === "shell"
-          ? extractShellCommand({
-              id: message.Tool.id,
-              name: message.Tool.name,
-              arguments: argumentsJson,
-            })
-          : undefined,
-        spansById[message.Tool.id],
-      ),
+      {
+        ...toolMessageToEntry(
+          message.Tool,
+          `tool:${message.Tool.message_id}`,
+          describeTool(message.Tool.name, argumentsJson),
+          message.Tool.name === "shell" ? extractShellCommand(call) : undefined,
+          spansById[message.Tool.id],
+        ),
+        script: extractRunJavaScriptCode(call),
+      },
     ];
   }
   if ("Compaction" in message) {
@@ -637,13 +642,16 @@ function finishToolEntry(
       generationSpans: withoutGenerationSpan(session, event.message.id),
       entries: [
         ...session.entries,
-        toolMessageToEntry(
-          event.message,
-          undefined,
-          call ? describeTool(call.name, call.arguments) : undefined,
-          call?.name === "shell" ? extractShellCommand(call) : undefined,
-          generation,
-        ),
+        {
+          ...toolMessageToEntry(
+            event.message,
+            undefined,
+            call ? describeTool(call.name, call.arguments) : undefined,
+            call?.name === "shell" ? extractShellCommand(call) : undefined,
+            generation,
+          ),
+          script: call ? extractRunJavaScriptCode(call) : undefined,
+        },
       ],
     };
   }
@@ -658,6 +666,7 @@ function finishToolEntry(
       entries[index].command,
       generation,
     ),
+    script: entries[index].script,
     agentName: event.agent_name,
     threadId: event.thread_id,
   };
@@ -939,7 +948,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         ...addActivity(session, {
           tone: event.agent_name === rootName ? "warning" : "cyan",
           label: `${event.agent_name} tool`,
-          detail: subAgentDisplayName(event.call.name),
+          detail: toolDisplayName(event.call.name),
         }),
         running: true,
         pendingCallInfo: withoutPendingCallInfo(session, event.call.id),
@@ -954,6 +963,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
             title: event.call.name,
             detail: describeTool(event.call.name, event.call.arguments),
             command: event.call.name === "shell" ? extractShellCommand(event.call) : undefined,
+            script: extractRunJavaScriptCode(event.call),
             content: callArguments(event.call),
             status: "running",
           },
@@ -964,7 +974,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         ...addActivity(finishToolEntry(session, event), {
           tone: "success",
           label: "tool finished",
-          detail: subAgentDisplayName(event.message.name),
+          detail: toolDisplayName(event.message.name),
         }),
       };
     case "compaction_start":
