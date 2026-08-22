@@ -50,12 +50,11 @@ function assistantMessage(id: string, promptTokens: number): HistoryMessage {
   };
 }
 
-function compactionMessage(id: string): HistoryMessage {
+function compactionMessage(id: string, cutoff: string): HistoryMessage {
   return {
-    Custom: {
+    Compaction: {
       message_id: id,
-      kind: "compaction",
-      role: "User",
+      outcome: { type: "summary", cutoff },
       content: "Summary",
       created_at: "2026-08-16T00:00:02Z",
     },
@@ -71,12 +70,11 @@ test("only a whole composer input is a compact command", () => {
   expect(parseCompactCommand("x/compact")).toBeNull();
 });
 
-test("a compaction custom message becomes a distinct transcript separator", () => {
+test("a compaction summary becomes a distinct transcript separator", () => {
   const message: HistoryMessage = {
-    Custom: {
+    Compaction: {
       message_id: "summary-1",
-      kind: "compaction",
-      role: "User",
+      outcome: { type: "summary", cutoff: "covered-1" },
       content: "Keep the storage invariants and continue with the web client.",
       created_at: "2026-08-16T00:00:00Z",
     },
@@ -363,7 +361,7 @@ test("a repeated /compact line stays optimistic until its compaction finishes", 
           created_at: "2026-08-16T00:00:00Z",
         },
       },
-      compactionMessage("old-summary"),
+      compactionMessage("old-summary", "old-command"),
     ],
     approvals: [],
     providerId: "provider:model",
@@ -430,7 +428,10 @@ test("the end-of-compaction snapshot retires the optimistic copy by content", ()
 
 test("a successful compaction clears usage until the next assistant response", () => {
   const compacted = applySnapshotToSession(session(), {
-    messages: [assistantMessage("old-assistant", 900), compactionMessage("summary")],
+    messages: [
+      assistantMessage("old-assistant", 900),
+      compactionMessage("summary", "old-assistant"),
+    ],
     approvals: [],
     providerId: "provider:model",
     reasoningEffort: null,
@@ -443,7 +444,7 @@ test("a successful compaction clears usage until the next assistant response", (
   const continued = applySnapshotToSession(compacted, {
     messages: [
       assistantMessage("old-assistant", 900),
-      compactionMessage("summary"),
+      compactionMessage("summary", "old-assistant"),
       assistantMessage("new-assistant", 100),
     ],
     approvals: [],
@@ -564,7 +565,7 @@ test("a /compact user message cannot be pulled back into the composer", () => {
   });
 });
 
-test("compaction_start shows a pending shimmer entry that custom replaces in place", () => {
+test("compaction_start shows a pending shimmer entry that compaction_end replaces in place", () => {
   const started = reduceEvent(session(), {
     type: "compaction_start",
     agent_name: "coda",
@@ -574,13 +575,12 @@ test("compaction_start shows a pending shimmer entry that custom replaces in pla
   expect(started.entries[0]).toMatchObject({ kind: "compaction", status: "compacting" });
 
   const finished = reduceEvent(started, {
-    type: "custom",
+    type: "compaction_end",
     agent_name: "coda",
     thread_id: "s1",
     message: {
       message_id: "summary-1",
-      kind: "compaction",
-      role: "User",
+      outcome: { type: "summary", cutoff: "covered-1" },
       content: "the gist",
       created_at: "2026-08-16T00:00:00Z",
     },

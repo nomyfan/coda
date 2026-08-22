@@ -469,40 +469,50 @@ impl ToolMessage {
     }
 }
 
-/// A message the application layer authored, carrying its own meaning.
+/// A record the compaction machinery authored: the summary a successful
+/// compaction leaves behind, or a note that one could not be produced.
 ///
-/// `kind` is opaque to everything below the layer that wrote it: the UI keys
-/// its rendering on it, and nothing here interprets it. `role` says which
-/// ordinary message this becomes when the request is built — and `None` marks
-/// a transcript-only message, which the model view never includes.
+/// `outcome` says which of the two this is — and, for a summary, where the
+/// boundary it draws falls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomMessage {
+pub struct CompactionMessage {
     pub message_id: MessageId,
-    pub kind: String,
-    /// The role the message is lowered to on the provider path. `None` marks a
-    /// transcript-only message — the model view filters it out before anything
-    /// lowers, so it has no request shape.
-    pub role: Option<CustomRole>,
+    pub outcome: CompactionOutcome,
     pub content: String,
     pub created_at: jiff::Timestamp,
-    /// For a compaction summary: the last message this summary covers. `None`
-    /// for every other kind, and for a summary written before this field
-    /// existed — the model view falls back to that summary's own position in
-    /// that case, which is what it always meant before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cutoff: Option<MessageId>,
 }
 
-/// What a [`CustomMessage`] becomes on its way to the provider.
-///
-/// No `Tool`: a tool message needs the id of the call it answers, and one built
-/// without a matching `tool_calls` entry ahead of it is an orphan result that
-/// providers reject. Projecting to a tool message needs a payload that carries
-/// all of that, not another variant here.
+impl CompactionMessage {
+    /// The last message this summary covers, or `None` for a failure record.
+    pub fn cutoff(&self) -> Option<MessageId> {
+        match self.outcome {
+            CompactionOutcome::Summary { cutoff } => Some(cutoff),
+            CompactionOutcome::Failed => None,
+        }
+    }
+
+    /// Whether this is a summary — the only outcome that moves the boundary.
+    pub fn is_summary(&self) -> bool {
+        matches!(self.outcome, CompactionOutcome::Summary { .. })
+    }
+}
+
+/// What a compaction attempt produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CustomRole {
-    User,
-    Assistant,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompactionOutcome {
+    /// A summary, which is also the new boundary. `cutoff` is the last message
+    /// it covers, which is what lets the model view put messages written after
+    /// it (an in-progress turn) back *after* the summary. Lowered to a user
+    /// message on the provider path — no `Tool`, and no assistant either: a
+    /// tool message needs the id of the call it answers, and one built without
+    /// a matching `tool_calls` entry ahead of it is an orphan result that
+    /// providers reject.
+    Summary { cutoff: MessageId },
+    /// No summary could be produced, so the history was left as it is. The
+    /// record is transcript-only: the model view filters it out, so nothing
+    /// ever lowers it.
+    Failed,
 }
 
 /// What a thread's history holds.
@@ -517,8 +527,8 @@ pub enum Message {
     Assistant(AssistantMessage),
     /// A message representing the result of a tool execution.
     Tool(ToolMessage),
-    /// A message the application layer authored — see [`CustomMessage`].
-    Custom(CustomMessage),
+    /// A record the compaction machinery authored — see [`CompactionMessage`].
+    Compaction(CompactionMessage),
 }
 
 impl Message {
@@ -529,16 +539,16 @@ impl Message {
             Message::User(message) => message.message_id,
             Message::Assistant(message) => message.message_id,
             Message::Tool(message) => message.message_id,
-            Message::Custom(message) => message.message_id,
+            Message::Compaction(message) => message.message_id,
         }
     }
 
-    /// Whether the model view shows this message. A custom message without a
-    /// role is transcript-only; everything else is ordinary conversation shown
-    /// in full.
+    /// Whether the model view shows this message. A failed compaction is
+    /// transcript-only; everything else is ordinary conversation shown in
+    /// full.
     pub fn visible_to_model(&self) -> bool {
         match self {
-            Message::Custom(custom) => custom.role.is_some(),
+            Message::Compaction(compaction) => compaction.is_summary(),
             _ => true,
         }
     }
@@ -546,9 +556,9 @@ impl Message {
 
 /// What a provider is sent.
 ///
-/// No `Custom`: every custom message is lowered to an ordinary one before the
-/// request is built, so a provider adapter never has to know what any `kind`
-/// means.
+/// No `Compaction`: a summary is lowered to an ordinary user message before
+/// the request is built, so a provider adapter never has to know that
+/// compaction exists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RequestMessage {
     /// System message.
@@ -568,28 +578,16 @@ impl From<&Message> for Option<RequestMessage> {
             Message::Assistant(message) => Some(RequestMessage::Assistant(message.clone())),
             Message::Tool(message) => Some(RequestMessage::Tool(message.clone())),
             // The request vector is discarded after the call, so reusing the
-            // custom message's own id costs nothing. The `None` arm is not a
-            // tripwire: a role-less custom message is transcript-only by
+            // compaction message's own id costs nothing. The `None` arm is not
+            // a tripwire: a failed compaction is transcript-only by
             // definition, so skipping it at the lowering is the correct
             // behavior even if a caller forgot to filter the model view.
-            Message::Custom(message) => match message.role {
-                Some(CustomRole::User) => Some(RequestMessage::User(UserMessage::text(
+            Message::Compaction(message) => match message.outcome {
+                CompactionOutcome::Summary { .. } => Some(RequestMessage::User(UserMessage::text(
                     message.message_id,
                     message.content.clone(),
                 ))),
-                Some(CustomRole::Assistant) => Some(RequestMessage::Assistant(AssistantMessage {
-                    message_id: message.message_id,
-                    content: message.content.clone(),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    reasoning_content: None,
-                    reasoning_continuation: None,
-                    reasoning_ended_at: None,
-                    aborted: false,
-                    started_at: message.created_at,
-                    ended_at: message.created_at,
-                })),
-                None => None,
+                CompactionOutcome::Failed => None,
             },
         }
     }

@@ -1,26 +1,15 @@
-//! What a thread shows the model — the model view — and the kinds the
-//! compaction machinery writes.
+//! What a thread shows the model — the model view.
 //!
 //! [`model_view`] starts at the last compaction summary (if any), then
 //! everything after its recorded `cutoff`, in original order. Storage only
 //! ever grows at the tail, so a summary can land after messages it actually
 //! protects (an in-progress turn); `cutoff` is what lets the view put them
-//! back after the summary instead of before it. A summary with no `cutoff`
-//! (written before the field existed) falls back to its own physical
-//! position. Transcript-only records (a failed compaction) are filtered out.
+//! back after the summary instead of before it. Transcript-only records (a
+//! failed compaction) are filtered out.
 
 use crate::agent::HistoryEntry;
 use coda_core::llm::{Message, MessageId};
 use std::collections::HashMap;
-
-/// The `kind` of the summary a successful compaction writes. Only this kind
-/// moves the boundary.
-pub const COMPACTION_KIND: &str = "compaction";
-
-/// The `kind` written when the summary could not be generated. It records what
-/// happened for the transcript but is written without a role (`role: None`),
-/// so the model view never pays for it. The boundary stays where it was.
-pub const COMPACTION_FAILED_KIND: &str = "compaction_failed";
 
 /// The model's view of `messages`: the last compaction summary (if any)
 /// leading, then everything after its `cutoff`, minus transcript-only
@@ -184,7 +173,7 @@ pub(crate) fn validate_messages<'a>(
                     expected,
                 });
             }
-            Message::User(_) | Message::Assistant(_) | Message::Custom(_) => {
+            Message::User(_) | Message::Assistant(_) | Message::Compaction(_) => {
                 finish_batch(&mut batch)?;
             }
         }
@@ -193,8 +182,8 @@ pub(crate) fn validate_messages<'a>(
 }
 
 /// The last summary's index, paired with where its protected tail begins —
-/// one past its resolved `cutoff`, or the summary's own index when none is
-/// recorded.
+/// one past its recorded `cutoff`, or the summary's own index when that
+/// message is no longer in the history.
 fn last_summary(messages: &[HistoryEntry]) -> Option<(usize, usize)> {
     let (summary_idx, summary) = messages
         .iter()
@@ -202,7 +191,7 @@ fn last_summary(messages: &[HistoryEntry]) -> Option<(usize, usize)> {
         .rev()
         .find(|(_, entry)| is_compaction_summary(&entry.message))?;
     let tail_start = match &summary.message {
-        Message::Custom(custom) => custom.cutoff,
+        Message::Compaction(compaction) => compaction.cutoff(),
         _ => None,
     }
     .and_then(|cutoff_id| {
@@ -216,13 +205,13 @@ fn last_summary(messages: &[HistoryEntry]) -> Option<(usize, usize)> {
 }
 
 pub(crate) fn is_compaction_summary(message: &Message) -> bool {
-    matches!(message, Message::Custom(custom) if custom.kind == COMPACTION_KIND)
+    matches!(message, Message::Compaction(compaction) if compaction.is_summary())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coda_core::llm::{CustomMessage, CustomRole, MessageId, TurnId, UserMessage};
+    use coda_core::llm::{CompactionMessage, CompactionOutcome, MessageId, TurnId, UserMessage};
 
     // `pub(super)`: shared with `validation_tests`, a sibling module.
     pub(super) fn entry(message: Message) -> HistoryEntry {
@@ -250,41 +239,40 @@ mod tests {
         )
     }
 
-    /// A custom message with a role: model-visible, like a summary.
-    fn custom(kind: &str, content: &str) -> HistoryEntry {
-        entry(Message::Custom(CustomMessage {
+    fn compaction(outcome: CompactionOutcome, content: &str) -> HistoryEntry {
+        entry(Message::Compaction(CompactionMessage {
             message_id: MessageId::new(),
-            kind: kind.to_string(),
-            role: Some(CustomRole::User),
+            outcome,
             content: content.to_string(),
             created_at: jiff::Timestamp::now(),
-            cutoff: None,
         }))
+    }
+
+    /// A summary whose `cutoff` names a message this history doesn't hold, so
+    /// the view falls back to the summary's own position.
+    fn summary(content: &str) -> HistoryEntry {
+        compaction(
+            CompactionOutcome::Summary {
+                cutoff: MessageId::new(),
+            },
+            content,
+        )
     }
 
     /// A compaction summary carrying a recorded `cutoff` pointing at
     /// `covers`, as an automatic mid-turn compaction would write.
     fn summary_covering(content: &str, covers: &HistoryEntry) -> HistoryEntry {
-        entry(Message::Custom(CustomMessage {
-            message_id: MessageId::new(),
-            kind: COMPACTION_KIND.to_string(),
-            role: Some(CustomRole::User),
-            content: content.to_string(),
-            created_at: jiff::Timestamp::now(),
-            cutoff: Some(covers.message.message_id()),
-        }))
+        compaction(
+            CompactionOutcome::Summary {
+                cutoff: covers.message.message_id(),
+            },
+            content,
+        )
     }
 
-    /// A role-less custom message: transcript-only, like a failure record.
-    fn custom_transcript_only(kind: &str, content: &str) -> HistoryEntry {
-        entry(Message::Custom(CustomMessage {
-            message_id: MessageId::new(),
-            kind: kind.to_string(),
-            role: None,
-            content: content.to_string(),
-            created_at: jiff::Timestamp::now(),
-            cutoff: None,
-        }))
+    /// A failed compaction: transcript-only, and not a boundary.
+    fn failure(content: &str) -> HistoryEntry {
+        compaction(CompactionOutcome::Failed, content)
     }
 
     fn texts<'a>(entries: impl IntoIterator<Item = &'a HistoryEntry>) -> Vec<String> {
@@ -292,8 +280,8 @@ mod tests {
             .into_iter()
             .map(|entry| match &entry.message {
                 Message::User(user) => user.first_text().unwrap_or_default().to_string(),
-                Message::Custom(custom) => custom.content.clone(),
-                _ => unreachable!("these tests only build user and custom messages"),
+                Message::Compaction(compaction) => compaction.content.clone(),
+                _ => unreachable!("these tests only build user and compaction messages"),
             })
             .collect()
     }
@@ -309,7 +297,7 @@ mod tests {
         let history = vec![
             user("old"),
             user("/compact"),
-            custom(COMPACTION_KIND, "summary"),
+            summary("summary"),
             user("next"),
         ];
         assert_eq!(texts(model_view(&history)), ["summary", "next"]);
@@ -318,9 +306,9 @@ mod tests {
     #[test]
     fn the_last_summary_wins() {
         let history = vec![
-            custom(COMPACTION_KIND, "first summary"),
+            summary("first summary"),
             user("work"),
-            custom(COMPACTION_KIND, "second summary"),
+            summary("second summary"),
         ];
         assert_eq!(texts(model_view(&history)), ["second summary"]);
     }
@@ -332,7 +320,7 @@ mod tests {
         let history = vec![
             user("old"),
             user("/compact"),
-            custom_transcript_only(COMPACTION_FAILED_KIND, "the provider timed out"),
+            failure("the provider timed out"),
         ];
         assert_eq!(texts(model_view(&history)), ["old", "/compact"]);
     }
@@ -344,22 +332,12 @@ mod tests {
     fn failure_records_between_boundary_and_talk_stay_hidden() {
         let history = vec![
             user("old"),
-            custom(COMPACTION_KIND, "summary"),
+            summary("summary"),
             user("/compact"),
-            custom_transcript_only(COMPACTION_FAILED_KIND, "the provider timed out"),
+            failure("the provider timed out"),
             user("next"),
         ];
         assert_eq!(texts(model_view(&history)), ["summary", "/compact", "next"]);
-    }
-
-    /// Keys on the role, not on any particular kind.
-    #[test]
-    fn a_custom_message_with_a_role_stays_visible() {
-        let history = vec![user("old"), custom("note", "a plain custom record")];
-        assert_eq!(
-            texts(model_view(&history)),
-            ["old", "a plain custom record"]
-        );
     }
 
     #[test]
@@ -409,16 +387,12 @@ mod tests {
         assert_eq!(texts(model_view(&history)), ["second gist", "fresh"]);
     }
 
-    /// A pre-migration summary with no recorded `cutoff` falls back to its own
-    /// physical position.
+    /// A summary whose `cutoff` names a message this history no longer holds
+    /// falls back to the summary's own physical position.
     #[test]
-    fn a_summary_with_no_recorded_cutoff_falls_back_to_its_own_position() {
-        let history = vec![
-            user("old"),
-            custom(COMPACTION_KIND, "legacy summary"),
-            user("next"),
-        ];
-        assert_eq!(texts(model_view(&history)), ["legacy summary", "next"]);
+    fn a_summary_with_an_unresolvable_cutoff_falls_back_to_its_own_position() {
+        let history = vec![user("old"), summary("dangling summary"), user("next")];
+        assert_eq!(texts(model_view(&history)), ["dangling summary", "next"]);
     }
 
     /// `model_view` never cares which turn a message belongs to.

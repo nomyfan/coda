@@ -60,7 +60,14 @@ fn labels<'a>(entries: impl IntoIterator<Item = &'a HistoryEntry>) -> Vec<String
                     .join(",")
             ),
             Message::Tool(tool) => format!("tool:{}", tool.id),
-            Message::Custom(custom) => format!("custom:{}", custom.kind),
+            Message::Compaction(compaction) => format!(
+                "compaction:{}",
+                if compaction.is_summary() {
+                    "summary"
+                } else {
+                    "failed"
+                }
+            ),
         })
         .collect()
 }
@@ -109,14 +116,14 @@ async fn a_first_turn_can_compact_after_its_completed_tool_batch() {
     let summary = history
         .iter()
         .find_map(|entry| match &entry.message {
-            Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND => Some(custom),
+            Message::Compaction(compaction) if compaction.is_summary() => Some(compaction),
             _ => None,
         })
         .expect("first-turn compaction");
-    assert_eq!(summary.cutoff, Some(result.message.message_id()));
+    assert_eq!(summary.cutoff(), Some(result.message.message_id()));
     assert_eq!(
         labels(message_view::model_view(&history)),
-        ["custom:compaction", "assistant:only done"]
+        ["compaction:summary", "assistant:only done"]
     );
 }
 
@@ -245,7 +252,7 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
 
     let summaries: Vec<_> = history
         .iter()
-        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND))
+        .filter(|entry| matches!(&entry.message, Message::Compaction(compaction) if compaction.is_summary()))
         .collect();
     assert_eq!(
         summaries.len(),
@@ -254,7 +261,7 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
         labels(&history)
     );
     assert!(
-        !history.iter().any(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_FAILED_KIND)),
+        !history.iter().any(|entry| matches!(&entry.message, Message::Compaction(compaction) if !compaction.is_summary())),
         "the scripted summary always succeeds in this test"
     );
 
@@ -268,11 +275,11 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
             |entry| matches!(&entry.message, Message::User(u) if u.first_text() == Some("second")),
         )
         .expect("turn 2's opening message");
-    let Message::Custom(first_summary) = &summaries[0].message else {
-        unreachable!("filtered to Custom above");
+    let Message::Compaction(first_summary) = &summaries[0].message else {
+        unreachable!("filtered to Compaction above");
     };
     assert_eq!(
-        first_summary.cutoff,
+        first_summary.cutoff(),
         Some(first_done.message.message_id()),
         "the summary should cover exactly through turn 1's last message"
     );
@@ -286,11 +293,11 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
         .iter()
         .find(|entry| matches!(&entry.message, Message::Tool(tool) if tool.id == "call_2"))
         .expect("turn 2's second tool result");
-    let Message::Custom(second_summary) = &summaries[1].message else {
-        unreachable!("filtered to Custom above");
+    let Message::Compaction(second_summary) = &summaries[1].message else {
+        unreachable!("filtered to Compaction above");
     };
     assert_eq!(
-        second_summary.cutoff,
+        second_summary.cutoff(),
         Some(call_2_result.message.message_id()),
         "the fallback should cover the latest complete tool batch"
     );
@@ -300,7 +307,7 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
     assert_eq!(
         labels(message_view::model_view(&history)),
         vec![
-            "custom:compaction".to_string(),
+            "compaction:summary".to_string(),
             "assistant:second done".to_string(),
         ]
     );
@@ -329,7 +336,7 @@ async fn auto_compaction_emits_a_start_event_before_the_result() {
             }
             match event {
                 AgentEvent::CompactionStart => saw_start = true,
-                AgentEvent::Custom(_) => {
+                AgentEvent::CompactionEnd(_) => {
                     assert!(saw_start, "the start event should precede the result");
                     return;
                 }
@@ -382,7 +389,7 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
 
     let summaries: Vec<_> = explore_history
         .iter()
-        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND))
+        .filter(|entry| matches!(&entry.message, Message::Compaction(compaction) if compaction.is_summary()))
         .collect();
     assert_eq!(
         summaries.len(),
@@ -396,17 +403,17 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
         .iter()
         .find(|entry| matches!(&entry.message, Message::Assistant(a) if a.content == "explore round 1 done"))
         .expect("explore's first invocation answer");
-    let Message::Custom(summary) = &summaries[0].message else {
-        unreachable!("filtered to Custom above");
+    let Message::Compaction(summary) = &summaries[0].message else {
+        unreachable!("filtered to Compaction above");
     };
     assert_eq!(
-        summary.cutoff,
+        summary.cutoff(),
         Some(round_1_done.message.message_id()),
         "the summary should cover exactly through explore's first invocation"
     );
 
     let view_labels = labels(message_view::model_view(&explore_history));
-    assert_eq!(view_labels.first(), Some(&"custom:compaction".to_string()));
+    assert_eq!(view_labels.first(), Some(&"compaction:summary".to_string()));
     assert_eq!(
         view_labels.last(),
         Some(&"assistant:explore round 2 done".to_string()),
@@ -449,11 +456,11 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
         .messages;
     let failures = history
         .iter()
-        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_FAILED_KIND))
+        .filter(|entry| matches!(&entry.message, Message::Compaction(compaction) if !compaction.is_summary()))
         .count();
     let successes = history
         .iter()
-        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND))
+        .filter(|entry| matches!(&entry.message, Message::Compaction(compaction) if compaction.is_summary()))
         .count();
     assert_eq!(failures, 1, "the first attempt was scripted to fail");
     assert_eq!(
@@ -550,7 +557,7 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
         .messages;
     let summaries = history
         .iter()
-        .filter(|entry| matches!(&entry.message, Message::Custom(custom) if custom.kind == message_view::COMPACTION_KIND))
+        .filter(|entry| matches!(&entry.message, Message::Compaction(compaction) if compaction.is_summary()))
         .count();
     assert_eq!(
         summaries,

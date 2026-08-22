@@ -161,14 +161,14 @@ fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
                 Message::User(_) => "user",
                 Message::Assistant(_) => "assistant",
                 Message::Tool(_) => "tool",
-                Message::Custom(_) => "custom",
+                Message::Compaction(_) => "compaction",
             };
             (role, m.message_id())
         })
         .collect()
 }
 
-/// Mid-turn auto-compaction appends a `Custom` message straight to the
+/// Mid-turn auto-compaction appends a `Compaction` message straight to the
 /// driver's history, outside the hub's `compact` command — it only reaches
 /// the live snapshot if it also travels the event pipeline. Without that, a
 /// client that never disconnects would never see it.
@@ -238,7 +238,7 @@ async fn auto_compaction_reaches_the_live_snapshot_without_a_reattach() {
     assert!(
         ids_by_role(&persisted)
             .iter()
-            .any(|(role, _)| *role == "custom"),
+            .any(|(role, _)| *role == "compaction"),
         "the scripted second turn should have crossed the auto-compact \
          threshold: {:?}",
         ids_by_role(&persisted)

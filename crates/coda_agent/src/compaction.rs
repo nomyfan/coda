@@ -11,9 +11,9 @@
 //! tool-batch boundary when the current turn itself has grown too large.
 
 use crate::agent::HistoryEntry;
-use crate::message_view::{self, COMPACTION_FAILED_KIND, COMPACTION_KIND};
+use crate::message_view;
 use coda_core::llm::{
-    ChatCompletionRequest, ContentPart, CustomMessage, CustomRole, Message, MessageId,
+    ChatCompletionRequest, CompactionMessage, CompactionOutcome, ContentPart, Message, MessageId,
     RequestMessage, SystemMessage, ToolOutput, TurnId, UserMessage,
 };
 
@@ -215,38 +215,24 @@ pub fn summary_message(cutoff: MessageId, trigger: Trigger, summary: &str) -> Me
             )
         }
     };
-    custom(
-        COMPACTION_KIND,
-        Some(CustomRole::User),
-        content,
-        Some(cutoff),
-    )
+    compaction(CompactionOutcome::Summary { cutoff }, content)
 }
 
 /// Recorded when no summary could be produced. Not a boundary, and
-/// transcript-only (no role), so the model view is untouched.
+/// transcript-only, so the model view is untouched.
 pub fn failure_message(reason: &str) -> Message {
-    custom(
-        COMPACTION_FAILED_KIND,
-        None,
+    compaction(
+        CompactionOutcome::Failed,
         format!("Compaction failed, so the conversation was left as it is: {reason}"),
-        None,
     )
 }
 
-fn custom(
-    kind: &str,
-    role: Option<CustomRole>,
-    content: String,
-    cutoff: Option<MessageId>,
-) -> Message {
-    Message::Custom(CustomMessage {
+fn compaction(outcome: CompactionOutcome, content: String) -> Message {
+    Message::Compaction(CompactionMessage {
         message_id: MessageId::new(),
-        kind: kind.to_string(),
-        role,
+        outcome,
         content,
         created_at: jiff::Timestamp::now(),
-        cutoff,
     })
 }
 
@@ -295,9 +281,9 @@ fn transcript<'a>(messages: impl IntoIterator<Item = &'a HistoryEntry>) -> Strin
                 out.push('\n');
             }
             // An earlier summary, which is where this view begins.
-            Message::Custom(custom) => {
-                out.push_str(&format!("\n## {}\n", custom.kind));
-                out.push_str(&custom.content);
+            Message::Compaction(compaction) => {
+                out.push_str("\n## Summary of the conversation so far\n");
+                out.push_str(&compaction.content);
                 out.push('\n');
             }
         }

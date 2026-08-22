@@ -77,26 +77,24 @@ export type UserMessage = {
   created_at: string;
 };
 
-/** A message the server authored, carrying its own meaning in `kind`. `role`
- * is what the model is shown it as, and is of no interest to the UI; `null`
- * marks a transcript-only record (e.g. a failed compaction). */
-export type CustomMessage = {
+/** What a compaction attempt produced: the summary it wrote — carrying
+ * `cutoff`, the id of the last message that summary covers — or the record of
+ * why it wrote none, which is transcript-only. */
+export type CompactionOutcome = { type: "summary"; cutoff: string } | { type: "failed" };
+
+/** A record the server's compaction machinery authored. */
+export type CompactionMessage = {
   message_id: string;
-  kind: string;
-  role: "User" | "Assistant" | null;
+  outcome: CompactionOutcome;
   content: string;
   created_at: string;
-  /** For a `kind: "compaction"` summary: the id of the last message it
-   * covers. Omitted (not `null`) on the wire when absent — a summary written
-   * before this field existed, or any other `kind`. */
-  cutoff?: string;
 };
 
 export type HistoryMessage =
   | { User: UserMessage }
   | { Assistant: AssistantMessage }
   | { Tool: ToolMessage }
-  | { Custom: CustomMessage };
+  | { Compaction: CompactionMessage };
 
 export type PendingApproval = {
   thread_id: string;
@@ -456,12 +454,13 @@ export type WireEvent =
       agent_name: string;
       thread_id: string;
     }
-  /** An auto-compaction summary or failure record. */
+  /** An auto-compaction's outcome: the summary it wrote, or the record of why
+   * it wrote none. */
   | {
-      type: "custom";
+      type: "compaction_end";
       agent_name: string;
       thread_id: string;
-      message: CustomMessage;
+      message: CompactionMessage;
     }
   | {
       type: "suspended";

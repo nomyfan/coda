@@ -6,9 +6,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use coda_core::llm::{
-    AssistantMessage, ChatCompletionRequest, CompletionUsage, CustomMessage, Message, MessageId,
-    RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage,
-    ToolOutput, TurnId, UserMessage,
+    AssistantMessage, ChatCompletionRequest, CompactionMessage, CompletionUsage, Message,
+    MessageId, RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition,
+    ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::Tools;
 
@@ -301,11 +301,11 @@ pub enum AgentEvent {
     ToolCallStart(ToolCall),
     ToolCallEnd(ToolMessage),
     /// An auto-compaction has begun. Live-only cue, like `LLMStart` — nothing
-    /// is persisted until `Custom` reports the outcome.
+    /// is persisted until `CompactionEnd` reports the outcome.
     CompactionStart,
-    /// A message appended outside the normal flow — today, only an
-    /// auto-compaction summary or failure record.
-    Custom(CustomMessage),
+    /// An auto-compaction's outcome: the summary it wrote, or the record of
+    /// why it wrote none. Appended outside the normal message flow.
+    CompactionEnd(CompactionMessage),
     /// Emitted when tool calls require human approval. The agent thread exits
     /// after this event. The caller should shut down the session, collect
     /// decisions, and open a new session with `resume_decisions` to continue.
