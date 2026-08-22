@@ -11,7 +11,7 @@
 - 用 `rquickjs` 执行模型生成的 ES2020 JavaScript。
 - 新建 `crates/coda_ptc`，隔离 JS engine、bridge protocol、资源限制和执行报告。
 - 只把 `read_file`、`write_file`、`edit_file`、`ls`、`read_todos`、`write_todos` 以异步 JS 函数暴露给脚本。
-- 每次 generation 取“固定六项 ∩ 当前 agent 已配置工具 ∩ 当前无需审批工具”，把这个 capability snapshot 与动态 descriptor 一起生成，并作为隐藏执行元数据持久化到对应的 runner call。
+- 每次 generation 取“固定六项 ∩ 当前 agent 已配置工具 ∩ 当前无需审批工具”，把 capability snapshot 作为隐藏执行元数据持久化到对应的 discovery/runner call；provider-visible 的 `run_javascript` 与 `list_javascript_tools` descriptor 本身保持固定。
 - 复用现有工具参数校验、取消、权限、文件锁、thread state 和 artifact 机制。
 - 给出安全边界、资源限制、持久化语义、测试与逐步实现方案。
 
@@ -30,10 +30,11 @@
 - 目标是给 Coda 增加 provider-independent 的本地 PTC，而不是接入 Claude 托管 code execution。若目标其实是完整兼容 Claude 原生协议，需要另做 `coda_anthropic` provider adapter，本设计的数据流会明显不同。
 - 首版每次 `run_javascript` 都创建独立、短生命周期的 QuickJS runtime。脚本之间不共享 JS 全局状态；需要持久化的数据仍由现有 `ThreadState` 所有。
 - `run_javascript` 本身没有文件、网络、进程等 ambient authority；所有外部能力只能通过受控的工具 bridge 获得。
-- MVP 不在 JS 内进入审批流程。`run_javascript` 是普通外层工具：permission mode 默认自动批准它；若 workspace `approval_required` 命中它，则在 QuickJS 启动前走现有审批、暂停和恢复流程，而不是被解释为禁用。
-- `run_javascript` 必须属于当前 agent 的配置，并且至少有一项 bridge 工具可注入时才出现在 request tools 中；runner 自身是否需要审批不影响 descriptor。默认 root agent 下，`explore` 注入 `read_file`、`ls`、`read_todos`、`write_todos`；`accept_edits`/`yolo` 注入全部六项。
+- MVP 不在 JS 内进入审批流程。`run_javascript` 与伴生 discovery 都是普通外层工具：permission mode 默认自动批准它们；若 workspace `approval_required` 命中，则在执行前走现有审批、暂停和恢复流程，而不是被解释为禁用。
+- `run_javascript` 必须属于当前 agent 的配置，并且至少有一项 bridge 工具可注入时，固定 descriptor 的 `run_javascript` 与伴生 synthetic tool `list_javascript_tools` 才一起出现在 request tools 中。`list_javascript_tools` 不需要在 `AGENT.md` 中单独配置，也不能脱离 runner 单独启用。默认 root agent 下，`explore` 注入 `read_file`、`ls`、`read_todos`、`write_todos`；`accept_edits`/`yolo` 注入全部六项。
 - workspace 若要禁用 PTC，应在 agent 的 `tools` 配置中省略 `run_javascript`；`approval_required` 只表示外层调用需要人工批准，不兼任 disable 开关。MVP 不另增 `enabled = false`。
-- capability snapshot 在构造 LLM request 时确定，绝不从模型参数接收；provider 返回 runner call 后，driver 把 snapshot 绑定为隐藏执行元数据。它必须跟随自动执行队列、待审批队列和 checkpoint 持久化，跨暂停、mode 变化和进程重启保持不变。
+- MVP 的每一项 JS bridge capability 也以同名普通 tool descriptor 出现在 provider request 中；因此 discovery 只需返回可用名称，模型从 request tools 读取对应 description 和 input schema。未来若引入 bridge-only capability，再单独扩展 discovery wire shape。
+- capability snapshot 在构造 LLM request 时确定，绝不从模型参数接收；provider 返回 discovery 或 runner call 后，driver 把 snapshot 绑定为隐藏执行元数据。它必须跟随自动执行队列、待审批队列和 checkpoint 持久化，跨暂停、mode 变化和进程重启保持不变。
 - 每个 bridge call 都重新检查“该名称在 generation snapshot 中，且当前完整 policy 仍无需审批”。实时检查只允许继续收缩，不能扩张：mode 或 workspace rules 中途收紧后，新调用返回 `TOOL_UNAVAILABLE`；反向放宽也不会让当前脚本得到 generation 时未暴露的工具。
 - 主 Tokio runtime 上的 supervisor 是唯一权威 wall-clock watchdog。它能从 worker 线程外设置 atomic interrupt flag 并取消 script/host-call token；worker 本地 select 只负责在 Promise 或 host await 正常被 poll 时快速响应，不负责唤醒 CPU 死循环。
 - QuickJS heap limit 不覆盖 Rust host 侧的 state 和 artifacts。PTC 另设 script-scoped 累计预算；每个嵌套调用先在隔离的 child context 中暂存 effects，成功才合并，失败或取消则丢弃。
@@ -65,7 +66,7 @@ interrupt handler 只会在 engine 正在执行 JS 指令时被调用；它不�
 
 - `ToolObject::execute` 已统一承担 JSON 参数反序列化、异步执行和字符串输出；PTC bridge 应调用它，而不是给每个工具另写 adapter。
 - `AgentDriver::handle_generation` 生成 tool descriptors 并用 `ToolApprovalMode` 分流审批；嵌套调用必须复用相同 predicate，否则 `shell` deny、workspace `approval_required` 和 permission mode 会被绕过。
-- 当前待执行调用只持久化 `ToolCall + outcome`，待审批队列甚至只保存 `ToolCall`。动态 descriptor 对应的 capability snapshot 若不随两条队列持久化，同批其他工具触发审批或进程重启后只能重新计算，并可能在 policy 放宽时扩大权限。
+- 当前待执行调用只持久化 `ToolCall + outcome`，待审批队列甚至只保存 `ToolCall`。capability snapshot 若不随 discovery/runner call 经过两条队列持久化，同批其他工具触发审批或进程重启后只能重新计算，并可能在 policy 放宽时扩大权限。
 - 每批普通工具目前共享 committed state snapshot、各自记录写入。PTC 可把整个脚本视为一个外层调用，但每个嵌套调用必须使用隔离的 child context；成功 child 才把 state/artifacts 合并到 script scope，最终统一锚定到 `run_javascript` 的 `ToolMessage`。
 - file tools 已通过 `ToolCallContext` 记录 file-diff artifacts；PTC 内部调用应继续复用该机制，无需为 MVP 新增消息或 artifact 类型。
 - `ToolWrapper::execute` 当前会把完整 JSON input/output 写入 tracing span。PTC 会放大大文件内容和待写内容进入日志的风险，因此安全摘要必须在 bridge 接入前完成，不能推迟到 helper-process hardening。
@@ -75,7 +76,7 @@ interrupt handler 只会在 engine 正在执行 JS 指令时被调用；它不�
 
 `PermissionMode::Explore` 已自动批准 `read_file`、`ls`、`read_todos`、`write_todos`；`AcceptEdits` 再增加 `write_file`、`edit_file`，`Yolo` 包含全部六项。workspace 的 `[permissions.tools].approval_required` 会继续收紧所有 mode，包括 `yolo`。此外 `PermissionModeCell` 是实时可变的。
 
-设计含义：MVP 可以完全不实现“JS 内部暂停等待审批”的控制流，但不能删除权限检查。generation 时计算 `eligible_tools = fixed_tools ∩ agent_tools ∩ policy_auto_approved_tools`，只注入这个子集并保存 snapshot；每个 bridge call 再检查 snapshot 和当前 policy。前者尊重 `AGENT.md` 的显式 tool 配置、给模型准确的能力视图并限定权限上界，后者处理 mode 中途收紧。外层 `run_javascript` 仍可在启动脚本前走现有审批。
+设计含义：MVP 可以完全不实现“JS 内部暂停等待审批”的控制流，但不能删除权限检查。generation 时计算 `eligible_tools = fixed_tools ∩ agent_tools ∩ policy_auto_approved_tools` 并保存 snapshot；`list_javascript_tools` 返回 snapshot 与执行时 policy 交集中的名称，bridge 每次调用仍检查 snapshot 和当前 policy。前者尊重 `AGENT.md` 的显式 tool 配置、给模型准确的能力视图并限定权限上界，后者处理 mode 中途收紧。外层 `run_javascript` 仍可在启动脚本前走现有审批。
 
 这六项都不是 `shell`，其现有审批判断只依赖工具名，不依赖具体参数。因此可以在 generation 前可靠计算可用子集；将来一旦加入 `shell`，就必须恢复按具体 arguments 判定。
 
@@ -85,6 +86,10 @@ interrupt handler 只会在 engine 正在执行 JS 指令时被调用；它不�
 
 ```text
 LLM
+  -> list_javascript_tools({})
+     -> generation snapshot ∩ current workspace policy
+     -> available tool names
+  -> LLM writes code using the discovered APIs
   -> run_javascript({ code })
      -> optional outer PendingApproval (before worker starts)
      -> main Tokio supervisor starts authoritative watchdog
@@ -99,6 +104,8 @@ LLM
      -> one bounded final result + existing file-diff artifacts
   -> LLM receives only the outer run_javascript result
 ```
+
+discovery 会多一次 provider round trip，但其 tool definition 固定，结果进入普通 history 后也可被后续 generation 的 prefix cache 复用。它是能力提示而不是授权凭据：下一次 generation 会产生新的 runner snapshot；若 policy 在 discovery 后收紧，runner/bridge 仍以新 snapshot 和实时检查为准，脚本可能收到 `TOOL_UNAVAILABLE`。
 
 JS 面向模型的接口：
 
@@ -210,15 +217,27 @@ supervisor 只在有限 grace period 内等待 context/runtime drop 和线程 jo
 
 ### 执行时重新计算 capability set
 
-无需扩展 checkpoint 类型，但同一批其他工具触发审批、session release 或进程重启后，执行时的 policy 可能已经变化。重新计算会让放宽后的 policy 给脚本增加 generation 时 descriptor 中不存在的能力，也无法证明执行的正是模型生成代码时看到的权限上界。
+无需扩展 checkpoint 类型，但同一批其他工具触发审批、session release 或进程重启后，执行时的 policy 可能已经变化。重新计算会让放宽后的 policy 给脚本增加 generation 时 snapshot 中不存在的能力，也无法证明执行的正是模型生成代码时允许使用的权限上界。
 
 结论：不用。request 构造时生成 capability snapshot，模型返回 call 后将其绑定为不可由模型修改的隐藏元数据；实时 policy 只与 snapshot 求交集。
+
+### 把 available APIs 编进 `run_javascript` descriptor
+
+优点是模型在同一次 generation 就知道精确 capability，无需额外调用。缺点是 permission mode、workspace policy、agent tool set 或 bridge catalog 改变都会改写 runner descriptor，破坏原本稳定的 request prefix；随着可编程工具增多，runner description 还会持续膨胀。
+
+结论：改为固定的 runner descriptor，并自动提供固定 descriptor 的 `list_javascript_tools`。discovery 返回当前可用名称，接受首次使用通常多一次 LLM round trip。结果进入普通 history，后续 generation 可复用；授权仍由下一次 runner snapshot 和 bridge 实时检查决定。
+
+### discovery 返回完整 definitions，而不是只返回名称
+
+完整 definition 可独立描述 bridge-only capability，但会把 description 和 schema 重复写入普通 ToolMessage、长期占用 history，还需要更大的独立 result budget。当前六项 capability 已经全部以同名直接工具出现在 provider request 中，模型只缺少“哪些名称可从 JS 使用”这一信息。
+
+结论：只返回有序名称。新增一个经过 allowlist/policy 的 bridge 工具后，其名称自动进入 discovery；description 和 input schema 继续复用同名直接工具 descriptor。接受暂不支持 bridge-only capability，避免为未出现的需求扩大 wire shape 和 history 占用。
 
 ### 让嵌套调用触发现有审批 UI，并在批准后恢复 JS
 
 体验最接近 Anthropic 容器暂停，但 QuickJS continuation 不能由当前 snapshot 序列化，服务重启或 session release 后无法可靠恢复；现有 `Suspended` 语义会退出 agent run，也不适合卡在一个 `ToolObject` Future 内。
 
-结论：MVP 不实现嵌套审批 UI。需要审批的普通工具只从本次 JS capability set 中移除，不影响其他 eligible tools。bridge 每次重新检查；某工具在执行前变得不可用时 reject Promise，错误码为 `TOOL_UNAVAILABLE`。外层 `run_javascript` 自身若需要审批，则在 worker 创建前照常走现有流程；模型也可在下一轮直接调用普通工具并走原有审批。
+结论：MVP 不实现嵌套审批 UI。需要审批的普通工具只从本次 JS capability set 中移除，不影响其他 eligible tools。bridge 每次重新检查；某工具在执行前变得不可用时 reject Promise，错误码为 `TOOL_UNAVAILABLE`，message 同时列出本次脚本仍可用的工具。外层 `run_javascript` 自身若需要审批，则在 worker 创建前照常走现有流程；模型也可在下一轮直接调用普通工具并走原有审批。
 
 ### 把每个嵌套调用写成普通 ToolMessage
 
@@ -230,7 +249,7 @@ supervisor 只在有限 grace period 内等待 context/runtime drop 和线程 jo
 
 ### `coda_ptc` crate
 
-唯一负责 PTC 领域逻辑的 crate：rquickjs runtime 生命周期、JS bootstrap、worker/host bridge、资源限制、typed errors、动态 `run_javascript` descriptor 和最终 report。它依赖 `coda_core`，但不依赖 `coda_agent`、`coda_server` 或 permission mode。
+唯一负责 PTC 领域逻辑的 crate：rquickjs runtime 生命周期、JS bootstrap、worker/host bridge、资源限制、typed errors、固定的 runner/discovery descriptors、discovery result wire shape 和最终 report。它依赖 `coda_core`，但不依赖 `coda_agent`、`coda_server` 或 permission mode。
 
 建议内部结构：
 
@@ -241,7 +260,7 @@ crates/coda_ptc/
     lib.rs        # public API、limits、request/report/error types
     engine.rs     # rquickjs runtime/context/promise lifecycle
     bridge.rs     # bounded request/response protocol
-    tool.rs       # RunJavaScriptTool + dynamic descriptor builder
+    tool.rs       # RunJavaScriptTool + stable runner/discovery descriptors
     bootstrap.js  # frozen tools object、console、result serialization
 ```
 
@@ -261,9 +280,17 @@ crates/coda_ptc/
 
 只负责把 `coda_ptc::RunJavaScriptTool` 注册进现有 built-in tool catalog，使 `AGENT.md` 的工具解析、冲突校验和默认 root tool set 沿用现有机制。`coda_tools` 不包含 QuickJS 执行逻辑。
 
+### `list_javascript_tools` synthetic tool（`coda_agent` + `coda_ptc`）
+
+`coda_ptc` 定义固定的 provider-visible descriptor、`{"available_tools":[...]}` result 格式，以及 discovery result 和 `TOOL_UNAVAILABLE` message 各 16 KiB 的上限；`coda_agent` 在当前 agent 配置了 runner 且 capability snapshot 非空时自动注入它，并返回 `snapshot ∩ current policy` 的有序名称。generation 构造 snapshot 时先用两个 formatter 验证完整列表及最长 requested name 都能放入各自上限；超限则 fail closed，记录错误并同时省略 discovery/runner。执行时的可用集合只是 snapshot 子集，因此两种输出都不会意外越界。结果和错误列表都不允许截断，因为不完整列表会误导模型。
+
+它不是普通 `ToolSpec`，不需要也不允许在 `AGENT.md` 中单独配置，不会被注入 JS bridge。`LIST_JAVASCRIPT_TOOLS_TOOL_NAME` 同时进入 `coda_tools` 导出的全局 synthetic reserved-name 集合；`AgentTeam::new` 对每个 agent 无条件拒绝同名 `ToolSpec`，无论 runner 是否启用。这样同名 prebuilt/custom tool 既不能产生重复 descriptor，也不能借 permission mode 对 synthetic name 的 auto-approve 获得普通工具权限。
+
+driver 的 special-case executor 是 model-input trust boundary：只接受 JSON 空对象 `{}`（允许空白，不接受 `null`、array、非 object 或任何属性），错误参数按普通 `InvalidParameters` 结束。它复用 local tool settlement 路径，产生一致的 ToolCallStart/ToolCallEnd、ToolMessage、outcome、started-at/duration 和空 artifacts；由于不经过 `ToolWrapper`，另建只记录 tool name、input/output byte length、status、duration 和 error category 的安全 tracing span，绝不记录 raw arguments/result。permission mode 默认自动批准，workspace `approval_required` 仍可要求外层审批。
+
 ### `AgentToolInvoker`（`coda_agent`）
 
-构造 LLM request 时先确认当前 agent 配置了 `run_javascript`，再按 agent registry 和 policy 逐项过滤固定六项，生成 `exposed_tools`；为空时不提供 runner descriptor。driver 保留这个 snapshot，provider 返回 runner call 后将其绑定到隐藏执行元数据，再进入普通 approval partition。runner 自身被 `approval_required` 命中时正常产生 `PendingApproval`；批准后仍使用原 snapshot。执行时只接受 snapshot 中的名称，并重新用当前 predicate 检查该工具。名称从未注入或当前已需审批时返回 `TOOL_UNAVAILABLE`。没有匹配到当前 generation descriptor、因而没有 snapshot 的伪造或过期 runner call fail closed 为 `PTC_UNAVAILABLE`。
+构造 LLM request 时先确认当前 agent 配置了 `run_javascript`，再按 agent registry 和 policy 逐项过滤固定 capability family，生成 `exposed_tools`；为空时不提供 runner/discovery descriptors。driver 保留这个 snapshot，provider 返回任一 synthetic call 后都将其绑定到隐藏执行元数据，再进入普通 approval partition。批准后仍使用原 snapshot。discovery 执行时只返回 `snapshot ∩ current policy` 的有序名称；runner 执行时只接受 snapshot 中的名称，并重新用当前 predicate 检查该工具。名称从未注入或当前已需审批时返回 `TOOL_UNAVAILABLE`，message 同时列出对本次脚本仍可用的 `snapshot ∩ current policy` 名称。没有匹配到当前 generation descriptor、因而没有 snapshot 的伪造或过期 discovery/runner call fail closed 为 `PTC_UNAVAILABLE`。
 
 ## Interfaces
 
@@ -280,9 +307,9 @@ pub async fn execute_javascript(
 
 // coda_core: neutral host boundary; it must not reference coda_ptc types.
 pub trait HostToolInvoker: Send + Sync {
-    /// Returns the tools exposed to JS. Descriptors are documentation only;
-    /// authorization is repeated on every call.
-    fn tools(&self) -> Vec<ToolDefinition>;
+    /// Returns the generation snapshot names installed in the JS runtime.
+    /// Authorization is repeated on every call and may further shrink it.
+    fn exposed_tools(&self) -> Arc<[String]>;
 
     /// Trust boundary: validates name/JSON/limits/policy, then executes one
     /// existing tool. Success is its raw textual output; failures are typed so
@@ -355,29 +382,58 @@ pub trait ThreadState: Send + Sync {
     fn get(&self, kind: &str) -> Option<serde_json::Value>;
     /// PTC's staged implementation enforces the state byte budget here and
     /// stores only the latest value per key.
-    fn set(&self, kind: &str, value: serde_json::Value) -> ToolResult<()>;
+    fn set(&self, kind: &str, value: serde_json::Value) -> Result<(), HostEffectError>;
 }
 
-pub type HostToolCallResult = Result<String, HostToolCallError>;
+pub struct HostToolCallResult {
+    pub output: String,
+}
 
 pub enum HostToolCallError {
-    UnknownTool,
-    Unavailable,
-    InvalidArguments(String),
+    Unavailable {
+        requested: String,
+        available: Vec<String>,
+    },
+    InvalidParameters(String),
     Execution(String),
-    LimitExceeded(String),
-    Aborted,
+    ResourceLimit(String),
+    Aborted(String),
 }
 
+// coda_ptc: both descriptors are stable across capability changes.
+pub fn run_javascript_definition() -> ToolDefinition;
+pub fn list_javascript_tools_definition() -> ToolDefinition;
+
+pub const DISCOVERY_RESULT_BYTES: usize = 16 * 1024;
+pub const TOOL_UNAVAILABLE_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// Encodes all names or fails without producing a partial capability list.
+pub fn available_tools_result(names: &[String]) -> Result<String, CapabilityMessageLimitError>;
+
+/// Includes every currently available name or fails; it never expands beyond
+/// the generation snapshot and never emits a partial list.
+pub fn tool_unavailable_message(
+    requested: &str,
+    available: &[String],
+) -> Result<String, CapabilityMessageLimitError>;
+
+// coda_tools: names injected outside ToolSpec/ToolObject dispatch.
+pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] = &[LIST_JAVASCRIPT_TOOLS_TOOL_NAME];
+
+// AgentTeam::new rejects a ToolSpec using any synthetic reserved name before
+// a provider request or permission decision can observe it.
+BuildError::ReservedToolName { agent: String, name: String };
+
 // ToolError gains ResourceLimit(String). HostToolInvoker maps it to
-// HostToolCallError::LimitExceeded without erasing the category.
+// HostToolCallError::ResourceLimit without erasing the category.
 
 pub struct JsRunReport {
-    pub status: JsRunStatus,
-    pub value: Option<String>,
+    pub ok: bool,
+    pub value: Option<serde_json::Value>,
+    pub error: Option<JsErrorReport>,
     pub stdout: String,
-    pub completed_calls: u32,
-    pub duration: Duration,
+    pub stdout_truncated: bool,
+    pub completed_calls: usize,
 }
 
 // coda_ptc: engine/bridge failures mapped into a bounded JsRunReport.
@@ -402,8 +458,9 @@ bridge 的单次调用顺序固定为：`scope.begin_tool_call(child_token)` →
 
 模型和 provider 只看到：
 
-1. Assistant 调用 `run_javascript`，参数是源码。
-2. 一个回答该 call id 的 ToolMessage，内容是最终 `JsRunReport` 的精简文本/JSON。
+1. 可选的 `list_javascript_tools({})` ToolCall 及其 ToolMessage；结果是当前有序名称列表，description 和 input schema 来自 request 中的同名直接工具。
+2. Assistant 调用 `run_javascript`，参数是源码。
+3. 一个回答该 call id 的 ToolMessage，内容是最终 `JsRunReport` 的精简文本/JSON。
 
 中间工具输出不创建 provider-visible Message。
 
@@ -465,13 +522,21 @@ QuickJS 专用线程只解释 JS，通过有界 channel 发 `ProgrammaticCallReq
 
 ### 每次嵌套调用重新鉴权
 
-`run_javascript` 加入 `Explore` 的 auto-approved 列表，因此 `AcceptEdits`/`Yolo` 也自然包含它；workspace `approval_required` 仍可要求对这个外层调用人工审批。固定六项则逐个通过完整 approval predicate 过滤：命中 tightening 的某一项只移除该项，不影响其余工具。每个 bridge call 都重新检查 generation snapshot 与当前 policy。审批规则是硬边界，JS 全局对象或模型提示不是。
+`run_javascript` 与 `list_javascript_tools` 加入 `Explore` 的 auto-approved 列表，因此 `AcceptEdits`/`Yolo` 也自然包含它们；workspace `approval_required` 仍可要求对这两个外层调用人工审批。固定六项则逐个通过完整 approval predicate 过滤：命中 tightening 的某一项只移除该项，不影响其余工具。每个 bridge call 都重新检查 generation snapshot 与当前 policy。`TOOL_UNAVAILABLE` 的 message 列出本次 snapshot 中仍通过实时 policy 的名称，使模型可直接调整脚本；它绝不列出 snapshot 外后来放宽的能力。审批规则是硬边界，JS 全局对象或模型提示不是。
 
 这意味着 MVP 没有“脚本内部暂停—打开审批 UI—恢复 continuation”的问题，但外层 runner 在启动前仍可正常审批，而且内部仍然有 authorization 问题。三者不能混为一谈。
 
 ### capability snapshot 固定权限上界
 
-动态 descriptor 与 snapshot 在同一次 request 构造中产生。provider 返回 call 后，snapshot 随调用经过审批、checkpoint 和重启；执行时的有效集合始终是 `generation_snapshot ∩ current_auto_approved_tools`。接受的代价是 scheduler/persistence 增加一小段隐藏元数据；换来 policy 放宽不能给已生成脚本扩权，且执行能力与模型生成代码时看到的 descriptor 一致。
+snapshot 在 request 构造时产生，但不再编码进 descriptor。provider 返回 discovery 或 runner call 后，snapshot 随调用经过审批、checkpoint 和重启；执行时的有效集合始终是 `generation_snapshot ∩ current_auto_approved_tools`。discovery 结果只描述它自己的 snapshot；下一次 generation 的 runner 会得到新 snapshot，因此提示与后续执行之间允许继续收缩，安全上不允许执行中的脚本扩张。接受这段时序差异，换取稳定 descriptor 和更好的 prefix cache 命中。
+
+### 固定 descriptor + 显式 discovery
+
+`run_javascript` 只描述稳定的 JS 环境、调用约定、错误和 runtime limits，不再列举 capability。伴生的 `list_javascript_tools` descriptor 同样固定，结果只承载当前可用名称；对应 description/schema 复用 request 中的同名直接工具。相比动态 runner descriptor，这通常让同一 provider/model/config 下的 request tool prefix 保持稳定，也让新增 allowlisted bridge tool 自动出现在 discovery 中；代价是模型首次使用或需要刷新 capability 时多一次 round trip。这个调整只提高 API presentation 的扩展性，不把任意工具自动变成安全的 bridge capability：固定 allowlist、agent 配置、policy 和递归隔离仍是接入门槛。
+
+### synthetic 名称是全局保留名
+
+选择在 `AgentTeam::new` 的唯一 validation gate 无条件拒绝任何名为 `list_javascript_tools` 的普通 `ToolSpec`，而不是让 permission predicate 区分 synthetic identity。后者需要把 identity 贯穿 `ToolCall`、wire、审批 UI 和 persistence，远大于当前单个 companion tool 的需求。保留名会让同名 custom/prebuilt tool 无法使用，但换来 descriptor 唯一性和基于名称的 auto-approval 仍然安全；即使 runner 未启用也必须拒绝，避免配置变化后语义翻转。
 
 ### wall-clock 由外部 watchdog 和 worker cancellation select 共同保证
 
@@ -498,7 +563,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
 - 单条返回给 JS 的工具结果：4 MiB；本次 bridge 累计结果：16 MiB。
 - script 累计 staged state：4 MiB，按序列化后的 JSON byte size 计费；同 key 替换时退还旧值额度，只保留最终值。
 - script 累计 artifacts：32 MiB，按实际 retained path/metadata/patch byte size 计费；in-flight child reservation 也计入。artifact 必须先成功预留再执行任何对应的文件 mutation。
-- `stdout` 与最终返回值：各 1 MiB。tracing 默认不记录原始参数和结果，只记录 byte length、状态、duration、error category 及工具级安全摘要；不得靠截断 raw preview 保护敏感内容。
+- `stdout` 与最终序列化 result report：各 1 MiB；后者包含 JSON envelope、不包含 stdout。tracing 默认不记录原始参数和结果，只记录 byte length、状态、duration、error category 及工具级安全摘要；不得靠截断 raw preview 保护敏感内容。
 - 全局 `run_javascript` 并发 semaphore，防止多个 session 同时吃满 heap/线程。
 
 补充边界：
@@ -518,6 +583,7 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
 5. **实时 mode 变化与暂停恢复。** 已经开始的嵌套调用按现有语义继续；mode 变化作用于下一次 bridge call。`accept_edits` 切到 `explore` 后，snapshot 中的 `write_file`/`edit_file` 调用返回 `TOOL_UNAVAILABLE`，读取和 todos 仍可继续。反向切换不能扩展当前脚本；即使 runner 因同批其他调用或自身审批而跨重启恢复，也使用 generation 时持久化的 snapshot。新能力从下一次 generation 生效。
 6. **进程内 worker 无法强杀。** 主 runtime watchdog 和 join grace 能限制请求等待，但 native engine 若失去响应，线程只能 detach 并永久占用一个并发 permit。spike 必须验证正常超时路径都能 teardown；多租户部署必须使用 helper process。
 7. **可观测性。** MVP 只有安全摘要 tracing 和外层最终 report，不新增实时嵌套调用 UI。若验证后确有需要，再设计 child events；不能把它们折叠成 provider-visible ToolMessage，也不能重新引入原始 input/output 日志。
+8. **discovery 的额外 round trip 是否值得。** 固定 descriptors 只有在 provider 的 prefix cache 覆盖 tool definitions 且 capability 经常变化时才有明显收益；首次 discovery 则必然增加一次 LLM 往返。evaluation 必须同时测 cache hit/input tokens、端到端 latency 和模型是否会不必要地重复 discovery，不能只以 descriptor byte 数判断收益。
 
 ## Implementation Roadmap
 
@@ -555,13 +621,29 @@ QuickJS heap 与 bridge-result budget 都不覆盖 Rust 侧 retained state/artif
       Purpose: 让默认 tools、`AGENT.md` 解析和名称冲突校验继续走现有路径。
       Verification: spec name 与 built tool name 一致；显式包含/省略 `run_javascript` 的 agent config tests。
 
-- [x] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时，把带有动态工具列表的 runner descriptor 和隐藏 snapshot 一起构造。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `HostCallScope` 显式传入的受限 child context。
+- [x] **[integration]** 在 agent driver 创建只捕获 tools/policy/snapshot 的 `AgentToolInvoker`；eligible subset 非空时生成隐藏 snapshot。runner 自身进入普通 approval partition；每次 bridge call 检查持久化 snapshot 和当前 policy，并接收由 `HostCallScope` 显式传入的受限 child context。
       Purpose: 保证 MVP 没有嵌套审批 continuation，同时不绕过 workspace tightening、文件锁、参数校验或 rewind 所依赖的 state anchor。
       Verification: 默认 explore 只暴露四项、accept_edits/yolo 暴露六项；workspace approval_required 只移除命中的内部工具；命中 runner 自身时正常 Suspended，批准后使用原 snapshot；mid-script 收紧 mode 后受影响工具返回 `TOOL_UNAVAILABLE`，放宽不扩权；嵌套普通工具看不到 invoker，并覆盖 abort、deadline、state/artifact budget tests。
 
-- [x] **[prompt/tool UX]** 给 `run_javascript` 生成精确描述，只列出本次 eligible subset，说明 `tools.<name>(object) -> Promise<string>`、`JSON.parse`、`Promise.all`、返回值和 `TOOL_UNAVAILABLE`；直接工具 descriptors 保留。
-      Purpose: 让模型知道什么时候 PTC 有收益、什么时候直接调用更合适。
-      Verification: fixture provider 检查 descriptor；人工/自动任务集确认工具名和参数生成稳定。
+- [x] **[synthetic namespace]** 在 `coda_tools` 声明 `list_javascript_tools` 为 synthetic reserved name，并让 `AgentTeam::new` 无条件拒绝任何 agent 的同名 `ToolSpec`。
+      Purpose: 防止重复 provider descriptor，并保证按名称 auto-approve 只可能命中内建 synthetic 操作。
+      Verification: root/sub-agent 的同名 prebuilt/custom tool 都返回 `ReservedToolName`；runner 未配置时同样拒绝；正常 runner 配置不需要显式 companion spec。
+
+- [x] **[cache-friendly discovery]** 把 `run_javascript` 改为不含 capability 的固定 descriptor；增加自动伴生、固定 descriptor 的 `list_javascript_tools` synthetic tool，返回 `snapshot ∩ current policy` 的有序名称。两种 call 都绑定并持久化 generation snapshot；discovery 不注册为 `ToolSpec`、不进入 JS bridge。
+      Purpose: capability/policy 变化不再改写 runner descriptor，同时让新增 allowlisted bridge tool 自动进入可发现名称列表。
+      Verification: capability 非空时，不同 permission mode 和 agent tool subset 生成 byte-for-byte 相同的两个 descriptors；discovery 分别返回四项/六项有序名称，且每个名称都在同一 request 中有直接 descriptor；snapshot 经过 approval/checkpoint/restart 后不扩张，执行前收紧会缩小结果；未配置 runner 或空 capability 时两者都不出现；伪造无 snapshot 的 discovery/runner 均 fail closed。
+
+- [x] **[synthetic execution]** 在 driver 增加 discovery special-case executor：只接受空对象，复用 local settlement 产生普通事件、ToolMessage、outcome、duration 和安全 tracing；用 `coda_ptc` formatter 生成 `{"available_tools":[...]}` 和 unavailable message，两者各有 16 KiB 硬上限且禁止部分截断。snapshot 构造时用完整名称集合和最长 requested name 预验证两种格式，上限失败时同时省略 runner/discovery。
+      Purpose: 补回不经过 `ToolWrapper` 后必须显式承担的 trust-boundary、可观测性和 history memory 边界。
+      Verification: `{}` 与带空白的对象成功；`null`、array、scalar、malformed JSON、非空对象返回 `InvalidParameters`；start/end event、ToolMessage、outcome 和 duration 与普通工具一致且 tracing 不含 sentinel raw data；两种 formatter 恰好等于各自上限时成功，超过一字节 fail closed 且无部分列表；生成阶段任一格式超限都不提供两个 synthetic descriptors。
+
+- [x] **[unavailable recovery]** 将 host unavailable error 扩展为 requested name + 当前 `snapshot ∩ policy` 名称，并映射成稳定的 `TOOL_UNAVAILABLE` message；空集合明确输出 `available tools: none`。
+      Purpose: policy 收紧或模型使用过期 capability 时，下一轮可直接重写脚本，不必再调用 discovery。
+      Verification: snapshot 外名称、mid-script policy 收紧和空 capability tests 均检查 error code 与有序 available list；policy 放宽后的 snapshot 外工具绝不出现在错误中；uncaught report、try/catch 和 `Promise.allSettled` 都保留同一 message。
+
+- [x] **[prompt/tool UX]** 固定 runner description 说明 `list_javascript_tools`、`tools.<name>(object) -> Promise<string>`、`JSON.parse`、`Promise.all`、runtime limits、返回值以及带 available list 的 `TOOL_UNAVAILABLE`；直接工具 descriptors 保留。
+      Purpose: 让模型知道 discovery 只返回名称、schema 应从同名直接工具读取，何时复用已有结果，以及什么时候 PTC 比直接调用更合适。
+      Verification: fixture provider 检查 descriptor 跨 policy 保持 byte-for-byte 稳定；人工/自动任务集确认 discovery、工具名和参数生成稳定。
 
 - [ ] **[evaluation]** 对批量文件读取、批量文件编辑、todo 过滤、小型单调用、workspace 强制审批五类任务做 A/B。
       Purpose: 确认收益来自真实 workload，而不是仅增加脚本开销。

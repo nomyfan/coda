@@ -523,6 +523,23 @@ impl LLMProvider for TestProvider {
                 content: "done".into(),
                 ..assistant()
             }),
+            "ptc-list" => {
+                if tool_message(&request.messages, "ptc_list").is_none() {
+                    Self::completed(AssistantMessage {
+                        tool_calls: vec![ToolCall {
+                            id: "ptc_list".into(),
+                            name: coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME.into(),
+                            arguments: Some("{}".into()),
+                        }],
+                        ..assistant()
+                    })
+                } else {
+                    Self::completed(AssistantMessage {
+                        content: "done".into(),
+                        ..assistant()
+                    })
+                }
+            }
             "ptc-run" => {
                 if tool_message(&request.messages, "ptc_call").is_none() {
                     Self::completed(AssistantMessage {

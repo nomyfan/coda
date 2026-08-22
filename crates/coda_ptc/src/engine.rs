@@ -403,9 +403,16 @@ impl JsExecutor {
 
 fn bridge_call_error(error: HostToolCallError) -> BridgeCallError {
     match error {
-        HostToolCallError::Unavailable => {
-            BridgeCallError::new("TOOL_UNAVAILABLE", "tool is no longer permitted")
-        }
+        HostToolCallError::Unavailable {
+            requested,
+            available,
+        } => BridgeCallError::new(
+            "TOOL_UNAVAILABLE",
+            crate::tool::tool_unavailable_message(&requested, &available).unwrap_or_else(|_| {
+                "requested tool is unavailable; available tool list exceeded its size limit"
+                    .to_string()
+            }),
+        ),
         HostToolCallError::InvalidParameters(message) => {
             BridgeCallError::new("INVALID_PARAMETERS", message)
         }

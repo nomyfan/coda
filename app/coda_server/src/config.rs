@@ -609,6 +609,7 @@ const EXPLORE_TOOLS: &[&str] = &[
     "read_todos",
     "write_todos",
     "run_javascript",
+    coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
 ];
 
 /// What [`PermissionMode::AcceptEdits`] adds on top of [`EXPLORE_TOOLS`].

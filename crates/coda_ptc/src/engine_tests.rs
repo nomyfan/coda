@@ -68,6 +68,28 @@ impl HostToolInvoker for FailingInvoker {
     }
 }
 
+struct UnavailableInvoker;
+
+impl HostToolInvoker for UnavailableInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".to_string(), "ls".to_string()])
+    }
+
+    fn call(
+        &self,
+        name: String,
+        _arguments: String,
+        _context: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        Box::pin(async move {
+            Err(HostToolCallError::Unavailable {
+                requested: name,
+                available: vec!["ls".to_string()],
+            })
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingState(std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>);
 
@@ -140,6 +162,20 @@ async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
 
 async fn run_with_tool_error(code: &str) -> JsRunReport {
     let invoker = Arc::new(FailingInvoker);
+    JsExecutor::new(PtcLimits::default())
+        .run(
+            code.to_string(),
+            invoker.exposed_tools(),
+            invoker,
+            scope(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn run_with_unavailable_tool(code: &str) -> JsRunReport {
+    let invoker = Arc::new(UnavailableInvoker);
     JsExecutor::new(PtcLimits::default())
         .run(
             code.to_string(),
@@ -305,6 +341,37 @@ return settled;
 }
 
 #[tokio::test]
+async fn unavailable_tool_lists_live_capabilities_in_all_error_paths() {
+    let expected = "tool \"read_file\" is unavailable; available tools: ls";
+
+    let uncaught = run_with_unavailable_tool("await tools.read_file({});").await;
+    assert!(!uncaught.ok);
+    assert_eq!(uncaught.error.as_ref().unwrap().code, "TOOL_UNAVAILABLE");
+    assert_eq!(uncaught.error.as_ref().unwrap().message, expected);
+
+    let caught = run_with_unavailable_tool(
+        "try { await tools.read_file({}); } catch (error) { return error; }",
+    )
+    .await;
+    assert!(caught.ok, "{caught:?}");
+    assert_eq!(caught.value.as_ref().unwrap()["code"], "TOOL_UNAVAILABLE");
+    assert_eq!(caught.value.as_ref().unwrap()["message"], expected);
+
+    let settled =
+        run_with_unavailable_tool("return (await Promise.allSettled([tools.read_file({})]))[0];")
+            .await;
+    assert!(settled.ok, "{settled:?}");
+    assert_eq!(
+        settled.value.as_ref().unwrap()["reason"]["code"],
+        "TOOL_UNAVAILABLE"
+    );
+    assert_eq!(
+        settled.value.as_ref().unwrap()["reason"]["message"],
+        expected
+    );
+}
+
+#[tokio::test]
 async fn host_call_and_result_limits_reject_inside_javascript() {
     let call_limits = PtcLimits {
         max_calls: 1,
@@ -329,6 +396,33 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
     )
     .await;
     assert_eq!(result_report.error.unwrap().code, "RESULT_LIMIT");
+}
+
+#[tokio::test]
+async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
+    let limits = PtcLimits {
+        max_calls: 3,
+        max_concurrent_calls: 1,
+        ..PtcLimits::default()
+    };
+    let invoker = Arc::new(FakeInvoker {
+        exposed: Arc::from(vec!["read_file".to_string()]),
+        delay: Duration::from_millis(10),
+    });
+    let report = JsExecutor::new(limits)
+        .run(
+            "return (await Promise.all([tools.read_file({ id: 1 }), tools.read_file({ id: 2 }), tools.read_file({ id: 3 })])).length;".to_string(),
+            invoker.exposed_tools(),
+            invoker,
+            scope(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.value, Some(serde_json::json!(3)));
+    assert_eq!(report.completed_calls, 3);
 }
 
 #[tokio::test]

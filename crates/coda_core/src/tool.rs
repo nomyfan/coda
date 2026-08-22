@@ -75,7 +75,12 @@ pub struct HostToolCallResult {
 /// Provider-independent failures at the host-call trust boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostToolCallError {
-    Unavailable,
+    Unavailable {
+        /// Tool name requested by the programmatic caller.
+        requested: String,
+        /// Snapshot-ordered tool names still allowed for this program.
+        available: Vec<String>,
+    },
     InvalidParameters(String),
     Execution(String),
     ResourceLimit(String),
