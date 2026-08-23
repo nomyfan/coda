@@ -761,6 +761,8 @@ fn explore_auto_approves_only_read_only_tools() {
         "grep",
         "read_todos",
         "write_todos",
+        "run_javascript",
+        "list_javascript_tools",
     ] {
         assert!(
             !config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
@@ -847,7 +849,7 @@ fn configured_tools_tighten_every_mode() {
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
         &config_path,
-        "[permissions.tools]\napproval_required = [\"write_todos\"]\n",
+        "[permissions.tools]\napproval_required = [\"write_todos\", \"list_javascript_tools\"]\n",
     )
     .unwrap();
 
@@ -855,6 +857,7 @@ fn configured_tools_tighten_every_mode() {
     // The workspace's own lock outranks the mode — yolo included.
     assert!(config.requires_approval(PermissionMode::Explore, &tool_call("write_todos")));
     assert!(config.requires_approval(PermissionMode::Yolo, &tool_call("write_todos")));
+    assert!(config.requires_approval(PermissionMode::Explore, &tool_call("list_javascript_tools")));
     // Everything it does not name is left to the mode.
     assert!(!config.requires_approval(PermissionMode::AcceptEdits, &tool_call("write_file")));
 }

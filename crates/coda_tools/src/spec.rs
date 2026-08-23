@@ -8,6 +8,7 @@ use crate::{
     EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
     WriteFileTool, WriteTodosTool,
 };
+use coda_ptc::RunJavaScriptTool;
 
 /// Runtime context for building tools.
 #[derive(Clone)]
@@ -145,6 +146,18 @@ impl ToolSpec for WriteTodosToolSpec {
     }
 }
 
+pub struct RunJavaScriptToolSpec;
+
+impl ToolSpec for RunJavaScriptToolSpec {
+    fn name(&self) -> &str {
+        coda_ptc::RUN_JAVASCRIPT_TOOL_NAME
+    }
+
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(RunJavaScriptTool::default()))
+    }
+}
+
 /// Wraps a pre-built `ToolObject` as a `ToolSpec`. Each call to `build`
 /// returns a shared wrapper around the same underlying tool. Cloning shares
 /// the same underlying tool, so one prebuilt tool can be handed to multiple
@@ -210,6 +223,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "glob",
     "read_todos",
     "write_todos",
+    "run_javascript",
 ];
 
 /// Resolves a builtin tool name to a fresh [`ToolSpec`]. Returns `None` for any
@@ -226,6 +240,7 @@ pub fn spec_by_name(name: &str) -> Option<Box<dyn ToolSpec>> {
         "glob" => Box::new(GlobToolSpec),
         "read_todos" => Box::new(ReadTodosToolSpec),
         "write_todos" => Box::new(WriteTodosToolSpec),
+        "run_javascript" => Box::new(RunJavaScriptToolSpec),
         _ => return None,
     })
 }

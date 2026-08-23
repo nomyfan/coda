@@ -13,8 +13,13 @@ impl ThreadState for FakeThread {
     fn get(&self, kind: &str) -> Option<serde_json::Value> {
         self.0.lock().unwrap().get(kind).cloned()
     }
-    fn set(&self, kind: &str, value: serde_json::Value) {
+    fn set(
+        &self,
+        kind: &str,
+        value: serde_json::Value,
+    ) -> Result<(), coda_core::tool::HostEffectError> {
         self.0.lock().unwrap().insert(kind.to_string(), value);
+        Ok(())
     }
 }
 
@@ -125,7 +130,9 @@ async fn an_unreadable_stored_value_reads_as_empty() {
     // or out validates the shape. A thread whose value cannot be read back still
     // loads; it does not fail the turn.
     let thread = Arc::<FakeThread>::default();
-    thread.set("todos", serde_json::json!({ "not": "a list" }));
+    thread
+        .set("todos", serde_json::json!({ "not": "a list" }))
+        .unwrap();
 
     assert_eq!(read(&thread).await, "No todos.");
 }

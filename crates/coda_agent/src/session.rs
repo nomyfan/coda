@@ -415,7 +415,10 @@ async fn collect_pending_approvals(
             thread_id: stored.thread_id,
             agent_name: stored.agent_name,
             parent_message_id,
-            calls: pending_approval_calls,
+            calls: pending_approval_calls
+                .into_iter()
+                .map(|prepared| prepared.tool_call)
+                .collect(),
             suspended_at: stored.suspended_at,
         });
     }

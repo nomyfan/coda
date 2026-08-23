@@ -536,6 +536,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   glob: "Find",
   grep: "Search",
   shell: "Run",
+  run_javascript: "Run code",
+  list_javascript_tools: "List JavaScript tools",
   read_todos: "Read todos",
   write_todos: "Update todos",
 };
@@ -594,6 +596,18 @@ export function extractShellCommand(call: ToolCall): string {
     return typeof command === "string" ? command : "";
   }
   return "";
+}
+
+export function extractRunJavaScriptCode(call: ToolCall): string | undefined {
+  if (call.name !== "run_javascript") {
+    return undefined;
+  }
+  const args = parseCallArguments(call);
+  if (args && typeof args === "object" && "code" in args) {
+    const code = (args as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
 }
 
 function basename(p: string): string {

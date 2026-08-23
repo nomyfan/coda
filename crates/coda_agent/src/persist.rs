@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use coda_core::llm::{MessageId, ToolCall, ToolCallOutcome};
 
 use crate::agent::{
-    Envelope, HistoryEntry, PendingReply, PendingToolCall, ReplyTarget, ResumePoint,
-    ToolExecutionState,
+    Envelope, HistoryEntry, PendingReply, PendingToolCall, PreparedToolCall, ReplyTarget,
+    ResumePoint, ToolExecutionState,
 };
 use crate::runtime::AgentRuntimeSnapshot;
 
@@ -86,7 +86,7 @@ pub enum StoredResumePoint {
     ToolExecution(StoredToolExecutionState),
     PendingApproval {
         parent_message_id: MessageId,
-        pending_approval_calls: Vec<ToolCall>,
+        pending_approval_calls: Vec<StoredPreparedToolCall>,
         pending_calls: Vec<StoredPendingToolCall>,
     },
 }
@@ -104,6 +104,13 @@ pub struct StoredToolExecutionState {
 pub struct StoredPendingToolCall {
     pub tool_call: ToolCall,
     pub outcome: ToolCallOutcome,
+    pub metadata: Option<crate::agent::ToolExecutionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredPreparedToolCall {
+    pub tool_call: ToolCall,
+    pub metadata: Option<crate::agent::ToolExecutionMetadata>,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +134,16 @@ impl From<PendingToolCall> for StoredPendingToolCall {
         StoredPendingToolCall {
             tool_call: p.tool_call,
             outcome: p.outcome,
+            metadata: p.metadata,
+        }
+    }
+}
+
+impl From<PreparedToolCall> for StoredPreparedToolCall {
+    fn from(p: PreparedToolCall) -> Self {
+        Self {
+            tool_call: p.tool_call,
+            metadata: p.metadata,
         }
     }
 }
@@ -152,7 +169,10 @@ impl From<ResumePoint> for StoredResumePoint {
                 pending_calls,
             } => StoredResumePoint::PendingApproval {
                 parent_message_id,
-                pending_approval_calls: pending_approval_calls.into(),
+                pending_approval_calls: pending_approval_calls
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
                 pending_calls: pending_calls.into_iter().map(Into::into).collect(),
             },
         }
@@ -178,6 +198,16 @@ impl From<StoredPendingToolCall> for PendingToolCall {
         PendingToolCall {
             tool_call: p.tool_call,
             outcome: p.outcome,
+            metadata: p.metadata,
+        }
+    }
+}
+
+impl From<StoredPreparedToolCall> for PreparedToolCall {
+    fn from(p: StoredPreparedToolCall) -> Self {
+        Self {
+            tool_call: p.tool_call,
+            metadata: p.metadata,
         }
     }
 }
@@ -203,7 +233,10 @@ impl From<StoredResumePoint> for ResumePoint {
                 pending_calls,
             } => ResumePoint::PendingApproval {
                 parent_message_id,
-                pending_approval_calls: pending_approval_calls.into(),
+                pending_approval_calls: pending_approval_calls
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
                 pending_calls: pending_calls.into_iter().map(Into::into).collect(),
             },
         }

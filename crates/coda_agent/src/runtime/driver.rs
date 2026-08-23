@@ -8,21 +8,25 @@ use serde_json::Value;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
-    MessageOrigin, StreamError, ToolCallOutcome, ToolMessage, ToolOutput, TurnId, UserMessage,
+    MessageOrigin, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
+    TurnId, UserMessage,
 };
-use coda_core::tool::{ThreadState, ToolCallContext, ToolError, ToolResult};
+use coda_core::tool::{
+    HostToolCallError, HostToolCallResult, HostToolInvoker, ThreadState, ToolCallContext,
+    ToolError, ToolResult, Tools,
+};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{Instrument, Span, error, info, info_span, instrument, warn};
 
 use super::AgentControl;
 use crate::{
     AbortedTarget, Agent, AgentEvent, Envelope, PendingApproval, ResumeDecision, Sender,
     SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
-        AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, Receiver, ReplyTarget,
-        ResumePoint, ToolExecutionState,
+        AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, PreparedToolCall, Receiver,
+        ReplyTarget, ResumePoint, ToolExecutionMetadata, ToolExecutionState,
     },
     compaction, message_view,
     persist::StoredCheckpoint,
@@ -345,6 +349,179 @@ enum AgentLoopState {
     Done(ResumePoint, Box<TurnEnd>),
 }
 
+struct AgentToolInvoker {
+    tools: Tools,
+    approval: ToolApprovalMode,
+    exposed_tools: Arc<[String]>,
+}
+
+impl AgentToolInvoker {
+    fn new(tools: Tools, approval: ToolApprovalMode, exposed_tools: Vec<String>) -> Self {
+        // Checkpoint data is not an authority source. Even if it is malformed
+        // or manually altered, canonicalize it back to the unique, fixed-order
+        // intersection of the MVP capability family and the current registry.
+        let requested: HashSet<_> = exposed_tools.into_iter().collect();
+        let exposed_tools: Vec<_> = coda_tools::PROGRAMMATIC_TOOL_NAMES
+            .iter()
+            .filter(|name| requested.contains(**name) && tools.get(name).is_some())
+            .map(|name| (*name).to_string())
+            .collect();
+        Self {
+            tools,
+            approval,
+            exposed_tools: Arc::from(exposed_tools),
+        }
+    }
+
+    fn currently_allowed(&self, call: &ToolCall) -> bool {
+        match &self.approval {
+            ToolApprovalMode::Auto => true,
+            ToolApprovalMode::Manual => false,
+            ToolApprovalMode::RequireWhen(predicate) => !predicate(call),
+        }
+    }
+
+    fn currently_available_tools(&self) -> Vec<String> {
+        self.currently_available_tools_for(None)
+    }
+
+    fn currently_available_tools_for(&self, requested: Option<(&str, &str)>) -> Vec<String> {
+        self.exposed_tools
+            .iter()
+            .filter(|name| {
+                let arguments = requested
+                    .filter(|(requested_name, _)| requested_name == name)
+                    .map_or_else(|| "{}".to_string(), |(_, arguments)| arguments.to_string());
+                self.tools.get(name).is_some()
+                    && self.currently_allowed(&ToolCall {
+                        id: "ptc-capability-probe".to_string(),
+                        name: (*name).clone(),
+                        arguments: Some(arguments),
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn unavailable(&self, requested: String, available: Vec<String>) -> HostToolCallError {
+        HostToolCallError::Unavailable {
+            requested,
+            available,
+        }
+    }
+}
+
+impl HostToolInvoker for AgentToolInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        self.exposed_tools.clone()
+    }
+
+    fn call(
+        &self,
+        name: String,
+        arguments: String,
+        context: ToolCallContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>>
+    {
+        let available = self.currently_available_tools_for(Some((&name, &arguments)));
+        if !available.contains(&name) {
+            let error = self.unavailable(name, available);
+            return Box::pin(async move { Err(error) });
+        }
+        let Some(tool) = self.tools.get(&name) else {
+            let error = self.unavailable(name, available);
+            return Box::pin(async move { Err(error) });
+        };
+        Box::pin(async move {
+            if context.cancel.is_cancelled() {
+                return Err(HostToolCallError::Aborted(
+                    "host tool call was cancelled".to_string(),
+                ));
+            }
+            let result = tool.execute(arguments, context).await;
+            match result {
+                Ok(output) => Ok(HostToolCallResult { output }),
+                Err(ToolError::InvalidParameters(message)) => {
+                    Err(HostToolCallError::InvalidParameters(message))
+                }
+                Err(ToolError::ExecutionError(message)) => {
+                    Err(HostToolCallError::Execution(message))
+                }
+                Err(ToolError::ResourceLimit(message)) => {
+                    Err(HostToolCallError::ResourceLimit(message))
+                }
+                Err(ToolError::Aborted(message)) => Err(HostToolCallError::Aborted(message)),
+            }
+        })
+    }
+}
+
+fn execute_javascript_tool_discovery(
+    input: String,
+    invoker: Option<AgentToolInvoker>,
+) -> std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+    let started = std::time::Instant::now();
+    let span = info_span!(
+        "execute_tool",
+        tool = coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
+        input_bytes = input.len(),
+        output_bytes = tracing::field::Empty,
+        status = tracing::field::Empty,
+        error_category = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+    );
+    Box::pin(
+        async move {
+            info!("executing tool");
+            let result = match serde_json::from_str::<Value>(&input) {
+                Ok(Value::Object(object)) if object.is_empty() => match invoker {
+                    Some(invoker) => coda_tools::available_tools_message(
+                        &invoker.currently_available_tools(),
+                    )
+                    .map_err(|error| ToolError::ResourceLimit(error.to_string())),
+                    None => Err(ToolError::ExecutionError(
+                        "PTC_UNAVAILABLE: list_javascript_tools has no persisted capability snapshot"
+                            .to_string(),
+                    )),
+                },
+                Ok(Value::Object(_)) => Err(ToolError::InvalidParameters(
+                    "expected an empty object".to_string(),
+                )),
+                Ok(_) => Err(ToolError::InvalidParameters(
+                    "expected an empty JSON object".to_string(),
+                )),
+                Err(error) => Err(ToolError::InvalidParameters(error.to_string())),
+            };
+            let span = Span::current();
+            match &result {
+                Ok(output) => {
+                    span.record("status", "ok");
+                    span.record("output_bytes", output.len());
+                }
+                Err(ToolError::InvalidParameters(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "invalid_parameters");
+                }
+                Err(ToolError::ExecutionError(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "execution");
+                }
+                Err(ToolError::ResourceLimit(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "resource_limit");
+                }
+                Err(ToolError::Aborted(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "aborted");
+                }
+            }
+            span.record("duration_ms", started.elapsed().as_millis() as u64);
+            result
+        }
+        .instrument(span),
+    )
+}
+
 /// One tool call's window onto the thread's state.
 ///
 /// `committed` is the thread as the whole batch was dispatched — shared, so
@@ -383,11 +560,16 @@ impl ThreadState for CallState {
             .or_else(|| self.committed.get(kind).cloned())
     }
 
-    fn set(&self, kind: &str, value: serde_json::Value) {
+    fn set(
+        &self,
+        kind: &str,
+        value: serde_json::Value,
+    ) -> Result<(), coda_core::tool::HostEffectError> {
         self.recorded
             .lock()
             .expect("state mutex poisoned")
             .push((kind.to_string(), value));
+        Ok(())
     }
 }
 
@@ -673,7 +855,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         thread_id: self.thread_id.as_ref().to_string(),
                         agent_name: self.agent.name.to_string(),
                         parent_message_id,
-                        calls: pending_approval_calls.iter().cloned().collect(),
+                        calls: pending_approval_calls
+                            .iter()
+                            .map(|prepared| prepared.tool_call.clone())
+                            .collect(),
                         suspended_at,
                     };
                     resume_point = ResumePoint::PendingApproval {
@@ -820,7 +1005,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 ..
             } => {
                 for tc in pending_approval_calls.drain(..) {
-                    self.write_off(tc.id, tc.name).await;
+                    self.write_off(tc.tool_call.id, tc.tool_call.name).await;
                 }
                 for tc in pending_calls.drain(..) {
                     self.write_off(tc.tool_call.id, tc.tool_call.name).await;
@@ -1165,21 +1350,26 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         let resolution_map: HashMap<String, ToolCallResolution> =
                             decision.resolutions.iter().cloned().collect();
                         for tc in pending_approval_calls.drain(..) {
+                            let PreparedToolCall {
+                                tool_call,
+                                metadata,
+                            } = tc;
                             let resolution = resolution_map
-                                .get(&tc.id)
+                                .get(&tool_call.id)
                                 .cloned()
                                 .unwrap_or(ToolCallResolution::Rejected { reason: None });
                             match resolution {
                                 ToolCallResolution::Execute => {
                                     pending_calls.push_back(PendingToolCall {
-                                        tool_call: tc,
+                                        tool_call,
                                         outcome: ToolCallOutcome::Approved,
+                                        metadata,
                                     });
                                 }
                                 ToolCallResolution::Resolved(output) => {
                                     self.add_tool_message(ToolMessage::new(
-                                        tc.id,
-                                        tc.name,
+                                        tool_call.id,
+                                        tool_call.name,
                                         output,
                                         ToolCallOutcome::Resolved,
                                         None,
@@ -1188,8 +1378,8 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                 }
                                 ToolCallResolution::Rejected { reason } => {
                                     self.add_tool_message(ToolMessage::new(
-                                        tc.id,
-                                        tc.name,
+                                        tool_call.id,
+                                        tool_call.name,
                                         ToolOutput::Err(
                                             reason
                                                 .clone()
@@ -1335,23 +1525,95 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         Err("the provider closed the stream without a summary".to_string())
     }
 
+    fn requires_approval(&self, call: &ToolCall) -> bool {
+        match &self.config.tool_approval {
+            ToolApprovalMode::Auto => false,
+            ToolApprovalMode::Manual => true,
+            ToolApprovalMode::RequireWhen(predicate) => predicate(call),
+        }
+    }
+
+    /// Build the provider-visible tools and the hidden capability snapshot from
+    /// the same policy decision. The snapshot is later attached to a returned
+    /// programmatic call and survives approvals/checkpoints.
+    fn generation_tools(&self) -> (Vec<ToolDefinition>, Option<Vec<String>>) {
+        let descriptors = self.agent.tools.descriptors();
+        let runner_configured = descriptors
+            .iter()
+            .any(|tool| tool.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME);
+        let by_name: HashMap<_, _> = descriptors
+            .iter()
+            .cloned()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect();
+        let eligible: Vec<ToolDefinition> = coda_tools::PROGRAMMATIC_TOOL_NAMES
+            .iter()
+            .filter_map(|name| {
+                let descriptor = by_name.get(*name)?;
+                let probe = ToolCall {
+                    id: "ptc-capability-probe".to_string(),
+                    name: (*name).to_string(),
+                    arguments: Some("{}".to_string()),
+                };
+                (!self.requires_approval(&probe)).then(|| descriptor.clone())
+            })
+            .collect();
+        let candidate_snapshot = (runner_configured && !eligible.is_empty()).then(|| {
+            eligible
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        });
+        let snapshot = candidate_snapshot.and_then(|names| {
+            let longest = names
+                .iter()
+                .max_by_key(|name| name.len())
+                .expect("nonempty capability snapshot");
+            match (
+                coda_tools::available_tools_message(&names),
+                coda_tools::tool_unavailable_message(longest, &names),
+            ) {
+                (Ok(_), Ok(_)) => Some(names),
+                (discovery, unavailable) => {
+                    let error = discovery
+                        .err()
+                        .or_else(|| unavailable.err())
+                        .expect("one capability message validation failed");
+                    error!(%error, "omitting programmatic tools because capability metadata exceeds its limit");
+                    None
+                }
+            }
+        });
+
+        let mut request_tools = Vec::with_capacity(descriptors.len() + 1);
+        for descriptor in descriptors {
+            if descriptor.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME {
+                if snapshot.is_some() {
+                    request_tools.push(coda_tools::list_javascript_tools_definition());
+                    request_tools.push(coda_tools::run_javascript_definition());
+                }
+            } else {
+                request_tools.push(descriptor);
+            }
+        }
+        request_tools.extend(self.agent.subagents.descriptors());
+        (request_tools, snapshot)
+    }
+
     async fn handle_generation(&mut self) -> AgentLoopState {
         let thread_id = self.thread_id.clone();
         let messages = match self.agent.messages().await {
             Ok(messages) => messages,
             Err(error) => return self.generation_failed(error.to_string()),
         };
+        let (request_tools, ptc_snapshot) = self.generation_tools();
         let request = ChatCompletionRequest {
             model: self.config.profile.model.clone(),
             max_completion_tokens: self.config.profile.max_completion_tokens,
             temperature: self.config.profile.temperature,
             reasoning_effort: self.config.profile.reasoning_effort.clone(),
             messages,
-            tools: {
-                let mut tools = self.agent.tools.descriptors();
-                tools.extend(self.agent.subagents.descriptors());
-                tools
-            },
+            tools: request_tools,
         };
         let started_at = jiff::Timestamp::now();
         self.runtime
@@ -1478,19 +1740,37 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         // carries its id so a sub-agent dispatched later — possibly after an
         // approval suspension or a restart — can still record what triggered it.
         let parent_message_id = assistant_message.message_id;
+        let prepared_calls: Vec<PreparedToolCall> = assistant_message
+            .tool_calls
+            .into_iter()
+            .map(|tool_call| PreparedToolCall {
+                metadata: if matches!(
+                    tool_call.name.as_str(),
+                    coda_tools::RUN_JAVASCRIPT_TOOL_NAME
+                        | coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+                ) {
+                    ptc_snapshot.clone().map(|exposed_tools| {
+                        ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools }
+                    })
+                } else {
+                    None
+                },
+                tool_call,
+            })
+            .collect();
         let (pending_approval_calls, auto_calls) = match &self.config.tool_approval {
-            ToolApprovalMode::Auto => (vec![], assistant_message.tool_calls),
-            ToolApprovalMode::Manual => (assistant_message.tool_calls, vec![]),
-            ToolApprovalMode::RequireWhen(predicate) => assistant_message
-                .tool_calls
+            ToolApprovalMode::Auto => (vec![], prepared_calls),
+            ToolApprovalMode::Manual => (prepared_calls, vec![]),
+            ToolApprovalMode::RequireWhen(predicate) => prepared_calls
                 .into_iter()
-                .partition(|call| predicate(call)),
+                .partition(|call| predicate(&call.tool_call)),
         };
         let auto_calls: VecDeque<_> = auto_calls
             .into_iter()
             .map(|call| PendingToolCall {
-                tool_call: call,
+                tool_call: call.tool_call,
                 outcome: ToolCallOutcome::Auto,
+                metadata: call.metadata,
             })
             .collect();
         if pending_approval_calls.is_empty() {
@@ -1670,7 +1950,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         started_at: jiff::Timestamp::now(),
                     });
                 }
-            } else if let Some(tool) = self.agent.tools.get(&tc.tool_call.name) {
+            } else if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+                || self.agent.tools.get(&tc.tool_call.name).is_some()
+            {
                 let started_at = jiff::Timestamp::now();
                 self.runtime
                     .emit_event(
@@ -1686,14 +1968,40 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // in-flight tool, and (later) a single tool can be cancelled
                 // without touching its siblings.
                 let call_state = Arc::new(CallState::new(committed.clone()));
-                let ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
-                let future = async move {
-                    let output = tool
-                        .execute(
+                let mut ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
+                let invoker = match &tc.metadata {
+                    Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools }) => {
+                        Some(AgentToolInvoker::new(
+                            self.agent.tools.clone(),
+                            self.config.tool_approval.clone(),
+                            exposed_tools.clone(),
+                        ))
+                    }
+                    None => None,
+                };
+                let execution: std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> =
+                    if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME {
+                        execute_javascript_tool_discovery(
                             tc.tool_call.arguments.clone().unwrap_or_default(),
-                            ctx.clone(),
+                            invoker,
                         )
-                        .await;
+                    } else {
+                        if tc.tool_call.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME
+                            && let Some(invoker) = invoker
+                        {
+                            ctx = ctx.with_invoker(Arc::new(invoker));
+                        }
+                        self.agent
+                            .tools
+                            .get(&tc.tool_call.name)
+                            .expect("ordinary local tool was checked above")
+                            .execute(
+                                tc.tool_call.arguments.clone().unwrap_or_default(),
+                                ctx.clone(),
+                            )
+                    };
+                let future = async move {
+                    let output = execution.await;
                     (tc, started_at, output, call_state, ctx.take_artifacts())
                 };
                 futures.push(future);

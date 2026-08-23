@@ -12,7 +12,9 @@
 
 use coda_agent::ThreadId;
 use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
-use coda_agent::persist::{StateEntry, StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use coda_agent::persist::{
+    StateEntry, StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint, StoredRuntimeSnapshot,
+};
 use coda_agent::runtime::SessionStorage;
 use coda_agent::{Envelope, HistoryEntry, Sender};
 use coda_core::llm::{
@@ -318,10 +320,13 @@ async fn a_saved_thread_comes_back_whole() {
         state: vec![],
         resume_point: StoredResumePoint::PendingApproval {
             parent_message_id: MessageId::new(),
-            pending_approval_calls: vec![ToolCall {
-                id: "call_shell".to_string(),
-                name: "shell".to_string(),
-                arguments: Some(r#"{"command":"ls"}"#.to_string()),
+            pending_approval_calls: vec![StoredPreparedToolCall {
+                tool_call: ToolCall {
+                    id: "call_shell".to_string(),
+                    name: "shell".to_string(),
+                    arguments: Some(r#"{"command":"ls"}"#.to_string()),
+                },
+                metadata: None,
             }],
             pending_calls: vec![],
         },
@@ -1146,10 +1151,13 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
                 state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
-                    pending_approval_calls: vec![ToolCall {
-                        id: "call_shell".to_string(),
-                        name: "shell".to_string(),
-                        arguments: Some(r#"{"command":"cargo test"}"#.to_string()),
+                    pending_approval_calls: vec![StoredPreparedToolCall {
+                        tool_call: ToolCall {
+                            id: "call_shell".to_string(),
+                            name: "shell".to_string(),
+                            arguments: Some(r#"{"command":"cargo test"}"#.to_string()),
+                        },
+                        metadata: None,
                     }],
                     pending_calls: vec![],
                 },
@@ -1730,10 +1738,13 @@ async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
         (
             StoredResumePoint::PendingApproval {
                 parent_message_id: MessageId::new(),
-                pending_approval_calls: vec![ToolCall {
-                    id: "call_shell".to_string(),
-                    name: "shell".to_string(),
-                    arguments: None,
+                pending_approval_calls: vec![StoredPreparedToolCall {
+                    tool_call: ToolCall {
+                        id: "call_shell".to_string(),
+                        name: "shell".to_string(),
+                        arguments: None,
+                    },
+                    metadata: None,
                 }],
                 pending_calls: vec![],
             },
@@ -2196,10 +2207,13 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
                 state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
-                    pending_approval_calls: vec![ToolCall {
-                        id: "call_shell".to_string(),
-                        name: "shell".to_string(),
-                        arguments: Some(r#"{"command":"rm -rf /"}"#.to_string()),
+                    pending_approval_calls: vec![StoredPreparedToolCall {
+                        tool_call: ToolCall {
+                            id: "call_shell".to_string(),
+                            name: "shell".to_string(),
+                            arguments: Some(r#"{"command":"rm -rf /"}"#.to_string()),
+                        },
+                        metadata: None,
                     }],
                     pending_calls: vec![],
                 },
