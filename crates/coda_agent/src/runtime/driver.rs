@@ -353,7 +353,6 @@ struct AgentToolInvoker {
     tools: Tools,
     approval: ToolApprovalMode,
     exposed_tools: Arc<[String]>,
-    exposed_set: HashSet<String>,
 }
 
 impl AgentToolInvoker {
@@ -367,12 +366,10 @@ impl AgentToolInvoker {
             .filter(|name| requested.contains(**name) && tools.get(name).is_some())
             .map(|name| (*name).to_string())
             .collect();
-        let exposed_set = exposed_tools.iter().cloned().collect();
         Self {
             tools,
             approval,
             exposed_tools: Arc::from(exposed_tools),
-            exposed_set,
         }
     }
 
@@ -427,10 +424,6 @@ impl HostToolInvoker for AgentToolInvoker {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>>
     {
         let available = self.currently_available_tools_for(Some((&name, &arguments)));
-        if !self.exposed_set.contains(&name) {
-            let error = self.unavailable(name, available);
-            return Box::pin(async move { Err(error) });
-        }
         if !available.contains(&name) {
             let error = self.unavailable(name, available);
             return Box::pin(async move { Err(error) });
