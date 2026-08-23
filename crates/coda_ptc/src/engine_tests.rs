@@ -244,8 +244,27 @@ return {
 
 #[tokio::test]
 async fn syntax_and_runtime_exceptions_are_structured_reports() {
-    let syntax = run("return (", &["read_file"], PtcLimits::default()).await;
-    assert_eq!(syntax.error.unwrap().code, "SYNTAX_ERROR");
+    let syntax = run(
+        "const a = 1;\nconst b = ;\nconsole.log(a + b);",
+        &["read_file"],
+        PtcLimits::default(),
+    )
+    .await;
+    let syntax_error = syntax.error.unwrap();
+    assert_eq!(syntax_error.code, "SYNTAX_ERROR");
+    assert!(
+        syntax_error.message.contains("unexpected token"),
+        "{}",
+        syntax_error.message
+    );
+    assert!(
+        syntax_error
+            .stack
+            .as_deref()
+            .is_some_and(|stack| stack.contains("run_javascript.js:2:")),
+        "{:?}",
+        syntax_error.stack
+    );
 
     let thrown = run(
         "throw new Error('boom');",

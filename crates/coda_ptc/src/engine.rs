@@ -5,13 +5,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use coda_core::tool::{HostCallScope, HostToolCallError, HostToolInvoker};
-use rquickjs::{AsyncContext, AsyncRuntime, Function, convert::List, function::Async};
+use rquickjs::{
+    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Function, context::EvalOptions,
+    convert::List, function::Async,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
+const SCRIPT_FILENAME: &str = "run_javascript.js";
+const WRAPPER_LINE_OFFSET: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PtcLimits {
@@ -36,7 +41,7 @@ impl Default for PtcLimits {
             source_bytes: 256 * KIB,
             heap_bytes: 64 * MIB,
             stack_bytes: 512 * KIB,
-            wall_time: Duration::from_secs(120),
+            wall_time: Duration::from_mins(2),
             join_grace: Duration::from_secs(1),
             max_calls: 128,
             max_concurrent_calls: 16,
@@ -66,6 +71,9 @@ pub struct JsRunReport {
 pub struct JsErrorReport {
     pub code: String,
     pub message: String,
+    /// QuickJS stack trace when the engine provides one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
 }
 
 #[derive(Debug)]
@@ -431,6 +439,7 @@ fn deadline_report() -> JsRunReport {
         error: Some(JsErrorReport {
             code: "DEADLINE_EXCEEDED".to_string(),
             message: "JavaScript execution exceeded its wall-clock deadline".to_string(),
+            stack: None,
         }),
         stdout: String::new(),
         stdout_truncated: false,
@@ -447,6 +456,7 @@ fn unawaited_calls_report(count: usize) -> JsRunReport {
             message: format!(
                 "JavaScript returned with {count} unfinished tool call(s); await every tool Promise"
             ),
+            stack: None,
         }),
         stdout: String::new(),
         stdout_truncated: false,
@@ -538,9 +548,25 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                 // The wrapper is itself an async IIFE, so evaluate it directly
                 // as a Promise. `eval_promise` is for source containing raw
                 // top-level await and would add a second wrapper here.
-                let promise = match ctx.eval::<rquickjs::Promise<'_>, _>(source) {
+                let mut eval_options = EvalOptions::default();
+                eval_options.filename = Some(SCRIPT_FILENAME.to_string());
+                let promise = match ctx
+                    .eval_with_options::<rquickjs::Promise<'_>, _>(source, eval_options)
+                    .catch(&ctx)
+                {
                     Ok(promise) => promise,
-                    Err(error) => return Ok(exception_report("SYNTAX_ERROR", error.to_string())),
+                    Err(CaughtError::Exception(exception)) => {
+                        return Ok(exception_report_with_stack(
+                            "SYNTAX_ERROR",
+                            exception
+                                .message()
+                                .unwrap_or_else(|| "JavaScript syntax error".to_string()),
+                            exception.stack().map(adjust_syntax_stack),
+                        ));
+                    }
+                    Err(error) => {
+                        return Ok(exception_report("SYNTAX_ERROR", error.to_string()));
+                    }
                 };
                 tokio::select! {
                     result = promise.into_future::<String>() => {
@@ -585,6 +611,27 @@ fn wrap_source(code: &str) -> String {
     )
 }
 
+fn adjust_syntax_stack(mut stack: String) -> String {
+    let marker = format!("{SCRIPT_FILENAME}:");
+    let Some(marker_start) = stack.find(&marker) else {
+        return stack;
+    };
+    let line_start = marker_start + marker.len();
+    let line_end = stack[line_start..]
+        .find(|character: char| !character.is_ascii_digit())
+        .map_or(stack.len(), |offset| line_start + offset);
+    let Ok(line) = stack[line_start..line_end].parse::<usize>() else {
+        return stack;
+    };
+    if line > WRAPPER_LINE_OFFSET {
+        stack.replace_range(
+            line_start..line_end,
+            &(line - WRAPPER_LINE_OFFSET).to_string(),
+        );
+    }
+    stack
+}
+
 fn decode_report(encoded: String, limit: usize) -> Result<JsRunReport, JsEngineError> {
     if encoded.len() > limit {
         return Ok(exception_report(
@@ -612,12 +659,17 @@ fn decode_report(encoded: String, limit: usize) -> Result<JsRunReport, JsEngineE
 }
 
 fn exception_report(code: &str, message: String) -> JsRunReport {
+    exception_report_with_stack(code, message, None)
+}
+
+fn exception_report_with_stack(code: &str, message: String, stack: Option<String>) -> JsRunReport {
     JsRunReport {
         ok: false,
         value: None,
         error: Some(JsErrorReport {
             code: code.to_string(),
             message,
+            stack,
         }),
         stdout: String::new(),
         stdout_truncated: false,
