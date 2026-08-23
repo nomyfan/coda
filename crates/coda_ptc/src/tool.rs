@@ -205,11 +205,7 @@ pub fn tool_unavailable_message(
     requested: &str,
     available: &[String],
 ) -> Result<String, CapabilityMessageLimitError> {
-    let names = if available.is_empty() {
-        "none".to_string()
-    } else {
-        available.join(", ")
-    };
+    let names = format!("[{}]", available.join(", "));
     ensure_message_limit(
         format!("tool \"{requested}\" is unavailable; available tools: {names}"),
         "JavaScript unavailable-tool message",
@@ -373,11 +369,11 @@ mod tests {
         assert_eq!(available_tools_message(&[]).unwrap(), "[]");
         assert_eq!(
             tool_unavailable_message("write_file", &names).unwrap(),
-            r#"tool "write_file" is unavailable; available tools: read_file, ls"#
+            r#"tool "write_file" is unavailable; available tools: [read_file, ls]"#
         );
         assert_eq!(
             tool_unavailable_message("write_file", &[]).unwrap(),
-            r#"tool "write_file" is unavailable; available tools: none"#
+            r#"tool "write_file" is unavailable; available tools: []"#
         );
 
         let error = ensure_message_limit("12345".to_string(), "test", 4).unwrap_err();

@@ -361,7 +361,7 @@ return settled;
 
 #[tokio::test]
 async fn unavailable_tool_lists_live_capabilities_in_all_error_paths() {
-    let expected = "tool \"read_file\" is unavailable; available tools: ls";
+    let expected = "tool \"read_file\" is unavailable; available tools: [ls]";
 
     let uncaught = run_with_unavailable_tool("await tools.read_file({});").await;
     assert!(!uncaught.ok);

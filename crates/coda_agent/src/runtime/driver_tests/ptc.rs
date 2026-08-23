@@ -421,7 +421,7 @@ async fn live_policy_can_shrink_but_not_bypass_the_snapshot() {
         assert_eq!(report["error"]["code"], "TOOL_UNAVAILABLE");
         assert_eq!(
             report["error"]["message"],
-            "tool \"read_todos\" is unavailable; available tools: none"
+            "tool \"read_todos\" is unavailable; available tools: []"
         );
     }
     harness.shutdown().await;

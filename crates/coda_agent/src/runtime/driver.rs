@@ -442,7 +442,7 @@ impl HostToolInvoker for AgentToolInvoker {
         Box::pin(async move {
             if context.cancel.is_cancelled() {
                 return Err(HostToolCallError::Aborted(
-                    "nested tool call was cancelled".to_string(),
+                    "host tool call was cancelled".to_string(),
                 ));
             }
             let result = tool.execute(arguments, context).await;
