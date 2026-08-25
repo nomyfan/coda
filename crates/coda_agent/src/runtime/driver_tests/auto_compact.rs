@@ -146,24 +146,21 @@ fn malformed_history(usage: Option<CompletionUsage>) -> Vec<HistoryEntry> {
         ..assistant()
     });
     vec![
-        HistoryEntry {
-            turn_id: turn,
-            message: Message::User(UserMessage::text(MessageId::new(), "old task")),
-        },
-        HistoryEntry {
-            turn_id: turn,
-            message: assistant,
-        },
-        HistoryEntry {
-            turn_id: turn,
-            message: Message::Tool(ToolMessage::new(
+        HistoryEntry::new(
+            turn,
+            Message::User(UserMessage::text(MessageId::new(), "old task")),
+        ),
+        HistoryEntry::new(turn, assistant),
+        HistoryEntry::new(
+            turn,
+            Message::Tool(ToolMessage::new(
                 "finished",
                 "read_todos",
                 ToolOutput::Ok("done".to_string()),
                 ToolCallOutcome::Auto,
                 None,
             )),
-        },
+        ),
     ]
 }
 
@@ -189,7 +186,6 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
                     derivation_key: None,
                     reply_target: None,
                     messages: malformed_history(usage),
-                    state: vec![],
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),
                 },

@@ -459,11 +459,10 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                 parent_thread_id: Some("session".into()),
                 derivation_key: Some("old-call".into()),
                 reply_target: None,
-                messages: vec![HistoryEntry {
-                    turn_id: old_turn,
-                    message: Message::User(UserMessage::text(old_prompt, "old turn")),
-                }],
-                state: vec![],
+                messages: vec![HistoryEntry::new(
+                    old_turn,
+                    Message::User(UserMessage::text(old_prompt, "old turn")),
+                )],
                 resume_point: StoredResumePoint::Generation,
                 suspended_at: jiff::Timestamp::default(),
             },
@@ -480,20 +479,19 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                 derivation_key: Some("current-call".into()),
                 reply_target: None,
                 messages: vec![
-                    HistoryEntry {
-                        turn_id: current_turn,
-                        message: Message::User(UserMessage::text(current_prompt, "current turn")),
-                    },
-                    HistoryEntry {
-                        turn_id: current_turn,
-                        message: Message::Assistant(AssistantMessage {
+                    HistoryEntry::new(
+                        current_turn,
+                        Message::User(UserMessage::text(current_prompt, "current turn")),
+                    ),
+                    HistoryEntry::new(
+                        current_turn,
+                        Message::Assistant(AssistantMessage {
                             message_id: parent_message_id,
                             tool_calls: vec![call.clone()],
                             ..assistant()
                         }),
-                    },
+                    ),
                 ],
-                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id,
                     pending_approval_calls: vec![StoredPreparedToolCall {

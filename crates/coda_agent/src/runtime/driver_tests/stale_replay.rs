@@ -50,13 +50,10 @@ fn dispatched(parent_message_id: MessageId) -> (TurnId, Vec<HistoryEntry>) {
     let prompt = MessageId::new();
     let turn = TurnId::from(prompt);
     let messages = vec![
-        HistoryEntry {
-            turn_id: turn,
-            message: Message::User(UserMessage::text(prompt, "inspect")),
-        },
-        HistoryEntry {
-            turn_id: turn,
-            message: Message::Assistant(AssistantMessage {
+        HistoryEntry::new(turn, Message::User(UserMessage::text(prompt, "inspect"))),
+        HistoryEntry::new(
+            turn,
+            Message::Assistant(AssistantMessage {
                 message_id: parent_message_id,
                 tool_calls: vec![ToolCall {
                     id: "call_explore".into(),
@@ -65,7 +62,7 @@ fn dispatched(parent_message_id: MessageId) -> (TurnId, Vec<HistoryEntry>) {
                 }],
                 ..assistant()
             }),
-        },
+        ),
     ];
     (turn, messages)
 }
@@ -85,7 +82,6 @@ async fn store_root(
                 derivation_key: None,
                 reply_target: None,
                 messages,
-                state: vec![],
                 resume_point: at,
                 suspended_at: jiff::Timestamp::default(),
             },

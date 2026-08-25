@@ -13,7 +13,7 @@
 use coda_agent::ThreadId;
 use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
 use coda_agent::persist::{
-    StateEntry, StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint, StoredRuntimeSnapshot,
+    StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint, StoredRuntimeSnapshot,
 };
 use coda_agent::runtime::SessionStorage;
 use coda_agent::{Envelope, HistoryEntry, Sender};
@@ -142,14 +142,13 @@ fn checkpoint(thread_id: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint 
         derivation_key: None,
         reply_target: None,
         messages,
-        state: vec![],
         resume_point: StoredResumePoint::Generation,
         suspended_at: jiff::Timestamp::default(),
     }
 }
 
 fn entry(turn_id: TurnId, message: Message) -> HistoryEntry {
-    HistoryEntry { turn_id, message }
+    HistoryEntry::new(turn_id, message)
 }
 
 /// A plain assistant reply, so tests that only need "something the agent said"
@@ -317,7 +316,6 @@ async fn a_saved_thread_comes_back_whole() {
             sender_thread_id: "chat".to_string(),
             call_id: "call_explore".to_string(),
         }),
-        state: vec![],
         resume_point: StoredResumePoint::PendingApproval {
             parent_message_id: MessageId::new(),
             pending_approval_calls: vec![StoredPreparedToolCall {
@@ -1148,7 +1146,6 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
         .save_checkpoint(
             "explore-thread".to_string(),
             StoredCheckpoint {
-                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![StoredPreparedToolCall {
@@ -2031,7 +2028,6 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
                     ),
                     entry(third, assistant("found again")),
                 ],
-                state: vec![],
                 resume_point: StoredResumePoint::Generation,
                 suspended_at: jiff::Timestamp::default(),
             },
@@ -2204,7 +2200,6 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
         .save_checkpoint(
             "source-session".to_string(),
             StoredCheckpoint {
-                state: vec![],
                 resume_point: StoredResumePoint::PendingApproval {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![StoredPreparedToolCall {
@@ -2444,18 +2439,18 @@ async fn forking_a_session_that_does_not_exist_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Anchored thread state
+// Thread state recorded on messages
 // ---------------------------------------------------------------------------
 
-/// A tool call and its result, plus the state the call recorded — the shape the
-/// runtime produces. `kind` is opaque here on purpose: nothing in storage knows
-/// what any kind holds, which is the whole point of the mechanism.
+/// A tool call and its result, with the state the call recorded on that result
+/// — the shape the runtime produces. `kind` is opaque on purpose: nothing in
+/// storage knows what any kind holds.
 fn recorded(
     turn: TurnId,
     call_id: &str,
     kind: &str,
     value: serde_json::Value,
-) -> (Vec<HistoryEntry>, StateEntry) {
+) -> Vec<HistoryEntry> {
     let result = ToolMessage::new(
         call_id.to_string(),
         "a_tool".to_string(),
@@ -2463,7 +2458,6 @@ fn recorded(
         ToolCallOutcome::Auto,
         None,
     );
-    let anchor = result.message_id;
     let call = Message::Assistant(AssistantMessage {
         message_id: MessageId::new(),
         content: String::new(),
@@ -2480,14 +2474,13 @@ fn recorded(
         started_at: jiff::Timestamp::default(),
         ended_at: jiff::Timestamp::default(),
     });
-    (
-        vec![entry(turn, call), entry(turn, Message::Tool(result))],
-        StateEntry {
-            message_id: anchor,
-            kind: kind.to_string(),
-            value,
+    vec![
+        entry(turn, call),
+        HistoryEntry {
+            state: [(kind.to_string(), value)].into_iter().collect(),
+            ..entry(turn, Message::Tool(result))
         },
-    )
+    ]
 }
 
 /// Two turns, each recording a different value of the same kind. Returns the
@@ -2501,47 +2494,35 @@ async fn seed_session_with_state(pool: &DbPool, workspace: &str) -> MessageId {
     let first = TurnId::from(first_root);
     let second = TurnId::from(second_root);
 
-    let (first_messages, first_state) = recorded(first, "c1", "plan", serde_json::json!(["a"]));
     let mut messages = vec![entry(
         first,
         Message::User(UserMessage::text(first_root, "start")),
     )];
-    messages.extend(first_messages);
-    let mut state = vec![first_state];
+    messages.extend(recorded(first, "c1", "plan", serde_json::json!(["a"])));
     storage
-        .save_checkpoint(
-            "chat".to_string(),
-            StoredCheckpoint {
-                state: state.clone(),
-                ..checkpoint("chat", messages.clone())
-            },
-        )
+        .save_checkpoint("chat".to_string(), checkpoint("chat", messages.clone()))
         .await
         .unwrap();
 
-    let (second_messages, second_state) =
-        recorded(second, "c1", "plan", serde_json::json!(["a", "b"]));
     messages.push(entry(
         second,
         Message::User(UserMessage::text(second_root, "carry on")),
     ));
-    messages.extend(second_messages);
-    state.push(second_state);
+    messages.extend(recorded(
+        second,
+        "c1",
+        "plan",
+        serde_json::json!(["a", "b"]),
+    ));
     storage
-        .save_checkpoint(
-            "chat".to_string(),
-            StoredCheckpoint {
-                state,
-                ..checkpoint("chat", messages)
-            },
-        )
+        .save_checkpoint("chat".to_string(), checkpoint("chat", messages))
         .await
         .unwrap();
 
     second_root
 }
 
-/// The value a thread holds now: its entries reduced last-wins, which is what
+/// The value a thread holds now: its messages reduced last-wins, which is what
 /// the runtime does on load.
 async fn current_state(
     pool: &DbPool,
@@ -2555,14 +2536,14 @@ async fn current_state(
         .await
         .unwrap()
         .unwrap()
-        .state
+        .messages
         .into_iter()
-        .rfind(|entry| entry.kind == kind)
-        .map(|entry| entry.value)
+        .rev()
+        .find_map(|entry| entry.state.get(kind).cloned())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rewind_takes_anchored_state_back_with_the_turns() {
+async fn a_rewind_takes_recorded_state_back_with_the_turns() {
     let pool = pool().await;
     let workspace = workspace_id("rewind-state");
     let cut = seed_session_with_state(&pool, &workspace).await;
@@ -2586,9 +2567,9 @@ async fn a_rewind_takes_anchored_state_back_with_the_turns() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewind_needs_no_code_of_its_own_to_cut_state() {
-    // The anchor is a foreign key onto `messages` with `on delete cascade`, so
-    // deleting the messages is what removes the state. Rewinding to the opening
-    // message must therefore leave no state row behind at all.
+    // State is a column of the message that recorded it, so deleting the
+    // messages removes it. Rewinding to the opening message must leave nothing
+    // carrying state at all.
     let pool = pool().await;
     let workspace = workspace_id("rewind-state-all");
     seed_session_with_state(&pool, &workspace).await;
@@ -2606,12 +2587,24 @@ async fn a_rewind_needs_no_code_of_its_own_to_cut_state() {
         })
         .unwrap();
 
-    assert!(row_count(&pool, "thread_state", &workspace).await > 0);
+    assert!(messages_with_state(&pool, &workspace).await > 0);
     PgSessionStorage::new(pool.clone(), &workspace, "chat")
         .rewind_to(first_root)
         .await
         .unwrap();
-    assert_eq!(row_count(&pool, "thread_state", &workspace).await, 0);
+    assert_eq!(messages_with_state(&pool, &workspace).await, 0);
+}
+
+/// How many message rows of this workspace carry any recorded state.
+async fn messages_with_state(pool: &DbPool, workspace: &str) -> i64 {
+    diesel::sql_query(
+        "select count(*) as count from messages where workspace_id = $1 and state <> '{}'::jsonb",
+    )
+    .bind::<Text, _>(workspace)
+    .get_result::<CountRow>(&mut conn(pool).await)
+    .await
+    .unwrap()
+    .count
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -26,7 +26,7 @@ use crate::{
     SubAgentMode, ThreadId, ToolApprovalMode, ToolCallResolution,
     agent::{
         AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, PreparedToolCall, Receiver,
-        ReplyTarget, ResumePoint, ToolExecutionMetadata, ToolExecutionState,
+        ReplyTarget, ResumePoint, ThreadStateMap, ToolExecutionMetadata, ToolExecutionState,
     },
     compaction, message_view,
     persist::StoredCheckpoint,
@@ -529,12 +529,12 @@ fn execute_javascript_tool_discovery(
 /// what *this* call has written, which only it can see until the runtime anchors
 /// it to the message recording the call.
 struct CallState {
-    committed: Arc<HashMap<String, serde_json::Value>>,
+    committed: Arc<ThreadStateMap>,
     recorded: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl CallState {
-    fn new(committed: Arc<HashMap<String, serde_json::Value>>) -> Self {
+    fn new(committed: Arc<ThreadStateMap>) -> Self {
         CallState {
             committed,
             recorded: std::sync::Mutex::new(Vec::new()),
@@ -712,9 +712,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         };
         let (mut resume_point, mut suspended_at): (ResumePoint, jiff::Timestamp) =
             if let Some(stored) = stored {
-                self.agent
-                    .restore_history(stored.messages, stored.state)
-                    .await;
+                self.agent.restore_history(stored.messages).await;
                 self.reply_target = stored.reply_target;
                 self.origin_thread = stored.parent_thread_id.zip(stored.derivation_key).map(
                     |(parent_thread_id, derivation_key)| OriginThread {
@@ -727,7 +725,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // The Agent instance may be reused across different thread IDs
                 // (e.g. stateless subagent calls), so we must clear any stale
                 // in-memory state to avoid leaking conversation across threads.
-                self.agent.restore_history(vec![], vec![]).await;
+                self.agent.restore_history(vec![]).await;
                 self.reply_target = None;
                 self.origin_thread = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
@@ -971,7 +969,6 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .map(|origin| origin.derivation_key.clone()),
             reply_target: self.reply_target.clone(),
             messages: self.agent.history().await,
-            state: self.agent.state_entries().await,
             resume_point: resume_point.into(),
             suspended_at,
         };

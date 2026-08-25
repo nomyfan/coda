@@ -1093,10 +1093,10 @@ async fn should_ignore_a_removed_agents_approval_across_reopens() {
         .await;
 }
 
-/// State a tool records must reach the checkpoint anchored to the message that
-/// recorded it, and come back on the next turn. This is the whole path —
-/// `ThreadState::set` → the call's result → `StoredCheckpoint::state` → storage
-/// → restore → `ThreadState::get` — which the unit tests either side of it
+/// State a tool records must reach the checkpoint on the message that recorded
+/// it, and come back on the next turn. This is the whole path —
+/// `ThreadState::set` → the call's result → `HistoryEntry::state` → storage →
+/// restore → `ThreadState::get` — which the unit tests either side of it
 /// cannot cover.
 #[tokio::test]
 async fn tool_state_survives_the_turn_that_recorded_it() {
@@ -1124,23 +1124,21 @@ async fn tool_state_survives_the_turn_that_recorded_it() {
         .expect("send");
     assert_eq!(collect_until_done(&session).await, "planned");
 
-    // Anchored, not stashed: the entry names the tool message that recorded it.
+    // On the message, not beside it: the entry carrying the write is the tool
+    // result that made it.
     let checkpoint = storage
         .load_checkpoint("todo-session")
         .await
         .expect("load")
         .expect("a checkpoint");
-    let entry = checkpoint
-        .state
+    let recorded = checkpoint
+        .messages
         .iter()
-        .find(|entry| entry.kind == "todos")
+        .find(|entry| entry.state.contains_key("todos"))
         .expect("the write was recorded");
     assert!(
-        checkpoint.messages.iter().any(|held| matches!(
-            &held.message,
-            Message::Tool(tool) if tool.message_id == entry.message_id
-        )),
-        "the anchor must be a message this thread actually holds, or no fork or \
+        matches!(&recorded.message, Message::Tool(_)),
+        "the write must ride on the tool result that made it, or no fork or \
          rewind can reach the state through it"
     );
 

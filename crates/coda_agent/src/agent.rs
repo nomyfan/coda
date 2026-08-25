@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -13,7 +13,6 @@ use coda_core::llm::{
 use coda_core::tool::Tools;
 
 use crate::message_view;
-use crate::persist::StateEntry;
 use tracing::{debug, error};
 
 /// Prefix applied to sub-agent names when they are exposed to the LLM as tools,
@@ -145,6 +144,9 @@ pub enum ResumePoint {
     },
 }
 
+/// Tool state recorded by one message — see [`ThreadState`](coda_core::tool::ThreadState).
+pub type ThreadStateMap = BTreeMap<String, serde_json::Value>;
+
 /// One message in a thread's history, tagged with the turn it belongs to.
 ///
 /// `turn_id` sits out here rather than inside `Message` for the same reason
@@ -156,18 +158,42 @@ pub enum ResumePoint {
 pub struct HistoryEntry {
     pub turn_id: TurnId,
     pub message: Message,
+    /// What the call recorded in this message wrote to the thread's tool state.
+    /// On the entry rather than in a list of its own, so a fork or a rewind
+    /// reaches it by the rule that already moves messages.
+    #[serde(default, skip_serializing_if = "ThreadStateMap::is_empty")]
+    pub state: ThreadStateMap,
 }
 
-pub struct AgentState {
-    pub messages: Vec<HistoryEntry>,
-    /// Tool state this thread has recorded, anchored to the messages that
-    /// recorded it — see [`StoredCheckpoint::state`](crate::persist::StoredCheckpoint::state).
-    /// Grows in step with `messages` and is cut by the same rule.
-    pub state: Vec<StateEntry>,
+impl HistoryEntry {
+    /// An entry that recorded no state, which is all but a few tool results.
+    pub fn new(turn_id: TurnId, message: Message) -> Self {
+        HistoryEntry {
+            turn_id,
+            message,
+            state: ThreadStateMap::new(),
+        }
+    }
+}
+
+/// A thread's history and what the runtime derives from it.
+///
+/// Every field is private: `state` only stays true to `messages` because
+/// [`restore`](Self::restore) and [`record`](Self::record) are the sole way to
+/// change either, and a caller that could reach past them would silently make
+/// [`Agent::state_snapshot`] wrong. Reads go through `Agent`, which already
+/// exposes each one that has a caller.
+#[derive(Default)]
+pub(crate) struct AgentState {
+    messages: Vec<HistoryEntry>,
+    /// Every entry's `state` reduced last-wins. Derived, never persisted: a tool
+    /// batch asks for it before each of its calls, and rebuilding it from a
+    /// transcript that only ever grows would cost more every turn.
+    state: ThreadStateMap,
     /// The turn newly appended messages belong to. Advances only when a user
     /// message is appended (see [`Agent::add_user_message`]); `None` only before
     /// this thread has any history at all.
-    pub current_turn: Option<TurnId>,
+    current_turn: Option<TurnId>,
 }
 
 /// Identifies what was interrupted by an abort.
@@ -466,7 +492,7 @@ pub struct Agent {
     pub name: String,
     pub mode: SubAgentMode,
     pub system_prompt: SystemPrompt,
-    pub state: Arc<Mutex<AgentState>>,
+    pub(crate) state: Arc<Mutex<AgentState>>,
     pub tools: Tools,
     pub subagents: SubAgents,
 }
@@ -554,10 +580,6 @@ pub(crate) struct AgentRunConfig<P> {
 }
 
 impl Agent {
-    pub fn state(&self) -> Arc<Mutex<AgentState>> {
-        self.state.clone()
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -576,10 +598,9 @@ impl Agent {
         debug!("Adding user message: {:?}", message);
         let mut state = self.state.lock().await;
         state.current_turn = Some(turn_id);
-        state.messages.push(HistoryEntry {
-            turn_id,
-            message: Message::User(message),
-        });
+        state
+            .messages
+            .push(HistoryEntry::new(turn_id, Message::User(message)));
     }
 
     /// Append a message to the current turn. Used for assistant and tool
@@ -588,7 +609,7 @@ impl Agent {
         debug!("Adding message: {:?}", message);
         let mut state = self.state.lock().await;
         let turn_id = state.stamp();
-        state.messages.push(HistoryEntry { turn_id, message });
+        state.messages.push(HistoryEntry::new(turn_id, message));
     }
 
     pub async fn add_messages(&self, messages: Vec<Message>) {
@@ -598,7 +619,7 @@ impl Agent {
         state.messages.extend(
             messages
                 .into_iter()
-                .map(|message| HistoryEntry { turn_id, message }),
+                .map(|message| HistoryEntry::new(turn_id, message)),
         );
     }
 
@@ -654,60 +675,67 @@ impl Agent {
             })
     }
 
-    /// Restore a stored thread's conversation and anchored tool state, replacing
-    /// whatever thread this agent last ran. State remains opaque here; tools
-    /// interpret their own kinds through `ToolCallContext::state` when invoked.
-    pub async fn restore_history(&self, messages: Vec<HistoryEntry>, entries: Vec<StateEntry>) {
+    /// Restore a stored thread's conversation, replacing whatever thread this
+    /// agent last ran. The tool state each entry carries stays opaque here;
+    /// tools interpret their own kinds through `ToolCallContext::state`.
+    pub async fn restore_history(&self, messages: Vec<HistoryEntry>) {
         let mut state = self.state.lock().await;
-        state.messages = messages;
-        state.state = entries;
+        state.restore(messages);
         // Whatever work is being resumed belongs to the turn of the last message
         // written, so the turn needs no separate persistence.
         state.current_turn = state.messages.last().map(|entry| entry.turn_id);
     }
 
     /// This thread's recorded state so far, reduced to one value per kind.
-    ///
-    /// Last-wins, because every entry is a complete value rather than a delta —
-    /// the property that also lets a compaction collapse a range of entries
-    /// without knowing what any kind means.
-    pub async fn state_snapshot(&self) -> HashMap<String, serde_json::Value> {
-        let state = self.state.lock().await;
-        let mut snapshot = HashMap::new();
-        for entry in &state.state {
-            snapshot.insert(entry.kind.clone(), entry.value.clone());
-        }
-        snapshot
-    }
-
-    pub async fn state_entries(&self) -> Vec<StateEntry> {
+    /// Last-wins, because every entry is a complete value rather than a delta.
+    pub async fn state_snapshot(&self) -> ThreadStateMap {
         self.state.lock().await.state.clone()
     }
 
     /// Append a message together with whatever the call that produced it
-    /// recorded. One critical section, because an entry without its anchor is
-    /// state nothing can cut and an anchor without its entry silently loses a
-    /// write.
+    /// recorded, as one entry — so state can neither lose its message nor
+    /// outlive it. `recorded` is in write order, so a kind written twice keeps
+    /// the last value, which is the one the call established.
     pub async fn add_message_with_state(
         &self,
         message: Message,
         recorded: Vec<(String, serde_json::Value)>,
     ) {
-        let anchor = message.message_id();
-        let mut state = self.state.lock().await;
-        let turn_id = state.stamp();
-        state.messages.push(HistoryEntry { turn_id, message });
-        state
-            .state
-            .extend(recorded.into_iter().map(|(kind, value)| StateEntry {
-                message_id: anchor,
-                kind,
-                value,
-            }));
+        self.state
+            .lock()
+            .await
+            .record(message, recorded.into_iter().collect());
     }
 }
 
 impl AgentState {
+    /// Replace the thread, rebuilding the derived snapshot from what arrived.
+    /// An empty history therefore clears it, which is what keeps an `Agent`
+    /// reused for another thread from handing over the last one's state.
+    fn restore(&mut self, messages: Vec<HistoryEntry>) {
+        self.state = messages
+            .iter()
+            .flat_map(|entry| entry.state.iter())
+            .map(|(kind, value)| (kind.clone(), value.clone()))
+            .collect();
+        self.messages = messages;
+    }
+
+    /// Append a message and the state its call recorded, in step.
+    fn record(&mut self, message: Message, state: ThreadStateMap) {
+        let turn_id = self.stamp();
+        self.state.extend(
+            state
+                .iter()
+                .map(|(kind, value)| (kind.clone(), value.clone())),
+        );
+        self.messages.push(HistoryEntry {
+            turn_id,
+            message,
+            state,
+        });
+    }
+
     /// The turn to tag a newly appended assistant/tool message with. Only the
     /// append paths call this — reading the turn goes through
     /// [`Agent::current_turn`], which reports "no turn yet" rather than minting
@@ -894,5 +922,70 @@ mod system_prompt_tests {
         assert_eq!(sp.resolve(), "skills: old");
         handle.set("new");
         assert_eq!(sp.resolve(), "skills: new");
+    }
+}
+
+#[cfg(test)]
+mod thread_state_tests {
+    use super::*;
+
+    /// A tool result carrying one recorded value — the only shape that fills
+    /// [`HistoryEntry::state`].
+    fn recorded(turn: TurnId, kind: &str, value: &str) -> HistoryEntry {
+        HistoryEntry {
+            state: [(kind.to_string(), json!(value))].into_iter().collect(),
+            ..HistoryEntry::new(turn, tool_message())
+        }
+    }
+
+    fn tool_message() -> Message {
+        Message::Tool(ToolMessage::new(
+            "call".to_string(),
+            "a_tool".to_string(),
+            ToolOutput::Ok("done".to_string()),
+            ToolCallOutcome::Auto,
+            None,
+        ))
+    }
+
+    #[test]
+    fn a_restored_thread_reduces_its_snapshot_from_the_messages_it_was_handed() {
+        let turn = TurnId::from(MessageId::new());
+        let mut state = AgentState::default();
+        state.restore(vec![
+            recorded(turn, "plan", "first"),
+            recorded(turn, "plan", "second"),
+            recorded(turn, "notes", "kept"),
+        ]);
+        assert_eq!(state.state.get("plan"), Some(&json!("second")));
+        assert_eq!(state.state.get("notes"), Some(&json!("kept")));
+    }
+
+    /// One `Agent` is reused across threads — a stateless sub-agent call
+    /// restores an empty history into it — so a snapshot that outlived the swap
+    /// would hand one thread's state to another.
+    #[test]
+    fn restoring_another_thread_leaves_none_of_the_last_ones_state() {
+        let turn = TurnId::from(MessageId::new());
+        let mut state = AgentState::default();
+        state.restore(vec![recorded(turn, "plan", "first")]);
+        state.restore(vec![]);
+        assert!(state.state.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_write_lands_on_the_message_and_in_the_snapshot() {
+        let turn = TurnId::from(MessageId::new());
+        let mut state = AgentState {
+            current_turn: Some(turn),
+            ..Default::default()
+        };
+        state.record(
+            tool_message(),
+            [("plan".to_string(), json!("now"))].into_iter().collect(),
+        );
+        let entry = state.messages.last().expect("the message was appended");
+        assert_eq!(entry.state.get("plan"), Some(&json!("now")));
+        assert_eq!(state.state.get("plan"), Some(&json!("now")));
     }
 }
