@@ -215,17 +215,11 @@ mod tests {
 
     // `pub(super)`: shared with `validation_tests`, a sibling module.
     pub(super) fn entry(message: Message) -> HistoryEntry {
-        HistoryEntry {
-            turn_id: TurnId::from(MessageId::new()),
-            message,
-        }
+        HistoryEntry::new(TurnId::from(MessageId::new()), message)
     }
 
     fn entry_in(turn: TurnId, message: Message) -> HistoryEntry {
-        HistoryEntry {
-            turn_id: turn,
-            message,
-        }
+        HistoryEntry::new(turn, message)
     }
 
     fn user(text: &str) -> HistoryEntry {

@@ -12,15 +12,14 @@ use super::llm::{ToolArtifact, ToolDefinition};
 
 /// A tool's durable state on the calling thread, keyed by an opaque `kind`.
 ///
-/// The runtime stores what a tool puts here **anchored to the message that
-/// records the call** — so state is cut by exactly the rule that cuts the
-/// conversation. A rewind that drops a turn drops the state written in it; a
-/// fork keeps whatever the kept turns wrote. Neither operation, and nothing
-/// else in the runtime, needs to know what any `kind` means.
+/// The runtime stores what a tool puts here **on the message that records the
+/// call** — so state is cut by exactly the rule that cuts the conversation. A
+/// rewind that drops a turn drops the state written in it; a fork keeps
+/// whatever the kept turns wrote. Neither operation, and nothing else in the
+/// runtime, needs to know what any `kind` means.
 ///
-/// Each `set` records a *complete* value, not a delta. That is what lets the
-/// runtime collapse a range of entries — which is what a compaction does — by
-/// keeping the last one of each kind, without a per-kind reducer.
+/// Each `set` records a *complete* value, not a delta, so reading is last-wins
+/// per kind and nothing has to know what a kind means to reduce it.
 ///
 /// Reads see the thread as it stood when this batch of calls was dispatched,
 /// plus anything this same call has already `set`. A batch runs concurrently

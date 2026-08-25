@@ -13,6 +13,7 @@ diesel::table! {
         origin_call_id -> Nullable<Text>,
         payload -> Jsonb,
         created_at -> Timestamptz,
+        state -> Jsonb,
     }
 }
 
@@ -52,20 +53,9 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    thread_state (workspace_id, session_id, message_id, kind) {
-        workspace_id -> Text,
-        session_id -> Text,
-        message_id -> Uuid,
-        kind -> Text,
-        value -> Jsonb,
-    }
-}
-
 diesel::allow_tables_to_appear_in_same_query!(
     messages,
     runtime_snapshots,
     sessions,
     thread_checkpoints,
-    thread_state,
 );

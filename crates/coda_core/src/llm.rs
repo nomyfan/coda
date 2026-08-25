@@ -532,8 +532,8 @@ pub enum Message {
 }
 
 impl Message {
-    /// The id this message carries. Total, which is what lets state recorded
-    /// during a call always find an anchor.
+    /// The id this message carries. Total, so anything that has to name a
+    /// message — a compaction cutoff, a rewind target — can name any of them.
     pub fn message_id(&self) -> MessageId {
         match self {
             Message::User(message) => message.message_id,

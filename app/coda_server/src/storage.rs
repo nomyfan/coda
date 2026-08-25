@@ -1,9 +1,9 @@
 use crate::jsonb::Json;
-use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints, thread_state};
+use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints};
 use coda_agent::HistoryEntry;
 use coda_agent::ThreadId;
-use coda_agent::agent::ReplyTarget;
-use coda_agent::persist::{StateEntry, StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
+use coda_agent::agent::{ReplyTarget, ThreadStateMap};
+use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
 use diesel::expression::IntoSql;
@@ -573,7 +573,8 @@ impl WorkspaceStorage {
                     let new_thread_id = &thread_ids[&checkpoint.thread_id];
 
                     // Payloads stay inside the database — some carry inline
-                    // base64 images.
+                    // base64 images. Tool state is just another column, so the
+                    // cut reaches it for free.
                     diesel::insert_into(messages::table)
                         .values(
                             messages::table
@@ -595,6 +596,7 @@ impl WorkspaceStorage {
                                     messages::origin_message_id,
                                     messages::origin_call_id,
                                     messages::payload,
+                                    messages::state,
                                 )),
                         )
                         .into_columns((
@@ -608,43 +610,7 @@ impl WorkspaceStorage {
                             messages::origin_message_id,
                             messages::origin_call_id,
                             messages::payload,
-                        ))
-                        .execute(conn)
-                        .await?;
-
-                    // State follows its anchor. Kept messages keep their
-                    // `message_id` under the new session, so this is a copy with
-                    // no remapping — and the cut reaches the state for free.
-                    diesel::insert_into(thread_state::table)
-                        .values(
-                            thread_state::table
-                                .inner_join(
-                                    messages::table.on(messages::workspace_id
-                                        .eq(thread_state::workspace_id)
-                                        .and(messages::session_id.eq(thread_state::session_id))
-                                        .and(messages::message_id.eq(thread_state::message_id))),
-                                )
-                                .filter(
-                                    thread_state::workspace_id
-                                        .eq(&self.workspace_id)
-                                        .and(thread_state::session_id.eq(source_id))
-                                        .and(messages::thread_id.eq(&checkpoint.thread_id))
-                                        .and(messages::turn_id.eq_any(&keep)),
-                                )
-                                .select((
-                                    thread_state::workspace_id,
-                                    new_id.as_str().into_sql::<Text>(),
-                                    thread_state::message_id,
-                                    thread_state::kind,
-                                    thread_state::value,
-                                )),
-                        )
-                        .into_columns((
-                            thread_state::workspace_id,
-                            thread_state::session_id,
-                            thread_state::message_id,
-                            thread_state::kind,
-                            thread_state::value,
+                            messages::state,
                         ))
                         .execute(conn)
                         .await?;
@@ -1176,40 +1142,11 @@ impl PgSessionStorage {
                             .eq(origin.map(|origin| origin.message_id.as_uuid())),
                         messages::origin_call_id.eq(origin.map(|origin| origin.call_id.as_str())),
                         messages::payload.eq(Json(&entry.message)),
+                        // Tool state rides on the row that recorded it, so
+                        // `message_count` governs it too and the two cannot
+                        // drift apart.
+                        messages::state.eq(Json(&entry.state)),
                     ))
-                    .execute(conn)
-                    .await?;
-            }
-
-            // Anchored to messages this save is appending, so `message_count` —
-            // already the one watermark for "what is new" — governs both tables
-            // and they cannot drift apart. An entry anchored anywhere else is a
-            // write the runtime never made.
-            let appended: std::collections::HashSet<MessageId> = checkpoint.messages
-                [stored_count..]
-                .iter()
-                .map(|entry| entry.message.message_id())
-                .collect();
-            for entry in &checkpoint.state {
-                if !appended.contains(&entry.message_id) {
-                    continue;
-                }
-                diesel::insert_into(thread_state::table)
-                    .values((
-                        thread_state::workspace_id.eq(&self.workspace_id),
-                        thread_state::session_id.eq(&self.session_id),
-                        thread_state::message_id.eq(entry.message_id.as_uuid()),
-                        thread_state::kind.eq(&entry.kind),
-                        thread_state::value.eq(Json(&entry.value)),
-                    ))
-                    .on_conflict((
-                        thread_state::workspace_id,
-                        thread_state::session_id,
-                        thread_state::message_id,
-                        thread_state::kind,
-                    ))
-                    .do_update()
-                    .set(thread_state::value.eq(Json(&entry.value)))
                     .execute(conn)
                     .await?;
             }
@@ -1294,49 +1231,15 @@ impl PgSessionStorage {
                     .and(messages::thread_id.eq(thread_id)),
             )
             .order(messages::seq)
-            .select((messages::turn_id, messages::payload))
-            .load::<(uuid::Uuid, Json<Message>)>(&mut conn)
+            .select((messages::turn_id, messages::payload, messages::state))
+            .load::<(uuid::Uuid, Json<Message>, Json<ThreadStateMap>)>(&mut conn)
             .await
             .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
             .into_iter()
-            .map(|(turn_id, payload)| HistoryEntry {
+            .map(|(turn_id, payload, state)| HistoryEntry {
                 turn_id: TurnId::from(MessageId::from(turn_id)),
                 message: payload.0,
-            })
-            .collect();
-
-        // Joined through `messages` rather than carrying a `thread_id` of its
-        // own: the anchor already names the thread, and duplicating it would put
-        // back the id remapping that anchoring on `message_id` exists to avoid.
-        let state = thread_state::table
-            .inner_join(
-                messages::table.on(messages::workspace_id
-                    .eq(thread_state::workspace_id)
-                    .and(messages::session_id.eq(thread_state::session_id))
-                    .and(messages::message_id.eq(thread_state::message_id))),
-            )
-            .filter(
-                thread_state::workspace_id
-                    .eq(&self.workspace_id)
-                    .and(thread_state::session_id.eq(&self.session_id))
-                    .and(messages::thread_id.eq(thread_id)),
-            )
-            // In thread order, so reducing the entries last-wins gives the value
-            // the thread actually ended on.
-            .order((messages::seq, thread_state::kind))
-            .select((
-                thread_state::message_id,
-                thread_state::kind,
-                thread_state::value,
-            ))
-            .load::<(uuid::Uuid, String, Json<serde_json::Value>)>(&mut conn)
-            .await
-            .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?
-            .into_iter()
-            .map(|(message_id, kind, value)| StateEntry {
-                message_id: MessageId::from(message_id),
-                kind,
-                value: value.into_inner(),
+                state: state.into_inner(),
             })
             .collect();
 
@@ -1347,7 +1250,6 @@ impl PgSessionStorage {
             derivation_key,
             reply_target: reply_target.map(Json::into_inner),
             messages,
-            state,
             resume_point: resume_point.into_inner(),
             suspended_at: suspended_at.to_jiff(),
         }))
