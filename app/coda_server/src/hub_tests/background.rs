@@ -67,7 +67,9 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
         "the entry was released with a task still running"
     );
 
-    release.notify_waiters();
+    // `notify_one` rather than `notify_waiters`: the task may not have reached
+    // its await yet, and a notification with nobody registered is simply lost.
+    release.notify_one();
     wait_released(&hub).await;
     hub.shutdown_all().await;
 }
@@ -161,7 +163,7 @@ async fn a_notice_arriving_mid_turn_waits_for_the_turn_to_end() {
         "the notice interrupted a running turn"
     );
 
-    gate.notify_waiters();
+    gate.notify_one();
     next_matching(&mut events, is_settling_llm_end).await;
 
     timeout(Duration::from_secs(5), async {
@@ -175,6 +177,10 @@ async fn a_notice_arriving_mid_turn_waits_for_the_turn_to_end() {
     .await
     .expect("the notice was never delivered after the turn ended");
 
+    // Let the notice's own turn finish too, or the teardown below sits out the
+    // full graceful deadline waiting for a provider that is still parked.
+    gate.notify_one();
+    wait_idle(&hub).await;
     hub.shutdown_all().await;
 }
 
@@ -233,6 +239,6 @@ async fn a_model_switch_keeps_the_running_tasks() {
         "the task did not survive the model switch"
     );
 
-    release.notify_waiters();
+    release.notify_one();
     hub.shutdown_all().await;
 }
