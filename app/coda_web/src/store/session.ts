@@ -16,6 +16,7 @@ import {
   RpcCode,
   type SkillInfo,
   type TaskNoticeOutcome,
+  type TaskSummary,
   type ToolCall,
   type ToolCallResolution,
   type ToolArtifact,
@@ -141,6 +142,10 @@ export type OpenedSession = {
   running: boolean;
   /** A compaction runs outside a normal turn but still owns the session. */
   compacting: boolean;
+  /** Background tasks this session started, newest first. Pushed on every
+   * change and carried on the snapshot, since tasks outlive turns and the
+   * client may attach long after one started. */
+  backgroundTasks: TaskSummary[];
   /** A draft session's opening `open_session` is in flight, ahead of its first
    * task. `running` can't cover this window — it isn't set until the task is
    * actually sent — so without it a second submit during the round trip would
@@ -279,6 +284,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     allowDrafts: {},
     running: false,
     compacting: false,
+    backgroundTasks: [],
     evicted: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     usage: [],
@@ -1613,6 +1619,7 @@ export function applySnapshotToSession(
     permissionMode: PermissionMode;
     turnRunning: boolean;
     compacting?: boolean;
+    backgroundTasks?: TaskSummary[];
   },
 ): OpenedSession {
   const argsById = collectToolArgs(snapshot.messages);
@@ -1666,6 +1673,7 @@ export function applySnapshotToSession(
     // message speaks for its own turn until the reply that created it lands.
     running: snapshot.turnRunning || pending.length > 0,
     compacting: snapshot.compacting ?? false,
+    backgroundTasks: snapshot.backgroundTasks ?? session.backgroundTasks,
     evicted: false,
     editing: reconcileEditing(session.editing, snapshot.messages),
     entries: [
@@ -1756,6 +1764,7 @@ function applySnapshot(
   permissionMode: PermissionMode,
   turnRunning: boolean,
   compacting: boolean,
+  backgroundTasks: TaskSummary[],
 ) {
   flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
@@ -1789,11 +1798,30 @@ function applySnapshot(
       permissionMode,
       turnRunning,
       compacting,
+      backgroundTasks,
     });
   });
   // Self-heal the memory: whatever the session is running under is what this
   // browser should reopen it on if the hub later closes it underneath us.
   rememberSessionMode(server, workspaceId, sessionId, permissionMode);
+}
+
+/** The session's task list changed. Its own push: tasks outlive turns, so
+ * their comings and goings are not part of a turn's event stream. */
+function applyBackgroundTasks(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  tasks: TaskSummary[],
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = state.servers[server]?.sessions[key];
+    if (session) {
+      session.backgroundTasks = tasks;
+    }
+  });
 }
 
 function setSessionModel(
@@ -2429,6 +2457,7 @@ async function requestOpenAndApply(
       snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
       snap.turn_running ?? false,
       snap.compacting ?? false,
+      snap.background_tasks ?? [],
     );
     return true;
   } catch (err) {
@@ -2563,7 +2592,11 @@ export function connectServer(rawUrl: string) {
       params.permission_mode ?? DEFAULT_PERMISSION_MODE,
       params.turn_running ?? false,
       params.compacting ?? false,
+      params.background_tasks ?? [],
     );
+  });
+  rpc.addMethod("background_tasks", (params) => {
+    applyBackgroundTasks(codaStore, server, params.workspace_id, params.session_id, params.tasks);
   });
   rpc.addMethod("session_evicted", (params) => {
     applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
@@ -3603,6 +3636,7 @@ export async function submitApprovals() {
 // Stable empties so default-valued selectors keep referential identity and
 // don't force re-renders under `useSyncExternalStore`.
 
+const EMPTY_BACKGROUND_TASKS: TaskSummary[] = [];
 const EMPTY_ENTRIES: TranscriptEntry[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_DRAFTS: Record<string, Record<string, ToolCallResolution>> = {};
@@ -3758,6 +3792,13 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveBackgroundTasks = (state: CodaStoreState) =>
+  activeSessionOf(state)?.backgroundTasks ?? EMPTY_BACKGROUND_TASKS;
+/** How many of the active session's tasks are still running — the badge on the
+ * panel trigger, and the reason to show it at all. */
+export const selectActiveRunningTaskCount = (state: CodaStoreState) =>
+  (activeSessionOf(state)?.backgroundTasks ?? EMPTY_BACKGROUND_TASKS).filter((task) => task.running)
+    .length;
 export const selectActiveCompacting = (state: CodaStoreState) =>
   activeSessionOf(state)?.compacting ?? false;
 export const selectActiveStarting = (state: CodaStoreState) =>

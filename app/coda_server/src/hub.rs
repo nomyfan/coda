@@ -21,7 +21,7 @@ use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
     runtime::SendCommandError,
 };
-use coda_background::{ArchiveDir, BackgroundProcesses, TaskNotice};
+use coda_background::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
 use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -92,6 +92,10 @@ pub enum SessionCommand {
 #[derive(Debug)]
 pub enum RelayEvent {
     Event(Box<WireEvent>),
+    /// The session's background task list changed. Not part of the event
+    /// stream: tasks outlive turns, so their comings and goings are not a
+    /// turn's history.
+    BackgroundTasks(Arc<[TaskSummary]>),
     /// The session's state changed outside the event stream and the attached
     /// client needs the whole picture again. Unlike the two below, the stream
     /// continues after it.
@@ -122,6 +126,9 @@ pub struct SnapshotPayload {
     /// without this a client attaching mid-compaction would read the session as
     /// idle and let the user send — only to be refused.
     pub compacting: bool,
+    /// Every background task the session still knows about, so an attaching
+    /// client starts with the list rather than waiting for the next change.
+    pub background_tasks: Arc<[TaskSummary]>,
 }
 
 pub struct AttachSession {
@@ -1607,9 +1614,13 @@ impl SessionRelay for SessionHub {
                 }
             }
 
-            let snapshot =
-                compose_snapshot(&state.phase, state.permission_mode.get(), state.compacting)
-                    .expect("phase is Live or Pending after initialization");
+            let snapshot = compose_snapshot(
+                &state.phase,
+                state.permission_mode.get(),
+                state.compacting,
+                current_tasks(state),
+            )
+            .expect("phase is Live or Pending after initialization");
 
             // Register the stream and capture the replay in the same critical
             // section the forwarder appends under: every event lands in the
@@ -1954,11 +1965,24 @@ fn push_snapshot(state: &EntryState) {
     let Some(attachment) = &state.attached else {
         return;
     };
-    if let Some(snapshot) =
-        compose_snapshot(&state.phase, state.permission_mode.get(), state.compacting)
-    {
+    if let Some(snapshot) = compose_snapshot(
+        &state.phase,
+        state.permission_mode.get(),
+        state.compacting,
+        current_tasks(state),
+    ) {
         let _ = attachment.tx.send(RelayEvent::Snapshot(Box::new(snapshot)));
     }
+}
+
+/// The entry's current task overview, or an empty list before its registry
+/// exists.
+fn current_tasks(state: &EntryState) -> Arc<[TaskSummary]> {
+    state
+        .background
+        .as_ref()
+        .map(|background| background.summaries().borrow().clone())
+        .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()))
 }
 
 /// Compose the attach-time snapshot for an entry. Pure over the entry state so
@@ -1967,6 +1991,7 @@ fn compose_snapshot(
     phase: &EntryPhase,
     permission_mode: PermissionMode,
     compacting: bool,
+    background_tasks: Arc<[TaskSummary]>,
 ) -> Option<SnapshotPayload> {
     match phase {
         EntryPhase::Live(live) => {
@@ -1984,6 +2009,7 @@ fn compose_snapshot(
                 permission_mode,
                 turn_running: live.turn_running,
                 compacting,
+                background_tasks,
             })
         }
         EntryPhase::Pending(pending) => Some(SnapshotPayload {
@@ -1999,6 +2025,7 @@ fn compose_snapshot(
             permission_mode,
             turn_running: false,
             compacting,
+            background_tasks,
         }),
         _ => None,
     }
@@ -2027,6 +2054,15 @@ fn spawn_notice_watcher(
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let mut rx = background.summaries();
+        // Mark what the watch already holds as seen: building the registry
+        // publishes once (seeding from the archive), and that is not a change
+        // anyone attached could have missed — the attach snapshot carries it.
+        rx.borrow_and_update();
+        // The first pass reads the value the watch already holds, which the
+        // attach snapshot carries too — so it drains notices (a task can
+        // finish between the registry being built and this subscribing) but
+        // pushes nothing. Only an actual change is news.
+        let mut changed = false;
         loop {
             {
                 // Entry lock first, then the registry's — the order every
@@ -2040,6 +2076,11 @@ fn spawn_notice_watcher(
                 }
                 let notices = background.take_notices().await;
                 guard.pending_notices.extend(notices);
+                if changed && let Some(attachment) = &guard.attached {
+                    let _ = attachment
+                        .tx
+                        .send(RelayEvent::BackgroundTasks(current_tasks(&guard)));
+                }
                 SessionHub::deliver_pending_notice(&mut guard, &entry.key).await;
                 if let Some(release) = SessionHub::maybe_release(&entries, &entry, &mut guard) {
                     drop(guard);
@@ -2050,6 +2091,7 @@ fn spawn_notice_watcher(
             if rx.changed().await.is_err() {
                 return;
             }
+            changed = true;
         }
     })
     .abort_handle()

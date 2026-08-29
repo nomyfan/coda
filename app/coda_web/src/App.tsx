@@ -1,4 +1,6 @@
-import { Folder, Menu } from "lucide-react";
+import { Folder, ListChecks, Menu } from "lucide-react";
+
+import { BackgroundTasksPanel } from "@/components/background-tasks";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abort,
@@ -7,6 +9,7 @@ import {
   dismissPersistError,
   openSession,
   selectActiveApprovalCount,
+  selectActiveRunningTaskCount,
   selectActiveCompacting,
   selectActiveEvicted,
   selectActivePersistError,
@@ -163,9 +166,15 @@ function WorkspaceTargetSelect({
 function WorkspaceHeader({
   sessionTitle,
   onOpenSidebar,
+  onToggleTasks,
+  runningTasks,
+  showTasks,
 }: {
   sessionTitle?: string;
   onOpenSidebar: () => void;
+  onToggleTasks: () => void;
+  runningTasks: number;
+  showTasks: boolean;
 }) {
   return (
     <header className="flex h-[calc(2.75rem_+_env(safe-area-inset-top))] shrink-0 items-center gap-2 border-b bg-background px-2 pt-[env(safe-area-inset-top)] sm:px-4">
@@ -185,6 +194,22 @@ function WorkspaceHeader({
           </span>
         ) : null}
       </div>
+      {showTasks ? (
+        <button
+          type="button"
+          className="relative flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+          onClick={onToggleTasks}
+          title="Background tasks"
+          aria-label="Background tasks"
+        >
+          <ListChecks className="size-4" />
+          {runningTasks > 0 ? (
+            <span className="absolute right-1 top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5625rem] font-medium text-primary-foreground">
+              {runningTasks}
+            </span>
+          ) : null}
+        </button>
+      ) : null}
       <ThemeToggle />
     </header>
   );
@@ -252,6 +277,8 @@ export default function App() {
   } | null>(null);
   const [newSessionMode, setNewSessionMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [tasksOpen, setTasksOpen] = useState(false);
+  const runningTaskCount = useCodaStore(selectActiveRunningTaskCount);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
   const selectedServerState = servers.find((server) => server.url === selectedServerUrl);
@@ -420,105 +447,111 @@ export default function App() {
         <WorkspaceHeader
           sessionTitle={activeSessionTitle}
           onOpenSidebar={() => setSidebarOpen(true)}
+          onToggleTasks={() => setTasksOpen((open) => !open)}
+          runningTasks={runningTaskCount}
+          showTasks={Boolean(activeKey) && !showingNewSession}
         />
-        <div className="relative flex min-w-0 min-h-0 flex-1 flex-col">
-          {/* `inert` also blocks keyboard focus, which the overlay alone
+        <div className="relative flex min-w-0 min-h-0 flex-1">
+          <div className="relative flex min-w-0 min-h-0 flex-1 flex-col">
+            {/* `inert` also blocks keyboard focus, which the overlay alone
               wouldn't; the sidebar stays interactive for switching away. */}
-          <div
-            inert={evictedTakeover || undefined}
-            className="flex min-w-0 min-h-0 flex-1 flex-col"
-          >
-            <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
-            <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
-              {!showingNewSession && activePersistError ? (
-                <div className="mx-3 mb-2 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
-                  <p className="min-w-0 flex-1 text-xs text-destructive">
-                    The last turn was not fully saved, so parts of it may be missing from this
-                    session. {""}
-                    <span className="text-destructive/80">{activePersistError}</span>
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-6 shrink-0 px-2 text-xs"
-                    onClick={dismissPersistError}
-                  >
-                    Dismiss
-                  </Button>
-                </div>
-              ) : null}
-              {showingNewSession ? (
-                <WorkspaceTargetBar
-                  servers={servers}
-                  target={newSessionTarget}
-                  onSelectTarget={setNewSessionTarget}
-                />
-              ) : (
-                <ApprovalPanel />
-              )}
-              {showComposer ? (
-                <Composer
-                  // Remounting on every change of edit target loads that
-                  // message without a sync effect. A fork draft is keyed by its
-                  // session so returning to it restores that session's text.
-                  key={
-                    activeEditing
-                      ? `edit:${activeEditing.target ?? "orphan"}`
-                      : activeForkDraft
-                        ? `fork-draft:${activeKey}`
-                        : "new"
-                  }
-                  status={
-                    showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
-                  }
-                  running={showingNewSession ? false : activeRunning}
-                  compacting={showingNewSession ? false : activeCompacting}
-                  approvalPending={showingNewSession ? false : activeApprovalCount > 0}
-                  starting={showingNewSession ? false : activeStarting}
-                  evicted={showingNewSession ? false : activeEvicted}
-                  workspace={selectedWorkspace}
-                  selectingTarget={showingNewSession}
-                  permissionMode={showingNewSession ? newSessionMode : activePermissionMode}
-                  providers={
-                    showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
-                  }
-                  providerId={
-                    showingNewSession ? selectedNewSessionModel?.providerId : activeProviderId
-                  }
-                  reasoningEffort={
-                    showingNewSession
-                      ? (selectedNewSessionModel?.reasoningEffort ?? null)
-                      : activeReasoningEffort
-                  }
-                  usage={showingNewSession ? NO_USAGE : activeUsage}
-                  sessionHasImages={showingNewSession ? false : activeHasImages}
-                  serverUrl={selectedServerUrl}
-                  workspaceId={selectedWorkspace ?? ""}
-                  editing={showingNewSession ? undefined : activeEditing}
-                  forkDraft={showingNewSession ? undefined : activeForkDraft}
-                  onForkDraftChange={handleForkDraftChange}
-                  onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
-                  onSetPermissionMode={showingNewSession ? setNewSessionMode : setPermissionMode}
-                  onSend={handleSend}
-                  onAbort={abort}
-                  onCancelEdit={cancelEdit}
-                />
-              ) : null}
-            </div>
-          </div>
-          {evictedTakeover && (
-            <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/60 p-4 backdrop-blur-[2px]">
-              <div className="flex max-w-sm flex-col items-center gap-3 rounded-lg border border-border bg-background p-6 text-center shadow-lg">
-                <p className="text-sm text-muted-foreground">
-                  This session is being driven by another window and this view is not receiving
-                  updates. Taking over will disconnect it there.
-                </p>
-                <Button size="sm" onClick={takeOverActiveSession}>
-                  Take over
-                </Button>
+            <div
+              inert={evictedTakeover || undefined}
+              className="flex min-w-0 min-h-0 flex-1 flex-col"
+            >
+              <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
+              <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
+                {!showingNewSession && activePersistError ? (
+                  <div className="mx-3 mb-2 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
+                    <p className="min-w-0 flex-1 text-xs text-destructive">
+                      The last turn was not fully saved, so parts of it may be missing from this
+                      session. {""}
+                      <span className="text-destructive/80">{activePersistError}</span>
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-2 text-xs"
+                      onClick={dismissPersistError}
+                    >
+                      Dismiss
+                    </Button>
+                  </div>
+                ) : null}
+                {showingNewSession ? (
+                  <WorkspaceTargetBar
+                    servers={servers}
+                    target={newSessionTarget}
+                    onSelectTarget={setNewSessionTarget}
+                  />
+                ) : (
+                  <ApprovalPanel />
+                )}
+                {showComposer ? (
+                  <Composer
+                    // Remounting on every change of edit target loads that
+                    // message without a sync effect. A fork draft is keyed by its
+                    // session so returning to it restores that session's text.
+                    key={
+                      activeEditing
+                        ? `edit:${activeEditing.target ?? "orphan"}`
+                        : activeForkDraft
+                          ? `fork-draft:${activeKey}`
+                          : "new"
+                    }
+                    status={
+                      showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
+                    }
+                    running={showingNewSession ? false : activeRunning}
+                    compacting={showingNewSession ? false : activeCompacting}
+                    approvalPending={showingNewSession ? false : activeApprovalCount > 0}
+                    starting={showingNewSession ? false : activeStarting}
+                    evicted={showingNewSession ? false : activeEvicted}
+                    workspace={selectedWorkspace}
+                    selectingTarget={showingNewSession}
+                    permissionMode={showingNewSession ? newSessionMode : activePermissionMode}
+                    providers={
+                      showingNewSession ? (selectedServerState?.providers ?? []) : activeProviders
+                    }
+                    providerId={
+                      showingNewSession ? selectedNewSessionModel?.providerId : activeProviderId
+                    }
+                    reasoningEffort={
+                      showingNewSession
+                        ? (selectedNewSessionModel?.reasoningEffort ?? null)
+                        : activeReasoningEffort
+                    }
+                    usage={showingNewSession ? NO_USAGE : activeUsage}
+                    sessionHasImages={showingNewSession ? false : activeHasImages}
+                    serverUrl={selectedServerUrl}
+                    workspaceId={selectedWorkspace ?? ""}
+                    editing={showingNewSession ? undefined : activeEditing}
+                    forkDraft={showingNewSession ? undefined : activeForkDraft}
+                    onForkDraftChange={handleForkDraftChange}
+                    onSetModel={showingNewSession ? handleSetNewSessionModel : setModel}
+                    onSetPermissionMode={showingNewSession ? setNewSessionMode : setPermissionMode}
+                    onSend={handleSend}
+                    onAbort={abort}
+                    onCancelEdit={cancelEdit}
+                  />
+                ) : null}
               </div>
             </div>
-          )}
+            {evictedTakeover && (
+              <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/60 p-4 backdrop-blur-[2px]">
+                <div className="flex max-w-sm flex-col items-center gap-3 rounded-lg border border-border bg-background p-6 text-center shadow-lg">
+                  <p className="text-sm text-muted-foreground">
+                    This session is being driven by another window and this view is not receiving
+                    updates. Taking over will disconnect it there.
+                  </p>
+                  <Button size="sm" onClick={takeOverActiveSession}>
+                    Take over
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+          <BackgroundTasksPanel open={tasksOpen} onClose={() => setTasksOpen(false)} />
         </div>
       </section>
     </div>

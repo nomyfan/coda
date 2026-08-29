@@ -273,6 +273,30 @@ type Snapshot = {
   turn_running?: boolean;
   /** A compaction request is running outside the normal turn machinery. */
   compacting?: boolean;
+  /** Every background task the session still knows about. Carried on the
+   * snapshot as well as pushed, since a task can be started — and finish —
+   * long before this client attached. */
+  background_tasks?: TaskSummary[];
+};
+
+/** One background task, as the dashboard lists it. `status` is the server's
+ * humanized label; `running` is what the UI groups on, so the client never
+ * parses that label. */
+export type TaskSummary = {
+  id: string;
+  command: string;
+  description: string;
+  /** Which agent started it — a sub-agent's tasks are listed too. */
+  agent_name: string;
+  status: string;
+  running: boolean;
+  started_at: string;
+};
+
+export type BackgroundTasksPush = {
+  workspace_id: string;
+  session_id: string;
+  tasks: TaskSummary[];
 };
 
 type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
@@ -429,6 +453,7 @@ export type RpcPushes = {
   snapshot: Snapshot;
   session_evicted: SessionRef;
   session_status: SessionStatusPush;
+  background_tasks: BackgroundTasksPush;
 };
 
 export type WireEvent =

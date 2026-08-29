@@ -455,6 +455,48 @@ pub struct Snapshot {
     /// session is busy.
     #[serde(default)]
     pub compacting: bool,
+    /// Every background task the session still knows about. Carried here as
+    /// well as pushed, because a task can be started (and finish) long before
+    /// this client attached.
+    #[serde(default)]
+    pub background_tasks: Vec<TaskSummaryWire>,
+}
+
+/// One background task, as the dashboard lists it. `status` is the humanized
+/// label; `running` is what the UI groups and sorts on, so a client never has
+/// to parse the label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummaryWire {
+    pub id: String,
+    pub command: String,
+    pub description: String,
+    /// Which agent started it — a sub-agent's tasks are listed too.
+    pub agent_name: String,
+    pub status: String,
+    pub running: bool,
+    pub started_at: String,
+}
+
+impl From<coda_background::TaskSummary> for TaskSummaryWire {
+    fn from(summary: coda_background::TaskSummary) -> Self {
+        Self {
+            id: summary.id,
+            command: summary.command,
+            description: summary.description,
+            agent_name: summary.agent_name,
+            status: summary.status.describe(),
+            running: summary.status.is_running(),
+            started_at: summary.started_at.to_string(),
+        }
+    }
+}
+
+/// Push payload for a session's background task list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTasksPush {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub tasks: Vec<TaskSummaryWire>,
 }
 
 /// Params of `compact`. `instructions` is what the user typed after

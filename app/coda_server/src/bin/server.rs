@@ -43,13 +43,14 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, CompactParams, CompactResult, DeleteSessionParams, EventParams,
-        FileCatalog, ForkAccepted, ForkSessionParams, ListFilesParams, ListSkillsParams,
-        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
-        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
-        RewindParams, SessionName, SessionRef, SessionStatusWire, SessionSummaryWire,
-        SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot,
-        TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        AddAllowPatternParams, BackgroundTasksPush, CompactParams, CompactResult,
+        DeleteSessionParams, EventParams, FileCatalog, ForkAccepted, ForkSessionParams,
+        ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams, PendingApprovalWire,
+        PermissionModeSelection, ProviderCatalog, ProviderInfoWire, RenameSessionParams,
+        ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef, SessionStatusWire,
+        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
+        Snapshot, TaskAccepted, TaskParams, TaskSummaryWire, WireEvent, WorkspaceCatalog,
+        WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -950,6 +951,12 @@ fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
         permission_mode: snapshot.permission_mode,
         turn_running: snapshot.turn_running,
         compacting: snapshot.compacting,
+        background_tasks: snapshot
+            .background_tasks
+            .iter()
+            .cloned()
+            .map(TaskSummaryWire::from)
+            .collect(),
     }
 }
 
@@ -2022,6 +2029,16 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                     // The session changed outside the event stream. Unlike the
                     // two below this is not the end of anything, so the stream
                     // and this connection's claim on it both stay put.
+                    // Tasks outlive turns, so their list is pushed on its own
+                    // rather than replayed as turn history.
+                    RelayEvent::BackgroundTasks(tasks) => {
+                        send_notify(&transport, "background_tasks", &BackgroundTasksPush {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            tasks: tasks.iter().cloned().map(TaskSummaryWire::from).collect(),
+                        })
+                        .await
+                    }
                     RelayEvent::Snapshot(snapshot) => {
                         send_notify(&transport, "snapshot", &wire_snapshot(&key, *snapshot)).await
                     }
