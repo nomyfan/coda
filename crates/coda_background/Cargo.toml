@@ -1,0 +1,20 @@
+[package]
+name = "coda_background"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coda_core = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Failure injection for the group sentinel, for tests in dependent crates.
+test-hooks = []

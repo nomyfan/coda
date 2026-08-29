@@ -198,14 +198,14 @@ async fn sentinel_spawn_failure_fails_the_call_without_running_the_command() {
     let marker = std::env::temp_dir().join(format!("coda-shell-sentinel-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
-    crate::process::FAIL_SENTINEL.with(|f| f.set(true));
+    coda_background::process::set_sentinel_failure(true);
     let result = tool()
         .execute(
             params(&format!("touch '{}'", marker.display())),
             ToolCallContext::default(),
         )
         .await;
-    crate::process::FAIL_SENTINEL.with(|f| f.set(false));
+    coda_background::process::set_sentinel_failure(false);
 
     assert!(
         matches!(result, Err(ToolError::ExecutionError(_))),

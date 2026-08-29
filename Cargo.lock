@@ -534,6 +534,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda_background"
+version = "0.1.0"
+dependencies = [
+ "coda_core",
+ "jiff",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "coda_core"
 version = "0.1.0"
 dependencies = [
@@ -635,6 +651,7 @@ dependencies = [
 name = "coda_tools"
 version = "0.1.0"
 dependencies = [
+ "coda_background",
  "coda_core",
  "coda_ptc",
  "diffy",

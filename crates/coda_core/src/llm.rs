@@ -187,6 +187,23 @@ impl MessageOrigin {
     }
 }
 
+/// Stable identity of a background-task notice *fact*, independent of its
+/// mutable payload (status, timestamp, reason). Lives here (rather than in
+/// `coda_background`) so wire and history types can carry it without a reverse
+/// crate dependency; it is identity-only and never used to build an archive
+/// path, hence the plain `String` task id.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskNoticeKey {
+    /// A task reached a terminal state.
+    Completed { task_id: String },
+    /// A task's retained output was later evicted by the session quota.
+    OutputExpired { task_id: String },
+    /// One overflow aggregate, identified by a stable id minted at creation so
+    /// facts it cannot enumerate individually are still deduped as a batch.
+    OverflowBatch { batch_id: String },
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
