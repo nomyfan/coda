@@ -162,6 +162,7 @@ fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
                 Message::Assistant(_) => "assistant",
                 Message::Tool(_) => "tool",
                 Message::Compaction(_) => "compaction",
+                Message::TaskNotice(_) => "task_notice",
             };
             (role, m.message_id())
         })

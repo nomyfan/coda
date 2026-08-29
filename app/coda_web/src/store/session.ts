@@ -15,6 +15,7 @@ import {
   type RpcRequests,
   RpcCode,
   type SkillInfo,
+  type TaskNoticeOutcome,
   type ToolCall,
   type ToolCallResolution,
   type ToolArtifact,
@@ -64,6 +65,7 @@ export type TranscriptEntry = {
     | "tool_call"
     | "tool_result"
     | "compaction"
+    | "task_notice"
     | "system"
     | "error";
   /** The server's id for this message, once the server has acknowledged it.
@@ -509,13 +511,39 @@ function historyToEntries(
       },
     ];
   }
+  if ("TaskNotice" in message) {
+    const notice = message.TaskNotice;
+    return [
+      {
+        id: `task-notice:${notice.message_id}`,
+        messageId: notice.message_id,
+        kind: "task_notice",
+        title: taskNoticeTitle(notice.outcome),
+        detail: notice.outcome.type === "finished" ? notice.outcome.command : undefined,
+        content: notice.content,
+        startedAt: notice.created_at,
+      },
+    ];
+  }
   return [];
+}
+
+function taskNoticeTitle(outcome: TaskNoticeOutcome): string {
+  switch (outcome.type) {
+    case "finished":
+      return `Background task ${outcome.status}`;
+    case "output_expired":
+      return "Background task output expired";
+    case "capped":
+      return `${outcome.events} more background task events`;
+  }
 }
 
 function messageIdOf(message: HistoryMessage): string {
   if ("User" in message) return message.User.message_id;
   if ("Assistant" in message) return message.Assistant.message_id;
   if ("Tool" in message) return message.Tool.message_id;
+  if ("TaskNotice" in message) return message.TaskNotice.message_id;
   return message.Compaction.message_id;
 }
 

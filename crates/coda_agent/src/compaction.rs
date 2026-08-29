@@ -280,6 +280,13 @@ fn transcript<'a>(messages: impl IntoIterator<Item = &'a HistoryEntry>) -> Strin
                 out.push_str(body);
                 out.push('\n');
             }
+            // A background task reporting in mid-conversation. Rendered as a
+            // turn of its own, because that is what it was.
+            Message::TaskNotice(notice) => {
+                out.push_str("\n## Background task\n");
+                out.push_str(&notice.content);
+                out.push('\n');
+            }
             // An earlier summary, which is where this view begins.
             Message::Compaction(compaction) => {
                 out.push_str("\n## Summary of the conversation so far\n");

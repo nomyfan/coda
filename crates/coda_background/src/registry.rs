@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use coda_core::llm::TaskNoticeOutcome;
 use coda_core::tool::CancellationToken;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -167,6 +168,31 @@ pub enum TaskNotice {
 }
 
 impl TaskNotice {
+    /// This notice in the shape the conversation records it: what a client
+    /// renders, without the engine's own types leaking into the transcript.
+    pub fn outcome(&self) -> TaskNoticeOutcome {
+        match self {
+            TaskNotice::Task {
+                id,
+                command,
+                status,
+                ..
+            } => TaskNoticeOutcome::Finished {
+                task_id: id.as_str().to_owned(),
+                command: command.clone(),
+                status: status.describe(),
+            },
+            TaskNotice::OutputExpired { id, .. } => TaskNoticeOutcome::OutputExpired {
+                task_id: id.as_str().to_owned(),
+            },
+            TaskNotice::Overflow {
+                dropped, uncounted, ..
+            } => TaskNoticeOutcome::Capped {
+                events: dropped.len() as u64 + uncounted,
+            },
+        }
+    }
+
     /// The text of the user-turn message that delivers this notice — what the
     /// model (and the user, as a notice card) reads.
     pub fn render(&self) -> String {

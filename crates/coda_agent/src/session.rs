@@ -19,7 +19,7 @@ use crate::{
     ToolCallResolution,
 };
 use coda_background::BackgroundProcesses;
-use coda_core::llm::{LLMProvider, Message, MessageId, TurnId, UserAuthor};
+use coda_core::llm::{LLMProvider, Message, MessageId, TaskNoticeOutcome, TurnId};
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -517,8 +517,7 @@ impl Session {
         task: impl Into<String>,
         images: Vec<String>,
     ) -> Result<(), SendCommandError> {
-        self.send_task(message_id, task.into(), images, UserAuthor::Human)
-            .await
+        self.send_task(message_id, task.into(), images, None).await
     }
 
     /// Open a turn with a background task's outcome rather than something the
@@ -529,9 +528,10 @@ impl Session {
     pub async fn send_task_notice(
         &self,
         message_id: MessageId,
-        text: impl Into<String>,
+        outcome: TaskNoticeOutcome,
+        content: impl Into<String>,
     ) -> Result<(), SendCommandError> {
-        self.send_task(message_id, text.into(), Vec::new(), UserAuthor::TaskNotice)
+        self.send_task(message_id, content.into(), Vec::new(), Some(outcome))
             .await
     }
 
@@ -540,7 +540,7 @@ impl Session {
         message_id: MessageId,
         task: String,
         images: Vec<String>,
-        author: UserAuthor,
+        notice: Option<TaskNoticeOutcome>,
     ) -> Result<(), SendCommandError> {
         let thread_id = ThreadId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
@@ -558,7 +558,7 @@ impl Session {
                     message_id,
                     task,
                     images,
-                    author,
+                    notice,
                 },
             }))
             .await

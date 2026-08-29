@@ -90,11 +90,31 @@ export type CompactionMessage = {
   created_at: string;
 };
 
+/** What a background task did, in the shape the transcript records it. The
+ * status is already humanized by the server ("exited with code 0", "killed"). */
+export type TaskNoticeOutcome =
+  | { type: "finished"; task_id: string; command: string; status: string }
+  | { type: "output_expired"; task_id: string }
+  | { type: "capped"; events: number };
+
+/** A record the runtime authored when background work finished. It opens a
+ * turn of its own — the model is told about it as a user message — but it is
+ * not something the user said, so it renders as a notice rather than a bubble
+ * and cannot be a rewind or fork target. */
+export type TaskNoticeMessage = {
+  message_id: string;
+  outcome: TaskNoticeOutcome;
+  /** What the model was told. */
+  content: string;
+  created_at: string;
+};
+
 export type HistoryMessage =
   | { User: UserMessage }
   | { Assistant: AssistantMessage }
   | { Tool: ToolMessage }
-  | { Compaction: CompactionMessage };
+  | { Compaction: CompactionMessage }
+  | { TaskNotice: TaskNoticeMessage };
 
 export type PendingApproval = {
   thread_id: string;

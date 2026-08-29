@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompactionMessage, CompletionUsage, Message,
-    MessageId, RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition,
-    ToolMessage, ToolOutput, TurnId, UserAuthor, UserMessage,
+    MessageId, RequestMessage, SystemMessage, TaskNoticeOutcome, ToolCall, ToolCallOutcome,
+    ToolDefinition, ToolMessage, ToolOutput, TurnId,
 };
 use coda_core::tool::Tools;
 
@@ -277,10 +277,10 @@ pub enum EnvelopeBody {
         /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
-        /// Who this turn is from. A background-task notice opens a turn just
-        /// like a typed message, but is not something the human said.
-        #[serde(default)]
-        author: UserAuthor,
+        /// Set when the runtime, not a person, opened this turn: a background
+        /// task reporting in. `task` is then the notice text the model reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<TaskNoticeOutcome>,
     },
     /// Call agent as a tool
     ToolCall {
@@ -598,13 +598,14 @@ impl Agent {
     /// advanced on arrival, a rewind to the new turn would delete them and leave
     /// the earlier assistant message with tool calls that have no results —
     /// history the provider rejects. Advancing here lets them keep the old turn.
-    pub async fn add_user_message(&self, turn_id: TurnId, message: UserMessage) {
-        debug!("Adding user message: {:?}", message);
+    /// Record the message that opens a turn: what the user sent, or the notice
+    /// the runtime wrote when background work finished. Both start a turn; only
+    /// these two kinds ever do.
+    pub async fn add_opening_message(&self, turn_id: TurnId, message: Message) {
+        debug!("Adding turn-opening message: {:?}", message);
         let mut state = self.state.lock().await;
         state.current_turn = Some(turn_id);
-        state
-            .messages
-            .push(HistoryEntry::new(turn_id, Message::User(message)));
+        state.messages.push(HistoryEntry::new(turn_id, message));
     }
 
     /// Append a message to the current turn. Used for assistant and tool

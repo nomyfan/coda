@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, LLMProvider, LLMStreamEvent, Message, MessageId,
-    MessageOrigin, StreamError, ToolCall, ToolCallOutcome, ToolDefinition, ToolMessage, ToolOutput,
-    TurnId, UserMessage,
+    MessageOrigin, StreamError, TaskNoticeMessage, ToolCall, ToolCallOutcome, ToolDefinition,
+    ToolMessage, ToolOutput, TurnId, UserMessage,
 };
 use coda_core::tool::{
     HostToolCallError, HostToolCallResult, HostToolInvoker, ThreadState, ToolCallContext,
@@ -1174,7 +1174,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // `None` for a root task, whose sender is the user rather than
                 // a calling agent.
                 self.reply_target = reply_target_from_envelope(&envelope);
-                self.agent.add_user_message(turn_id, user).await;
+                self.agent.add_opening_message(turn_id, user).await;
                 EnvelopeOutcome::Next(ResumePoint::Generation)
             }
             ResumePoint::ToolExecution(mut tool_execution) => {
@@ -1265,7 +1265,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                             }
                             self.reply_target = reply_target_from_envelope(&envelope);
                             if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
-                                self.agent.add_user_message(turn_id, user).await;
+                                self.agent.add_opening_message(turn_id, user).await;
                             }
                             return EnvelopeOutcome::Next(ResumePoint::Generation);
                         }
@@ -2115,18 +2115,25 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
 /// copy to stay in sync with — inherits the caller's turn, and records the
 /// calling thread's tool call as its origin, which is what later lets a rewind
 /// tell this invocation's messages from another invocation's in the same thread.
-fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, UserMessage)> {
+///
+/// A root task normally becomes a user message; when the runtime opened the
+/// turn to report a finished background task, it becomes a notice instead.
+fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, Message)> {
     match body {
         EnvelopeBody::Task {
             message_id,
             task,
             images,
-            author,
+            notice,
         } => Some((
             TurnId::from(*message_id),
-            UserMessage {
-                author: *author,
-                ..UserMessage::with_images(*message_id, task.clone(), images)
+            match notice {
+                Some(outcome) => Message::TaskNotice(TaskNoticeMessage::new(
+                    *message_id,
+                    outcome.clone(),
+                    task.clone(),
+                )),
+                None => Message::User(UserMessage::with_images(*message_id, task.clone(), images)),
             },
         )),
         EnvelopeBody::ToolCall {
@@ -2137,14 +2144,14 @@ fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, UserMessage)> {
             ..
         } => Some((
             *turn_id,
-            UserMessage::from_subagent_call(
+            Message::User(UserMessage::from_subagent_call(
                 MessageId::new(),
                 task.clone(),
                 MessageOrigin {
                     message_id: *parent_message_id,
                     call_id: call_id.clone(),
                 },
-            ),
+            )),
         )),
         EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_) => None,
     }

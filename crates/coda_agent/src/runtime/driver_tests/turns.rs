@@ -29,7 +29,7 @@ fn user_task(to: &ThreadId) -> Envelope {
             message_id: MessageId::new(),
             task: "inspect".into(),
             images: vec![],
-            author: Default::default(),
+            notice: None,
         },
     })
 }

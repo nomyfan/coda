@@ -815,6 +815,7 @@ fn message_row_identity(message: &Message) -> (MessageId, &'static str) {
         Message::Assistant(_) => "assistant",
         Message::Tool(_) => "tool",
         Message::Compaction(_) => "compaction",
+        Message::TaskNotice(_) => "task_notice",
     };
     (message.message_id(), role)
 }

@@ -22,7 +22,7 @@ use coda_agent::{
     runtime::SendCommandError,
 };
 use coda_background::{ArchiveDir, BackgroundProcesses, TaskNotice};
-use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
+use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};
@@ -1013,10 +1013,11 @@ impl SessionHub {
             return false;
         };
         let text = notice.render();
+        let outcome = notice.outcome();
         let message_id = MessageId::new();
         if let Err(err) = live
             .session
-            .send_task_notice(message_id, text.clone())
+            .send_task_notice(message_id, outcome.clone(), text.clone())
             .await
         {
             warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notice: {err}");
@@ -1028,7 +1029,7 @@ impl SessionHub {
         live.turn_running = true;
         live.unsettled_user_message = Some((
             TurnId::from(message_id),
-            Message::User(UserMessage::task_notice(message_id, text)),
+            Message::TaskNotice(TaskNoticeMessage::new(message_id, outcome, text)),
         ));
         true
     }

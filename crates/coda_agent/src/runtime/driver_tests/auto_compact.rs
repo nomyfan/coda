@@ -47,6 +47,7 @@ fn labels<'a>(entries: impl IntoIterator<Item = &'a HistoryEntry>) -> Vec<String
         .into_iter()
         .map(|entry| match &entry.message {
             Message::User(user) => format!("user:{}", user.first_text().unwrap_or_default()),
+            Message::TaskNotice(notice) => format!("task-notice:{}", notice.content),
             Message::Assistant(assistant) if assistant.tool_calls.is_empty() => {
                 format!("assistant:{}", assistant.content)
             }

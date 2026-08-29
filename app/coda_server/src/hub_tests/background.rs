@@ -4,7 +4,6 @@
 use super::super::*;
 use super::fixtures::*;
 use coda_agent::ToolApprovalMode;
-use coda_core::llm::UserAuthor;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -20,9 +19,7 @@ async fn notice_in_view(hub: &SessionHub) -> Option<String> {
             .iter()
             .map(|(_, message)| message);
         live.snapshot.iter().chain(unsettled).find_map(|m| match m {
-            Message::User(u) if u.author == UserAuthor::TaskNotice => {
-                Some(u.first_text().unwrap_or_default().to_string())
-            }
+            Message::TaskNotice(notice) => Some(notice.content.clone()),
             _ => None,
         })
     })

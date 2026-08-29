@@ -303,7 +303,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
-    use coda_core::llm::{MessageId, TurnId, UserMessage};
+    use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
     use coda_core::tool::{ToolCallContext, ToolObject, ToolResult};
 
     use super::*;
@@ -535,7 +535,10 @@ mod tests {
 
         let turn = TurnId::from(MessageId::new());
         agent
-            .add_user_message(turn, UserMessage::text(MessageId::new(), "inspect"))
+            .add_opening_message(
+                turn,
+                Message::User(UserMessage::text(MessageId::new(), "inspect")),
+            )
             .await;
 
         assert_eq!(agent.current_turn().await, Some(turn));

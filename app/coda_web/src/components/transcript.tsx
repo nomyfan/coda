@@ -164,20 +164,27 @@ function turnGroup(entries: TranscriptEntry[]): TranscriptRenderItem {
   };
 }
 
+/** Entries that begin a turn, and so end the preceding one's group. A task
+ * notice is one: the runtime opened a turn with it, exactly as a user message
+ * would have. */
+function opensTurn(entry: TranscriptEntry): boolean {
+  return entry.kind === "user" || entry.kind === "task_notice";
+}
+
 export function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRenderItem[] {
   const items: TranscriptRenderItem[] = [];
   let index = 0;
 
   while (index < entries.length) {
     const entry = entries[index];
-    if (entry.kind === "user") {
+    if (opensTurn(entry)) {
       items.push({ type: "entry", entry });
       index += 1;
       continue;
     }
 
     const start = index;
-    while (index < entries.length && entries[index].kind !== "user") {
+    while (index < entries.length && !opensTurn(entries[index])) {
       index += 1;
     }
 
@@ -343,7 +350,9 @@ export const Transcript = memo(function Transcript({
             {/* Optimistic loading bubble: the turn is running but the backend
              * hasn't streamed its first event yet, so no assistant turn exists
              * to carry the shimmer. Shown from send until the first chunk/tool. */}
-            {running && lastEntry?.kind === "user" ? <PendingTurnBubble /> : null}
+            {running && (lastEntry?.kind === "user" || lastEntry?.kind === "task_notice") ? (
+              <PendingTurnBubble />
+            ) : null}
           </>
         )}
         <div ref={bottomRef} />
@@ -1205,6 +1214,41 @@ const TranscriptItem = memo(function TranscriptItem({
 
   if (entry.kind === "user") {
     return <UserMessageBubble entry={entry} forkable={forkable === true} />;
+  }
+
+  if (entry.kind === "task_notice") {
+    return (
+      <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
+        <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="quiet"
+              size="sm"
+              className="h-auto w-full justify-start gap-2 px-0 py-0 text-left"
+              title={toolResultOpen ? "Hide task output" : "Show task output"}
+            >
+              <SquareTerminal className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="text-xs font-medium">{entry.title}</span>
+              {entry.detail ? (
+                <span className="truncate font-mono text-xs text-muted-foreground">
+                  {entry.detail}
+                </span>
+              ) : null}
+              {toolResultOpen ? (
+                <ChevronDown className="ml-auto size-3.5 shrink-0" />
+              ) : (
+                <ChevronRight className="ml-auto size-3.5 shrink-0" />
+              )}
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
+              {entry.content}
+            </pre>
+          </CollapsibleContent>
+        </div>
+      </Collapsible>
+    );
   }
 
   if (entry.kind === "compaction") {

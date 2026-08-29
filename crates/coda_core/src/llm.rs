@@ -187,30 +187,57 @@ impl MessageOrigin {
     }
 }
 
-/// Who authored a user-role message: the human, or the runtime relaying a
-/// background task's outcome on their behalf.
+/// What a background task did, in the shape a client renders. The status is
+/// already humanized: `coda_core` describes the message, not the task engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskNoticeOutcome {
+    /// The task reached a terminal state.
+    Finished {
+        task_id: String,
+        command: String,
+        /// e.g. "exited with code 0", "killed".
+        status: String,
+    },
+    /// A finished task's retained output was evicted to reclaim space, so it
+    /// can no longer be read back.
+    OutputExpired { task_id: String },
+    /// Several notices were capped into one; `events` counts what it covers.
+    Capped { events: u64 },
+}
+
+/// A record the runtime authored when background work finished.
 ///
-/// A task notice is a user message because that is what opens a turn — the
-/// agent has to be *told* something to act on it — but it is not something the
-/// human said, and clients must not render it as if it were.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UserAuthor {
-    #[default]
-    Human,
-    /// The runtime, delivering a background task's terminal outcome.
-    TaskNotice,
+/// It opens a turn — something has to, or the model would never hear about the
+/// task — and lowers to a plain user message on the way to the provider. It is
+/// kept a message of its own so that everything else can tell it apart from
+/// what a person typed: clients render it as a notice rather than a chat
+/// bubble, it never becomes a session's preview, and a rewind cannot target it
+/// (only the human turns that bracket it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNoticeMessage {
+    pub message_id: MessageId,
+    pub outcome: TaskNoticeOutcome,
+    /// What the model reads.
+    pub content: String,
+    pub created_at: jiff::Timestamp,
+}
+
+impl TaskNoticeMessage {
+    pub fn new(message_id: MessageId, outcome: TaskNoticeOutcome, content: String) -> Self {
+        Self {
+            message_id,
+            outcome,
+            content,
+            created_at: jiff::Timestamp::now(),
+        }
+    }
 }
 
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
     pub message_id: MessageId,
-    /// Who this message is from. `Human` for everything a person typed;
-    /// `TaskNotice` for the ones the runtime injects when background work
-    /// finishes. Defaults so older stored messages read back as human.
-    #[serde(default, skip_serializing_if = "UserAuthor::is_human")]
-    pub author: UserAuthor,
     /// Set on the message that opens a sub-agent thread's work, naming the
     /// parent-thread call that triggered it. `None` for a root user message,
     /// which nothing triggered.
@@ -220,13 +247,6 @@ pub struct UserMessage {
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
     pub created_at: jiff::Timestamp,
-}
-
-impl UserAuthor {
-    /// Serde skip predicate: the default needs no field on the wire.
-    fn is_human(&self) -> bool {
-        matches!(self, UserAuthor::Human)
-    }
 }
 
 impl UserMessage {
@@ -239,7 +259,6 @@ impl UserMessage {
     pub fn text(message_id: MessageId, text: impl Into<String>) -> Self {
         Self {
             message_id,
-            author: UserAuthor::Human,
             origin: None,
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
@@ -275,20 +294,9 @@ impl UserMessage {
         );
         Self {
             message_id,
-            author: UserAuthor::Human,
             origin: None,
             parts,
             created_at: jiff::Timestamp::now(),
-        }
-    }
-
-    /// Construct the message the runtime injects when a background task
-    /// finishes. It opens a turn like any user message, but says plainly who
-    /// wrote it.
-    pub fn task_notice(message_id: MessageId, text: impl Into<String>) -> Self {
-        Self {
-            author: UserAuthor::TaskNotice,
-            ..Self::text(message_id, text)
         }
     }
 
@@ -568,6 +576,9 @@ pub enum Message {
     Tool(ToolMessage),
     /// A record the compaction machinery authored — see [`CompactionMessage`].
     Compaction(CompactionMessage),
+    /// A record the runtime authored when background work finished — see
+    /// [`TaskNoticeMessage`].
+    TaskNotice(TaskNoticeMessage),
 }
 
 impl Message {
@@ -579,6 +590,7 @@ impl Message {
             Message::Assistant(message) => message.message_id,
             Message::Tool(message) => message.message_id,
             Message::Compaction(message) => message.message_id,
+            Message::TaskNotice(message) => message.message_id,
         }
     }
 
@@ -628,6 +640,13 @@ impl From<&Message> for Option<RequestMessage> {
                 ))),
                 CompactionOutcome::Failed => None,
             },
+            // The model is *told* about the task, in the only role a provider
+            // accepts unprompted input in. Reusing the notice's own id costs
+            // nothing: the request vector is discarded after the call.
+            Message::TaskNotice(message) => Some(RequestMessage::User(UserMessage::text(
+                message.message_id,
+                message.content.clone(),
+            ))),
         }
     }
 }

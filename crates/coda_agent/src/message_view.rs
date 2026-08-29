@@ -173,7 +173,10 @@ pub(crate) fn validate_messages<'a>(
                     expected,
                 });
             }
-            Message::User(_) | Message::Assistant(_) | Message::Compaction(_) => {
+            Message::User(_)
+            | Message::Assistant(_)
+            | Message::Compaction(_)
+            | Message::TaskNotice(_) => {
                 finish_batch(&mut batch)?;
             }
         }
