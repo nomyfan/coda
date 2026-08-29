@@ -890,6 +890,31 @@ impl BackgroundProcesses {
         drain_notices(&mut inner)
     }
 
+    /// Wait for detached archive/quota work already in flight to settle, then
+    /// atomically check whether the registry has no running tasks and, if so,
+    /// drain every pending notice. `None` means a task is still running.
+    ///
+    /// The caller must prevent new user operations from starting while this
+    /// runs. The hub does that with the idle entry lock; the remaining writers
+    /// are task monitors and already-registered detached transactions, both of
+    /// which are covered by the barriers and registry mutex below.
+    pub async fn take_notices_if_quiescent(&self) -> Option<Vec<TaskNotice>> {
+        let expirations = match &self.store {
+            Store::Enabled(backend) => {
+                backend.quota.settle().await;
+                backend.archive.settle().await;
+                backend.quota.take_expirations()
+            }
+            Store::Disabled(_) => Vec::new(),
+        };
+        let mut inner = self.inner.lock().await;
+        enqueue_expirations(&mut inner, expirations);
+        if inner.running_count != 0 {
+            return None;
+        }
+        Some(drain_notices(&mut inner))
+    }
+
     /// Live overview of every retained task. Watch semantics: subscribing
     /// yields the current value immediately; every terminal commit and spawn
     /// publishes. Keepalive watchers count `Running` entries here.

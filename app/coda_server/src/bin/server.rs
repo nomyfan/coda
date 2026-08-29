@@ -10,7 +10,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     compaction, runtime::SessionStorage,
 };
-use coda_background::{ArchiveDir, BackgroundProcesses};
+use coda_background::{ArchiveDir, BackgroundProcesses, BackgroundRootLock};
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
 use coda_server::storage::{
@@ -104,9 +104,6 @@ struct AppState {
     /// Process-level session relay: live sessions belong here, not to the
     /// connection that opened them. See `coda_server::hub`.
     relay: Arc<dyn SessionRelay>,
-    /// Root of this run's background task spools; a deleted session's is
-    /// removed from under it.
-    background_root: PathBuf,
     /// Keepalive tuning handed to each new connection's transport.
     keepalive: KeepaliveConfig,
 }
@@ -242,11 +239,9 @@ struct AppOpener {
     providers: HashMap<String, Arc<ProviderHandle>>,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
     /// Where background tasks spool their output, one directory per session
-    /// beneath it. Deliberately under the system temp directory and scoped to
-    /// this run: the output is a convenience for reading a task back, not
-    /// durable history — that lives in the conversation — so it must not
-    /// accumulate across restarts. It outlives a hub entry, though, so unread
-    /// output survives a release and reopen.
+    /// beneath it. The root is stable across process incarnations so unread
+    /// output survives a normal restart; session deletion is its cleanup
+    /// boundary.
     background_root: PathBuf,
 }
 
@@ -345,6 +340,29 @@ impl SessionOpener for AppOpener {
                 .workspaces
                 .get(&key.0)
                 .ok_or_else(|| OpenError::Storage(format!("unknown workspace '{}'", key.0)))?;
+            // Re-assert the session row, under the hub's entry lock this time.
+            // `open_session`'s handler creates it before it ever reaches the
+            // hub — it needs the durable model binding to pick a provider — so
+            // a delete holding the key can remove that row while the open is
+            // still waiting on the tombstone, leaving this runtime live with
+            // nothing to write to. The insert is idempotent, so the ordinary
+            // path pays one no-op statement.
+            let provider = self
+                .providers
+                .get(provider_id)
+                .expect("caller passes a validated provider id");
+            workspace
+                .storage
+                .initialize_session(
+                    &key.1,
+                    SessionModelBinding {
+                        provider_id: provider.provider_id.clone(),
+                        model_id: provider.model_id.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                    },
+                )
+                .await
+                .map_err(|err| OpenError::Storage(err.to_string()))?;
             open_session(
                 &self.providers,
                 workspace,
@@ -362,6 +380,30 @@ impl SessionOpener for AppOpener {
     fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String> {
         let dir = background_dir(&self.background_root, &key.0, &key.1)?;
         ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
+    }
+
+    fn delete_persisted<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+            workspace
+                .storage
+                .delete_session(&key.1)
+                .await
+                .map_err(|error| error.to_string())?;
+            // Only once the session is durably gone: until then its tasks'
+            // output is still worth keeping. Best-effort from here — a spool
+            // left behind costs disk, not correctness, and reporting the delete
+            // as failed would tell the client to expect a session that no
+            // longer exists.
+            remove_background_dir(&self.background_root, &key.0, &key.1);
+            Ok(())
+        })
     }
 
     fn load_messages<'a>(
@@ -1468,12 +1510,24 @@ async fn dispatch_request(
                     .into();
             }
             let key = (params.workspace_id.clone(), params.session_id.clone());
-            // Stop the runtime before removing its files so no checkpoint is
-            // written back after deletion. Refused when another connection is
-            // attached — a stale client must not erase work someone else is
-            // driving (the persisted state stays too).
+            // One barrier, held by the hub: it stops the runtime, closes the
+            // task registry, and removes the stored session and its task spool
+            // before it frees the key — so nothing reopens the session halfway
+            // through. Refused when another connection is attached: a stale
+            // client must not erase work someone else is driving (the persisted
+            // state stays too).
             match app.relay.delete(key.clone(), conn_id).await {
                 DeleteOutcome::Deleted => {}
+                // The runtime is gone but the session is not: it stays in the
+                // catalog, so the client is told rather than shown a delete
+                // that did not happen. Already logged by the hub.
+                DeleteOutcome::Failed(err) => {
+                    return (
+                        id,
+                        RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
+                    )
+                        .into();
+                }
                 DeleteOutcome::NotOwner => {
                     return (
                         id,
@@ -1495,25 +1549,6 @@ async fn dispatch_request(
             // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
             selections.remove(&key);
-            let workspace = app
-                .workspaces
-                .get(&params.workspace_id)
-                .expect("workspace presence checked above");
-            if let Err(err) = workspace.storage.delete_session(&params.session_id).await {
-                warn!(workspace_id = %params.workspace_id, session_id = %params.session_id, "failed to delete session: {err}");
-                return (
-                    id,
-                    RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
-                )
-                    .into();
-            }
-            // Only once the session is durably gone: until then its tasks'
-            // output is still worth keeping.
-            remove_background_dir(
-                &app.background_root,
-                &params.workspace_id,
-                &params.session_id,
-            );
             // The catalog is authoritative only after a durable delete.
             (
                 id,
@@ -2410,6 +2445,15 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let background_root = server_config.background.root.clone();
+    let _background_root_lock = BackgroundRootLock::acquire(&background_root).unwrap_or_else(|e| {
+        eprintln!(
+            "error locking background spool root {}: {e}",
+            background_root.display()
+        );
+        std::process::exit(1);
+    });
+
     // Config guarantees at least one provider with at least one model;
     // the first model is the session default.
     let default_provider = {
@@ -2439,17 +2483,13 @@ async fn main() {
         workspaces.insert(id, Arc::new(state));
     }
 
-    // One spool root per run, named for the process so a crashed predecessor's
-    // leftovers are never adopted. Removed on the way out.
-    let background_root = std::env::temp_dir().join(format!("coda-{}", std::process::id()));
-
     // The relay owns live sessions process-wide; its opener holds its own map
     // clones so it exists independently of `AppState`.
     let relay: Arc<dyn SessionRelay> = Arc::new(SessionHub::new(
         Arc::new(AppOpener {
             providers: providers.clone(),
             workspaces: workspaces.clone(),
-            background_root: background_root.clone(),
+            background_root,
         }),
         server_config.relay,
     ));
@@ -2461,7 +2501,6 @@ async fn main() {
         shutdown: shutdown.clone(),
         workspaces,
         relay,
-        background_root: background_root.clone(),
         keepalive: server_config.keepalive,
     });
 
@@ -2494,14 +2533,6 @@ async fn main() {
     // Stop every live session (graceful, checkpoints on disk) before tearing
     // down the MCP connections their tools may still be using.
     state.relay.shutdown_all().await;
-
-    // Every background task is gone with its session; its spooled output has
-    // no reader left.
-    if let Err(error) = std::fs::remove_dir_all(&background_root)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(path = %background_root.display(), "failed to remove background task spool root: {error}");
-    }
 
     match Arc::try_unwrap(state) {
         Ok(app_state) => {

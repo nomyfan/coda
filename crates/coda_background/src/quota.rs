@@ -527,7 +527,7 @@ impl SessionQuota {
     }
 
     #[cfg(test)]
-    fn pause_next_delete(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    pub(crate) fn pause_next_delete(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *self.delete_pause.lock().unwrap() = Some(DeletePause {

@@ -140,6 +140,68 @@ path = "/tmp/scratch"
             }],
         }]
     );
+    assert_eq!(config.background, BackgroundConfig::default());
+}
+
+#[test]
+fn parse_server_config_resolves_background_root() {
+    let relative = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "spool"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv/coda"),
+    )
+    .unwrap();
+    assert_eq!(relative.background.root, PathBuf::from("/srv/coda/spool"));
+
+    let absolute = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "/var/lib/coda/background"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv/coda"),
+    )
+    .unwrap();
+    assert_eq!(
+        absolute.background.root,
+        PathBuf::from("/var/lib/coda/background")
+    );
+}
+
+#[test]
+fn parse_server_config_expands_background_root_env() {
+    let _env = EnvVarGuard::set("CODA_TEST_BACKGROUND_ROOT", "/mnt/coda-background");
+    let config = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "${{CODA_TEST_BACKGROUND_ROOT}}"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv"),
+    )
+    .unwrap();
+    assert_eq!(
+        config.background.root,
+        PathBuf::from("/mnt/coda-background")
+    );
 }
 
 #[test]

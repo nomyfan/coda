@@ -51,6 +51,25 @@ async fn initial_manifest_failure_removes_partial_task() {
 }
 
 #[tokio::test]
+async fn oversized_initial_manifest_is_rejected_and_rolled_back() {
+    let (_tmp, archive) = root();
+    let id = TaskId::new();
+    let oversized = TaskMeta {
+        command: "x".repeat(MAX_MANIFEST_BYTES as usize),
+        description: "d".into(),
+        agent_name: "coda".into(),
+    };
+
+    let error = match archive.create_unreserved(&id, &oversized).await {
+        Ok(_) => panic!("writer accepted a manifest its reader rejects"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("over the 65536 cap"));
+    assert!(archive.root().open_dir(&id).is_err());
+    assert_eq!(archive.root().entries().unwrap().count(), 0);
+}
+
+#[tokio::test]
 async fn cancelled_manifest_commit_finishes_disk_and_memory_together() {
     let (_tmp, archive) = root();
     let id = TaskId::new();

@@ -1,5 +1,6 @@
 use super::*;
 use crate::DEFAULT_STREAM_CAPACITY;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -188,6 +189,32 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
 }
 
 #[tokio::test]
+async fn oversized_task_metadata_is_rejected_before_work_starts() {
+    let reg = BackgroundProcesses::new();
+    let started = Arc::new(AtomicBool::new(false));
+    let work_started = started.clone();
+    let error = reg
+        .spawn_with(
+            TaskMeta {
+                command: "x".repeat(64 * 1024),
+                description: "too large".into(),
+                agent_name: "coda".into(),
+            },
+            move |_ctx| {
+                work_started.store(true, Ordering::SeqCst);
+                async { TaskExit::Exited { code: Some(0) } }
+            },
+        )
+        .await
+        .expect_err("oversized manifest was accepted");
+    assert!(error.to_string().contains("over the 65536 cap"));
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "work was started before validation"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_waits_for_detached_create_transaction() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
@@ -231,6 +258,103 @@ async fn shutdown_waits_for_detached_create_transaction() {
         .expect("shutdown did not resume after create settled")
         .unwrap();
     assert_eq!(archive.root().entries().unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn quiescent_drain_waits_for_detached_quota_expiration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+    let archive = Arc::new(TaskArchive::new(root));
+    let quota = SessionQuota::from_inventory(
+        &ArchiveInventory::default(),
+        2 * DEFAULT_STREAM_CAPACITY,
+        archive.clone(),
+    );
+    let reg = Arc::new(BackgroundProcesses::with_store(Store::Enabled(Arc::new(
+        Backend {
+            archive,
+            quota: quota.clone(),
+            temp: None,
+        },
+    ))));
+
+    let old = reg
+        .spawn_with(meta("old"), |ctx| async move {
+            ctx.append_stdout(b"unread").await.unwrap();
+            TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
+    let mut summaries = reg.summaries();
+    while running_count(&summaries) != 0 {
+        summaries.changed().await.unwrap();
+    }
+    reg.take_notices().await;
+
+    let (delete_entered, release_delete) = quota.pause_next_delete();
+    let spawn_reg = reg.clone();
+    let spawn = tokio::spawn(async move {
+        spawn_reg
+            .spawn_with(meta("cancelled replacement"), |_ctx| async {
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+    });
+    delete_entered.notified().await;
+    spawn.abort();
+    assert!(matches!(spawn.await, Err(error) if error.is_cancelled()));
+
+    let drain_reg = reg.clone();
+    let mut drain = tokio::spawn(async move { drain_reg.take_notices_if_quiescent().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut drain)
+            .await
+            .is_err(),
+        "quiescent drain returned before detached quota work settled"
+    );
+    release_delete.notify_one();
+    let notices = tokio::time::timeout(Duration::from_secs(2), drain)
+        .await
+        .expect("quiescent drain did not resume")
+        .unwrap()
+        .expect("no task is running");
+    assert!(notices.iter().any(|notice| matches!(
+        notice,
+        TaskNotice::OutputExpired { id, .. } if id == &old
+    )));
+}
+
+#[tokio::test]
+async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+    let reg = BackgroundProcesses::session_backed(root.clone()).await;
+    let id = reg
+        .spawn_with(meta("restart"), |ctx| async move {
+            ctx.append_stdout(b"before restart").await.unwrap();
+            ctx.cancelled().cancelled().await;
+            TaskExit::Killed
+        })
+        .await
+        .unwrap();
+
+    let shutdown_notices = reg.shutdown().await;
+    assert!(shutdown_notices.iter().any(|notice| matches!(
+        notice,
+        TaskNotice::Task { id: notice_id, status: TaskStatus::Killed { .. }, .. }
+            if notice_id == &id
+    )));
+    drop(reg);
+
+    let reopened = BackgroundProcesses::session_backed(root).await;
+    assert!(
+        reopened.take_notices().await.is_empty(),
+        "normal restart unexpectedly replayed a completion notice"
+    );
+    let read = reopened.read(&id).await.unwrap().unwrap();
+    assert!(matches!(read.status, TaskStatus::Killed { .. }));
+    assert_eq!(read.stdout, "before restart");
+    reopened.shutdown().await;
 }
 
 #[tokio::test]

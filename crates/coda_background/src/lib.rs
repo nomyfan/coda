@@ -27,7 +27,7 @@ mod registry;
 mod task_archive;
 mod task_id;
 
-pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName};
+pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, BackgroundRootLock};
 pub use disk_tail::{DiskTail, OutputChunk};
 pub use manifest::{ExpireReason, OutputDisposition, StreamManifest, TaskOutputManifest};
 pub use process::{GroupedChild, PIPE_DRAIN_TIMEOUT};

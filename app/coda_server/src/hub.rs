@@ -237,6 +237,7 @@ pub enum ForkOutcome {
 }
 
 /// Result of [`SessionRelay::delete`].
+#[derive(Clone, Debug)]
 pub enum DeleteOutcome {
     Deleted,
     /// Another connection currently holds the session.
@@ -244,6 +245,10 @@ pub enum DeleteOutcome {
     /// A compaction is running. Deleting would waste the summary and race the
     /// commit; wait it out.
     NotIdle,
+    /// The runtime is gone but the persisted state is still (at least partly)
+    /// there. The session survives and can be reopened, so the client must be
+    /// told this failed rather than shown a catalog it has vanished from.
+    Failed(String),
 }
 
 /// What a compaction wrote to the root thread. Both messages are always
@@ -293,6 +298,18 @@ pub trait SessionOpener: Send + Sync + 'static {
     /// is still readable after the reopen; `Err` disables background work for
     /// the session without otherwise affecting it.
     fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String>;
+
+    /// Remove everything `key` durably owns — its stored session and its
+    /// background task spool.
+    ///
+    /// Called from inside the hub's delete tombstone, with the runtime stopped
+    /// and the task registry closed, so nothing is still writing to either.
+    /// `Err` leaves the session reachable: the caller frees the key regardless,
+    /// and a client that reopens it must find it there.
+    fn delete_persisted<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
     /// Load the persisted conversation history for `key` (empty when none).
     /// Used for the snapshot of approvals-gated opens, where no live session
@@ -421,8 +438,12 @@ pub trait SessionRelay: Send + Sync {
     fn detach_all<'a>(&'a self, conn_id: ConnId) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Stop and remove the session immediately (aborting in-flight work, no
-    /// checkpoint write-back). [`DeleteOutcome::Deleted`] means the runtime is
-    /// gone so the caller can safely delete persisted state.
+    /// checkpoint write-back), *including* everything it persisted — the
+    /// stored session and its background task spool go with it, inside the
+    /// same barrier, so no attach can reopen the key while they are being
+    /// removed. [`DeleteOutcome::Deleted`] means it is all durably gone;
+    /// [`DeleteOutcome::Failed`] means the runtime stopped but the session is
+    /// still there and can be reopened.
     /// [`DeleteOutcome::NotOwner`] is a stale client trying to erase work
     /// another connection is driving (latest-wins). [`DeleteOutcome::NotIdle`]
     /// is a running compaction: the summary is in flight with no lock held, and
@@ -690,8 +711,36 @@ enum EntryPhase {
     Releasing {
         done: watch::Receiver<bool>,
     },
+    /// Delete in progress outside the lock. Like `Releasing`, except the
+    /// barrier reaches past the runtime: the stored session and its task spool
+    /// go too, and `done` only carries an outcome once all of that has happened
+    /// and the map slot is gone. Anyone arriving meanwhile waits here rather
+    /// than opening a session whose rows are on their way out.
+    Deleting {
+        done: watch::Receiver<Option<DeleteOutcome>>,
+    },
     /// Tombstone: this Arc is (about to be) gone from the map; retry there.
     Released,
+}
+
+/// Wait for a delete tombstone to publish its outcome.
+///
+/// A sender dropped without publishing means the delete task died mid-way; the
+/// persisted state is then in an unknown state, which is a failure, not a
+/// silent success.
+async fn await_delete(done: &watch::Receiver<Option<DeleteOutcome>>) -> DeleteOutcome {
+    let mut done = done.clone();
+    loop {
+        // watch carries the value, so a delete that finished before we
+        // subscribed is still observed (no missed wakeup).
+        let current = done.borrow_and_update().clone();
+        if let Some(outcome) = current {
+            return outcome;
+        }
+        if done.changed().await.is_err() {
+            return DeleteOutcome::Failed("the delete did not report an outcome".into());
+        }
+    }
 }
 
 /// What a source session's live state says about forking it.
@@ -769,8 +818,13 @@ impl SessionHub {
         }
     }
 
-    /// Get or insert the entry for `key`, waiting out any in-flight release.
-    /// Returns with the entry lock held and the phase not `Releasing`/`Released`.
+    /// Get or insert the entry for `key`, waiting out any in-flight release or
+    /// delete. Returns with the entry lock held and the phase not
+    /// `Releasing`/`Deleting`/`Released`.
+    ///
+    /// Shared by attach, fork and delete: taking the same gate is what makes
+    /// them serialize on a key none of them found live, since the slot this
+    /// inserts is the only thing they have to lock.
     async fn lock_entry_for_attach(&self, key: &SessionKey) -> (Arc<SessionEntry>, EntryGuard) {
         loop {
             let entry = {
@@ -804,6 +858,15 @@ impl SessionHub {
                             break; // sender dropped == release finished
                         }
                     }
+                }
+                EntryPhase::Deleting { done } => {
+                    let done = done.clone();
+                    drop(guard);
+                    // The delete owns the key until it publishes: waiting here
+                    // is what stops an attach from opening a session whose rows
+                    // and spool are still being removed. Its outcome is not our
+                    // business — loop and take whatever the map holds now.
+                    let _ = await_delete(&done).await;
                 }
                 EntryPhase::Released => {
                     drop(guard);
@@ -865,6 +928,7 @@ impl SessionHub {
             EntryPhase::Live(live) => Some(live.session),
             _ => None,
         };
+        let background = state.background.take();
         // `Closed` is sent before the shutdown below completes; that cannot
         // race a reattach past the checkpoint barrier, because an attach that
         // arrives while the phase is `Releasing` waits for `done` (set only
@@ -896,6 +960,12 @@ impl SessionHub {
                 // once the runtime has already stopped on its own).
                 session.shutdown(mode).await;
             }
+            if let Some(background) = background {
+                // The hub owns injected registries. Runtime shutdown comes
+                // first so no agent can start another task while the registry
+                // closes, kills its process groups, and joins every monitor.
+                let _ = background.shutdown().await;
+            }
             {
                 let mut map = entries.lock().expect("entries mutex poisoned");
                 if map
@@ -911,13 +981,89 @@ impl SessionHub {
         }
     }
 
-    /// Give back the entry a fork took the gate on.
+    /// Transition the entry to `Deleting` and return the whole delete to run
+    /// *outside* the entry lock: stop the runtime, close the task registry,
+    /// remove everything the session persisted, and only then drop the map slot
+    /// and publish the outcome.
     ///
-    /// When the fork created it, the slot has to go — but a tombstone comes
+    /// The tombstone is the point. Stopping the runtime and deleting what it
+    /// wrote are one transaction, and it used to be split across two callers:
+    /// the hub freed the key as soon as the runtime was down, leaving an attach
+    /// free to open the session again while its rows and its task spool were
+    /// still being removed underneath it. Holding the entry across the whole
+    /// thing closes that window — including for a key nothing was live on,
+    /// which is why the caller borrows a slot to put this in.
+    fn begin_delete(
+        &self,
+        entry: &Arc<SessionEntry>,
+        state: &mut EntryState,
+    ) -> impl Future<Output = DeleteOutcome> + Send + 'static {
+        let (done_tx, done_rx) = watch::channel(None);
+        if let Some(watcher) = state.notice_watcher.take() {
+            watcher.abort();
+        }
+        let phase = std::mem::replace(&mut state.phase, EntryPhase::Deleting { done: done_rx });
+        let session = match phase {
+            EntryPhase::Live(live) => Some(live.session),
+            _ => None,
+        };
+        let background = state.background.take();
+        let entries = self.entries.clone();
+        let opener = self.opener.clone();
+        let entry = entry.clone();
+        async move {
+            if let Some(session) = session {
+                // Abort rather than graceful: a turn still in flight gets cut
+                // off instead of finishing, so no checkpoint is written back
+                // after the rows it belongs to are gone.
+                session.shutdown(Shutdown::abort()).await;
+            }
+            if let Some(background) = background {
+                // Runtime first, then the registry the hub owns: no agent can
+                // start another task while it kills its process groups and
+                // joins every monitor. Both are done before anything on disk
+                // goes, so nothing is still writing into what we remove.
+                let _ = background.shutdown().await;
+            }
+            let outcome = match opener.delete_persisted(&entry.key).await {
+                Ok(()) => DeleteOutcome::Deleted,
+                Err(error) => {
+                    warn!(
+                        workspace_id = %entry.key.0,
+                        session_id = %entry.key.1,
+                        "failed to delete persisted session state: {error}"
+                    );
+                    // The session is still there, so the slot has to be freed
+                    // either way — a client that reopens it must be served, not
+                    // parked on a tombstone nothing will ever lift.
+                    DeleteOutcome::Failed(error)
+                }
+            };
+            {
+                let mut map = entries.lock().expect("entries mutex poisoned");
+                if map
+                    .get(&entry.key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    map.remove(&entry.key);
+                }
+            }
+            entry.inner.lock().await.phase = EntryPhase::Released;
+            let _ = done_tx.send(Some(outcome.clone()));
+            if matches!(outcome, DeleteOutcome::Deleted) {
+                info!(workspace_id = %entry.key.0, session_id = %entry.key.1, "session deleted");
+            }
+            outcome
+        }
+    }
+
+    /// Give back the entry a fork or a refused delete took the gate on.
+    ///
+    /// When the caller created it, the slot has to go — but a tombstone comes
     /// first: an attach may already hold this `Arc` and be blocked on the mutex,
     /// and seeing `Released` sends it back to the map for a fresh slot instead of
     /// opening a runtime on an entry nothing can look up.
-    fn leave_fork_gate(
+    fn leave_entry_gate(
         entries: &Entries,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
@@ -938,7 +1084,7 @@ impl SessionHub {
 
     /// Release the entry when nothing keeps it alive: no attached client and
     /// no running turn. Returns the outside-the-lock work, if any.
-    fn maybe_release(
+    async fn maybe_release(
         entries: &Entries,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
@@ -946,32 +1092,36 @@ impl SessionHub {
         if state.attached.is_some() || state.compacting {
             return None;
         }
-        // Background work keeps the session alive on its own: a running task
-        // has a completion to report, and a notice already in hand has one to
-        // deliver. Releasing here would either orphan the task or drop what it
-        // had to say — and since the registry enqueues a notice *before* the
-        // running count drops, a task that just finished is always visible as
-        // one or the other, never as neither.
-        if !state.pending_notices.is_empty() {
-            return None;
-        }
-        if let Some(background) = &state.background
-            && background
-                .summaries()
-                .borrow()
-                .iter()
-                .any(|t| t.status.is_running())
-        {
-            return None;
-        }
         let idle = match &state.phase {
             EntryPhase::Live(live) => !live.turn_running,
             EntryPhase::Pending(_) => true,
             _ => false,
         };
-        idle.then(|| {
-            Self::begin_release(entries, entry, state, Shutdown::graceful_unbounded(), false)
-        })
+        if !idle {
+            return None;
+        }
+        // Background work keeps the session alive on its own: a running task
+        // has a completion to report, and a notice already in hand has one to
+        // deliver. The registry check also waits out detached archive/quota
+        // work, which can stage an expiration after its original waiter was
+        // cancelled.
+        if !state.pending_notices.is_empty() {
+            return None;
+        }
+        if let Some(background) = state.background.clone() {
+            let fresh = background.take_notices_if_quiescent().await?;
+            state.pending_notices.extend(fresh);
+            if !state.pending_notices.is_empty() {
+                return None;
+            }
+        }
+        Some(Self::begin_release(
+            entries,
+            entry,
+            state,
+            Shutdown::graceful_unbounded(),
+            false,
+        ))
     }
 
     /// The entry's task registry, created on first use by whichever attach
@@ -1252,7 +1402,7 @@ impl SessionHub {
         push_snapshot(&guard);
         // The client may have disconnected during the round-trip, and the
         // release that would normally follow was held off by `compacting`.
-        if let Some(release) = Self::maybe_release(&self.entries, entry, &mut guard) {
+        if let Some(release) = Self::maybe_release(&self.entries, entry, &mut guard).await {
             drop(guard);
             tokio::spawn(release);
         }
@@ -1265,17 +1415,9 @@ impl SessionHub {
     /// failures a rewind can hit *after* its truncation has committed — the
     /// client's view is stale from that moment on, and a fresh attach is the
     /// same route a crash would have forced anyway.
-    fn abandon(entries: &Entries, key: &SessionKey, state: &mut EntryState) {
-        if let Some(attachment) = state.attached.take() {
-            let _ = attachment.tx.send(RelayEvent::Closed);
-        }
-        let phase = std::mem::replace(&mut state.phase, EntryPhase::Released);
-        entries.lock().expect("entries mutex poisoned").remove(key);
-        if let EntryPhase::Live(live) = phase {
-            tokio::spawn(async move {
-                live.session.shutdown(Shutdown::abort()).await;
-            });
-        }
+    fn abandon(entries: &Entries, entry: &Arc<SessionEntry>, state: &mut EntryState) {
+        let release = Self::begin_release(entries, entry, state, Shutdown::abort(), true);
+        tokio::spawn(release);
     }
 
     /// Discard the target message and everything after it, then start the
@@ -1343,7 +1485,7 @@ impl SessionHub {
         {
             Ok(session) => session,
             Err(err) => {
-                Self::abandon(&self.entries, key, state);
+                Self::abandon(&self.entries, entry, state);
                 return CommandOutcome::OpenFailed(err);
             }
         };
@@ -1386,7 +1528,7 @@ impl SessionHub {
                     session_id = %key.1,
                     "rewind truncated the session but its replacement turn could not start"
                 );
-                Self::abandon(&self.entries, key, state);
+                Self::abandon(&self.entries, entry, state);
                 CommandOutcome::RewindNotStarted
             }
         }
@@ -1455,11 +1597,7 @@ impl SessionHub {
                     Err(err) => {
                         // Match the previous behavior: the gated open is
                         // dropped; a fresh OpenSession retries from scratch.
-                        state.phase = EntryPhase::Released;
-                        self.entries
-                            .lock()
-                            .expect("entries mutex poisoned")
-                            .remove(key);
+                        Self::abandon(&self.entries, entry, state);
                         CommandOutcome::OpenFailed(err)
                     }
                 }
@@ -1636,12 +1774,9 @@ impl SessionRelay for SessionHub {
                         });
                     }
                     Err(err) => {
-                        // Don't wedge the key: drop the half-built entry.
-                        state.phase = EntryPhase::Released;
-                        self.entries
-                            .lock()
-                            .expect("entries mutex poisoned")
-                            .remove(&key);
+                        // Don't wedge the key: close the half-built registry
+                        // before a fresh attach reopens this archive.
+                        Self::abandon(&self.entries, &entry, state);
                         return Err(AttachError::Open(err));
                     }
                 }
@@ -1775,7 +1910,7 @@ impl SessionRelay for SessionHub {
             {
                 state.attached = None;
             }
-            if let Some(release) = Self::maybe_release(&self.entries, &entry, state) {
+            if let Some(release) = Self::maybe_release(&self.entries, &entry, state).await {
                 drop(guard);
                 tokio::spawn(release);
             }
@@ -1803,10 +1938,12 @@ impl SessionRelay for SessionHub {
         conn_id: ConnId,
     ) -> Pin<Box<dyn Future<Output = DeleteOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let Some(entry) = self.get_entry(&key) else {
-                return DeleteOutcome::Deleted; // nothing live; persisted state is free to go
-            };
-            let mut guard = entry.inner.clone().lock_owned().await;
+            // The same gate attach takes, so a delete and an open of the same
+            // key serialize even when neither found anything live — the slot
+            // this borrows is the only thing either of them can lock, and it is
+            // where the delete tombstone goes.
+            let (entry, mut guard) = self.lock_entry_for_attach(&key).await;
+            let borrowed = matches!(guard.phase, EntryPhase::Uninitialized);
             let state = &mut *guard;
             // Latest-wins also covers destruction: only the attached client
             // (or anyone, when nobody is attached) may delete a live session.
@@ -1820,40 +1957,21 @@ impl SessionRelay for SessionHub {
                     session_id = %key.1,
                     "rejecting delete from a connection that is not attached"
                 );
+                Self::leave_entry_gate(&self.entries, &entry, state, borrowed);
                 return DeleteOutcome::NotOwner;
             }
             if state.compacting {
+                Self::leave_entry_gate(&self.entries, &entry, state, borrowed);
                 return DeleteOutcome::NotIdle;
-            }
-            if matches!(
-                state.phase,
-                EntryPhase::Releasing { .. } | EntryPhase::Released
-            ) {
-                // Already going away; the caller only needs the runtime gone,
-                // and the release path guarantees that shortly. Wait it out.
-                if let EntryPhase::Releasing { done } = &state.phase {
-                    let mut done = done.clone();
-                    drop(guard);
-                    while !*done.borrow_and_update() {
-                        if done.changed().await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                return DeleteOutcome::Deleted;
             }
             if let Some(attachment) = state.attached.take() {
                 let _ = attachment.tx.send(RelayEvent::Evicted);
             }
-            // Abort rather than graceful: a turn still in flight gets cut off
-            // instead of finishing, so nothing new is added to history before
-            // the caller deletes the persisted directory right after.
-            let release =
-                Self::begin_release(&self.entries, &entry, state, Shutdown::abort(), false);
+            let delete = self.begin_delete(&entry, state);
             drop(guard);
-            // Inline: the caller deletes persisted state right after.
-            release.await;
-            DeleteOutcome::Deleted
+            // Inline: this returning is what tells the caller the session is
+            // durably gone (or why it is not).
+            delete.await
         })
     }
 
@@ -1889,7 +2007,7 @@ impl SessionRelay for SessionHub {
                 ForkGate::Ready => ForkSource::Live,
                 ForkGate::Cold => ForkSource::Cold,
                 ForkGate::Busy => {
-                    Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
+                    Self::leave_entry_gate(&self.entries, &entry, &mut guard, borrowed);
                     return ForkOutcome::NotIdle;
                 }
             };
@@ -1899,7 +2017,7 @@ impl SessionRelay for SessionHub {
             };
 
             let forked = self.opener.fork(&source, cut, source_state).await;
-            Self::leave_fork_gate(&self.entries, &entry, &mut guard, borrowed);
+            Self::leave_entry_gate(&self.entries, &entry, &mut guard, borrowed);
 
             match forked {
                 Ok(forked) => ForkOutcome::Forked(forked),
@@ -1946,9 +2064,28 @@ impl SessionRelay for SessionHub {
             for entry in entries {
                 let mut guard = entry.inner.clone().lock_owned().await;
                 let state = &mut *guard;
+                if let EntryPhase::Releasing { done } = &state.phase {
+                    let mut done = done.clone();
+                    drop(guard);
+                    while !*done.borrow_and_update() {
+                        if done.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if let EntryPhase::Deleting { done } = &state.phase {
+                    // Same reason as `Releasing`: the process must not exit
+                    // while a delete is still killing process groups and
+                    // removing files.
+                    let done = done.clone();
+                    drop(guard);
+                    let _ = await_delete(&done).await;
+                    continue;
+                }
                 if matches!(
                     state.phase,
-                    EntryPhase::Releasing { .. } | EntryPhase::Released | EntryPhase::Uninitialized
+                    EntryPhase::Released | EntryPhase::Uninitialized
                 ) {
                     continue;
                 }
@@ -2121,7 +2258,9 @@ fn spawn_notice_watcher(
                 let mut guard = entry.inner.clone().lock_owned().await;
                 if matches!(
                     guard.phase,
-                    EntryPhase::Releasing { .. } | EntryPhase::Released
+                    EntryPhase::Releasing { .. }
+                        | EntryPhase::Deleting { .. }
+                        | EntryPhase::Released
                 ) {
                     return;
                 }
@@ -2131,7 +2270,8 @@ fn spawn_notice_watcher(
                         .send(RelayEvent::BackgroundTasks(current_tasks(&guard)));
                 }
                 SessionHub::deliver_pending_notices(&mut guard, &entry.key).await;
-                if let Some(release) = SessionHub::maybe_release(&entries, &entry, &mut guard) {
+                if let Some(release) = SessionHub::maybe_release(&entries, &entry, &mut guard).await
+                {
                     drop(guard);
                     release.await;
                     return;
@@ -2318,7 +2458,8 @@ async fn run_forwarder(
                             outcome,
                         });
                     }
-                    if let Some(release) = SessionHub::maybe_release(&entries, &entry, state) {
+                    if let Some(release) = SessionHub::maybe_release(&entries, &entry, state).await
+                    {
                         drop(guard);
                         release.await;
                         return;

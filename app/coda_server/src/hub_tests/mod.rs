@@ -3,6 +3,7 @@ mod fixtures;
 mod approval;
 mod background;
 mod compaction;
+mod delete;
 mod event_log;
 mod forking;
 mod permission_mode;

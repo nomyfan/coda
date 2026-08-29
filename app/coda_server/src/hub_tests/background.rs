@@ -78,7 +78,257 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
     // its await yet, and a notification with nobody registered is simply lost.
     release.notify_one();
     wait_released(&hub).await;
+    assert!(
+        background
+            .spawn_with(task_meta("too late"), |_ctx| async {
+                coda_background::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err(),
+        "detach release left the external registry open"
+    );
     hub.shutdown_all().await;
+}
+
+/// A completion can publish while the notice watcher is blocked on the entry
+/// lock. The release check itself must take the registry notice before it
+/// trusts the zero running count.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_check_cannot_overtake_a_published_completion_notice() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _events = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .expect("attach");
+    let background = background_of(&hub).await;
+    let finish = Arc::new(Notify::new());
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("race"), move |_ctx| async move {
+            task_finish.notified().await;
+            coda_background::TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
+
+    let entry = hub.get_entry(&key()).unwrap();
+    let mut guard = entry.inner.clone().lock_owned().await;
+    guard.attached = None;
+    let mut summaries = background.summaries();
+    finish.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while summaries
+            .borrow_and_update()
+            .iter()
+            .any(|task| task.status.is_running())
+        {
+            summaries.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("task did not settle");
+
+    assert!(
+        SessionHub::maybe_release(&hub.entries, &entry, &mut guard)
+            .await
+            .is_none(),
+        "release overtook the watcher and dropped the completion"
+    );
+    assert_eq!(guard.pending_notices.len(), 1);
+    drop(guard);
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let hub = Arc::new(hub);
+    let _events = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let background = background_of(&hub).await;
+    let cancelled = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let task_cancelled = cancelled.clone();
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("held shutdown"), move |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            task_cancelled.notify_one();
+            task_finish.notified().await;
+            coda_background::TaskExit::Killed
+        })
+        .await
+        .unwrap();
+
+    let shutdown_hub = hub.clone();
+    let mut shutdown = tokio::spawn(async move { shutdown_hub.shutdown_all().await });
+    timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("registry shutdown did not cancel the task");
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "map entry removed too early"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown_all returned before the monitor joined"
+    );
+    finish.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown_all did not finish")
+        .unwrap();
+    assert!(hub.get_entry(&key()).is_none());
+    assert!(
+        background
+            .spawn_with(task_meta("too late"), |_ctx| async {
+                coda_background::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_all_waits_for_an_in_flight_delete() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let hub = Arc::new(hub);
+    let _events = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let background = background_of(&hub).await;
+    let cancelled = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let task_cancelled = cancelled.clone();
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("delete barrier"), move |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            task_cancelled.notify_one();
+            task_finish.notified().await;
+            coda_background::TaskExit::Killed
+        })
+        .await
+        .unwrap();
+
+    let delete_hub = hub.clone();
+    let delete = tokio::spawn(async move { delete_hub.delete(key(), 1).await });
+    timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("delete did not enter registry shutdown");
+    let shutdown_hub = hub.clone();
+    let mut shutdown = tokio::spawn(async move { shutdown_hub.shutdown_all().await });
+    assert!(
+        timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown_all skipped an entry with a delete in flight"
+    );
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "map entry removed too early"
+    );
+
+    finish.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(5), delete)
+            .await
+            .expect("delete did not finish")
+            .unwrap(),
+        DeleteOutcome::Deleted
+    ));
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown_all did not observe release completion")
+        .unwrap();
+    assert!(hub.get_entry(&key()).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_ended_release_closes_the_external_registry_before_map_removal() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _events = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let background = background_of(&hub).await;
+    let entry = hub.get_entry(&key()).unwrap();
+    let generation = with_live(&hub, |live| live.generation).await;
+    let cancelled = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let task_cancelled = cancelled.clone();
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("stream end"), move |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            task_cancelled.notify_one();
+            task_finish.notified().await;
+            coda_background::TaskExit::Killed
+        })
+        .await
+        .unwrap();
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(tx);
+    tokio::spawn(run_forwarder(
+        hub.entries.clone(),
+        entry,
+        rx,
+        "coda".into(),
+        generation,
+        hub.opener.clone(),
+        hub.status_tx.clone(),
+    ));
+    timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("stream-ended release did not close the registry");
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "map entry removed too early"
+    );
+    finish.notify_one();
+    wait_released(&hub).await;
+    assert!(
+        background
+            .spawn_with(task_meta("too late"), |_ctx| async {
+                coda_background::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err()
+    );
 }
 
 /// A task that finishes gets the model's attention on its own: the notice

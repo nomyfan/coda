@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Stat};
+use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat};
 use rustix::io::Errno;
 use rustix::process::geteuid;
 
@@ -105,6 +105,15 @@ pub enum EntryKind {
 #[derive(Clone)]
 pub struct ArchiveDir {
     fd: Arc<OwnedFd>,
+}
+
+/// Process-wide ownership of a background spool root. The verified directory
+/// capability and locked file descriptor stay alive together; dropping this
+/// value releases the kernel lock but deliberately leaves `.lock` in place so
+/// every process incarnation locks the same inode.
+pub struct BackgroundRootLock {
+    _root: ArchiveDir,
+    _lock: OwnedFd,
 }
 
 fn dir_oflags() -> OFlags {
@@ -214,6 +223,68 @@ impl ArchiveDir {
     }
 }
 
+impl BackgroundRootLock {
+    /// Safely create or strictly open a background spool root, then acquire a
+    /// non-blocking exclusive lock on its fd-relative `.lock` file.
+    ///
+    /// A newly-created leaf is requested as `0700` (umask can only make it
+    /// narrower), then tightened and verified. An existing leaf must already
+    /// be an owned `0700` directory; it is never silently repaired. The lock
+    /// file follows the same rule at `0600`, and neither path follows symlinks.
+    pub fn acquire(path: &Path) -> Result<Self, ArchiveError> {
+        let parent = path.parent().ok_or_else(|| {
+            ArchiveError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background root has no parent directory",
+            ))
+        })?;
+        std::fs::create_dir_all(parent)?;
+
+        let created = match fs::mkdir(path, Mode::from_raw_mode(0o700)) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(error) => return Err(error.into()),
+        };
+        let fd = fs::open(path, dir_oflags(), Mode::empty())?;
+        verify_dir(&fd)?;
+        if created {
+            fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
+        }
+        verify_mode(&fd, 0o700)?;
+        let root = ArchiveDir { fd: Arc::new(fd) };
+
+        let create_flags =
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let (lock, lock_created) = match fs::openat(
+            root.fd.as_fd(),
+            ".lock",
+            create_flags,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => (fd, true),
+            Err(Errno::EXIST) => {
+                let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                (
+                    fs::openat(root.fd.as_fd(), ".lock", flags, Mode::empty())?,
+                    false,
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        verify_regular(&lock)?;
+        if lock_created {
+            fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
+        }
+        verify_mode(&lock, 0o600)?;
+        fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
+
+        Ok(Self {
+            _root: root,
+            _lock: lock,
+        })
+    }
+}
+
 /// Streaming directory iterator. `rustix::fs::Dir` owns an independent fd
 /// (dup'd from ours internally) and closes it on drop.
 pub struct ArchiveEntries {
@@ -285,14 +356,135 @@ fn verify_mode<Fd: AsFd>(fd: Fd, expected: RawMode) -> Result<(), ArchiveError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     fn temp_root() -> (tempfile::TempDir, ArchiveDir) {
         let dir = tempfile::tempdir().unwrap();
         let root = ArchiveDir::open_or_create_root(&dir.path().join("background/tasks")).unwrap();
         (dir, root)
+    }
+
+    #[test]
+    fn background_root_lock_creates_strict_root_and_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("background");
+        let lock = BackgroundRootLock::acquire(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(path.join(".lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(lock);
+        assert!(path.join(".lock").is_file(), "lock inode stays stable");
+    }
+
+    #[test]
+    fn background_root_lock_rejects_unsafe_root_and_lock_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let wrong_mode = tmp.path().join("wrong-mode");
+        std::fs::create_dir(&wrong_mode).unwrap();
+        std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            BackgroundRootLock::acquire(&wrong_mode),
+            Err(ArchiveError::Corrupt(_))
+        ));
+
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let linked_root = tmp.path().join("linked-root");
+        symlink(&target, &linked_root).unwrap();
+        assert!(BackgroundRootLock::acquire(&linked_root).is_err());
+
+        let linked_lock_root = tmp.path().join("linked-lock-root");
+        std::fs::create_dir(&linked_lock_root).unwrap();
+        std::fs::set_permissions(&linked_lock_root, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let outside = tmp.path().join("outside-lock");
+        std::fs::File::create(&outside).unwrap();
+        symlink(&outside, linked_lock_root.join(".lock")).unwrap();
+        assert!(BackgroundRootLock::acquire(&linked_lock_root).is_err());
+
+        let directory_lock_root = tmp.path().join("directory-lock-root");
+        std::fs::create_dir(&directory_lock_root).unwrap();
+        std::fs::set_permissions(&directory_lock_root, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::create_dir(directory_lock_root.join(".lock")).unwrap();
+        assert!(BackgroundRootLock::acquire(&directory_lock_root).is_err());
+
+        let wide_lock_root = tmp.path().join("wide-lock-root");
+        std::fs::create_dir(&wide_lock_root).unwrap();
+        std::fs::set_permissions(&wide_lock_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wide_lock = wide_lock_root.join(".lock");
+        std::fs::File::create(&wide_lock).unwrap();
+        std::fs::set_permissions(&wide_lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            BackgroundRootLock::acquire(&wide_lock_root),
+            Err(ArchiveError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn background_root_lock_child_helper() {
+        let Some(root) = std::env::var_os("CODA_BACKGROUND_LOCK_CHILD_ROOT") else {
+            return;
+        };
+        let _lock = BackgroundRootLock::acquire(Path::new(&root)).unwrap();
+        println!("CODA_BACKGROUND_LOCK_READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn background_root_lock_is_exclusive_across_processes_and_released_on_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("background");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "archive_dir::tests::background_root_lock_child_helper",
+                "--nocapture",
+            ])
+            .env("CODA_BACKGROUND_LOCK_CHILD_ROOT", &root)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("CODA_BACKGROUND_LOCK_READY") {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("child did not acquire the background root lock");
+
+        assert!(
+            BackgroundRootLock::acquire(&root).is_err(),
+            "a second process acquired the same root"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        BackgroundRootLock::acquire(&root)
+            .expect("kernel did not release the lock when the child exited");
     }
 
     #[test]

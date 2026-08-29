@@ -119,11 +119,28 @@ pub struct DatabaseConfig {
     pub url: String,
 }
 
+/// Stable root for session-owned background task output. A fixed temp path is
+/// enough to survive a normal server restart; deployments that need stronger
+/// durability can override it with `[background].root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundConfig {
+    pub root: PathBuf,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            root: std::env::temp_dir().join("coda-background"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
     pub database: DatabaseConfig,
+    pub background: BackgroundConfig,
     pub relay: RelayConfig,
     pub keepalive: KeepaliveConfig,
 }
@@ -141,6 +158,7 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let providers = parse_providers(&doc)?;
     let workspaces = parse_workspaces(&doc, base_dir)?;
     let database = parse_database(&doc)?;
+    let background = parse_background(&doc, base_dir)?;
     let relay = parse_relay(&doc)?;
     let keepalive = parse_keepalive(&doc)?;
 
@@ -148,8 +166,33 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
         providers,
         workspaces,
         database,
+        background,
         relay,
         keepalive,
+    })
+}
+
+/// Parse optional durable background output storage. Relative overrides use
+/// the same config-directory base as workspace paths.
+fn parse_background(
+    doc: &toml_edit::DocumentMut,
+    base_dir: &Path,
+) -> Result<BackgroundConfig, ConfigError> {
+    let Some(item) = doc.get("background") else {
+        return Ok(BackgroundConfig::default());
+    };
+    let table = item.as_table().ok_or_else(|| {
+        ConfigError::Parse("background must be a table with an optional root string".to_string())
+    })?;
+    let Some(root) = table.get("root") else {
+        return Ok(BackgroundConfig::default());
+    };
+    let raw = root
+        .as_str()
+        .ok_or_else(|| ConfigError::Parse("background root must be a string".to_string()))?;
+    let expanded = expand_env(raw)?;
+    Ok(BackgroundConfig {
+        root: resolve_workspace_path(base_dir, &expanded),
     })
 }
 

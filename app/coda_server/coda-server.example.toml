@@ -44,6 +44,15 @@ models = [
 [database]
 url = "${DATABASE_URL}"
 
+# --- Background task output -------------------------------------------------
+# Optional. The default is a stable `coda-background` directory beneath the
+# system temp directory. Set this to a persistent local volume if output must
+# survive host reboots or temp-directory cleanup. One server process may own a
+# root at a time; startup fails while another process holds its lock.
+
+# [background]
+# root = "/var/lib/coda/background"
+
 [[workspaces]]
 id = "coda"
 path = "/path/to/coda"

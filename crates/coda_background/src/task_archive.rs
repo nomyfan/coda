@@ -873,6 +873,12 @@ pub(crate) fn validate_manifest(
 fn save_manifest(task_dir: &ArchiveDir, manifest: &TaskOutputManifest) -> Result<(), ArchiveError> {
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|e| ArchiveError::corrupt(format!("manifest serialize error: {e}")))?;
+    if json.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(ArchiveError::corrupt(format!(
+            "meta.json is {} bytes, over the {MAX_MANIFEST_BYTES} cap",
+            json.len()
+        )));
+    }
     // Clear any crash-leftover temp before O_EXCL create.
     task_dir.unlink(ArchiveFileName::MetaTmp)?;
     let mut file = task_dir.create_file(ArchiveFileName::MetaTmp)?;

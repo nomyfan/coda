@@ -355,6 +355,22 @@ pub(super) struct TestOpener {
     pub(super) mark_unseen_entered: Arc<Notify>,
     /// Effectively disabled by default; lowered by tests that need it.
     pub(super) auto_compact_threshold_tokens: u32,
+    /// Holds `delete_persisted` until released, so a test can drive an attach
+    /// while the delete tombstone is still standing.
+    pub(super) delete_gate: Option<Arc<Notify>>,
+    /// Notified as soon as `delete_persisted` is entered, before it waits on
+    /// `delete_gate` — a rendezvous point for tests.
+    pub(super) delete_entered: Arc<Notify>,
+    /// What `delete_persisted` reports; `Some` makes it fail, leaving the
+    /// session behind for a later attach to reopen.
+    pub(super) delete_error: Option<String>,
+    /// The keys `delete_persisted` was asked for, in order.
+    pub(super) deleted: Arc<std::sync::Mutex<Vec<SessionKey>>>,
+    /// `"open"` / `"delete_persisted"` in call order. Opening a session is
+    /// where the real opener (re-)creates its stored row, so the order of these
+    /// two is what says whether a delete can pull that row out from under a
+    /// session that is already live.
+    pub(super) calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl TestOpener {
@@ -440,6 +456,11 @@ impl TestOpener {
             mark_unseen_gate: None,
             mark_unseen_entered: Arc::new(Notify::new()),
             auto_compact_threshold_tokens: u32::MAX,
+            delete_gate: None,
+            delete_entered: Arc::new(Notify::new()),
+            delete_error: None,
+            deleted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -461,6 +482,10 @@ impl SessionOpener for TestOpener {
         background: Arc<coda_background::BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push("open");
             self.opened_modes
                 .lock()
                 .unwrap()
@@ -498,6 +523,40 @@ impl SessionOpener for TestOpener {
     fn background_archive(&self, key: &SessionKey) -> Result<coda_background::ArchiveDir, String> {
         let dir = self.background_root.path().join(&key.0).join(&key.1);
         coda_background::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
+    }
+
+    /// Stands in for the SQL delete plus the spool removal. `MemoryStorage`
+    /// has no delete, so the stored conversation is left alone — what these
+    /// tests are about is *when* this runs relative to attach, not what SQL it
+    /// spells. The spool is real, so a test can see that it is gone.
+    fn delete_persisted<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push("delete_persisted");
+            self.delete_entered.notify_one();
+            if let Some(gate) = &self.delete_gate {
+                gate.notified().await;
+            }
+            self.deleted
+                .lock()
+                .expect("deleted mutex poisoned")
+                .push(key.clone());
+            if let Some(error) = &self.delete_error {
+                return Err(error.clone());
+            }
+            let dir = self.background_root.path().join(&key.0).join(&key.1);
+            if let Err(error) = std::fs::remove_dir_all(&dir)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error.to_string());
+            }
+            Ok(())
+        })
     }
 
     fn load_messages<'a>(
@@ -750,6 +809,12 @@ pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_background::Back
         .background
         .clone()
         .expect("an initialized entry has a registry")
+}
+
+/// Where `key`'s background tasks spool under this opener's root. Tests use it
+/// to watch a delete reach disk.
+pub(super) fn spool_dir(opener: &TestOpener, key: &SessionKey) -> std::path::PathBuf {
+    opener.background_root.path().join(&key.0).join(&key.1)
 }
 
 /// Metadata for a test task.
