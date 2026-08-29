@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use coda_background::{BackgroundProcesses, TaskMeta};
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::debug;
@@ -17,28 +19,64 @@ pub struct ShellToolParams {
     /// A short (5-10 word) description of what this command does, in active
     /// voice. For example: "List files in the current directory".
     description: String,
+    /// Run the command as a background task: the call returns immediately
+    /// with a task id, and the command is not subject to the 2-minute
+    /// timeout. Use task_output to read its output incrementally and
+    /// task_kill to terminate it. Use this for long-running commands (dev
+    /// servers, watchers, long builds).
+    #[serde(default)]
+    run_in_background: Option<bool>,
 }
 
 pub struct ShellTool {
-    schema: Schema,
+    schema: serde_json::Value,
     description: String,
     cwd: String,
+    agent_name: String,
     timeout: Duration,
+    background: Arc<BackgroundProcesses>,
+    /// Only when true does `run_in_background` appear in the schema (and take
+    /// effect — the flag is ignored for agents not granted it).
+    allow_background: bool,
 }
 
 impl ShellTool {
-    pub fn new(cwd: String) -> Self {
-        let description = "Execute Bash commands and return stdout and stderr. Commands have a \
-                           fixed 2-minute timeout."
-            .to_string();
-        let schema = schemars::schema_for!(ShellToolParams);
+    pub fn new(
+        cwd: String,
+        agent_name: String,
+        background: Arc<BackgroundProcesses>,
+        allow_background: bool,
+    ) -> Self {
+        // Backgrounding is how a command escapes the timeout, so the two are
+        // described together — but only to an agent that can actually follow
+        // a task up.
+        let description = if allow_background {
+            "Execute Bash commands and return stdout and stderr. Commands have a \
+             fixed 2-minute timeout; run anything that may outlast it as a \
+             background task instead of splitting or truncating it."
+        } else {
+            "Execute Bash commands and return stdout and stderr. Commands have a \
+             fixed 2-minute timeout."
+        }
+        .to_string();
+
+        let mut schema = serde_json::to_value(schemars::schema_for!(ShellToolParams))
+            .expect("shell schema serializes");
+        if !allow_background
+            && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+        {
+            props.remove("run_in_background");
+        }
         debug!("ShellTool schema: {:?}", schema);
 
         ShellTool {
             schema,
             description,
             cwd,
+            agent_name,
             timeout: SHELL_TIMEOUT,
+            background,
+            allow_background,
         }
     }
 }
@@ -56,7 +94,7 @@ impl Tool for ShellTool {
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
-        self.schema.as_value()
+        &self.schema
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -66,12 +104,49 @@ impl Tool for ShellTool {
         ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let cwd = self.cwd.clone();
+        let agent_name = self.agent_name.clone();
         let timeout = self.timeout;
+        let background = self.background.clone();
+        // An agent without the follow-up tools cannot be trusted with the
+        // flag even if it hallucinates one: the task would be unobservable
+        // and unkillable.
+        let run_in_background = self.allow_background && params.run_in_background.unwrap_or(false);
         async move {
             debug!(description = %params.description, command = %params.command, "Executing shell command");
             // `shell` is the platform-agnostic tool name; `bash` is the current backend.
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(&params.command).current_dir(&cwd);
+
+            if run_in_background {
+                // The call settles now; the task lives outside tool-call
+                // semantics (only task_kill / registry shutdown end it), and
+                // outside the timeout — escaping it is the point. An already
+                // aborted turn must not start work, mirroring the foreground
+                // pre-cancellation check inside `run_command`.
+                if ctx.cancel.is_cancelled() {
+                    return Err(ToolError::Aborted(
+                        "Command was aborted by the user before it started.".into(),
+                    ));
+                }
+                let id = background
+                    .spawn(
+                        cmd,
+                        TaskMeta {
+                            command: params.command.clone(),
+                            description: params.description.clone(),
+                            agent_name,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ToolError::ExecutionError(format!("Failed to start background task: {e}"))
+                    })?;
+                return Ok(format!(
+                    "Started background task {id}. Use task_output to read its \
+                     output and task_kill to terminate it. You will be notified \
+                     when it finishes."
+                ));
+            }
 
             let execution_cancel = ctx.cancel.child_token();
             let mut command = Box::pin(run_command(cmd, execution_cancel.clone()));

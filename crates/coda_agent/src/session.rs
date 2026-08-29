@@ -18,6 +18,7 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
+use coda_background::BackgroundProcesses;
 use coda_core::llm::{LLMProvider, Message, MessageId, TurnId};
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
@@ -158,6 +159,7 @@ pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
     session_id: Option<String>,
     resume_decisions: HashMap<String, ResumeDecision>,
     file_locks: Option<Arc<KeyedLock<String>>>,
+    background: Option<Arc<BackgroundProcesses>>,
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
@@ -169,6 +171,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
             session_id: None,
             resume_decisions: HashMap::new(),
             file_locks: None,
+            background: None,
         }
     }
 }
@@ -206,6 +209,16 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         self
     }
 
+    /// Inject an externally-owned background task registry (e.g. held by the
+    /// server's session hub, so tasks survive session rebuilds like a model
+    /// switch). The session then never shuts the registry down — its owner
+    /// does. Without this call the session builds a private registry and
+    /// [`Session::shutdown`] tears it down once the runtime has exited.
+    pub fn background(mut self, registry: Arc<BackgroundProcesses>) -> Self {
+        self.background = Some(registry);
+        self
+    }
+
     /// If unset, a fresh UUID is generated. Provide an existing id to resume a
     /// prior session (the snapshot + root checkpoint are loaded automatically).
     pub fn session_id(mut self, id: impl Into<String>) -> Self {
@@ -235,12 +248,22 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .take()
             .ok_or(OpenError::MissingField("run_config"))?;
 
+        // An injected registry is externally owned (the server's session hub
+        // holds it, so tasks outlive session rebuilds like a model switch) and
+        // this session only borrows it. A self-built one is owned, and
+        // `shutdown` tears it down. Resolved before the agents are built —
+        // their tools capture it.
+        let (background, owns_background) = match self.background.take() {
+            Some(registry) => (registry, false),
+            None => (Arc::new(BackgroundProcesses::temporary()), true),
+        };
+
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
         let file_locks = self
             .file_locks
             .take()
             .unwrap_or_else(coda_tools::shared_file_locks);
-        let agents = team.build(&workspace_dir, file_locks);
+        let agents = team.build(&workspace_dir, file_locks, background.clone());
         let root_name = team.root().name.to_string();
 
         let session_id = self
@@ -378,6 +401,8 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                 resumed_messages,
                 has_resuming_agents,
                 events_rx: Mutex::new(events_rx),
+                background,
+                owns_background,
             }),
         })
     }
@@ -432,6 +457,11 @@ struct SessionInner {
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
+    background: Arc<BackgroundProcesses>,
+    /// Self-built registry (no [`SessionBuilder::background`]): `shutdown`
+    /// tears it down once the runtime has confirmedly exited. An injected
+    /// registry is never touched — its external owner manages its lifecycle.
+    owns_background: bool,
 }
 
 /// High-level handle to a running agent session.
@@ -572,7 +602,26 @@ impl Session {
     /// Stop the session. Returns whether the agents stopped of their own accord
     /// within the requested policy; every mode but `graceful_unbounded` also
     /// guarantees that none of them is still running once this returns.
+    /// The session's background task registry (injected or self-built).
+    pub fn background(&self) -> &Arc<BackgroundProcesses> {
+        &self.inner.background
+    }
+
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
+        let exited = self.stop_runtime(mode).await;
+        // Tear down an owned registry only once the runtime has confirmedly
+        // exited: a graceful timeout that returns `false` leaves the session
+        // running, and killing its background tasks then would leave a
+        // half-closed state (session up, registry closed). Undelivered
+        // notices are dropped — a standalone session has no reopen to deliver
+        // them to.
+        if exited && self.inner.owns_background {
+            let _ = self.inner.background.shutdown().await;
+        }
+        exited
+    }
+
+    async fn stop_runtime(&self, mode: Shutdown) -> bool {
         match mode {
             Shutdown::Graceful { timeout } => {
                 self.inner.runtime.request_exit().await;

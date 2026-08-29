@@ -519,10 +519,12 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "coda_agent"
 version = "0.1.0"
 dependencies = [
+ "coda_background",
  "coda_core",
  "coda_tools",
  "futures",
  "jiff",
+ "libc",
  "schemars",
  "serde",
  "serde_json",
@@ -611,6 +613,7 @@ dependencies = [
  "brush-parser",
  "clap",
  "coda_agent",
+ "coda_background",
  "coda_core",
  "coda_mcp",
  "coda_openai",

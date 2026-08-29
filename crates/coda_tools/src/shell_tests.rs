@@ -1,13 +1,35 @@
 use super::*;
+use std::str::FromStr;
 
 fn tool() -> ShellTool {
-    ShellTool::new(std::env::temp_dir().to_string_lossy().into_owned())
+    tool_with_background(false).0
+}
+
+/// A shell tool plus the registry it was built against, so background tests
+/// can observe and tear down what they start.
+fn tool_with_background(allow_background: bool) -> (ShellTool, Arc<BackgroundProcesses>) {
+    let background = Arc::new(BackgroundProcesses::temporary());
+    let tool = ShellTool::new(
+        std::env::temp_dir().to_string_lossy().into_owned(),
+        "coda".to_string(),
+        background.clone(),
+        allow_background,
+    );
+    (tool, background)
 }
 
 fn params(command: &str) -> ShellToolParams {
     ShellToolParams {
         command: command.to_string(),
         description: "test command".to_string(),
+        run_in_background: None,
+    }
+}
+
+fn background_params(command: &str) -> ShellToolParams {
+    ShellToolParams {
+        run_in_background: Some(true),
+        ..params(command)
     }
 }
 
@@ -324,4 +346,85 @@ async fn cancel_settles_promptly_when_a_descendant_escapes_the_group() {
     );
 
     let _ = std::fs::remove_file(&ready);
+}
+
+/// The flag is a *capability*, granted with the follow-up tools: an agent
+/// that cannot observe or kill a task must not be able to start one, and must
+/// not even see the option.
+#[test]
+fn run_in_background_is_only_in_the_schema_once_granted() {
+    let ungranted = tool_with_background(false).0;
+    let props = ungranted.parameter_schema()["properties"]
+        .as_object()
+        .expect("schema has properties");
+    assert!(props.contains_key("command"));
+    assert!(!props.contains_key("run_in_background"));
+
+    let granted = tool_with_background(true).0;
+    assert!(
+        granted.parameter_schema()["properties"]
+            .as_object()
+            .expect("schema has properties")
+            .contains_key("run_in_background")
+    );
+    assert!(
+        granted.description().contains("background task"),
+        "a granted agent should be told what to do with long commands: {}",
+        granted.description()
+    );
+}
+
+/// A model that invents the parameter anyway gets a foreground run, not an
+/// unobservable task.
+#[tokio::test]
+async fn an_ungranted_run_in_background_flag_runs_in_the_foreground() {
+    let (shell, background) = tool_with_background(false);
+    let out = shell
+        .execute(background_params("echo hi"), ToolCallContext::default())
+        .await
+        .expect("command ran");
+
+    assert_eq!(out.trim(), "hi");
+    assert!(
+        background.summaries().borrow().is_empty(),
+        "task was started"
+    );
+}
+
+/// Backgrounding is how a command escapes the 2-minute limit, so the timeout
+/// must not reach it: the call settles at once with an id, and the task is
+/// still running well after a (shortened) timeout would have killed it.
+#[tokio::test]
+async fn a_background_task_settles_at_once_and_outlives_the_timeout() {
+    let (mut shell, background) = tool_with_background(true);
+    shell.timeout = Duration::from_millis(200);
+
+    let out = tokio::time::timeout(
+        Duration::from_secs(2),
+        shell.execute(background_params("sleep 41.07"), ToolCallContext::default()),
+    )
+    .await
+    .expect("background call did not settle promptly")
+    .expect("background call failed");
+
+    let id = out
+        .split_whitespace()
+        .find(|word| word.starts_with("bg_"))
+        .map(|word| word.trim_end_matches('.'))
+        .expect("no task id in the result");
+    let id = coda_background::TaskId::from_str(id).expect("well-formed task id");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let read = background
+        .read(&id)
+        .await
+        .expect("registry readable")
+        .expect("task still known");
+    assert_eq!(
+        read.status.describe(),
+        "running",
+        "the foreground timeout reached a background task"
+    );
+
+    background.shutdown().await;
 }

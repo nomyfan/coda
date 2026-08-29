@@ -143,7 +143,7 @@ async fn bootstrapped(
     let events = runtime.subscribe();
     runtime
         .bootstrap(
-            team().build(".", coda_tools::shared_file_locks()),
+            team().build(".", coda_tools::shared_file_locks(), test_registry()),
             Some(snapshot),
             HashMap::new(),
             test_config(TestProvider::default(), ToolApprovalMode::Auto),
@@ -289,7 +289,7 @@ async fn a_checkpoint_that_cannot_be_read_refuses_the_recovery() {
     let mut runtime = AgentRuntime::new(storage, SESSION.to_string());
     let error = runtime
         .bootstrap(
-            team().build(".", coda_tools::shared_file_locks()),
+            team().build(".", coda_tools::shared_file_locks(), test_registry()),
             Some(snapshot_holding(explore_reply(DISPATCH))),
             HashMap::new(),
             test_config(TestProvider::default(), ToolApprovalMode::Auto),

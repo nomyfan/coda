@@ -360,7 +360,11 @@ fn shared_subagent_is_allowed() {
     );
     let files = load_agent_files(dir.path()).unwrap();
     let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
-    let agents = team.build(".", coda_tools::shared_file_locks());
+    let agents = team.build(
+        ".",
+        coda_tools::shared_file_locks(),
+        std::sync::Arc::new(coda_background::BackgroundProcesses::temporary()),
+    );
     assert!(agents.contains_key("shared"));
     assert!(agents.contains_key("a"));
     assert!(agents.contains_key("b"));

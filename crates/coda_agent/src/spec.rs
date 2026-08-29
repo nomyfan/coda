@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use coda_background::BackgroundProcesses;
 use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
 
 use crate::agent::{
@@ -233,11 +234,14 @@ impl AgentTeam {
     /// `file_locks` is the deliberate exception to "independent state": the
     /// same registry must reach every call in the process, or concurrent
     /// `edit_file`s from sibling agents or from two sessions over one workspace
-    /// clobber each other.
+    /// clobber each other. `background` is shared one level down — every agent
+    /// in the session sees the same task registry, since a task belongs to the
+    /// conversation rather than to whichever agent happened to start it.
     pub fn build(
         &self,
         default_workspace: &str,
         file_locks: Arc<KeyedLock<String>>,
+        background: Arc<BackgroundProcesses>,
     ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
@@ -251,9 +255,19 @@ impl AgentTeam {
                 .get(&spec.name)
                 .map(String::as_str)
                 .unwrap_or(default_workspace);
+            // Starting background work requires the whole follow-up kit: an
+            // agent that can start a task must also be able to observe and
+            // kill it. Holding only one of the two is still legal — that
+            // agent just can't *start* anything.
+            let tool_names: HashSet<&str> = spec.tools.iter().map(|t| t.name()).collect();
+            let allow_background_shell =
+                tool_names.contains("task_output") && tool_names.contains("task_kill");
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 file_locks: file_locks.clone(),
+                agent_name: spec.name.clone(),
+                background: background.clone(),
+                allow_background_shell,
             };
 
             let mut agent = Agent {
@@ -341,6 +355,60 @@ mod tests {
         }
     }
 
+    /// Captures the background-task wiring each tool build sees.
+    struct BackgroundProbeSpec {
+        seen: Arc<StdMutex<Vec<(String, bool, usize)>>>,
+    }
+    impl ToolSpec for BackgroundProbeSpec {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+            self.seen.lock().unwrap().push((
+                ctx.agent_name.clone(),
+                ctx.allow_background_shell,
+                Arc::as_ptr(&ctx.background) as usize,
+            ));
+            Box::new(RecordingTool)
+        }
+    }
+
+    /// Backgrounding a shell command is granted by holding the whole follow-up
+    /// kit, and the registry itself is shared across the session's agents.
+    /// Holding only `task_output` is a legal observer — it just cannot start
+    /// background work.
+    #[test]
+    fn background_shell_is_granted_by_the_full_task_kit_and_shares_one_registry() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let probe = || {
+            Box::new(BackgroundProbeSpec { seen: seen.clone() }) as Box<dyn coda_tools::ToolSpec>
+        };
+        let tool = |name: &str| coda_tools::spec_by_name(name).expect("builtin");
+        let root = AgentSpec {
+            tools: vec![probe(), tool("task_output"), tool("task_kill")],
+            subagents: vec!["observer".into()],
+            ..spec("coda")
+        };
+        let observer = AgentSpec {
+            tools: vec![probe(), tool("task_output")],
+            ..spec("observer")
+        };
+        let team = AgentTeam::new(root, vec![observer]).unwrap();
+        let background = Arc::new(BackgroundProcesses::temporary());
+        team.build(".", coda_tools::shared_file_locks(), background.clone());
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        let registry = Arc::as_ptr(&background) as usize;
+        assert_eq!(
+            got,
+            vec![
+                ("coda".to_string(), true, registry),
+                ("observer".to_string(), false, registry),
+            ]
+        );
+    }
+
     struct ReservedToolSpec;
 
     impl ToolSpec for ReservedToolSpec {
@@ -402,7 +470,11 @@ mod tests {
             .unwrap()
             .with_agent_workspaces(HashMap::from([("sub".to_string(), "/sub".to_string())]));
 
-        team.build("/root", coda_tools::shared_file_locks());
+        team.build(
+            "/root",
+            coda_tools::shared_file_locks(),
+            Arc::new(BackgroundProcesses::temporary()),
+        );
 
         let mut got = seen.lock().unwrap().clone();
         got.sort();
@@ -449,7 +521,11 @@ mod tests {
     async fn a_fresh_agent_is_in_no_turn_and_asking_does_not_open_one() {
         let agents = AgentTeam::new(spec("coda"), vec![])
             .expect("valid team")
-            .build("/root", coda_tools::shared_file_locks());
+            .build(
+                "/root",
+                coda_tools::shared_file_locks(),
+                Arc::new(BackgroundProcesses::temporary()),
+            );
         let agent = &agents["coda"];
 
         assert_eq!(agent.current_turn().await, None);

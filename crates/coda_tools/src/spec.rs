@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
+use coda_background::BackgroundProcesses;
+
 use crate::locks::KeyedLock;
 use crate::{
     EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
-    WriteFileTool, WriteTodosTool,
+    TaskKillTool, TaskOutputTool, WriteFileTool, WriteTodosTool,
 };
 use coda_ptc::RunJavaScriptTool;
 
@@ -18,6 +20,21 @@ pub struct BuildContext {
     /// serialize against registries nobody else consults and exclude nothing.
     /// Defaults to [`shared_file_locks`].
     pub file_locks: Arc<KeyedLock<String>>,
+    /// Name of the agent the tools are built for; echoed in the metadata of
+    /// background tasks it starts.
+    pub agent_name: String,
+    /// Shared by every agent in one session — background tasks are
+    /// session-scoped, not per-agent. Always present, so `task_output` and
+    /// `task_kill` are unconditionally buildable: granting only one of them
+    /// (an observer agent) is a feature, not an error.
+    pub background: Arc<BackgroundProcesses>,
+    /// True when this agent is granted both `task_output` and `task_kill`;
+    /// gates whether `shell` exposes `run_in_background` in its schema. This
+    /// is a *capability* judgement, independent of the session's permission
+    /// mode — backgrounding changes how long a command may run, not whether
+    /// it is allowed to run, so the call still faces the same approval policy
+    /// a foreground one would.
+    pub allow_background_shell: bool,
 }
 
 impl BuildContext {
@@ -27,6 +44,9 @@ impl BuildContext {
         BuildContext {
             workspace_dir: workspace_dir.into(),
             file_locks: crate::locks::shared_file_locks(),
+            agent_name: "coda".into(),
+            background: Arc::new(BackgroundProcesses::temporary()),
+            allow_background_shell: false,
         }
     }
 }
@@ -52,7 +72,36 @@ impl ToolSpec for ShellToolSpec {
         "shell"
     }
     fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ShellTool::new(ctx.workspace_dir.clone())))
+        Box::new(ToolWrapper::from(ShellTool::new(
+            ctx.workspace_dir.clone(),
+            ctx.agent_name.clone(),
+            ctx.background.clone(),
+            ctx.allow_background_shell,
+        )))
+    }
+}
+
+pub struct TaskOutputToolSpec;
+
+impl ToolSpec for TaskOutputToolSpec {
+    fn name(&self) -> &str {
+        "task_output"
+    }
+    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskOutputTool::new(
+            ctx.background.clone(),
+        )))
+    }
+}
+
+pub struct TaskKillToolSpec;
+
+impl ToolSpec for TaskKillToolSpec {
+    fn name(&self) -> &str {
+        "task_kill"
+    }
+    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskKillTool::new(ctx.background.clone())))
     }
 }
 
@@ -215,6 +264,8 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
 /// Names of all builtin tools, in canonical order.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "shell",
+    "task_output",
+    "task_kill",
     "read_file",
     "write_file",
     "edit_file",
@@ -232,6 +283,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 pub fn spec_by_name(name: &str) -> Option<Box<dyn ToolSpec>> {
     Some(match name {
         "shell" => Box::new(ShellToolSpec),
+        "task_output" => Box::new(TaskOutputToolSpec),
+        "task_kill" => Box::new(TaskKillToolSpec),
         "read_file" => Box::new(ReadFileToolSpec),
         "write_file" => Box::new(WriteFileToolSpec),
         "edit_file" => Box::new(EditFileToolSpec),

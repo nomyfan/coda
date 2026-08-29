@@ -27,6 +27,13 @@ use tokio::{
     time::Duration,
 };
 
+/// A throwaway background-task registry, for the driver tests that only need
+/// `AgentTeam::build` to have one. Each call gets its own, so nothing leaks
+/// between tests.
+pub(super) fn test_registry() -> std::sync::Arc<coda_background::BackgroundProcesses> {
+    std::sync::Arc::new(coda_background::BackgroundProcesses::temporary())
+}
+
 /// Base assistant message for tests; callers override the fields they care
 /// about with struct-update syntax (`..assistant()`).
 pub(super) fn assistant() -> AssistantMessage {
@@ -1238,9 +1245,11 @@ where
         approval: ToolApprovalMode,
         initial_task: &str,
     ) -> Self {
-        let agents = AgentTeam::new(root, subagents)
-            .expect("valid team")
-            .build(".", coda_tools::shared_file_locks());
+        let agents = AgentTeam::new(root, subagents).expect("valid team").build(
+            ".",
+            coda_tools::shared_file_locks(),
+            test_registry(),
+        );
         Self::start_agents(storage, agents, provider, approval, initial_task).await
     }
 

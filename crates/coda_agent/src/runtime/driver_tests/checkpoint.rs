@@ -28,7 +28,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         vec![],
     )
     .expect("valid team")
-    .build(".", coda_tools::shared_file_locks());
+    .build(".", coda_tools::shared_file_locks(), test_registry());
 
     let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
@@ -494,7 +494,7 @@ async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
     let team = AgentTeam::new(coda, vec![explore]).expect("valid team");
     let harness = Harness::start_agents(
         storage.clone(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
         ToolApprovalMode::Auto,
         "t1",

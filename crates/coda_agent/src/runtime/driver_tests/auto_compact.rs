@@ -96,7 +96,7 @@ async fn a_first_turn_can_compact_after_its_completed_tool_batch() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let agents = AgentTeam::new(coda_spec("auto-compact-first-turn-main", vec![]), vec![])
         .expect("valid team")
-        .build(".", coda_tools::shared_file_locks());
+        .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "only").await;
     wait_for_root_answer(&mut harness, "only done").await;
@@ -194,7 +194,7 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
             .expect("seed malformed checkpoint");
         let agents = AgentTeam::new(coda_spec("main-system", vec![]), vec![])
             .expect("valid team")
-            .build(".", coda_tools::shared_file_locks());
+            .build(".", coda_tools::shared_file_locks(), test_registry());
         let mut harness =
             Harness::start_with_config_at(storage, agents, config, thread_id, "new task").await;
 
@@ -229,7 +229,7 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let agents = AgentTeam::new(coda_spec("auto-compact-main", vec![]), vec![])
         .expect("valid team")
-        .build(".", coda_tools::shared_file_locks());
+        .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
     wait_for_root_answer(&mut harness, "first done").await;
@@ -317,7 +317,7 @@ async fn auto_compaction_emits_a_start_event_before_the_result() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let agents = AgentTeam::new(coda_spec("auto-compact-main", vec![]), vec![])
         .expect("valid team")
-        .build(".", coda_tools::shared_file_locks());
+        .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
     wait_for_root_answer(&mut harness, "first done").await;
@@ -365,7 +365,7 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
     };
     let agents = AgentTeam::new(root, vec![explore])
         .expect("valid team")
-        .build(".", coda_tools::shared_file_locks());
+        .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
     wait_for_root_answer(&mut harness, "first done").await;
@@ -429,7 +429,7 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
     );
     let agents = AgentTeam::new(coda_spec("auto-compact-main", vec![]), vec![])
         .expect("valid team")
-        .build(".", coda_tools::shared_file_locks());
+        .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
     wait_for_root_answer(&mut harness, "first done").await;
@@ -483,7 +483,7 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
         vec![],
     )
     .expect("valid team")
-    .build(".", coda_tools::shared_file_locks());
+    .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness =
         Harness::start_with_config(MemoryStorage::default(), agents, config, "first").await;
     wait_for_root_answer(&mut harness, "first done").await;

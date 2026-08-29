@@ -1156,3 +1156,66 @@ async fn tool_state_survives_the_turn_that_recorded_it() {
         .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
         .await;
 }
+
+/// A session that built its own task registry owns it: shutting the session
+/// down kills the background work it started, rather than leaving orphans
+/// behind a registry nobody can reach any more.
+#[tokio::test]
+async fn should_kill_owned_background_tasks_on_shutdown() {
+    let session = Session::builder()
+        .storage(MemoryStorage::default())
+        .team(&solo_team(simple_spec("session-system")), ".")
+        .run_config(run_config(ToolApprovalMode::Auto))
+        .open()
+        .await
+        .expect("open session");
+
+    let pidfile = std::env::temp_dir().join(format!("coda-session-bg-{}", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!("echo $$ > '{}'; sleep 43.11", pidfile.display()));
+    session
+        .background()
+        .spawn(
+            cmd,
+            coda_background::TaskMeta {
+                command: "sleep".into(),
+                description: "owned task".into(),
+                agent_name: "coda".into(),
+            },
+        )
+        .await
+        .expect("spawn background task");
+
+    let pid: i32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("task never reported its pid");
+
+    assert!(
+        session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+            .await,
+        "session did not confirm exit, so the registry is deliberately left alone"
+    );
+
+    // SAFETY: signal 0 only probes for existence.
+    timeout(Duration::from_secs(5), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background process survived session shutdown");
+
+    let _ = std::fs::remove_file(&pidfile);
+}

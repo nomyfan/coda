@@ -5,6 +5,7 @@ mod locks;
 mod process;
 mod shell;
 mod spec;
+mod task;
 mod todo;
 
 pub use coda_ptc::{
@@ -20,9 +21,10 @@ pub use shell::ShellTool;
 pub use spec::{
     BUILTIN_TOOL_NAMES, BuildContext, EditFileToolSpec, GlobToolSpec, GrepToolSpec,
     ListDirectoryToolSpec, PrebuiltToolSpec, ReadFileToolSpec, ReadTodosToolSpec,
-    RunJavaScriptToolSpec, ShellToolSpec, ToolSpec, WriteFileToolSpec, WriteTodosToolSpec,
-    builtin_specs, spec_by_name,
+    RunJavaScriptToolSpec, ShellToolSpec, TaskKillToolSpec, TaskOutputToolSpec, ToolSpec,
+    WriteFileToolSpec, WriteTodosToolSpec, builtin_specs, spec_by_name,
 };
+pub use task::{TaskKillTool, TaskOutputTool};
 pub use todo::{ReadTodosTool, TodoItem, WriteTodosTool};
 
 /// Provider-visible synthetic names that ToolSpec implementations may not claim.

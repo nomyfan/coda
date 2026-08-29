@@ -51,6 +51,8 @@ diesel_migrations = "2.3"
 ignore = "0.4"
 
 [dev-dependencies]
+# Only the agent-config tests need it directly, to satisfy `AgentTeam::build`.
+coda_background = { workspace = true }
 tempfile = "3"
 
 # The PostgreSQL storage tests need a live database, so they live in their own

@@ -32,7 +32,7 @@ async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
     let gate = storage.hold_checkpoints_of("explore").await;
     let mut harness = Harness::start_agents(
         storage.clone(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         provider.clone(),
         approval.clone(),
         "inspect",
@@ -68,7 +68,7 @@ async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
     // What proves the thread survived: the next process asks again.
     let mut harness = harness
         .restart(
-            team.build(".", coda_tools::shared_file_locks()),
+            team.build(".", coda_tools::shared_file_locks(), test_registry()),
             provider,
             approval,
             HashMap::new(),
@@ -100,7 +100,7 @@ async fn a_user_abort_while_a_subagent_suspends_still_ends_the_turn() {
     let gate = storage.hold_checkpoints_of("explore").await;
     let mut harness = Harness::start_agents(
         storage.clone(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos")),
         "inspect",
@@ -138,7 +138,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let (root, subagents) = explore_read_todos_specs("main-system");
     let team = AgentTeam::new(root, subagents).expect("valid team");
-    let agents1 = team.build(".", coda_tools::shared_file_locks());
+    let agents1 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -182,7 +182,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
             },
         ),
     );
-    let agents2 = team.build(".", coda_tools::shared_file_locks());
+    let agents2 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = harness
         .restart(agents2, provider, approval, decisions)
         .await;
@@ -239,7 +239,7 @@ async fn pending_approval_supports_mixed_resolutions() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".", coda_tools::shared_file_locks());
+    let agents1 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -289,7 +289,7 @@ async fn pending_approval_supports_mixed_resolutions() {
         result.expect("timed out waiting for suspension")
     };
     harness.shutdown().await;
-    let agents2 = team.build(".", coda_tools::shared_file_locks());
+    let agents2 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     harness = harness
         .restart(agents2, provider, approval, decisions_map)
         .await;
@@ -336,7 +336,7 @@ async fn reject_pending_approval_via_restart() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".", coda_tools::shared_file_locks());
+    let agents1 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -386,7 +386,7 @@ async fn reject_pending_approval_via_restart() {
             },
         ),
     );
-    let agents2 = team.build(".", coda_tools::shared_file_locks());
+    let agents2 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = harness
         .restart(agents2, provider, approval, reject_decisions)
         .await;
@@ -427,7 +427,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     .expect("valid team");
     let provider = TestProvider::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
-    let agents1 = team.build(".", coda_tools::shared_file_locks());
+    let agents1 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents1,
@@ -451,7 +451,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     };
     harness.shutdown().await;
 
-    let agents2 = team.build(".", coda_tools::shared_file_locks());
+    let agents2 = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = harness
         .restart(agents2, provider, approval, HashMap::new())
         .await;
@@ -497,7 +497,7 @@ async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         provider.clone(),
         approval.clone(),
         "inspect todos",
@@ -529,7 +529,7 @@ async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
     .into();
     let mut harness = harness
         .restart_without_snapshot(
-            team.build(".", coda_tools::shared_file_locks()),
+            team.build(".", coda_tools::shared_file_locks(), test_registry()),
             provider,
             approval,
             decisions,
@@ -572,7 +572,7 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         provider.clone(),
         approval.clone(),
         "inspect todos",
@@ -604,7 +604,7 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     .into();
     let mut harness = harness
         .restart(
-            team.build(".", coda_tools::shared_file_locks()),
+            team.build(".", coda_tools::shared_file_locks(), test_registry()),
             provider,
             approval,
             decisions,
@@ -647,7 +647,7 @@ async fn in_process_resume_after_suspension() {
     let provider = TestProvider::default();
     let approval =
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
-    let agents = team.build(".", coda_tools::shared_file_locks());
+    let agents = team.build(".", coda_tools::shared_file_locks(), test_registry());
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
         agents,
@@ -720,7 +720,7 @@ async fn an_empty_decision_for_the_parked_batch_rejects_it() {
     .expect("valid team");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos")),
         "two batches",
@@ -781,7 +781,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
         ToolApprovalMode::RequireWhen(Arc::new(|call: &ToolCall| call.name == "read_todos"));
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::default(),
         approval,
         "two batches",
