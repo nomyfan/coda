@@ -21,6 +21,7 @@ use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
     runtime::SendCommandError,
 };
+use coda_background::{ArchiveDir, BackgroundProcesses, TaskNotice};
 use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -265,7 +266,14 @@ pub trait SessionOpener: Send + Sync + 'static {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
+
+    /// Open the on-disk archive holding `key`'s background task output. Its
+    /// root outlives any one entry, so output a task produced before a release
+    /// is still readable after the reopen; `Err` disables background work for
+    /// the session without otherwise affecting it.
+    fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String>;
 
     /// Load the persisted conversation history for `key` (empty when none).
     /// Used for the snapshot of approvals-gated opens, where no live session
@@ -696,6 +704,20 @@ struct EntryState {
     /// kept in the phase would vanish under a compaction and leave the entry
     /// looking idle — free to be released, or to accept a second compaction.
     compacting: bool,
+    /// The session's background task registry, created by the attach that
+    /// initializes the entry. It sits here rather than in a phase for the same
+    /// reason `permission_mode` does, and more: a task belongs to the session,
+    /// so it has to outlive the `SetModel` rebuild that replaces the whole
+    /// runtime underneath it.
+    background: Option<Arc<BackgroundProcesses>>,
+    /// Task notices waiting for a turn to deliver them in. Drained from the
+    /// registry as soon as they appear; each one opens its own turn, so they
+    /// queue here whenever the session is busy. A non-empty queue keeps the
+    /// entry alive — releasing with notices still in hand would drop them.
+    pending_notices: VecDeque<TaskNotice>,
+    /// Stops the notice watcher when the entry goes away. Without it the task
+    /// would park on a watch nothing will ever publish to again.
+    notice_watcher: Option<tokio::task::AbortHandle>,
 }
 
 /// A cheap, cloneable handle to a session's slot, kept separate from the
@@ -743,6 +765,9 @@ impl SessionHub {
                                 attached: None,
                                 permission_mode: PermissionModeCell::default(),
                                 compacting: false,
+                                background: None,
+                                pending_notices: VecDeque::new(),
+                                notice_watcher: None,
                             })),
                         })
                     })
@@ -813,6 +838,9 @@ impl SessionHub {
         notify_closed: bool,
     ) -> impl Future<Output = ()> + Send + 'static {
         let (done_tx, done_rx) = watch::channel(false);
+        if let Some(watcher) = state.notice_watcher.take() {
+            watcher.abort();
+        }
         let phase = std::mem::replace(&mut state.phase, EntryPhase::Releasing { done: done_rx });
         let session = match phase {
             EntryPhase::Live(live) => Some(live.session),
@@ -899,6 +927,24 @@ impl SessionHub {
         if state.attached.is_some() || state.compacting {
             return None;
         }
+        // Background work keeps the session alive on its own: a running task
+        // has a completion to report, and a notice already in hand has one to
+        // deliver. Releasing here would either orphan the task or drop what it
+        // had to say — and since the registry enqueues a notice *before* the
+        // running count drops, a task that just finished is always visible as
+        // one or the other, never as neither.
+        if !state.pending_notices.is_empty() {
+            return None;
+        }
+        if let Some(background) = &state.background
+            && background
+                .summaries()
+                .borrow()
+                .iter()
+                .any(|t| t.status.is_running())
+        {
+            return None;
+        }
         let idle = match &state.phase {
             EntryPhase::Live(live) => !live.turn_running,
             EntryPhase::Pending(_) => true,
@@ -907,6 +953,84 @@ impl SessionHub {
         idle.then(|| {
             Self::begin_release(entries, entry, state, Shutdown::graceful_unbounded(), false)
         })
+    }
+
+    /// The entry's task registry, created on first use by whichever attach
+    /// initializes the entry — which is also when its watcher starts. Opening
+    /// the archive can fail; a disabled registry keeps the conversation
+    /// working with background execution turned off.
+    async fn ensure_background(
+        &self,
+        entry: &Arc<SessionEntry>,
+        state: &mut EntryState,
+    ) -> Arc<BackgroundProcesses> {
+        if let Some(background) = &state.background {
+            return background.clone();
+        }
+        let background = Arc::new(match self.opener.background_archive(&entry.key) {
+            Ok(archive) => BackgroundProcesses::session_backed(archive).await,
+            Err(error) => {
+                warn!(
+                    workspace_id = %entry.key.0,
+                    session_id = %entry.key.1,
+                    "background task archive unavailable: {error}"
+                );
+                BackgroundProcesses::disabled_from(error)
+            }
+        });
+        state.background = Some(background.clone());
+        state.notice_watcher = Some(spawn_notice_watcher(
+            self.entries.clone(),
+            entry.clone(),
+            background.clone(),
+        ));
+        background
+    }
+
+    /// Hand one pending notice to the session as its own turn. Returns whether
+    /// a turn was started, which is also what tells the caller the entry is no
+    /// longer idle.
+    ///
+    /// Notices are never merged: each finished task gets its own turn, so a
+    /// second one waits here until this turn settles.
+    async fn deliver_pending_notice(state: &mut EntryState, key: &SessionKey) -> bool {
+        if state.compacting || state.pending_notices.is_empty() {
+            return false;
+        }
+        let EntryPhase::Live(live) = &mut state.phase else {
+            return false;
+        };
+        // The runtime runs one root turn at a time, and a suspension does not
+        // end one — a session parked on an approval holds its notices until a
+        // human answers.
+        if live.turn_running
+            || !live.pending_approvals.is_empty()
+            || live.unsettled_user_message.is_some()
+        {
+            return false;
+        }
+        let Some(notice) = state.pending_notices.pop_front() else {
+            return false;
+        };
+        let text = notice.render();
+        let message_id = MessageId::new();
+        if let Err(err) = live
+            .session
+            .send_task_notice(message_id, text.clone())
+            .await
+        {
+            warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notice: {err}");
+            // Keep it: the session refusing now says nothing about later, and
+            // dropping it would lose the only record that the task ended.
+            state.pending_notices.push_front(notice);
+            return false;
+        }
+        live.turn_running = true;
+        live.unsettled_user_message = Some((
+            TurnId::from(message_id),
+            Message::User(UserMessage::task_notice(message_id, text)),
+        ));
+        true
     }
 
     /// Build a `LiveState` around a freshly opened session and start its event
@@ -1130,6 +1254,7 @@ impl SessionHub {
         images: Vec<String>,
     ) -> CommandOutcome {
         let permission_mode = state.permission_mode.clone();
+        let background = self.ensure_background(entry, state).await;
         let compacting = state.compacting;
         let (provider_id, reasoning_effort, generation, previous_snapshot) = {
             let EntryPhase::Live(live) = &mut state.phase else {
@@ -1171,6 +1296,7 @@ impl SessionHub {
                 reasoning_effort.clone(),
                 permission_mode,
                 HashMap::new(),
+                background,
             )
             .await
         {
@@ -1234,6 +1360,7 @@ impl SessionHub {
         thread_id: String,
         decision: ResumeDecision,
     ) -> CommandOutcome {
+        let background = self.ensure_background(entry, state).await;
         match &mut state.phase {
             EntryPhase::Live(live) => {
                 if let Err(err) = live.session.resume(&agent_name, &thread_id, decision).await {
@@ -1262,6 +1389,7 @@ impl SessionHub {
                         reasoning_effort.clone(),
                         state.permission_mode.clone(),
                         decisions,
+                        background,
                     )
                     .await
                 {
@@ -1307,6 +1435,9 @@ impl SessionHub {
         provider_id: String,
         reasoning_effort: Option<String>,
     ) -> CommandOutcome {
+        // The registry is the entry's, not the runtime's: the replacement
+        // session adopts the very tasks the outgoing one started.
+        let background = self.ensure_background(entry, state).await;
         // Not `Live` (stale/not-attached is caught earlier by `command`'s guard;
         // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
         // `set_model` path as `SESSION_NOT_LIVE` (Decision 8).
@@ -1344,6 +1475,7 @@ impl SessionHub {
                 // posture the session already had.
                 permission_mode,
                 HashMap::new(),
+                background,
             )
             .await
         {
@@ -1425,6 +1557,7 @@ impl SessionRelay for SessionHub {
                 // Only a fresh entry adopts the client's mode; anything
                 // already initialized keeps the one it is running under.
                 state.permission_mode.set(permission_mode);
+                let background = self.ensure_background(&entry, state).await;
                 match self
                     .opener
                     .open(
@@ -1433,6 +1566,7 @@ impl SessionRelay for SessionHub {
                         reasoning_effort.clone(),
                         state.permission_mode.clone(),
                         HashMap::new(),
+                        background,
                     )
                     .await
                 {
@@ -1877,6 +2011,49 @@ fn compose_snapshot(
 /// partially recover from — see the `Lagged` arm in the forwarder). Stage 2
 /// (forwarder) consumes the channel and does the per-event work under the
 /// entry lock.
+/// Watch a session's task registry for as long as its entry lives. Every
+/// change to the overview means a task started or settled — which is exactly
+/// when a notice may have appeared to deliver, and when the entry may have
+/// become releasable.
+///
+/// Notices are drained into the entry rather than left in the registry so that
+/// "has something to say" is one of the entry's own keepalive conditions,
+/// checked under the same lock as everything else that decides a release.
+fn spawn_notice_watcher(
+    entries: Entries,
+    entry: Arc<SessionEntry>,
+    background: Arc<BackgroundProcesses>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        let mut rx = background.summaries();
+        loop {
+            {
+                // Entry lock first, then the registry's — the order every
+                // other path takes.
+                let mut guard = entry.inner.clone().lock_owned().await;
+                if matches!(
+                    guard.phase,
+                    EntryPhase::Releasing { .. } | EntryPhase::Released
+                ) {
+                    return;
+                }
+                let notices = background.take_notices().await;
+                guard.pending_notices.extend(notices);
+                SessionHub::deliver_pending_notice(&mut guard, &entry.key).await;
+                if let Some(release) = SessionHub::maybe_release(&entries, &entry, &mut guard) {
+                    drop(guard);
+                    release.await;
+                    return;
+                }
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .abort_handle()
+}
+
 fn spawn_event_pipeline(
     entries: Entries,
     entry: Arc<SessionEntry>,
@@ -2028,6 +2205,15 @@ async fn run_forwarder(
                         &root_name,
                         turn_id,
                     );
+                    // A task that finished while this turn ran gets the next
+                    // one. Checked before the bookkeeping below, so a session
+                    // that is about to keep working is not recorded as having
+                    // finished unattended.
+                    let delivered = SessionHub::deliver_pending_notice(state, &entry.key).await;
+                    let EntryPhase::Live(live) = &mut state.phase else {
+                        return;
+                    };
+                    let awaits_approval = awaits_approval && !delivered;
                     // Suspensions awaiting approval already have their own
                     // indicator. Still under `guard`, so no attach can land
                     // between "nobody's here" and "we recorded that".

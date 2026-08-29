@@ -556,98 +556,6 @@ async fn notice_overflow_degrades_into_aggregate() {
     reg.shutdown().await;
 }
 
-fn completed_notice(id: &TaskId) -> TaskNotice {
-    TaskNotice::Task {
-        id: id.clone(),
-        command: "old".into(),
-        description: String::new(),
-        status: TaskStatus::Killed {
-            at: jiff::Timestamp::now(),
-        },
-        output_tail: String::new(),
-        stdout_overwritten: 0,
-        stderr_overwritten: 0,
-    }
-}
-
-fn fact_ids(dropped: &[TaskNoticeFact]) -> Vec<String> {
-    dropped
-        .iter()
-        .map(|f| match f {
-            TaskNoticeFact::Completed { id, .. } => id.as_str().to_owned(),
-            TaskNoticeFact::OutputExpired { id, .. } => id.as_str().to_owned(),
-        })
-        .collect()
-}
-
-/// A restored aggregate merges into the overflow slot — never into the
-/// full-notice queue, where the demotion path only expects full notices.
-#[tokio::test]
-async fn restore_merges_persisted_aggregate_into_overflow_slot() {
-    let reg = BackgroundProcesses::new();
-    let old = TaskId::new();
-    let x = TaskId::new();
-    reg.restore_notices(vec![
-        completed_notice(&old),
-        TaskNotice::Overflow {
-            batch_id: "batch-1".into(),
-            dropped: vec![TaskNoticeFact::Completed {
-                id: x.clone(),
-                status: TaskStatus::Killed {
-                    at: jiff::Timestamp::now(),
-                },
-            }],
-            uncounted: 5,
-        },
-    ])
-    .await;
-
-    // Drive exactly enough completions to force one demotion: the
-    // restored full notice is the oldest and degrades into the slot.
-    for i in 0..MAX_FULL_NOTICES {
-        let id = reg
-            .spawn_with(meta(&format!("r{i}")), |_ctx| async {
-                TaskExit::Exited { code: Some(0) }
-            })
-            .await
-            .unwrap();
-        let mut rx = reg.summaries();
-        loop {
-            let settled = rx
-                .borrow_and_update()
-                .iter()
-                .any(|s| s.id == id.as_str() && !s.status.is_running())
-                || !rx.borrow().iter().any(|s| s.id == id.as_str());
-            if settled {
-                break;
-            }
-            rx.changed().await.unwrap();
-        }
-    }
-
-    let notices = reg.take_notices().await;
-    let fulls = notices
-        .iter()
-        .filter(|n| matches!(n, TaskNotice::Task { .. }))
-        .count();
-    assert_eq!(fulls, MAX_FULL_NOTICES);
-    let (dropped, uncounted) = notices
-        .iter()
-        .find_map(|n| match n {
-            TaskNotice::Overflow {
-                dropped, uncounted, ..
-            } => Some((dropped, *uncounted)),
-            _ => None,
-        })
-        .expect("aggregate present");
-    assert_eq!(
-        fact_ids(dropped),
-        vec![x.as_str().to_owned(), old.as_str().to_owned()]
-    );
-    assert_eq!(uncounted, 5);
-    reg.shutdown().await;
-}
-
 /// Concurrent shutdowns serialize on the teardown barrier: the notice of
 /// the killed task lands in exactly one drain, and neither call returns
 /// with work still running.
@@ -669,38 +577,6 @@ async fn concurrent_shutdowns_share_the_barrier() {
     );
     let rx = reg.summaries();
     assert_eq!(running_count(&rx), 0);
-}
-
-/// Restored notices come out ahead of ones accumulated since.
-#[tokio::test]
-async fn restore_notices_orders_before_new_completions() {
-    let reg = BackgroundProcesses::new();
-    let id = reg
-        .spawn_with(meta("new"), |_ctx| async {
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-    let mut rx = reg.summaries();
-    while running_count(&rx) > 0 {
-        rx.changed().await.unwrap();
-    }
-    let old = TaskId::new();
-    reg.restore_notices(vec![completed_notice(&old)]).await;
-    let notices = reg.take_notices().await;
-    // Restored notice first, then the completion accumulated since.
-    let ids: Vec<Vec<TaskNoticeKey>> = notices.iter().map(|n| n.keys()).collect();
-    assert_eq!(
-        ids,
-        vec![
-            vec![TaskNoticeKey::Completed {
-                task_id: old.as_str().to_owned()
-            }],
-            vec![TaskNoticeKey::Completed {
-                task_id: id.as_str().to_owned()
-            }],
-        ]
-    );
 }
 
 // ---- real-process tasks -------------------------------------------

@@ -5,7 +5,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use coda_core::llm::TaskNoticeKey;
 use coda_core::tool::CancellationToken;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -122,18 +121,6 @@ pub enum TaskNoticeFact {
 }
 
 impl TaskNoticeFact {
-    /// The stable dedupe key for this fact.
-    pub fn key(&self) -> TaskNoticeKey {
-        match self {
-            TaskNoticeFact::Completed { id, .. } => TaskNoticeKey::Completed {
-                task_id: id.as_str().to_owned(),
-            },
-            TaskNoticeFact::OutputExpired { id, .. } => TaskNoticeKey::OutputExpired {
-                task_id: id.as_str().to_owned(),
-            },
-        }
-    }
-
     fn describe(&self) -> String {
         match self {
             TaskNoticeFact::Completed { id, status } => format!("{id}: {}", status.describe()),
@@ -170,8 +157,8 @@ pub enum TaskNotice {
         reason: ExpireReason,
     },
     Overflow {
-        /// Stable id minted when the aggregate is first created; preserved across
-        /// merge and NoticeStore round-trips so the whole batch dedupes as one.
+        /// Stable id minted when the aggregate is first created and preserved
+        /// across merges, so one flood reads as one batch.
         #[serde(default)]
         batch_id: String,
         dropped: Vec<TaskNoticeFact>,
@@ -180,28 +167,6 @@ pub enum TaskNotice {
 }
 
 impl TaskNotice {
-    /// Every stable fact key this notice covers. `Completed` and `OutputExpired`
-    /// of the same task produce *different* keys.
-    pub fn keys(&self) -> Vec<TaskNoticeKey> {
-        match self {
-            TaskNotice::Task { id, .. } => vec![TaskNoticeKey::Completed {
-                task_id: id.as_str().to_owned(),
-            }],
-            TaskNotice::OutputExpired { id, .. } => vec![TaskNoticeKey::OutputExpired {
-                task_id: id.as_str().to_owned(),
-            }],
-            TaskNotice::Overflow {
-                batch_id, dropped, ..
-            } => {
-                let mut keys = vec![TaskNoticeKey::OverflowBatch {
-                    batch_id: batch_id.clone(),
-                }];
-                keys.extend(dropped.iter().map(TaskNoticeFact::key));
-                keys
-            }
-        }
-    }
-
     /// The text of the user-turn message that delivers this notice — what the
     /// model (and the user, as a notice card) reads.
     pub fn render(&self) -> String {
@@ -403,23 +368,6 @@ impl RegistryState {
         }
     }
 
-    /// Preserve a restored aggregate's batch id so it dedupes as one batch.
-    fn merge_overflow_batch(
-        &mut self,
-        batch_id: String,
-        facts: Vec<TaskNoticeFact>,
-        uncounted: u64,
-    ) {
-        if self.overflow.is_none() {
-            self.overflow = Some(OverflowSlot {
-                batch_id,
-                dropped: Vec::new(),
-                uncounted: 0,
-            });
-        }
-        self.merge_overflow(facts, uncounted);
-    }
-
     /// `notices` holds only full `Task`/`OutputExpired` entries (aggregates live
     /// in the `overflow` slot); the oldest degrades to a fact on overflow.
     fn push_notice(&mut self, notice: TaskNotice) {
@@ -569,7 +517,10 @@ impl BackgroundProcesses {
         Self::disabled_from(error.to_string())
     }
 
-    fn disabled_from(error: String) -> Self {
+    /// A registry with no store behind it: spawning fails and nothing is
+    /// recorded, but the session it belongs to works otherwise. Used when the
+    /// archive root cannot be opened.
+    pub fn disabled_from(error: String) -> Self {
         Self::with_store(Store::Disabled(error.into()))
     }
 
@@ -897,32 +848,6 @@ impl BackgroundProcesses {
         let mut inner = self.inner.lock().await;
         enqueue_expirations(&mut inner, expirations);
         drain_notices(&mut inner)
-    }
-
-    /// Re-enqueue notices persisted by a previous incarnation: full notices
-    /// (`Task`/`OutputExpired`) go ahead of any accumulated since, and a
-    /// restored aggregate merges into the overflow slot keeping its batch id.
-    /// Once per registry instance (the caller guarantees once per hub entry).
-    pub async fn restore_notices(&self, restored: Vec<TaskNotice>) {
-        if restored.is_empty() {
-            return;
-        }
-        let mut inner = self.inner.lock().await;
-        let mut fulls = Vec::new();
-        for notice in restored {
-            match notice {
-                TaskNotice::Task { .. } | TaskNotice::OutputExpired { .. } => fulls.push(notice),
-                TaskNotice::Overflow {
-                    batch_id,
-                    dropped,
-                    uncounted,
-                } => {
-                    inner.merge_overflow_batch(batch_id, dropped, uncounted);
-                }
-            }
-        }
-        let newer = std::mem::replace(&mut inner.notices, fulls);
-        inner.notices.extend(newer);
     }
 
     /// Live overview of every retained task. Watch semantics: subscribing

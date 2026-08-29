@@ -2121,9 +2121,13 @@ fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, UserMessage)> {
             message_id,
             task,
             images,
+            author,
         } => Some((
             TurnId::from(*message_id),
-            UserMessage::with_images(*message_id, task.clone(), images),
+            UserMessage {
+                author: *author,
+                ..UserMessage::with_images(*message_id, task.clone(), images)
+            },
         )),
         EnvelopeBody::ToolCall {
             call_id,

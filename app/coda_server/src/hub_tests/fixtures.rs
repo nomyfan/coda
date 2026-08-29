@@ -318,6 +318,8 @@ pub(super) type UnseenOutcomeCalls = Vec<(SessionKey, Option<UnseenOutcome>)>;
 
 pub(super) struct TestOpener {
     pub(super) storage: SlowStorage,
+    /// Spool root for this test's sessions; dropped with the opener.
+    background_root: tempfile::TempDir,
     provider: TestProvider,
     team: AgentTeam,
     approval: ToolApprovalMode,
@@ -419,6 +421,7 @@ impl TestOpener {
     fn with_team(team: AgentTeam, approval: ToolApprovalMode, storage: SlowStorage) -> Self {
         Self {
             storage,
+            background_root: tempfile::tempdir().expect("temp spool root"),
             provider: TestProvider {
                 gate: Arc::new(Notify::new()),
             },
@@ -455,6 +458,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<coda_background::BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.opened_modes
@@ -484,10 +488,16 @@ impl SessionOpener for TestOpener {
                 })
                 .session_id(key.1.clone())
                 .resume_decisions(decisions)
+                .background(background)
                 .open()
                 .await?;
             Ok(session)
         })
+    }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_background::ArchiveDir, String> {
+        let dir = self.background_root.path().join(&key.0).join(&key.1);
+        coda_background::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
     }
 
     fn load_messages<'a>(
@@ -729,6 +739,26 @@ pub(super) async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState
         panic!("the entry is not live");
     };
     f(live)
+}
+
+/// The entry's background task registry, so a test can start and settle tasks
+/// the way `shell` would.
+pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_background::BackgroundProcesses> {
+    let entry = hub.get_entry(&key()).expect("a live entry");
+    let guard = entry.inner.clone().lock_owned().await;
+    guard
+        .background
+        .clone()
+        .expect("an initialized entry has a registry")
+}
+
+/// Metadata for a test task.
+pub(super) fn task_meta(command: &str) -> coda_background::TaskMeta {
+    coda_background::TaskMeta {
+        command: command.into(),
+        description: "test task".into(),
+        agent_name: "coda".into(),
+    }
 }
 
 /// Await the next `RelayEvent` matching `pred`, skipping others.

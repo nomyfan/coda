@@ -10,6 +10,7 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     compaction, runtime::SessionStorage,
 };
+use coda_background::{ArchiveDir, BackgroundProcesses};
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
 use coda_server::storage::{
@@ -102,6 +103,9 @@ struct AppState {
     /// Process-level session relay: live sessions belong here, not to the
     /// connection that opened them. See `coda_server::hub`.
     relay: Arc<dyn SessionRelay>,
+    /// Root of this run's background task spools; a deleted session's is
+    /// removed from under it.
+    background_root: PathBuf,
     /// Keepalive tuning handed to each new connection's transport.
     keepalive: KeepaliveConfig,
 }
@@ -236,6 +240,40 @@ fn task_image_data_uri_decoded_len(image: &str) -> Option<usize> {
 struct AppOpener {
     providers: HashMap<String, Arc<ProviderHandle>>,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
+    /// Where background tasks spool their output, one directory per session
+    /// beneath it. Deliberately under the system temp directory and scoped to
+    /// this run: the output is a convenience for reading a task back, not
+    /// durable history — that lives in the conversation — so it must not
+    /// accumulate across restarts. It outlives a hub entry, though, so unread
+    /// output survives a release and reopen.
+    background_root: PathBuf,
+}
+
+/// Per-session background spool directory. Session ids are validated as
+/// path-safe on the way in; workspace ids come from the config file, so they
+/// are checked here rather than trusted into a path.
+fn background_dir(root: &FsPath, workspace_id: &str, session_id: &str) -> Result<PathBuf, String> {
+    let unsafe_id =
+        |id: &str| id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']);
+    if unsafe_id(workspace_id) || unsafe_id(session_id) {
+        return Err(format!(
+            "unsafe session key: {workspace_id:?}/{session_id:?}"
+        ));
+    }
+    Ok(root.join(workspace_id).join(session_id))
+}
+
+/// Remove a session's background spool. Best-effort: its absence only costs
+/// the ability to read a finished task's output back.
+fn remove_background_dir(root: &FsPath, workspace_id: &str, session_id: &str) {
+    let Ok(dir) = background_dir(root, workspace_id, session_id) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %dir.display(), "failed to remove background task spool: {error}");
+    }
 }
 
 /// How long a compaction waits on its provider. There is no abort path — the
@@ -299,6 +337,7 @@ impl SessionOpener for AppOpener {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
+        background: Arc<BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
@@ -313,9 +352,15 @@ impl SessionOpener for AppOpener {
                 reasoning_effort,
                 permission_mode,
                 decisions,
+                background,
             )
             .await
         })
+    }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String> {
+        let dir = background_dir(&self.background_root, &key.0, &key.1)?;
+        ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
     }
 
     fn load_messages<'a>(
@@ -517,6 +562,7 @@ async fn open_session(
     reasoning_effort: Option<String>,
     permission_mode: PermissionModeCell,
     decisions: HashMap<String, ResumeDecision>,
+    background: Arc<BackgroundProcesses>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)
@@ -572,6 +618,9 @@ async fn open_session(
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
+        // Hub-owned: the entry outlives this session, so a model switch keeps
+        // the tasks it started.
+        .background(background)
         .open()
         .await
 }
@@ -1451,6 +1500,13 @@ async fn dispatch_request(
                 )
                     .into();
             }
+            // Only once the session is durably gone: until then its tasks'
+            // output is still worth keeping.
+            remove_background_dir(
+                &app.background_root,
+                &params.workspace_id,
+                &params.session_id,
+            );
             // The catalog is authoritative only after a durable delete.
             (
                 id,
@@ -2338,12 +2394,17 @@ async fn main() {
         workspaces.insert(id, Arc::new(state));
     }
 
+    // One spool root per run, named for the process so a crashed predecessor's
+    // leftovers are never adopted. Removed on the way out.
+    let background_root = std::env::temp_dir().join(format!("coda-{}", std::process::id()));
+
     // The relay owns live sessions process-wide; its opener holds its own map
     // clones so it exists independently of `AppState`.
     let relay: Arc<dyn SessionRelay> = Arc::new(SessionHub::new(
         Arc::new(AppOpener {
             providers: providers.clone(),
             workspaces: workspaces.clone(),
+            background_root: background_root.clone(),
         }),
         server_config.relay,
     ));
@@ -2355,6 +2416,7 @@ async fn main() {
         shutdown: shutdown.clone(),
         workspaces,
         relay,
+        background_root: background_root.clone(),
         keepalive: server_config.keepalive,
     });
 
@@ -2387,6 +2449,14 @@ async fn main() {
     // Stop every live session (graceful, checkpoints on disk) before tearing
     // down the MCP connections their tools may still be using.
     state.relay.shutdown_all().await;
+
+    // Every background task is gone with its session; its spooled output has
+    // no reader left.
+    if let Err(error) = std::fs::remove_dir_all(&background_root)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %background_root.display(), "failed to remove background task spool root: {error}");
+    }
 
     match Arc::try_unwrap(state) {
         Ok(app_state) => {

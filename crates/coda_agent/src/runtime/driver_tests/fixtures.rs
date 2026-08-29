@@ -1190,6 +1190,7 @@ pub(super) fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
             message_id: MessageId::new(),
             task: task.into(),
             images: vec![],
+            author: Default::default(),
         },
     })
 }

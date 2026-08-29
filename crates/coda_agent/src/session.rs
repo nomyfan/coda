@@ -19,7 +19,7 @@ use crate::{
     ToolCallResolution,
 };
 use coda_background::BackgroundProcesses;
-use coda_core::llm::{LLMProvider, Message, MessageId, TurnId};
+use coda_core::llm::{LLMProvider, Message, MessageId, TurnId, UserAuthor};
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -517,7 +517,31 @@ impl Session {
         task: impl Into<String>,
         images: Vec<String>,
     ) -> Result<(), SendCommandError> {
-        let task = task.into();
+        self.send_task(message_id, task.into(), images, UserAuthor::Human)
+            .await
+    }
+
+    /// Open a turn with a background task's outcome rather than something the
+    /// user typed. Refused with [`SendCommandError::TurnAlreadyActive`] just
+    /// like [`send`](Self::send) — the runtime runs one root turn at a time,
+    /// so a notice that arrives mid-turn waits for the caller to retry once
+    /// the turn has ended.
+    pub async fn send_task_notice(
+        &self,
+        message_id: MessageId,
+        text: impl Into<String>,
+    ) -> Result<(), SendCommandError> {
+        self.send_task(message_id, text.into(), Vec::new(), UserAuthor::TaskNotice)
+            .await
+    }
+
+    async fn send_task(
+        &self,
+        message_id: MessageId,
+        task: String,
+        images: Vec<String>,
+        author: UserAuthor,
+    ) -> Result<(), SendCommandError> {
         let thread_id = ThreadId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
         self.inner
@@ -534,6 +558,7 @@ impl Session {
                     message_id,
                     task,
                     images,
+                    author,
                 },
             }))
             .await

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompactionMessage, CompletionUsage, Message,
     MessageId, RequestMessage, SystemMessage, ToolCall, ToolCallOutcome, ToolDefinition,
-    ToolMessage, ToolOutput, TurnId, UserMessage,
+    ToolMessage, ToolOutput, TurnId, UserAuthor, UserMessage,
 };
 use coda_core::tool::Tools;
 
@@ -277,6 +277,10 @@ pub enum EnvelopeBody {
         /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+        /// Who this turn is from. A background-task notice opens a turn just
+        /// like a typed message, but is not something the human said.
+        #[serde(default)]
+        author: UserAuthor,
     },
     /// Call agent as a tool
     ToolCall {

@@ -187,27 +187,30 @@ impl MessageOrigin {
     }
 }
 
-/// Stable identity of a background-task notice *fact*, independent of its
-/// mutable payload (status, timestamp, reason). Lives here (rather than in
-/// `coda_background`) so wire and history types can carry it without a reverse
-/// crate dependency; it is identity-only and never used to build an archive
-/// path, hence the plain `String` task id.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TaskNoticeKey {
-    /// A task reached a terminal state.
-    Completed { task_id: String },
-    /// A task's retained output was later evicted by the session quota.
-    OutputExpired { task_id: String },
-    /// One overflow aggregate, identified by a stable id minted at creation so
-    /// facts it cannot enumerate individually are still deduped as a batch.
-    OverflowBatch { batch_id: String },
+/// Who authored a user-role message: the human, or the runtime relaying a
+/// background task's outcome on their behalf.
+///
+/// A task notice is a user message because that is what opens a turn — the
+/// agent has to be *told* something to act on it — but it is not something the
+/// human said, and clients must not render it as if it were.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAuthor {
+    #[default]
+    Human,
+    /// The runtime, delivering a background task's terminal outcome.
+    TaskNotice,
 }
 
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
     pub message_id: MessageId,
+    /// Who this message is from. `Human` for everything a person typed;
+    /// `TaskNotice` for the ones the runtime injects when background work
+    /// finishes. Defaults so older stored messages read back as human.
+    #[serde(default, skip_serializing_if = "UserAuthor::is_human")]
+    pub author: UserAuthor,
     /// Set on the message that opens a sub-agent thread's work, naming the
     /// parent-thread call that triggered it. `None` for a root user message,
     /// which nothing triggered.
@@ -217,6 +220,13 @@ pub struct UserMessage {
     /// When the user turn was created. Stamped by the constructors so every
     /// message carries a timestamp for the UI.
     pub created_at: jiff::Timestamp,
+}
+
+impl UserAuthor {
+    /// Serde skip predicate: the default needs no field on the wire.
+    fn is_human(&self) -> bool {
+        matches!(self, UserAuthor::Human)
+    }
 }
 
 impl UserMessage {
@@ -229,6 +239,7 @@ impl UserMessage {
     pub fn text(message_id: MessageId, text: impl Into<String>) -> Self {
         Self {
             message_id,
+            author: UserAuthor::Human,
             origin: None,
             parts: vec![ContentPart::Text { text: text.into() }],
             created_at: jiff::Timestamp::now(),
@@ -264,9 +275,20 @@ impl UserMessage {
         );
         Self {
             message_id,
+            author: UserAuthor::Human,
             origin: None,
             parts,
             created_at: jiff::Timestamp::now(),
+        }
+    }
+
+    /// Construct the message the runtime injects when a background task
+    /// finishes. It opens a turn like any user message, but says plainly who
+    /// wrote it.
+    pub fn task_notice(message_id: MessageId, text: impl Into<String>) -> Self {
+        Self {
+            author: UserAuthor::TaskNotice,
+            ..Self::text(message_id, text)
         }
     }
 
