@@ -11,6 +11,8 @@ skills/
 .claude/worktrees/
 .claude/launch.json
 coda-server.toml
+coda-server.*.toml
+.env.*
 
 # examples/ ships curated reference config; keep its whole tree tracked despite
 # the skills/, .coda, and coda-server.toml rules above. Re-include directories
