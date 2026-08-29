@@ -524,8 +524,11 @@ function historyToEntries(
         id: `task-notice:${notice.message_id}`,
         messageId: notice.message_id,
         kind: "task_notice",
-        title: taskNoticeTitle(notice.outcome),
-        detail: notice.outcome.type === "finished" ? notice.outcome.command : undefined,
+        title: taskNoticeTitle(notice.outcomes),
+        detail:
+          notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
+            ? notice.outcomes[0].command
+            : undefined,
         content: notice.content,
         startedAt: notice.created_at,
       },
@@ -534,14 +537,21 @@ function historyToEntries(
   return [];
 }
 
-function taskNoticeTitle(outcome: TaskNoticeOutcome): string {
-  switch (outcome.type) {
+/** One notice can cover several tasks — everything that finished while the
+ * previous turn ran. Name the single case precisely and the rest by count;
+ * the detail is in the body either way. */
+function taskNoticeTitle(outcomes: TaskNoticeOutcome[]): string {
+  const [only] = outcomes;
+  if (outcomes.length !== 1 || !only) {
+    return `${outcomes.length} background task updates`;
+  }
+  switch (only.type) {
     case "finished":
-      return `Background task ${outcome.status}`;
+      return `Background task ${only.status}`;
     case "output_expired":
       return "Background task output expired";
     case "capped":
-      return `${outcome.events} more background task events`;
+      return `${only.events} more background task events`;
   }
 }
 

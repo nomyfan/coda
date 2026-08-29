@@ -277,10 +277,11 @@ pub enum EnvelopeBody {
         /// Base64 data-URIs or HTTPS URLs for images to attach to this turn.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
-        /// Set when the runtime, not a person, opened this turn: a background
-        /// task reporting in. `task` is then the notice text the model reads.
+        /// Set when the runtime, not a person, opened this turn: background
+        /// tasks reporting in. `task` is then the notice text the model reads,
+        /// covering every outcome listed here. Never `Some` of an empty list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        notice: Option<TaskNoticeOutcome>,
+        notice: Option<Vec<TaskNoticeOutcome>>,
     },
     /// Call agent as a tool
     ToolCall {

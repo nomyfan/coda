@@ -214,20 +214,26 @@ pub enum TaskNoticeOutcome {
 /// what a person typed: clients render it as a notice rather than a chat
 /// bubble, it never becomes a session's preview, and a rewind cannot target it
 /// (only the human turns that bracket it).
+///
+/// `outcomes` is everything that had happened by the time a turn was free to
+/// carry it. Three tasks that finish while one turn runs are one interruption,
+/// not three, so they arrive together; a fourth that finishes after this went
+/// out gets the next turn, because there is no message left to add it to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNoticeMessage {
     pub message_id: MessageId,
-    pub outcome: TaskNoticeOutcome,
+    /// Never empty.
+    pub outcomes: Vec<TaskNoticeOutcome>,
     /// What the model reads.
     pub content: String,
     pub created_at: jiff::Timestamp,
 }
 
 impl TaskNoticeMessage {
-    pub fn new(message_id: MessageId, outcome: TaskNoticeOutcome, content: String) -> Self {
+    pub fn new(message_id: MessageId, outcomes: Vec<TaskNoticeOutcome>, content: String) -> Self {
         Self {
             message_id,
-            outcome,
+            outcomes,
             content,
             created_at: jiff::Timestamp::now(),
         }

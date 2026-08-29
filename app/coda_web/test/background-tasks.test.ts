@@ -32,12 +32,14 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
 const finished: HistoryMessage = {
   TaskNotice: {
     message_id: "notice-1",
-    outcome: {
-      type: "finished",
-      task_id: "bg_1",
-      command: "cargo build --release",
-      status: "exited with code 0",
-    },
+    outcomes: [
+      {
+        type: "finished",
+        task_id: "bg_1",
+        command: "cargo build --release",
+        status: "exited with code 0",
+      },
+    ],
     content: "Background task bg_1 finished: exited with code 0.\nCommand: cargo build --release",
     created_at: "2026-08-29T00:00:00Z",
   },
@@ -135,4 +137,36 @@ test("running tasks sort ahead of settled ones, newest first", () => {
     task("running", true, "2026-08-29T00:00:01Z"),
   ]);
   expect(ordered.map((t) => t.id)).toEqual(["running", "new-done", "old-done"]);
+});
+
+test("one notice covering several tasks is titled by count, not by the first one", () => {
+  const merged: HistoryMessage = {
+    TaskNotice: {
+      message_id: "notice-2",
+      outcomes: [
+        { type: "finished", task_id: "bg_1", command: "cargo build", status: "exited with code 0" },
+        { type: "finished", task_id: "bg_2", command: "cargo test", status: "killed" },
+      ],
+      content: "…two of them…",
+      created_at: "2026-08-29T00:00:00Z",
+    },
+  };
+  const after = applySnapshotToSession(session(), {
+    messages: [merged],
+    approvals: [],
+    providerId: "provider:model",
+    reasoningEffort: null,
+    permissionMode: "accept_edits",
+    turnRunning: false,
+    compacting: false,
+  });
+
+  expect(after.entries).toEqual([
+    expect.objectContaining({
+      kind: "task_notice",
+      title: "2 background task updates",
+      // A single command would be misleading when the notice covers two.
+      detail: undefined,
+    }),
+  ]);
 });

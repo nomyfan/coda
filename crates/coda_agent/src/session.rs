@@ -528,10 +528,10 @@ impl Session {
     pub async fn send_task_notice(
         &self,
         message_id: MessageId,
-        outcome: TaskNoticeOutcome,
+        outcomes: Vec<TaskNoticeOutcome>,
         content: impl Into<String>,
     ) -> Result<(), SendCommandError> {
-        self.send_task(message_id, content.into(), Vec::new(), Some(outcome))
+        self.send_task(message_id, content.into(), Vec::new(), Some(outcomes))
             .await
     }
 
@@ -540,7 +540,7 @@ impl Session {
         message_id: MessageId,
         task: String,
         images: Vec<String>,
-        notice: Option<TaskNoticeOutcome>,
+        notice: Option<Vec<TaskNoticeOutcome>>,
     ) -> Result<(), SendCommandError> {
         let thread_id = ThreadId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();

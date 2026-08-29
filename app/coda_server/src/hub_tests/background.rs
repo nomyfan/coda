@@ -4,6 +4,7 @@
 use super::super::*;
 use super::fixtures::*;
 use coda_agent::ToolApprovalMode;
+use coda_core::llm::TaskNoticeMessage;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -13,13 +14,19 @@ use tokio::time::{Duration, timeout};
 /// turn of its own settles, which the gated provider in these tests may never
 /// let happen.
 async fn notice_in_view(hub: &SessionHub) -> Option<String> {
+    notice_message_in_view(hub).await.map(|n| n.content)
+}
+
+/// The notice message itself, for the assertions that are about what it
+/// carries rather than what it says.
+async fn notice_message_in_view(hub: &SessionHub) -> Option<TaskNoticeMessage> {
     with_live(hub, |live| {
         let unsettled = live
             .unsettled_user_message
             .iter()
             .map(|(_, message)| message);
         live.snapshot.iter().chain(unsettled).find_map(|m| match m {
-            Message::TaskNotice(notice) => Some(notice.content.clone()),
+            Message::TaskNotice(notice) => Some(notice.clone()),
             _ => None,
         })
     })
@@ -315,5 +322,90 @@ async fn killing_a_task_from_the_client_settles_it() {
         CommandOutcome::Ignored
     ));
 
+    hub.shutdown_all().await;
+}
+
+/// Three tasks finishing while one turn runs is one interruption, not three:
+/// everything waiting when a turn frees up goes out together.
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_that_pile_up_during_a_turn_arrive_as_one() {
+    let (hub, gate) = hub_with("hold", ToolApprovalMode::Auto);
+    let attach = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .expect("attach");
+    let mut events = attach.events;
+
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: "work".into(),
+            images: vec![],
+        },
+    )
+    .await;
+
+    let background = background_of(&hub).await;
+    for i in 0..3 {
+        background
+            .spawn_with(task_meta(&format!("echo {i}")), |_ctx| async {
+                coda_background::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .expect("spawn");
+    }
+
+    // All three must actually have finished before the turn frees up, or this
+    // would be testing the timing rather than the merging.
+    let mut summaries = background.summaries();
+    timeout(Duration::from_secs(5), async {
+        while summaries
+            .borrow_and_update()
+            .iter()
+            .any(|t| t.status.is_running())
+        {
+            summaries.changed().await.expect("registry alive");
+        }
+    })
+    .await
+    .expect("tasks never settled");
+
+    gate.notify_one();
+    next_matching(&mut events, is_settling_llm_end).await;
+
+    let notice = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(notice) = notice_message_in_view(&hub).await {
+                return notice;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the notices were never delivered");
+
+    assert_eq!(
+        notice.outcomes.len(),
+        3,
+        "each task should be a fact of the one message, not a turn of its own"
+    );
+    for i in 0..3 {
+        assert!(
+            notice.content.contains(&format!("echo {i}")),
+            "task {i} missing from the notice: {}",
+            notice.content
+        );
+    }
+
+    gate.notify_one();
+    wait_idle(&hub).await;
     hub.shutdown_all().await;
 }

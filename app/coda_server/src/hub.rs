@@ -1000,14 +1000,22 @@ impl SessionHub {
         background
     }
 
-    /// Hand one pending notice to the session as its own turn. Returns whether
-    /// a turn was started, which is also what tells the caller the entry is no
+    /// Hand every pending notice to the session as one turn. Returns whether a
+    /// turn was started, which is also what tells the caller the entry is no
     /// longer idle.
-    ///
-    /// Notices are never merged: each finished task gets its own turn, so a
-    /// second one waits here until this turn settles.
-    async fn deliver_pending_notice(state: &mut EntryState, key: &SessionKey) -> bool {
-        if state.compacting || state.pending_notices.is_empty() {
+    async fn deliver_pending_notices(state: &mut EntryState, key: &SessionKey) -> bool {
+        if state.compacting {
+            return false;
+        }
+        // Take whatever the registry is holding first. The watcher drains on
+        // its own schedule — one wake per task settling — so without this a
+        // turn ending mid-flurry would carry only the notices that happened to
+        // have been drained by then, and the rest would each get a turn.
+        if let Some(background) = state.background.clone() {
+            let fresh = background.take_notices().await;
+            state.pending_notices.extend(fresh);
+        }
+        if state.pending_notices.is_empty() {
             return false;
         }
         let EntryPhase::Live(live) = &mut state.phase else {
@@ -1022,27 +1030,34 @@ impl SessionHub {
         {
             return false;
         }
-        let Some(notice) = state.pending_notices.pop_front() else {
-            return false;
-        };
-        let text = notice.render();
-        let outcome = notice.outcome();
+        // Everything waiting goes in one message. Tasks that finished while a
+        // turn ran are one interruption, not one each; what cannot be merged is
+        // a notice that arrives after this has gone out, and that one simply
+        // gets the next turn.
+        let notices: Vec<TaskNotice> = state.pending_notices.drain(..).collect();
+        let text = notices
+            .iter()
+            .map(TaskNotice::render)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let outcomes: Vec<_> = notices.iter().map(TaskNotice::outcome).collect();
         let message_id = MessageId::new();
         if let Err(err) = live
             .session
-            .send_task_notice(message_id, outcome.clone(), text.clone())
+            .send_task_notice(message_id, outcomes.clone(), text.clone())
             .await
         {
-            warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notice: {err}");
-            // Keep it: the session refusing now says nothing about later, and
-            // dropping it would lose the only record that the task ended.
-            state.pending_notices.push_front(notice);
+            warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notices: {err}");
+            // Keep them, in order: the session refusing now says nothing about
+            // later, and dropping them would lose the only record that those
+            // tasks ended.
+            state.pending_notices.extend(notices);
             return false;
         }
         live.turn_running = true;
         live.unsettled_user_message = Some((
             TurnId::from(message_id),
-            Message::TaskNotice(TaskNoticeMessage::new(message_id, outcome, text)),
+            Message::TaskNotice(TaskNoticeMessage::new(message_id, outcomes, text)),
         ));
         true
     }
@@ -2098,14 +2113,12 @@ fn spawn_notice_watcher(
                 ) {
                     return;
                 }
-                let notices = background.take_notices().await;
-                guard.pending_notices.extend(notices);
                 if changed && let Some(attachment) = &guard.attached {
                     let _ = attachment
                         .tx
                         .send(RelayEvent::BackgroundTasks(current_tasks(&guard)));
                 }
-                SessionHub::deliver_pending_notice(&mut guard, &entry.key).await;
+                SessionHub::deliver_pending_notices(&mut guard, &entry.key).await;
                 if let Some(release) = SessionHub::maybe_release(&entries, &entry, &mut guard) {
                     drop(guard);
                     release.await;
@@ -2276,7 +2289,7 @@ async fn run_forwarder(
                     // one. Checked before the bookkeeping below, so a session
                     // that is about to keep working is not recorded as having
                     // finished unattended.
-                    let delivered = SessionHub::deliver_pending_notice(state, &entry.key).await;
+                    let delivered = SessionHub::deliver_pending_notices(state, &entry.key).await;
                     let EntryPhase::Live(live) = &mut state.phase else {
                         return;
                     };

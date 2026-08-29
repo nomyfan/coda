@@ -2128,9 +2128,9 @@ fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, Message)> {
         } => Some((
             TurnId::from(*message_id),
             match notice {
-                Some(outcome) => Message::TaskNotice(TaskNoticeMessage::new(
+                Some(outcomes) => Message::TaskNotice(TaskNoticeMessage::new(
                     *message_id,
-                    outcome.clone(),
+                    outcomes.clone(),
                     task.clone(),
                 )),
                 None => Message::User(UserMessage::with_images(*message_id, task.clone(), images)),

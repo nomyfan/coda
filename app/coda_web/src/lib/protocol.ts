@@ -100,10 +100,13 @@ export type TaskNoticeOutcome =
 /** A record the runtime authored when background work finished. It opens a
  * turn of its own — the model is told about it as a user message — but it is
  * not something the user said, so it renders as a notice rather than a bubble
- * and cannot be a rewind or fork target. */
+ * and cannot be a rewind or fork target.
+ *
+ * `outcomes` is everything that had happened by the time a turn was free to
+ * carry it: tasks finishing during one turn arrive together. Never empty. */
 export type TaskNoticeMessage = {
   message_id: string;
-  outcome: TaskNoticeOutcome;
+  outcomes: TaskNoticeOutcome[];
   /** What the model was told. */
   content: string;
   created_at: string;
