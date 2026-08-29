@@ -102,6 +102,12 @@ pub enum RelayEvent {
     /// stream: tasks outlive turns, so their comings and goings are not a
     /// turn's history.
     BackgroundTasks(Arc<[TaskSummary]>),
+    /// The runtime opened a turn with a background-task notice. The event
+    /// stream carries no user-role messages — a human's own message is the
+    /// client's optimistic copy — so a message nobody typed has to be handed
+    /// over explicitly, or an attached client would not see it until it
+    /// re-attached. Sent under the entry lock, ahead of that turn's events.
+    TaskNotice(Box<TaskNoticeMessage>),
     /// The session's state changed outside the event stream and the attached
     /// client needs the whole picture again. Unlike the two below, the stream
     /// continues after it.
@@ -1054,11 +1060,17 @@ impl SessionHub {
             state.pending_notices.extend(notices);
             return false;
         }
+        let notice = TaskNoticeMessage::new(message_id, outcomes, text);
+        if let Some(attachment) = &state.attached {
+            let _ = attachment
+                .tx
+                .send(RelayEvent::TaskNotice(Box::new(notice.clone())));
+        }
+        let EntryPhase::Live(live) = &mut state.phase else {
+            unreachable!("phase was Live above and the lock was never released");
+        };
         live.turn_running = true;
-        live.unsettled_user_message = Some((
-            TurnId::from(message_id),
-            Message::TaskNotice(TaskNoticeMessage::new(message_id, outcomes, text)),
-        ));
+        live.unsettled_user_message = Some((TurnId::from(message_id), Message::TaskNotice(notice)));
         true
     }
 

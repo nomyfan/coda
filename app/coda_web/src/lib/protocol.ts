@@ -302,6 +302,16 @@ export type BackgroundTasksPush = {
   tasks: TaskSummary[];
 };
 
+/** The runtime opened a turn with a background-task notice. Pushed rather than
+ * carried on the event stream, which has no user-role messages in it: a
+ * human's own message is the client's optimistic copy, and one nobody typed
+ * has to be handed over. Arrives ahead of that turn's events. */
+export type TaskNoticePush = {
+  workspace_id: string;
+  session_id: string;
+  message: TaskNoticeMessage;
+};
+
 type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
 
 /** `list_files` result: the ranked matches for one `@` query. `truncated` says
@@ -460,6 +470,7 @@ export type RpcPushes = {
   session_evicted: SessionRef;
   session_status: SessionStatusPush;
   background_tasks: BackgroundTasksPush;
+  task_notice: TaskNoticePush;
 };
 
 export type WireEvent =

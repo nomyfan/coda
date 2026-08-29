@@ -49,8 +49,8 @@ use coda_server::{
         PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
         RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
         SessionStatusWire, SessionSummaryWire, SetModelParams, SetPermissionModeParams,
-        SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskParams, TaskSummaryWire,
-        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskNoticePush, TaskParams,
+        TaskSummaryWire, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -2056,6 +2056,14 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                             workspace_id: key.0.clone(),
                             session_id: key.1.clone(),
                             tasks: tasks.iter().cloned().map(TaskSummaryWire::from).collect(),
+                        })
+                        .await
+                    }
+                    RelayEvent::TaskNotice(message) => {
+                        send_notify(&transport, "task_notice", &TaskNoticePush {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            message: *message,
                         })
                         .await
                     }

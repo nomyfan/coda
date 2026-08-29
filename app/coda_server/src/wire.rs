@@ -2,7 +2,8 @@ use crate::config::{PermissionMode, ToolApprovalConfig, extract_shell_command};
 use crate::files::FileEntry;
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{
-    AssistantMessage, CompactionMessage, Message, MessageId, Modality, ToolCall, ToolMessage,
+    AssistantMessage, CompactionMessage, Message, MessageId, Modality, TaskNoticeMessage, ToolCall,
+    ToolMessage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -497,6 +498,16 @@ impl From<coda_background::TaskSummary> for TaskSummaryWire {
             started_at: summary.started_at.to_string(),
         }
     }
+}
+
+/// Push payload for a runtime-authored task notice: the message that opened
+/// the turn. Separate from the event stream, which carries no user-role
+/// messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNoticePush {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub message: TaskNoticeMessage,
 }
 
 /// Push payload for a session's background task list.

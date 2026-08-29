@@ -16,6 +16,7 @@ import {
   RpcCode,
   type SkillInfo,
   type TaskNoticeOutcome,
+  type TaskNoticeMessage,
   type TaskSummary,
   type ToolCall,
   type ToolCallResolution,
@@ -1816,6 +1817,30 @@ function applySnapshot(
   rememberSessionMode(server, workspaceId, sessionId, permissionMode);
 }
 
+/** A notice the runtime wrote opened a turn. It never comes over the event
+ * stream — that carries no user-role messages — so it is appended here, ahead
+ * of the events of the turn it opened. */
+function appendTaskNotice(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  message: TaskNoticeMessage,
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const entries = historyToEntries({ TaskNotice: message }, {}, {});
+    // A resync can land the same notice from the snapshot; the id is the
+    // message's, so this stays idempotent.
+    const known = new Set(session.entries.map((entry) => entry.id));
+    session.entries.push(...entries.filter((entry) => !known.has(entry.id)));
+  });
+}
+
 /** The session's task list changed. Its own push: tasks outlive turns, so
  * their comings and goings are not part of a turn's event stream. */
 function applyBackgroundTasks(
@@ -2607,6 +2632,9 @@ export function connectServer(rawUrl: string) {
   });
   rpc.addMethod("background_tasks", (params) => {
     applyBackgroundTasks(codaStore, server, params.workspace_id, params.session_id, params.tasks);
+  });
+  rpc.addMethod("task_notice", (params) => {
+    appendTaskNotice(codaStore, server, params.workspace_id, params.session_id, params.message);
   });
   rpc.addMethod("session_evicted", (params) => {
     applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
