@@ -45,12 +45,12 @@ use coda_server::{
     wire::{
         AddAllowPatternParams, BackgroundTasksPush, CompactParams, CompactResult,
         DeleteSessionParams, EventParams, FileCatalog, ForkAccepted, ForkSessionParams,
-        ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams, PendingApprovalWire,
-        PermissionModeSelection, ProviderCatalog, ProviderInfoWire, RenameSessionParams,
-        ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef, SessionStatusWire,
-        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
-        Snapshot, TaskAccepted, TaskParams, TaskSummaryWire, WireEvent, WorkspaceCatalog,
-        WorkspaceSummaryWire,
+        KillTaskParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
+        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
+        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
+        SessionStatusWire, SessionSummaryWire, SetModelParams, SetPermissionModeParams,
+        SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskParams, TaskSummaryWire,
+        WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -1677,6 +1677,26 @@ async fn dispatch_notification<T: Transport>(
             }
             Err(err) => {
                 warn!("ignoring malformed abort notification: {}", err.message);
+                true
+            }
+        },
+        // Fire-and-forget like `abort`: the answer the user cares about is the
+        // task list, which the hub pushes on its own.
+        "kill_task" => match parse_params::<KillTaskParams>(params) {
+            Ok(params) => {
+                app.relay
+                    .command(
+                        (params.workspace_id, params.session_id),
+                        conn_id,
+                        SessionCommand::KillTask {
+                            task_id: params.task_id,
+                        },
+                    )
+                    .await;
+                true
+            }
+            Err(err) => {
+                warn!("ignoring malformed kill_task notification: {}", err.message);
                 true
             }
         },

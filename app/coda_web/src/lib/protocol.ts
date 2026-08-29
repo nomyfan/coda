@@ -444,6 +444,9 @@ export type RpcNotifications = {
     decision: ResumeDecision;
   };
   abort: SessionRef;
+  /** Stop a background task. Fire-and-forget like `abort`: the answer is the
+   * task list, which the server pushes on its own. */
+  kill_task: { workspace_id: string; session_id: string; task_id: string };
   close_session: SessionRef;
 };
 

@@ -337,6 +337,22 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     let read = reg.read(&id).await.unwrap().unwrap();
     assert!(matches!(read.status, TaskStatus::Interrupted { .. }));
     assert_eq!(read.stdout, "saved");
+
+    // Dying with the server is still a way for a task to end, so it owes the
+    // model a notice — the same one a normal completion would produce.
+    let notices = reg.take_notices().await;
+    let TaskNotice::Task {
+        id: noticed,
+        status,
+        output_tail,
+        ..
+    } = notices.first().expect("an interrupted task notifies")
+    else {
+        panic!("unexpected notice: {:?}", notices[0]);
+    };
+    assert_eq!(noticed, &id);
+    assert!(matches!(status, TaskStatus::Interrupted { .. }));
+    assert_eq!(output_tail, "saved");
 }
 
 #[tokio::test]

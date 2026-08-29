@@ -242,3 +242,78 @@ async fn a_model_switch_keeps_the_running_tasks() {
     release.notify_one();
     hub.shutdown_all().await;
 }
+
+/// The user can stop a task themselves: killing needs no live turn and no
+/// agreement from the model, since the registry belongs to the entry rather
+/// than to whatever the runtime is doing.
+#[tokio::test(flavor = "multi_thread")]
+async fn killing_a_task_from_the_client_settles_it() {
+    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
+    let _events = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .expect("attach");
+
+    let background = background_of(&hub).await;
+    let id = background
+        .spawn_with(task_meta("sleep"), |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            coda_background::TaskExit::Killed
+        })
+        .await
+        .expect("spawn");
+
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::KillTask {
+                task_id: id.to_string(),
+            },
+        )
+        .await,
+        CommandOutcome::Ok
+    ));
+
+    let read = background
+        .read(&id)
+        .await
+        .expect("registry readable")
+        .expect("task still known");
+    assert_eq!(read.status.describe(), "killed");
+
+    // Killing something already gone is not an error — the list the user
+    // clicked from is allowed to be a moment stale — but an id that never
+    // existed is.
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::KillTask {
+                task_id: id.to_string(),
+            },
+        )
+        .await,
+        CommandOutcome::Ok
+    ));
+    assert!(matches!(
+        hub.command(
+            key(),
+            1,
+            SessionCommand::KillTask {
+                task_id: "bg_00000000000000000000000000000000".into(),
+            },
+        )
+        .await,
+        CommandOutcome::Ignored
+    ));
+
+    hub.shutdown_all().await;
+}

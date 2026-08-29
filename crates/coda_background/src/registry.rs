@@ -602,7 +602,21 @@ impl BackgroundProcesses {
             {
                 tracing::warn!(task = id.as_str(), error = %error, "Interrupted task output finalize failed");
             }
+            // A task the previous incarnation was running ended without
+            // anyone being told — the process died with the server. That is a
+            // terminal fact like any other, so it is queued as a notice and
+            // reaches the model the same way a normal completion does.
+            let output_tail = terminal_tail(&record).await;
             let mut inner = self.inner.lock().await;
+            inner.push_notice(TaskNotice::Task {
+                id: id.clone(),
+                command: record.meta().command.clone(),
+                description: record.meta().description.clone(),
+                status: status.clone(),
+                output_tail,
+                stdout_overwritten: 0,
+                stderr_overwritten: 0,
+            });
             inner.summaries.insert(
                 id.clone(),
                 TaskSummary {

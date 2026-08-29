@@ -390,6 +390,14 @@ pub struct SetPermissionModeParams {
     pub mode: PermissionMode,
 }
 
+/// Params of `kill_task`: which background task to terminate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KillTaskParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub task_id: String,
+}
+
 /// Result of `set_permission_mode`: the mode now in effect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionModeSelection {

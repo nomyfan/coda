@@ -3343,6 +3343,20 @@ export function abort() {
   }
 }
 
+/** Stop one of the active session's background tasks. Optimistically nothing:
+ * the server pushes the updated list, and killing something that has already
+ * settled is a no-op there. */
+export function killBackgroundTask(taskId: string) {
+  const active = currentActive();
+  if (active) {
+    notify(active.server, "kill_task", {
+      workspace_id: active.session.workspaceId,
+      session_id: active.session.sessionId,
+      task_id: taskId,
+    });
+  }
+}
+
 /** Stage (or clear, with `null`) an "always allow" pattern for a call. The
  * pattern is only sent to the server on submit, so the choice is cancelable. */
 export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern: string | null) {

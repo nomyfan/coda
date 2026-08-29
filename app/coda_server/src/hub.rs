@@ -86,6 +86,12 @@ pub enum SessionCommand {
     Compact {
         instructions: String,
     },
+    /// SIGKILL a background task's process group. Needs no live runtime — the
+    /// registry belongs to the entry — so it works while a turn is in flight,
+    /// which is exactly when a user watching a runaway task wants it.
+    KillTask {
+        task_id: String,
+    },
 }
 
 /// An element of the per-attachment event stream.
@@ -1700,6 +1706,24 @@ impl SessionRelay for SessionHub {
                     state.permission_mode.set(mode);
                     info!(workspace_id = %key.0, session_id = %key.1, "permission mode set to {mode:?}");
                     CommandOutcome::Ok
+                }
+                SessionCommand::KillTask { task_id } => {
+                    let Some(background) = state.background.clone() else {
+                        return CommandOutcome::Ignored;
+                    };
+                    let Ok(parsed) = task_id.parse() else {
+                        return CommandOutcome::Ignored;
+                    };
+                    match background.kill(&parsed).await {
+                        // Killing an already-finished task is not an error:
+                        // the list the user clicked from can be a moment stale.
+                        Ok(Some(_)) => CommandOutcome::Ok,
+                        Ok(None) => CommandOutcome::Ignored,
+                        Err(error) => {
+                            warn!(workspace_id = %key.0, session_id = %key.1, "failed to kill task: {error}");
+                            CommandOutcome::Ignored
+                        }
+                    }
                 }
                 SessionCommand::Compact { .. } => unreachable!("taken by the guard above"),
             }

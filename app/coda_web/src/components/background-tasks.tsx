@@ -1,10 +1,10 @@
 import { memo } from "react";
-import { ListChecks, X } from "lucide-react";
+import { ListChecks, Square, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { TaskSummary } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
-import { selectActiveBackgroundTasks, useCodaStore } from "@/store/session";
+import { killBackgroundTask, selectActiveBackgroundTasks, useCodaStore } from "@/store/session";
 
 /** Running first, then most recently started — the ones still worth watching
  * stay at the top as older ones settle beneath them. */
@@ -32,6 +32,18 @@ function TaskRow({ task }: { task: TaskSummary }) {
         <span className="min-w-0 flex-1 truncate font-mono text-xs" title={task.command}>
           {task.command}
         </span>
+        {task.running ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
+            onClick={() => killBackgroundTask(task.id)}
+            title="Stop this task"
+            aria-label={`Stop ${task.command}`}
+          >
+            <Square className="size-3" />
+          </Button>
+        ) : null}
       </div>
       {task.description ? (
         <p className="mt-1 truncate text-xs text-muted-foreground" title={task.description}>
