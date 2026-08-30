@@ -58,7 +58,7 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
     background
         .spawn_with(task_meta("sleep"), move |_ctx| async move {
             held.notified().await;
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -81,7 +81,7 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err(),
@@ -113,7 +113,7 @@ async fn release_check_cannot_overtake_a_published_completion_notice() {
     background
         .spawn_with(task_meta("race"), move |_ctx| async move {
             task_finish.notified().await;
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();
@@ -171,7 +171,7 @@ async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -200,7 +200,7 @@ async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()
@@ -232,7 +232,7 @@ async fn shutdown_all_waits_for_an_in_flight_delete() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn stream_ended_release_closes_the_external_registry_before_map_removal() 
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -324,7 +324,7 @@ async fn stream_ended_release_closes_the_external_registry_before_map_removal() 
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()
@@ -352,7 +352,7 @@ async fn a_finished_task_opens_a_turn_of_its_own() {
     let background = background_of(&hub).await;
     background
         .spawn_with(task_meta("echo hi"), |_ctx| async {
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -406,7 +406,7 @@ async fn a_notice_arriving_mid_turn_waits_for_the_turn_to_end() {
     let background = background_of(&hub).await;
     background
         .spawn_with(task_meta("echo hi"), |_ctx| async {
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -464,7 +464,7 @@ async fn a_model_switch_keeps_the_running_tasks() {
     let id = before
         .spawn_with(task_meta("sleep"), move |_ctx| async move {
             held.notified().await;
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -522,7 +522,7 @@ async fn killing_a_task_from_the_client_settles_it() {
     let id = background
         .spawn_with(task_meta("sleep"), |ctx| async move {
             ctx.cancelled().cancelled().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .expect("spawn");
@@ -607,7 +607,7 @@ async fn notices_that_pile_up_during_a_turn_arrive_as_one() {
     for i in 0..3 {
         background
             .spawn_with(task_meta(&format!("echo {i}")), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .expect("spawn");

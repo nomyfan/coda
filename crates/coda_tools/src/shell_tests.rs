@@ -220,14 +220,14 @@ async fn sentinel_spawn_failure_fails_the_call_without_running_the_command() {
     let marker = std::env::temp_dir().join(format!("coda-shell-sentinel-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
-    coda_background::process::set_sentinel_failure(true);
+    coda_process::process::set_sentinel_failure(true);
     let result = tool()
         .execute(
             params(&format!("touch '{}'", marker.display())),
             ToolCallContext::default(),
         )
         .await;
-    coda_background::process::set_sentinel_failure(false);
+    coda_process::process::set_sentinel_failure(false);
 
     assert!(
         matches!(result, Err(ToolError::ExecutionError(_))),
@@ -412,7 +412,7 @@ async fn a_background_task_settles_at_once_and_outlives_the_timeout() {
         .find(|word| word.starts_with("bg_"))
         .map(|word| word.trim_end_matches('.'))
         .expect("no task id in the result");
-    let id = coda_background::TaskId::from_str(id).expect("well-formed task id");
+    let id = coda_process::TaskId::from_str(id).expect("well-formed task id");
 
     tokio::time::sleep(Duration::from_millis(600)).await;
     let read = background

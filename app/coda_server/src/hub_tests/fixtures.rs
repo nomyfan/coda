@@ -479,7 +479,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Arc<coda_background::BackgroundProcesses>,
+        background: Arc<coda_process::BackgroundProcesses>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls
@@ -520,9 +520,9 @@ impl SessionOpener for TestOpener {
         })
     }
 
-    fn background_archive(&self, key: &SessionKey) -> Result<coda_background::ArchiveDir, String> {
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_process::ArchiveDir, String> {
         let dir = self.background_root.path().join(&key.0).join(&key.1);
-        coda_background::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
+        coda_process::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
     }
 
     /// Stands in for the SQL delete plus the spool removal. `MemoryStorage`
@@ -802,7 +802,7 @@ pub(super) async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState
 
 /// The entry's background task registry, so a test can start and settle tasks
 /// the way `shell` would.
-pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_background::BackgroundProcesses> {
+pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundProcesses> {
     let entry = hub.get_entry(&key()).expect("a live entry");
     let guard = entry.inner.clone().lock_owned().await;
     guard
@@ -818,8 +818,8 @@ pub(super) fn spool_dir(opener: &TestOpener, key: &SessionKey) -> std::path::Pat
 }
 
 /// Metadata for a test task.
-pub(super) fn task_meta(command: &str) -> coda_background::TaskMeta {
-    coda_background::TaskMeta {
+pub(super) fn task_meta(command: &str) -> coda_process::TaskMeta {
+    coda_process::TaskMeta {
         command: command.into(),
         description: "test task".into(),
         agent_name: "coda".into(),

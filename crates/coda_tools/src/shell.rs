@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use coda_background::{BackgroundProcesses, TaskMeta};
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
+use coda_process::{BackgroundProcesses, TaskMeta};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;

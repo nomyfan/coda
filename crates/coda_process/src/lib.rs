@@ -1,5 +1,12 @@
-//! Session-scoped background task execution (design:
-//! `docs/design/background-tasks.md`, `docs/design/background-task-output-spool.md`).
+//! Running child processes on behalf of an agent, in both tenses.
+//!
+//! [`process`] holds the primitive every caller shares — [`GroupedChild`], a
+//! command pinned inside a killable process group — whether the command is
+//! awaited within a turn (`coda_tools`' foreground path: `shell`, `grep`,
+//! `glob`, `ls`) or outlives it. It depends on nothing else here.
+//!
+//! The rest is the background half (design: `docs/design/background-tasks.md`,
+//! `docs/design/background-task-output-spool.md`).
 //!
 //! [`BackgroundProcesses`] owns the lifecycle of background work independently
 //! of any turn: tasks are started via [`BackgroundProcesses::spawn_with`],

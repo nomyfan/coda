@@ -1,4 +1,4 @@
-//! Thin tool shells over the `coda_background` task registry: `task_output` reads
+//! Thin tool shells over the `coda_process` task registry: `task_output` reads
 //! incremental output, `task_kill` terminates a task. Both are buildable for
 //! any agent that is granted them (the registry handle is always present in
 //! the build context) — they are not tied to `shell`.
@@ -10,7 +10,7 @@ use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
-use coda_background::{BackgroundProcesses, TaskId};
+use coda_process::{BackgroundProcesses, TaskId};
 
 fn unknown_task(id: &str) -> String {
     format!(
@@ -182,7 +182,7 @@ impl Tool for TaskKillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coda_background::TaskMeta;
+    use coda_process::TaskMeta;
     use tokio::process::Command;
 
     fn bash(command: &str) -> Command {

@@ -1,5 +1,5 @@
 [package]
-name = "coda_background"
+name = "coda_process"
 version = "0.1.0"
 edition = "2024"
 

@@ -30,8 +30,8 @@ use tokio::{
 /// A throwaway background-task registry, for the driver tests that only need
 /// `AgentTeam::build` to have one. Each call gets its own, so nothing leaks
 /// between tests.
-pub(super) fn test_registry() -> std::sync::Arc<coda_background::BackgroundProcesses> {
-    std::sync::Arc::new(coda_background::BackgroundProcesses::temporary())
+pub(super) fn test_registry() -> std::sync::Arc<coda_process::BackgroundProcesses> {
+    std::sync::Arc::new(coda_process::BackgroundProcesses::temporary())
 }
 
 /// Base assistant message for tests; callers override the fields they care

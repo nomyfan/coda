@@ -21,8 +21,8 @@ use coda_agent::{
     AgentEvent, OpenError, PendingApproval, ResumeDecision, Session, SessionStreamItem, Shutdown,
     runtime::SendCommandError,
 };
-use coda_background::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
 use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
+use coda_process::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};

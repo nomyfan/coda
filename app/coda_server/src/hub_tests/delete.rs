@@ -79,7 +79,7 @@ async fn persisted_state_goes_only_after_the_runtime_and_registry_are_down() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -248,7 +248,7 @@ async fn deleting_a_session_removes_its_task_spool() {
     background_of(&hub)
         .await
         .spawn_with(task_meta("echo spooled"), |_ctx| async {
-            coda_background::TaskExit::Exited { code: Some(0) }
+            coda_process::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();

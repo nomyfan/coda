@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_background::BackgroundProcesses;
+use coda_process::BackgroundProcesses;
 use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
 
 use crate::agent::{

@@ -1,7 +1,7 @@
 # Background Task Execution — 设计方案(Step 2)
 
 > **搬迁说明（2026-08-29）**：本文写于 session 存储还在文件系统的时代，引擎已迁入
-> `crates/coda_background`。执行引擎、进程组、终态提交协议、通知队列与配额语义仍然有效
+> `crates/coda_process`。执行引擎、进程组、终态提交协议、通知队列与配额语义仍然有效
 > 且已随代码搬迁；**接线层的下列决定已被 main 作废，须重新设计**：
 >
 > - `WorkspaceStorage::session_dir` 已不存在（session 存储迁往 PostgreSQL），因此

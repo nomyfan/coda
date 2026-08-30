@@ -351,7 +351,7 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -384,7 +384,7 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()

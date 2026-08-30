@@ -18,8 +18,8 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
-use coda_background::BackgroundProcesses;
 use coda_core::llm::{LLMProvider, Message, MessageId, TaskNoticeOutcome, TurnId};
+use coda_process::BackgroundProcesses;
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;

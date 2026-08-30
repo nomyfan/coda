@@ -519,8 +519,8 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "coda_agent"
 version = "0.1.0"
 dependencies = [
- "coda_background",
  "coda_core",
+ "coda_process",
  "coda_tools",
  "futures",
  "jiff",
@@ -531,22 +531,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "coda_background"
-version = "0.1.0"
-dependencies = [
- "coda_core",
- "jiff",
- "libc",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -593,6 +577,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda_process"
+version = "0.1.0"
+dependencies = [
+ "coda_core",
+ "jiff",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "coda_ptc"
 version = "0.1.0"
 dependencies = [
@@ -613,10 +613,10 @@ dependencies = [
  "brush-parser",
  "clap",
  "coda_agent",
- "coda_background",
  "coda_core",
  "coda_mcp",
  "coda_openai",
+ "coda_process",
  "coda_skills",
  "coda_tools",
  "diesel",
@@ -654,8 +654,8 @@ dependencies = [
 name = "coda_tools"
 version = "0.1.0"
 dependencies = [
- "coda_background",
  "coda_core",
+ "coda_process",
  "coda_ptc",
  "diffy",
  "libc",

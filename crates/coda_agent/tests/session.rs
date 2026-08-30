@@ -1179,7 +1179,7 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
         .background()
         .spawn(
             cmd,
-            coda_background::TaskMeta {
+            coda_process::TaskMeta {
                 command: "sleep".into(),
                 description: "owned task".into(),
                 agent_name: "coda".into(),

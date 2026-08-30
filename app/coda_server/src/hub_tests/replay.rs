@@ -497,7 +497,7 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_background::TaskExit::Killed
+            coda_process::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -527,7 +527,7 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_background::TaskExit::Exited { code: Some(0) }
+                coda_process::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()

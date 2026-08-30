@@ -6,7 +6,7 @@ members = [
   "crates/coda_skills",
   "crates/coda_mcp",
   "crates/coda_tools",
-  "crates/coda_background",
+  "crates/coda_process",
   "crates/coda_ptc",
   "app/coda_server",
 ]
@@ -14,10 +14,10 @@ resolver = "3"
 
 [workspace.dependencies]
 coda_agent = { path = "crates/coda_agent" }
-coda_background = { path = "crates/coda_background" }
 coda_core = { path = "crates/coda_core" }
 coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
+coda_process = { path = "crates/coda_process" }
 coda_skills = { path = "crates/coda_skills" }
 coda_tools = { path = "crates/coda_tools" }
 coda_ptc = { path = "crates/coda_ptc" }

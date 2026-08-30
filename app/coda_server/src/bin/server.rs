@@ -10,9 +10,9 @@ use coda_agent::{
     AgentTeam, ModelProfile, OpenError, ResumeDecision, RunConfig, Session, SharedSystemPrompt,
     compaction, runtime::SessionStorage,
 };
-use coda_background::{ArchiveDir, BackgroundProcesses, BackgroundRootLock};
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
+use coda_process::{ArchiveDir, BackgroundProcesses, BackgroundRootLock};
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
 };

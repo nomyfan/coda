@@ -486,8 +486,8 @@ pub struct TaskSummaryWire {
     pub started_at: String,
 }
 
-impl From<coda_background::TaskSummary> for TaskSummaryWire {
-    fn from(summary: coda_background::TaskSummary) -> Self {
+impl From<coda_process::TaskSummary> for TaskSummaryWire {
+    fn from(summary: coda_process::TaskSummary) -> Self {
         Self {
             id: summary.id,
             command: summary.command,

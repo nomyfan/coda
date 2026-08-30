@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
-use coda_background::BackgroundProcesses;
+use coda_process::BackgroundProcesses;
 
 use crate::locks::KeyedLock;
 use crate::{
