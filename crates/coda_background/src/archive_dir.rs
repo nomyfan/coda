@@ -449,6 +449,39 @@ mod tests {
     }
 
     #[test]
+    fn background_root_lock_relative_root_child_helper() {
+        if std::env::var_os("CODA_BACKGROUND_LOCK_RELATIVE_CHILD").is_none() {
+            return;
+        }
+        let _lock = BackgroundRootLock::acquire(Path::new("background")).unwrap();
+        assert!(Path::new("background/.lock").is_file());
+    }
+
+    #[test]
+    fn background_root_lock_accepts_a_root_relative_to_the_working_directory() {
+        // `background.root = "background"` beside a config named by a bare
+        // filename resolves to this shape: one component, empty parent. A child
+        // process because such a path means nothing without a cwd, and every
+        // test in a binary shares one.
+        let tmp = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "archive_dir::tests::background_root_lock_relative_root_child_helper",
+                "--nocapture",
+            ])
+            .env("CODA_BACKGROUND_LOCK_RELATIVE_CHILD", "1")
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "a single-component relative root was refused"
+        );
+        assert!(tmp.path().join("background").join(".lock").is_file());
+    }
+
+    #[test]
     fn background_root_lock_is_exclusive_across_processes_and_released_on_exit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("background");

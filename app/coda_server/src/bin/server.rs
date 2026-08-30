@@ -245,13 +245,26 @@ struct AppOpener {
     background_root: PathBuf,
 }
 
-/// Per-session background spool directory. Session ids are validated as
-/// path-safe on the way in; workspace ids come from the config file, so they
-/// are checked here rather than trusted into a path.
+/// Where a retired spool waits to be deleted, beside the root's own `.lock`.
+/// The leading dot is what puts it out of reach: `background_dir` refuses one.
+const BACKGROUND_TRASH_DIR: &str = ".trash";
+
+/// Per-session background spool directory. Both ids are validated on the way in
+/// — `config::is_workspace_id` and `storage::validate_session_id` — and checked
+/// again here rather than trusted into a path.
+///
+/// The two rules differ because the levels do. A workspace names a directory in
+/// the root, where `.lock` and `.trash` live, so it may not start with a dot;
+/// under it a session id names nothing reserved, so it only has to be a plain
+/// component. Keeping the session rule to what `validate_session_id` already
+/// rejects is what stops an id the API accepted from being unspoolable.
 fn background_dir(root: &FsPath, workspace_id: &str, session_id: &str) -> Result<PathBuf, String> {
-    let unsafe_id =
+    let unsafe_component =
         |id: &str| id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']);
-    if unsafe_id(workspace_id) || unsafe_id(session_id) {
+    if unsafe_component(workspace_id)
+        || workspace_id.starts_with('.')
+        || unsafe_component(session_id)
+    {
         return Err(format!(
             "unsafe session key: {workspace_id:?}/{session_id:?}"
         ));
@@ -259,17 +272,48 @@ fn background_dir(root: &FsPath, workspace_id: &str, session_id: &str) -> Result
     Ok(root.join(workspace_id).join(session_id))
 }
 
-/// Remove a session's background spool. Best-effort: its absence only costs
-/// the ability to read a finished task's output back.
-fn remove_background_dir(root: &FsPath, workspace_id: &str, session_id: &str) {
+/// Retire a session's background spool: rename it out of reach, then delete it.
+///
+/// Only the rename can fail the caller. `root/<workspace>/<session>` is
+/// addressed by session id alone, so whatever is left there is adopted whole by
+/// the next session opened under that id — the deleted session's tasks and
+/// their output, or a half-removed archive that refuses to open at all. That is
+/// state crossing between sessions, not a wasted directory. Once the name is
+/// gone nothing can reach the bytes, so the removal below is best-effort.
+fn retire_background_dir(
+    root: &FsPath,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    // A key this refuses is a key nothing could ever have spooled under, since
+    // this is the only way the path is built — so there is nothing to retire,
+    // and failing here would leave the session undeletable instead.
     let Ok(dir) = background_dir(root, workspace_id, session_id) else {
-        return;
+        return Ok(());
     };
-    if let Err(error) = std::fs::remove_dir_all(&dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(path = %dir.display(), "failed to remove background task spool: {error}");
+    if !dir.try_exists().map_err(|error| error.to_string())? {
+        return Ok(());
     }
+    let trash = root.join(BACKGROUND_TRASH_DIR);
+    std::fs::create_dir_all(&trash)
+        .map_err(|error| format!("failed to create {}: {error}", trash.display()))?;
+    // Both under the root, so this is an atomic rename, not a copy. The stamp
+    // only has to separate repeated retirements of the same key.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let retired = trash.join(format!("{workspace_id}-{session_id}-{stamp}"));
+    std::fs::rename(&dir, &retired).map_err(|error| {
+        format!(
+            "failed to retire background task spool {}: {error}",
+            dir.display()
+        )
+    })?;
+    if let Err(error) = std::fs::remove_dir_all(&retired) {
+        warn!(path = %retired.display(), "failed to remove retired background task spool: {error}");
+    }
+    Ok(())
 }
 
 /// How long a compaction waits on its provider. There is no abort path — the
@@ -391,17 +435,17 @@ impl SessionOpener for AppOpener {
                 .workspaces
                 .get(&key.0)
                 .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+            // Spool first, rows second: "deleted" must never be reported
+            // over a spool still at the canonical path. The cost is the rarer
+            // failure — a storage error after the spool is gone leaves the
+            // session reopenable without its finished tasks' output, which
+            // beats its successor inheriting them.
+            retire_background_dir(&self.background_root, &key.0, &key.1)?;
             workspace
                 .storage
                 .delete_session(&key.1)
                 .await
                 .map_err(|error| error.to_string())?;
-            // Only once the session is durably gone: until then its tasks'
-            // output is still worth keeping. Best-effort from here — a spool
-            // left behind costs disk, not correctness, and reporting the delete
-            // as failed would tell the client to expect a session that no
-            // longer exists.
-            remove_background_dir(&self.background_root, &key.0, &key.1);
             Ok(())
         })
     }
@@ -2553,6 +2597,88 @@ async fn main() {
     }
 
     info!("server stopped");
+}
+
+#[cfg(test)]
+mod background_spool_tests {
+    use super::*;
+
+    #[test]
+    fn a_retired_spool_is_gone_from_the_path_a_new_session_would_open() {
+        let root = tempfile::tempdir().expect("temp root");
+        let dir = background_dir(root.path(), "ws", "sess").expect("a safe key");
+        std::fs::create_dir_all(dir.join("task-1")).expect("spool a task");
+        std::fs::write(dir.join("task-1").join("meta.json"), b"{}").expect("write meta");
+
+        retire_background_dir(root.path(), "ws", "sess").expect("retire");
+
+        assert!(
+            !dir.exists(),
+            "the next session under this id would inherit it"
+        );
+    }
+
+    #[test]
+    fn retiring_a_spool_that_was_never_created_is_not_a_failure() {
+        // The common case: a session that never ran a background task.
+        let root = tempfile::tempdir().expect("temp root");
+        retire_background_dir(root.path(), "ws", "sess").expect("retire");
+        assert!(!root.path().join(BACKGROUND_TRASH_DIR).exists());
+    }
+
+    #[test]
+    fn a_spool_whose_removal_fails_is_still_out_of_reach() {
+        // A read-only parent stands in for a removal that cannot finish.
+        let root = tempfile::tempdir().expect("temp root");
+        let dir = background_dir(root.path(), "ws", "sess").expect("a safe key");
+        std::fs::create_dir_all(&dir).expect("spool");
+        let trash = root.path().join(BACKGROUND_TRASH_DIR);
+        std::fs::create_dir_all(&trash).expect("trash");
+        let mut perms = std::fs::metadata(&trash).expect("trash meta").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&trash, perms).expect("lock the trash down");
+
+        let retired = retire_background_dir(root.path(), "ws", "sess");
+
+        // Either the rename failed and said so, or only the removal was
+        // refused. Ruled out: success with the spool still reachable.
+        assert_eq!(
+            retired.is_ok(),
+            !dir.exists(),
+            "a retirement reported success without freeing the path"
+        );
+        let mut perms = std::fs::metadata(&trash).expect("trash meta").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&trash, perms).expect("restore for cleanup");
+    }
+
+    #[test]
+    fn the_trash_is_not_addressable_as_a_workspace() {
+        // What keeps a retired spool retired.
+        let root = tempfile::tempdir().expect("temp root");
+        assert!(background_dir(root.path(), BACKGROUND_TRASH_DIR, "sess").is_err());
+        assert!(background_dir(root.path(), ".lock", "sess").is_err());
+        assert!(background_dir(root.path(), "..", "sess").is_err());
+        assert!(background_dir(root.path(), "ws", "..").is_err());
+        assert!(background_dir(root.path(), "ws", "a/b").is_err());
+    }
+
+    #[test]
+    fn a_session_id_the_api_accepts_can_always_be_spooled_and_retired() {
+        // The root's reserved names are the root's problem: a dot-prefixed
+        // session id collides with nothing, and `validate_session_id` lets it
+        // through — so refusing it here would disable background work for a
+        // session the API created, and make it undeletable besides.
+        let root = tempfile::tempdir().expect("temp root");
+        coda_server::storage::validate_session_id(".foo").expect("the API accepts it");
+        let dir = background_dir(root.path(), "ws", ".foo").expect("a spoolable session");
+        std::fs::create_dir_all(&dir).expect("spool");
+
+        retire_background_dir(root.path(), "ws", ".foo").expect("retire");
+
+        assert!(!dir.exists());
+    }
 }
 
 #[cfg(test)]

@@ -93,14 +93,16 @@ background.root/
         stderr.ring
 ```
 
-正常 release 和 server shutdown 保留 session 目录；显式 session delete 在 `Deleting` tombstone 内完成数据库删除后递归删除该目录。
+正常 release 和 server shutdown 保留 session 目录；显式 session delete 在 `Deleting` tombstone 内先把 `<workspace_id>/<session_id>` rename 到 root 下的 `.trash/`，再删数据库行，最后 best-effort 递归删除被隔离的副本。`.trash` 与 `.lock` 一样以 `.` 开头，而 workspace id 不允许以 `.` 开头（`config::is_workspace_id` 在启动时拒绝，`background_dir` 再校验一次），因此隔离目录不可能再被任何 session 打开。session id 位于 workspace 目录之下，不与任何保留名冲突，因此仍只按 `storage::validate_session_id` 的规则校验——两处规则必须一致，否则 API 接受的 session 会无法 spool，并且连删除都会失败。
 
 ## Load-Bearing Decisions
 
 - background root 使用专用 opener：新 leaf 请求 `0700` 创建并在新建分支收紧、复核；已有 leaf 以 `O_NOFOLLOW` 打开并严格验证 owner/type/精确 `0700`，不修复错误 mode。`.lock` 只允许通过已验证目录 fd 安全创建/打开，同样验证 owner/type/精确 `0600`。root capability 和 lock fd 在 hub 构造前取得并持有到 server 完全退出；任何 lock 冲突或 symlink/非普通文件都是启动失败。
 - server 运行期间绝不 unlink、rename 或 recreate `.lock`；锁 inode 保持稳定，进程退出由内核释放 file lock。
 - registry shutdown 发生在 runtime 完全停止之后、entry 从 map 移除之前，保证没有 agent 再 spawn，同时 reopen 不会与旧 monitor 的 manifest 写入竞态。
-- 显式 session delete 先把 entry 变成 `Deleting` tombstone；runtime、registry、数据库和 spool 清理全部完成后才从 map 移除并唤醒 attach。数据库清理失败也必须释放 tombstone，让后续 attach 可以重新打开仍存在的 session；没有 live entry 的删除同样要先创建 tombstone。
+- 显式 session delete 的实际工作跑在 hub 自己 spawn 的 task 里，调用方只订阅 watch 结果。tombstone 只能由删除自身完成来解除，若把 future 绑在调用方身上，被 abort 的请求 task（例如连接断开）会留下永远无法解除的 `Deleting`，之后每次 attach 都在它上面空转。
+- spool 清理排在数据库删除之前，且以 rename 为准：只有 canonical 路径消失才算成功，rename 失败即整体失败，不删任何数据库行。留在 `root/<workspace_id>/<session_id>` 的内容会被下一个同 id 的 session 整个继承（继承已删除 session 的任务与输出，或因半删 archive 而无法启用 background），这是状态串线而非磁盘泄漏。rename 之后的递归删除才是 best-effort。代价是更罕见的失败方向：数据库删除失败时 session 仍可重开但丢失已完成任务的输出。
+- 显式 session delete 先把 entry 变成 `Deleting` tombstone；runtime、registry、spool 和数据库清理全部完成后才从 map 移除并唤醒 attach。数据库清理失败也必须释放 tombstone，让后续 attach 可以重新打开仍存在的 session；没有 live entry 的删除同样要先创建 tombstone。
 - `AppOpener::open` 在 hub entry 锁内幂等重建 session 行（`initialize_session` 是 insert-on-conflict-do-nothing）。handler 侧的调用只用于读取 binding；行的存在性由 tombstone 之后的这次调用保证。
 - 普通 release 先等待 quota/archive activity barrier，再在 registry mutex 下检查 running count 并 drain quota expiration 与 notice；entry mutex 仍先于 registry 内部锁，保持现有锁序。
 - `Releasing` entry 的 `done` 只在 runtime 和 registry 两个 shutdown 都完成、map entry 已移除后发布；`shutdown_all` 遇到 already-Releasing 时等待 `done`，不能跳过。
@@ -133,6 +135,15 @@ background.root/
 - [x] [session delete] 将数据库与 spool 删除纳入 hub 的 `Deleting` tombstone
       Purpose：消除 `relay.delete()` 返回、数据库删除和 `remove_background_dir()` 之间允许新 attach 的窗口；覆盖原本没有 live entry 的删除。
       Verification：删除事务未完成时 attach 必须等待；数据库或 spool 清理完成后 entry 才能消失；清理失败后 attach 可以重新打开保留的 session；新 attach 不会继续使用随后被递归删除的 archive；opener 的 `open` 必须排在 `delete_persisted` 之后，使并发 open 不会留下没有 session 行的 live session。
+- [x] [delete ownership] 把删除工作交给 hub 自持的 task，调用方只等待 watch 结果
+      Purpose：调用方被取消时不能让 `Deleting` tombstone 永久占住 key。
+      Verification：delete 进入 `delete_persisted` 后 abort 调用方，清理仍须完成、tombstone 须消失、随后 attach 能重新打开 session。
+- [x] [spool quarantine] 删除时先 rename 走 canonical spool 路径，再删数据库行
+      Purpose：`Deleted` 不得在旧 spool 仍位于 canonical 路径时返回，否则同 id 的新 session 会继承它。
+      Verification：retire 之后 canonical 路径必须不存在；未创建过 spool 的 session 不算失败；隔离副本删除失败时 retire 仍可成功，但报告成功必然意味着 canonical 路径已释放；`.trash`/`.lock`/`..`/含 `/` 的 workspace id 一律不可寻址，且启动时即报错；`validate_session_id` 接受的 session id（含 `.foo`）必须能正常 spool 与 retire。
+- [x] [relative root] 固定单组件相对 root 的行为
+      Purpose：`background.root = "background"` 配在裸文件名的配置旁时解析出的 parent 是空路径。
+      Verification：子进程在临时工作目录下以 `BackgroundRootLock::acquire(Path::new("background"))` 取锁成功并创建 `background/.lock`（`create_dir_all("")` 本身返回 `Ok`，无需改动代码）。
 - [x] [validation] 运行 workspace formatter、clippy 和 tests
       Purpose：验证跨 crate 接线和既有行为不回退。
       Verification：`cargo clippy --workspace --all-targets` 与 `cargo test --workspace` 通过。

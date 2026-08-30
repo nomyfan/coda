@@ -268,3 +268,46 @@ async fn deleting_a_session_removes_its_task_spool() {
     );
     hub.shutdown_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_delete_waiter_does_not_strand_the_key() {
+    // The delete belongs to the hub, not to whoever asked for it: an aborted
+    // request task used to take it down with it, leaving a tombstone nothing
+    // could ever lift.
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    let gate = Arc::new(Notify::new());
+    opener.delete_gate = Some(gate.clone());
+    let (hub, opener) = hub_and_opener(opener);
+    let _attached = attach(&hub, 1).await.expect("attach");
+    let spool = spool_dir(&opener, &key());
+
+    let delete_hub = hub.clone();
+    let delete = tokio::spawn(async move { delete_hub.delete(key(), 1).await });
+    timeout(Duration::from_secs(5), opener.delete_entered.notified())
+        .await
+        .expect("delete never reached the persisted state");
+    delete.abort();
+    assert!(delete.await.unwrap_err().is_cancelled());
+
+    gate.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while hub.get_entry(&key()).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the abandoned delete never dropped its tombstone");
+    assert_eq!(
+        opener.deleted.lock().unwrap().as_slice(),
+        &[key()],
+        "the abandoned delete never removed the persisted state"
+    );
+    assert!(!spool.exists(), "the abandoned delete kept the task spool");
+
+    let attached = timeout(Duration::from_secs(5), attach(&hub, 2))
+        .await
+        .expect("attach never woke from the abandoned delete")
+        .expect("reopen after an abandoned delete");
+    drop(attached);
+    hub.shutdown_all().await;
+}

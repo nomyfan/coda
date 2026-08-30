@@ -618,6 +618,25 @@ path = "/tmp/b"
 }
 
 #[test]
+fn parse_server_config_rejects_a_dot_prefixed_workspace_id() {
+    // It would name a directory beside the background root's own `.lock` and
+    // `.trash`, so it is refused where the operator can see it.
+    let err = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = ".trash"
+path = "/tmp/a"
+"#
+        ),
+        Path::new("/srv"),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("may not start with"));
+}
+
+#[test]
 fn parse_server_config_defaults_relay_limits() {
     let config = parse_server_config(
         &format!(

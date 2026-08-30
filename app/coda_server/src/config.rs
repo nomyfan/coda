@@ -548,7 +548,8 @@ fn parse_workspaces(
         let id = require_str(workspace, "id", "workspace")?;
         if !is_workspace_id(&id) {
             return Err(ConfigError::Parse(format!(
-                "workspace id '{id}' may only contain letters, digits, '.', '_', and '-'"
+                "workspace id '{id}' may only contain letters, digits, '.', '_', and '-', \
+                 and may not start with '.'"
             )));
         }
         if !seen.insert(id.clone()) {
@@ -590,8 +591,13 @@ fn expand_env(value: &str) -> Result<String, ConfigError> {
         .map_err(|_| ConfigError::Parse(format!("environment variable '{var}' is not set")))
 }
 
+/// A workspace id becomes a directory name under the background spool root,
+/// where the root keeps `.lock` and `.trash` for itself — hence the leading-dot
+/// rule. Refusing it here makes an unusable id a startup error rather than a
+/// workspace whose sessions silently lose background tasks.
 fn is_workspace_id(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('.')
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))

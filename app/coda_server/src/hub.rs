@@ -981,10 +981,10 @@ impl SessionHub {
         }
     }
 
-    /// Transition the entry to `Deleting` and return the whole delete to run
+    /// Transition the entry to `Deleting` and spawn the whole delete to run
     /// *outside* the entry lock: stop the runtime, close the task registry,
     /// remove everything the session persisted, and only then drop the map slot
-    /// and publish the outcome.
+    /// and publish the outcome on the returned watch.
     ///
     /// The tombstone is the point. Stopping the runtime and deleting what it
     /// wrote are one transaction, and it used to be split across two callers:
@@ -993,16 +993,26 @@ impl SessionHub {
     /// still being removed underneath it. Holding the entry across the whole
     /// thing closes that window — including for a key nothing was live on,
     /// which is why the caller borrows a slot to put this in.
+    ///
+    /// The hub spawns it rather than handing the future to the caller: only
+    /// the delete finishing lifts the tombstone, so a caller dropped mid-way
+    /// (a request task aborted with its connection) would leave the key held
+    /// forever, with every later attach spinning on it.
     fn begin_delete(
         &self,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
-    ) -> impl Future<Output = DeleteOutcome> + Send + 'static {
+    ) -> watch::Receiver<Option<DeleteOutcome>> {
         let (done_tx, done_rx) = watch::channel(None);
         if let Some(watcher) = state.notice_watcher.take() {
             watcher.abort();
         }
-        let phase = std::mem::replace(&mut state.phase, EntryPhase::Deleting { done: done_rx });
+        let phase = std::mem::replace(
+            &mut state.phase,
+            EntryPhase::Deleting {
+                done: done_rx.clone(),
+            },
+        );
         let session = match phase {
             EntryPhase::Live(live) => Some(live.session),
             _ => None,
@@ -1011,7 +1021,7 @@ impl SessionHub {
         let entries = self.entries.clone();
         let opener = self.opener.clone();
         let entry = entry.clone();
-        async move {
+        tokio::spawn(async move {
             if let Some(session) = session {
                 // Abort rather than graceful: a turn still in flight gets cut
                 // off instead of finishing, so no checkpoint is written back
@@ -1049,12 +1059,12 @@ impl SessionHub {
                 }
             }
             entry.inner.lock().await.phase = EntryPhase::Released;
-            let _ = done_tx.send(Some(outcome.clone()));
             if matches!(outcome, DeleteOutcome::Deleted) {
                 info!(workspace_id = %entry.key.0, session_id = %entry.key.1, "session deleted");
             }
-            outcome
-        }
+            let _ = done_tx.send(Some(outcome));
+        });
+        done_rx
     }
 
     /// Give back the entry a fork or a refused delete took the gate on.
@@ -1967,11 +1977,11 @@ impl SessionRelay for SessionHub {
             if let Some(attachment) = state.attached.take() {
                 let _ = attachment.tx.send(RelayEvent::Evicted);
             }
-            let delete = self.begin_delete(&entry, state);
+            let done = self.begin_delete(&entry, state);
             drop(guard);
-            // Inline: this returning is what tells the caller the session is
-            // durably gone (or why it is not).
-            delete.await
+            // Only watching: the delete is the hub's own task, so a caller
+            // that goes away cannot strand the tombstone.
+            await_delete(&done).await
         })
     }
 
