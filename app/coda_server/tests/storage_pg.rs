@@ -193,6 +193,7 @@ fn queued_task(thread_id: &str, task: &str) -> Envelope {
             message_id: MessageId::new(),
             task: task.to_string(),
             images: vec![],
+            notice: None,
         },
     })
 }
