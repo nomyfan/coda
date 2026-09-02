@@ -11,7 +11,7 @@ fn meta() -> TaskMeta {
 
 fn archive() -> (tempfile::TempDir, Arc<TaskArchive>) {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+    let dir = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     (tmp, Arc::new(TaskArchive::new(dir)))
 }
 
@@ -207,7 +207,7 @@ async fn eviction_commit_failure_restores_the_victim() {
     let record = archive.open(&id).await.unwrap().unwrap();
     quota.finalize_terminal(&record).await.unwrap();
 
-    let task_path = tmp.path().join("background/tasks").join(id.as_str());
+    let task_path = tmp.path().join(id.as_str());
     std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o500)).unwrap();
     let failed = quota.reserve_for_test(DEFAULT_STREAM_CAPACITY_SUM).await;
     assert!(matches!(failed.reservation, Err(QuotaError::Archive(_))));

@@ -451,12 +451,6 @@ pub struct BackgroundProcesses {
     store: Store,
 }
 
-impl Default for BackgroundProcesses {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BackgroundProcesses {
     fn with_store(store: Store) -> Self {
         let (summaries_tx, summaries_rx) = watch::channel(Arc::from(Vec::new().into_boxed_slice()));
@@ -492,7 +486,7 @@ impl BackgroundProcesses {
 
     fn try_temporary() -> std::io::Result<Self> {
         let temp = tempfile::tempdir()?;
-        let root = ArchiveDir::open_or_create_root(&temp.path().join("background/tasks"))
+        let root = ArchiveDir::open_or_create_root(temp.path())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let archive = Arc::new(TaskArchive::new(root));
         let quota = SessionQuota::from_inventory(
@@ -505,11 +499,6 @@ impl BackgroundProcesses {
             quota,
             temp: Some(temp),
         }))))
-    }
-
-    /// Equivalent to [`temporary`](Self::temporary); the historical name.
-    pub fn new() -> Self {
-        Self::temporary()
     }
 
     /// A hub-owned registry backed by a session archive directory. Runs the
@@ -870,6 +859,13 @@ impl BackgroundProcesses {
         Ok(Some(
             entry.record.lock_commit().await.current().status.clone(),
         ))
+    }
+
+    /// Whether this registry has storage behind it. False when the session
+    /// archive could not be opened, which is when a caller should offer no
+    /// background tools at all rather than ones that only report the failure.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self.store, Store::Enabled(_))
     }
 
     fn enabled(&self) -> Result<Arc<Backend>, TaskAccessError> {

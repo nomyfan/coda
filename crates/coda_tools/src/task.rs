@@ -201,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_output_reads_incrementally_and_reports_expiry() {
-        let background = Arc::new(BackgroundProcesses::new());
+        let background = Arc::new(BackgroundProcesses::temporary());
         let id = background
             .spawn(bash("echo first; sleep 39.01"), meta("stream"))
             .await
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_kill_terminates_and_is_idempotent() {
-        let background = Arc::new(BackgroundProcesses::new());
+        let background = Arc::new(BackgroundProcesses::temporary());
         let id = background
             .spawn(bash("sleep 39.21"), meta("victim"))
             .await

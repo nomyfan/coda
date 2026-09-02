@@ -844,13 +844,14 @@ fn explore_auto_approves_only_read_only_tools() {
         "write_todos",
         "run_javascript",
         "list_javascript_tools",
+        "task_output",
     ] {
         assert!(
             !config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should run unattended under explore"
         );
     }
-    for tool in ["write_file", "edit_file", "mcp__time__now"] {
+    for tool in ["write_file", "edit_file", "task_kill", "mcp__time__now"] {
         assert!(
             config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should ask under explore"

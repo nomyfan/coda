@@ -255,19 +255,11 @@ impl AgentTeam {
                 .get(&spec.name)
                 .map(String::as_str)
                 .unwrap_or(default_workspace);
-            // Starting background work requires the whole follow-up kit: an
-            // agent that can start a task must also be able to observe and
-            // kill it. Holding only one of the two is still legal — that
-            // agent just can't *start* anything.
-            let tool_names: HashSet<&str> = spec.tools.iter().map(|t| t.name()).collect();
-            let allow_background_shell =
-                tool_names.contains("task_output") && tool_names.contains("task_kill");
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 file_locks: file_locks.clone(),
                 agent_name: spec.name.clone(),
                 background: background.clone(),
-                allow_background_shell,
             };
 
             let mut agent = Agent {
@@ -280,6 +272,11 @@ impl AgentTeam {
             };
 
             for tool_spec in &spec.tools {
+                agent.tools.register(tool_spec.build(&tool_ctx));
+            }
+            // Not declarable and not per-agent: these exist whenever the
+            // session has somewhere to run background work.
+            for tool_spec in coda_tools::background_specs(&background) {
                 agent.tools.register(tool_spec.build(&tool_ctx));
             }
             for child in &spec.subagents {
@@ -355,7 +352,8 @@ mod tests {
         }
     }
 
-    /// Captures the background-task wiring each tool build sees.
+    /// Captures what each tool build sees: agent, whether background work is
+    /// possible, and which registry.
     struct BackgroundProbeSpec {
         seen: Arc<StdMutex<Vec<(String, bool, usize)>>>,
     }
@@ -366,37 +364,42 @@ mod tests {
         fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
             self.seen.lock().unwrap().push((
                 ctx.agent_name.clone(),
-                ctx.allow_background_shell,
+                ctx.background.is_enabled(),
                 Arc::as_ptr(&ctx.background) as usize,
             ));
             Box::new(RecordingTool)
         }
     }
 
-    /// Backgrounding a shell command is granted by holding the whole follow-up
-    /// kit, and the registry itself is shared across the session's agents.
-    /// Holding only `task_output` is a legal observer — it just cannot start
-    /// background work.
+    /// The follow-up tools are the session's, not an agent's: nobody declares
+    /// them and every agent gets them, over one shared registry.
     #[test]
-    fn background_shell_is_granted_by_the_full_task_kit_and_shares_one_registry() {
+    fn background_tools_are_injected_for_every_agent_and_share_one_registry() {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let probe = || {
             Box::new(BackgroundProbeSpec { seen: seen.clone() }) as Box<dyn coda_tools::ToolSpec>
         };
-        let tool = |name: &str| coda_tools::spec_by_name(name).expect("builtin");
         let root = AgentSpec {
-            tools: vec![probe(), tool("task_output"), tool("task_kill")],
-            subagents: vec!["observer".into()],
+            tools: vec![probe()],
+            subagents: vec!["sub".into()],
             ..spec("coda")
         };
-        let observer = AgentSpec {
-            tools: vec![probe(), tool("task_output")],
-            ..spec("observer")
+        let sub = AgentSpec {
+            tools: vec![probe()],
+            ..spec("sub")
         };
-        let team = AgentTeam::new(root, vec![observer]).unwrap();
+        let team = AgentTeam::new(root, vec![sub]).unwrap();
         let background = Arc::new(BackgroundProcesses::temporary());
-        team.build(".", coda_tools::shared_file_locks(), background.clone());
+        let agents = team.build(".", coda_tools::shared_file_locks(), background.clone());
 
+        for name in ["coda", "sub"] {
+            let tools = &agents[name].tools;
+            assert!(
+                tools.get("task_output").is_some(),
+                "{name} has no task_output"
+            );
+            assert!(tools.get("task_kill").is_some(), "{name} has no task_kill");
+        }
         let mut got = seen.lock().unwrap().clone();
         got.sort();
         let registry = Arc::as_ptr(&background) as usize;
@@ -404,9 +407,71 @@ mod tests {
             got,
             vec![
                 ("coda".to_string(), true, registry),
-                ("observer".to_string(), false, registry),
+                ("sub".to_string(), true, registry),
             ]
         );
+    }
+
+    /// No storage, nothing to follow up on: the two tools are never injected
+    /// and `shell` stops offering to background anything. One condition,
+    /// three surfaces.
+    #[test]
+    fn without_background_storage_the_task_tools_are_never_registered() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let tool = |name: &str| coda_tools::spec_by_name(name).expect("builtin");
+        let root = AgentSpec {
+            tools: vec![
+                Box::new(BackgroundProbeSpec { seen: seen.clone() }),
+                tool("shell"),
+            ],
+            ..spec("coda")
+        };
+        let team = AgentTeam::new(root, vec![]).unwrap();
+        let background = Arc::new(BackgroundProcesses::disabled_from(
+            "archive root is unreadable".into(),
+        ));
+
+        let agents = team.build(".", coda_tools::shared_file_locks(), background);
+
+        let tools = &agents["coda"].tools;
+        assert!(tools.get("task_output").is_none());
+        assert!(tools.get("task_kill").is_none());
+        assert!(
+            tools.get("shell").is_some(),
+            "an unrelated tool was dropped"
+        );
+        assert_eq!(
+            seen.lock().unwrap().first().map(|(_, allowed, _)| *allowed),
+            Some(false),
+            "shell was offered a follow-up kit that was not registered"
+        );
+    }
+
+    /// The injected names are reserved, so nothing can register them by hand.
+    #[test]
+    fn rejects_a_spec_claiming_an_injected_background_tool_name() {
+        for name in ["task_output", "task_kill"] {
+            let root = AgentSpec {
+                tools: vec![Box::new(NamedSpec(name))],
+                ..spec("coda")
+            };
+            assert!(matches!(
+                AgentTeam::new(root, vec![]),
+                Err(BuildError::ReservedToolName { name: claimed, .. }) if claimed == name
+            ));
+        }
+    }
+
+    struct NamedSpec(&'static str);
+
+    impl ToolSpec for NamedSpec {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+            unreachable!("reserved tool names are rejected before build")
+        }
     }
 
     struct ReservedToolSpec;

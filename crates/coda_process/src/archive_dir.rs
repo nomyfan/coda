@@ -1,5 +1,5 @@
-//! `ArchiveDir` — an opened, fd-confined capability over one session's
-//! `background/tasks` directory (design: "Archive path safety").
+//! `ArchiveDir` — an opened, fd-confined capability over one session's task
+//! archive directory (design: "Archive path safety").
 //!
 //! The security contract: every descendant operation is relative to a held
 //! directory fd via `openat`/`mkdirat`/`renameat`/`unlinkat` with `O_NOFOLLOW`,
@@ -364,7 +364,7 @@ mod tests {
 
     fn temp_root() -> (tempfile::TempDir, ArchiveDir) {
         let dir = tempfile::tempdir().unwrap();
-        let root = ArchiveDir::open_or_create_root(&dir.path().join("background/tasks")).unwrap();
+        let root = ArchiveDir::open_or_create_root(dir.path()).unwrap();
         (dir, root)
     }
 
@@ -547,11 +547,7 @@ mod tests {
         let id = TaskId::new();
         let task = root.create_dir(&id).unwrap();
         task.create_file(ArchiveFileName::Meta).unwrap();
-        let path = tmp
-            .path()
-            .join("background/tasks")
-            .join(id.as_str())
-            .join("meta.json");
+        let path = tmp.path().join(id.as_str()).join("meta.json");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             task.open_file(ArchiveFileName::Meta, false),
@@ -610,7 +606,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let id = TaskId::new();
-        let link = tmp.path().join("background/tasks").join(id.as_str());
+        let link = tmp.path().join(id.as_str());
         symlink(&outside, &link).unwrap();
         // The name appears in entries (as a symlink) but cannot be opened.
         assert!(root.open_dir(&id).is_err());
@@ -622,7 +618,7 @@ mod tests {
     fn open_dir_rejects_non_directory() {
         let (tmp, root) = temp_root();
         let id = TaskId::new();
-        let path = tmp.path().join("background/tasks").join(id.as_str());
+        let path = tmp.path().join(id.as_str());
         std::fs::File::create(&path).unwrap();
         assert!(root.open_dir(&id).is_err());
     }

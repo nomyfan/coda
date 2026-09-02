@@ -11,7 +11,7 @@ fn meta() -> TaskMeta {
 
 fn root() -> (tempfile::TempDir, TaskArchive) {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = ArchiveDir::open_or_create_root(&tmp.path().join("background/tasks")).unwrap();
+    let dir = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     (tmp, TaskArchive::new(dir))
 }
 

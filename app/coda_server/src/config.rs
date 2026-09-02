@@ -658,6 +658,8 @@ const EXPLORE_TOOLS: &[&str] = &[
     "read_todos",
     "write_todos",
     "run_javascript",
+    // A read like any other; `task_kill` ends a process, so it is not here.
+    "task_output",
     coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
 ];
 

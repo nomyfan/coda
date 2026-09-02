@@ -1,7 +1,7 @@
 //! Session-local archive inventory and the 64 MiB payload quota.
 //!
 //! **Inventory** (`scan_inventory`) is entry-reopen recovery, not startup
-//! cleanup: it streams the `background/tasks` children, classifies and *charges*
+//! cleanup: it streams the archive root's children, classifies and *charges*
 //! each without deleting or repairing anything, and produces only bounded,
 //! fd-free outputs — a ≤512 retained victim index, ≤32 recent summaries, ≤32
 //! issue samples, and totals. Any corrupt/orphan/unsafe entry sets a session
