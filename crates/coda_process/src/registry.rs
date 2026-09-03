@@ -430,14 +430,6 @@ struct Backend {
     temp: Option<tempfile::TempDir>,
 }
 
-/// Storage backing: enabled (archive + quota) or disabled (the session archive
-/// root could not be opened; the conversation still works, background is off).
-#[derive(Clone)]
-enum Store {
-    Enabled(Arc<Backend>),
-    Disabled(Arc<str>),
-}
-
 /// Session-scoped background task registry. The owner (hub entry, or the
 /// `Session` itself when self-built) is responsible for calling
 /// [`shutdown`](Self::shutdown) per the ownership rules in the design doc.
@@ -448,11 +440,11 @@ pub struct BackgroundProcesses {
     /// must hold for every caller, not just the one that drains the monitor
     /// handles first.
     shutdown_gate: Mutex<()>,
-    store: Store,
+    backend: Arc<Backend>,
 }
 
 impl BackgroundProcesses {
-    fn with_store(store: Store) -> Self {
+    fn new(backend: Arc<Backend>) -> Self {
         let (summaries_tx, summaries_rx) = watch::channel(Arc::from(Vec::new().into_boxed_slice()));
         BackgroundProcesses {
             inner: Arc::new(Mutex::new(RegistryState {
@@ -468,23 +460,14 @@ impl BackgroundProcesses {
             })),
             summaries_rx,
             shutdown_gate: Mutex::new(()),
-            store,
+            backend,
         }
     }
 
     /// A self-owned registry backed by a fresh temporary directory whose output
     /// is deleted when the registry drops. The default backing for a standalone
     /// `Session`.
-    pub fn temporary() -> Self {
-        match Self::try_temporary() {
-            Ok(reg) => reg,
-            Err(e) => Self::with_store(Store::Disabled(
-                format!("could not create temporary background archive: {e}").into(),
-            )),
-        }
-    }
-
-    fn try_temporary() -> std::io::Result<Self> {
+    pub fn temporary() -> std::io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = ArchiveDir::open_or_create_root(temp.path())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -494,11 +477,11 @@ impl BackgroundProcesses {
             SESSION_QUOTA_BYTES,
             archive.clone(),
         );
-        Ok(Self::with_store(Store::Enabled(Arc::new(Backend {
+        Ok(Self::new(Arc::new(Backend {
             archive,
             quota,
             temp: Some(temp),
-        }))))
+        })))
     }
 
     /// A hub-owned registry backed by a session archive directory. Runs the
@@ -506,37 +489,27 @@ impl BackgroundProcesses {
     /// seeds the live overview from recent terminal summaries, and converts any
     /// crash-`Running` task that passes validation to `Interrupted`. Output is
     /// **not** deleted on shutdown.
-    pub async fn session_backed(archive_dir: ArchiveDir) -> Self {
+    pub async fn session_backed(archive_dir: ArchiveDir) -> std::io::Result<Self> {
         let archive = Arc::new(TaskArchive::new(archive_dir));
         let scan_root = archive.root().clone();
         let inventory = match tokio::task::spawn_blocking(move || scan_inventory(&scan_root)).await
         {
             Ok(Ok(inv)) => inv,
-            Ok(Err(e)) => return Self::disabled_from(e.to_string()),
-            Err(e) => return Self::disabled_from(format!("inventory worker failed: {e}")),
+            Ok(Err(e)) => return Err(std::io::Error::other(e.to_string())),
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "inventory worker failed: {e}"
+                )));
+            }
         };
         let quota = SessionQuota::from_inventory(&inventory, SESSION_QUOTA_BYTES, archive.clone());
-        let reg = Self::with_store(Store::Enabled(Arc::new(Backend {
+        let reg = Self::new(Arc::new(Backend {
             archive: archive.clone(),
             quota,
             temp: None,
-        })));
+        }));
         reg.seed_from_inventory(&archive, inventory).await;
-        reg
-    }
-
-    /// A disabled registry: the archive root could not be opened. Spawn/read/
-    /// kill return a clear error; summaries are empty; the conversation is
-    /// otherwise unaffected.
-    pub fn disabled(error: ArchiveError) -> Self {
-        Self::disabled_from(error.to_string())
-    }
-
-    /// A registry with no store behind it: spawning fails and nothing is
-    /// recorded, but the session it belongs to works otherwise. Used when the
-    /// archive root cannot be opened.
-    pub fn disabled_from(error: String) -> Self {
-        Self::with_store(Store::Disabled(error.into()))
+        Ok(reg)
     }
 
     /// Seed the live overview from an inventory scan and convert recoverable
@@ -558,16 +531,12 @@ impl BackgroundProcesses {
                         task = id.as_str(),
                         "recoverable task disappeared during reopen"
                     );
-                    if let Ok(backend) = self.backend() {
-                        backend.quota.block_spawns();
-                    }
+                    self.backend.quota.block_spawns();
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(task = id.as_str(), error = %error, "recoverable task could not be reopened");
-                    if let Ok(backend) = self.backend() {
-                        backend.quota.block_spawns();
-                    }
+                    self.backend.quota.block_spawns();
                     continue;
                 }
             };
@@ -579,16 +548,12 @@ impl BackgroundProcesses {
             if let Err(error) = guard.commit(candidate).await {
                 tracing::warn!(task = id.as_str(), error = %error, "Running task could not be converted to Interrupted");
                 drop(guard);
-                if let Ok(backend) = self.backend() {
-                    backend.quota.block_spawns();
-                }
+                self.backend.quota.block_spawns();
                 continue;
             }
             let status = guard.current().status.clone();
             drop(guard);
-            if let Ok(backend) = self.backend()
-                && let Err(error) = backend.quota.finalize_terminal(&record).await
-            {
+            if let Err(error) = self.backend.quota.finalize_terminal(&record).await {
                 tracing::warn!(task = id.as_str(), error = %error, "Interrupted task output finalize failed");
             }
             // A task the previous incarnation was running ended without
@@ -621,15 +586,8 @@ impl BackgroundProcesses {
         self.inner.lock().await.publish();
     }
 
-    fn backend(&self) -> std::io::Result<Arc<Backend>> {
-        match &self.store {
-            Store::Enabled(b) => Ok(b.clone()),
-            Store::Disabled(e) => Err(std::io::Error::other(e.to_string())),
-        }
-    }
-
     /// Start `cmd` as a background process task in its own sentinel-pinned
-    /// process group. Rejection (closed / running limit / disabled / quota) has
+    /// process group. Rejection (closed / running limit / quota) has
     /// no side effects; only `kill`/`shutdown` terminate a started task.
     pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<TaskId> {
         self.register_task(meta, move |ctx| {
@@ -641,7 +599,7 @@ impl BackgroundProcesses {
 
     /// Start `work` as a background task. The task is visible in the summaries
     /// (and thus to keepalive watchers) before the id is returned. Fails when
-    /// closed, at `MAX_RUNNING`, disabled, or the quota is blocked.
+    /// closed, at `MAX_RUNNING`, or the quota is blocked.
     pub async fn spawn_with<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
     where
         F: FnOnce(TaskCtx) -> Fut,
@@ -662,7 +620,7 @@ impl BackgroundProcesses {
         F: FnOnce(TaskCtx) -> std::io::Result<Fut>,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
-        let backend = self.backend()?;
+        let backend = &self.backend;
         let mut inner = self.inner.lock().await;
         inner.check_capacity()?;
 
@@ -709,7 +667,7 @@ impl BackgroundProcesses {
         reservation.commit();
         let monitor = tokio::spawn(monitor_task(
             self.inner.clone(),
-            backend.clone(),
+            self.backend.clone(),
             entry.clone(),
             fut,
         ));
@@ -724,11 +682,11 @@ impl BackgroundProcesses {
     }
 
     /// Incremental read: output since the previous read plus current status.
-    /// `Ok(None)` for an unknown id; `Err` for a disabled/corrupt archive. The
+    /// `Ok(None)` for an unknown id; `Err` for a corrupt archive or I/O error. The
     /// cursor is persisted before any bytes are returned, so a failed save
     /// yields an error rather than silently advancing the cursor.
     pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
-        let backend = self.enabled()?;
+        let backend = &self.backend;
         let Some(record) = backend
             .archive
             .open(id)
@@ -818,7 +776,7 @@ impl BackgroundProcesses {
     /// `take_notices` after returning sees the completion. Idempotent; returns
     /// the settled status, `Ok(None)` for an unknown id.
     pub async fn kill(&self, id: &TaskId) -> Result<Option<TaskStatus>, TaskAccessError> {
-        let backend = self.enabled()?;
+        let backend = &self.backend;
         let live = self.inner.lock().await.tasks.get(id).cloned();
         let Some(entry) = live else {
             // Not live: report the archived task's terminal status, if any.
@@ -861,26 +819,9 @@ impl BackgroundProcesses {
         ))
     }
 
-    /// Whether this registry has storage behind it. False when the session
-    /// archive could not be opened, which is when a caller should offer no
-    /// background tools at all rather than ones that only report the failure.
-    pub fn is_enabled(&self) -> bool {
-        matches!(self.store, Store::Enabled(_))
-    }
-
-    fn enabled(&self) -> Result<Arc<Backend>, TaskAccessError> {
-        match &self.store {
-            Store::Enabled(b) => Ok(b.clone()),
-            Store::Disabled(e) => Err(TaskAccessError::Disabled(e.to_string())),
-        }
-    }
-
     /// Drain accumulated notices (the overflow aggregate last).
     pub async fn take_notices(&self) -> Vec<TaskNotice> {
-        let expirations = match &self.store {
-            Store::Enabled(backend) => backend.quota.take_expirations(),
-            Store::Disabled(_) => Vec::new(),
-        };
+        let expirations = self.backend.quota.take_expirations();
         let mut inner = self.inner.lock().await;
         enqueue_expirations(&mut inner, expirations);
         drain_notices(&mut inner)
@@ -895,13 +836,10 @@ impl BackgroundProcesses {
     /// are task monitors and already-registered detached transactions, both of
     /// which are covered by the barriers and registry mutex below.
     pub async fn take_notices_if_quiescent(&self) -> Option<Vec<TaskNotice>> {
-        let expirations = match &self.store {
-            Store::Enabled(backend) => {
-                backend.quota.settle().await;
-                backend.archive.settle().await;
-                backend.quota.take_expirations()
-            }
-            Store::Disabled(_) => Vec::new(),
+        let expirations = {
+            self.backend.quota.settle().await;
+            self.backend.archive.settle().await;
+            self.backend.quota.take_expirations()
         };
         let mut inner = self.inner.lock().await;
         enqueue_expirations(&mut inner, expirations);
@@ -952,14 +890,10 @@ impl BackgroundProcesses {
                 }
             }
         }
-        if let Store::Enabled(backend) = &self.store {
-            backend.quota.settle().await;
-            backend.archive.settle().await;
-        }
+        self.backend.quota.settle().await;
+        self.backend.archive.settle().await;
         let mut inner = self.inner.lock().await;
-        if let Store::Enabled(backend) = &self.store {
-            enqueue_expirations(&mut inner, backend.quota.take_expirations());
-        }
+        enqueue_expirations(&mut inner, self.backend.quota.take_expirations());
         let notices = drain_notices(&mut inner);
         // Wake watchers even when nothing changed (e.g. zero tasks) so a
         // keepalive watcher parked on this registry re-checks its entry and
@@ -992,21 +926,14 @@ fn drain_notices(inner: &mut RegistryState) -> Vec<TaskNotice> {
     notices
 }
 
-/// Errors from `read`/`kill` distinct from an unknown id (`Ok(None)`).
+/// An error from `read`/`kill`, distinct from an unknown id (`Ok(None)`): the
+/// archive entry is present but corrupt, or the I/O failed.
 #[derive(Debug)]
-pub enum TaskAccessError {
-    /// Background storage is disabled (the archive root could not be opened).
-    Disabled(String),
-    /// The archive entry is present but corrupt, or an I/O error occurred.
-    Archive(String),
-}
+pub struct TaskAccessError(String);
 
 impl std::fmt::Display for TaskAccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TaskAccessError::Disabled(e) => write!(f, "background tasks are disabled: {e}"),
-            TaskAccessError::Archive(e) => write!(f, "background task archive error: {e}"),
-        }
+        write!(f, "background task archive error: {}", self.0)
     }
 }
 
@@ -1014,13 +941,13 @@ impl std::error::Error for TaskAccessError {}
 
 impl From<ArchiveError> for TaskAccessError {
     fn from(e: ArchiveError) -> Self {
-        TaskAccessError::Archive(e.to_string())
+        TaskAccessError(e.to_string())
     }
 }
 
 impl From<std::io::Error> for TaskAccessError {
     fn from(e: std::io::Error) -> Self {
-        TaskAccessError::Archive(e.to_string())
+        TaskAccessError(e.to_string())
     }
 }
 

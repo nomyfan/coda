@@ -479,7 +479,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Arc<coda_process::BackgroundProcesses>,
+        background: Option<Arc<coda_process::BackgroundProcesses>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls
@@ -808,6 +808,7 @@ pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::Backgro
     guard
         .background
         .clone()
+        .flatten()
         .expect("an initialized entry has a registry")
 }
 

@@ -377,7 +377,7 @@ impl SessionOpener for AppOpener {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Arc<BackgroundProcesses>,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
@@ -649,7 +649,7 @@ async fn open_session(
     reasoning_effort: Option<String>,
     permission_mode: PermissionModeCell,
     decisions: HashMap<String, ResumeDecision>,
-    background: Arc<BackgroundProcesses>,
+    background: Option<Arc<BackgroundProcesses>>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)

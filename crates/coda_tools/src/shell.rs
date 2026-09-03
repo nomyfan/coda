@@ -34,23 +34,21 @@ pub struct ShellTool {
     cwd: String,
     agent_name: String,
     timeout: Duration,
-    background: Arc<BackgroundProcesses>,
-    /// Only when true does `run_in_background` appear in the schema (and take
-    /// effect — the flag is ignored for agents not granted it).
-    allow_background: bool,
+    /// `None` when the session has no registry: `run_in_background` is then
+    /// absent from the schema, and ignored if the model invents it anyway.
+    background: Option<Arc<BackgroundProcesses>>,
 }
 
 impl ShellTool {
     pub fn new(
         cwd: String,
         agent_name: String,
-        background: Arc<BackgroundProcesses>,
-        allow_background: bool,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> Self {
         // Backgrounding is how a command escapes the timeout, so the two are
         // described together — but only to an agent that can actually follow
         // a task up.
-        let description = if allow_background {
+        let description = if background.is_some() {
             "Execute Bash commands and return stdout and stderr. Commands have a \
              fixed 2-minute timeout; run anything that may outlast it as a \
              background task instead of splitting or truncating it."
@@ -62,7 +60,7 @@ impl ShellTool {
 
         let mut schema = serde_json::to_value(schemars::schema_for!(ShellToolParams))
             .expect("shell schema serializes");
-        if !allow_background
+        if background.is_none()
             && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
         {
             props.remove("run_in_background");
@@ -76,7 +74,6 @@ impl ShellTool {
             agent_name,
             timeout: SHELL_TIMEOUT,
             background,
-            allow_background,
         }
     }
 }
@@ -106,18 +103,19 @@ impl Tool for ShellTool {
         let cwd = self.cwd.clone();
         let agent_name = self.agent_name.clone();
         let timeout = self.timeout;
-        let background = self.background.clone();
-        // An agent without the follow-up tools cannot be trusted with the
-        // flag even if it hallucinates one: the task would be unobservable
-        // and unkillable.
-        let run_in_background = self.allow_background && params.run_in_background.unwrap_or(false);
+        // An invented flag must not start a task nothing can observe or kill.
+        let background = params
+            .run_in_background
+            .unwrap_or(false)
+            .then(|| self.background.clone())
+            .flatten();
         async move {
             debug!(description = %params.description, command = %params.command, "Executing shell command");
             // `shell` is the platform-agnostic tool name; `bash` is the current backend.
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(&params.command).current_dir(&cwd);
 
-            if run_in_background {
+            if let Some(background) = background {
                 // The call settles now; the task lives outside tool-call
                 // semantics (only task_kill / registry shutdown end it), and
                 // outside the timeout — escaping it is the point. An already

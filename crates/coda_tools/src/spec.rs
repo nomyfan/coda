@@ -24,11 +24,11 @@ pub struct BuildContext {
     /// background tasks it starts.
     pub agent_name: String,
     /// Shared by every agent in one session, and the one thing that decides
-    /// whether background work exists at all: with no storage behind it,
-    /// [`background_specs`] and `shell`'s `run_in_background` both go. That is
+    /// whether background work exists at all: `None` takes both
+    /// [`background_specs`] and `shell`'s `run_in_background` with it. That is
     /// a capability, not a permission — backgrounding changes how long a
     /// command may run, so the call still faces the usual approval policy.
-    pub background: Arc<BackgroundProcesses>,
+    pub background: Option<Arc<BackgroundProcesses>>,
 }
 
 impl BuildContext {
@@ -42,9 +42,7 @@ impl BuildContext {
             workspace_dir: workspace_dir.into(),
             file_locks: crate::locks::shared_file_locks(),
             agent_name: "coda".into(),
-            background: Arc::new(BackgroundProcesses::disabled_from(
-                "a standalone build context has no background storage".into(),
-            )),
+            background: None,
         }
     }
 }
@@ -74,32 +72,32 @@ impl ToolSpec for ShellToolSpec {
             ctx.workspace_dir.clone(),
             ctx.agent_name.clone(),
             ctx.background.clone(),
-            ctx.background.is_enabled(),
         )))
     }
 }
 
-pub(crate) struct TaskOutputToolSpec;
+/// Both specs carry the registry instead of reading it off the context:
+/// [`background_specs`] is their only constructor and only runs when there is
+/// one, so neither can exist without a registry.
+pub(crate) struct TaskOutputToolSpec(Arc<BackgroundProcesses>);
 
 impl ToolSpec for TaskOutputToolSpec {
     fn name(&self) -> &str {
         "task_output"
     }
-    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(TaskOutputTool::new(
-            ctx.background.clone(),
-        )))
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskOutputTool::new(self.0.clone())))
     }
 }
 
-pub(crate) struct TaskKillToolSpec;
+pub(crate) struct TaskKillToolSpec(Arc<BackgroundProcesses>);
 
 impl ToolSpec for TaskKillToolSpec {
     fn name(&self) -> &str {
         "task_kill"
     }
-    fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(TaskKillTool::new(ctx.background.clone())))
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskKillTool::new(self.0.clone())))
     }
 }
 
@@ -259,18 +257,20 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
         .collect()
 }
 
-/// The background follow-up tools, for a session whose registry has storage
-/// behind it — empty otherwise.
+/// The background follow-up tools, for a session that has a registry — empty
+/// otherwise.
 ///
 /// Not declarable in `tools` and not granted per agent: whether there is
 /// anything to follow up on is the only question, and `shell`'s
 /// `run_in_background` answers it the same way, so the three appear and
 /// disappear together.
-pub fn background_specs(background: &BackgroundProcesses) -> Vec<Box<dyn ToolSpec>> {
-    if background.is_enabled() {
-        vec![Box::new(TaskOutputToolSpec), Box::new(TaskKillToolSpec)]
-    } else {
-        Vec::new()
+pub fn background_specs(background: Option<&Arc<BackgroundProcesses>>) -> Vec<Box<dyn ToolSpec>> {
+    match background {
+        Some(registry) => vec![
+            Box::new(TaskOutputToolSpec(registry.clone())),
+            Box::new(TaskKillToolSpec(registry.clone())),
+        ],
+        None => Vec::new(),
     }
 }
 

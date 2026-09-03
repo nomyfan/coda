@@ -432,9 +432,9 @@ manifest 和 ring fd 在该项完成校验/计费后立即关闭，任意时刻�
   `task_output`/`task_kill`。对具有合法 TaskId 但损坏的记录，查询返回该 task 的
   archive-corrupt 错误；不能降级成 unknown。
 - 只有 session background 根目录本身无法安全打开/枚举时，archive 初始化失败；hub
-  attach 仍可恢复对话，但 background registry 进入 disabled 状态，既不恢复 task 也不
-  允许 spawn，并把错误作为 server warning/工具错误暴露。不能让输出子系统阻断整个
-  对话 session。
+  attach 仍可恢复对话，但该 session 没有 registry：三个后台工具（`shell` 的
+  `run_in_background`、`task_output`、`task_kill`）一并不存在，失败原因作为 server
+  warning 记录。不能让输出子系统阻断整个对话 session。
 - blocker 本版没有自动修复 API；解除方式是用户删除 session 或在 server 停止后人工
   处理目录。entry/server 启动、attach 和 inventory 本身都不删除文件。
 - quota 只对 Coda 管理的 ring payload 给出 64 MiB 上限。外部同 Unix 用户主动写入
@@ -478,24 +478,21 @@ Consumed/Expired 清理只通过已打开 task dir fd unlink 已知 ring files�
 impl BackgroundProcesses {
     /// hub-owned registry：调用方提供已安全打开的 session archive capability；entry
     /// reopen 时先 inventory 再恢复。registry shutdown 只 flush/close，不删除未读输出。
-    pub fn session_backed(archive_dir: ArchiveDir) -> Self;
-
-    /// session archive 根 capability 无法安全打开时使用：对话 session 继续工作，
-    /// summaries 为空，spawn/read/kill 返回同一明确 archive-disabled 错误。
-    pub fn disabled(error: ArchiveError) -> Self;
+    /// 打不开或 inventory 扫描失败返回 Err：该 session 没有 registry，调用方负责记日志。
+    pub async fn session_backed(archive_dir: ArchiveDir) -> std::io::Result<Self>;
 
     /// 独立 Session 使用：输出位于 registry-owned 临时目录；Session 的 runtime
     /// 已确认退出且 registry shutdown 后没有后续消费者，因此可删除整个目录。
-    pub fn temporary() -> Self;
+    pub fn temporary() -> std::io::Result<Self>;
 
     /// 增量读取 active 或 archived task。每个 stream 最多返回 READ_CHUNK_LIMIT；
     /// manifest/cursor 写失败返回 Err，不能返回内容后假装游标已可靠推进。
-    pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskReadError>;
+    pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError>;
 
-    /// active task 执行 kill；archived terminal 返回既有状态。corrupt/disabled archive
+    /// active task 执行 kill；archived terminal 返回既有状态。corrupt archive
     /// 返回明确错误，未知 canonical id 才返回 Ok(None)。
     pub async fn kill(&self, id: &TaskId)
-        -> Result<Option<TaskStatus>, TaskControlError>;
+        -> Result<Option<TaskStatus>, TaskAccessError>;
 }
 ```
 
@@ -1049,7 +1046,7 @@ stderr pump result
       Verification：valid Retained 按 persisted capacity；Consumed/Expired 残留按 file
       length；missing/corrupt/unknown-layout/orphan/unsafe 项均不静默忽略；损坏目录存在时
       quota 不少算且新 spawn 被拒绝；session attach 和其他 valid task 查询仍成功；根目录
-      无法安全打开时 background disabled 但对话仍可 attach；inventory 不删除任何文件；
+      无法安全打开时 session 没有 registry 但对话仍可 attach；inventory 不删除任何文件；
       构造大量 Consumed/Expired 和 orphan 后断言 fd 峰值为常数、recent summaries≤32、
       issue samples≤32、retained index≤512，且 Weak record map 未被 inventory 填充；
       directory entries 为 lazy iterator，超 64 KiB manifest 不读取正文，sample 文本有界。
@@ -1125,9 +1122,10 @@ stderr pump result
 
 ### 实现说明（phase 4–10）
 
-- **registry/process**：`BackgroundProcesses` 改为 `Store`（archive + `SessionQuota`），
-  `new()=temporary()`、新增 `session_backed()`/`disabled()`；spawn 在 registry 锁下
-  reserve+create（无环锁序）；read 在 per-task commit lock 下分段读、写游标后才返回
+- **registry/process**：`BackgroundProcesses` 持有一个 `Backend`（archive +
+  `SessionQuota`），由 `temporary()`/`session_backed()` 构造，两者都可失败——没有
+  storage 就没有 registry，持有者用 `Option<Arc<BackgroundProcesses>>` 表达；
+  spawn 在 registry 锁下 reserve+create（无环锁序）；read 在 per-task commit lock 下分段读、写游标后才返回
   bytes、drained terminal 触发 `finalize_consumed`；monitor 提交 terminal manifest →
   `finalize_terminal` → 发 notice/summary。pump 返回结构化 `PumpResult`，read/spool
   failure kill group 并提交唯一 `Failed`，cancellation biased 保持 `Killed`。read/kill
@@ -1139,7 +1137,7 @@ stderr pump result
 - **hub lifecycle**：entry 首次 attach 惰性建 `session_backed`（rooted at
   `<session_dir>/background/tasks`，随 `delete_session` 递归删除），跨 detach/reopen/
   model switch/重启可读；inventory 重建 quota/blocker，恢复 recoverable Running→
-  Interrupted；archive 打不开则 background disabled 但对话可用。
+  Interrupted；archive 打不开则 session 没有 registry 但对话可用。
 - **cleanup/quota**：消费清理由 cursor+terminal 双事件触发，Consumed/Expired 严格
   manifest→delete→release，删除失败保留 reservation；淘汰按 terminal_at 最老优先，
   fully-consumed 强制 Consumed；expiration 由 registry 在 quota 锁释放后入队。

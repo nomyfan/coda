@@ -290,13 +290,13 @@ pub trait SessionOpener: Send + Sync + 'static {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Arc<BackgroundProcesses>,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
 
     /// Open the on-disk archive holding `key`'s background task output. Its
     /// root outlives any one entry, so output a task produced before a release
-    /// is still readable after the reopen; `Err` disables background work for
-    /// the session without otherwise affecting it.
+    /// is still readable after the reopen; `Err` leaves the session without
+    /// background work, but otherwise unaffected.
     fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String>;
 
     /// Remove everything `key` durably owns — its stored session and its
@@ -772,12 +772,13 @@ struct EntryState {
     /// kept in the phase would vanish under a compaction and leave the entry
     /// looking idle — free to be released, or to accept a second compaction.
     compacting: bool,
-    /// The session's background task registry, created by the attach that
-    /// initializes the entry. It sits here rather than in a phase for the same
-    /// reason `permission_mode` does, and more: a task belongs to the session,
-    /// so it has to outlive the `SetModel` rebuild that replaces the whole
-    /// runtime underneath it.
-    background: Option<Arc<BackgroundProcesses>>,
+    /// The session's background task registry: the outer `None` means no
+    /// attach has opened the archive yet, the inner one that an attach tried
+    /// and failed — no later one retries. It sits here rather than in a phase
+    /// for the same reason `permission_mode` does, and more: a task belongs to
+    /// the session, so it has to outlive the `SetModel` rebuild that replaces
+    /// the whole runtime underneath it.
+    background: Option<Option<Arc<BackgroundProcesses>>>,
     /// Task notices waiting for a turn to deliver them in. Drained from the
     /// registry as soon as they appear; each one opens its own turn, so they
     /// queue here whenever the session is busy. A non-empty queue keeps the
@@ -928,7 +929,7 @@ impl SessionHub {
             EntryPhase::Live(live) => Some(live.session),
             _ => None,
         };
-        let background = state.background.take();
+        let background = state.background.take().flatten();
         // `Closed` is sent before the shutdown below completes; that cannot
         // race a reattach past the checkpoint barrier, because an attach that
         // arrives while the phase is `Releasing` waits for `done` (set only
@@ -1017,7 +1018,7 @@ impl SessionHub {
             EntryPhase::Live(live) => Some(live.session),
             _ => None,
         };
-        let background = state.background.take();
+        let background = state.background.take().flatten();
         let entries = self.entries.clone();
         let opener = self.opener.clone();
         let entry = entry.clone();
@@ -1118,7 +1119,7 @@ impl SessionHub {
         if !state.pending_notices.is_empty() {
             return None;
         }
-        if let Some(background) = state.background.clone() {
+        if let Some(Some(background)) = state.background.clone() {
             let fresh = background.take_notices_if_quiescent().await?;
             state.pending_notices.extend(fresh);
             if !state.pending_notices.is_empty() {
@@ -1134,36 +1135,42 @@ impl SessionHub {
         ))
     }
 
-    /// The entry's task registry, created on first use by whichever attach
+    /// The entry's task registry, opened on first use by whichever attach
     /// initializes the entry — which is also when its watcher starts. Opening
-    /// the archive can fail; a disabled registry keeps the conversation
-    /// working with background execution turned off.
+    /// can fail; the session then works on with no background tools.
     async fn ensure_background(
         &self,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
-    ) -> Arc<BackgroundProcesses> {
+    ) -> Option<Arc<BackgroundProcesses>> {
         if let Some(background) = &state.background {
             return background.clone();
         }
-        let background = Arc::new(match self.opener.background_archive(&entry.key) {
-            Ok(archive) => BackgroundProcesses::session_backed(archive).await,
+        let opened = match self.opener.background_archive(&entry.key) {
+            Ok(archive) => BackgroundProcesses::session_backed(archive)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(error) => Err(error),
+        };
+        let background = match opened {
+            Ok(registry) => Some(Arc::new(registry)),
             Err(error) => {
                 warn!(
                     workspace_id = %entry.key.0,
                     session_id = %entry.key.1,
                     "background task archive unavailable: {error}"
                 );
-                BackgroundProcesses::disabled_from(error)
+                None
             }
-        });
+        };
         state.background = Some(background.clone());
+        let background = background?;
         state.notice_watcher = Some(spawn_notice_watcher(
             self.entries.clone(),
             entry.clone(),
             background.clone(),
         ));
-        background
+        Some(background)
     }
 
     /// Hand every pending notice to the session as one turn. Returns whether a
@@ -1177,7 +1184,7 @@ impl SessionHub {
         // its own schedule — one wake per task settling — so without this a
         // turn ending mid-flurry would carry only the notices that happened to
         // have been drained by then, and the rest would each get a turn.
-        if let Some(background) = state.background.clone() {
+        if let Some(Some(background)) = state.background.clone() {
             let fresh = background.take_notices().await;
             state.pending_notices.extend(fresh);
         }
@@ -1880,7 +1887,7 @@ impl SessionRelay for SessionHub {
                     CommandOutcome::Ok
                 }
                 SessionCommand::KillTask { task_id } => {
-                    let Some(background) = state.background.clone() else {
+                    let Some(Some(background)) = state.background.clone() else {
                         return CommandOutcome::Ignored;
                     };
                     let Ok(parsed) = task_id.parse() else {
@@ -2179,6 +2186,7 @@ fn current_tasks(state: &EntryState) -> Arc<[TaskSummary]> {
     state
         .background
         .as_ref()
+        .and_then(Option::as_ref)
         .map(|background| background.summaries().borrow().clone())
         .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()))
 }

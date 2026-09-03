@@ -1177,6 +1177,7 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
         .arg(format!("echo $$ > '{}'; sleep 43.11", pidfile.display()));
     session
         .background()
+        .expect("a self-built session has a registry")
         .spawn(
             cmd,
             coda_process::TaskMeta {

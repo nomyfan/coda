@@ -159,7 +159,15 @@ pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
     session_id: Option<String>,
     resume_decisions: HashMap<String, ResumeDecision>,
     file_locks: Option<Arc<KeyedLock<String>>>,
-    background: Option<Arc<BackgroundProcesses>>,
+    background: BackgroundSource,
+}
+
+/// Where a session's task registry comes from. An injected `None` (its owner
+/// could not open the archive) means no background work at all — what a plain
+/// `Option` would conflate with `SelfBuilt`.
+enum BackgroundSource {
+    SelfBuilt,
+    Injected(Option<Arc<BackgroundProcesses>>),
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
@@ -171,7 +179,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
             session_id: None,
             resume_decisions: HashMap::new(),
             file_locks: None,
-            background: None,
+            background: BackgroundSource::SelfBuilt,
         }
     }
 }
@@ -212,10 +220,13 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     /// Inject an externally-owned background task registry (e.g. held by the
     /// server's session hub, so tasks survive session rebuilds like a model
     /// switch). The session then never shuts the registry down — its owner
-    /// does. Without this call the session builds a private registry and
+    /// does. `None` injects the absence — no background tools at all — which
+    /// is what an owner with no archive to open passes.
+    ///
+    /// Without this call the session builds a private registry and
     /// [`Session::shutdown`] tears it down once the runtime has exited.
-    pub fn background(mut self, registry: Arc<BackgroundProcesses>) -> Self {
-        self.background = Some(registry);
+    pub fn background(mut self, registry: Option<Arc<BackgroundProcesses>>) -> Self {
+        self.background = BackgroundSource::Injected(registry);
         self
     }
 
@@ -253,10 +264,17 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         // this session only borrows it. A self-built one is owned, and
         // `shutdown` tears it down. Resolved before the agents are built —
         // their tools capture it.
-        let (background, owns_background) = match self.background.take() {
-            Some(registry) => (registry, false),
-            None => (Arc::new(BackgroundProcesses::temporary()), true),
-        };
+        let (background, owns_background) =
+            match std::mem::replace(&mut self.background, BackgroundSource::Injected(None)) {
+                BackgroundSource::Injected(registry) => (registry, false),
+                BackgroundSource::SelfBuilt => match BackgroundProcesses::temporary() {
+                    Ok(registry) => (Some(Arc::new(registry)), true),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not create a temporary background archive");
+                        (None, false)
+                    }
+                },
+            };
 
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
         let file_locks = self
@@ -457,7 +475,7 @@ struct SessionInner {
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
-    background: Arc<BackgroundProcesses>,
+    background: Option<Arc<BackgroundProcesses>>,
     /// Self-built registry (no [`SessionBuilder::background`]): `shutdown`
     /// tears it down once the runtime has confirmedly exited. An injected
     /// registry is never touched — its external owner manages its lifecycle.
@@ -627,9 +645,10 @@ impl Session {
     /// Stop the session. Returns whether the agents stopped of their own accord
     /// within the requested policy; every mode but `graceful_unbounded` also
     /// guarantees that none of them is still running once this returns.
-    /// The session's background task registry (injected or self-built).
-    pub fn background(&self) -> &Arc<BackgroundProcesses> {
-        &self.inner.background
+    /// The session's background task registry (injected or self-built), or
+    /// `None` for a session running without background work.
+    pub fn background(&self) -> Option<&Arc<BackgroundProcesses>> {
+        self.inner.background.as_ref()
     }
 
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
@@ -640,8 +659,11 @@ impl Session {
         // half-closed state (session up, registry closed). Undelivered
         // notices are dropped — a standalone session has no reopen to deliver
         // them to.
-        if exited && self.inner.owns_background {
-            let _ = self.inner.background.shutdown().await;
+        if exited
+            && self.inner.owns_background
+            && let Some(background) = &self.inner.background
+        {
+            let _ = background.shutdown().await;
         }
         exited
     }

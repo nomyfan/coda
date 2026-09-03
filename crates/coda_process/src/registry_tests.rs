@@ -22,7 +22,7 @@ fn running_count(rx: &watch::Receiver<Arc<[TaskSummary]>>) -> usize {
 /// spawn publishes the running task before returning the id.
 #[tokio::test]
 async fn spawn_publishes_keepalive_before_returning() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let rx = reg.summaries();
     assert_eq!(running_count(&rx), 0);
     let gate = Arc::new(Notify::new());
@@ -45,7 +45,7 @@ async fn spawn_publishes_keepalive_before_returning() {
 /// drainable (publish is the last step of the commit).
 #[tokio::test]
 async fn notice_is_enqueued_before_zero_is_visible() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let mut rx = reg.summaries();
     let gate = Arc::new(Notify::new());
     let g = gate.clone();
@@ -75,7 +75,7 @@ async fn notice_is_enqueued_before_zero_is_visible() {
 /// kill vs natural exit: exactly one terminal state, one notice.
 #[tokio::test]
 async fn kill_racing_natural_exit_settles_once() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let id = reg
         .spawn_with(meta("racy"), |ctx| async move {
             let cancel = ctx.cancelled();
@@ -102,7 +102,7 @@ async fn kill_racing_natural_exit_settles_once() {
 /// in the returned batch; afterwards spawn is rejected.
 #[tokio::test]
 async fn shutdown_returns_notices_of_killed_tasks_and_closes() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let id = reg
         .spawn_with(meta("forever"), |ctx| async move {
             ctx.cancelled().cancelled().await;
@@ -129,7 +129,7 @@ async fn shutdown_returns_notices_of_killed_tasks_and_closes() {
 
 #[tokio::test]
 async fn running_limit_rejects_spawn() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let gate = Arc::new(Notify::new());
     for _ in 0..MAX_RUNNING {
         let g = gate.clone();
@@ -154,7 +154,7 @@ async fn running_limit_rejects_spawn() {
 
 #[tokio::test]
 async fn rejected_process_spawn_has_no_command_side_effects() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     reg.shutdown().await;
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("should-not-exist");
@@ -176,21 +176,21 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+    let reg = BackgroundProcesses::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
-    })));
+    }));
 
     let cmd = Command::new("/definitely/not/a/real/executable");
     assert!(reg.spawn(cmd, meta("bad executable")).await.is_err());
     assert_eq!(archive.root().entries().unwrap().count(), 0);
-    assert_eq!(reg.backend().unwrap().quota.reserved(), 0);
+    assert_eq!(reg.backend.quota.reserved(), 0);
 }
 
 #[tokio::test]
 async fn oversized_task_metadata_is_rejected_before_work_starts() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let started = Arc::new(AtomicBool::new(false));
     let work_started = started.clone();
     let error = reg
@@ -224,13 +224,11 @@ async fn shutdown_waits_for_detached_create_transaction() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = Arc::new(BackgroundProcesses::with_store(Store::Enabled(Arc::new(
-        Backend {
-            archive: archive.clone(),
-            quota,
-            temp: None,
-        },
-    ))));
+    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
+        archive: archive.clone(),
+        quota,
+        temp: None,
+    })));
     let (entered, release) = archive.pause_next_create();
     let spawn_reg = reg.clone();
     let spawn = tokio::spawn(async move {
@@ -270,13 +268,11 @@ async fn quiescent_drain_waits_for_detached_quota_expiration() {
         2 * DEFAULT_STREAM_CAPACITY,
         archive.clone(),
     );
-    let reg = Arc::new(BackgroundProcesses::with_store(Store::Enabled(Arc::new(
-        Backend {
-            archive,
-            quota: quota.clone(),
-            temp: None,
-        },
-    ))));
+    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
+        archive,
+        quota: quota.clone(),
+        temp: None,
+    })));
 
     let old = reg
         .spawn_with(meta("old"), |ctx| async move {
@@ -328,7 +324,9 @@ async fn quiescent_drain_waits_for_detached_quota_expiration() {
 async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let reg = BackgroundProcesses::session_backed(root.clone()).await;
+    let reg = BackgroundProcesses::session_backed(root.clone())
+        .await
+        .unwrap();
     let id = reg
         .spawn_with(meta("restart"), |ctx| async move {
             ctx.append_stdout(b"before restart").await.unwrap();
@@ -346,7 +344,7 @@ async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
     )));
     drop(reg);
 
-    let reopened = BackgroundProcesses::session_backed(root).await;
+    let reopened = BackgroundProcesses::session_backed(root).await.unwrap();
     assert!(
         reopened.take_notices().await.is_empty(),
         "normal restart unexpectedly replayed a completion notice"
@@ -367,11 +365,11 @@ async fn create_failure_does_not_lose_prior_expiration_fact() {
         2 * DEFAULT_STREAM_CAPACITY,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+    let reg = BackgroundProcesses::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
-    })));
+    }));
     let old = reg
         .spawn_with(meta("old"), |ctx| async move {
             ctx.append_stdout(b"unread").await.unwrap();
@@ -398,12 +396,12 @@ async fn create_failure_does_not_lose_prior_expiration_fact() {
         TaskNotice::OutputExpired { id, .. } if id == &old
     )));
     archive.settle().await;
-    assert_eq!(reg.backend().unwrap().quota.reserved(), 0);
+    assert_eq!(reg.backend.quota.reserved(), 0);
 }
 
 #[tokio::test]
 async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let ready = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
     let task_ready = ready.clone();
@@ -454,8 +452,8 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     drop(record);
     drop(archive);
 
-    let reg = BackgroundProcesses::session_backed(root).await;
-    let backend = reg.backend().unwrap();
+    let reg = BackgroundProcesses::session_backed(root).await.unwrap();
+    let backend = &reg.backend;
     assert!(backend.quota.retained_contains(&id));
     assert_eq!(backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
     let read = reg.read(&id).await.unwrap().unwrap();
@@ -491,11 +489,11 @@ async fn shutdown_retries_dirty_in_memory_failed_manifest() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::with_store(Store::Enabled(Arc::new(Backend {
+    let reg = BackgroundProcesses::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
-    })));
+    }));
     let finish = Arc::new(Notify::new());
     let task_finish = finish.clone();
     let id = reg
@@ -545,7 +543,7 @@ async fn shutdown_retries_dirty_in_memory_failed_manifest() {
 /// reported as lost bytes, never re-read or skipped.
 #[tokio::test]
 async fn read_reports_lost_bytes_after_truncation() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let gate = Arc::new(Notify::new());
     let g = gate.clone();
     let id = reg
@@ -607,7 +605,7 @@ async fn read_reports_lost_bytes_after_truncation() {
 /// memory reclamation is decoupled from disk retention.
 #[tokio::test]
 async fn terminal_entries_are_reclaimed_beyond_cap() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let mut first_id = None;
     for i in 0..(MAX_TERMINAL + 1) {
         let id = reg
@@ -656,7 +654,7 @@ async fn terminal_entries_are_reclaimed_beyond_cap() {
 /// aggregate itself is never dropped.
 #[tokio::test]
 async fn notice_overflow_degrades_into_aggregate() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     for i in 0..(MAX_FULL_NOTICES + 3) {
         let id = reg
             .spawn_with(meta(&format!("n{i}")), |_ctx| async {
@@ -701,7 +699,7 @@ async fn notice_overflow_degrades_into_aggregate() {
 /// with work still running.
 #[tokio::test]
 async fn concurrent_shutdowns_share_the_barrier() {
-    let reg = Arc::new(BackgroundProcesses::temporary());
+    let reg = Arc::new(BackgroundProcesses::temporary().unwrap());
     reg.spawn_with(meta("forever"), |ctx| async move {
         ctx.cancelled().cancelled().await;
         TaskExit::Killed
@@ -790,7 +788,7 @@ async fn assert_pids_die(pids: &[i32]) {
 /// window, and the completion notice reports the storage-level overwrite.
 #[tokio::test]
 async fn chatty_process_overflows_ring_and_reports_overwrite() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     // ~10 bytes/line × 200_000 ≈ 2 MiB, well past the 512 KiB ring.
     let id = reg
         .spawn(
@@ -835,7 +833,7 @@ async fn chatty_process_overflows_ring_and_reports_overwrite() {
 /// commits the code and produces a notice carrying the tail.
 #[tokio::test]
 async fn process_task_streams_output_and_notifies_on_exit() {
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let id = reg
         .spawn(
             bash("echo out-marker; echo err-marker >&2; exit 3"),
@@ -889,7 +887,7 @@ async fn kill_kills_the_whole_process_group() {
     let pidfile = std::env::temp_dir().join(format!("coda-bg-group-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let command = format!(
         "sleep 38.21 & echo \"$$ $!\" > '{}'; wait",
         pidfile.display()
@@ -922,7 +920,7 @@ async fn kill_after_leader_exit_reports_killed() {
         std::env::temp_dir().join(format!("coda-bg-exited-leader-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let command = format!(
         "sleep 38.31 & echo \"$$ $!\" > '{}'; exit 0",
         pidfile.display()
@@ -966,7 +964,7 @@ async fn kill_settles_promptly_when_a_descendant_escapes_the_group() {
     let ready = std::env::temp_dir().join(format!("coda-bg-escape-{}", std::process::id()));
     let _ = std::fs::remove_file(&ready);
 
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let command = format!(
         "perl -MPOSIX -e 'POSIX::setsid(); open my $f, \">\", $ARGV[0]; print $f $$; close $f; exec \"sleep\", \"38.41\"' '{}' & wait",
         ready.display()
@@ -993,7 +991,7 @@ async fn shutdown_leaves_no_process_residue() {
     let pidfile = std::env::temp_dir().join(format!("coda-bg-shutdown-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary();
+    let reg = BackgroundProcesses::temporary().unwrap();
     let command = format!(
         "sleep 38.61 & echo \"$$ $!\" > '{}'; wait",
         pidfile.display()

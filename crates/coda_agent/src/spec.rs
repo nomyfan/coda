@@ -241,7 +241,7 @@ impl AgentTeam {
         &self,
         default_workspace: &str,
         file_locks: Arc<KeyedLock<String>>,
-        background: Arc<BackgroundProcesses>,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
@@ -276,7 +276,7 @@ impl AgentTeam {
             }
             // Not declarable and not per-agent: these exist whenever the
             // session has somewhere to run background work.
-            for tool_spec in coda_tools::background_specs(&background) {
+            for tool_spec in coda_tools::background_specs(background.as_ref()) {
                 agent.tools.register(tool_spec.build(&tool_ctx));
             }
             for child in &spec.subagents {
@@ -364,8 +364,10 @@ mod tests {
         fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
             self.seen.lock().unwrap().push((
                 ctx.agent_name.clone(),
-                ctx.background.is_enabled(),
-                Arc::as_ptr(&ctx.background) as usize,
+                ctx.background.is_some(),
+                ctx.background
+                    .as_ref()
+                    .map_or(0, |registry| Arc::as_ptr(registry) as usize),
             ));
             Box::new(RecordingTool)
         }
@@ -389,8 +391,12 @@ mod tests {
             ..spec("sub")
         };
         let team = AgentTeam::new(root, vec![sub]).unwrap();
-        let background = Arc::new(BackgroundProcesses::temporary());
-        let agents = team.build(".", coda_tools::shared_file_locks(), background.clone());
+        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+        let agents = team.build(
+            ".",
+            coda_tools::shared_file_locks(),
+            Some(background.clone()),
+        );
 
         for name in ["coda", "sub"] {
             let tools = &agents[name].tools;
@@ -427,11 +433,8 @@ mod tests {
             ..spec("coda")
         };
         let team = AgentTeam::new(root, vec![]).unwrap();
-        let background = Arc::new(BackgroundProcesses::disabled_from(
-            "archive root is unreadable".into(),
-        ));
 
-        let agents = team.build(".", coda_tools::shared_file_locks(), background);
+        let agents = team.build(".", coda_tools::shared_file_locks(), None);
 
         let tools = &agents["coda"].tools;
         assert!(tools.get("task_output").is_none());
@@ -538,7 +541,7 @@ mod tests {
         team.build(
             "/root",
             coda_tools::shared_file_locks(),
-            Arc::new(BackgroundProcesses::temporary()),
+            Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
         );
 
         let mut got = seen.lock().unwrap().clone();
@@ -589,7 +592,7 @@ mod tests {
             .build(
                 "/root",
                 coda_tools::shared_file_locks(),
-                Arc::new(BackgroundProcesses::temporary()),
+                Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
             );
         let agent = &agents["coda"];
 
