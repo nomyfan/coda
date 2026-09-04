@@ -345,7 +345,7 @@ export const Composer = memo(function Composer({
 
   return (
     <form
-      className="bg-background p-2 sm:p-3"
+      className="p-2 sm:p-3"
       onSubmit={(event) => {
         event.preventDefault();
         submit();

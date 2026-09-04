@@ -117,7 +117,7 @@ export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
       {/* Wide: part of the layout, so the transcript reflows rather than
           being covered by something the user then has to dismiss. */}
       {open ? (
-        <aside className="hidden w-[20rem] shrink-0 flex-col overflow-hidden border-l bg-background p-2.5 lg:flex">
+        <aside className="hidden w-[20rem] shrink-0 flex-col overflow-hidden rounded-lg border bg-background p-2.5 lg:flex">
           <PanelHeader onClose={onClose} />
           <div className="min-h-0 flex-1 overflow-y-auto">
             <TaskList tasks={tasks} />

@@ -75,7 +75,7 @@ export function ThemeToggle() {
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" className="size-8 shrink-0" title="Theme">
+        <Button variant="ghost" size="icon" className="size-6 shrink-0" title="Theme">
           <Icon className="size-4" />
         </Button>
       </DropdownMenuTrigger>

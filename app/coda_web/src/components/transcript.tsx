@@ -305,7 +305,7 @@ export const Transcript = memo(function Transcript({
       ref={scrollRef}
       onScroll={handleScroll}
       layoutScroll
-      className="scrollbar-fine fade-edge-bottom min-h-0 flex-1 overflow-y-auto bg-background px-4 py-3"
+      className="scrollbar-fine fade-edge-bottom min-h-0 flex-1 overflow-y-auto px-4 py-3"
     >
       <div ref={contentRef} className="mx-auto flex w-full max-w-4xl flex-col gap-2">
         {entries.length === 0 ? (

@@ -177,7 +177,7 @@ function WorkspaceHeader({
   showTasks: boolean;
 }) {
   return (
-    <header className="flex h-[calc(2.75rem_+_env(safe-area-inset-top))] shrink-0 items-center gap-2 border-b bg-background px-2 pt-[env(safe-area-inset-top)] sm:px-4">
+    <header className="flex h-[calc(2.75rem_+_env(safe-area-inset-top))] shrink-0 items-center gap-2 px-2 pt-[env(safe-area-inset-top)] sm:px-4">
       <button
         type="button"
         className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground lg:hidden"
@@ -197,14 +197,14 @@ function WorkspaceHeader({
       {showTasks ? (
         <button
           type="button"
-          className="relative flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+          className="relative flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
           onClick={onToggleTasks}
           title="Background tasks"
           aria-label="Background tasks"
         >
           <ListChecks className="size-4" />
           {runningTasks > 0 ? (
-            <span className="absolute right-1 top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5625rem] font-medium text-primary-foreground">
+            <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-[0.5625rem] font-medium text-primary-foreground">
               {runningTasks}
             </span>
           ) : null}
@@ -225,7 +225,7 @@ function WorkspaceTargetBar({
   onSelectTarget: (target: NewSessionTarget) => void;
 }) {
   return (
-    <div className="bg-background px-3 pt-2">
+    <div className="px-3 pt-2">
       <div className="mx-auto flex max-w-4xl items-center">
         <WorkspaceTargetSelect servers={servers} target={target} onSelectTarget={onSelectTarget} />
       </div>
@@ -434,7 +434,7 @@ export default function App() {
   );
 
   return (
-    <div className="relative flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px]">
+    <div className="relative flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px] lg:gap-1 lg:bg-muted/70 lg:p-1">
       <Sidebar
         mobileOpen={sidebarOpen}
         onMobileOpenChange={setSidebarOpen}
@@ -443,24 +443,26 @@ export default function App() {
         onStartNewSession={startNewSession}
         onNewSession={startNewSession}
       />
-      <section className="flex min-w-0 min-h-0 flex-1 flex-col bg-background">
-        <WorkspaceHeader
-          sessionTitle={activeSessionTitle}
-          onOpenSidebar={() => setSidebarOpen(true)}
-          onToggleTasks={() => setTasksOpen((open) => !open)}
-          runningTasks={runningTaskCount}
-          showTasks={Boolean(activeKey) && !showingNewSession}
-        />
-        <div className="relative flex min-w-0 min-h-0 flex-1">
-          <div className="relative flex min-w-0 min-h-0 flex-1 flex-col">
+      <section className="flex min-w-0 min-h-0 flex-1 flex-col">
+        <div className="relative flex min-w-0 min-h-0 flex-1 gap-1">
+          <div className="relative flex min-w-0 min-h-0 flex-1 flex-col gap-1">
             {/* `inert` also blocks keyboard focus, which the overlay alone
               wouldn't; the sidebar stays interactive for switching away. */}
             <div
               inert={evictedTakeover || undefined}
-              className="flex min-w-0 min-h-0 flex-1 flex-col"
+              className="flex min-w-0 min-h-0 flex-1 flex-col overflow-hidden bg-background lg:rounded-lg lg:border"
             >
-              <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
-              <div className="relative z-20 shrink-0 bg-background pb-[env(safe-area-inset-bottom)]">
+              <div className="flex min-w-0 min-h-0 flex-1 flex-col">
+                <WorkspaceHeader
+                  sessionTitle={activeSessionTitle}
+                  onOpenSidebar={() => setSidebarOpen(true)}
+                  onToggleTasks={() => setTasksOpen((open) => !open)}
+                  runningTasks={runningTaskCount}
+                  showTasks={Boolean(activeKey) && !showingNewSession}
+                />
+                <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
+              </div>
+              <div className="relative z-20 shrink-0 pb-[env(safe-area-inset-bottom)]">
                 {!showingNewSession && activePersistError ? (
                   <div className="mx-3 mb-2 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
                     <p className="min-w-0 flex-1 text-xs text-destructive">
