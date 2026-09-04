@@ -21,6 +21,7 @@ If that sibling file itself grows large enough to cover several distinct categor
 ## Git Workflow
 
 - Use Conventional Commits format for commit messages and pull request titles.
+- Run GitHub CLI and remote Git commands that depend on network access or the OS keyring (for example `gh auth status`, `gh pr ...`, and `git push`) with sandbox escalation. The restricted sandbox may be unable to read valid keyring credentials and can misleadingly report them as invalid; never conclude that authentication has expired until the same check has been retried with escalation.
 - Every commit must include a `Co-authored-by` trailer that names the **AI agent** which made the change — not the human. The human is already the commit author, so listing them as co-author is redundant and wrong. Use the agent's own identity, optionally followed by the model's display name (e.g. `Opus 4.8` — not a slug like `claude-opus-4-8`):
 
   ```

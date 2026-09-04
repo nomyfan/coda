@@ -50,7 +50,7 @@ where you launch from.
 | --- | --- |
 | `coda-server.toml` | Multiple providers, per-model `context_window` / `reasoning_efforts` / `input_modalities`, `${VAR}` expansion, workspace declaration. |
 | `workspace/AGENTS.md` | Root **workspace knowledge**, exposed to bodies as the `{{workspace_custom_instructions}}` variable and hot-reloaded on change. |
-| `.coda/agents/AGENT.md` | Root `coda` overrides: explicit `subagents`, plus a custom body that composes the env, `{{skills_guide}}`/`{{workspace_available_skills}}`, and `{{workspace_custom_instructions}}` variables. |
+| `.coda/agents/AGENT.md` | Root `coda` overrides: an exclude-only `tools` rule (missing include keeps root's all-tools default), explicit `subagents`, plus a custom body that composes the env, `{{skills_guide}}`/`{{workspace_available_skills}}`, and `{{workspace_custom_instructions}}` variables. |
 | `planner/` | A **stateful** orchestrator with a minimal tool set (`read_todos`/`write_todos`) and its own `subagents` — a deeper graph under `coda`. A pure delegator, so its body pulls in the env and custom instructions but **not** the skills variables. |
 | `researcher/` | **Stateless**, read-only tools, an MCP **prefix pattern** (`mcp__time__*`), a per-agent **model override** to a cheaper model, and a body that references the skills variables. |
 | `coder/` | A fuller tool set incl. `shell`, the full env block plus `{{skills_guide}}`/`{{workspace_available_skills}}`, a **reasoning model** override with `reasoning_effort: high`. |

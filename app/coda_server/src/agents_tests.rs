@@ -42,10 +42,48 @@ impl ToolObject for FakeTool {
 /// A registry preloaded with two `mcp__example__*` tools and one other.
 fn registry_with_mcp() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.insert(FakeTool::boxed("mcp__example__search"));
-    registry.insert(FakeTool::boxed("mcp__example__extract"));
-    registry.insert(FakeTool::boxed("mcp__other__list"));
     registry
+        .insert(FakeTool::boxed("mcp__example__search"))
+        .unwrap();
+    registry
+        .insert(FakeTool::boxed("mcp__example__extract"))
+        .unwrap();
+    registry
+        .insert(FakeTool::boxed("mcp__other__list"))
+        .unwrap();
+    registry
+}
+
+#[test]
+fn registry_rejects_a_prebuilt_name_that_collides_with_a_builtin() {
+    let mut registry = ToolRegistry::new();
+    assert_eq!(
+        registry.insert(FakeTool::boxed("shell")),
+        Err(ToolRegistryError::DuplicateToolName("shell".to_string()))
+    );
+}
+
+#[test]
+fn registry_rejects_duplicate_prebuilt_names() {
+    let mut registry = ToolRegistry::new();
+    registry.insert(FakeTool::boxed("mcp__same")).unwrap();
+    assert_eq!(
+        registry.insert(FakeTool::boxed("mcp__same")),
+        Err(ToolRegistryError::DuplicateToolName(
+            "mcp__same".to_string()
+        ))
+    );
+}
+
+fn include(names: &[&str]) -> ToolSelection {
+    ToolSelection::Include(names.iter().map(|name| (*name).to_string()).collect())
+}
+
+fn rules(include: Option<&[&str]>, exclude: &[&str]) -> ToolSelection {
+    ToolSelection::Rules(ToolRules {
+        include: include.map(|names| names.iter().map(|name| (*name).to_string()).collect()),
+        exclude: exclude.iter().map(|name| (*name).to_string()).collect(),
+    })
 }
 
 fn write_agent(dir: &Path, name: &str, content: &str) {
@@ -65,7 +103,7 @@ fn write_root_agent(dir: &Path, content: &str) {
 fn build_team(
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
-    root_tools: Option<Vec<String>>,
+    root_tools: Option<ToolSelection>,
     root_subagents: Option<Vec<String>>,
 ) -> Result<AgentTeam, LoadError> {
     build_agent_team(
@@ -178,8 +216,40 @@ fn parses_valid_agent() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].name, "explore");
     assert_eq!(files[0].mode, SubAgentMode::Stateless);
-    assert_eq!(files[0].tools, vec!["read_file", "grep"]);
+    assert_eq!(files[0].tools, Some(include(&["read_file", "grep"])));
     assert_eq!(files[0].system_prompt, "You explore.");
+}
+
+#[test]
+fn parses_agent_tool_include_and_exclude_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    write_agent(
+        dir.path(),
+        "explore",
+        "---\ndescription: explores\nmode: stateless\ntools:\n  include: [read_file, mcp__example__*]\n  exclude: [mcp__example__delete]\n---\nYou explore.",
+    );
+    let files = load_agent_files(dir.path()).unwrap();
+    assert_eq!(
+        files[0].tools,
+        Some(rules(
+            Some(&["read_file", "mcp__example__*"]),
+            &["mcp__example__delete"]
+        ))
+    );
+}
+
+#[test]
+fn rejects_unknown_tool_rule_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    write_agent(
+        dir.path(),
+        "explore",
+        "---\ndescription: explores\nmode: stateless\ntools:\n  incldue: [read_file]\n---\nYou explore.",
+    );
+    assert!(matches!(
+        load_agent_files(dir.path()),
+        Err(LoadError::Parse { .. })
+    ));
 }
 
 #[test]
@@ -389,10 +459,7 @@ fn root_agent_file_parses_overrides_and_body() {
         "---\ntools: [shell, read_file]\nsubagents: [explore]\n---\nYou are coda.",
     );
     let root = load_root_agent_file(dir.path()).unwrap();
-    assert_eq!(
-        root.tools,
-        Some(vec!["shell".to_string(), "read_file".to_string()])
-    );
+    assert_eq!(root.tools, Some(include(&["shell", "read_file"])));
     assert_eq!(root.subagents, Some(vec!["explore".to_string()]));
     assert_eq!(root.system_prompt.as_deref(), Some("You are coda."));
 }
@@ -403,8 +470,19 @@ fn root_agent_file_empty_body_is_none() {
     write_root_agent(dir.path(), "---\ntools: []\n---\n");
     let root = load_root_agent_file(dir.path()).unwrap();
     // Explicit empty list overrides to "no tools"; empty body falls back.
-    assert_eq!(root.tools, Some(vec![]));
+    assert_eq!(root.tools, Some(include(&[])));
     assert!(root.system_prompt.is_none());
+}
+
+#[test]
+fn root_agent_file_parses_exclude_without_include() {
+    let dir = tempfile::tempdir().unwrap();
+    write_root_agent(
+        dir.path(),
+        "---\ntools:\n  exclude: [shell, mcp__example__*]\n---\nbody",
+    );
+    let root = load_root_agent_file(dir.path()).unwrap();
+    assert_eq!(root.tools, Some(rules(None, &["shell", "mcp__example__*"])));
 }
 
 #[test]
@@ -444,7 +522,7 @@ fn root_tools_override_unknown_tool_errors() {
     let result = build_team(
         &ToolRegistry::new(),
         files,
-        Some(vec!["no_such_tool".into()]),
+        Some(include(&["no_such_tool"])),
         None,
     );
     assert!(matches!(
@@ -459,7 +537,8 @@ fn tool_pattern_expands_to_matching_prebuilt_tools() {
     let tools = resolve_tools(
         &registry,
         "explore",
-        &["read_file".to_string(), "mcp__example__*".to_string()],
+        Some(&include(&["read_file", "mcp__example__*"])),
+        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -478,10 +557,8 @@ fn tool_pattern_dedups_against_literal_overlap() {
     let tools = resolve_tools(
         &registry,
         "explore",
-        &[
-            "mcp__example__search".to_string(),
-            "mcp__example__*".to_string(),
-        ],
+        Some(&include(&["mcp__example__search", "mcp__example__*"])),
+        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -489,9 +566,102 @@ fn tool_pattern_dedups_against_literal_overlap() {
 }
 
 #[test]
+fn include_and_exclude_are_resolved_with_exclude_priority() {
+    let registry = registry_with_mcp();
+    let tools = resolve_tools(
+        &registry,
+        "explore",
+        Some(&rules(
+            Some(&["read_file", "mcp__example__*", "grep"]),
+            &["mcp__example__search", "grep"],
+        )),
+        DefaultToolSet::Empty,
+    )
+    .unwrap();
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(names, vec!["read_file", "mcp__example__extract"]);
+}
+
+#[test]
+fn root_exclude_without_include_filters_the_default_tool_set() {
+    let registry = registry_with_mcp();
+    let team = build_team(
+        &registry,
+        Vec::new(),
+        Some(rules(None, &["shell", "mcp__example__*"])),
+        None,
+    )
+    .unwrap();
+    let names: Vec<&str> = team.root().tools.iter().map(|tool| tool.name()).collect();
+    assert!(!names.contains(&"shell"));
+    assert!(!names.iter().any(|name| name.starts_with("mcp__example__")));
+    assert!(names.contains(&"read_file"));
+    assert!(names.contains(&"mcp__other__list"));
+}
+
+#[test]
+fn subagent_exclude_without_include_keeps_the_empty_default_tool_set() {
+    let dir = tempfile::tempdir().unwrap();
+    write_agent(
+        dir.path(),
+        "worker",
+        "---\ndescription: x\nmode: stateless\ntools:\n  exclude: [shell]\n---\nbody",
+    );
+    let files = load_agent_files(dir.path()).unwrap();
+    let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
+    let agents = team.build(".", coda_tools::shared_file_locks(), None);
+    assert!(agents["worker"].tools.descriptors().is_empty());
+}
+
+#[test]
+fn explicit_empty_include_does_not_fall_back_to_the_root_default() {
+    let team = build_team(
+        &ToolRegistry::new(),
+        Vec::new(),
+        Some(rules(Some(&[]), &[])),
+        None,
+    )
+    .unwrap();
+    assert!(team.root().tools.is_empty());
+}
+
+#[test]
+fn excluding_a_known_tool_outside_the_include_set_is_a_noop() {
+    let tools = resolve_tools(
+        &ToolRegistry::new(),
+        "explore",
+        Some(&rules(Some(&["read_file"]), &["shell"])),
+        DefaultToolSet::Empty,
+    )
+    .unwrap();
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(names, vec!["read_file"]);
+}
+
+#[test]
+fn unknown_exact_exclude_is_an_error() {
+    let result = resolve_tools(
+        &ToolRegistry::new(),
+        "explore",
+        Some(&rules(Some(&["read_file"]), &["no_such_tool"])),
+        DefaultToolSet::Empty,
+    );
+    assert!(matches!(
+        result,
+        Err(LoadError::UnknownTool { tool, .. }) if tool == "no_such_tool"
+    ));
+}
+
+#[test]
 fn tool_pattern_matching_nothing_is_not_an_error() {
     let registry = registry_with_mcp();
-    let tools = resolve_tools(&registry, "explore", &["mcp__nope__*".to_string()]).unwrap();
+    let tools = resolve_tools(
+        &registry,
+        "explore",
+        Some(&include(&["mcp__nope__*"])),
+        DefaultToolSet::Empty,
+    )
+    .unwrap();
     assert!(tools.is_empty());
 }
 
@@ -500,7 +670,12 @@ fn bare_star_is_not_a_wildcard() {
     // A bare `*` is not a pattern (omit `tools` to get everything); it has
     // no non-empty prefix, so it resolves like a literal and is unknown.
     let registry = registry_with_mcp();
-    let result = resolve_tools(&registry, "explore", &["*".to_string()]);
+    let result = resolve_tools(
+        &registry,
+        "explore",
+        Some(&include(&["*"])),
+        DefaultToolSet::Empty,
+    );
     assert!(matches!(
         result,
         Err(LoadError::UnknownTool { tool, .. }) if tool == "*"
