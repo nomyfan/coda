@@ -12,6 +12,7 @@ use coda_agent::{
 };
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
+use coda_process::{ArchiveDir, BackgroundProcesses, BackgroundRootLock};
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
 };
@@ -42,13 +43,14 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, CompactParams, CompactResult, DeleteSessionParams, EventParams,
-        FileCatalog, ForkAccepted, ForkSessionParams, ListFilesParams, ListSkillsParams,
-        ModelSelection, OpenSessionParams, PendingApprovalWire, PermissionModeSelection,
-        ProviderCatalog, ProviderInfoWire, RenameSessionParams, ResumeParams, RewindAccepted,
-        RewindParams, SessionName, SessionRef, SessionStatusWire, SessionSummaryWire,
-        SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire, Snapshot,
-        TaskAccepted, TaskParams, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        AddAllowPatternParams, BackgroundTasksPush, CompactParams, CompactResult,
+        DeleteSessionParams, EventParams, FileCatalog, ForkAccepted, ForkSessionParams,
+        KillTaskParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
+        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
+        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
+        SessionStatusWire, SessionSummaryWire, SetModelParams, SetPermissionModeParams,
+        SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskNoticePush, TaskParams,
+        TaskSummaryWire, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -236,6 +238,82 @@ fn task_image_data_uri_decoded_len(image: &str) -> Option<usize> {
 struct AppOpener {
     providers: HashMap<String, Arc<ProviderHandle>>,
     workspaces: HashMap<String, Arc<WorkspaceState>>,
+    /// Where background tasks spool their output, one directory per session
+    /// beneath it. The root is stable across process incarnations so unread
+    /// output survives a normal restart; session deletion is its cleanup
+    /// boundary.
+    background_root: PathBuf,
+}
+
+/// Where a retired spool waits to be deleted, beside the root's own `.lock`.
+/// The leading dot is what puts it out of reach: `background_dir` refuses one.
+const BACKGROUND_TRASH_DIR: &str = ".trash";
+
+/// Per-session background spool directory. Both ids are validated on the way in
+/// — `config::is_workspace_id` and `storage::validate_session_id` — and checked
+/// again here rather than trusted into a path.
+///
+/// The two rules differ because the levels do. A workspace names a directory in
+/// the root, where `.lock` and `.trash` live, so it may not start with a dot;
+/// under it a session id names nothing reserved, so it only has to be a plain
+/// component. Keeping the session rule to what `validate_session_id` already
+/// rejects is what stops an id the API accepted from being unspoolable.
+fn background_dir(root: &FsPath, workspace_id: &str, session_id: &str) -> Result<PathBuf, String> {
+    let unsafe_component =
+        |id: &str| id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']);
+    if unsafe_component(workspace_id)
+        || workspace_id.starts_with('.')
+        || unsafe_component(session_id)
+    {
+        return Err(format!(
+            "unsafe session key: {workspace_id:?}/{session_id:?}"
+        ));
+    }
+    Ok(root.join(workspace_id).join(session_id))
+}
+
+/// Retire a session's background spool: rename it out of reach, then delete it.
+///
+/// Only the rename can fail the caller. `root/<workspace>/<session>` is
+/// addressed by session id alone, so whatever is left there is adopted whole by
+/// the next session opened under that id — the deleted session's tasks and
+/// their output, or a half-removed archive that refuses to open at all. That is
+/// state crossing between sessions, not a wasted directory. Once the name is
+/// gone nothing can reach the bytes, so the removal below is best-effort.
+fn retire_background_dir(
+    root: &FsPath,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    // A key this refuses is a key nothing could ever have spooled under, since
+    // this is the only way the path is built — so there is nothing to retire,
+    // and failing here would leave the session undeletable instead.
+    let Ok(dir) = background_dir(root, workspace_id, session_id) else {
+        return Ok(());
+    };
+    if !dir.try_exists().map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    let trash = root.join(BACKGROUND_TRASH_DIR);
+    std::fs::create_dir_all(&trash)
+        .map_err(|error| format!("failed to create {}: {error}", trash.display()))?;
+    // Both under the root, so this is an atomic rename, not a copy. The stamp
+    // only has to separate repeated retirements of the same key.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let retired = trash.join(format!("{workspace_id}-{session_id}-{stamp}"));
+    std::fs::rename(&dir, &retired).map_err(|error| {
+        format!(
+            "failed to retire background task spool {}: {error}",
+            dir.display()
+        )
+    })?;
+    if let Err(error) = std::fs::remove_dir_all(&retired) {
+        warn!(path = %retired.display(), "failed to remove retired background task spool: {error}");
+    }
+    Ok(())
 }
 
 /// How long a compaction waits on its provider. There is no abort path — the
@@ -299,12 +377,36 @@ impl SessionOpener for AppOpener {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
                 .workspaces
                 .get(&key.0)
                 .ok_or_else(|| OpenError::Storage(format!("unknown workspace '{}'", key.0)))?;
+            // Re-assert the session row, under the hub's entry lock this time.
+            // `open_session`'s handler creates it before it ever reaches the
+            // hub — it needs the durable model binding to pick a provider — so
+            // a delete holding the key can remove that row while the open is
+            // still waiting on the tombstone, leaving this runtime live with
+            // nothing to write to. The insert is idempotent, so the ordinary
+            // path pays one no-op statement.
+            let provider = self
+                .providers
+                .get(provider_id)
+                .expect("caller passes a validated provider id");
+            workspace
+                .storage
+                .initialize_session(
+                    &key.1,
+                    SessionModelBinding {
+                        provider_id: provider.provider_id.clone(),
+                        model_id: provider.model_id.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                    },
+                )
+                .await
+                .map_err(|err| OpenError::Storage(err.to_string()))?;
             open_session(
                 &self.providers,
                 workspace,
@@ -313,8 +415,38 @@ impl SessionOpener for AppOpener {
                 reasoning_effort,
                 permission_mode,
                 decisions,
+                background,
             )
             .await
+        })
+    }
+
+    fn background_archive(&self, key: &SessionKey) -> Result<ArchiveDir, String> {
+        let dir = background_dir(&self.background_root, &key.0, &key.1)?;
+        ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
+    }
+
+    fn delete_persisted<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
+            // Spool first, rows second: "deleted" must never be reported
+            // over a spool still at the canonical path. The cost is the rarer
+            // failure — a storage error after the spool is gone leaves the
+            // session reopenable without its finished tasks' output, which
+            // beats its successor inheriting them.
+            retire_background_dir(&self.background_root, &key.0, &key.1)?;
+            workspace
+                .storage
+                .delete_session(&key.1)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
         })
     }
 
@@ -517,6 +649,7 @@ async fn open_session(
     reasoning_effort: Option<String>,
     permission_mode: PermissionModeCell,
     decisions: HashMap<String, ResumeDecision>,
+    background: Option<Arc<BackgroundProcesses>>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)
@@ -572,6 +705,9 @@ async fn open_session(
         .run_config(config)
         .session_id(session_id)
         .resume_decisions(decisions)
+        // Hub-owned: the entry outlives this session, so a model switch keeps
+        // the tasks it started.
+        .background(background)
         .open()
         .await
 }
@@ -901,6 +1037,12 @@ fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
         permission_mode: snapshot.permission_mode,
         turn_running: snapshot.turn_running,
         compacting: snapshot.compacting,
+        background_tasks: snapshot
+            .background_tasks
+            .iter()
+            .cloned()
+            .map(TaskSummaryWire::from)
+            .collect(),
     }
 }
 
@@ -1412,12 +1554,24 @@ async fn dispatch_request(
                     .into();
             }
             let key = (params.workspace_id.clone(), params.session_id.clone());
-            // Stop the runtime before removing its files so no checkpoint is
-            // written back after deletion. Refused when another connection is
-            // attached — a stale client must not erase work someone else is
-            // driving (the persisted state stays too).
+            // One barrier, held by the hub: it stops the runtime, closes the
+            // task registry, and removes the stored session and its task spool
+            // before it frees the key — so nothing reopens the session halfway
+            // through. Refused when another connection is attached: a stale
+            // client must not erase work someone else is driving (the persisted
+            // state stays too).
             match app.relay.delete(key.clone(), conn_id).await {
                 DeleteOutcome::Deleted => {}
+                // The runtime is gone but the session is not: it stays in the
+                // catalog, so the client is told rather than shown a delete
+                // that did not happen. Already logged by the hub.
+                DeleteOutcome::Failed(err) => {
+                    return (
+                        id,
+                        RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
+                    )
+                        .into();
+                }
                 DeleteOutcome::NotOwner => {
                     return (
                         id,
@@ -1439,18 +1593,6 @@ async fn dispatch_request(
             // Drop our own stream (the hub evicted our attachment, if any).
             streams.remove(&key);
             selections.remove(&key);
-            let workspace = app
-                .workspaces
-                .get(&params.workspace_id)
-                .expect("workspace presence checked above");
-            if let Err(err) = workspace.storage.delete_session(&params.session_id).await {
-                warn!(workspace_id = %params.workspace_id, session_id = %params.session_id, "failed to delete session: {err}");
-                return (
-                    id,
-                    RpcError::with_detail(rpc::DELETE_FAILED, "failed to delete session", err),
-                )
-                    .into();
-            }
             // The catalog is authoritative only after a durable delete.
             (
                 id,
@@ -1614,6 +1756,26 @@ async fn dispatch_notification<T: Transport>(
             }
             Err(err) => {
                 warn!("ignoring malformed abort notification: {}", err.message);
+                true
+            }
+        },
+        // Fire-and-forget like `abort`: the answer the user cares about is the
+        // task list, which the hub pushes on its own.
+        "kill_task" => match parse_params::<KillTaskParams>(params) {
+            Ok(params) => {
+                app.relay
+                    .command(
+                        (params.workspace_id, params.session_id),
+                        conn_id,
+                        SessionCommand::KillTask {
+                            task_id: params.task_id,
+                        },
+                    )
+                    .await;
+                true
+            }
+            Err(err) => {
+                warn!("ignoring malformed kill_task notification: {}", err.message);
                 true
             }
         },
@@ -1966,6 +2128,24 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                     // The session changed outside the event stream. Unlike the
                     // two below this is not the end of anything, so the stream
                     // and this connection's claim on it both stay put.
+                    // Tasks outlive turns, so their list is pushed on its own
+                    // rather than replayed as turn history.
+                    RelayEvent::BackgroundTasks(tasks) => {
+                        send_notify(&transport, "background_tasks", &BackgroundTasksPush {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            tasks: tasks.iter().cloned().map(TaskSummaryWire::from).collect(),
+                        })
+                        .await
+                    }
+                    RelayEvent::TaskNotice(message) => {
+                        send_notify(&transport, "task_notice", &TaskNoticePush {
+                            workspace_id: key.0.clone(),
+                            session_id: key.1.clone(),
+                            message: *message,
+                        })
+                        .await
+                    }
                     RelayEvent::Snapshot(snapshot) => {
                         send_notify(&transport, "snapshot", &wire_snapshot(&key, *snapshot)).await
                     }
@@ -2309,6 +2489,15 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let background_root = server_config.background.root.clone();
+    let _background_root_lock = BackgroundRootLock::acquire(&background_root).unwrap_or_else(|e| {
+        eprintln!(
+            "error locking background spool root {}: {e}",
+            background_root.display()
+        );
+        std::process::exit(1);
+    });
+
     // Config guarantees at least one provider with at least one model;
     // the first model is the session default.
     let default_provider = {
@@ -2344,6 +2533,7 @@ async fn main() {
         Arc::new(AppOpener {
             providers: providers.clone(),
             workspaces: workspaces.clone(),
+            background_root,
         }),
         server_config.relay,
     ));
@@ -2407,6 +2597,88 @@ async fn main() {
     }
 
     info!("server stopped");
+}
+
+#[cfg(test)]
+mod background_spool_tests {
+    use super::*;
+
+    #[test]
+    fn a_retired_spool_is_gone_from_the_path_a_new_session_would_open() {
+        let root = tempfile::tempdir().expect("temp root");
+        let dir = background_dir(root.path(), "ws", "sess").expect("a safe key");
+        std::fs::create_dir_all(dir.join("task-1")).expect("spool a task");
+        std::fs::write(dir.join("task-1").join("meta.json"), b"{}").expect("write meta");
+
+        retire_background_dir(root.path(), "ws", "sess").expect("retire");
+
+        assert!(
+            !dir.exists(),
+            "the next session under this id would inherit it"
+        );
+    }
+
+    #[test]
+    fn retiring_a_spool_that_was_never_created_is_not_a_failure() {
+        // The common case: a session that never ran a background task.
+        let root = tempfile::tempdir().expect("temp root");
+        retire_background_dir(root.path(), "ws", "sess").expect("retire");
+        assert!(!root.path().join(BACKGROUND_TRASH_DIR).exists());
+    }
+
+    #[test]
+    fn a_spool_whose_removal_fails_is_still_out_of_reach() {
+        // A read-only parent stands in for a removal that cannot finish.
+        let root = tempfile::tempdir().expect("temp root");
+        let dir = background_dir(root.path(), "ws", "sess").expect("a safe key");
+        std::fs::create_dir_all(&dir).expect("spool");
+        let trash = root.path().join(BACKGROUND_TRASH_DIR);
+        std::fs::create_dir_all(&trash).expect("trash");
+        let mut perms = std::fs::metadata(&trash).expect("trash meta").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&trash, perms).expect("lock the trash down");
+
+        let retired = retire_background_dir(root.path(), "ws", "sess");
+
+        // Either the rename failed and said so, or only the removal was
+        // refused. Ruled out: success with the spool still reachable.
+        assert_eq!(
+            retired.is_ok(),
+            !dir.exists(),
+            "a retirement reported success without freeing the path"
+        );
+        let mut perms = std::fs::metadata(&trash).expect("trash meta").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&trash, perms).expect("restore for cleanup");
+    }
+
+    #[test]
+    fn the_trash_is_not_addressable_as_a_workspace() {
+        // What keeps a retired spool retired.
+        let root = tempfile::tempdir().expect("temp root");
+        assert!(background_dir(root.path(), BACKGROUND_TRASH_DIR, "sess").is_err());
+        assert!(background_dir(root.path(), ".lock", "sess").is_err());
+        assert!(background_dir(root.path(), "..", "sess").is_err());
+        assert!(background_dir(root.path(), "ws", "..").is_err());
+        assert!(background_dir(root.path(), "ws", "a/b").is_err());
+    }
+
+    #[test]
+    fn a_session_id_the_api_accepts_can_always_be_spooled_and_retired() {
+        // The root's reserved names are the root's problem: a dot-prefixed
+        // session id collides with nothing, and `validate_session_id` lets it
+        // through — so refusing it here would disable background work for a
+        // session the API created, and make it undeletable besides.
+        let root = tempfile::tempdir().expect("temp root");
+        coda_server::storage::validate_session_id(".foo").expect("the API accepts it");
+        let dir = background_dir(root.path(), "ws", ".foo").expect("a spoolable session");
+        std::fs::create_dir_all(&dir).expect("spool");
+
+        retire_background_dir(root.path(), "ws", ".foo").expect("retire");
+
+        assert!(!dir.exists());
+    }
 }
 
 #[cfg(test)]

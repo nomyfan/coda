@@ -5,6 +5,7 @@ mod locks;
 mod process;
 mod shell;
 mod spec;
+mod task;
 mod todo;
 
 pub use coda_ptc::{
@@ -21,9 +22,13 @@ pub use spec::{
     BUILTIN_TOOL_NAMES, BuildContext, EditFileToolSpec, GlobToolSpec, GrepToolSpec,
     ListDirectoryToolSpec, PrebuiltToolSpec, ReadFileToolSpec, ReadTodosToolSpec,
     RunJavaScriptToolSpec, ShellToolSpec, ToolSpec, WriteFileToolSpec, WriteTodosToolSpec,
-    builtin_specs, spec_by_name,
+    background_specs, builtin_specs, spec_by_name,
 };
+pub use task::{TaskKillTool, TaskOutputTool};
 pub use todo::{ReadTodosTool, TodoItem, WriteTodosTool};
 
-/// Provider-visible synthetic names that ToolSpec implementations may not claim.
-pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] = &[LIST_JAVASCRIPT_TOOLS_TOOL_NAME];
+/// Provider-visible synthetic names that ToolSpec implementations may not
+/// claim: the runtime injects these itself, so a spec claiming one would be
+/// registered where the real tool is absent, and replaced where it is not.
+pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] =
+    &[LIST_JAVASCRIPT_TOOLS_TOOL_NAME, "task_output", "task_kill"];

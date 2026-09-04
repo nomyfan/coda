@@ -18,7 +18,8 @@ use crate::{
     AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
     ToolCallResolution,
 };
-use coda_core::llm::{LLMProvider, Message, MessageId, TurnId};
+use coda_core::llm::{LLMProvider, Message, MessageId, TaskNoticeOutcome, TurnId};
+use coda_process::BackgroundProcesses;
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,6 +159,15 @@ pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
     session_id: Option<String>,
     resume_decisions: HashMap<String, ResumeDecision>,
     file_locks: Option<Arc<KeyedLock<String>>>,
+    background: BackgroundSource,
+}
+
+/// Where a session's task registry comes from. An injected `None` (its owner
+/// could not open the archive) means no background work at all — what a plain
+/// `Option` would conflate with `SelfBuilt`.
+enum BackgroundSource {
+    SelfBuilt,
+    Injected(Option<Arc<BackgroundProcesses>>),
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
@@ -169,6 +179,7 @@ impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
             session_id: None,
             resume_decisions: HashMap::new(),
             file_locks: None,
+            background: BackgroundSource::SelfBuilt,
         }
     }
 }
@@ -206,6 +217,19 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         self
     }
 
+    /// Inject an externally-owned background task registry (e.g. held by the
+    /// server's session hub, so tasks survive session rebuilds like a model
+    /// switch). The session then never shuts the registry down — its owner
+    /// does. `None` injects the absence — no background tools at all — which
+    /// is what an owner with no archive to open passes.
+    ///
+    /// Without this call the session builds a private registry and
+    /// [`Session::shutdown`] tears it down once the runtime has exited.
+    pub fn background(mut self, registry: Option<Arc<BackgroundProcesses>>) -> Self {
+        self.background = BackgroundSource::Injected(registry);
+        self
+    }
+
     /// If unset, a fresh UUID is generated. Provide an existing id to resume a
     /// prior session (the snapshot + root checkpoint are loaded automatically).
     pub fn session_id(mut self, id: impl Into<String>) -> Self {
@@ -235,12 +259,29 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .take()
             .ok_or(OpenError::MissingField("run_config"))?;
 
+        // An injected registry is externally owned (the server's session hub
+        // holds it, so tasks outlive session rebuilds like a model switch) and
+        // this session only borrows it. A self-built one is owned, and
+        // `shutdown` tears it down. Resolved before the agents are built —
+        // their tools capture it.
+        let (background, owns_background) =
+            match std::mem::replace(&mut self.background, BackgroundSource::Injected(None)) {
+                BackgroundSource::Injected(registry) => (registry, false),
+                BackgroundSource::SelfBuilt => match BackgroundProcesses::temporary() {
+                    Ok(registry) => (Some(Arc::new(registry)), true),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not create a temporary background archive");
+                        (None, false)
+                    }
+                },
+            };
+
         let (team, workspace_dir) = self.team.take().ok_or(OpenError::MissingField("team"))?;
         let file_locks = self
             .file_locks
             .take()
             .unwrap_or_else(coda_tools::shared_file_locks);
-        let agents = team.build(&workspace_dir, file_locks);
+        let agents = team.build(&workspace_dir, file_locks, background.clone());
         let root_name = team.root().name.to_string();
 
         let session_id = self
@@ -378,6 +419,8 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                 resumed_messages,
                 has_resuming_agents,
                 events_rx: Mutex::new(events_rx),
+                background,
+                owns_background,
             }),
         })
     }
@@ -432,6 +475,11 @@ struct SessionInner {
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
+    background: Option<Arc<BackgroundProcesses>>,
+    /// Self-built registry (no [`SessionBuilder::background`]): `shutdown`
+    /// tears it down once the runtime has confirmedly exited. An injected
+    /// registry is never touched — its external owner manages its lifecycle.
+    owns_background: bool,
 }
 
 /// High-level handle to a running agent session.
@@ -487,7 +535,31 @@ impl Session {
         task: impl Into<String>,
         images: Vec<String>,
     ) -> Result<(), SendCommandError> {
-        let task = task.into();
+        self.send_task(message_id, task.into(), images, None).await
+    }
+
+    /// Open a turn with a background task's outcome rather than something the
+    /// user typed. Refused with [`SendCommandError::TurnAlreadyActive`] just
+    /// like [`send`](Self::send) — the runtime runs one root turn at a time,
+    /// so a notice that arrives mid-turn waits for the caller to retry once
+    /// the turn has ended.
+    pub async fn send_task_notice(
+        &self,
+        message_id: MessageId,
+        outcomes: Vec<TaskNoticeOutcome>,
+        content: impl Into<String>,
+    ) -> Result<(), SendCommandError> {
+        self.send_task(message_id, content.into(), Vec::new(), Some(outcomes))
+            .await
+    }
+
+    async fn send_task(
+        &self,
+        message_id: MessageId,
+        task: String,
+        images: Vec<String>,
+        notice: Option<Vec<TaskNoticeOutcome>>,
+    ) -> Result<(), SendCommandError> {
         let thread_id = ThreadId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
         self.inner
@@ -504,6 +576,7 @@ impl Session {
                     message_id,
                     task,
                     images,
+                    notice,
                 },
             }))
             .await
@@ -572,7 +645,28 @@ impl Session {
     /// Stop the session. Returns whether the agents stopped of their own accord
     /// within the requested policy; every mode but `graceful_unbounded` also
     /// guarantees that none of them is still running once this returns.
+    /// The session's background task registry (injected or self-built), or
+    /// `None` for a session running without background work.
+    pub fn background(&self) -> Option<&Arc<BackgroundProcesses>> {
+        self.inner.background.as_ref()
+    }
+
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
+        let stopped_as_requested = self.stop_runtime(mode).await;
+        // `stop_runtime` never returns while agent tasks are still running: a
+        // bounded wait force-aborts stragglers. Its result reports the policy
+        // outcome, not whether tasks remain, so it must not gate cleanup.
+        // Undelivered notices are dropped: a standalone session has no reopen
+        // to deliver them to.
+        if self.inner.owns_background
+            && let Some(background) = &self.inner.background
+        {
+            let _ = background.shutdown().await;
+        }
+        stopped_as_requested
+    }
+
+    async fn stop_runtime(&self, mode: Shutdown) -> bool {
         match mode {
             Shutdown::Graceful { timeout } => {
                 self.inner.runtime.request_exit().await;

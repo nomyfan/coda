@@ -90,11 +90,34 @@ export type CompactionMessage = {
   created_at: string;
 };
 
+/** What a background task did, in the shape the transcript records it. The
+ * status is already humanized by the server ("exited with code 0", "killed"). */
+export type TaskNoticeOutcome =
+  | { type: "finished"; task_id: string; command: string; status: string }
+  | { type: "output_expired"; task_id: string }
+  | { type: "capped"; events: number };
+
+/** A record the runtime authored when background work finished. It opens a
+ * turn of its own — the model is told about it as a user message — but it is
+ * not something the user said, so it renders as a notice rather than a bubble
+ * and cannot be a rewind or fork target.
+ *
+ * `outcomes` is everything that had happened by the time a turn was free to
+ * carry it: tasks finishing during one turn arrive together. Never empty. */
+export type TaskNoticeMessage = {
+  message_id: string;
+  outcomes: TaskNoticeOutcome[];
+  /** What the model was told. */
+  content: string;
+  created_at: string;
+};
+
 export type HistoryMessage =
   | { User: UserMessage }
   | { Assistant: AssistantMessage }
   | { Tool: ToolMessage }
-  | { Compaction: CompactionMessage };
+  | { Compaction: CompactionMessage }
+  | { TaskNotice: TaskNoticeMessage };
 
 export type PendingApproval = {
   thread_id: string;
@@ -253,6 +276,40 @@ type Snapshot = {
   turn_running?: boolean;
   /** A compaction request is running outside the normal turn machinery. */
   compacting?: boolean;
+  /** Every background task the session still knows about. Carried on the
+   * snapshot as well as pushed, since a task can be started — and finish —
+   * long before this client attached. */
+  background_tasks?: TaskSummary[];
+};
+
+/** One background task, as the dashboard lists it. `status` is the server's
+ * humanized label; `running` is what the UI groups on, so the client never
+ * parses that label. */
+export type TaskSummary = {
+  id: string;
+  command: string;
+  description: string;
+  /** Which agent started it — a sub-agent's tasks are listed too. */
+  agent_name: string;
+  status: string;
+  running: boolean;
+  started_at: string;
+};
+
+export type BackgroundTasksPush = {
+  workspace_id: string;
+  session_id: string;
+  tasks: TaskSummary[];
+};
+
+/** The runtime opened a turn with a background-task notice. Pushed rather than
+ * carried on the event stream, which has no user-role messages in it: a
+ * human's own message is the client's optimistic copy, and one nobody typed
+ * has to be handed over. Arrives ahead of that turn's events. */
+export type TaskNoticePush = {
+  workspace_id: string;
+  session_id: string;
+  message: TaskNoticeMessage;
 };
 
 type WorkspaceCatalog = { workspaces: WorkspaceSummary[] };
@@ -400,6 +457,9 @@ export type RpcNotifications = {
     decision: ResumeDecision;
   };
   abort: SessionRef;
+  /** Stop a background task. Fire-and-forget like `abort`: the answer is the
+   * task list, which the server pushes on its own. */
+  kill_task: { workspace_id: string; session_id: string; task_id: string };
   close_session: SessionRef;
 };
 
@@ -409,6 +469,8 @@ export type RpcPushes = {
   snapshot: Snapshot;
   session_evicted: SessionRef;
   session_status: SessionStatusPush;
+  background_tasks: BackgroundTasksPush;
+  task_notice: TaskNoticePush;
 };
 
 export type WireEvent =

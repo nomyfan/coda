@@ -6,6 +6,7 @@ members = [
   "crates/coda_skills",
   "crates/coda_mcp",
   "crates/coda_tools",
+  "crates/coda_process",
   "crates/coda_ptc",
   "app/coda_server",
 ]
@@ -16,6 +17,7 @@ coda_agent = { path = "crates/coda_agent" }
 coda_core = { path = "crates/coda_core" }
 coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
+coda_process = { path = "crates/coda_process" }
 coda_skills = { path = "crates/coda_skills" }
 coda_tools = { path = "crates/coda_tools" }
 coda_ptc = { path = "crates/coda_ptc" }
@@ -30,8 +32,10 @@ schemars = "1.2.1"
 jiff = { version = "0.2", features = ["serde"] }
 diffy = "0.4"
 libc = "0.2"
+rustix = { version = "1", features = ["fs", "process"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+tempfile = "3"
 rquickjs = { version = "0.12.2", default-features = false, features = ["std", "futures"] }
 
 [profile.release]

@@ -5,6 +5,7 @@ use super::super::*;
 use super::fixtures::*;
 use coda_agent::ToolApprovalMode;
 use coda_agent::runtime::SessionStorage;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 
 /// Start a session and run one turn, returning the hub, the event stream, and
@@ -340,6 +341,20 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
     let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
     opener.fail_open_after_rewind = true;
     let (hub, mut events, first_turn) = session_with_one_turn(Arc::new(opener)).await;
+    let background = background_of(&hub).await;
+    let cancelled = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let task_cancelled = cancelled.clone();
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("abandon barrier"), move |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            task_cancelled.notify_one();
+            task_finish.notified().await;
+            coda_process::TaskExit::Killed
+        })
+        .await
+        .unwrap();
 
     let outcome = hub
         .command(
@@ -357,8 +372,21 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
         next_matching(&mut events, |event| matches!(event, RelayEvent::Closed)).await,
         RelayEvent::Closed
     ));
+    tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("abandon did not close the external registry");
     assert!(
-        hub.get_entry(&key()).is_none(),
-        "the slot must be free so the next attach reads the truncated state"
+        hub.get_entry(&key()).is_some(),
+        "abandon removed the map entry before registry shutdown completed"
+    );
+    finish.notify_one();
+    wait_released(&hub).await;
+    assert!(
+        background
+            .spawn_with(task_meta("too late"), |_ctx| async {
+                coda_process::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err()
     );
 }

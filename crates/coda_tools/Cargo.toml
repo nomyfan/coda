@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+coda_process = { workspace = true }
 coda_core = { workspace = true }
 coda_ptc = { workspace = true }
 diffy = { workspace = true }
@@ -13,3 +14,8 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The sentinel failure hook lives in coda_process; the test that exercises
+# the fail-safe path (the command must never start) is a shell-tool test.
+coda_process = { workspace = true, features = ["test-hooks"] }

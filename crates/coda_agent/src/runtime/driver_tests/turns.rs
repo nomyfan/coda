@@ -29,6 +29,7 @@ fn user_task(to: &ThreadId) -> Envelope {
             message_id: MessageId::new(),
             task: "inspect".into(),
             images: vec![],
+            notice: None,
         },
     })
 }
@@ -286,9 +287,11 @@ async fn a_restart_puts_the_interrupted_turn_back() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let mut harness = Harness::start_agents(
         storage.clone(),
-        AgentTeam::new(root, subagents)
-            .expect("valid team")
-            .build(".", coda_tools::shared_file_locks()),
+        AgentTeam::new(root, subagents).expect("valid team").build(
+            ".",
+            coda_tools::shared_file_locks(),
+            test_registry(),
+        ),
         TestProvider::default(),
         approval.clone(),
         "inspect",
@@ -326,7 +329,7 @@ async fn a_restart_puts_the_interrupted_turn_back() {
         .restart(
             AgentTeam::new(stalled_root, resumed_subagents)
                 .expect("valid team")
-                .build(".", coda_tools::shared_file_locks()),
+                .build(".", coda_tools::shared_file_locks(), test_registry()),
             TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new())),
             approval,
             HashMap::from([(
@@ -371,7 +374,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
         storage.clone(),
         AgentTeam::new(root_running("continuation-main"), vec![])
             .expect("valid team")
-            .build(".", coda_tools::shared_file_locks()),
+            .build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::default(),
         approval.clone(),
         "inspect todos",
@@ -405,7 +408,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
         .restart_without_snapshot(
             AgentTeam::new(root_running("abort-generation-main"), vec![])
                 .expect("valid team")
-                .build(".", coda_tools::shared_file_locks()),
+                .build(".", coda_tools::shared_file_locks(), test_registry()),
             TestProvider::with_hold_generation(Arc::new(tokio::sync::Notify::new())),
             approval,
             HashMap::from([(
@@ -539,7 +542,7 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
         }],
     )
     .expect("valid team")
-    .build(".", coda_tools::shared_file_locks());
+    .build(".", coda_tools::shared_file_locks(), test_registry());
     let mut runtime = AgentRuntime::new(storage, "session".into());
     runtime
         .bootstrap(

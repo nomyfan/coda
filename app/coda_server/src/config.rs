@@ -119,11 +119,28 @@ pub struct DatabaseConfig {
     pub url: String,
 }
 
+/// Stable root for session-owned background task output. A fixed temp path is
+/// enough to survive a normal server restart; deployments that need stronger
+/// durability can override it with `[background].root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundConfig {
+    pub root: PathBuf,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            root: std::env::temp_dir().join("coda-background"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
     pub database: DatabaseConfig,
+    pub background: BackgroundConfig,
     pub relay: RelayConfig,
     pub keepalive: KeepaliveConfig,
 }
@@ -141,6 +158,7 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let providers = parse_providers(&doc)?;
     let workspaces = parse_workspaces(&doc, base_dir)?;
     let database = parse_database(&doc)?;
+    let background = parse_background(&doc, base_dir)?;
     let relay = parse_relay(&doc)?;
     let keepalive = parse_keepalive(&doc)?;
 
@@ -148,8 +166,33 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
         providers,
         workspaces,
         database,
+        background,
         relay,
         keepalive,
+    })
+}
+
+/// Parse optional durable background output storage. Relative overrides use
+/// the same config-directory base as workspace paths.
+fn parse_background(
+    doc: &toml_edit::DocumentMut,
+    base_dir: &Path,
+) -> Result<BackgroundConfig, ConfigError> {
+    let Some(item) = doc.get("background") else {
+        return Ok(BackgroundConfig::default());
+    };
+    let table = item.as_table().ok_or_else(|| {
+        ConfigError::Parse("background must be a table with an optional root string".to_string())
+    })?;
+    let Some(root) = table.get("root") else {
+        return Ok(BackgroundConfig::default());
+    };
+    let raw = root
+        .as_str()
+        .ok_or_else(|| ConfigError::Parse("background root must be a string".to_string()))?;
+    let expanded = expand_env(raw)?;
+    Ok(BackgroundConfig {
+        root: resolve_workspace_path(base_dir, &expanded),
     })
 }
 
@@ -505,7 +548,8 @@ fn parse_workspaces(
         let id = require_str(workspace, "id", "workspace")?;
         if !is_workspace_id(&id) {
             return Err(ConfigError::Parse(format!(
-                "workspace id '{id}' may only contain letters, digits, '.', '_', and '-'"
+                "workspace id '{id}' may only contain letters, digits, '.', '_', and '-', \
+                 and may not start with '.'"
             )));
         }
         if !seen.insert(id.clone()) {
@@ -547,8 +591,13 @@ fn expand_env(value: &str) -> Result<String, ConfigError> {
         .map_err(|_| ConfigError::Parse(format!("environment variable '{var}' is not set")))
 }
 
+/// A workspace id becomes a directory name under the background spool root,
+/// where the root keeps `.lock` and `.trash` for itself — hence the leading-dot
+/// rule. Refusing it here makes an unusable id a startup error rather than a
+/// workspace whose sessions silently lose background tasks.
 fn is_workspace_id(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('.')
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -609,6 +658,8 @@ const EXPLORE_TOOLS: &[&str] = &[
     "read_todos",
     "write_todos",
     "run_javascript",
+    // A read like any other; `task_kill` ends a process, so it is not here.
+    "task_output",
     coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
 ];
 

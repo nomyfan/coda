@@ -140,6 +140,68 @@ path = "/tmp/scratch"
             }],
         }]
     );
+    assert_eq!(config.background, BackgroundConfig::default());
+}
+
+#[test]
+fn parse_server_config_resolves_background_root() {
+    let relative = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "spool"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv/coda"),
+    )
+    .unwrap();
+    assert_eq!(relative.background.root, PathBuf::from("/srv/coda/spool"));
+
+    let absolute = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "/var/lib/coda/background"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv/coda"),
+    )
+    .unwrap();
+    assert_eq!(
+        absolute.background.root,
+        PathBuf::from("/var/lib/coda/background")
+    );
+}
+
+#[test]
+fn parse_server_config_expands_background_root_env() {
+    let _env = EnvVarGuard::set("CODA_TEST_BACKGROUND_ROOT", "/mnt/coda-background");
+    let config = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[background]
+root = "${{CODA_TEST_BACKGROUND_ROOT}}"
+
+[[workspaces]]
+id = "coda"
+path = "/tmp/coda"
+"#
+        ),
+        Path::new("/srv"),
+    )
+    .unwrap();
+    assert_eq!(
+        config.background.root,
+        PathBuf::from("/mnt/coda-background")
+    );
 }
 
 #[test]
@@ -556,6 +618,25 @@ path = "/tmp/b"
 }
 
 #[test]
+fn parse_server_config_rejects_a_dot_prefixed_workspace_id() {
+    // It would name a directory beside the background root's own `.lock` and
+    // `.trash`, so it is refused where the operator can see it.
+    let err = parse_server_config(
+        &format!(
+            r#"{PROVIDERS}{DATABASE}
+[[workspaces]]
+id = ".trash"
+path = "/tmp/a"
+"#
+        ),
+        Path::new("/srv"),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("may not start with"));
+}
+
+#[test]
 fn parse_server_config_defaults_relay_limits() {
     let config = parse_server_config(
         &format!(
@@ -763,13 +844,14 @@ fn explore_auto_approves_only_read_only_tools() {
         "write_todos",
         "run_javascript",
         "list_javascript_tools",
+        "task_output",
     ] {
         assert!(
             !config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should run unattended under explore"
         );
     }
-    for tool in ["write_file", "edit_file", "mcp__time__now"] {
+    for tool in ["write_file", "edit_file", "task_kill", "mcp__time__now"] {
         assert!(
             config.requires_approval(PermissionMode::Explore, &tool_call(tool)),
             "{tool} should ask under explore"

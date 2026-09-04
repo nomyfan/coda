@@ -15,6 +15,9 @@ import {
   type RpcRequests,
   RpcCode,
   type SkillInfo,
+  type TaskNoticeOutcome,
+  type TaskNoticeMessage,
+  type TaskSummary,
   type ToolCall,
   type ToolCallResolution,
   type ToolArtifact,
@@ -64,6 +67,7 @@ export type TranscriptEntry = {
     | "tool_call"
     | "tool_result"
     | "compaction"
+    | "task_notice"
     | "system"
     | "error";
   /** The server's id for this message, once the server has acknowledged it.
@@ -139,6 +143,10 @@ export type OpenedSession = {
   running: boolean;
   /** A compaction runs outside a normal turn but still owns the session. */
   compacting: boolean;
+  /** Background tasks this session started, newest first. Pushed on every
+   * change and carried on the snapshot, since tasks outlive turns and the
+   * client may attach long after one started. */
+  backgroundTasks: TaskSummary[];
   /** A draft session's opening `open_session` is in flight, ahead of its first
    * task. `running` can't cover this window — it isn't set until the task is
    * actually sent — so without it a second submit during the round trip would
@@ -277,6 +285,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     allowDrafts: {},
     running: false,
     compacting: false,
+    backgroundTasks: [],
     evicted: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
     usage: [],
@@ -509,13 +518,49 @@ function historyToEntries(
       },
     ];
   }
+  if ("TaskNotice" in message) {
+    const notice = message.TaskNotice;
+    return [
+      {
+        id: `task-notice:${notice.message_id}`,
+        messageId: notice.message_id,
+        kind: "task_notice",
+        title: taskNoticeTitle(notice.outcomes),
+        detail:
+          notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
+            ? notice.outcomes[0].command
+            : undefined,
+        content: notice.content,
+        startedAt: notice.created_at,
+      },
+    ];
+  }
   return [];
+}
+
+/** One notice can cover several tasks — everything that finished while the
+ * previous turn ran. Name the single case precisely and the rest by count;
+ * the detail is in the body either way. */
+function taskNoticeTitle(outcomes: TaskNoticeOutcome[]): string {
+  const [only] = outcomes;
+  if (outcomes.length !== 1 || !only) {
+    return `${outcomes.length} background task updates`;
+  }
+  switch (only.type) {
+    case "finished":
+      return `Background task ${only.status}`;
+    case "output_expired":
+      return "Background task output expired";
+    case "capped":
+      return `${only.events} more background task events`;
+  }
 }
 
 function messageIdOf(message: HistoryMessage): string {
   if ("User" in message) return message.User.message_id;
   if ("Assistant" in message) return message.Assistant.message_id;
   if ("Tool" in message) return message.Tool.message_id;
+  if ("TaskNotice" in message) return message.TaskNotice.message_id;
   return message.Compaction.message_id;
 }
 
@@ -1585,6 +1630,7 @@ export function applySnapshotToSession(
     permissionMode: PermissionMode;
     turnRunning: boolean;
     compacting?: boolean;
+    backgroundTasks?: TaskSummary[];
   },
 ): OpenedSession {
   const argsById = collectToolArgs(snapshot.messages);
@@ -1638,6 +1684,7 @@ export function applySnapshotToSession(
     // message speaks for its own turn until the reply that created it lands.
     running: snapshot.turnRunning || pending.length > 0,
     compacting: snapshot.compacting ?? false,
+    backgroundTasks: snapshot.backgroundTasks ?? session.backgroundTasks,
     evicted: false,
     editing: reconcileEditing(session.editing, snapshot.messages),
     entries: [
@@ -1728,6 +1775,7 @@ function applySnapshot(
   permissionMode: PermissionMode,
   turnRunning: boolean,
   compacting: boolean,
+  backgroundTasks: TaskSummary[],
 ) {
   flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
@@ -1761,11 +1809,57 @@ function applySnapshot(
       permissionMode,
       turnRunning,
       compacting,
+      backgroundTasks,
     });
   });
   // Self-heal the memory: whatever the session is running under is what this
   // browser should reopen it on if the hub later closes it underneath us.
   rememberSessionMode(server, workspaceId, sessionId, permissionMode);
+}
+
+/** A notice the runtime wrote opened a turn. It never comes over the event
+ * stream — that carries no user-role messages — so it is appended here, ahead
+ * of the events of the turn it opened. */
+export function appendTaskNotice(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  message: TaskNoticeMessage,
+) {
+  // The server sends the previous turn's settling event before this notice,
+  // but streamed events may still be waiting for the next animation frame.
+  flushPendingEvents();
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = draftSession(state, server, key);
+    if (!session) {
+      return;
+    }
+    const entries = historyToEntries({ TaskNotice: message }, {}, {});
+    // A resync can land the same notice from the snapshot; the id is the
+    // message's, so this stays idempotent.
+    const known = new Set(session.entries.map((entry) => entry.id));
+    session.entries.push(...entries.filter((entry) => !known.has(entry.id)));
+  });
+}
+
+/** The session's task list changed. Its own push: tasks outlive turns, so
+ * their comings and goings are not part of a turn's event stream. */
+function applyBackgroundTasks(
+  store: CodaStore,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  tasks: TaskSummary[],
+) {
+  const key = sessionKey(workspaceId, sessionId);
+  updateState(store, (state) => {
+    const session = state.servers[server]?.sessions[key];
+    if (session) {
+      session.backgroundTasks = tasks;
+    }
+  });
 }
 
 function setSessionModel(
@@ -1868,7 +1962,12 @@ function applySessionStatus(
   });
 }
 
-function applyEvent(server: string, workspaceId: string, sessionId: string, event: WireEvent) {
+export function applyEvent(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  event: WireEvent,
+) {
   pendingEvents.push({ server, workspaceId, sessionId, event });
   scheduleFlush();
 }
@@ -2401,6 +2500,7 @@ async function requestOpenAndApply(
       snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
       snap.turn_running ?? false,
       snap.compacting ?? false,
+      snap.background_tasks ?? [],
     );
     return true;
   } catch (err) {
@@ -2535,7 +2635,14 @@ export function connectServer(rawUrl: string) {
       params.permission_mode ?? DEFAULT_PERMISSION_MODE,
       params.turn_running ?? false,
       params.compacting ?? false,
+      params.background_tasks ?? [],
     );
+  });
+  rpc.addMethod("background_tasks", (params) => {
+    applyBackgroundTasks(codaStore, server, params.workspace_id, params.session_id, params.tasks);
+  });
+  rpc.addMethod("task_notice", (params) => {
+    appendTaskNotice(codaStore, server, params.workspace_id, params.session_id, params.message);
   });
   rpc.addMethod("session_evicted", (params) => {
     applyHeldElsewhere(codaStore, server, params.workspace_id, params.session_id, "evicted");
@@ -3282,6 +3389,20 @@ export function abort() {
   }
 }
 
+/** Stop one of the active session's background tasks. Optimistically nothing:
+ * the server pushes the updated list, and killing something that has already
+ * settled is a no-op there. */
+export function killBackgroundTask(taskId: string) {
+  const active = currentActive();
+  if (active) {
+    notify(active.server, "kill_task", {
+      workspace_id: active.session.workspaceId,
+      session_id: active.session.sessionId,
+      task_id: taskId,
+    });
+  }
+}
+
 /** Stage (or clear, with `null`) an "always allow" pattern for a call. The
  * pattern is only sent to the server on submit, so the choice is cancelable. */
 export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern: string | null) {
@@ -3575,6 +3696,7 @@ export async function submitApprovals() {
 // Stable empties so default-valued selectors keep referential identity and
 // don't force re-renders under `useSyncExternalStore`.
 
+const EMPTY_BACKGROUND_TASKS: TaskSummary[] = [];
 const EMPTY_ENTRIES: TranscriptEntry[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_DRAFTS: Record<string, Record<string, ToolCallResolution>> = {};
@@ -3730,6 +3852,13 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   );
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
+export const selectActiveBackgroundTasks = (state: CodaStoreState) =>
+  activeSessionOf(state)?.backgroundTasks ?? EMPTY_BACKGROUND_TASKS;
+/** How many of the active session's tasks are still running — the badge on the
+ * panel trigger, and the reason to show it at all. */
+export const selectActiveRunningTaskCount = (state: CodaStoreState) =>
+  (activeSessionOf(state)?.backgroundTasks ?? EMPTY_BACKGROUND_TASKS).filter((task) => task.running)
+    .length;
 export const selectActiveCompacting = (state: CodaStoreState) =>
   activeSessionOf(state)?.compacting ?? false;
 export const selectActiveStarting = (state: CodaStoreState) =>

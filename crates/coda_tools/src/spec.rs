@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
+use coda_process::BackgroundProcesses;
+
 use crate::locks::KeyedLock;
 use crate::{
     EditFileTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ReadTodosTool, ShellTool,
-    WriteFileTool, WriteTodosTool,
+    TaskKillTool, TaskOutputTool, WriteFileTool, WriteTodosTool,
 };
 use coda_ptc::RunJavaScriptTool;
 
@@ -18,15 +20,29 @@ pub struct BuildContext {
     /// serialize against registries nobody else consults and exclude nothing.
     /// Defaults to [`shared_file_locks`].
     pub file_locks: Arc<KeyedLock<String>>,
+    /// Name of the agent the tools are built for; echoed in the metadata of
+    /// background tasks it starts.
+    pub agent_name: String,
+    /// Shared by every agent in one session, and the one thing that decides
+    /// whether background work exists at all: `None` takes both
+    /// [`background_specs`] and `shell`'s `run_in_background` with it. That is
+    /// a capability, not a permission — backgrounding changes how long a
+    /// command may run, so the call still faces the usual approval policy.
+    pub background: Option<Arc<BackgroundProcesses>>,
 }
 
 impl BuildContext {
     /// A standalone context, holding — on purpose — the process-wide file lock
     /// registry.
+    ///
+    /// Background work is off: building specs one at a time skips
+    /// [`background_specs`], so a task started here could not be followed up on.
     pub fn new(workspace_dir: impl Into<String>) -> Self {
         BuildContext {
             workspace_dir: workspace_dir.into(),
             file_locks: crate::locks::shared_file_locks(),
+            agent_name: "coda".into(),
+            background: None,
         }
     }
 }
@@ -52,7 +68,36 @@ impl ToolSpec for ShellToolSpec {
         "shell"
     }
     fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
-        Box::new(ToolWrapper::from(ShellTool::new(ctx.workspace_dir.clone())))
+        Box::new(ToolWrapper::from(ShellTool::new(
+            ctx.workspace_dir.clone(),
+            ctx.agent_name.clone(),
+            ctx.background.clone(),
+        )))
+    }
+}
+
+/// Both specs carry the registry instead of reading it off the context:
+/// [`background_specs`] is their only constructor and only runs when there is
+/// one, so neither can exist without a registry.
+pub(crate) struct TaskOutputToolSpec(Arc<BackgroundProcesses>);
+
+impl ToolSpec for TaskOutputToolSpec {
+    fn name(&self) -> &str {
+        "task_output"
+    }
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskOutputTool::new(self.0.clone())))
+    }
+}
+
+pub(crate) struct TaskKillToolSpec(Arc<BackgroundProcesses>);
+
+impl ToolSpec for TaskKillToolSpec {
+    fn name(&self) -> &str {
+        "task_kill"
+    }
+    fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+        Box::new(ToolWrapper::from(TaskKillTool::new(self.0.clone())))
     }
 }
 
@@ -212,7 +257,26 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
         .collect()
 }
 
-/// Names of all builtin tools, in canonical order.
+/// The background follow-up tools, for a session that has a registry — empty
+/// otherwise.
+///
+/// Not declarable in `tools` and not granted per agent: whether there is
+/// anything to follow up on is the only question, and `shell`'s
+/// `run_in_background` answers it the same way, so the three appear and
+/// disappear together.
+pub fn background_specs(background: Option<&Arc<BackgroundProcesses>>) -> Vec<Box<dyn ToolSpec>> {
+    match background {
+        Some(registry) => vec![
+            Box::new(TaskOutputToolSpec(registry.clone())),
+            Box::new(TaskKillToolSpec(registry.clone())),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// Names of the builtin tools an agent may name in `tools`, in canonical
+/// order. The background tools are absent on purpose — see
+/// [`background_specs`].
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "shell",
     "read_file",
@@ -248,6 +312,20 @@ pub fn spec_by_name(name: &str) -> Option<Box<dyn ToolSpec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Building specs one at a time skips the injection point, so the shell a
+    /// standalone context builds must not offer to background anything.
+    #[test]
+    fn a_standalone_context_builds_a_foreground_only_shell() {
+        let shell = ShellToolSpec.build(&BuildContext::new("."));
+        assert!(
+            shell.parameter_schema()["properties"]
+                .get("run_in_background")
+                .is_none(),
+            "{}",
+            shell.parameter_schema()
+        );
+    }
 
     /// `ToolSpec::name` is metadata used for validation without building; it must
     /// stay consistent with the name the built tool actually reports.

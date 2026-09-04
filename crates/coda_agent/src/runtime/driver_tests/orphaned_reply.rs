@@ -43,7 +43,7 @@ async fn a_new_task_does_not_wait_for_a_sub_agent_that_no_longer_exists() {
     let team = crate::AgentTeam::new(root, subagents).expect("valid team");
     let harness = Harness::start_agents(
         storage.clone(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
         ToolApprovalMode::Auto,
         "inspect",
@@ -78,7 +78,7 @@ async fn a_new_task_does_not_wait_for_a_sub_agent_that_no_longer_exists() {
     // session has the root's outstanding call and no sub-agent behind it.
     let mut reopened = harness
         .restart(
-            team.build(".", coda_tools::shared_file_locks()),
+            team.build(".", coda_tools::shared_file_locks(), test_registry()),
             TestProvider::with_hold_subagent(Arc::new(tokio::sync::Notify::new())),
             ToolApprovalMode::Auto,
             HashMap::new(),

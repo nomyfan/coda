@@ -1,5 +1,6 @@
 //! Attach/reattach/replay lifecycle over a live hub: folded history on
-//! reconnect, mid-turn replay, eviction on takeover, and deletion.
+//! reconnect, mid-turn replay, and eviction on takeover. Deletion has its own
+//! category — see `delete.rs`.
 
 use super::super::*;
 use super::fixtures::*;
@@ -162,6 +163,7 @@ fn ids_by_role(messages: &[Message]) -> Vec<(&'static str, MessageId)> {
                 Message::Assistant(_) => "assistant",
                 Message::Tool(_) => "tool",
                 Message::Compaction(_) => "compaction",
+                Message::TaskNotice(_) => "task_notice",
             };
             (role, m.message_id())
         })
@@ -485,6 +487,20 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
         .await
         .expect("attach");
     let mut events1 = attach1.events;
+    let background = background_of(&hub).await;
+    let cancelled = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let task_cancelled = cancelled.clone();
+    let task_finish = finish.clone();
+    background
+        .spawn_with(task_meta("resync barrier"), move |ctx| async move {
+            ctx.cancelled().cancelled().await;
+            task_cancelled.notify_one();
+            task_finish.notified().await;
+            coda_process::TaskExit::Killed
+        })
+        .await
+        .unwrap();
     hub.command(
         key(),
         1,
@@ -499,7 +515,23 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
     // fan-out turn could ever settle; the client is told to resync rather
     // than the hub buffering all of it in memory.
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("forced resync did not close the external registry");
+    assert!(
+        hub.get_entry(&key()).is_some(),
+        "forced resync removed the map entry before registry shutdown completed"
+    );
+    finish.notify_one();
     wait_released(&hub).await;
+    assert!(
+        background
+            .spawn_with(task_meta("too late"), |_ctx| async {
+                coda_process::TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .is_err()
+    );
 
     // Reopening reads the checkpoint the runtime saved once its (now
     // exit-barriered) tool execution batch finished.
@@ -515,27 +547,6 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
         .await
         .expect("re-attach");
     assert!(!attach2.snapshot.turn_running);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn delete_evicts_attached_client_and_removes_entry() {
-    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
-    let attach1 = hub
-        .attach(
-            key(),
-            1,
-            "prov".into(),
-            None,
-            PermissionMode::default(),
-            false,
-        )
-        .await
-        .expect("attach");
-    let mut events1 = attach1.events;
-
-    assert!(matches!(hub.delete(key(), 1).await, DeleteOutcome::Deleted));
-    next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
-    assert!(hub.get_entry(&key()).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -588,46 +599,6 @@ async fn attach_without_takeover_is_refused_while_held() {
     next_matching(&mut events1, |e| matches!(e, RelayEvent::Evicted)).await;
 
     hub.shutdown_all().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn delete_from_stale_connection_is_rejected() {
-    // Latest-wins covers destruction too: after being evicted, the old
-    // connection must not be able to delete the session the new client is
-    // driving.
-    let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
-    let _attach1 = hub
-        .attach(
-            key(),
-            1,
-            "prov".into(),
-            None,
-            PermissionMode::default(),
-            false,
-        )
-        .await
-        .expect("attach");
-    let _attach2 = hub
-        .attach(
-            key(),
-            2,
-            "prov".into(),
-            None,
-            PermissionMode::default(),
-            true,
-        )
-        .await
-        .expect("attach2 evicts conn 1");
-
-    assert!(matches!(
-        hub.delete(key(), 1).await,
-        DeleteOutcome::NotOwner
-    ));
-    assert!(hub.get_entry(&key()).is_some());
-
-    // The attached client itself may delete.
-    assert!(matches!(hub.delete(key(), 2).await, DeleteOutcome::Deleted));
-    assert!(hub.get_entry(&key()).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use coda_process::BackgroundProcesses;
 use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
 
 use crate::agent::{
@@ -233,11 +234,14 @@ impl AgentTeam {
     /// `file_locks` is the deliberate exception to "independent state": the
     /// same registry must reach every call in the process, or concurrent
     /// `edit_file`s from sibling agents or from two sessions over one workspace
-    /// clobber each other.
+    /// clobber each other. `background` is shared one level down — every agent
+    /// in the session sees the same task registry, since a task belongs to the
+    /// conversation rather than to whichever agent happened to start it.
     pub fn build(
         &self,
         default_workspace: &str,
         file_locks: Arc<KeyedLock<String>>,
+        background: Option<Arc<BackgroundProcesses>>,
     ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
@@ -254,6 +258,8 @@ impl AgentTeam {
             let tool_ctx = BuildContext {
                 workspace_dir: workspace_dir.to_string(),
                 file_locks: file_locks.clone(),
+                agent_name: spec.name.clone(),
+                background: background.clone(),
             };
 
             let mut agent = Agent {
@@ -266,6 +272,11 @@ impl AgentTeam {
             };
 
             for tool_spec in &spec.tools {
+                agent.tools.register(tool_spec.build(&tool_ctx));
+            }
+            // Not declarable and not per-agent: these exist whenever the
+            // session has somewhere to run background work.
+            for tool_spec in coda_tools::background_specs(background.as_ref()) {
                 agent.tools.register(tool_spec.build(&tool_ctx));
             }
             for child in &spec.subagents {
@@ -289,7 +300,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
-    use coda_core::llm::{MessageId, TurnId, UserMessage};
+    use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
     use coda_core::tool::{ToolCallContext, ToolObject, ToolResult};
 
     use super::*;
@@ -338,6 +349,131 @@ mod tests {
         fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
             self.seen.lock().unwrap().push(ctx.workspace_dir.clone());
             Box::new(RecordingTool)
+        }
+    }
+
+    /// Captures what each tool build sees: agent, whether background work is
+    /// possible, and which registry.
+    struct BackgroundProbeSpec {
+        seen: Arc<StdMutex<Vec<(String, bool, usize)>>>,
+    }
+    impl ToolSpec for BackgroundProbeSpec {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn build(&self, ctx: &BuildContext) -> Box<dyn ToolObject> {
+            self.seen.lock().unwrap().push((
+                ctx.agent_name.clone(),
+                ctx.background.is_some(),
+                ctx.background
+                    .as_ref()
+                    .map_or(0, |registry| Arc::as_ptr(registry) as usize),
+            ));
+            Box::new(RecordingTool)
+        }
+    }
+
+    /// The follow-up tools are the session's, not an agent's: nobody declares
+    /// them and every agent gets them, over one shared registry.
+    #[test]
+    fn background_tools_are_injected_for_every_agent_and_share_one_registry() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let probe = || {
+            Box::new(BackgroundProbeSpec { seen: seen.clone() }) as Box<dyn coda_tools::ToolSpec>
+        };
+        let root = AgentSpec {
+            tools: vec![probe()],
+            subagents: vec!["sub".into()],
+            ..spec("coda")
+        };
+        let sub = AgentSpec {
+            tools: vec![probe()],
+            ..spec("sub")
+        };
+        let team = AgentTeam::new(root, vec![sub]).unwrap();
+        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+        let agents = team.build(
+            ".",
+            coda_tools::shared_file_locks(),
+            Some(background.clone()),
+        );
+
+        for name in ["coda", "sub"] {
+            let tools = &agents[name].tools;
+            assert!(
+                tools.get("task_output").is_some(),
+                "{name} has no task_output"
+            );
+            assert!(tools.get("task_kill").is_some(), "{name} has no task_kill");
+        }
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        let registry = Arc::as_ptr(&background) as usize;
+        assert_eq!(
+            got,
+            vec![
+                ("coda".to_string(), true, registry),
+                ("sub".to_string(), true, registry),
+            ]
+        );
+    }
+
+    /// No storage, nothing to follow up on: the two tools are never injected
+    /// and `shell` stops offering to background anything. One condition,
+    /// three surfaces.
+    #[test]
+    fn without_background_storage_the_task_tools_are_never_registered() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let tool = |name: &str| coda_tools::spec_by_name(name).expect("builtin");
+        let root = AgentSpec {
+            tools: vec![
+                Box::new(BackgroundProbeSpec { seen: seen.clone() }),
+                tool("shell"),
+            ],
+            ..spec("coda")
+        };
+        let team = AgentTeam::new(root, vec![]).unwrap();
+
+        let agents = team.build(".", coda_tools::shared_file_locks(), None);
+
+        let tools = &agents["coda"].tools;
+        assert!(tools.get("task_output").is_none());
+        assert!(tools.get("task_kill").is_none());
+        assert!(
+            tools.get("shell").is_some(),
+            "an unrelated tool was dropped"
+        );
+        assert_eq!(
+            seen.lock().unwrap().first().map(|(_, allowed, _)| *allowed),
+            Some(false),
+            "shell was offered a follow-up kit that was not registered"
+        );
+    }
+
+    /// The injected names are reserved, so nothing can register them by hand.
+    #[test]
+    fn rejects_a_spec_claiming_an_injected_background_tool_name() {
+        for name in ["task_output", "task_kill"] {
+            let root = AgentSpec {
+                tools: vec![Box::new(NamedSpec(name))],
+                ..spec("coda")
+            };
+            assert!(matches!(
+                AgentTeam::new(root, vec![]),
+                Err(BuildError::ReservedToolName { name: claimed, .. }) if claimed == name
+            ));
+        }
+    }
+
+    struct NamedSpec(&'static str);
+
+    impl ToolSpec for NamedSpec {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn build(&self, _ctx: &BuildContext) -> Box<dyn ToolObject> {
+            unreachable!("reserved tool names are rejected before build")
         }
     }
 
@@ -402,7 +538,11 @@ mod tests {
             .unwrap()
             .with_agent_workspaces(HashMap::from([("sub".to_string(), "/sub".to_string())]));
 
-        team.build("/root", coda_tools::shared_file_locks());
+        team.build(
+            "/root",
+            coda_tools::shared_file_locks(),
+            Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
+        );
 
         let mut got = seen.lock().unwrap().clone();
         got.sort();
@@ -449,7 +589,11 @@ mod tests {
     async fn a_fresh_agent_is_in_no_turn_and_asking_does_not_open_one() {
         let agents = AgentTeam::new(spec("coda"), vec![])
             .expect("valid team")
-            .build("/root", coda_tools::shared_file_locks());
+            .build(
+                "/root",
+                coda_tools::shared_file_locks(),
+                Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
+            );
         let agent = &agents["coda"];
 
         assert_eq!(agent.current_turn().await, None);
@@ -459,7 +603,10 @@ mod tests {
 
         let turn = TurnId::from(MessageId::new());
         agent
-            .add_user_message(turn, UserMessage::text(MessageId::new(), "inspect"))
+            .add_opening_message(
+                turn,
+                Message::User(UserMessage::text(MessageId::new(), "inspect")),
+            )
             .await;
 
         assert_eq!(agent.current_turn().await, Some(turn));

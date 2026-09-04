@@ -472,7 +472,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     let team = AgentTeam::new(root, subagents).expect("valid team");
     let mut harness = Harness::start_agents(
         MemoryStorage::default(),
-        team.build(".", coda_tools::shared_file_locks()),
+        team.build(".", coda_tools::shared_file_locks(), test_registry()),
         provider.clone(),
         approval.clone(),
         "inspect",
@@ -499,7 +499,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
 
     let mut harness = harness
         .restart(
-            team.build(".", coda_tools::shared_file_locks()),
+            team.build(".", coda_tools::shared_file_locks(), test_registry()),
             provider,
             approval,
             HashMap::from([(

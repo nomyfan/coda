@@ -187,6 +187,59 @@ impl MessageOrigin {
     }
 }
 
+/// What a background task did, in the shape a client renders. The status is
+/// already humanized: `coda_core` describes the message, not the task engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskNoticeOutcome {
+    /// The task reached a terminal state.
+    Finished {
+        task_id: String,
+        command: String,
+        /// e.g. "exited with code 0", "killed".
+        status: String,
+    },
+    /// A finished task's retained output was evicted to reclaim space, so it
+    /// can no longer be read back.
+    OutputExpired { task_id: String },
+    /// Several notices were capped into one; `events` counts what it covers.
+    Capped { events: u64 },
+}
+
+/// A record the runtime authored when background work finished.
+///
+/// It opens a turn — something has to, or the model would never hear about the
+/// task — and lowers to a plain user message on the way to the provider. It is
+/// kept a message of its own so that everything else can tell it apart from
+/// what a person typed: clients render it as a notice rather than a chat
+/// bubble, it never becomes a session's preview, and a rewind cannot target it
+/// (only the human turns that bracket it).
+///
+/// `outcomes` is everything that had happened by the time a turn was free to
+/// carry it. Three tasks that finish while one turn runs are one interruption,
+/// not three, so they arrive together; a fourth that finishes after this went
+/// out gets the next turn, because there is no message left to add it to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNoticeMessage {
+    pub message_id: MessageId,
+    /// Never empty.
+    pub outcomes: Vec<TaskNoticeOutcome>,
+    /// What the model reads.
+    pub content: String,
+    pub created_at: jiff::Timestamp,
+}
+
+impl TaskNoticeMessage {
+    pub fn new(message_id: MessageId, outcomes: Vec<TaskNoticeOutcome>, content: String) -> Self {
+        Self {
+            message_id,
+            outcomes,
+            content,
+            created_at: jiff::Timestamp::now(),
+        }
+    }
+}
+
 /// A user-turn message whose content may include text and/or images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -529,6 +582,9 @@ pub enum Message {
     Tool(ToolMessage),
     /// A record the compaction machinery authored — see [`CompactionMessage`].
     Compaction(CompactionMessage),
+    /// A record the runtime authored when background work finished — see
+    /// [`TaskNoticeMessage`].
+    TaskNotice(TaskNoticeMessage),
 }
 
 impl Message {
@@ -540,6 +596,7 @@ impl Message {
             Message::Assistant(message) => message.message_id,
             Message::Tool(message) => message.message_id,
             Message::Compaction(message) => message.message_id,
+            Message::TaskNotice(message) => message.message_id,
         }
     }
 
@@ -589,6 +646,13 @@ impl From<&Message> for Option<RequestMessage> {
                 ))),
                 CompactionOutcome::Failed => None,
             },
+            // The model is *told* about the task, in the only role a provider
+            // accepts unprompted input in. Reusing the notice's own id costs
+            // nothing: the request vector is discarded after the call.
+            Message::TaskNotice(message) => Some(RequestMessage::User(UserMessage::text(
+                message.message_id,
+                message.content.clone(),
+            ))),
         }
     }
 }
