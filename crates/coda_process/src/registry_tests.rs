@@ -600,6 +600,83 @@ async fn read_reports_lost_bytes_after_truncation() {
     reg.shutdown().await;
 }
 
+/// Reopened summaries and newly interrupted crash leftovers occupy the same
+/// bounded terminal overview as tasks completed by the new process.
+#[tokio::test]
+async fn recovered_terminal_entries_share_the_live_overview_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
+    let archive = TaskArchive::new(root.clone());
+    let mut oldest = None;
+
+    // Seed 31 durable terminal tasks plus one crash-Running task. Reopen must
+    // put both kinds into the same oldest-first eviction queue.
+    for i in 0..(MAX_TERMINAL - 1) {
+        let id = TaskId::new();
+        let record = archive
+            .create_unreserved(&id, &meta(&format!("restored-{i}")))
+            .await
+            .unwrap();
+        let mut guard = record.lock_commit().await;
+        let mut candidate = guard.current().clone();
+        candidate.status = TaskStatus::Exited {
+            code: Some(0),
+            at: format!("2020-01-01T00:00:{i:02}Z").parse().unwrap(),
+        };
+        guard.commit(candidate).await.unwrap();
+        oldest.get_or_insert(id);
+    }
+    let oldest = oldest.unwrap();
+    let interrupted = TaskId::new();
+    archive
+        .create_unreserved(&interrupted, &meta("crashed"))
+        .await
+        .unwrap();
+    drop(archive);
+
+    let reg = BackgroundProcesses::session_backed(root).await.unwrap();
+    assert_eq!(reg.summaries().borrow().len(), MAX_TERMINAL);
+    assert!(
+        reg.summaries()
+            .borrow()
+            .iter()
+            .any(|summary| summary.id == interrupted.as_str())
+    );
+
+    let newest = reg
+        .spawn_with(meta("newest"), |_ctx| async {
+            TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
+    let mut summaries = reg.summaries();
+    loop {
+        if summaries
+            .borrow_and_update()
+            .iter()
+            .any(|summary| summary.id == newest.as_str() && !summary.status.is_running())
+        {
+            break;
+        }
+        summaries.changed().await.unwrap();
+    }
+
+    let summaries = summaries.borrow();
+    assert_eq!(summaries.len(), MAX_TERMINAL);
+    assert!(
+        !summaries
+            .iter()
+            .any(|summary| summary.id == oldest.as_str())
+    );
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary.id == interrupted.as_str())
+    );
+    drop(summaries);
+    reg.shutdown().await;
+}
+
 /// Terminal entries beyond MAX_TERMINAL are reclaimed from the in-memory
 /// live overview oldest-first, but stay readable by id from the archive:
 /// memory reclamation is decoupled from disk retention.

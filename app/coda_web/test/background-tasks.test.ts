@@ -1,10 +1,13 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
-import type { HistoryMessage, TaskSummary } from "../src/lib/protocol.ts";
+import type { HistoryMessage, TaskNoticeMessage, TaskSummary } from "../src/lib/protocol.ts";
 import { orderTasks } from "../src/components/background-tasks.tsx";
 import { transcriptRenderItems } from "../src/components/transcript.tsx";
 import {
+  appendTaskNotice,
+  applyEvent,
   applySnapshotToSession,
+  codaStore,
   type OpenedSession,
   type TranscriptEntry,
 } from "../src/store/session.ts";
@@ -29,21 +32,21 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   } as OpenedSession;
 }
 
-const finished: HistoryMessage = {
-  TaskNotice: {
-    message_id: "notice-1",
-    outcomes: [
-      {
-        type: "finished",
-        task_id: "bg_1",
-        command: "cargo build --release",
-        status: "exited with code 0",
-      },
-    ],
-    content: "Background task bg_1 finished: exited with code 0.\nCommand: cargo build --release",
-    created_at: "2026-08-29T00:00:00Z",
-  },
+const finishedNotice: TaskNoticeMessage = {
+  message_id: "notice-1",
+  outcomes: [
+    {
+      type: "finished",
+      task_id: "bg_1",
+      command: "cargo build --release",
+      status: "exited with code 0",
+    },
+  ],
+  content: "Background task bg_1 finished: exited with code 0.\nCommand: cargo build --release",
+  created_at: "2026-08-29T00:00:00Z",
 };
+
+const finished: HistoryMessage = { TaskNotice: finishedNotice };
 
 test("a finished background task renders as a notice, not a user bubble", () => {
   const after = applySnapshotToSession(session(), {
@@ -82,6 +85,55 @@ test("a notice opens a turn, so it is never folded into the previous one", () =>
   const items = transcriptRenderItems(entries);
   const notice = items.find((item) => item.type === "entry" && item.entry.kind === "task_notice");
   expect(notice).toBeDefined();
+});
+
+test("a task notice flushes the previous turn before it is appended", () => {
+  const server = "ws://task-notice-order";
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn(() => 1),
+  );
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  codaStore.setState((state) => {
+    state.servers[server] = {
+      url: server,
+      status: "connected",
+      catalog: [],
+      providers: [],
+      sessions: { "ws/s1": session({ running: true }) },
+    };
+  });
+
+  try {
+    applyEvent(server, "ws", "s1", {
+      type: "llm_end",
+      agent_name: "coda",
+      thread_id: "s1",
+      message: {
+        message_id: "answer-1",
+        content: "done",
+        tool_calls: [],
+        usage: null,
+        reasoning_content: null,
+        reasoning_ended_at: null,
+        aborted: false,
+        started_at: "2026-08-29T00:00:00Z",
+        ended_at: "2026-08-29T00:00:01Z",
+      },
+    });
+    expect(codaStore.getState().servers[server].sessions["ws/s1"].entries).toEqual([]);
+
+    appendTaskNotice(codaStore, server, "ws", "s1", finishedNotice);
+
+    expect(
+      codaStore.getState().servers[server].sessions["ws/s1"].entries.map((entry) => entry.kind),
+    ).toEqual(["assistant", "task_notice"]);
+  } finally {
+    codaStore.setState((state) => {
+      delete state.servers[server];
+    });
+    vi.unstubAllGlobals();
+  }
 });
 
 test("the task list arrives with the snapshot and is replaced by its own push", () => {

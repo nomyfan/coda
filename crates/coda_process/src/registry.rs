@@ -367,6 +367,22 @@ impl RegistryState {
         Ok(())
     }
 
+    /// Record one terminal task and keep the live overview's terminal slice
+    /// bounded oldest-first, regardless of whether the task ran in this
+    /// process or was recovered from disk.
+    fn record_terminal(&mut self, id: TaskId, summary: TaskSummary) {
+        self.summaries.insert(id.clone(), summary);
+        self.terminal_order.push_back(id);
+        if self.terminal_order.len() > MAX_TERMINAL
+            && let Some(oldest) = self.terminal_order.pop_front()
+        {
+            self.tasks.remove(&oldest);
+            self.summaries.remove(&oldest);
+            // A reclaimed task's monitor has long finished; drop its handle.
+            self.monitors.remove(&oldest);
+        }
+    }
+
     /// Recompute and publish the summaries snapshot. Per the terminal-commit
     /// protocol this must be the *last* mutation of a commit: when a watcher
     /// observes zero running tasks, the matching notice is already enqueued.
@@ -516,9 +532,10 @@ impl BackgroundProcesses {
     /// crash-`Running` tasks to `Interrupted` (durably, one commit each).
     async fn seed_from_inventory(&self, archive: &TaskArchive, inventory: ArchiveInventory) {
         let mut inner = self.inner.lock().await;
-        for summary in inventory.recent_terminal {
+        // Inventory is newest-first; the eviction queue is oldest-first.
+        for summary in inventory.recent_terminal.into_iter().rev() {
             if let Ok(id) = summary.id.parse::<TaskId>() {
-                inner.summaries.insert(id, summary);
+                inner.record_terminal(id, summary);
             }
         }
         drop(inner);
@@ -571,7 +588,7 @@ impl BackgroundProcesses {
                 stdout_overwritten: 0,
                 stderr_overwritten: 0,
             });
-            inner.summaries.insert(
+            inner.record_terminal(
                 id.clone(),
                 TaskSummary {
                     id: id.as_str().to_owned(),
@@ -1181,18 +1198,7 @@ async fn monitor_task(
         stderr_overwritten: outcome.stderr_overwritten,
     });
     inner.running_count -= 1;
-    inner.terminal_order.push_back(id.clone());
-    if inner.terminal_order.len() > MAX_TERMINAL
-        && let Some(oldest) = inner.terminal_order.pop_front()
-    {
-        inner.tasks.remove(&oldest);
-        inner.summaries.remove(&oldest);
-        // A reclaimed task's monitor has long finished; drop its handle.
-        inner.monitors.remove(&oldest);
-    }
-    if let Some(summary) = inner.summaries.get_mut(&id) {
-        summary.status = outcome.status;
-    }
+    inner.record_terminal(id, entry.summary(outcome.status));
     inner.publish();
 }
 

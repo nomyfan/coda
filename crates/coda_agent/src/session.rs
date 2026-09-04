@@ -652,20 +652,18 @@ impl Session {
     }
 
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
-        let exited = self.stop_runtime(mode).await;
-        // Tear down an owned registry only once the runtime has confirmedly
-        // exited: a graceful timeout that returns `false` leaves the session
-        // running, and killing its background tasks then would leave a
-        // half-closed state (session up, registry closed). Undelivered
-        // notices are dropped — a standalone session has no reopen to deliver
-        // them to.
-        if exited
-            && self.inner.owns_background
+        let stopped_as_requested = self.stop_runtime(mode).await;
+        // `stop_runtime` never returns while agent tasks are still running: a
+        // bounded wait force-aborts stragglers. Its result reports the policy
+        // outcome, not whether tasks remain, so it must not gate cleanup.
+        // Undelivered notices are dropped: a standalone session has no reopen
+        // to deliver them to.
+        if self.inner.owns_background
             && let Some(background) = &self.inner.background
         {
             let _ = background.shutdown().await;
         }
-        exited
+        stopped_as_requested
     }
 
     async fn stop_runtime(&self, mode: Shutdown) -> bool {

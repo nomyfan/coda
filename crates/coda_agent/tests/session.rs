@@ -73,6 +73,11 @@ fn completed(
     )))]))
 }
 
+fn never_completed()
+-> std::pin::Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, StreamError>> + Send>> {
+    Box::pin(stream::pending())
+}
+
 /// Base assistant message for tests; callers override the fields they care
 /// about with struct-update syntax (`..assistant()`).
 fn assistant() -> AssistantMessage {
@@ -108,6 +113,10 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         let has_results = has_tool_results(&request.messages);
 
         // --- Routing ---
+
+        if user_text.contains("never finish") {
+            return never_completed();
+        }
 
         // 1. "simple hello" → pure text reply
         if user_text.contains("simple hello") {
@@ -1157,9 +1166,9 @@ async fn tool_state_survives_the_turn_that_recorded_it() {
         .await;
 }
 
-/// A session that built its own task registry owns it: shutting the session
-/// down kills the background work it started, rather than leaving orphans
-/// behind a registry nobody can reach any more.
+/// A session that built its own task registry still closes it after missing a
+/// graceful deadline: the runtime has been stopped even though shutdown
+/// returns false to report that it did not stop naturally.
 #[tokio::test]
 async fn should_kill_owned_background_tasks_on_shutdown() {
     let session = Session::builder()
@@ -1202,11 +1211,28 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
     .await
     .expect("task never reported its pid");
 
+    session
+        .send(MessageId::new(), "never finish", vec![])
+        .await
+        .expect("send");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let Some(SessionStreamItem::Event(event)) = session.recv().await else {
+                continue;
+            };
+            if event.origin.is_root() && matches!(event.kind, AgentEvent::LLMStart(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn never started");
+
     assert!(
-        session
-            .shutdown(Shutdown::graceful_then_abort(Duration::from_secs(2)))
+        !session
+            .shutdown(Shutdown::graceful_then_abort(Duration::from_millis(20)))
             .await,
-        "session did not confirm exit, so the registry is deliberately left alone"
+        "the pending generation unexpectedly stopped within the graceful deadline"
     );
 
     // SAFETY: signal 0 only probes for existence.

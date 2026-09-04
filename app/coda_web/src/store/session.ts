@@ -1820,13 +1820,16 @@ function applySnapshot(
 /** A notice the runtime wrote opened a turn. It never comes over the event
  * stream — that carries no user-role messages — so it is appended here, ahead
  * of the events of the turn it opened. */
-function appendTaskNotice(
+export function appendTaskNotice(
   store: CodaStore,
   server: string,
   workspaceId: string,
   sessionId: string,
   message: TaskNoticeMessage,
 ) {
+  // The server sends the previous turn's settling event before this notice,
+  // but streamed events may still be waiting for the next animation frame.
+  flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
     const session = draftSession(state, server, key);
@@ -1959,7 +1962,12 @@ function applySessionStatus(
   });
 }
 
-function applyEvent(server: string, workspaceId: string, sessionId: string, event: WireEvent) {
+export function applyEvent(
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+  event: WireEvent,
+) {
   pendingEvents.push({ server, workspaceId, sessionId, event });
   scheduleFlush();
 }
