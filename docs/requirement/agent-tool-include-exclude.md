@@ -18,11 +18,13 @@ In:
 - include 与 exclude 都支持精确工具名和现有的尾部 `*` 前缀模式。
 - 显式对象写法中可以只声明 include 或 exclude。省略 include 时沿用原有默认：root agent 以全部已注册工具为基础，sub-agent 以空集为基础；省略 exclude 时不排除任何工具。
 - 最终工具集为 include 的展开结果减去 exclude 的展开结果，并保持去重。
+- 在 `examples/` 的 agent 配置中展示 exclude-only 写法及其默认集语义。
 
 Out:
 
 - 不改变 `task_output`、`task_kill` 等后台能力工具的自动注入机制；它们仍不可在 `tools` 中声明或排除。
 - 不改变工具审批、权限模式或 shell allow/deny 规则。
+- 不在项目根 `AGENTS.md` 中增加该配置项的说明；配置用法由 `examples/` 承载。
 
 ## Constraints
 
@@ -37,3 +39,4 @@ Out:
 - 同时配置 include 与 exclude 时，只有被 include 且未被 exclude 的工具可用，exclude 优先。
 - 精确名称、前缀模式、重复及交叠项均按上述规则稳定解析。
 - 自动注入的后台能力工具和现有权限控制行为不受影响。
+- 示例 workspace 的 root agent 使用合法的 exclude-only 配置，并说明 include 缺省时沿用 root 的全部工具默认集。

@@ -2351,9 +2351,11 @@ async fn build_workspace(
 
     let registry_ctx = BuildContext::new(workspace_str.clone());
     let mut registry = ToolRegistry::new();
-    registry.insert(AskUserToolSpec.build(&registry_ctx));
+    registry
+        .insert(AskUserToolSpec.build(&registry_ctx))
+        .map_err(|e| e.to_string())?;
     for tool in mcp_servers.tool_objects() {
-        registry.insert(tool);
+        registry.insert(tool).map_err(|e| e.to_string())?;
     }
 
     let agent_files = load_agent_files(&workspace_dir).map_err(|e| e.to_string())?;

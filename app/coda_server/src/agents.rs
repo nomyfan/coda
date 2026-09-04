@@ -13,13 +13,13 @@
 //! present; otherwise the built-ins apply (all tools, auto-attached unreferenced
 //! agents, and the built-in base prompt respectively). `coda` is always present.
 //!
-//! A [`ToolRegistry`] resolves the `tools` list: built-in tools by name, plus
-//! any prebuilt tools (MCP, `ask_user`) registered at startup. A name ending in
-//! `*` over a non-empty prefix is a pattern (e.g. `mcp__example__*` enables
-//! every tool that server exposes); a bare `*` is *not* a wildcard. To grant
-//! every tool, omit `tools` on the root `coda` agent (its default is all tools)
-//! — a sub-agent that omits `tools` gets none. An unknown plain name is a hard
-//! error, surfaced at startup; a pattern that matches nothing only warns.
+//! A [`ToolRegistry`] resolves `tools` includes and excludes: built-in tools by
+//! name, plus any prebuilt tools (MCP, `ask_user`) registered at startup. The
+//! original list form remains an include shorthand. A name ending in `*` over
+//! a non-empty prefix is a pattern (e.g. `mcp__example__*`); a bare `*` is *not*
+//! a wildcard. When include is absent, the root defaults to all tools and a
+//! sub-agent defaults to none. Exclude always wins. An unknown plain name is a
+//! hard error, surfaced at startup; a pattern that matches nothing only warns.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -30,7 +30,7 @@ use coda_agent::{
 
 use crate::{WorkspaceKnowledge, make_vars_provider};
 use coda_core::tool::ToolObject;
-use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, builtin_specs, spec_by_name};
+use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, spec_by_name};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -105,6 +105,26 @@ impl From<std::io::Error> for LoadError {
     }
 }
 
+/// Errors raised while assembling the global declarable-tool namespace.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ToolRegistryError {
+    /// A prebuilt tool has the same name as a builtin or an earlier prebuilt.
+    DuplicateToolName(String),
+}
+
+impl std::fmt::Display for ToolRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolRegistryError::DuplicateToolName(name) => write!(
+                f,
+                "duplicate tool name '{name}': tool names must be globally unique"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ToolRegistryError {}
+
 /// Resolves tool names to [`ToolSpec`] factories. Built-in tools are resolved by
 /// name; prebuilt tools (MCP adapters, `ask_user`) are registered explicitly and
 /// shared across every agent that names them.
@@ -118,11 +138,21 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Register a prebuilt tool under its own `name()`. Replaces any tool
-    /// previously registered under the same name.
-    pub fn insert(&mut self, tool: Box<dyn ToolObject>) {
-        self.prebuilt
-            .insert(tool.name().to_string(), PrebuiltToolSpec::new(tool));
+    /// Register a prebuilt tool under its own `name()`.
+    ///
+    /// Tool names are global: colliding with a builtin or an earlier prebuilt
+    /// is rejected instead of silently choosing one implementation.
+    pub fn insert(&mut self, tool: Box<dyn ToolObject>) -> Result<(), ToolRegistryError> {
+        let name = tool.name().to_string();
+        if BUILTIN_TOOL_NAMES.contains(&name.as_str()) || self.prebuilt.contains_key(&name) {
+            return Err(ToolRegistryError::DuplicateToolName(name));
+        }
+        self.prebuilt.insert(name, PrebuiltToolSpec::new(tool));
+        Ok(())
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        BUILTIN_TOOL_NAMES.contains(&name) || self.prebuilt.contains_key(name)
     }
 
     /// Resolve a tool name to a fresh spec, or `None` if unknown.
@@ -135,35 +165,46 @@ impl ToolRegistry {
             .map(|p| Box::new(p.clone()) as Box<dyn ToolSpec>)
     }
 
-    /// Expand a trailing-`*` prefix pattern (e.g. `mcp__example__*`) to every tool
-    /// — built-in or prebuilt — whose name starts with `prefix`, as fresh specs
-    /// sorted by name. `prefix` is always non-empty (the caller rejects a bare
-    /// `*`).
-    fn expand_pattern(&self, prefix: &str) -> Vec<Box<dyn ToolSpec>> {
-        let mut names: Vec<&str> = BUILTIN_TOOL_NAMES
+    /// Every declarable tool name in the existing default order: builtins first,
+    /// then prebuilt tools sorted by name.
+    fn all_names(&self) -> Vec<String> {
+        BUILTIN_TOOL_NAMES
             .iter()
-            .copied()
-            .chain(self.prebuilt.keys().map(String::as_str))
+            .map(|name| (*name).to_string())
+            .chain(self.prebuilt.keys().cloned())
+            .collect()
+    }
+
+    /// Expand a trailing-`*` prefix pattern to matching tool names, sorted by
+    /// name. `prefix` is always non-empty (the caller rejects a bare `*`).
+    fn expand_pattern(&self, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .all_names()
+            .into_iter()
             .filter(|name| name.starts_with(prefix))
             .collect();
         names.sort_unstable();
         names
-            .iter()
-            .map(|name| {
-                // Every name came straight from a known source, so a miss is a
-                // broken internal invariant — surface it rather than dropping it.
-                self.resolve(name).expect("enumerated tool name resolves")
-            })
-            .collect()
     }
+}
 
-    /// Every registered prebuilt tool, for handing to the top-level agent.
-    fn all_prebuilt(&self) -> Vec<Box<dyn ToolSpec>> {
-        self.prebuilt
-            .values()
-            .map(|p| Box::new(p.clone()) as Box<dyn ToolSpec>)
-            .collect()
-    }
+/// An agent's `tools` selection. The list form is retained as include shorthand.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolSelection {
+    Include(Vec<String>),
+    Rules(ToolRules),
+}
+
+/// Explicit include/exclude rules. A missing include uses the agent's existing
+/// default, while an explicit empty include selects no declarable tools.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolRules {
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -187,7 +228,7 @@ struct Frontmatter {
     description: String,
     mode: ModeRaw,
     #[serde(default)]
-    tools: Vec<String>,
+    tools: Option<ToolSelection>,
     #[serde(default)]
     subagents: Vec<String>,
     /// Optional per-agent workspace (tool root + knowledge source). Absolute, or
@@ -209,7 +250,7 @@ pub struct AgentFile {
     name: String,
     description: String,
     mode: SubAgentMode,
-    tools: Vec<String>,
+    tools: Option<ToolSelection>,
     subagents: Vec<String>,
     system_prompt: String,
     workspace: Option<String>,
@@ -245,7 +286,7 @@ impl AgentFile {
 #[derive(Deserialize, Default)]
 struct RootFrontmatter {
     #[serde(default)]
-    tools: Option<Vec<String>>,
+    tools: Option<ToolSelection>,
     #[serde(default)]
     subagents: Option<Vec<String>>,
 }
@@ -255,7 +296,7 @@ struct RootFrontmatter {
 /// [`build_agent_team`] (tools, sub-agents) and the system-prompt assembly (body).
 #[derive(Default)]
 pub struct RootAgentFile {
-    pub tools: Option<Vec<String>>,
+    pub tools: Option<ToolSelection>,
     pub subagents: Option<Vec<String>>,
     /// The body, used as the root agent's base system prompt; `None` when the
     /// file is absent or its body is empty (fall back to the built-in default).
@@ -395,27 +436,22 @@ pub fn load_root_agent_file(workspace_dir: &Path) -> Result<RootAgentFile, LoadE
     parse_root_agent_file(&content)
 }
 
-/// Resolve a list of tool names to [`ToolSpec`] factories via `registry`.
+/// Resolve tool names and patterns against `registry`, preserving first-seen
+/// order and deduplicating overlaps.
 ///
 /// A name ending in `*` with a non-empty prefix is a pattern (e.g.
-/// `mcp__example__*`), expanded to every matching tool; a pattern that matches
-/// nothing is warned about, not an error, since which MCP tools exist can
-/// legitimately vary. A bare `*` is not a pattern (to grant every tool, omit
-/// `tools` on the root agent) — it falls through and resolves to nothing, a hard
-/// error. A plain name that resolves to nothing is likewise a hard
-/// [`LoadError::UnknownTool`] (attributed to `agent`). The result is
-/// deduplicated by name so a pattern overlapping a literal entry doesn't trip
-/// the tool-namespace conflict check downstream.
-fn resolve_tools(
+/// `mcp__example__*`), expanded to every matching tool; a pattern matching
+/// nothing only warns. A bare `*` and any unknown plain name are hard errors.
+fn expand_tool_names(
     registry: &ToolRegistry,
     agent: &str,
     names: &[String],
-) -> Result<Vec<Box<dyn ToolSpec>>, LoadError> {
-    let mut tools: Vec<Box<dyn ToolSpec>> = Vec::with_capacity(names.len());
+) -> Result<Vec<String>, LoadError> {
+    let mut expanded = Vec::with_capacity(names.len());
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |tools: &mut Vec<Box<dyn ToolSpec>>, spec: Box<dyn ToolSpec>| {
-        if seen.insert(spec.name().to_string()) {
-            tools.push(spec);
+    let mut push = |expanded: &mut Vec<String>, name: String| {
+        if seen.insert(name.clone()) {
+            expanded.push(name);
         }
     };
 
@@ -428,22 +464,60 @@ fn resolve_tools(
             if matches.is_empty() {
                 warn!(agent, pattern = name, "tool pattern matched no tools");
             }
-            for spec in matches {
-                push(&mut tools, spec);
+            for matched in matches {
+                push(&mut expanded, matched);
             }
+        } else if registry.contains(name) {
+            push(&mut expanded, name.clone());
         } else {
-            match registry.resolve(name) {
-                Some(spec) => push(&mut tools, spec),
-                None => {
-                    return Err(LoadError::UnknownTool {
-                        agent: agent.to_string(),
-                        tool: name.clone(),
-                    });
-                }
-            }
+            return Err(LoadError::UnknownTool {
+                agent: agent.to_string(),
+                tool: name.clone(),
+            });
         }
     }
-    Ok(tools)
+    Ok(expanded)
+}
+
+#[derive(Clone, Copy)]
+enum DefaultToolSet {
+    All,
+    Empty,
+}
+
+/// Resolve an agent's final declarable tools as `base - exclude`.
+fn resolve_tools(
+    registry: &ToolRegistry,
+    agent: &str,
+    selection: Option<&ToolSelection>,
+    default: DefaultToolSet,
+) -> Result<Vec<Box<dyn ToolSpec>>, LoadError> {
+    let (include, exclude): (Option<&[String]>, &[String]) = match selection {
+        None => (None, &[]),
+        Some(ToolSelection::Include(include)) => (Some(include), &[]),
+        Some(ToolSelection::Rules(rules)) => (rules.include.as_deref(), &rules.exclude),
+    };
+
+    let mut names = match include {
+        Some(include) => expand_tool_names(registry, agent, include)?,
+        None => match default {
+            DefaultToolSet::All => registry.all_names(),
+            DefaultToolSet::Empty => Vec::new(),
+        },
+    };
+    let excluded: HashSet<String> = expand_tool_names(registry, agent, exclude)?
+        .into_iter()
+        .collect();
+    names.retain(|name| !excluded.contains(name));
+
+    Ok(names
+        .iter()
+        .map(|name| {
+            registry
+                .resolve(name)
+                .expect("validated registry name resolves")
+        })
+        .collect())
 }
 
 /// Assemble a validated [`AgentTeam`] rooted at the top-level `coda` agent.
@@ -477,7 +551,7 @@ pub fn build_agent_team(
     agent_workspaces: &HashMap<String, String>,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
-    root_tools: Option<Vec<String>>,
+    root_tools: Option<ToolSelection>,
     root_subagents: Option<Vec<String>>,
 ) -> Result<AgentTeam, LoadError> {
     // Assemble a prompt for an agent rooted at `workspace`: its base body plus a
@@ -512,14 +586,12 @@ pub fn build_agent_team(
         }
     };
 
-    let root_tools = match root_tools {
-        Some(names) => resolve_tools(registry, ROOT_AGENT_NAME, &names)?,
-        None => {
-            let mut tools = builtin_specs();
-            tools.extend(registry.all_prebuilt());
-            tools
-        }
-    };
+    let root_tools = resolve_tools(
+        registry,
+        ROOT_AGENT_NAME,
+        root_tools.as_ref(),
+        DefaultToolSet::All,
+    )?;
 
     let root = AgentSpec {
         name: ROOT_AGENT_NAME.to_string(),
@@ -532,7 +604,12 @@ pub fn build_agent_team(
 
     let mut subagents = Vec::with_capacity(files.len());
     for file in files {
-        let tools = resolve_tools(registry, &file.name, &file.tools)?;
+        let tools = resolve_tools(
+            registry,
+            &file.name,
+            file.tools.as_ref(),
+            DefaultToolSet::Empty,
+        )?;
         let workspace = agent_workspaces
             .get(&file.name)
             .map(String::as_str)

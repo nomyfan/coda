@@ -4,9 +4,9 @@
 
 ## Scope
 
-In: YAML 数据模型、工具名称/模式展开、include/exclude 集合运算、工具注册重名校验、启动期错误传播和测试。
+In: YAML 数据模型、工具名称/模式展开、include/exclude 集合运算、工具注册重名校验、启动期错误传播、测试和示例配置。
 
-Out: runtime 工具注入、审批策略、shell allow/deny，以及 MCP 的发现、连接和工具执行逻辑；MCP 工具进入 registry 时的重名校验属于本方案范围。
+Out: runtime 工具注入、审批策略、shell allow/deny、项目根 `AGENTS.md` 的配置说明，以及 MCP 的发现、连接和工具执行逻辑；MCP 工具进入 registry 时的重名校验属于本方案范围。
 
 ## Validation Findings
 
@@ -97,21 +97,21 @@ pub fn insert(
 
 ## Implementation Roadmap
 
-- [ ] [配置边界] 引入 `ToolSelection`/`ToolRules` 并接入两类 frontmatter
+- [x] [配置边界] 引入 `ToolSelection`/`ToolRules` 并接入两类 frontmatter
   - Purpose: 保留列表兼容性以及缺省/显式空集的区别
   - Verification: YAML 解析测试覆盖列表、对象、仅 exclude、空 include 和非法键
-- [ ] [核心逻辑] 将模式展开改为名称级解析，并实现默认集、include、exclude 的集合运算
+- [x] [核心逻辑] 将模式展开改为名称级解析，并实现默认集、include、exclude 的集合运算
   - Purpose: 在构造工具前集中完成校验、去重、优先级和稳定排序
   - Verification: 单元测试覆盖精确名称、前缀、重叠、未命中模式及已注册但不在 base 的排除项
-- [ ] [registry 约束] 让 `ToolRegistry::insert` 拒绝与 builtin 或既有 prebuilt 重名的工具，并向 workspace 启动路径传播错误
+- [x] [registry 约束] 让 `ToolRegistry::insert` 拒绝与 builtin 或既有 prebuilt 重名的工具，并向 workspace 启动路径传播错误
   - Purpose: 保证名称级运算不会静默隐藏或替换不同的工具实现
   - Verification: 回归测试分别覆盖 prebuilt/builtin、prebuilt/prebuilt 冲突以及正常注册
-- [ ] [集成] root 以 `All`、sub-agent 以 `Empty` 调用统一解析器，并更新模块说明
+- [x] [集成] root 以 `All`、sub-agent 以 `Empty` 调用统一解析器，并更新模块说明
   - Purpose: 接通真实 agent team 构建路径且不影响后台工具注入
   - Verification: team 测试覆盖两类 agent 的字段缺省、仅 exclude 及 include+exclude
-- [ ] [配置文档] 更新 `AGENTS.md` 的 Agent Configuration 说明和示例
-  - Purpose: 让配置者能看懂列表简写、对象写法、root/sub-agent 默认集差异、exclude 优先级和后台工具例外
-  - Verification: 文档示例覆盖仅 include、仅 exclude、include+exclude，并与解析测试中的语义一致
-- [ ] [回归] 执行项目规定的 Rust 检查
+- [x] [示例配置] 在 `examples/` 的 root agent 配置中使用 exclude-only 写法，并更新示例索引
+  - Purpose: 通过可复制的配置体现 exclude 语义，不扩充项目根 `AGENTS.md`
+  - Verification: 示例缺省 include、排除一个已知工具，并说明它以 root 的全部工具默认集为基础
+- [x] [回归] 执行项目规定的 Rust 检查
   - Purpose: 确认格式、lint、常规测试和 feature-gated storage targets 均可构建
   - Verification: `cargo fmt --check`、`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`

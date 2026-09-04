@@ -1,4 +1,6 @@
 ---
+tools:
+  exclude: [shell]
 subagents: [planner, docs-writer]
 ---
 
