@@ -14,8 +14,6 @@
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-#[cfg(test)]
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -132,11 +130,6 @@ impl ArchiveDir {
         // Force restrictive perms on the leaf (create_dir_all honours umask).
         fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
         Ok(ArchiveDir { fd: Arc::new(fd) })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
     }
 
     /// Lazily enumerate direct children, one classified entry at a time, without
@@ -536,9 +529,7 @@ mod tests {
 
         // Reopen the task dir by id and confirm the mode is 0700.
         let reopened = root.open_dir(&id).unwrap();
-        // SAFETY: `reopened` keeps the fd alive for the duration of this call.
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(reopened.raw_fd()) };
-        verify_mode(borrowed, 0o700).unwrap();
+        verify_mode(reopened.fd.as_fd(), 0o700).unwrap();
     }
 
     #[test]

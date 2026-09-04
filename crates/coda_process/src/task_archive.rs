@@ -118,22 +118,6 @@ impl TaskRecord {
         }
     }
 
-    #[cfg(test)]
-    fn pause_next_commit(
-        &self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
-    ) {
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        *self.commit_pause.lock().unwrap() = Some(CommitPause {
-            entered: entered_tx,
-            release: release_rx,
-        });
-        (entered_rx, release_tx)
-    }
-
     /// Build the full manifest for a candidate state, snapshotting each ring's
     /// current logical range (callers flush first for a terminal range).
     async fn build_manifest(&self, state: &TaskPersistentState) -> TaskOutputManifest {
@@ -354,11 +338,16 @@ pub struct TaskArchive {
     index: Arc<StdMutex<HashMap<TaskId, Weak<TaskRecord>>>>,
     activity: Arc<ArchiveActivity>,
     #[cfg(test)]
-    fail_next_initial_manifest: Arc<AtomicBool>,
-    #[cfg(test)]
-    create_pause: Arc<StdMutex<Option<CreatePause>>>,
-    #[cfg(test)]
-    fail_next_discard: Arc<AtomicBool>,
+    test_hooks: Arc<TaskArchiveTestHooks>,
+}
+
+/// Shared deterministic scheduling and fault-injection state for archive tests.
+#[cfg(test)]
+#[derive(Default)]
+struct TaskArchiveTestHooks {
+    fail_next_initial_manifest: AtomicBool,
+    create_pause: StdMutex<Option<CreatePause>>,
+    fail_next_discard: AtomicBool,
 }
 
 impl TaskArchive {
@@ -370,38 +359,12 @@ impl TaskArchive {
                 count: watch::channel(0).0,
             }),
             #[cfg(test)]
-            fail_next_initial_manifest: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            create_pause: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            fail_next_discard: Arc::new(AtomicBool::new(false)),
+            test_hooks: Arc::new(TaskArchiveTestHooks::default()),
         }
     }
 
     pub fn root(&self) -> &ArchiveDir {
         &self.root
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_initial_manifest(&self) {
-        self.fail_next_initial_manifest
-            .store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_next_create(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.create_pause.lock().unwrap() = Some(CreatePause {
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-        (entered, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_discard(&self) {
-        self.fail_next_discard.store(true, Ordering::SeqCst);
     }
 
     /// Create a task's private `0700` directory and two `0600` ring files, and
@@ -418,15 +381,6 @@ impl TaskArchive {
             .map_err(|error| ArchiveError::corrupt(error.to_string()))?;
         let record = self.create_transaction(id, meta, Some(lease)).await?;
         Ok((record, reservation))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn create_unreserved(
-        &self,
-        id: &TaskId,
-        meta: &TaskMeta,
-    ) -> Result<Arc<TaskRecord>, ArchiveError> {
-        self.create_transaction(id, meta, None).await
     }
 
     async fn create_transaction(
@@ -496,7 +450,7 @@ impl TaskArchive {
         meta: &TaskMeta,
     ) -> Result<Arc<TaskRecord>, CreateFailure> {
         #[cfg(test)]
-        let pause = { self.create_pause.lock().unwrap().take() };
+        let pause = { self.test_hooks.create_pause.lock().unwrap().take() };
         #[cfg(test)]
         if let Some(pause) = pause {
             pause.entered.notify_one();
@@ -566,6 +520,7 @@ impl TaskArchive {
             let candidate = guard.current().clone();
             #[cfg(test)]
             let commit = if self
+                .test_hooks
                 .fail_next_initial_manifest
                 .swap(false, Ordering::SeqCst)
             {
@@ -602,7 +557,11 @@ impl TaskArchive {
     pub async fn discard_created(&self, record: &TaskRecord) -> Result<(), ArchiveError> {
         self.index.lock().unwrap().remove(record.id());
         #[cfg(test)]
-        if self.fail_next_discard.swap(false, Ordering::SeqCst) {
+        if self
+            .test_hooks
+            .fail_next_discard
+            .swap(false, Ordering::SeqCst)
+        {
             return Err(ArchiveError::Io(std::io::Error::other(
                 "injected detached create cleanup failure",
             )));

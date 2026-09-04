@@ -472,9 +472,15 @@ pub struct SessionQuota {
     archive: Arc<TaskArchive>,
     activity: Arc<QuotaActivity>,
     #[cfg(test)]
-    fail_next_delete: Arc<AtomicBool>,
-    #[cfg(test)]
-    delete_pause: Arc<Mutex<Option<DeletePause>>>,
+    test_hooks: Arc<QuotaTestHooks>,
+}
+
+/// Shared deterministic scheduling and fault-injection state for quota tests.
+#[cfg(test)]
+#[derive(Default)]
+struct QuotaTestHooks {
+    fail_next_delete: AtomicBool,
+    delete_pause: Mutex<Option<DeletePause>>,
 }
 
 impl SessionQuota {
@@ -500,41 +506,8 @@ impl SessionQuota {
                 count: watch::channel(0).0,
             }),
             #[cfg(test)]
-            fail_next_delete: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            delete_pause: Arc::new(Mutex::new(None)),
+            test_hooks: Arc::new(QuotaTestHooks::default()),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reserved(&self) -> u64 {
-        self.inner.lock().unwrap().reserved
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_contains(&self, id: &TaskId) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .retained
-            .iter()
-            .any(|entry| entry.id == *id)
-    }
-
-    #[cfg(test)]
-    fn fail_next_delete(&self) {
-        self.fail_next_delete.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_next_delete(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.delete_pause.lock().unwrap() = Some(DeletePause {
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-        (entered, release)
     }
 
     /// Reserve `bytes` for a new task. Residual deletes are retried first; then
@@ -543,11 +516,6 @@ impl SessionQuota {
     pub async fn reserve_for_create(&self) -> ReserveOutcome {
         self.reserve_bytes(2 * super::task_archive::DEFAULT_STREAM_CAPACITY)
             .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn reserve_for_test(&self, bytes: u64) -> ReserveOutcome {
-        self.reserve_bytes(bytes).await
     }
 
     async fn reserve_bytes(&self, bytes: u64) -> ReserveOutcome {
@@ -816,13 +784,17 @@ impl SessionQuota {
         guard: &super::task_archive::TaskCommitGuard,
     ) -> Result<(), ArchiveError> {
         #[cfg(test)]
-        if self.fail_next_delete.swap(false, Ordering::SeqCst) {
+        if self
+            .test_hooks
+            .fail_next_delete
+            .swap(false, Ordering::SeqCst)
+        {
             return Err(ArchiveError::Io(std::io::Error::other(
                 "injected ring delete failure",
             )));
         }
         #[cfg(test)]
-        let pause = { self.delete_pause.lock().unwrap().take() };
+        let pause = { self.test_hooks.delete_pause.lock().unwrap().take() };
         #[cfg(test)]
         if let Some(pause) = pause {
             pause.entered.notify_one();

@@ -1,6 +1,41 @@
 use super::*;
 use crate::TaskMeta;
 
+impl SessionQuota {
+    pub(crate) fn reserved(&self) -> u64 {
+        self.inner.lock().unwrap().reserved
+    }
+
+    pub(crate) fn retained_contains(&self, id: &TaskId) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .retained
+            .iter()
+            .any(|entry| entry.id == *id)
+    }
+
+    fn fail_next_delete(&self) {
+        self.test_hooks
+            .fail_next_delete
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn pause_next_delete(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_hooks.delete_pause.lock().unwrap() = Some(DeletePause {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    pub(crate) async fn reserve_for_test(&self, bytes: u64) -> ReserveOutcome {
+        self.reserve_bytes(bytes).await
+    }
+}
+
 fn meta() -> TaskMeta {
     TaskMeta {
         command: "c".into(),

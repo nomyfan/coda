@@ -1,6 +1,55 @@
 use super::*;
 use crate::quota::{QuotaError, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory};
 
+impl TaskRecord {
+    fn pause_next_commit(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.commit_pause.lock().unwrap() = Some(CommitPause {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+}
+
+impl TaskArchive {
+    pub(crate) fn fail_next_initial_manifest(&self) {
+        self.test_hooks
+            .fail_next_initial_manifest
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn pause_next_create(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_hooks.create_pause.lock().unwrap() = Some(CreatePause {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    pub(crate) fn fail_next_discard(&self) {
+        self.test_hooks
+            .fail_next_discard
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn create_unreserved(
+        &self,
+        id: &TaskId,
+        meta: &TaskMeta,
+    ) -> Result<Arc<TaskRecord>, ArchiveError> {
+        self.create_transaction(id, meta, None).await
+    }
+}
+
 fn meta() -> TaskMeta {
     TaskMeta {
         command: "echo hi".into(),
