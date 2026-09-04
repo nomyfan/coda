@@ -35,6 +35,18 @@ impl TaskArchive {
         (entered, release)
     }
 
+    pub(crate) fn pause_after_next_create_ack(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_hooks.acknowledged_create_pause.lock().unwrap() = Some(CreatePause {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
     pub(crate) fn fail_next_discard(&self) {
         self.test_hooks
             .fail_next_discard
@@ -181,6 +193,41 @@ async fn cancelled_create_transaction_cleans_delivered_record() {
     })
     .await
     .expect("owned create transaction did not clean its undelivered record");
+}
+
+#[tokio::test]
+async fn acknowledged_create_finishes_handoff_before_it_can_be_cancelled() {
+    let (_tmp, archive) = root();
+    let archive = Arc::new(archive);
+    let quota = SessionQuota::from_inventory(
+        &scan_inventory(archive.root()).unwrap(),
+        SESSION_QUOTA_BYTES,
+        archive.clone(),
+    );
+    let reservation = quota.reserve_for_create().await.reservation.unwrap();
+    let (acknowledged, release) = archive.pause_after_next_create_ack();
+    let create_archive = archive.clone();
+    let id = TaskId::new();
+    let create_id = id.clone();
+    let create = tokio::spawn(async move {
+        create_archive
+            .create(&create_id, &meta(), reservation)
+            .await
+    });
+
+    acknowledged.notified().await;
+    create.abort();
+    let (record, reservation) = create
+        .await
+        .expect("acknowledged create still had a cancellation point")
+        .unwrap();
+    archive.discard_created(&record).await.unwrap();
+    drop(reservation);
+    assert_eq!(archive.root().entries().unwrap().count(), 0);
+    assert_eq!(quota.reserved(), 0);
+
+    release.notify_one();
+    archive.settle().await;
 }
 
 #[tokio::test]

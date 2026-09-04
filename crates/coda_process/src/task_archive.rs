@@ -347,6 +347,7 @@ pub struct TaskArchive {
 struct TaskArchiveTestHooks {
     fail_next_initial_manifest: AtomicBool,
     create_pause: StdMutex<Option<CreatePause>>,
+    acknowledged_create_pause: StdMutex<Option<CreatePause>>,
     fail_next_discard: AtomicBool,
 }
 
@@ -395,6 +396,10 @@ impl TaskArchive {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let activity = ArchiveActivity::begin(&self.activity);
+        // The detached worker owns this quota hold until acknowledgement can
+        // transfer it synchronously, or cleanup failure makes it permanent.
+        let reservation_handoff = Arc::new(StdMutex::new(reservation));
+        let detached_reservation = reservation_handoff.clone();
         tokio::spawn(async move {
             let _activity = activity;
             let result = archive.create_inner(&id, &meta).await;
@@ -408,11 +413,25 @@ impl TaskArchive {
                 .err()
                 .map(|failure| failure.error.to_string());
             let acknowledged = result_tx.send(result).is_ok() && ack_rx.await.is_ok();
+            #[cfg(test)]
+            if acknowledged {
+                let pause = archive
+                    .test_hooks
+                    .acknowledged_create_pause
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(pause) = pause {
+                    pause.entered.notify_one();
+                    pause.release.notified().await;
+                }
+            }
             if create_cleanup_failed {
                 let error = ArchiveError::corrupt(
                     diagnostic.unwrap_or_else(|| "task create cleanup failed".into()),
                 );
                 tracing::error!(task = id.as_str(), error = %error, "task create cleanup failed");
+                let reservation = detached_reservation.lock().unwrap().take();
                 if let Some(reservation) = reservation {
                     reservation.block_and_commit(&error);
                 }
@@ -429,6 +448,7 @@ impl TaskArchive {
             };
             if let Some(error) = cleanup_error {
                 tracing::error!(task = id.as_str(), error = %error, "detached task create cleanup failed");
+                let reservation = detached_reservation.lock().unwrap().take();
                 if let Some(reservation) = reservation {
                     reservation.block_and_commit(&error);
                 }
@@ -438,9 +458,16 @@ impl TaskArchive {
         let result = result_rx
             .await
             .map_err(|_| ArchiveError::corrupt("task create transaction stopped"))?;
+        let cleanup_failed = result
+            .as_ref()
+            .err()
+            .is_some_and(|failure| failure.cleanup_failed);
         ack_tx
             .send(())
             .map_err(|_| ArchiveError::corrupt("task create delivery stopped"))?;
+        if !cleanup_failed {
+            drop(reservation_handoff.lock().unwrap().take());
+        }
         result.map_err(|failure| failure.error)
     }
 

@@ -171,21 +171,32 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     let archive = Arc::new(TaskArchive::new(root));
+    let (acknowledged, release) = archive.pause_after_next_create_ack();
     let quota = SessionQuota::from_inventory(
         &ArchiveInventory::default(),
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::new(Arc::new(Backend {
+    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
-    }));
+    })));
 
     let cmd = Command::new("/definitely/not/a/real/executable");
-    assert!(reg.spawn(cmd, meta("bad executable")).await.is_err());
+    let spawn_reg = reg.clone();
+    let spawn = tokio::spawn(async move { spawn_reg.spawn(cmd, meta("bad executable")).await });
+    acknowledged.notified().await;
+    let error = tokio::time::timeout(Duration::from_secs(2), spawn)
+        .await
+        .expect("process-start failure waited for the acknowledged create transaction")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert_eq!(archive.root().entries().unwrap().count(), 0);
     assert_eq!(reg.backend.quota.reserved(), 0);
+    release.notify_one();
+    archive.settle().await;
 }
 
 #[tokio::test]
