@@ -238,3 +238,111 @@ async fn failed_notice_append_rolls_back_its_receipt() {
         1
     );
 }
+
+fn observed_read(task: &TaskId) -> Message {
+    let mut message = ToolMessage::new(
+        "read",
+        "task_output",
+        ToolOutput::Ok("complete terminal output".into()),
+        ToolCallOutcome::Auto,
+        None,
+    );
+    message.observed_task = Some(task.clone());
+    Message::Tool(message)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn root_task_read_receipt_survives_reopen_and_rewind_but_not_fork() {
+    let pool = pool().await;
+    let workspace = workspace_id("task_read");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    let task = TaskId::new();
+    let user_id = MessageId::new();
+    let turn = TurnId::from(user_id);
+    let mut child = checkpoint("child", vec![entry(turn, observed_read(&task))]);
+    child.parent_thread_id = Some("root".into());
+    child.derivation_key = Some("child".into());
+    storage
+        .save_checkpoint("child".into(), child)
+        .await
+        .unwrap();
+    assert!(
+        !storage.has_notice_receipt(task.clone()).await.unwrap(),
+        "non-root reads cannot acknowledge root delivery"
+    );
+    let root = checkpoint(
+        "root",
+        vec![
+            entry(
+                turn,
+                Message::User(UserMessage::text(user_id, "read result")),
+            ),
+            entry(turn, observed_read(&task)),
+        ],
+    );
+    storage.save_checkpoint("root".into(), root).await.unwrap();
+    let reopened = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    assert!(reopened.has_notice_receipt(task.clone()).await.unwrap());
+    let fork = WorkspaceStorage::new(pool.clone(), &workspace)
+        .fork_session("root", ForkCut::All, ForkSource::Live)
+        .await
+        .unwrap();
+    let fork_storage = PgSessionStorage::new(pool, &workspace, &fork.session_id);
+    assert!(!fork_storage.has_notice_receipt(task.clone()).await.unwrap());
+    let mut fork_checkpoint = fork_storage
+        .load_checkpoint(&fork.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    fork_checkpoint
+        .messages
+        .push(entry(turn, assistant("next response")));
+    fork_storage
+        .save_checkpoint(fork.session_id, fork_checkpoint)
+        .await
+        .unwrap();
+    assert!(
+        !fork_storage.has_notice_receipt(task.clone()).await.unwrap(),
+        "saving a fork must not re-acknowledge copied history"
+    );
+    reopened.rewind_to(user_id).await.unwrap();
+    assert!(reopened.has_notice_receipt(task).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_checkpoint_rolls_back_the_task_read_receipt() {
+    let pool = pool().await;
+    let workspace = workspace_id("task_read_rollback");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool, &workspace, "root");
+    let task = TaskId::new();
+    let user_id = MessageId::new();
+    let turn = TurnId::from(user_id);
+    let user = entry(turn, Message::User(UserMessage::text(user_id, "start")));
+    storage
+        .save_checkpoint("root".into(), checkpoint("root", vec![user.clone()]))
+        .await
+        .unwrap();
+    let failed = checkpoint(
+        "root",
+        vec![user.clone(), entry(turn, observed_read(&task)), user],
+    );
+    assert!(
+        storage
+            .save_checkpoint("root".into(), failed)
+            .await
+            .is_err()
+    );
+    assert!(!storage.has_notice_receipt(task).await.unwrap());
+    assert_eq!(
+        storage
+            .load_checkpoint("root")
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+}

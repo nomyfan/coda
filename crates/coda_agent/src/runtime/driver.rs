@@ -1203,6 +1203,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         result: ToolResult<String>,
         call_state: &CallState,
         artifacts: Vec<coda_core::llm::ToolArtifact>,
+        observed_task: Option<coda_core::task::TaskId>,
     ) -> bool {
         let (output, outcome) = match result {
             Ok(output) => (ToolOutput::Ok(output), tc.outcome),
@@ -1222,18 +1223,18 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         } else {
             Vec::new()
         };
-        self.add_message_with_state(
-            ToolMessage::new(
-                tc.tool_call.id,
-                tc.tool_call.name,
-                output,
-                outcome,
-                Some(started_at),
-            )
-            .with_artifacts(if succeeded { artifacts } else { Vec::new() }),
-            recorded,
+        let mut message = ToolMessage::new(
+            tc.tool_call.id,
+            tc.tool_call.name,
+            output,
+            outcome,
+            Some(started_at),
         )
-        .await;
+        .with_artifacts(if succeeded { artifacts } else { Vec::new() });
+        if succeeded && !aborted && self.runtime.is_root_thread(&self.thread_id) {
+            message.observed_task = observed_task;
+        }
+        self.add_message_with_state(message, recorded).await;
         aborted
     }
 
@@ -2199,7 +2200,14 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     };
                 let future = async move {
                     let output = execution.await;
-                    (tc, started_at, output, call_state, ctx.take_artifacts())
+                    (
+                        tc,
+                        started_at,
+                        output,
+                        call_state,
+                        ctx.take_artifacts(),
+                        ctx.take_task_result(),
+                    )
                 };
                 futures.push(future);
             } else {
@@ -2231,9 +2239,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break true,
-                Some((tc, started_at, result, call_state, artifacts)) = futures.next() => {
+                Some((tc, started_at, result, call_state, artifacts, observed_task)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    self.settle_local_tool(tc, started_at, result, &call_state, artifacts).await;
+                    self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task).await;
                 }
             }
         };
@@ -2255,10 +2263,10 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 tokio::select! {
                     biased;
                     _ = &mut grace => break,
-                    Some((tc, started_at, result, call_state, artifacts)) = futures.next() => {
+                    Some((tc, started_at, result, call_state, artifacts, observed_task)) = futures.next() => {
                         pending_local.remove(&tc.tool_call.id);
                         let id = tc.tool_call.id.clone();
-                        if self.settle_local_tool(tc, started_at, result, &call_state, artifacts).await {
+                        if self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task).await {
                             aborted_ids.push(id);
                         }
                     }

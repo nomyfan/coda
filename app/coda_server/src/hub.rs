@@ -1250,6 +1250,30 @@ impl SessionHub {
         {
             return false;
         }
+        // A terminal task_output already in root's checkpoint supersedes the
+        // queued shell notice. An uncertain receipt lookup leaves the queue
+        // intact for the watcher's next retry.
+        let mut observed = std::collections::HashSet::new();
+        for notice in &state.pending_notices {
+            if let TaskNotice::Task { id, .. } = notice {
+                match live.session.has_task_notice_receipt(id.clone()).await {
+                    Ok(true) => {
+                        observed.insert(id.clone());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%error, "could not check task result receipt");
+                        return false;
+                    }
+                }
+            }
+        }
+        state.pending_notices.retain(
+            |notice| !matches!(notice, TaskNotice::Task { id, .. } if observed.contains(id)),
+        );
+        if state.pending_notices.is_empty() {
+            return false;
+        }
         // Everything waiting goes in one message. Tasks that finished while a
         // turn ran are one interruption, not one each; what cannot be merged is
         // a notice that arrives after this has gone out, and that one simply

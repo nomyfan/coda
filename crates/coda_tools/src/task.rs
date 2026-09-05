@@ -70,7 +70,7 @@ impl Tool for TaskOutputTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
@@ -83,6 +83,9 @@ impl Tool for TaskOutputTool {
                 Ok(None) => return Ok(unknown_task(&params.id)),
                 Err(e) => return Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
             };
+            if read.complete {
+                ctx.record_task_result(id);
+            }
             let mut out = format!("status: {}", read.status.describe());
             if let Some(note) = &read.note {
                 out.push_str(&format!("\n({note})"));
@@ -183,161 +186,5 @@ impl Tool for TaskKillTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use coda_process::TaskMeta;
-    use tokio::process::Command;
-
-    fn bash(command: &str) -> Command {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd
-    }
-
-    fn meta(command: &str) -> TaskMeta {
-        TaskMeta::shell(command.into(), "test task".into(), "coda".into())
-    }
-
-    #[tokio::test]
-    async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
-        let background = Arc::new(BackgroundTasks::temporary().unwrap());
-        let id = coda_process::TaskId::new();
-        let own_id = id.clone();
-        let tool = TaskKillTool::new(background.clone());
-        let meta = coda_process::TaskMeta {
-            kind: coda_process::TaskKind::Subagent {
-                agent_name: "worker".into(),
-            },
-            description: "self stop".into(),
-            parent_task_id: None,
-            origin: Default::default(),
-        };
-        background
-            .spawn_identified(id.clone(), meta, move |_| async move {
-                let mut ctx = ToolCallContext::default();
-                ctx.background_task = Some(own_id.clone());
-                tool.execute(
-                    TaskKillToolParams {
-                        id: own_id.to_string(),
-                    },
-                    ctx,
-                )
-                .await
-                .unwrap();
-                coda_process::TaskExit::Killed
-            })
-            .await
-            .unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            background.wait_terminal(&id),
-        )
-        .await
-        .expect("self stop must not wait on its own monitor");
-        assert!(matches!(
-            background.read(&id).await.unwrap().unwrap().status,
-            coda_process::TaskStatus::Killed { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn task_output_reads_incrementally_and_reports_expiry() {
-        let background = Arc::new(BackgroundTasks::temporary().unwrap());
-        let id = background
-            .spawn(bash("echo first; sleep 39.01"), meta("stream"))
-            .await
-            .unwrap();
-        let tool = TaskOutputTool::new(background.clone());
-
-        // First read eventually sees "first"; the next read must not repeat it.
-        let out = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let out = tool
-                    .execute(
-                        TaskOutputToolParams { id: id.to_string() },
-                        ToolCallContext::default(),
-                    )
-                    .await
-                    .unwrap();
-                if out.contains("first") {
-                    break out;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("output never arrived");
-        assert!(out.contains("status: running"), "unexpected: {out}");
-
-        let again = tool
-            .execute(
-                TaskOutputToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            again.contains("(no new output)"),
-            "second read repeated output: {again}"
-        );
-
-        let missing = tool
-            .execute(
-                TaskOutputToolParams {
-                    id: "bg_00000000000000000000000000000000".into(),
-                },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            missing.contains("Unknown or expired task id"),
-            "unexpected: {missing}"
-        );
-        background.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn task_kill_terminates_and_is_idempotent() {
-        let background = Arc::new(BackgroundTasks::temporary().unwrap());
-        let id = background
-            .spawn(bash("sleep 39.21"), meta("victim"))
-            .await
-            .unwrap();
-        let tool = TaskKillTool::new(background.clone());
-
-        let out = tool
-            .execute(
-                TaskKillToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(out.contains("killed"), "unexpected: {out}");
-
-        // Idempotent: reports the settled status instead of failing.
-        let again = tool
-            .execute(
-                TaskKillToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(again.contains("killed"), "unexpected: {again}");
-
-        let missing = tool
-            .execute(
-                TaskKillToolParams {
-                    id: "bg_00000000000000000000000000000000".into(),
-                },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            missing.contains("Unknown or expired task id"),
-            "unexpected: {missing}"
-        );
-        background.shutdown().await;
-    }
-}
+#[path = "task_tests.rs"]
+mod tests;

@@ -142,6 +142,7 @@ pub struct ToolCallContext {
     pub state: Arc<dyn ThreadState>,
     /// Destination for presentation artifacts produced by this call.
     artifacts: Arc<dyn ArtifactSink>,
+    observed_task: Arc<std::sync::Mutex<Option<crate::task::TaskId>>>,
     /// Optional capability installed only for a programmatic runner call.
     invoker: Option<Arc<dyn HostToolInvoker>>,
 }
@@ -154,8 +155,19 @@ impl ToolCallContext {
             origin: crate::task::TaskOrigin::default(),
             state,
             artifacts: Arc::new(UnboundedArtifactSink::default()),
+            observed_task: Arc::default(),
             invoker: None,
         }
+    }
+
+    /// Record the complete terminal result returned by this task_output call.
+    /// Delivery is acknowledged only when the runtime persists its tool result.
+    pub fn record_task_result(&self, task_id: crate::task::TaskId) {
+        *self.observed_task.lock().expect("task result") = Some(task_id);
+    }
+
+    pub fn take_task_result(&self) -> Option<crate::task::TaskId> {
+        self.observed_task.lock().expect("task result").take()
     }
 
     /// Install the narrowly scoped host-call capability for a runner tool.
@@ -289,6 +301,7 @@ impl HostCallScope {
             origin: self.0.outer.origin.clone(),
             state: state.clone(),
             artifacts: artifacts.clone(),
+            observed_task: Arc::default(),
             invoker: None,
         };
         StagedToolCall {

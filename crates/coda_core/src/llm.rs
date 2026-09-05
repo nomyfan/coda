@@ -484,6 +484,9 @@ pub struct ToolMessage {
     pub outcome: ToolCallOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ToolArtifact>,
+    /// Complete terminal task result received through this successful call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_task: Option<crate::task::TaskId>,
     /// When the tool call began executing, when known. Calls that resolve
     /// instantly (rejections, dispatch errors) leave this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,6 +514,7 @@ impl ToolMessage {
             output,
             outcome,
             artifacts: Vec::new(),
+            observed_task: None,
             started_at,
             ended_at: jiff::Timestamp::now(),
         }

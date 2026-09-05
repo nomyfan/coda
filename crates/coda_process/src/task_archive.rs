@@ -48,6 +48,8 @@ pub struct TaskPersistentState {
     pub status: TaskStatus,
     pub stdout_cursor: u64,
     pub stderr_cursor: u64,
+    /// Any read skipped overwritten bytes; persists across pages and reopen.
+    pub output_lost: bool,
     pub stdout_carry: Vec<u8>,
     pub stderr_carry: Vec<u8>,
     pub disposition: OutputDisposition,
@@ -170,6 +172,7 @@ impl TaskRecord {
         let (so_start, so_total) = self.files.stdout.logical_range().await;
         let (se_start, se_total) = self.files.stderr.logical_range().await;
         TaskOutputManifest {
+            output_lost: state.output_lost,
             result_bytes: state.result_bytes,
             notice: state.notice.clone(),
             cleanup_pending: state.cleanup_pending,
@@ -585,6 +588,7 @@ impl TaskArchive {
             status: TaskStatus::Running,
             stdout_cursor: 0,
             stderr_cursor: 0,
+            output_lost: false,
             stdout_carry: Vec::new(),
             stderr_carry: Vec::new(),
             disposition: OutputDisposition::Retained,
@@ -742,6 +746,7 @@ impl TaskArchive {
             status: manifest.status.clone(),
             stdout_cursor: manifest.stdout.read_cursor,
             stderr_cursor: manifest.stderr.read_cursor,
+            output_lost: manifest.output_lost,
             stdout_carry: manifest.stdout.utf8_carry.clone(),
             stderr_carry: manifest.stderr.utf8_carry.clone(),
             disposition: manifest.output.clone(),

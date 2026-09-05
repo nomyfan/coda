@@ -1195,6 +1195,22 @@ impl PgSessionStorage {
                 ))
                 .execute(conn)
                 .await?;
+            if thread_id == self.session_id
+                && let Message::Tool(tool) = &entry.message
+                && let Some(task_id) = &tool.observed_task
+            {
+                // The result and its delivery receipt commit or roll back together.
+                diesel::insert_into(task_notice_receipts::table)
+                    .values((
+                        task_notice_receipts::workspace_id.eq(&self.workspace_id),
+                        task_notice_receipts::session_id.eq(&self.session_id),
+                        task_notice_receipts::task_id.eq(task_id.as_str()),
+                        task_notice_receipts::message_id.eq(tool.message_id.as_uuid()),
+                    ))
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .await?;
+            }
         }
 
         let state = (

@@ -635,6 +635,19 @@ impl Session {
             .await
     }
 
+    /// Whether this task's completion has reached root through a durable
+    /// notice or a complete task_output result.
+    pub async fn has_task_notice_receipt(
+        &self,
+        task_id: coda_core::task::TaskId,
+    ) -> Result<bool, String> {
+        self.inner
+            .runtime
+            .session_storage
+            .has_notice_receipt(task_id)
+            .await
+    }
+
     pub async fn send_background_notice(
         &self,
         task_id: coda_core::task::TaskId,

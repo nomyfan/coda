@@ -53,6 +53,47 @@ impl LLMProvider for TestProvider {
         }
         match system.as_str() {
             "reply" => Self::completed(assistant("done")),
+            "read-task-results" | "read-running-task-result" => {
+                let read_count = request
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, RequestMessage::Tool(_)))
+                    .count();
+                let expected_reads = if system == "read-running-task-result" {
+                    2
+                } else {
+                    1
+                };
+                if read_count >= expected_reads {
+                    Self::completed(assistant("read both terminal results"))
+                } else {
+                    let ids: Vec<String> = request
+                        .messages
+                        .iter()
+                        .find_map(|m| match m {
+                            RequestMessage::User(user) => {
+                                Some(serde_json::from_str(user.first_text().unwrap()).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let gate = self.gate.clone();
+                    Box::pin(stream::once(async move {
+                        gate.notified().await;
+                        let mut answer = assistant("");
+                        answer.tool_calls = ids
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, id)| ToolCall {
+                                id: format!("read_{read_count}_{i}"),
+                                name: "task_output".into(),
+                                arguments: Some(serde_json::json!({"id":id}).to_string()),
+                            })
+                            .collect();
+                        Ok(LLMStreamEvent::Completed(Box::new(answer)))
+                    }))
+                }
+            }
             "hold" => {
                 let gate = self.gate.clone();
                 Box::pin(
@@ -233,6 +274,13 @@ impl SlowStorage {
 }
 
 impl SessionStorage for SlowStorage {
+    fn has_notice_receipt(
+        &self,
+        task_id: coda_core::task::TaskId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        self.inner.has_notice_receipt(task_id)
+    }
+
     fn save_checkpoint(
         &self,
         thread_id: String,

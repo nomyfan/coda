@@ -222,7 +222,15 @@ Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提�
 
 投递顺序：取得 root 空闲槽且确认无待审批 → storage 将 notice 开场 checkpoint、可恢复前台执行和收据同事务提交 → 驱动同一 root 开场 → hub 尝试 ack 归档标记。明确未提交时释放槽、保留记录；事务结果尚不能确认时保留开场和槽，重试查询收据后继续。ack 失败重试但不阻止已提交处理。已有收据只补 ack，不再次追加 notice 或新建 turn；若事务成功但返回结果丢失，接管已持久化的同一前台执行。
 
-这里“一次”指一项完成事实只追加一条 notice，不承诺崩溃恢复期间的 LLM 请求或外部工具副作用恰好执行一次。Root 接收方随 session 存活。
+这里“一次”指一项完成事实最多追加一条 notice；root 已主动完整读取时无需追加。不承诺崩溃恢复期间的 LLM 请求或外部工具副作用恰好执行一次。Root 接收方随 session 存活。
+
+主动读取也可以完成交付：`task_output` 完整读到终态结果时，将类型化 task ID 随工具结果记录。只有实际 root thread 的成功、非中止结果才在 checkpoint 事务内写入同一 `task_notice_receipts` 表，`message_id` 指向该 ToolMessage。收据既可对应 notice，也可对应完整读取；rewind 不删除，fork 不复制。shell 待投递队列按收据过滤，subagent 仍走已有收据检查和归档 ack，已经确认的完成事实不再启动额外 turn。
+
+读取侧不直接撤销通知：Running、尚有未读分页、输出缺失/过期、I/O 失败和非 root 读取均不确认交付。面板读取不产生工具结果收据。checkpoint 失败或事务返回不确定时，以数据库内的收据为准；不能解析输出文本猜测任务身份或终态。
+
+shell 归档以 `output_lost` 保存读取过程中是否曾跳过被覆盖的 stdout/stderr 字节，与游标在同一次 manifest 提交中持久化；后续分页、进入终态或重新打开归档都不能清除该标记。`complete` 必须同时满足终态、无剩余分页和从未丢失输出。manifest 格式升为 v3，旧格式按既有版本校验拒绝打开。
+
+`Consumed` 表示输出已读完，可能在 Running 期间读完、退出时自动回收。此时 root 再读取终态也应确认交付，只要 `output_lost` 为 false；重复终态读取共用同一 task 收据。`Expired` 表示未读输出已过期，不能确认交付。
 
 ### 5. 任意 checkpoint 失败均结束所属后台 scope
 
@@ -306,3 +314,20 @@ Runtime、注册表、持久化、Hub 和 Web 已接通。下列阶段的完成�
 - 连续 16 轮、32 次 stateless 同步调用后仅保留 root driver 与执行记录，完成的 JoinSet 项也及时回收；原 stateful 连续调用历史测试验证 driver 重建不会丢失会话。
 
 本轮修复后重新通过 `cargo clippy --all-targets`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`，以及前端 lint、typecheck 和 135 项测试。真实进程崩溃与数据库联动、浏览器 E2E 本轮未验证。
+
+### 主动读取后的通知去重
+
+- 只读核查 `cowork/d0b000fc-192f-4997-a30f-491a56c96900`：user message `9830d361-769c-4748-b0ae-4d1824c0931c` 后，两次 shell 终态读取分别在 seq 24、32，root 总结在 seq 33；seq 34 又合并同两项完成事实，导致 seq 35 重复答复。
+- [x] 完整终态读取通过工具上下文携带 task 身份，根线程成功结果与收据同事务保存。
+- [x] Hub 在 shell 批次投递前剔除已有收据的任务，保留未读项；subagent 复用已存在的收据和 ack 路径。
+- [x] 验证完整/部分读取、root/非 root、混合通知、checkpoint 回滚、重开及 rewind/fork；业务库只读，数据库测试使用单独临时库。
+
+本轮通过 `cargo clippy --all-targets`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`，以及独立临时 PostgreSQL 库中的全部 46 项存储测试。Hub 后台专项 13 项和 task 工具专项 4 项通过，覆盖正常结束、被 kill、已读与未读混合、subagent 归档确认等路径。
+
+- [x] 审阅补充：跨页累积输出丢失标记，stdout/stderr 任一丢失后，后续分页、归档重开和 Running → 终态都不确认完整交付。回归测试先复现最后一页误判，再验证修复及 task_output 不记录收据。
+
+该补充通过 `cargo clippy --all-targets`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`、task 工具专项 5 项及 `git diff --check`；未重跑真实 PostgreSQL 测试。
+
+- [x] 实测补充：`cowork/4a44f5a1-a9c3-4efc-9541-d0d97be9af0f` 在 seq 20 已确认自然退出，但输出在 Running 期间已读完、退出时变为 Consumed，因此漏记收据并在 seq 30 重复通知。Consumed 且无累计丢失的终态读取现可记录收据。新增 Hub 测试先复现，再确认运行中读取、退出回收、终态读取、收据保存及通知过滤完整路径通过。
+
+该补充通过 Hub 后台专项 14 项、task 工具专项 5 项、`cargo clippy --all-targets`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets` 和格式检查；业务库只读，未重跑真实 PostgreSQL 测试，未再次变更归档格式。

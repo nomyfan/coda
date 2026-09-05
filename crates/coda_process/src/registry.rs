@@ -338,6 +338,8 @@ impl TaskNotice {
 /// this read could observe them.
 #[derive(Debug)]
 pub struct TaskRead {
+    /// Drained a terminal task with no output lost in this or any prior read.
+    pub complete: bool,
     pub status: TaskStatus,
     pub stdout: String,
     pub stderr: String,
@@ -977,6 +979,7 @@ impl BackgroundTasks {
                 state.status.describe()
             };
             return Ok(Some(TaskRead {
+                complete: !state.status.is_running() && !expired,
                 status: state.status.clone(),
                 stdout,
                 stderr: String::new(),
@@ -999,6 +1002,10 @@ impl BackgroundTasks {
                 _ => "output fully consumed; nothing more to read".to_owned(),
             };
             return Ok(Some(TaskRead {
+                // Output may have been drained while Running and reclaimed
+                // at exit, before root could read the terminal status.
+                complete: matches!(state.disposition, OutputDisposition::Consumed { .. })
+                    && !state.output_lost,
                 status,
                 stdout: String::new(),
                 stderr: String::new(),
@@ -1034,12 +1041,14 @@ impl BackgroundTasks {
             terminal && !err.has_more,
         );
 
-        // Persist the advanced cursors + carry before returning any bytes.
+        // Persist cursors, carry and cumulative loss before returning any bytes.
         let mut candidate = state;
         candidate.stdout_cursor = out.next_cursor;
         candidate.stderr_cursor = err.next_cursor;
+        candidate.output_lost |= out.lost > 0 || err.lost > 0;
         candidate.stdout_carry = out_carry;
         candidate.stderr_carry = err_carry;
+        let complete = terminal && !out.has_more && !err.has_more && !candidate.output_lost;
         guard
             .commit(candidate)
             .await
@@ -1052,6 +1061,7 @@ impl BackgroundTasks {
         }
 
         Ok(Some(TaskRead {
+            complete,
             status,
             stdout,
             stderr,

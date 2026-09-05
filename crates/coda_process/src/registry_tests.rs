@@ -595,10 +595,59 @@ async fn read_reports_lost_bytes_after_truncation() {
         "the whole retained window is drained"
     );
     // Cursor is at total_written now: nothing further, nothing repeated.
+    reg.kill(&id).await.unwrap();
     let read = reg.read(&id).await.unwrap().unwrap();
     assert_eq!(read.stdout.len(), 0);
     assert_eq!(read.stdout_lost, 0);
+    assert!(!read.complete, "loss while running still counts after exit");
     reg.shutdown().await;
+}
+
+#[tokio::test]
+async fn paginated_loss_prevents_complete_reads_even_after_reopen() {
+    for stderr in [false, true] {
+        for reopen in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
+            let mut reg = BackgroundTasks::session_backed(root.clone()).await.unwrap();
+            let id = reg
+                .spawn_with(meta("paginated loss"), move |ctx| async move {
+                    let bytes = vec![b'x'; TAIL_BUF_CAP + 7];
+                    if stderr {
+                        ctx.append_stderr(&bytes).await.unwrap();
+                    } else {
+                        ctx.append_stdout(&bytes).await.unwrap();
+                    }
+                    TaskExit::Exited { code: Some(0) }
+                })
+                .await
+                .unwrap();
+            reg.wait_terminal(&id).await;
+
+            let first = reg.read(&id).await.unwrap().unwrap();
+            assert_eq!(first.stdout_lost + first.stderr_lost, 7);
+            assert!(!first.complete);
+            let mut drained = first.stdout.len() + first.stderr.len();
+            if reopen {
+                reg.shutdown().await;
+                drop(reg);
+                reg = BackgroundTasks::session_backed(root).await.unwrap();
+            }
+            while drained < TAIL_BUF_CAP {
+                let page = reg.read(&id).await.unwrap().unwrap();
+                assert_eq!(page.stdout_lost + page.stderr_lost, 0);
+                let bytes = page.stdout.len() + page.stderr.len();
+                assert!(bytes > 0);
+                drained += bytes;
+                assert!(
+                    !page.complete,
+                    "earlier loss must survive pagination: stderr={stderr}, reopen={reopen}, drained={drained}"
+                );
+            }
+            assert_eq!(drained, TAIL_BUF_CAP);
+            reg.shutdown().await;
+        }
+    }
 }
 
 /// Reopened summaries and newly interrupted crash leftovers occupy the same

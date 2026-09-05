@@ -11,7 +11,7 @@ use coda_core::task::TaskId;
 
 /// Current on-disk manifest format. A future breaking change bumps this;
 /// an unknown version is treated as corrupt.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Full manifest persisted as `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,7 @@ pub struct TaskOutputManifest {
     pub status: TaskStatus,
     pub stdout: StreamManifest,
     pub stderr: StreamManifest,
+    pub output_lost: bool,
     pub output: OutputDisposition,
 }
 
@@ -235,6 +236,7 @@ mod tests {
             status: TaskStatus::Running,
             stdout: StreamManifest::empty(MIN_CAPACITY),
             stderr: StreamManifest::empty(MIN_CAPACITY),
+            output_lost: false,
             output: OutputDisposition::Retained,
         };
         let json = serde_json::to_string(&m).unwrap();

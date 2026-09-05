@@ -237,6 +237,20 @@ pub struct MemoryStorage {
 }
 
 impl MemoryStorage {
+    async fn record_task_reads(&self, checkpoint: &StoredCheckpoint, stored_count: usize) {
+        if checkpoint.parent_thread_id.is_some() {
+            return;
+        }
+        let mut receipts = self.notice_receipts.lock().await;
+        for entry in checkpoint.messages.iter().skip(stored_count) {
+            if let coda_core::llm::Message::Tool(tool) = &entry.message
+                && let Some(task) = &tool.observed_task
+            {
+                receipts.insert(task.clone());
+            }
+        }
+    }
+
     /// Every checkpoint written so far, sorted by thread id. For assertions
     /// about a session as a whole (its thread tree), where the caller cannot
     /// name the threads up front because their ids are derived.
@@ -330,6 +344,10 @@ impl SessionStorage for MemoryStorage {
             {
                 return Err("execution was aborted".into());
             }
+            let stored_count = checkpoints
+                .get(&identity.thread_id)
+                .map_or(0, |cp| cp.messages.len());
+            self.record_task_reads(&checkpoint, stored_count).await;
             checkpoints.insert(identity.thread_id, checkpoint);
             Ok(())
         })
@@ -369,7 +387,12 @@ impl SessionStorage for MemoryStorage {
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            self.checkpoints.lock().await.insert(thread_id, checkpoint);
+            let mut checkpoints = self.checkpoints.lock().await;
+            let stored_count = checkpoints
+                .get(&thread_id)
+                .map_or(0, |cp| cp.messages.len());
+            self.record_task_reads(&checkpoint, stored_count).await;
+            checkpoints.insert(thread_id, checkpoint);
             Ok(())
         })
     }
