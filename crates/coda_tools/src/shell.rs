@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
-use coda_process::{BackgroundProcesses, TaskMeta};
+use coda_process::{BackgroundTasks, TaskMeta};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -36,15 +36,11 @@ pub struct ShellTool {
     timeout: Duration,
     /// `None` when the session has no registry: `run_in_background` is then
     /// absent from the schema, and ignored if the model invents it anyway.
-    background: Option<Arc<BackgroundProcesses>>,
+    background: Option<Arc<BackgroundTasks>>,
 }
 
 impl ShellTool {
-    pub fn new(
-        cwd: String,
-        agent_name: String,
-        background: Option<Arc<BackgroundProcesses>>,
-    ) -> Self {
+    pub fn new(cwd: String, agent_name: String, background: Option<Arc<BackgroundTasks>>) -> Self {
         // Backgrounding is how a command escapes the timeout, so the two are
         // described together — but only to an agent that can actually follow
         // a task up.
@@ -126,19 +122,18 @@ impl Tool for ShellTool {
                         "Command was aborted by the user before it started.".into(),
                     ));
                 }
-                let id = background
-                    .spawn(
-                        cmd,
-                        TaskMeta {
-                            command: params.command.clone(),
-                            description: params.description.clone(),
-                            agent_name,
-                        },
-                    )
-                    .await
-                    .map_err(|e| {
-                        ToolError::ExecutionError(format!("Failed to start background task: {e}"))
-                    })?;
+                let mut meta = TaskMeta::shell(
+                    params.command.clone(),
+                    params.description.clone(),
+                    agent_name,
+                );
+                meta.parent_task_id = ctx.background_task.clone();
+                if !ctx.origin.agent_path.is_empty() {
+                    meta.origin = ctx.origin.clone();
+                }
+                let id = background.spawn(cmd, meta).await.map_err(|e| {
+                    ToolError::ExecutionError(format!("Failed to start background task: {e}"))
+                })?;
                 return Ok(format!(
                     "Started background task {id}. Use task_output to read its \
                      output and task_kill to terminate it. You will be notified \

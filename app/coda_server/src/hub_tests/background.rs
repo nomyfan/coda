@@ -659,3 +659,188 @@ async fn notices_that_pile_up_during_a_turn_arrive_as_one() {
     wait_idle(&hub).await;
     hub.shutdown_all().await;
 }
+
+async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
+    timeout(Duration::from_secs(5), async {
+        let (hub, gate) = hub_with("read-task-results", ToolApprovalMode::Auto);
+        let _attachment = hub
+            .attach(
+                key(),
+                1,
+                "prov".into(),
+                None,
+                PermissionMode::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let background = background_of(&hub).await;
+        let meta = |name: &str| {
+            let mut meta = task_meta(name);
+            if subagents {
+                meta.kind = coda_process::TaskKind::Subagent {
+                    agent_name: name.into(),
+                };
+            }
+            meta
+        };
+        let finish = Arc::new(Notify::new());
+        let release = finish.clone();
+        let normal = background
+            .spawn_with(meta("normal"), move |ctx| async move {
+                release.notified().await;
+                ctx.append_stdout(b"complete output").await.unwrap();
+                if subagents {
+                    coda_process::TaskExit::Completed {
+                        answer: "complete subagent answer".into(),
+                    }
+                } else {
+                    coda_process::TaskExit::Exited { code: Some(0) }
+                }
+            })
+            .await
+            .unwrap();
+        let killed = background
+            .spawn_with(meta("killed"), |ctx| async move {
+                ctx.cancelled().cancelled().await;
+                ctx.append_stdout(b"partial output before kill")
+                    .await
+                    .unwrap();
+                coda_process::TaskExit::Killed
+            })
+            .await
+            .unwrap();
+        hub.command(
+            key(),
+            1,
+            SessionCommand::Task {
+                task: serde_json::to_string(&vec![normal.to_string(), killed.to_string()]).unwrap(),
+                images: vec![],
+            },
+        )
+        .await;
+        finish.notify_one();
+        background.wait_terminal(&normal).await;
+        background.kill(&killed).await.unwrap();
+        let unread = if include_unread {
+            let id = background
+                .spawn_with(task_meta("unread"), |_| async {
+                    coda_process::TaskExit::Exited { code: Some(0) }
+                })
+                .await
+                .unwrap();
+            background.wait_terminal(&id).await;
+            Some(id)
+        } else {
+            None
+        };
+        gate.notify_one();
+        wait_idle(&hub).await;
+        if subagents {
+            while !background.take_notices().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let notice = notice_message_in_view(&hub).await;
+        if let Some(unread) = unread {
+            let notice = notice.expect("the unread completion must still trigger a turn");
+            assert_eq!(notice.outcomes.len(), 1);
+            assert!(notice.content.contains(unread.as_str()));
+            assert!(!notice.content.contains(normal.as_str()));
+            assert!(!notice.content.contains(killed.as_str()));
+        } else {
+            assert!(
+                notice.is_none(),
+                "reading both results must not trigger a redundant turn"
+            );
+        }
+        let entry = hub.get_entry(&key()).unwrap();
+        let guard = entry.inner.lock().await;
+        let EntryPhase::Live(live) = &guard.phase else {
+            panic!("live session")
+        };
+        assert!(live.session.has_task_notice_receipt(normal).await.unwrap());
+        assert!(live.session.has_task_notice_receipt(killed).await.unwrap());
+        drop(guard);
+        hub.shutdown_all().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_terminal_status_after_draining_running_output_suppresses_notice() {
+    let (hub, gate) = hub_with("read-running-task-result", ToolApprovalMode::Auto);
+    let mut attachment = hub
+        .attach(
+            key(),
+            1,
+            "prov".into(),
+            None,
+            PermissionMode::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let background = background_of(&hub).await;
+    let ready = Arc::new(Notify::new());
+    let written = ready.clone();
+    let finish = Arc::new(Notify::new());
+    let release = finish.clone();
+    let id = background
+        .spawn_with(task_meta("read before exit"), move |ctx| async move {
+            ctx.append_stdout(b"all output before exit").await.unwrap();
+            written.notify_one();
+            release.notified().await;
+            coda_process::TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
+    ready.notified().await;
+    hub.command(
+        key(),
+        1,
+        SessionCommand::Task {
+            task: serde_json::to_string(&vec![id.to_string()]).unwrap(),
+            images: vec![],
+        },
+    )
+    .await;
+    gate.notify_one();
+    next_matching(&mut attachment.events, |event| {
+        matches!(
+            event,
+            RelayEvent::Event(e) if matches!(&**e, WireEvent::ToolCallEnd { message, .. }
+                if message.name == "task_output")
+        )
+    })
+    .await;
+    finish.notify_one();
+    background.wait_terminal(&id).await;
+    gate.notify_one();
+    wait_idle(&hub).await;
+    assert!(notice_message_in_view(&hub).await.is_none());
+    let entry = hub.get_entry(&key()).unwrap();
+    let guard = entry.inner.lock().await;
+    let EntryPhase::Live(live) = &guard.phase else {
+        panic!("live session")
+    };
+    assert!(live.session.has_task_notice_receipt(id).await.unwrap());
+    drop(guard);
+    hub.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_completed_and_killed_shell_results_suppresses_the_extra_notice_turn() {
+    root_reads_terminal_results(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notice_batch_keeps_only_the_task_root_has_not_read() {
+    root_reads_terminal_results(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_terminal_subagent_results_acknowledges_the_archive_without_an_extra_turn() {
+    root_reads_terminal_results(false, true).await;
+}

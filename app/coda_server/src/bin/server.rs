@@ -12,7 +12,7 @@ use coda_agent::{
 };
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_openai::OpenAICompatible;
-use coda_process::{ArchiveDir, BackgroundProcesses, BackgroundRootLock};
+use coda_process::{ArchiveDir, BackgroundRootLock, BackgroundTasks};
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
 };
@@ -370,6 +370,20 @@ impl AppOpener {
 }
 
 impl SessionOpener for AppOpener {
+    fn persist_allow_patterns<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        patterns: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self.workspaces.get(&key.0).ok_or("unknown workspace")?;
+            for pattern in patterns {
+                add_allow_pattern(workspace.approval_config.clone(), pattern).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn open<'a>(
         &'a self,
         key: &'a SessionKey,
@@ -377,7 +391,7 @@ impl SessionOpener for AppOpener {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Option<Arc<BackgroundProcesses>>,
+        background: Option<Arc<BackgroundTasks>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             let workspace = self
@@ -649,7 +663,7 @@ async fn open_session(
     reasoning_effort: Option<String>,
     permission_mode: PermissionModeCell,
     decisions: HashMap<String, ResumeDecision>,
-    background: Option<Arc<BackgroundProcesses>>,
+    background: Option<Arc<BackgroundTasks>>,
 ) -> Result<Session, OpenError> {
     let provider = providers
         .get(provider_id)
@@ -938,32 +952,6 @@ fn build_providers(
     }
 
     (providers, catalog)
-}
-
-async fn send_pending_approval_events<T: Transport>(
-    transport: &T,
-    workspace_id: &str,
-    session_id: &str,
-    approvals: &[coda_agent::PendingApproval],
-) -> bool {
-    for approval in approvals {
-        let event = WireEvent::Suspended {
-            agent_name: approval.agent_name.clone(),
-            thread_id: approval.thread_id.clone(),
-            approval: PendingApprovalWire::from_agent(approval.clone()),
-        };
-        if !send_event(
-            transport,
-            workspace_id.to_string(),
-            session_id.to_string(),
-            event,
-        )
-        .await
-        {
-            return false;
-        }
-    }
-    true
 }
 
 struct Selection {
@@ -1652,6 +1640,60 @@ async fn dispatch_request(
                     .into(),
             }
         }
+        "resume" => {
+            let params: ResumeParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(error) => return (id, error).into(),
+            };
+            let result = app
+                .relay
+                .command(
+                    (params.workspace_id, params.session_id),
+                    conn_id,
+                    SessionCommand::Resume {
+                        agent_name: params.agent_name,
+                        thread_id: params.thread_id,
+                        decision: params.decision,
+                        allow_patterns: params.allow_patterns,
+                    },
+                )
+                .await;
+            match result {
+                CommandOutcome::Ok | CommandOutcome::StillPending(_) => {
+                    (id, &serde_json::json!({"accepted":true})).into()
+                }
+                CommandOutcome::Ignored => (id, &serde_json::json!({"accepted":false})).into(),
+                _ => (
+                    id,
+                    RpcError::new(rpc::OPEN_FAILED, "could not resume session"),
+                )
+                    .into(),
+            }
+        }
+        "get_task_result" => {
+            let params: KillTaskParams = match parse_params(params) {
+                Ok(params) => params,
+                Err(error) => return (id, error).into(),
+            };
+            match app
+                .relay
+                .command(
+                    (params.workspace_id, params.session_id),
+                    conn_id,
+                    SessionCommand::GetTaskResult {
+                        task_id: params.task_id,
+                    },
+                )
+                .await
+            {
+                CommandOutcome::TaskResult(result) => (id, &result).into(),
+                _ => (
+                    id,
+                    RpcError::new(rpc::SESSION_NOT_LIVE, "session is not attached"),
+                )
+                    .into(),
+            }
+        }
         "task" => {
             let params: TaskParams = match parse_params(params) {
                 Ok(params) => params,
@@ -1727,7 +1769,7 @@ async fn dispatch_request(
 /// bad params is logged and dropped. Returns `false` when a mid-handler push
 /// found the transport gone.
 async fn dispatch_notification<T: Transport>(
-    transport: &T,
+    _transport: &T,
     app: &Arc<AppState>,
     conn_id: ConnId,
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
@@ -1736,13 +1778,6 @@ async fn dispatch_notification<T: Transport>(
     params: Value,
 ) -> bool {
     match method {
-        "resume" => match parse_params::<ResumeParams>(params) {
-            Ok(params) => handle_resume(transport, app, conn_id, params).await,
-            Err(err) => {
-                warn!("ignoring malformed resume notification: {}", err.message);
-                true
-            }
-        },
         "abort" => match parse_params::<SessionRef>(params) {
             Ok(params) => {
                 app.relay
@@ -2035,38 +2070,6 @@ async fn handle_rewind(
 
 /// Answer a suspended tool call. Any follow-up (more pending approvals, an open
 /// failure) streams back as `event` notifications; there is no request id here.
-async fn handle_resume<T: Transport>(
-    transport: &T,
-    app: &Arc<AppState>,
-    conn_id: ConnId,
-    params: ResumeParams,
-) -> bool {
-    let key = (params.workspace_id.clone(), params.session_id.clone());
-    match app
-        .relay
-        .command(
-            key,
-            conn_id,
-            SessionCommand::Resume {
-                agent_name: params.agent_name,
-                thread_id: params.thread_id,
-                decision: params.decision,
-            },
-        )
-        .await
-    {
-        CommandOutcome::StillPending(more) => {
-            send_pending_approval_events(transport, &params.workspace_id, &params.session_id, &more)
-                .await
-        }
-        CommandOutcome::OpenFailed(err) => {
-            send_open_error(transport, &params.workspace_id, &params.session_id, err).await;
-            true
-        }
-        _ => true,
-    }
-}
-
 /// Connection ids distinguish clients inside the hub (latest-wins eviction and
 /// stale-command rejection). Monotonic per process.
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);

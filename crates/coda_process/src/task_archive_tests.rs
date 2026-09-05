@@ -63,11 +63,7 @@ impl TaskArchive {
 }
 
 fn meta() -> TaskMeta {
-    TaskMeta {
-        command: "echo hi".into(),
-        description: "d".into(),
-        agent_name: "coda".into(),
-    }
+    TaskMeta::shell("echo hi".into(), "d".into(), "coda".into())
 }
 
 fn root() -> (tempfile::TempDir, TaskArchive) {
@@ -115,11 +111,11 @@ async fn initial_manifest_failure_removes_partial_task() {
 async fn oversized_initial_manifest_is_rejected_and_rolled_back() {
     let (_tmp, archive) = root();
     let id = TaskId::new();
-    let oversized = TaskMeta {
-        command: "x".repeat(MAX_MANIFEST_BYTES as usize),
-        description: "d".into(),
-        agent_name: "coda".into(),
-    };
+    let oversized = TaskMeta::shell(
+        "x".repeat(MAX_MANIFEST_BYTES as usize),
+        "d".into(),
+        "coda".into(),
+    );
 
     let error = match archive.create_unreserved(&id, &oversized).await {
         Ok(_) => panic!("writer accepted a manifest its reader rejects"),

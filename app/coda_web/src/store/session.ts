@@ -83,6 +83,8 @@ export type TranscriptEntry = {
   title?: string;
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
+  /** Task referenced by a single completion notice. */
+  taskId?: string;
   /** Executed shell command, shown alongside shell results. */
   command?: string;
   /** Model-generated source executed by run_javascript. */
@@ -526,6 +528,10 @@ function historyToEntries(
         messageId: notice.message_id,
         kind: "task_notice",
         title: taskNoticeTitle(notice.outcomes),
+        taskId:
+          notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
+            ? notice.outcomes[0].task_id
+            : undefined,
         detail:
           notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
             ? notice.outcomes[0].command
@@ -897,15 +903,18 @@ function finishAssistant(
 
 // Everything a pending approval keeps alive, reset together when the turn it
 // belongs to settles for good.
-const clearedApprovalState: Pick<
-  OpenedSession,
-  "approvals" | "pendingCallInfo" | "drafts" | "allowDrafts"
-> = {
-  approvals: [],
-  pendingCallInfo: {},
-  drafts: {},
-  allowDrafts: {},
-};
+function retainBackgroundApprovals(session: OpenedSession) {
+  const approvals = session.approvals.filter((approval) => approval.task_id);
+  const keys = new Set(approvals.map(approvalKey));
+  return {
+    approvals,
+    pendingCallInfo: {},
+    drafts: Object.fromEntries(Object.entries(session.drafts).filter(([key]) => keys.has(key))),
+    allowDrafts: Object.fromEntries(
+      Object.entries(session.allowDrafts).filter(([key]) => keys.has(key)),
+    ),
+  };
+}
 
 function upsertApproval(approvals: PendingApproval[], approval: PendingApproval) {
   const key = approvalKey(approval);
@@ -1068,6 +1077,25 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         },
       );
     }
+    case "background_error":
+      return addActivity(session, {
+        tone: "danger",
+        label: "background task failed",
+        detail: `${event.task_id}: ${event.message}`,
+      });
+    case "approval_removed": {
+      const key = `${event.thread_id}:${event.parent_message_id}`;
+      const drafts = { ...session.drafts };
+      const allowDrafts = { ...session.allowDrafts };
+      delete drafts[key];
+      delete allowDrafts[key];
+      return {
+        ...session,
+        drafts,
+        allowDrafts,
+        approvals: session.approvals.filter((approval) => approvalKey(approval) !== key),
+      };
+    }
     case "suspended":
       return {
         ...addActivity(session, {
@@ -1076,8 +1104,10 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
           detail: `${event.approval.calls.length} call(s) from ${event.agent_name}`,
         }),
         approvals: upsertApproval(session.approvals, event.approval),
-        pendingCallInfo: withPendingCallInfo(session, event.approval.calls),
-        running: false,
+        pendingCallInfo: event.approval.task_id
+          ? session.pendingCallInfo
+          : withPendingCallInfo(session, event.approval.calls),
+        running: event.approval.task_id ? session.running : false,
       };
     case "aborted": {
       const updated = addActivity(
@@ -1117,7 +1147,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         // `event_settles_turn`), and buries its pending approvals with it: a
         // decision for them has no thread left to wake, and keeping them
         // would hold the composer busy forever.
-        ...(event.agent_name === rootName ? clearedApprovalState : {}),
+        ...(event.agent_name === rootName ? retainBackgroundApprovals(session) : {}),
       };
     }
     case "error": {
@@ -1147,7 +1177,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         ],
         running: false,
         // A root error settles the turn like a root abort does; see above.
-        ...(event.agent_name === rootName ? clearedApprovalState : {}),
+        ...(event.agent_name === rootName ? retainBackgroundApprovals(session) : {}),
       };
     }
     case "persist_failed":
@@ -1633,6 +1663,21 @@ export function applySnapshotToSession(
     backgroundTasks?: TaskSummary[];
   },
 ): OpenedSession {
+  const drafts: OpenedSession["drafts"] = {};
+  const allowDrafts: OpenedSession["allowDrafts"] = {};
+  for (const approval of snapshot.approvals) {
+    const key = approvalKey(approval);
+    for (const call of approval.calls) {
+      const resolution = session.drafts[key]?.[call.id];
+      if (resolution !== undefined) {
+        (drafts[key] ??= {})[call.id] = resolution;
+      }
+      const pattern = session.allowDrafts[key]?.[call.id];
+      if (pattern !== undefined) {
+        (allowDrafts[key] ??= {})[call.id] = pattern;
+      }
+    }
+  }
   const argsById = collectToolArgs(snapshot.messages);
   const spansById = collectGenerationSpans(snapshot.messages);
   const pending = session.entries.filter(isPendingUserEntry);
@@ -1693,8 +1738,8 @@ export function applySnapshotToSession(
       ...pendingCompaction,
       ...pendingCompactionStatus,
     ],
-    drafts: {},
-    allowDrafts: {},
+    drafts,
+    allowDrafts,
     // Same reasoning for the title: on a session whose very first task is the
     // pending one, the optimistic title is the only one there is, and nothing
     // downstream would restore it — the reply only carries an id.
@@ -1972,34 +2017,6 @@ export function applyEvent(
   scheduleFlush();
 }
 
-function addAllowResultActivity(
-  store: CodaStore,
-  server: string,
-  workspaceId: string,
-  pattern: string,
-  error?: string | null,
-) {
-  updateState(store, (state) => {
-    if (state.activeServer !== server || !state.activeKey) {
-      return;
-    }
-    if (splitKey(state.activeKey).workspaceId !== workspaceId) {
-      return;
-    }
-    const session = draftSession(state, server, state.activeKey);
-    if (session) {
-      state.servers[server].sessions[state.activeKey] = addActivity(session, {
-        tone: error ? "danger" : "success",
-        label: error ? "allow pattern failed" : "allow pattern saved",
-        detail: error || pattern,
-      });
-    }
-  });
-}
-
-/** The transcript key for a user message, from the id the server minted for it.
- * Shared by the optimistic path and the replayed-history path so one message
- * keeps one key. */
 function userEntryId(messageId: string) {
   return `user:${messageId}`;
 }
@@ -3392,6 +3409,22 @@ export function abort() {
 /** Stop one of the active session's background tasks. Optimistically nothing:
  * the server pushes the updated list, and killing something that has already
  * settled is a no-op there. */
+export async function getBackgroundTaskResult(taskId: string) {
+  const active = currentActive();
+  if (!active) {
+    throw new Error("No active session");
+  }
+  const rpc = rpcFor(active.server);
+  if (!rpc) {
+    throw new Error("Connection closed");
+  }
+  return rpc.request("get_task_result", {
+    workspace_id: active.session.workspaceId,
+    session_id: active.session.sessionId,
+    task_id: taskId,
+  });
+}
+
 export function killBackgroundTask(taskId: string) {
   const active = currentActive();
   if (active) {
@@ -3641,51 +3674,40 @@ export async function submitApprovals() {
     }
     submittingApprovals.add(inFlight);
     try {
-      // Persist staged "always allow" patterns for approved calls only. This is
-      // best-effort and must never block the resume: gather the writes with
-      // `allSettled` (a rejection only logs a non-fatal activity) (Decision 11).
+      if (!rpc) {
+        continue;
+      }
       const allow = session.allowDrafts[approvalId] ?? {};
-      const allowWrites: Promise<unknown>[] = [];
-      if (rpc) {
-        for (const item of approval.calls) {
-          const pattern = allow[item.id];
-          if (pattern && draft[item.id] === "Execute") {
-            allowWrites.push(
-              rpc
-                .request("add_allow_pattern", { workspace_id: session.workspaceId, pattern })
-                .then(() =>
-                  addAllowResultActivity(codaStore, server, session.workspaceId, pattern, null),
-                )
-                .catch((err) =>
-                  addAllowResultActivity(
-                    codaStore,
-                    server,
-                    session.workspaceId,
-                    pattern,
-                    isServerError(err) ? err.message : "connection closed",
-                  ),
-                ),
-            );
-          }
-        }
+      const allowPatterns: [string, string][] = approval.calls.flatMap((call) =>
+        allow[call.id] && draft[call.id] === "Execute"
+          ? [[call.id, allow[call.id]] as [string, string]]
+          : [],
+      );
+      const result = await rpc.request("resume", {
+        workspace_id: session.workspaceId,
+        session_id: session.sessionId,
+        agent_name: approval.agent_name,
+        thread_id: approval.thread_id,
+        allow_patterns: allowPatterns,
+        decision: {
+          parent_message_id: approval.parent_message_id,
+          resolutions: approval.calls.map((call) => [call.id, draft[call.id]]),
+        },
+      });
+      clearApprovalState(codaStore, server, session.key, approval);
+      if (!result.accepted) {
+        addSessionActivity(server, session.workspaceId, session.sessionId, {
+          tone: "warning",
+          label: "approval expired",
+          detail: "This approval is no longer pending.",
+        });
       }
-      await Promise.allSettled(allowWrites);
-      // Clear the approval + allow drafts only when the resume actually left the
-      // client, so a disconnect leaves them intact for retry (Decision 11).
-      if (
-        notify(server, "resume", {
-          workspace_id: session.workspaceId,
-          session_id: session.sessionId,
-          agent_name: approval.agent_name,
-          thread_id: approval.thread_id,
-          decision: {
-            parent_message_id: approval.parent_message_id,
-            resolutions: approval.calls.map((item) => [item.id, draft[item.id]]),
-          },
-        })
-      ) {
-        clearApprovalState(codaStore, server, session.key, approval);
-      }
+    } catch (error) {
+      addSessionActivity(server, session.workspaceId, session.sessionId, {
+        tone: "danger",
+        label: "approval not submitted",
+        detail: isServerError(error) ? error.message : "Connection closed",
+      });
     } finally {
       submittingApprovals.delete(inFlight);
     }

@@ -438,7 +438,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
 }
 
 #[tokio::test]
-async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
+async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
     let storage = MemoryStorage::default();
     let old_thread = "old-stateless-thread";
     let current_thread = "current-stateless-thread";
@@ -461,7 +461,7 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                 agent_name: "explore".into(),
                 parent_thread_id: Some("session".into()),
                 derivation_key: Some("old-call".into()),
-                reply_target: None,
+                active_execution: None,
                 messages: vec![HistoryEntry::new(
                     old_turn,
                     Message::User(UserMessage::text(old_prompt, "old turn")),
@@ -480,7 +480,7 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
                 agent_name: "explore".into(),
                 parent_thread_id: Some("session".into()),
                 derivation_key: Some("current-call".into()),
-                reply_target: None,
+                active_execution: None,
                 messages: vec![
                     HistoryEntry::new(
                         current_turn,
@@ -510,12 +510,13 @@ async fn a_resume_target_overrides_the_same_agents_stale_snapshot_thread() {
         .expect("save current checkpoint");
 
     let snapshot = AgentRuntimeSnapshot {
-        active_threads: HashMap::from([("explore".into(), old_thread.into())]),
+        active_threads: HashMap::from([(current_thread.into(), "explore".into())]),
         ..Default::default()
     };
     let resume_targets = HashMap::from([(
-        "explore".into(),
+        current_thread.into(),
         ResumeTarget {
+            agent_name: "explore".into(),
             thread_id: ThreadId::from(current_thread.to_string()),
             decision: ResumeDecision {
                 parent_message_id,

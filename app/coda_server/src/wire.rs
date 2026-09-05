@@ -11,6 +11,20 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WireEvent {
+    #[serde(rename = "approval_removed")]
+    ApprovalRemoved {
+        agent_name: String,
+        thread_id: String,
+        parent_message_id: MessageId,
+        task_id: Option<coda_core::task::TaskId>,
+    },
+    #[serde(rename = "background_error")]
+    BackgroundError {
+        agent_name: String,
+        thread_id: String,
+        task_id: coda_core::task::TaskId,
+        message: String,
+    },
     #[serde(rename = "llm_start")]
     LlmStart {
         agent_name: String,
@@ -117,6 +131,22 @@ impl WireEvent {
         let thread_id = event.thread_id.as_ref().to_string();
 
         match event.kind {
+            AgentEvent::ApprovalRemoved {
+                thread_id,
+                parent_message_id,
+                task_id,
+            } => WireEvent::ApprovalRemoved {
+                agent_name,
+                thread_id,
+                parent_message_id,
+                task_id,
+            },
+            AgentEvent::BackgroundError { task_id, message } => WireEvent::BackgroundError {
+                agent_name,
+                thread_id,
+                task_id,
+                message,
+            },
             AgentEvent::LLMStart(request) => WireEvent::LlmStart {
                 agent_name,
                 thread_id,
@@ -240,6 +270,8 @@ pub struct RewindParams {
 /// from the [`PendingApprovalWire`] carried by a `Suspended` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeParams {
+    #[serde(default)]
+    pub allow_patterns: Vec<(String, String)>,
     pub workspace_id: String,
     pub session_id: String,
     pub agent_name: String,
@@ -476,6 +508,11 @@ pub struct Snapshot {
 /// to parse the label.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummaryWire {
+    pub task_status: coda_process::TaskStatus,
+    pub kind: coda_process::TaskKind,
+    pub parent_task_id: Option<coda_core::task::TaskId>,
+    pub subtree_active: bool,
+    pub result_available: bool,
     pub id: String,
     pub command: String,
     pub description: String,
@@ -489,6 +526,11 @@ pub struct TaskSummaryWire {
 impl From<coda_process::TaskSummary> for TaskSummaryWire {
     fn from(summary: coda_process::TaskSummary) -> Self {
         Self {
+            task_status: summary.status.clone(),
+            kind: summary.kind,
+            parent_task_id: summary.parent_task_id,
+            subtree_active: summary.subtree_active,
+            result_available: summary.result_available,
             id: summary.id,
             command: summary.command,
             description: summary.description,
@@ -621,6 +663,8 @@ impl From<crate::hub::SessionStatusEvent> for SessionStatusWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApprovalWire {
+    pub task_id: Option<coda_core::task::TaskId>,
+    pub agent_path: Vec<String>,
     pub thread_id: String,
     pub agent_name: String,
     /// Identifies the batch; the client echoes it back in `resume` so a stale
@@ -641,6 +685,8 @@ impl PendingApprovalWire {
             })
             .collect();
         Self {
+            task_id: approval.task_id,
+            agent_path: approval.agent_path,
             thread_id: approval.thread_id,
             agent_name: approval.agent_name,
             parent_message_id: approval.parent_message_id,
@@ -662,3 +708,13 @@ fn suggested_shell_allow_pattern(call: &ToolCall) -> Option<String> {
 #[cfg(test)]
 #[path = "wire_tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TaskResultWire {
+    Unknown,
+    Pending { status: String },
+    Available { status: String, answer: String },
+    Expired { status: String },
+    Error { message: String },
+}

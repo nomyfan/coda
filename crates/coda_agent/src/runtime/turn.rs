@@ -125,6 +125,22 @@ pub(super) struct CallLedger {
 }
 
 impl CallLedger {
+    pub(super) fn clear(&self, thread: &ThreadId) {
+        self.unanswered
+            .lock()
+            .expect("unanswered calls")
+            .remove(thread);
+    }
+
+    pub(super) fn try_begin(&self, thread_id: &ThreadId) -> bool {
+        let mut unanswered = self.unanswered.lock().expect("unanswered calls");
+        if unanswered.contains_key(thread_id) {
+            return false;
+        }
+        unanswered.insert(thread_id.clone(), 1);
+        true
+    }
+
     /// Note that a call has gone out to `thread_id` and has not been answered.
     pub(super) fn begin(&self, thread_id: &ThreadId) {
         *self

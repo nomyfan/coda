@@ -10,7 +10,7 @@ use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
-use coda_process::{BackgroundProcesses, TaskId};
+use coda_process::{BackgroundTasks, TaskId};
 
 fn unknown_task(id: &str) -> String {
     format!(
@@ -37,11 +37,11 @@ pub struct TaskOutputToolParams {
 
 pub struct TaskOutputTool {
     schema: Schema,
-    background: Arc<BackgroundProcesses>,
+    background: Arc<BackgroundTasks>,
 }
 
 impl TaskOutputTool {
-    pub fn new(background: Arc<BackgroundProcesses>) -> Self {
+    pub fn new(background: Arc<BackgroundTasks>) -> Self {
         TaskOutputTool {
             schema: schemars::schema_for!(TaskOutputToolParams),
             background,
@@ -58,9 +58,8 @@ impl Tool for TaskOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Read a background task's status and the output it produced since \
-         the previous read. Each call returns only new output; call again \
-         later for more."
+        "Read a background task. Shell output is incremental; subagent results \
+         include the complete final answer and can be read repeatedly."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -71,7 +70,7 @@ impl Tool for TaskOutputTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
@@ -84,6 +83,9 @@ impl Tool for TaskOutputTool {
                 Ok(None) => return Ok(unknown_task(&params.id)),
                 Err(e) => return Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
             };
+            if read.complete {
+                ctx.record_task_result(id);
+            }
             let mut out = format!("status: {}", read.status.describe());
             if let Some(note) = &read.note {
                 out.push_str(&format!("\n({note})"));
@@ -128,11 +130,11 @@ pub struct TaskKillToolParams {
 
 pub struct TaskKillTool {
     schema: Schema,
-    background: Arc<BackgroundProcesses>,
+    background: Arc<BackgroundTasks>,
 }
 
 impl TaskKillTool {
-    pub fn new(background: Arc<BackgroundProcesses>) -> Self {
+    pub fn new(background: Arc<BackgroundTasks>) -> Self {
         TaskKillTool {
             schema: schemars::schema_for!(TaskKillToolParams),
             background,
@@ -149,9 +151,8 @@ impl Tool for TaskKillTool {
     }
 
     fn description(&self) -> &str {
-        "Terminate a background task (SIGKILL to its whole process group). \
-         Idempotent: for a task that already finished, reports its final \
-         status."
+        "Stop a background task and the work it owns, including synchronous \
+         subagents and background shell processes. Repeated stops are harmless."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -162,7 +163,7 @@ impl Tool for TaskKillTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
@@ -170,7 +171,12 @@ impl Tool for TaskKillTool {
                 Ok(id) => id,
                 Err(msg) => return Ok(msg),
             };
-            match background.kill(&id).await {
+            let result = if ctx.background_task.as_ref() == Some(&id) {
+                background.request_kill(&id).await
+            } else {
+                background.kill(&id).await
+            };
+            match result {
                 Ok(None) => Ok(unknown_task(&params.id)),
                 Ok(Some(status)) => Ok(format!("Task {}: {}.", params.id, status.describe())),
                 Err(e) => Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
@@ -180,123 +186,5 @@ impl Tool for TaskKillTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use coda_process::TaskMeta;
-    use tokio::process::Command;
-
-    fn bash(command: &str) -> Command {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd
-    }
-
-    fn meta(command: &str) -> TaskMeta {
-        TaskMeta {
-            command: command.into(),
-            description: "test task".into(),
-            agent_name: "coda".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn task_output_reads_incrementally_and_reports_expiry() {
-        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
-        let id = background
-            .spawn(bash("echo first; sleep 39.01"), meta("stream"))
-            .await
-            .unwrap();
-        let tool = TaskOutputTool::new(background.clone());
-
-        // First read eventually sees "first"; the next read must not repeat it.
-        let out = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let out = tool
-                    .execute(
-                        TaskOutputToolParams { id: id.to_string() },
-                        ToolCallContext::default(),
-                    )
-                    .await
-                    .unwrap();
-                if out.contains("first") {
-                    break out;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("output never arrived");
-        assert!(out.contains("status: running"), "unexpected: {out}");
-
-        let again = tool
-            .execute(
-                TaskOutputToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            again.contains("(no new output)"),
-            "second read repeated output: {again}"
-        );
-
-        let missing = tool
-            .execute(
-                TaskOutputToolParams {
-                    id: "bg_00000000000000000000000000000000".into(),
-                },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            missing.contains("Unknown or expired task id"),
-            "unexpected: {missing}"
-        );
-        background.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn task_kill_terminates_and_is_idempotent() {
-        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
-        let id = background
-            .spawn(bash("sleep 39.21"), meta("victim"))
-            .await
-            .unwrap();
-        let tool = TaskKillTool::new(background.clone());
-
-        let out = tool
-            .execute(
-                TaskKillToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(out.contains("killed"), "unexpected: {out}");
-
-        // Idempotent: reports the settled status instead of failing.
-        let again = tool
-            .execute(
-                TaskKillToolParams { id: id.to_string() },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(again.contains("killed"), "unexpected: {again}");
-
-        let missing = tool
-            .execute(
-                TaskKillToolParams {
-                    id: "bg_00000000000000000000000000000000".into(),
-                },
-                ToolCallContext::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            missing.contains("Unknown or expired task id"),
-            "unexpected: {missing}"
-        );
-        background.shutdown().await;
-    }
-}
+#[path = "task_tests.rs"]
+mod tests;

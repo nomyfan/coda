@@ -5,7 +5,6 @@ import {
   GitBranch,
   LoaderCircle,
   MoreHorizontal,
-  PanelLeft,
   Pencil,
   Plug,
   Plus,
@@ -34,7 +33,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
 import { StatusDot, type DotTone } from "@/components/status-dot";
 import {
   connectServer,
@@ -70,32 +68,6 @@ function ServerStatusDot({ status }: { status: ConnectionStatus }) {
     />
   );
 }
-
-/** Compact server entry shown in the collapsed rail: click starts a new session
- * under that server (in its first workspace). */
-const CollapsedServerButton = memo(function CollapsedServerButton({
-  server,
-  onNewSession,
-}: {
-  server: SessionListServer;
-  onNewSession: (serverUrl: string, workspaceId: string) => void;
-}) {
-  const firstWorkspace = server.catalog[0]?.id;
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      // The dot's color is itself the status indicator, so keep it at full
-      // opacity even when the button is disabled (server not connected).
-      className="size-6 disabled:opacity-100"
-      disabled={server.status !== "connected" || !firstWorkspace}
-      onClick={() => firstWorkspace && onNewSession(server.url, firstWorkspace)}
-      title={`New session · ${serverLabel(server)}`}
-    >
-      <ServerStatusDot status={server.status} />
-    </Button>
-  );
-});
 
 function AddServerDialog({
   open,
@@ -635,6 +607,7 @@ function WorkspaceNode({
 }
 
 export function Sidebar({
+  desktopCollapsed,
   mobileOpen,
   onMobileOpenChange,
   newSessionTarget,
@@ -642,6 +615,7 @@ export function Sidebar({
   onStartNewSession,
   onNewSession,
 }: {
+  desktopCollapsed: boolean;
   mobileOpen: boolean;
   onMobileOpenChange: (open: boolean) => void;
   newSessionTarget: NewSessionTarget | null;
@@ -679,15 +653,8 @@ export function Sidebar({
           ? { serverUrl: firstConnectedServer.url, workspaceId: firstConnectedServer.catalog[0].id }
           : undefined;
   const [adding, setAdding] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
   const [isMobileViewport, setIsMobileViewport] = useState(false);
-  const mobileDrawerHidden = isMobileViewport && !mobileOpen;
-
-  useEffect(() => {
-    if (mobileOpen) {
-      setCollapsed(false);
-    }
-  }, [mobileOpen]);
+  const hidden = isMobileViewport ? !mobileOpen : desktopCollapsed;
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 1023.98px)");
@@ -730,72 +697,25 @@ export function Sidebar({
         />
       ) : null}
       <aside
-        aria-hidden={mobileDrawerHidden}
-        inert={mobileDrawerHidden ? true : undefined}
+        aria-hidden={hidden}
+        inert={hidden ? true : undefined}
         className={cn(
-          // The width animates between collapsed/expanded; `overflow-hidden` lets
-          // the fixed-width content below act as a curtain-revealed layer so its
-          // children never reflow (slide) mid-animation. See `lg:w-[calc(...)]`.
-          "absolute inset-y-0 left-0 z-50 flex min-h-0 w-[min(22rem,calc(100vw-2rem))] shrink-0 flex-col gap-2 overflow-hidden border-r bg-background p-2.5 transition-[transform,width] duration-200 lg:static lg:z-auto lg:w-[256px] lg:translate-x-0 lg:rounded-lg lg:border",
+          "absolute inset-y-0 left-0 z-50 flex min-h-0 w-[min(22rem,calc(100vw-2rem))] shrink-0 flex-col gap-2 overflow-hidden border-r bg-background p-2.5 transition-transform duration-200 lg:static lg:z-auto lg:w-[256px] lg:translate-x-0 lg:rounded-lg lg:border",
           mobileOpen ? "translate-x-0" : "-translate-x-full",
-          collapsed && "lg:w-12",
+          desktopCollapsed && "lg:hidden",
         )}
       >
         <div className="flex items-center justify-start">
-          {collapsed ? (
+          <div className="flex min-w-0 flex-1 items-center gap-1 lg:w-[calc(256px-var(--spacing)*5)] lg:flex-none">
             <Button
               variant="ghost"
               size="icon"
-              className="hidden size-6 lg:inline-flex"
-              onClick={() => setCollapsed(false)}
-              title="Expand servers"
+              className="size-6 lg:hidden"
+              onClick={() => onMobileOpenChange(false)}
+              title="Close sidebar"
             >
-              <PanelLeft className="size-4" />
+              <X className="size-4" />
             </Button>
-          ) : (
-            <div className="flex min-w-0 flex-1 items-center gap-1 lg:w-[calc(256px-var(--spacing)*5)] lg:flex-none">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6 lg:hidden"
-                onClick={() => onMobileOpenChange(false)}
-                title="Close sidebar"
-              >
-                <X className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="hidden size-6 lg:inline-flex"
-                onClick={() => setCollapsed(true)}
-                title="Collapse servers"
-              >
-                <PanelLeft className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6"
-                disabled={!startTarget}
-                onClick={startSelectedWorkspaceSession}
-                title="New session"
-              >
-                <Plus className="size-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6"
-                onClick={() => setAdding(true)}
-                title="Add server"
-              >
-                <Plug className="size-4" />
-              </Button>
-            </div>
-          )}
-        </div>
-        {collapsed ? (
-          <div className="scrollbar-fine flex min-h-0 flex-1 flex-col items-start gap-1 overflow-y-auto">
             <Button
               variant="ghost"
               size="icon"
@@ -815,43 +735,38 @@ export function Sidebar({
             >
               <Plug className="size-4" />
             </Button>
-            {servers.length > 0 ? <Separator className="my-1 w-6" /> : null}
-            {servers.map((server) => (
-              <CollapsedServerButton key={server.url} server={server} onNewSession={onNewSession} />
-            ))}
           </div>
-        ) : (
-          <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md p-1.5 lg:w-[calc(256px-var(--spacing)*5)]">
-            {servers.length === 0 ? (
-              <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
-                <div className="text-sm font-medium">No servers</div>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  Connect to a local or remote Coda server.
-                </p>
-                <Button size="sm" onClick={() => setAdding(true)}>
-                  <Plug className="size-4" />
-                  Add server
-                </Button>
-              </div>
-            ) : (
-              <>
-                {servers.map((server) => (
-                  <ServerGroup
-                    key={server.url}
-                    server={server}
-                    activeServer={activeServer}
-                    activeKey={activeKey}
-                    newSessionTarget={newSessionTarget}
-                    onOpenSession={openSession}
-                    onNewSession={newSession}
-                    onDeleteSession={deleteSession}
-                    onForkSession={forkSession}
-                  />
-                ))}
-              </>
-            )}
-          </div>
-        )}
+        </div>
+        <div className="scrollbar-fine min-h-0 flex-1 space-y-0.5 overflow-y-auto rounded-md p-1.5 lg:w-[calc(256px-var(--spacing)*5)]">
+          {servers.length === 0 ? (
+            <div className="flex min-h-32 flex-col items-center justify-center gap-3 px-3 py-6 text-center">
+              <div className="text-sm font-medium">No servers</div>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Connect to a local or remote Coda server.
+              </p>
+              <Button size="sm" onClick={() => setAdding(true)}>
+                <Plug className="size-4" />
+                Add server
+              </Button>
+            </div>
+          ) : (
+            <>
+              {servers.map((server) => (
+                <ServerGroup
+                  key={server.url}
+                  server={server}
+                  activeServer={activeServer}
+                  activeKey={activeKey}
+                  newSessionTarget={newSessionTarget}
+                  onOpenSession={openSession}
+                  onNewSession={newSession}
+                  onDeleteSession={deleteSession}
+                  onForkSession={forkSession}
+                />
+              ))}
+            </>
+          )}
+        </div>
         <AddServerDialog open={adding} onOpenChange={setAdding} onConnect={connectServer} />
       </aside>
     </>

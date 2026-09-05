@@ -185,7 +185,7 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
                     agent_name: "coda".to_string(),
                     parent_thread_id: None,
                     derivation_key: None,
-                    reply_target: None,
+                    active_execution: None,
                     messages: malformed_history(usage),
                     resume_point: StoredResumePoint::Generation,
                     suspended_at: jiff::Timestamp::default(),

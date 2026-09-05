@@ -23,8 +23,8 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 use super::archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, EntryKind};
 use super::manifest::{OutputDisposition, StreamManifest, TaskOutputManifest};
 use super::task_archive::{TaskArchive, TaskRecord, read_manifest, validate_manifest};
-use super::task_id::TaskId;
 use super::{TaskStatus, TaskSummary};
+use coda_core::task::TaskId;
 
 /// Session ring payload quota: reserved as the sum of both streams' manifest
 /// capacities per task. `64 MiB >= MAX_RUNNING(16) × 2 × 512 KiB`, so every
@@ -47,6 +47,7 @@ pub struct ArchiveInventory {
     pub retained_index_truncated: bool,
     /// Newest ≤32 terminal summaries for the live overview.
     pub recent_terminal: Vec<TaskSummary>,
+    pub subagents: Vec<TaskId>,
     pub reserved_bytes: u64,
     pub issue_count: u64,
     pub sampled_issues: Vec<InventoryIssue>,
@@ -67,11 +68,12 @@ pub struct RetainedIndexEntry {
     pub terminal_at: jiff::Timestamp,
     pub stdout_capacity: u64,
     pub stderr_capacity: u64,
+    pub result_bytes: u64,
 }
 
 impl RetainedIndexEntry {
     fn reserved(&self) -> u64 {
-        self.stdout_capacity + self.stderr_capacity
+        self.stdout_capacity + self.stderr_capacity + self.result_bytes
     }
 }
 
@@ -208,12 +210,57 @@ fn classify_valid(
     manifest: TaskOutputManifest,
     inv: &mut ArchiveInventory,
 ) {
+    // A running manifest has never committed an answer. A crash between the
+    // result rename and the terminal manifest leaves only disposable staging.
+    if manifest.meta.is_subagent() && manifest.status.is_running() && manifest.result_bytes == 0 {
+        for name in [ArchiveFileName::ResultTmp, ArchiveFileName::Result] {
+            match task_dir.open_file(name, false) {
+                Ok(_) => {
+                    if let Err(error) = task_dir.unlink(name).and_then(|_| task_dir.sync()) {
+                        record_issue(
+                            inv,
+                            InventoryIssue::UnsafeEntry {
+                                name: id.to_string(),
+                                error: error.to_string(),
+                            },
+                        );
+                    }
+                }
+                Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => record_issue(
+                    inv,
+                    InventoryIssue::UnsafeEntry {
+                        name: id.to_string(),
+                        error: error.to_string(),
+                    },
+                ),
+            }
+        }
+    }
+    if manifest.meta.is_subagent()
+        && (manifest.status.is_running()
+            || manifest.cleanup_pending
+            || manifest.notice == Some(super::manifest::NoticeDelivery::Pending))
+    {
+        if inv.subagents.len() < MAX_RECOVERABLE_RUNNING {
+            inv.subagents.push(id.clone());
+        } else {
+            record_issue(
+                inv,
+                InventoryIssue::UnsafeEntry {
+                    name: id.to_string(),
+                    error: "too many unsettled subagent archives".into(),
+                },
+            );
+        }
+    }
     match &manifest.status {
-        TaskStatus::Running => {
+        TaskStatus::Running | TaskStatus::WaitingApproval | TaskStatus::Cancelling => {
             // Crash leftover. Recoverable only if both ring lengths match the
             // manifest; otherwise it is a corrupt task, charged and blocking.
             if rings_length_ok(task_dir, &manifest) {
-                inv.reserved_bytes += manifest.stdout.capacity + manifest.stderr.capacity;
+                inv.reserved_bytes +=
+                    manifest.stdout.capacity + manifest.stderr.capacity + manifest.result_bytes;
                 if inv.recoverable_running.len() < MAX_RECOVERABLE_RUNNING {
                     inv.recoverable_running.push(id);
                 } else {
@@ -221,7 +268,9 @@ fn classify_valid(
                         inv,
                         InventoryIssue::CorruptTask {
                             id: Some(id),
-                            charged_bytes: manifest.stdout.capacity + manifest.stderr.capacity,
+                            charged_bytes: manifest.stdout.capacity
+                                + manifest.stderr.capacity
+                                + manifest.result_bytes,
                             error: "recoverable Running task limit exceeded".into(),
                         },
                     );
@@ -244,7 +293,14 @@ fn classify_valid(
             match &manifest.output {
                 OutputDisposition::Retained => {
                     if rings_length_ok(task_dir, &manifest) {
-                        inv.reserved_bytes += manifest.stdout.capacity + manifest.stderr.capacity;
+                        inv.reserved_bytes += manifest.stdout.capacity
+                            + manifest.stderr.capacity
+                            + manifest.result_bytes;
+                        if manifest.notice == Some(super::manifest::NoticeDelivery::Pending)
+                            || manifest.cleanup_pending
+                        {
+                            return;
+                        }
                         inv.retained_count += 1;
                         if inv.retained.len() < MAX_RETAINED_INDEX {
                             inv.retained.push(RetainedIndexEntry {
@@ -252,6 +308,7 @@ fn classify_valid(
                                 terminal_at: manifest.terminal_at.unwrap_or(manifest.started_at),
                                 stdout_capacity: manifest.stdout.capacity,
                                 stderr_capacity: manifest.stderr.capacity,
+                                result_bytes: manifest.result_bytes,
                             });
                         } else {
                             inv.retained_index_truncated = true;
@@ -302,10 +359,16 @@ fn classify_valid(
 
 fn summary_of(id: &TaskId, manifest: &TaskOutputManifest) -> TaskSummary {
     TaskSummary {
+        kind: manifest.meta.kind.clone(),
+        parent_task_id: manifest.meta.parent_task_id.clone(),
+        subtree_active: manifest.status.is_running(),
+        result_available: manifest.meta.is_subagent()
+            && manifest.output.rings_present()
+            && matches!(manifest.status, TaskStatus::Completed { .. }),
         id: id.as_str().to_owned(),
-        command: manifest.command.clone(),
-        description: manifest.description.clone(),
-        agent_name: manifest.agent_name.clone(),
+        command: manifest.meta.command().to_owned(),
+        description: manifest.meta.description.clone(),
+        agent_name: manifest.meta.agent_name().to_owned(),
         status: manifest.status.clone(),
         started_at: manifest.started_at,
     }
@@ -340,7 +403,12 @@ fn record_issue(inv: &mut ArchiveInventory, issue: InventoryIssue) {
 /// already flagged the task as an issue).
 fn charge_ring_files(task_dir: &ArchiveDir) -> u64 {
     let mut total = 0;
-    for name in [ArchiveFileName::StdoutRing, ArchiveFileName::StderrRing] {
+    for name in [
+        ArchiveFileName::StdoutRing,
+        ArchiveFileName::StderrRing,
+        ArchiveFileName::Result,
+        ArchiveFileName::ResultTmp,
+    ] {
         if let Ok(file) = task_dir.open_file(name, false)
             && let Ok(meta) = file.metadata()
         {
@@ -355,7 +423,12 @@ fn charge_ring_files(task_dir: &ArchiveDir) -> u64 {
 fn residual_ring_bytes(task_dir: &ArchiveDir) -> Result<Option<u64>, ArchiveError> {
     let mut total = 0;
     let mut present = false;
-    for name in [ArchiveFileName::StdoutRing, ArchiveFileName::StderrRing] {
+    for name in [
+        ArchiveFileName::StdoutRing,
+        ArchiveFileName::StderrRing,
+        ArchiveFileName::Result,
+        ArchiveFileName::ResultTmp,
+    ] {
         match task_dir.open_file(name, false) {
             Ok(file) => {
                 present = true;
@@ -380,6 +453,21 @@ fn rings_length_ok(task_dir: &ArchiveDir, manifest: &TaskOutputManifest) -> bool
     };
     ok(ArchiveFileName::StdoutRing, &manifest.stdout)
         && ok(ArchiveFileName::StderrRing, &manifest.stderr)
+        && match task_dir.open_file(ArchiveFileName::Result, false) {
+            Ok(file) => {
+                file.metadata()
+                    .is_ok_and(|meta| meta.len() == manifest.result_bytes)
+                    && (matches!(manifest.status, TaskStatus::Completed { .. })
+                        || manifest.result_bytes > 0)
+            }
+            Err(ArchiveError::Io(error)) => {
+                error.kind() == std::io::ErrorKind::NotFound
+                    && manifest.result_bytes == 0
+                    && !matches!(manifest.status, TaskStatus::Completed { .. })
+            }
+            Err(_) => false,
+        }
+        && matches!(task_dir.open_file(ArchiveFileName::ResultTmp, false), Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn truncate(s: &str) -> String {
@@ -518,7 +606,7 @@ impl SessionQuota {
             .await
     }
 
-    async fn reserve_bytes(&self, bytes: u64) -> ReserveOutcome {
+    pub(crate) async fn reserve_bytes(&self, bytes: u64) -> ReserveOutcome {
         let quota = self.clone();
         let activity = self.begin_activity();
         let transaction = tokio::spawn(async move {
@@ -588,7 +676,8 @@ impl SessionQuota {
             )));
         }
         let now = jiff::Timestamp::now();
-        let fully_consumed = current.stdout_cursor == record.files().stdout.logical_range().await.1
+        let fully_consumed = !record.meta().is_subagent()
+            && current.stdout_cursor == record.files().stdout.logical_range().await.1
             && current.stderr_cursor == record.files().stderr.logical_range().await.1
             && current.stdout_carry.is_empty()
             && current.stderr_carry.is_empty();
@@ -681,12 +770,17 @@ impl SessionQuota {
     ) -> Result<(), ArchiveError> {
         let mut guard = record.lock_commit().await;
         let current = guard.current().clone();
-        if current.status.is_running() || current.disposition != OutputDisposition::Retained {
+        if current.status.is_running()
+            || current.disposition != OutputDisposition::Retained
+            || current.notice == Some(super::manifest::NoticeDelivery::Pending)
+            || current.cleanup_pending
+        {
             return Ok(());
         }
         let stdout_total = record.files().stdout.logical_range().await.1;
         let stderr_total = record.files().stderr.logical_range().await.1;
-        let fully_consumed = current.stdout_cursor == stdout_total
+        let fully_consumed = !record.meta().is_subagent()
+            && current.stdout_cursor == stdout_total
             && current.stderr_cursor == stderr_total
             && current.stdout_carry.is_empty()
             && current.stderr_carry.is_empty();
@@ -702,7 +796,7 @@ impl SessionQuota {
                     let caps = record.capacities();
                     let terminal_at = current.status.terminal_at().unwrap_or(record.started_at());
                     drop(guard);
-                    self.register_retained(record.id(), caps, terminal_at);
+                    self.register_retained(record.id(), caps, current.result_bytes, terminal_at);
                 }
                 return Err(error);
             }
@@ -718,12 +812,18 @@ impl SessionQuota {
             let caps = record.capacities();
             let terminal_at = current.status.terminal_at().unwrap_or(record.started_at());
             drop(guard);
-            self.register_retained(record.id(), caps, terminal_at);
+            self.register_retained(record.id(), caps, current.result_bytes, terminal_at);
         }
         Ok(())
     }
 
-    fn register_retained(&self, id: &TaskId, caps: (u64, u64), terminal_at: jiff::Timestamp) {
+    fn register_retained(
+        &self,
+        id: &TaskId,
+        caps: (u64, u64),
+        result_bytes: u64,
+        terminal_at: jiff::Timestamp,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         if !inner.retained.iter().any(|entry| entry.id == *id) {
             inner.retained.push(RetainedIndexEntry {
@@ -731,6 +831,7 @@ impl SessionQuota {
                 terminal_at,
                 stdout_capacity: caps.0,
                 stderr_capacity: caps.1,
+                result_bytes,
             });
         }
     }

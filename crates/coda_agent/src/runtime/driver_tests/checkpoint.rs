@@ -38,6 +38,14 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
         .await
         .expect("bootstrap");
 
+    runtime
+        .send_message(user_task(
+            &ThreadId::from("test-session".to_string()),
+            "hello",
+        ))
+        .await
+        .expect("start a driver");
+
     assert!(!runtime.wait_for_exit(Some(Duration::from_millis(20))).await);
 
     runtime.request_exit().await;

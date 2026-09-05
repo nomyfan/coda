@@ -25,8 +25,8 @@ use super::archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName};
 use super::disk_tail::{DiskTail, LAYOUT_VERSION};
 use super::manifest::{MANIFEST_VERSION, OutputDisposition, StreamManifest, TaskOutputManifest};
 use super::quota::{CreateReservationLease, QuotaReservation};
-use super::task_id::TaskId;
 use super::{TaskMeta, TaskStatus};
+use coda_core::task::TaskId;
 
 /// Per-stream ring capacity for a fresh task (512 KiB). Internal config, not a
 /// wire contract; a file always reopens at its manifest capacity, not this.
@@ -41,9 +41,15 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// snapshotted at commit time, so they are not duplicated here.
 #[derive(Debug, Clone)]
 pub struct TaskPersistentState {
+    pub result_bytes: u64,
+    pub notice: Option<super::manifest::NoticeDelivery>,
+    pub cleanup_pending: bool,
+    pub scope_members: Vec<coda_core::task::ScopeMember>,
     pub status: TaskStatus,
     pub stdout_cursor: u64,
     pub stderr_cursor: u64,
+    /// Any read skipped overwritten bytes; persists across pages and reopen.
+    pub output_lost: bool,
     pub stdout_carry: Vec<u8>,
     pub stderr_carry: Vec<u8>,
     pub disposition: OutputDisposition,
@@ -118,17 +124,62 @@ impl TaskRecord {
         }
     }
 
+    pub async fn write_result(&self, answer: String) -> Result<(), ArchiveError> {
+        let directory = self.task_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut file = directory.create_file(ArchiveFileName::ResultTmp)?;
+            file.write_all(answer.as_bytes())?;
+            file.sync_all()?;
+            directory.rename(ArchiveFileName::ResultTmp, ArchiveFileName::Result)?;
+            directory.sync()?;
+            Ok(())
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    pub async fn discard_uncommitted_result(&self) -> Result<(), ArchiveError> {
+        let directory = self.task_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            directory.unlink(ArchiveFileName::ResultTmp)?;
+            directory.unlink(ArchiveFileName::Result)?;
+            directory.sync()
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    pub async fn read_result(&self, bytes: u64) -> Result<String, ArchiveError> {
+        let directory = self.task_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = directory.open_file(ArchiveFileName::Result, false)?;
+            if bytes > super::SESSION_QUOTA_BYTES || file.metadata()?.len() != bytes {
+                return Err(ArchiveError::corrupt(
+                    "subagent result length disagrees with manifest",
+                ));
+            }
+            let mut answer = String::new();
+            file.take(bytes + 1).read_to_string(&mut answer)?;
+            Ok(answer)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
     /// Build the full manifest for a candidate state, snapshotting each ring's
     /// current logical range (callers flush first for a terminal range).
     async fn build_manifest(&self, state: &TaskPersistentState) -> TaskOutputManifest {
         let (so_start, so_total) = self.files.stdout.logical_range().await;
         let (se_start, se_total) = self.files.stderr.logical_range().await;
         TaskOutputManifest {
+            output_lost: state.output_lost,
+            result_bytes: state.result_bytes,
+            notice: state.notice.clone(),
+            cleanup_pending: state.cleanup_pending,
+            scope_members: state.scope_members.clone(),
             manifest_version: MANIFEST_VERSION,
             id: self.id.clone(),
-            command: self.meta.command.clone(),
-            description: self.meta.description.clone(),
-            agent_name: self.meta.agent_name.clone(),
+            meta: self.meta.clone(),
             started_at: self.started_at,
             terminal_at: state.status.terminal_at(),
             status: state.status.clone(),
@@ -254,7 +305,11 @@ impl TaskCommitGuard {
     /// any terminal manifest. This is the final degradation boundary: runtime
     /// lifecycle state must still settle even though crash recovery cannot be
     /// made reliable. A later `commit(current().clone())` may retry the save.
-    pub fn fail_in_memory(&mut self, status: TaskStatus) -> Result<(), ArchiveError> {
+    pub fn fail_in_memory(
+        &mut self,
+        status: TaskStatus,
+        result_bytes: u64,
+    ) -> Result<(), ArchiveError> {
         if !matches!(status, TaskStatus::Failed { .. }) {
             return Err(ArchiveError::corrupt(
                 "in-memory persistence degradation must be Failed",
@@ -262,6 +317,10 @@ impl TaskCommitGuard {
         }
         let mut candidate = self.current().clone();
         candidate.status = status;
+        candidate.result_bytes = result_bytes;
+        if self.record.meta().is_subagent() {
+            candidate.notice = Some(super::manifest::NoticeDelivery::Pending);
+        }
         candidate.persistence_dirty = true;
         check_transition(self.current(), &candidate)?;
         *self.state.as_deref_mut().expect("commit guard owns state") = candidate;
@@ -276,6 +335,8 @@ impl TaskCommitGuard {
         tokio::task::spawn_blocking(move || {
             task_dir.unlink(ArchiveFileName::StdoutRing)?;
             task_dir.unlink(ArchiveFileName::StderrRing)?;
+            task_dir.unlink(ArchiveFileName::Result)?;
+            task_dir.unlink(ArchiveFileName::ResultTmp)?;
             Ok::<(), ArchiveError>(())
         })
         .await
@@ -520,9 +581,14 @@ impl TaskArchive {
             }
         };
         let state = TaskPersistentState {
+            result_bytes: 0,
+            notice: None,
+            cleanup_pending: false,
+            scope_members: vec![],
             status: TaskStatus::Running,
             stdout_cursor: 0,
             stderr_cursor: 0,
+            output_lost: false,
             stdout_carry: Vec::new(),
             stderr_carry: Vec::new(),
             disposition: OutputDisposition::Retained,
@@ -673,9 +739,14 @@ impl TaskArchive {
         .map_err(join_err)??;
 
         let state = TaskPersistentState {
+            result_bytes: manifest.result_bytes,
+            notice: manifest.notice.clone(),
+            cleanup_pending: manifest.cleanup_pending,
+            scope_members: manifest.scope_members.clone(),
             status: manifest.status.clone(),
             stdout_cursor: manifest.stdout.read_cursor,
             stderr_cursor: manifest.stderr.read_cursor,
+            output_lost: manifest.output_lost,
             stdout_carry: manifest.stdout.utf8_carry.clone(),
             stderr_carry: manifest.stderr.utf8_carry.clone(),
             disposition: manifest.output.clone(),
@@ -683,11 +754,7 @@ impl TaskArchive {
         };
         Ok(Arc::new(TaskRecord {
             id: id.clone(),
-            meta: TaskMeta {
-                command: manifest.command,
-                description: manifest.description,
-                agent_name: manifest.agent_name,
-            },
+            meta: manifest.meta,
             started_at: manifest.started_at,
             capacities: (manifest.stdout.capacity, manifest.stderr.capacity),
             task_dir,
@@ -756,6 +823,8 @@ fn rollback_created_task_blocking(
         ArchiveFileName::Meta,
         ArchiveFileName::StdoutRing,
         ArchiveFileName::StderrRing,
+        ArchiveFileName::Result,
+        ArchiveFileName::ResultTmp,
     ] {
         if let Err(error) = task_dir.unlink(name)
             && first_error.is_none()
@@ -871,6 +940,7 @@ fn save_manifest(task_dir: &ArchiveDir, manifest: &TaskOutputManifest) -> Result
     file.write_all(&json)?;
     file.sync_all()?;
     task_dir.rename(ArchiveFileName::MetaTmp, ArchiveFileName::Meta)?;
+    task_dir.sync()?;
     Ok(())
 }
 

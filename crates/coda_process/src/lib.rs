@@ -8,15 +8,15 @@
 //! The rest is the background half (design: `docs/design/background-tasks.md`,
 //! `docs/design/background-task-output-spool.md`).
 //!
-//! [`BackgroundProcesses`] owns the lifecycle of background work independently
-//! of any turn: tasks are started via [`BackgroundProcesses::spawn_with`],
+//! [`BackgroundTasks`] owns the lifecycle of background work independently
+//! of any turn: tasks are started via [`BackgroundTasks::spawn_with`],
 //! observed via incremental reads and a summaries watch, torn down via
-//! [`kill`](BackgroundProcesses::kill) / [`shutdown`](BackgroundProcesses::shutdown),
+//! [`kill`](BackgroundTasks::kill) / [`shutdown`](BackgroundTasks::shutdown),
 //! and their completions accumulate as [`TaskNotice`]s until a caller drains
 //! them for delivery.
 //!
 //! The registry is generic over what a task *runs* (a boxed future given a
-//! [`TaskCtx`]); the process-backed [`BackgroundProcesses::spawn`] builds on
+//! [`TaskCtx`]); the process-backed [`BackgroundTasks::spawn`] builds on
 //! this same engine. The future seam stays public: cross-crate lifecycle tests
 //! drive fake tasks through it, and it is the seam a non-process backend
 //! plugs into.
@@ -32,9 +32,9 @@ pub mod process;
 mod quota;
 mod registry;
 mod task_archive;
-mod task_id;
 
 pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, BackgroundRootLock};
+pub use coda_core::task::{InvalidTaskId, TaskId};
 pub use disk_tail::{DiskTail, OutputChunk};
 pub use manifest::{ExpireReason, OutputDisposition, StreamManifest, TaskOutputManifest};
 pub use process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
@@ -47,4 +47,3 @@ pub use task_archive::{
     DEFAULT_STREAM_CAPACITY, TaskArchive, TaskCommitGuard, TaskOutputFiles, TaskPersistentState,
     TaskRecord,
 };
-pub use task_id::{InvalidTaskId, TaskId};

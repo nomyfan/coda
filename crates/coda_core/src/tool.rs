@@ -134,11 +134,15 @@ impl ArtifactSink for UnboundedArtifactSink {
 #[derive(Clone)]
 pub struct ToolCallContext {
     pub cancel: CancellationToken,
+    /// Background subagent owning this call, inherited by synchronous descendants.
+    pub background_task: Option<crate::task::TaskId>,
+    pub origin: crate::task::TaskOrigin,
     /// Where a tool keeps anything that has to outlive the call — see
     /// [`ThreadState`].
     pub state: Arc<dyn ThreadState>,
     /// Destination for presentation artifacts produced by this call.
     artifacts: Arc<dyn ArtifactSink>,
+    observed_task: Arc<std::sync::Mutex<Option<crate::task::TaskId>>>,
     /// Optional capability installed only for a programmatic runner call.
     invoker: Option<Arc<dyn HostToolInvoker>>,
 }
@@ -147,10 +151,23 @@ impl ToolCallContext {
     pub fn new(cancel: CancellationToken, state: Arc<dyn ThreadState>) -> Self {
         Self {
             cancel,
+            background_task: None,
+            origin: crate::task::TaskOrigin::default(),
             state,
             artifacts: Arc::new(UnboundedArtifactSink::default()),
+            observed_task: Arc::default(),
             invoker: None,
         }
+    }
+
+    /// Record the complete terminal result returned by this task_output call.
+    /// Delivery is acknowledged only when the runtime persists its tool result.
+    pub fn record_task_result(&self, task_id: crate::task::TaskId) {
+        *self.observed_task.lock().expect("task result") = Some(task_id);
+    }
+
+    pub fn take_task_result(&self) -> Option<crate::task::TaskId> {
+        self.observed_task.lock().expect("task result").take()
     }
 
     /// Install the narrowly scoped host-call capability for a runner tool.
@@ -280,8 +297,11 @@ impl HostCallScope {
         });
         let context = ToolCallContext {
             cancel,
+            background_task: self.0.outer.background_task.clone(),
+            origin: self.0.outer.origin.clone(),
             state: state.clone(),
             artifacts: artifacts.clone(),
+            observed_task: Arc::default(),
             invoker: None,
         };
         StagedToolCall {

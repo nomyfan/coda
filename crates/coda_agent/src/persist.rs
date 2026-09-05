@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use coda_core::llm::{MessageId, ToolCall, ToolCallOutcome};
 
 use crate::agent::{
-    Envelope, HistoryEntry, PendingReply, PendingToolCall, PreparedToolCall, ReplyTarget,
-    ResumePoint, ToolExecutionState,
+    Envelope, HistoryEntry, PendingReply, PendingToolCall, PreparedToolCall, ResumePoint,
+    ToolExecutionState,
 };
 use crate::runtime::AgentRuntimeSnapshot;
 
@@ -44,14 +44,14 @@ pub struct StoredCheckpoint {
     /// The derivation is one-way, so without recording these the parent/child
     /// structure can only be re-guessed; a fork, which has to rebuild every
     /// derived id under a new root, needs to walk it directly. Kept separate
-    /// from `reply_target`, which names the same parent but only for the span of
+    /// from `active_execution`, which names the same parent but only for the span of
     /// one call and is cleared as soon as the reply is sent.
     #[serde(default)]
     pub parent_thread_id: Option<String>,
     #[serde(default)]
     pub derivation_key: Option<String>,
     #[serde(default)]
-    pub reply_target: Option<ReplyTarget>,
+    pub active_execution: Option<crate::execution::StoredExecution>,
     pub messages: Vec<HistoryEntry>,
     pub resume_point: StoredResumePoint,
     #[serde(default)]
@@ -105,6 +105,7 @@ pub struct StoredPreparedToolCall {
 pub struct StoredRuntimeSnapshot {
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
+    /// Thread id → agent name; inbox maps above are also keyed by thread id.
     pub active_threads: HashMap<String, String>,
 }
 

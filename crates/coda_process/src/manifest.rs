@@ -7,25 +7,28 @@ use serde::{Deserialize, Serialize};
 
 use super::TaskStatus;
 use super::disk_tail::{LAYOUT_VERSION, MAX_CAPACITY, MIN_CAPACITY};
-use super::task_id::TaskId;
+use coda_core::task::TaskId;
 
 /// Current on-disk manifest format. A future breaking change bumps this;
 /// an unknown version is treated as corrupt.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Full manifest persisted as `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOutputManifest {
+    pub result_bytes: u64,
+    pub notice: Option<NoticeDelivery>,
+    pub cleanup_pending: bool,
+    pub scope_members: Vec<coda_core::task::ScopeMember>,
     pub manifest_version: u32,
     pub id: TaskId,
-    pub command: String,
-    pub description: String,
-    pub agent_name: String,
+    pub meta: super::TaskMeta,
     pub started_at: jiff::Timestamp,
     pub terminal_at: Option<jiff::Timestamp>,
     pub status: TaskStatus,
     pub stdout: StreamManifest,
     pub stderr: StreamManifest,
+    pub output_lost: bool,
     pub output: OutputDisposition,
 }
 
@@ -221,16 +224,19 @@ mod tests {
     #[test]
     fn manifest_json_roundtrip() {
         let m = TaskOutputManifest {
+            result_bytes: 0,
+            notice: None,
+            cleanup_pending: false,
+            scope_members: vec![],
             manifest_version: MANIFEST_VERSION,
             id: TaskId::new(),
-            command: "echo hi".into(),
-            description: "d".into(),
-            agent_name: "coda".into(),
+            meta: super::super::TaskMeta::shell("echo hi".into(), "d".into(), "coda".into()),
             started_at: jiff::Timestamp::now(),
             terminal_at: None,
             status: TaskStatus::Running,
             stdout: StreamManifest::empty(MIN_CAPACITY),
             stderr: StreamManifest::empty(MIN_CAPACITY),
+            output_lost: false,
             output: OutputDisposition::Retained,
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -239,4 +245,10 @@ mod tests {
         assert_eq!(back.status, m.status);
         assert_eq!(back.output, m.output);
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoticeDelivery {
+    Pending,
+    Delivered,
 }

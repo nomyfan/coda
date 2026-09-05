@@ -80,7 +80,7 @@ async fn store_root(
                 agent_name: "coda".into(),
                 parent_thread_id: None,
                 derivation_key: None,
-                reply_target: None,
+                active_execution: None,
                 messages,
                 resume_point: at,
                 suspended_at: jiff::Timestamp::default(),

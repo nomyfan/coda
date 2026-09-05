@@ -384,9 +384,13 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               {decidedCount}/{items.length} reviewed
             </Badge>
           </div>
+          <p className="px-3 pt-1 text-xs text-muted-foreground sm:px-4">
+            {current.approval.agent_path.join(" → ")}
+            {current.approval.task_id ? ` · ${current.approval.task_id}` : ""}
+          </p>
           <div className="scrollbar-fine overflow-y-auto px-3 py-2.5 sm:px-4">
             <ApprovalCall
-              key={`${current.approval.thread_id}:${current.call.id}`}
+              key={`${approvalKey(current.approval)}:${current.call.id}`}
               call={current.call}
               decision={decisionOf(current)}
               allowPattern={allowOf(current)}
