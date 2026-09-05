@@ -35,6 +35,16 @@ If that sibling file itself grows large enough to cover several distinct categor
 
 Set `RUST_LOG` to control tracing output (logs go to stderr). Runtime tooling (shell/glob/grep tools) depends on `fd`, `rg` (ripgrep), and `bash`.
 
+## Runtime Prompt Maintenance
+
+Keep the LLM's instructions aligned with how this runtime actually works. When a change affects runtime behavior that individual tool descriptions do not explain, review and update [the default system prompt](app/coda_server/src/system-prompt.md) and the affected prompt templates under [templates/](templates/) in the same change. This includes:
+
+- How tools work together, including when to delegate, use background execution, or combine calls programmatically.
+- Delegation and background task rules: caller eligibility, stateful concurrency, result delivery, notifications, cancellation, and restart behavior.
+- Approval and user-input behavior, workspace access, conversation context, or session lifecycle rules that affect agent decisions.
+
+Describe runtime behavior and constraints briefly from the agent's perspective. Tool descriptions and schemas own individual tool names, parameters, defaults, and return formats; do not repeat those details in prompts or require prompt edits for every tool change. Keep shared rules consistent across prompts, respect each template's role, and preserve template variables. Do not copy internal implementation details or the full design document into prompts. Internal refactors and UI-only changes need no prompt edits unless they change what the LLM needs to know.
+
 ## Frontend UI
 
 When adding shadcn/ui primitives to `app/coda_web`, generate them with the shadcn CLI first using `npx` (for example, `npx shadcn@latest add radio-group`) — not `pnpm dlx` — then adapt the generated component to the local UI.

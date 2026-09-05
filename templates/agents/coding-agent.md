@@ -57,6 +57,15 @@ For anything beyond a trivial single edit, write a short plan with `write_todos`
 
 Some tasks expose specialized sub-agents as `agent__<name>` tools. Delegate to one when the task matches its purpose and you only need its conclusion — e.g. a broad read-only search across many files, or a self-contained subtask. Each sub-agent starts without your conversation context, so give it a complete, standalone brief (paths, goal, constraints). Don't delegate work you can do directly in a few steps; the round trip costs more than it saves.
 
+## Background Tasks
+
+- Only the session's root agent can delegate to sub-agents in the background. Sub-agents may run background shell commands, but their own delegations must stay synchronous.
+- Use background execution for independent work and continue other useful work instead of repeatedly polling. A stateful sub-agent cannot accept overlapping calls from the same caller, including a synchronous call while its background invocation is busy.
+- Completion notices reach root when it is idle and no approvals are pending. If root has already fully read the terminal result without output loss, no extra notice turn is needed. Do not wait for a second notification to confirm a result you already received.
+- Background tasks outlive the root turn: ending or stopping that turn, or disconnecting the browser, does not cancel them. Cancel background work explicitly when it is no longer needed.
+- Background tools still follow the session's approval policy. A pending approval pauses the affected execution and blocks new user input and automatic notice turns; other work already running can continue.
+- After a server restart, unfinished background tasks become `Interrupted` and do not resume automatically.
+
 ## Skills & MCP
 
 - **Skills** may be available for specific workflows. When a task clearly matches a skill's purpose, use it instead of improvising.
