@@ -51,6 +51,7 @@ import {
   discardedFrom,
   forkActiveSession,
   selectActiveApprovalCount,
+  selectActiveBackgroundTasks,
   selectActiveEditing,
   selectActiveEntries,
   selectActiveForkKey,
@@ -63,6 +64,7 @@ import {
 } from "@/store/session";
 import { parseCompactCommand } from "@/lib/compact-command";
 import {
+  type TaskSummary,
   isSubAgentToolName,
   subAgentDisplayName,
   SUBAGENT_TOOL_PREFIX,
@@ -207,11 +209,14 @@ export function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRen
 export const Transcript = memo(function Transcript({
   workspace,
   suppressed,
+  onViewTaskResult,
 }: {
   workspace?: string;
   suppressed: boolean;
+  onViewTaskResult?: (taskId: string) => void;
 }) {
   const liveEntries = useCodaStore(selectActiveEntries);
+  const backgroundTasks = useCodaStore(selectActiveBackgroundTasks);
   const liveRunning = useCodaStore(selectActiveRunning);
   const liveApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeKey = useCodaStore(selectActiveKey);
@@ -334,7 +339,17 @@ export const Transcript = memo(function Transcript({
                   )}
                 >
                   {item.type === "entry" ? (
-                    <TranscriptItem entry={item.entry} forkable={item.entry.id !== firstUserId} />
+                    <TranscriptItem
+                      entry={item.entry}
+                      forkable={item.entry.id !== firstUserId}
+                      onViewTaskResult={onViewTaskResult}
+                      resultTask={backgroundTasks.find(
+                        (task) =>
+                          task.id === item.entry.taskId &&
+                          task.kind.kind === "subagent" &&
+                          task.result_available,
+                      )}
+                    />
                   ) : (
                     <AssistantTurnBubble
                       entries={item.entries}
@@ -1206,9 +1221,13 @@ function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkab
 const TranscriptItem = memo(function TranscriptItem({
   entry,
   forkable,
+  onViewTaskResult,
+  resultTask,
 }: {
   entry: TranscriptEntry;
   forkable?: boolean;
+  resultTask?: TaskSummary;
+  onViewTaskResult?: (taskId: string) => void;
 }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
@@ -1217,6 +1236,25 @@ const TranscriptItem = memo(function TranscriptItem({
   }
 
   if (entry.kind === "task_notice") {
+    if (onViewTaskResult && resultTask) {
+      return (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border bg-muted/40 px-3 py-2">
+          <ListChecks className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="text-xs font-medium">{entry.title}</span>
+          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+            {entry.detail}
+          </span>
+          <Button
+            variant="quiet"
+            size="sm"
+            className="ml-auto h-6 px-2 text-xs"
+            onClick={() => onViewTaskResult(resultTask.id)}
+          >
+            View result
+          </Button>
+        </div>
+      );
+    }
     return (
       <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
         <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">

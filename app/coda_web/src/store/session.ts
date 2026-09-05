@@ -83,6 +83,8 @@ export type TranscriptEntry = {
   title?: string;
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
+  /** Task referenced by a single completion notice. */
+  taskId?: string;
   /** Executed shell command, shown alongside shell results. */
   command?: string;
   /** Model-generated source executed by run_javascript. */
@@ -526,6 +528,10 @@ function historyToEntries(
         messageId: notice.message_id,
         kind: "task_notice",
         title: taskNoticeTitle(notice.outcomes),
+        taskId:
+          notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
+            ? notice.outcomes[0].task_id
+            : undefined,
         detail:
           notice.outcomes.length === 1 && notice.outcomes[0].type === "finished"
             ? notice.outcomes[0].command
