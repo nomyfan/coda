@@ -1,7 +1,8 @@
 import { memo, useState } from "react";
-import { ListChecks, Square, X } from "lucide-react";
+import { ChevronRight, ListChecks, Square, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import type { TaskSummary, TaskResult } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
 import {
@@ -31,7 +32,7 @@ function TaskRow({ task }: { task: TaskSummary }) {
   const label = task.kind.kind === "subagent" ? task.kind.agent_name : task.command;
   const [result, setResult] = useState<TaskResult | null>(null);
   const [loading, setLoading] = useState(false);
-  const showResult = async () => {
+  const loadResult = async () => {
     setLoading(true);
     try {
       setResult(await getBackgroundTaskResult(task.id));
@@ -87,24 +88,39 @@ function TaskRow({ task }: { task: TaskSummary }) {
         {task.agent_name && task.agent_name !== "coda" ? <span>· {task.agent_name}</span> : null}
       </div>
       {task.kind.kind === "subagent" && !task.running ? (
-        <div className="mt-2">
-          <Button variant="ghost" size="sm" disabled={loading} onClick={showResult}>
-            {loading ? "Loading…" : result ? "Refresh result" : "View result"}
-          </Button>
-          {result ? (
-            <div className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs">
-              {result.state === "available"
-                ? result.answer
-                : result.state === "expired"
-                  ? "Result expired"
-                  : result.state === "unknown"
-                    ? "Task not found"
-                    : result.state === "error"
-                      ? result.message
-                      : result.status}
-            </div>
-          ) : null}
-        </div>
+        <Collapsible
+          className="mt-2"
+          onOpenChange={(open) => {
+            if (open && !result && !loading) {
+              void loadResult();
+            }
+          }}
+        >
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="sm" className="group w-full justify-between text-left">
+              Result
+              <ChevronRight className="size-3 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <Button variant="ghost" size="sm" disabled={loading} onClick={loadResult}>
+              {loading ? "Loading…" : "Refresh result"}
+            </Button>
+            {result ? (
+              <div className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs">
+                {result.state === "available"
+                  ? result.answer
+                  : result.state === "expired"
+                    ? "Result expired"
+                    : result.state === "unknown"
+                      ? "Task not found"
+                      : result.state === "error"
+                        ? result.message
+                        : result.status}
+              </div>
+            ) : null}
+          </CollapsibleContent>
+        </Collapsible>
       ) : null}
     </li>
   );
