@@ -5,6 +5,8 @@ import type { PendingApproval } from "../src/lib/protocol.ts";
 
 function approval(...callIds: string[]): PendingApproval {
   return {
+    task_id: null,
+    agent_path: ["coda"],
     thread_id: "s1",
     agent_name: "coda",
     parent_message_id: "m-batch-1",
@@ -53,21 +55,18 @@ test("a second submit of the same approval while one is in flight is dropped", a
       sessions: {
         "ws/s1": session({
           approvals: [approval("call_a1")],
-          drafts: { "coda:s1": { call_a1: "Execute" } },
-          allowDrafts: { "coda:s1": { call_a1: "ls *" } },
+          drafts: { "s1:m-batch-1": { call_a1: "Execute" } },
+          allowDrafts: { "s1:m-batch-1": { call_a1: "ls *" } },
         }),
       },
     };
     state.activeServer = server;
     state.activeKey = "ws/s1";
     state.rpcMap[server] = {
-      notify: (_method: string, params: unknown) => {
+      request: (_method: string, params: unknown) => {
         resumes.push(params);
-        return true;
+        return allowWrite;
       },
-      // Holds the submit open at its one await point, the way a real
-      // `add_allow_pattern` round trip does.
-      request: () => allowWrite,
     } as never;
   });
 
@@ -75,7 +74,7 @@ test("a second submit of the same approval while one is in flight is dropped", a
   // allow-pattern write, and the approval it will answer is still in the store.
   const first = submitApprovals();
   const second = submitApprovals();
-  releaseAllowWrite(undefined);
+  releaseAllowWrite({ accepted: true });
   await Promise.all([first, second]);
 
   expect(resumes).toHaveLength(1);

@@ -1,6 +1,6 @@
 # 后台 Subagent 设计
 
-状态：已确认，进入实现；首版仅允许 root 启动后台 subagent。
+状态：实现及回归已完成；首版仅允许 root 启动后台 subagent。
 
 ## Problem
 
@@ -24,19 +24,18 @@ Out：后台 reasoning/tool 流展示；重启恢复后台执行；改变权限�
 
 ## Validation Findings
 
-本次通过静态代码核对前提，未修改业务代码或运行原型、测试。
+实现已完成以下专项验证，最终检查结果见文末。
 
-| 核对点 | 现有代码与结果 | 对本方案的影响 |
-| --- | --- | --- |
-| 后台执行入口 | [registry.rs](../../crates/coda_process/src/registry.rs) 的 `spawn_with` 已接收任意返回 `TaskExit` 的 future | 复用注册表，增加 agent 执行结果类型 |
-| 调度隔离 | [runtime.rs](../../crates/coda_agent/src/runtime.rs) 按 agent 名称维护一个 driver/inbox，driver 会切换当前 thread | 多个后台调用仍需按 thread 独立驱动，不能共享可变 `AgentState` |
-| Stateful 身份 | [driver.rs](../../crates/coda_agent/src/runtime/driver.rs) 按 `uuid5(parent_thread_id, agent_name)` 派生 thread，并只检查同批次冲突 | 保留派生规则，补充跨批次、跨 root turn 的调用占用 |
-| 同步后代 | `pending_replies` 和 `ReplyTarget` 已处理同步调用的等待及返回 | B 内部继续使用现有同步路径 |
-| 审批归属 | [hub.rs](../../app/coda_server/src/hub.rs) 将任意 `Suspended` 视为 root 暂停；结束事件清空审批，resume 总把 root 标为运行中 | Root 状态与 session 审批集合仍须拆开 |
-| 恢复入口 | [session.rs](../../crates/coda_agent/src/session.rs) 按 agent 名称整理恢复目标；`TurnGate` 只接受一个活动 turn | 快照改按 thread 索引，执行元数据标明前台/后台 |
-| 完成答复 | 当前 notice 只带 4 KiB 输出尾部，拥塞时合并；shell 读取推进游标 | Subagent 结果单独完整保存，不能套用 shell 截断和消费语义 |
-| 通知交付 | 当前 notice 在内存 drain；[storage.rs](../../app/coda_server/src/storage.rs) 事务保存 checkpoint，但无任务交付收据 | 使用持久待交付标记及一次入史的事务收据 |
-| Checkpoint 失败 | `persist_and_announce` 在任意保存失败后上报 `PersistFailed` 并跳过 Reply；当前 hub 会关闭整个 runtime，普通取消也不会代替存活子调用回复 | 后台错误由 runtime 直接结束所属 scope，解除 Reply 等待并隔离相关 thread；控制事件只报告处理结果 |
+| 核对点 | 实现及验证 |
+| --- | --- |
+| 执行隔离 | driver、inbox、恢复目标均按 thread 索引；同名 stateless 并发测试覆盖同步与后台调用，stateful 冲突立即拒绝 |
+| Root 资格 | 工具参数与 runtime dispatch 双重校验；非 root 强传参数、同名非 root thread 均不能启动后台 subagent |
+| 同步后代 | B → 同步 C 保留 Reply 路径；root 可先结束 turn，C 完成后 B 继续并提交完整结果 |
+| 审批归属 | runtime 持有按 thread/批次隔离的审批集合；后台审批、root abort、定向移除和重复 call ID 已有回归测试 |
+| Checkpoint 失败 | 注入 C 待审批保存失败和后续清理失败，验证 B 进入 Failed、无 Reply 等待或审批、无关任务继续；中止事务完成前保持 thread 隔离 |
+| 冷启动与迟到写入 | 打开 session 前中止后台 checkpoint，PG 事务记录旧 invocation 的写入屏障；旧快照和 checkpoint 不能恢复已中止调用 |
+| 结果及通知 | 完整结果重复读取、重开归档、未提交结果清理、通知容量背压均有测试；通知事务返回不确定时复用同一开场，收据保证一次入史 |
+| Relay | 丢事件与缓冲溢出改用运行中快照；回归验证不会为重建客户端投影而关闭 runtime |
 
 ## 设计依据
 
@@ -64,7 +63,7 @@ Out：后台 reasoning/tool 流展示；重启恢复后台执行；改变权限�
 ### 执行和任务身份
 
 - `ThreadId` 标识会话；`MessageOrigin(parent_message_id, call_id)` 标识一次委派；`TaskId` 标识一次后台任务。Stateful 和 stateless 的 thread 派生规则保持不变。
-- 每个活跃 thread 一个 driver，独占 `AgentState`。工具、模型配置和 prompt 知识句柄可共享，消息、当前 turn 和工具状态不能跨 thread 共享。
+- 每个活跃 thread 一个 driver，独占 `AgentState`。前台同步调用完成后，先持久化最终 checkpoint、移除 driver 注册和执行记录，再交接 Reply 并退出；stateful 下次调用从 checkpoint 恢复历史。后台成员仍由所属 scope 统一回收。工具、模型配置和 prompt 知识句柄可共享，消息、当前 turn 和工具状态不能跨 thread 共享。
 - `ExecutionScope = Foreground { turn_id } | Background { task_id }`。同步后代继承 scope；只有 root 的后台分支创建新的后台 scope。
 - `CompletionTarget = RootTurn | Caller(ReplyTarget) | BackgroundTask(TaskId)`。同步 C 完成仍返回 B；后台 B 完成直接交给注册表，不对已返回启动结果的 root tool call 再补 Reply。
 - `StoredExecution` 保存当前调用身份、scope 和 completion target，终态后清空。它替换独立的 `reply_target` 字段；runtime 快照、inbox 和恢复目标改用 thread ID 索引，并记录 agent 名称。
@@ -134,10 +133,12 @@ task_kill({ id: string })
 get_task_result({ workspace_id, session_id, task_id })
 // 面板按需获取最终答复，不推进工具游标；未知、过期、I/O 错误明确区分。
 
-resume({ workspace_id, session_id, thread_id, decision: {
+resume({ workspace_id, session_id, agent_name, thread_id, decision: {
   parent_message_id, resolutions
-}})
-// 只处理这个 thread 的指定审批批次；过期决议返回 stale。
+}, allow_patterns?: Array<[call_id: string, pattern: string]> })
+// JSON-RPC request，返回 { accepted: boolean }。
+// 只处理该 thread 的指定审批批次；过期决议返回 accepted: false。
+// “总是允许”规则随决议提交，只有有效且被接受的 shell 批准才写入配置。
 ```
 
 **信任边界**：工具定义按实际调用 thread 生成，只有 root 且注册表可用才暴露后台参数；runtime 在 dispatch 入口再次校验资格、参数类型和该调用者可用的 subagent。非 root 强行传入 `true` 必须报错，不能只靠 prompt 或 schema 限制，也不能降级为同步。Root 的判定使用 `is_root_thread`，同名 agent 的非 root thread 不获得资格。下游只接收已验证调用，不重复推断调用者权限。
@@ -197,7 +198,7 @@ Root 立即收到启动结果，不增加 `pending_replies`；后台 B 的同步
 
 ### 2. 审批集合与 root 状态分离
 
-Runtime 按 `(thread_id, parent_message_id)` 持有权威审批集合，checkpoint 保存成功后发布 added/removed 事件，发布及恢复都与 scope 的取消状态串行判定。Hub/front-end 接收定向变更，重连获取完整集合。
+Runtime 按 `(thread_id, parent_message_id)` 持有权威审批集合，checkpoint 保存成功后发布 added/removed 事件，发布及恢复都与 scope 的取消状态串行判定。Hub/front-end 接收定向变更，重连获取完整集合。`approval_removed` 和 `background_error` 的实际序列化 JSON 与前端共用样本验证；快照按仍存在的 thread、审批批次及 call ID 保留草稿，仅清理失效项。
 
 后台 B 或其同步后代等待审批，B 的 task 显示 `WaitingApproval`；多个同步分支产生多个批次时，处理一项不能清除其余项。批准/拒绝只恢复对应 thread，其他 task 的运行不受影响。拒绝是工具结果，subagent 可以继续生成，不直接把 task 标为失败。
 
@@ -211,7 +212,7 @@ Runtime 按 `(thread_id, parent_message_id)` 持有权威审批集合，checkpoi
 
 B 已正常完成而关联 shell 仍活跃时，保留 B 的终态并停止这些 shell；`subtree_active` 保留面板停止入口。停止单个 shell 不向上取消 B。若 B 或其同步后代调用 `task_kill(B)`，只提交取消请求并返回，避免等待自身退出；UI/外部调用可等待清理屏障。
 
-Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提交请求后释放锁等待，再核对 generation。每个任务终态只提交一次，完成与停止竞争由提交点决定。
+Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提交请求后释放锁等待，再核对最新 attachment；等待期间不得将旧连接的结果发送给新连接。每个任务终态只提交一次，完成与停止竞争由提交点决定。
 
 ### 4. Root 接收完整结果，完成事实只入史一次
 
@@ -219,7 +220,7 @@ Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提�
 
 注册任务时预留待通知名额，沿用现有 full notice 数量级作为容量上限；耗尽时拒绝新后台 subagent，已接受任务仍能完成。不为维持队列上限而丢弃最终答复。
 
-投递顺序：取得 root 空闲槽且确认无待审批 → storage 将 notice 开场 checkpoint、可恢复前台执行和收据同事务提交 → 尝试 ack 归档标记 → 驱动 root。写入失败释放槽、保留记录；ack 失败重试但不阻止已提交处理。已有收据只补 ack，不再次追加 notice 或新建 turn；若事务成功但返回结果丢失，接管已持久化的同一前台执行。
+投递顺序：取得 root 空闲槽且确认无待审批 → storage 将 notice 开场 checkpoint、可恢复前台执行和收据同事务提交 → 驱动同一 root 开场 → hub 尝试 ack 归档标记。明确未提交时释放槽、保留记录；事务结果尚不能确认时保留开场和槽，重试查询收据后继续。ack 失败重试但不阻止已提交处理。已有收据只补 ack，不再次追加 notice 或新建 turn；若事务成功但返回结果丢失，接管已持久化的同一前台执行。
 
 这里“一次”指一项完成事实只追加一条 notice，不承诺崩溃恢复期间的 LLM 请求或外部工具副作用恰好执行一次。Root 接收方随 session 存活。
 
@@ -233,7 +234,7 @@ Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提�
 2. 确认 scope 内执行停止后，runtime 统一结清该 scope 的 `CallLedger` 义务，移除 `pending_replies`、reply target 和排队的调用/恢复消息。迟到 Reply 依据调用身份丢弃，不能重复结清或进入后续调用。这是终止整个 scope，不是假造 C 的成功回复让 B 继续运行。
 3. 注册表提交 B 的 `Failed` 终态和一次失败通知，释放后台运行名额；保留所有成员 thread 的隔离。该终态只证明执行已结束，不证明 checkpoint 已修复。数据库持续不可写时，task 仍可结束，不等待数据库恢复；通知入史按正常重试规则等待存储可用。
 4. Runtime 调用 `SessionStorage::abort_scope`：核对成员调用身份，在同一事务中清理这些 thread 的审批、待执行工具、Reply 等待、`active_execution` 及 runtime 快照中的排队消息。对已持久化但没有结果的工具调用追加明确的中止结果；已持久化结果保留，不补写未成功保存的正常答复或工具状态。事务提交成功才得到清理收据。
-5. 清理成功后清除归档的 `cleanup_pending`，重新加载已清理 checkpoint，再解除该 scope 成员的隔离。任一步失败都保持隔离，后续调用返回明确的“等待中止清理”错误；读取数据库成功、重新连接或 task 已终态都不足以解除隔离。
+5. 中止事务成功后重新加载已清理 checkpoint，再清除归档的 `cleanup_pending`；确认任务已终态后解除该 scope 成员的隔离。任一步失败都保持隔离，后续调用返回明确的“等待中止清理”错误；读取数据库成功、重新连接或 task 已终态都不足以解除隔离。
 
 **写入和重启约束。** 同一 thread 的 checkpoint 写入与中止事务必须串行并核验执行身份；中止清理成功后，旧 driver 的迟到写入必须被拒绝。快照写入也不能重新引入已关闭 scope 的排队消息。存储返回结果不确定时，重新读取持久状态核对后幂等清理，不能假定失败的事务一定没有提交。
 
@@ -261,21 +262,47 @@ Hub 不持 entry 锁等待依赖事件转发的清理：验证 attachment、提�
 
 ## Implementation Roadmap
 
-1. [ ] **[风险验证 / runtime]** 限制 root 后台资格，按 thread 隔离 driver，建立后台 B + 同步 C 的最小切片。
+Runtime、注册表、持久化、Hub 和 Web 已接通。下列阶段的完成状态以对应专项回归为准。
+
+1. [x] **[风险验证 / runtime]** 限制 root 后台资格，按 thread 隔离 driver，建立后台 B + 同步 C 的最小切片。
    目的：证明 root 可继续对话，内部同步调用保持正确。
    验证：非 root 后台请求无副作用地报错；两个同名 stateless 并行；stateful 同步/后台冲突立即报错；C 回复 B、B 通知 root；C 保存待审批 checkpoint 失败时，B 进入 `Failed`、释放任务名额，无残留 Reply 等待或审批，无关后台任务继续。
-2. [ ] **[注册表 / 工具]** 增加 task kind、agent 结果归档、scope 和关联 shell，接入读取及停止。
+2. [x] **[注册表 / 工具]** 增加 task kind、agent 结果归档、scope 和关联 shell，接入读取及停止。
    目的：复用任务体验，同时保证整个后台执行可停止。
    验证：停止 B 覆盖多层同步后代及 shell、无关任务继续；B 已结束后的 shell 可停止；spawn/kill 竞争、自身停止、容量和 I/O 失败正确处理。
-3. [ ] **[审批 / relay]** 拆开 root 状态和全量审批集合，接入定向变更及重连快照。
+3. [x] **[审批 / relay]** 拆开 root 状态和全量审批集合，接入定向变更及重连快照。
    目的：后台审批独立处理，输入准入前后端一致。
    验证：多个 task、同名 agent、call ID 复用不串批次；root 完成不清空后台审批；重连及 relay 缺口不取消任务；权限策略回归。
-4. [ ] **[持久化 / 通知]** 迁移执行元数据和快照索引，增加 scope 中止事务、隔离恢复、root notice 收据事务、归档 ack 和后台冷启动清理。
+4. [x] **[持久化 / 通知]** 迁移执行元数据和快照索引，增加 scope 中止事务、隔离恢复、root notice 收据事务、归档 ack 和后台冷启动清理。
    目的：保持一次入史，保证失败 scope 清理完成后才可复用，重启不恢复后台执行。
    验证：C 保存审批或工具状态失败、清理再次失败时，B 已终态而成员 thread 仍隔离；清理成功后才可复用。覆盖迟到写入、事务结果不确定、清理完成前重启，恢复后不重放 C 的旧调用；无关同名 thread 不受影响。Interrupted/root notice、重复投递、rewind/fork 及 storage pg-tests 回归。
-5. [ ] **[Hub / Web]** 接通任务摘要、最终答复、审批归属、关闭顺序及 session 操作准入。
+5. [x] **[Hub / Web]** 接通任务摘要、最终答复、审批归属、关闭顺序及 session 操作准入。
    目的：让用户完整观察和控制首版后台任务。
    验证：后台 B 顶层展示、关联 shell 归属正确；无连接时仍运行及通知；root abort 保留后台；删除/shutdown 无遗留执行；操作限制明确且可解除。
-6. [ ] **[验收 / 文档]** 完成需求场景回归，更新工具说明、协议和架构文档。
+6. [x] **[验收 / 文档]** 完成需求场景回归，更新工具说明、协议和架构文档。
    目的：确认首版范围、默认同步行为及错误路径完整。
    验证：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`；一次性 PostgreSQL 的 feature-enabled storage tests；`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`。
+
+
+## 最终验证结果
+
+2026-09-05 完成：
+
+- `cargo clippy --all-targets`：通过，无警告。
+- `cargo test`：workspace 全量测试通过；原有一项标为 ignored 的测试保持原配置。
+- `cargo check -p coda_server --features pg-tests --all-targets`：通过。
+- `cargo test -p coda_server --features pg-tests --test storage_pg`：使用独立临时 PostgreSQL 数据库，44 项通过，包含 scope 中止、迟到写入、通知事务回滚、rewind/fork 收据隔离。
+- `pnpm --filter coda-web lint`、`pnpm --filter coda-web typecheck`：通过。
+- `pnpm --filter coda-web test`：17 个测试文件、135 项通过。
+- `git diff --check`：通过。
+
+数据库迁移已加入 `20260905000000_background_subagents`，`schema.rs` 由 Diesel 生成。迁移由服务启动时的现有流程执行。
+
+
+### Reviewer 问题修复验证
+
+- 修复两个控制事件的 JSON 类型名，并以同一份 JSON 样本连接 Rust 实际序列化测试与前端 reducer 测试。
+- 覆盖 root 完成/停止后紧接快照的审批草稿保留，以及已结束 call、替换批次的草稿清理。
+- 连续 16 轮、32 次 stateless 同步调用后仅保留 root driver 与执行记录，完成的 JoinSet 项也及时回收；原 stateful 连续调用历史测试验证 driver 重建不会丢失会话。
+
+本轮修复后重新通过 `cargo clippy --all-targets`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`，以及前端 lint、typecheck 和 135 项测试。真实进程崩溃与数据库联动、浏览器 E2E 本轮未验证。

@@ -2,7 +2,7 @@
 //! notice queue and the summaries watch. Storage (the session archive, ring
 //! files and quota) lives in the sibling modules this one drives.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use coda_core::llm::TaskNoticeOutcome;
@@ -13,13 +13,13 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::archive_dir::{ArchiveDir, ArchiveError};
-use crate::manifest::{ExpireReason, OutputDisposition};
+use crate::manifest::{ExpireReason, NoticeDelivery, OutputDisposition};
 use crate::process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
 use crate::quota::{
     ArchiveInventory, ExpirationFact, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory,
 };
 use crate::task_archive::{TaskArchive, TaskRecord};
-use crate::task_id::TaskId;
+use coda_core::task::TaskId;
 
 /// Concurrent `Running` tasks per session.
 const MAX_RUNNING: usize = 16;
@@ -36,12 +36,58 @@ const NOTICE_TAIL_LIMIT: usize = 4096;
 /// over what is actually returned, so a large backlog drains across calls.
 const READ_CHUNK_LIMIT: usize = 128 * 1024;
 
-/// Caller-supplied identity of a task, echoed in summaries and notices.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskKind {
+    Shell { command: String },
+    Subagent { agent_name: String },
+}
+
+pub use coda_core::task::TaskOrigin;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskMeta {
-    pub command: String,
+    pub kind: TaskKind,
     pub description: String,
-    pub agent_name: String,
+    pub parent_task_id: Option<TaskId>,
+    pub origin: TaskOrigin,
+}
+
+impl TaskMeta {
+    pub fn shell(command: String, description: String, agent_name: String) -> Self {
+        Self {
+            kind: TaskKind::Shell { command },
+            description,
+            parent_task_id: None,
+            origin: TaskOrigin {
+                agent_path: vec![agent_name],
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn command(&self) -> &str {
+        match &self.kind {
+            TaskKind::Shell { command } => command,
+            TaskKind::Subagent { .. } => "",
+        }
+    }
+
+    pub fn agent_name(&self) -> &str {
+        match &self.kind {
+            TaskKind::Subagent { agent_name } => agent_name,
+            TaskKind::Shell { .. } => self
+                .origin
+                .agent_path
+                .last()
+                .map(String::as_str)
+                .unwrap_or(""),
+        }
+    }
+
+    pub fn is_subagent(&self) -> bool {
+        matches!(self.kind, TaskKind::Subagent { .. })
+    }
 }
 
 /// Where a task stands. Terminal states are committed exactly once, by the
@@ -49,6 +95,11 @@ pub struct TaskMeta {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Running,
+    WaitingApproval,
+    Cancelling,
+    Completed {
+        at: jiff::Timestamp,
+    },
     Exited {
         code: Option<i32>,
         at: jiff::Timestamp,
@@ -72,14 +123,18 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     pub fn is_running(&self) -> bool {
-        matches!(self, TaskStatus::Running)
+        matches!(
+            self,
+            TaskStatus::Running | TaskStatus::WaitingApproval | TaskStatus::Cancelling
+        )
     }
 
     /// Terminal time of a settled task, `None` while `Running`.
     pub fn terminal_at(&self) -> Option<jiff::Timestamp> {
         match self {
-            TaskStatus::Running => None,
-            TaskStatus::Exited { at, .. }
+            TaskStatus::Running | TaskStatus::WaitingApproval | TaskStatus::Cancelling => None,
+            TaskStatus::Completed { at }
+            | TaskStatus::Exited { at, .. }
             | TaskStatus::Killed { at }
             | TaskStatus::Failed { at, .. }
             | TaskStatus::Interrupted { at } => Some(*at),
@@ -90,6 +145,9 @@ impl TaskStatus {
     pub fn describe(&self) -> String {
         match self {
             TaskStatus::Running => "running".into(),
+            TaskStatus::WaitingApproval => "waiting for approval".into(),
+            TaskStatus::Cancelling => "cancelling".into(),
+            TaskStatus::Completed { .. } => "completed".into(),
             TaskStatus::Exited {
                 code: Some(code), ..
             } => format!("exited with code {code}"),
@@ -104,6 +162,10 @@ impl TaskStatus {
 /// One row of the registry's live overview (dashboard / keepalive signal).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSummary {
+    pub kind: TaskKind,
+    pub parent_task_id: Option<TaskId>,
+    pub subtree_active: bool,
+    pub result_available: bool,
     pub id: String,
     pub command: String,
     pub description: String,
@@ -139,6 +201,11 @@ impl TaskNoticeFact {
 /// survives even under a flood.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TaskNotice {
+    Subagent {
+        id: TaskId,
+        agent_name: String,
+        status: TaskStatus,
+    },
     Task {
         id: TaskId,
         command: String,
@@ -172,6 +239,15 @@ impl TaskNotice {
     /// renders, without the engine's own types leaking into the transcript.
     pub fn outcome(&self) -> TaskNoticeOutcome {
         match self {
+            TaskNotice::Subagent {
+                id,
+                agent_name,
+                status,
+            } => TaskNoticeOutcome::Finished {
+                task_id: id.as_str().to_owned(),
+                command: format!("agent__{agent_name}"),
+                status: status.describe(),
+            },
             TaskNotice::Task {
                 id,
                 command,
@@ -197,6 +273,14 @@ impl TaskNotice {
     /// model (and the user, as a notice card) reads.
     pub fn render(&self) -> String {
         match self {
+            TaskNotice::Subagent {
+                id,
+                agent_name,
+                status,
+            } => format!(
+                "Background subagent {agent_name} ({id}) {}.",
+                status.describe()
+            ),
             TaskNotice::Task {
                 id,
                 command,
@@ -268,6 +352,9 @@ pub struct TaskRead {
 /// `Killed` when it tore the process group down in response to cancellation.
 #[derive(Debug)]
 pub enum TaskExit {
+    Completed {
+        answer: String,
+    },
     Exited {
         code: Option<i32>,
     },
@@ -294,10 +381,15 @@ impl TaskEntry {
 
     fn summary(&self, status: TaskStatus) -> TaskSummary {
         TaskSummary {
+            kind: self.record.meta().kind.clone(),
+            parent_task_id: self.record.meta().parent_task_id.clone(),
+            subtree_active: status.is_running(),
+            result_available: self.record.meta().is_subagent()
+                && matches!(status, TaskStatus::Completed { .. }),
             id: self.record.id().as_str().to_owned(),
-            command: self.record.meta().command.clone(),
+            command: self.record.meta().command().to_owned(),
             description: self.record.meta().description.clone(),
-            agent_name: self.record.meta().agent_name.clone(),
+            agent_name: self.record.meta().agent_name().to_owned(),
             status,
             started_at: self.record.started_at(),
         }
@@ -338,6 +430,10 @@ struct OverflowSlot {
 }
 
 struct RegistryState {
+    subagent_slots: HashSet<TaskId>,
+    subagent_notices: HashMap<TaskId, TaskNotice>,
+    cleanup_pending: HashSet<TaskId>,
+    recovered_scopes: HashMap<TaskId, Vec<coda_core::task::ScopeMember>>,
     tasks: HashMap<TaskId, Arc<TaskEntry>>,
     /// Redundant indexes so everything below is answerable while holding this
     /// lock alone — a task's ring/commit locks are never taken under it.
@@ -374,7 +470,15 @@ impl RegistryState {
         self.summaries.insert(id.clone(), summary);
         self.terminal_order.push_back(id);
         if self.terminal_order.len() > MAX_TERMINAL
-            && let Some(oldest) = self.terminal_order.pop_front()
+            && let Some(index) = self.terminal_order.iter().position(|id| {
+                !self.subagent_slots.contains(id)
+                    && !self.cleanup_pending.contains(id)
+                    && !self
+                        .summaries
+                        .values()
+                        .any(|s| s.parent_task_id.as_ref() == Some(id) && s.status.is_running())
+            })
+            && let Some(oldest) = self.terminal_order.remove(index)
         {
             self.tasks.remove(&oldest);
             self.summaries.remove(&oldest);
@@ -388,6 +492,16 @@ impl RegistryState {
     /// observes zero running tasks, the matching notice is already enqueued.
     fn publish(&self) {
         let mut all: Vec<TaskSummary> = self.summaries.values().cloned().collect();
+        for summary in &mut all {
+            summary.subtree_active = summary.status.is_running()
+                || self.summaries.values().any(|child| {
+                    child
+                        .parent_task_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == summary.id)
+                        && child.status.is_running()
+                });
+        }
         all.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
         self.summaries_tx.send_replace(all.into());
     }
@@ -430,7 +544,7 @@ fn notice_into_fact(notice: TaskNotice) -> Option<TaskNoticeFact> {
         TaskNotice::OutputExpired { id, reason, .. } => {
             Some(TaskNoticeFact::OutputExpired { id, reason })
         }
-        TaskNotice::Overflow { .. } => None,
+        TaskNotice::Overflow { .. } | TaskNotice::Subagent { .. } => None,
     }
 }
 
@@ -449,7 +563,7 @@ struct Backend {
 /// Session-scoped background task registry. The owner (hub entry, or the
 /// `Session` itself when self-built) is responsible for calling
 /// [`shutdown`](Self::shutdown) per the ownership rules in the design doc.
-pub struct BackgroundProcesses {
+pub struct BackgroundTasks {
     inner: Arc<Mutex<RegistryState>>,
     summaries_rx: watch::Receiver<Arc<[TaskSummary]>>,
     /// Serializes concurrent `shutdown` calls: the join-before-drain barrier
@@ -459,12 +573,32 @@ pub struct BackgroundProcesses {
     backend: Arc<Backend>,
 }
 
-impl BackgroundProcesses {
+impl BackgroundTasks {
+    pub async fn close_spawns(&self) {
+        self.inner.lock().await.closed = true;
+    }
+
+    pub async fn recovered_scopes(&self) -> Vec<(TaskId, Vec<coda_core::task::ScopeMember>)> {
+        self.inner
+            .lock()
+            .await
+            .recovered_scopes
+            .iter()
+            .map(|(id, members)| (id.clone(), members.clone()))
+            .collect()
+    }
+    pub async fn has_pending_cleanup(&self) -> bool {
+        !self.inner.lock().await.cleanup_pending.is_empty()
+    }
     fn new(backend: Arc<Backend>) -> Self {
         let (summaries_tx, summaries_rx) = watch::channel(Arc::from(Vec::new().into_boxed_slice()));
-        BackgroundProcesses {
+        BackgroundTasks {
             inner: Arc::new(Mutex::new(RegistryState {
                 tasks: HashMap::new(),
+                subagent_slots: HashSet::new(),
+                subagent_notices: HashMap::new(),
+                cleanup_pending: HashSet::new(),
+                recovered_scopes: HashMap::new(),
                 running_count: 0,
                 summaries: HashMap::new(),
                 terminal_order: VecDeque::new(),
@@ -540,6 +674,38 @@ impl BackgroundProcesses {
         }
         drop(inner);
 
+        for id in &inventory.subagents {
+            if let Ok(Some(record)) = archive.open(id).await {
+                let guard = record.lock_commit().await;
+                let current = guard.current();
+                let mut inner = self.inner.lock().await;
+                if current.status.is_running() || current.cleanup_pending {
+                    inner.cleanup_pending.insert(id.clone());
+                    inner
+                        .recovered_scopes
+                        .insert(id.clone(), current.scope_members.clone());
+                }
+                inner.subagent_slots.insert(id.clone());
+                if !current.status.is_running() && current.notice == Some(NoticeDelivery::Pending) {
+                    inner.subagent_notices.insert(
+                        id.clone(),
+                        TaskNotice::Subagent {
+                            id: id.clone(),
+                            agent_name: record.meta().agent_name().to_owned(),
+                            status: current.status.clone(),
+                        },
+                    );
+                    let entry = Arc::new(TaskEntry {
+                        record: record.clone(),
+                        cancel: CancellationToken::new(),
+                    });
+                    inner
+                        .summaries
+                        .insert(id.clone(), entry.summary(current.status.clone()));
+                    inner.tasks.insert(id.clone(), entry);
+                }
+            }
+        }
         for id in inventory.recoverable_running {
             let record = match archive.open(&id).await {
                 Ok(Some(record)) => record,
@@ -559,6 +725,10 @@ impl BackgroundProcesses {
             };
             let mut guard = record.lock_commit().await;
             let mut candidate = guard.current().clone();
+            if record.meta().is_subagent() {
+                candidate.notice = Some(NoticeDelivery::Pending);
+                candidate.cleanup_pending = true;
+            }
             candidate.status = TaskStatus::Interrupted {
                 at: jiff::Timestamp::now(),
             };
@@ -579,22 +749,44 @@ impl BackgroundProcesses {
             // reaches the model the same way a normal completion does.
             let output_tail = terminal_tail(&record).await;
             let mut inner = self.inner.lock().await;
-            inner.push_notice(TaskNotice::Task {
-                id: id.clone(),
-                command: record.meta().command.clone(),
-                description: record.meta().description.clone(),
-                status: status.clone(),
-                output_tail,
-                stdout_overwritten: 0,
-                stderr_overwritten: 0,
-            });
+            if record.meta().is_subagent() {
+                inner.subagent_notices.insert(
+                    id.clone(),
+                    TaskNotice::Subagent {
+                        id: id.clone(),
+                        agent_name: record.meta().agent_name().to_owned(),
+                        status: status.clone(),
+                    },
+                );
+                inner.tasks.insert(
+                    id.clone(),
+                    Arc::new(TaskEntry {
+                        record: record.clone(),
+                        cancel: CancellationToken::new(),
+                    }),
+                );
+            } else {
+                inner.push_notice(TaskNotice::Task {
+                    id: id.clone(),
+                    command: record.meta().command().to_owned(),
+                    description: record.meta().description.clone(),
+                    status: status.clone(),
+                    output_tail,
+                    stdout_overwritten: 0,
+                    stderr_overwritten: 0,
+                });
+            }
             inner.record_terminal(
                 id.clone(),
                 TaskSummary {
+                    kind: record.meta().kind.clone(),
+                    parent_task_id: record.meta().parent_task_id.clone(),
+                    subtree_active: false,
+                    result_available: false,
                     id: id.as_str().to_owned(),
-                    command: record.meta().command.clone(),
+                    command: record.meta().command().to_owned(),
                     description: record.meta().description.clone(),
-                    agent_name: record.meta().agent_name.clone(),
+                    agent_name: record.meta().agent_name().to_owned(),
                     status,
                     started_at: record.started_at(),
                 },
@@ -607,7 +799,7 @@ impl BackgroundProcesses {
     /// process group. Rejection (closed / running limit / quota) has
     /// no side effects; only `kill`/`shutdown` terminate a started task.
     pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<TaskId> {
-        self.register_task(meta, move |ctx| {
+        self.register_task(TaskId::new(), meta, move |ctx| {
             let group = GroupedChild::spawn(&mut cmd)?;
             Ok(run_process(group, ctx))
         })
@@ -622,7 +814,21 @@ impl BackgroundProcesses {
         F: FnOnce(TaskCtx) -> Fut,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
-        self.register_task(meta, move |ctx| Ok(work(ctx))).await
+        self.register_task(TaskId::new(), meta, move |ctx| Ok(work(ctx)))
+            .await
+    }
+
+    pub async fn spawn_identified<F, Fut>(
+        &self,
+        id: TaskId,
+        meta: TaskMeta,
+        work: F,
+    ) -> std::io::Result<TaskId>
+    where
+        F: FnOnce(TaskCtx) -> Fut,
+        Fut: Future<Output = TaskExit> + Send + 'static,
+    {
+        self.register_task(id, meta, move |ctx| Ok(work(ctx))).await
     }
 
     /// Reserve quota, create the archive record, and register the task. The
@@ -632,14 +838,44 @@ impl BackgroundProcesses {
     /// quota lock while waiting for the registry lock. On any failure before
     /// registration no task is published; a process-start failure rolls back
     /// the prepared archive before returning.
-    async fn register_task<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
+    async fn register_task<F, Fut>(
+        &self,
+        id: TaskId,
+        meta: TaskMeta,
+        work: F,
+    ) -> std::io::Result<TaskId>
     where
         F: FnOnce(TaskCtx) -> std::io::Result<Fut>,
         Fut: Future<Output = TaskExit> + Send + 'static,
     {
         let backend = &self.backend;
         let mut inner = self.inner.lock().await;
+        if meta.is_subagent()
+            && (inner.tasks.contains_key(&id)
+                || self
+                    .backend
+                    .archive
+                    .open(&id)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .is_some())
+        {
+            return Ok(id);
+        }
         inner.check_capacity()?;
+        if meta.is_subagent() && inner.subagent_slots.len() >= MAX_FULL_NOTICES {
+            return Err(std::io::Error::other(
+                "too many undelivered subagent results",
+            ));
+        }
+        if let Some(parent) = &meta.parent_task_id {
+            let allowed = inner.tasks.get(parent).is_some_and(|task| {
+                task.record.meta().is_subagent() && !task.cancel.is_cancelled()
+            });
+            if !allowed {
+                return Err(std::io::Error::other("parent background scope is closed"));
+            }
+        }
 
         let outcome = backend.quota.reserve_for_create().await;
         // These facts are already durable even if reservation or archive
@@ -648,7 +884,6 @@ impl BackgroundProcesses {
         let reservation = outcome
             .reservation
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let id = TaskId::new();
         let (record, reservation) = match backend.archive.create(&id, &meta, reservation).await {
             Ok(record) => record,
             Err(error) => {
@@ -688,6 +923,9 @@ impl BackgroundProcesses {
             entry.clone(),
             fut,
         ));
+        if meta.is_subagent() {
+            inner.subagent_slots.insert(id.clone());
+        }
         inner.tasks.insert(id.clone(), entry.clone());
         inner.running_count += 1;
         inner
@@ -702,6 +940,20 @@ impl BackgroundProcesses {
     /// `Ok(None)` for an unknown id; `Err` for a corrupt archive or I/O error. The
     /// cursor is persisted before any bytes are returned, so a failed save
     /// yields an error rather than silently advancing the cursor.
+    /// Non-consuming panel access is restricted to immutable subagent results.
+    pub async fn read_subagent_result(
+        &self,
+        id: &TaskId,
+    ) -> Result<Option<TaskRead>, TaskAccessError> {
+        let Some(record) = self.backend.archive.open(id).await? else {
+            return Ok(None);
+        };
+        if !record.meta().is_subagent() {
+            return Ok(None);
+        }
+        self.read(id).await
+    }
+
     pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
         let backend = &self.backend;
         let Some(record) = backend
@@ -712,6 +964,27 @@ impl BackgroundProcesses {
         else {
             return Ok(None);
         };
+
+        if record.meta().is_subagent() {
+            let guard = record.lock_commit().await;
+            let state = guard.current();
+            let expired = !state.disposition.rings_present();
+            let stdout = if expired || state.status.is_running() {
+                String::new()
+            } else if matches!(state.status, TaskStatus::Completed { .. }) {
+                record.read_result(state.result_bytes).await?
+            } else {
+                state.status.describe()
+            };
+            return Ok(Some(TaskRead {
+                status: state.status.clone(),
+                stdout,
+                stderr: String::new(),
+                stdout_lost: 0,
+                stderr_lost: 0,
+                note: expired.then(|| "subagent result expired".into()),
+            }));
+        }
 
         let mut guard = record.lock_commit().await;
         let state = guard.current().clone();
@@ -792,48 +1065,185 @@ impl BackgroundProcesses {
     /// published terminal summary, not just the status flip, so an immediate
     /// `take_notices` after returning sees the completion. Idempotent; returns
     /// the settled status, `Ok(None)` for an unknown id.
-    pub async fn kill(&self, id: &TaskId) -> Result<Option<TaskStatus>, TaskAccessError> {
-        let backend = &self.backend;
-        let live = self.inner.lock().await.tasks.get(id).cloned();
-        let Some(entry) = live else {
-            // Not live: report the archived task's terminal status, if any.
-            return match backend
-                .archive
-                .open(id)
-                .await
-                .map_err(TaskAccessError::from)?
-            {
-                Some(record) => Ok(Some(record.lock_commit().await.current().status.clone())),
-                None => Ok(None),
-            };
-        };
+    pub async fn contains(&self, id: &TaskId) -> Result<bool, TaskAccessError> {
+        if self.inner.lock().await.tasks.contains_key(id) {
+            return Ok(true);
+        }
+        Ok(self.backend.archive.open(id).await?.is_some())
+    }
 
-        let mut rx = self.summaries_rx.clone();
-        entry.cancel.cancel();
+    pub async fn kill_children(&self, id: &TaskId) {
+        let children: Vec<_> = self
+            .inner
+            .lock()
+            .await
+            .tasks
+            .iter()
+            .filter(|(_, child)| child.record.meta().parent_task_id.as_ref() == Some(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for child in &children {
+            let _ = self.request_kill(child).await;
+        }
+        for child in &children {
+            let _ = self.kill(child).await;
+        }
+    }
+
+    pub async fn wait_terminal(&self, id: &TaskId) {
+        let mut watch = self.summaries_rx.clone();
         loop {
+            if watch
+                .borrow_and_update()
+                .iter()
+                .find(|s| s.id == id.as_str())
+                .is_none_or(|s| !s.status.is_running())
             {
-                let summaries = rx.borrow_and_update();
-                match summaries
-                    .iter()
-                    .find(|summary| summary.id == entry.id().as_str())
-                {
-                    // Terminal in the published snapshot: the commit (notice
-                    // included — publish is its last step) is complete.
-                    Some(summary) if !summary.status.is_running() => {
-                        return Ok(Some(summary.status.clone()));
-                    }
-                    Some(_) => {}
-                    // Absent: reclaimed, which only happens post-commit.
-                    None => break,
-                }
+                return;
             }
-            if rx.changed().await.is_err() {
-                break; // registry gone; fall back to the record's state
+            if watch.changed().await.is_err() {
+                return;
             }
         }
-        Ok(Some(
-            entry.record.lock_commit().await.current().status.clone(),
-        ))
+    }
+
+    pub async fn request_kill(&self, id: &TaskId) -> Result<Option<TaskStatus>, TaskAccessError> {
+        let mut inner = self.inner.lock().await;
+        let mut found = None;
+        let ids: Vec<_> = inner
+            .tasks
+            .iter()
+            .filter(|(key, task)| {
+                *key == id || task.record.meta().parent_task_id.as_ref() == Some(id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in ids {
+            let entry = &inner.tasks[&key];
+            entry.cancel.cancel();
+            if let Some(summary) = inner.summaries.get_mut(&key) {
+                if summary.status.is_running() {
+                    summary.status = TaskStatus::Cancelling;
+                }
+                if &key == id {
+                    found = Some(summary.status.clone());
+                }
+            }
+        }
+        inner.publish();
+        drop(inner);
+        if found.is_none()
+            && let Some(record) = self.backend.archive.open(id).await?
+        {
+            found = Some(record.lock_commit().await.current().status.clone());
+        }
+        Ok(found)
+    }
+
+    pub async fn kill(&self, id: &TaskId) -> Result<Option<TaskStatus>, TaskAccessError> {
+        let Some(mut status) = self.request_kill(id).await? else {
+            return Ok(None);
+        };
+        let mut rx = self.summaries_rx.clone();
+        loop {
+            let active = {
+                let summaries = rx.borrow_and_update();
+                if let Some(summary) = summaries.iter().find(|s| s.id == id.as_str()) {
+                    status = summary.status.clone();
+                }
+                summaries.iter().any(|s| {
+                    (s.id == id.as_str() || s.parent_task_id.as_ref() == Some(id))
+                        && s.status.is_running()
+                })
+            };
+            if !active || rx.changed().await.is_err() {
+                return Ok(Some(status));
+            }
+        }
+    }
+
+    pub async fn set_waiting_approval(
+        &self,
+        id: &TaskId,
+        waiting: bool,
+    ) -> Result<(), TaskAccessError> {
+        let entry = self.inner.lock().await.tasks.get(id).cloned();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let mut guard = entry.record.lock_commit().await;
+        if !guard.current().status.is_running() || entry.cancel.is_cancelled() {
+            return Ok(());
+        }
+        let mut candidate = guard.current().clone();
+        candidate.status = if waiting {
+            TaskStatus::WaitingApproval
+        } else {
+            TaskStatus::Running
+        };
+        guard.commit(candidate.clone()).await?;
+        drop(guard);
+        let mut inner = self.inner.lock().await;
+        if let Some(summary) = inner.summaries.get_mut(id) {
+            summary.status = if entry.cancel.is_cancelled() {
+                TaskStatus::Cancelling
+            } else {
+                candidate.status
+            };
+        }
+        inner.publish();
+        Ok(())
+    }
+
+    pub async fn record_scope(
+        &self,
+        id: &TaskId,
+        members: Vec<coda_core::task::ScopeMember>,
+        cleanup_pending: bool,
+    ) -> Result<(), TaskAccessError> {
+        if cleanup_pending {
+            self.inner.lock().await.cleanup_pending.insert(id.clone());
+        }
+        let record = self
+            .backend
+            .archive
+            .open(id)
+            .await?
+            .ok_or_else(|| std::io::Error::other("unknown background scope"))?;
+        let mut guard = record.lock_commit().await;
+        let mut candidate = guard.current().clone();
+        candidate.scope_members = members;
+        candidate.cleanup_pending = cleanup_pending;
+        guard.commit(candidate).await?;
+        drop(guard);
+        if !cleanup_pending {
+            let mut inner = self.inner.lock().await;
+            inner.cleanup_pending.remove(id);
+            inner.recovered_scopes.remove(id);
+        }
+        self.backend.quota.finalize_terminal(&record).await?;
+        Ok(())
+    }
+
+    pub async fn acknowledge_notice(&self, id: &TaskId) -> Result<(), TaskAccessError> {
+        let record = self
+            .backend
+            .archive
+            .open(id)
+            .await?
+            .ok_or_else(|| std::io::Error::other("unknown subagent notice"))?;
+        let mut guard = record.lock_commit().await;
+        let mut candidate = guard.current().clone();
+        candidate.notice = Some(crate::manifest::NoticeDelivery::Delivered);
+        guard.commit(candidate).await?;
+        drop(guard);
+        {
+            let mut inner = self.inner.lock().await;
+            inner.subagent_notices.remove(id);
+            inner.subagent_slots.remove(id);
+        }
+        self.backend.quota.finalize_terminal(&record).await?;
+        Ok(())
     }
 
     /// Drain accumulated notices (the overflow aggregate last).
@@ -922,6 +1332,9 @@ impl BackgroundProcesses {
 
 fn enqueue_expirations(inner: &mut RegistryState, expirations: Vec<ExpirationFact>) {
     for fact in expirations {
+        if let Some(summary) = inner.summaries.get_mut(&fact.id) {
+            summary.result_available = false;
+        }
         inner.push_notice(TaskNotice::OutputExpired {
             id: fact.id,
             expired_at: fact.expired_at,
@@ -933,6 +1346,7 @@ fn enqueue_expirations(inner: &mut RegistryState, expirations: Vec<ExpirationFac
 /// Drain the notices and the overflow aggregate (aggregate last).
 fn drain_notices(inner: &mut RegistryState) -> Vec<TaskNotice> {
     let mut notices = std::mem::take(&mut inner.notices);
+    notices.extend(inner.subagent_notices.values().cloned());
     if let Some(slot) = inner.overflow.take() {
         notices.push(TaskNotice::Overflow {
             batch_id: slot.batch_id,
@@ -1174,7 +1588,7 @@ async fn monitor_task(
 ) {
     let exit = work.await;
     let record = &entry.record;
-    let outcome = commit_terminal(record, exit).await;
+    let outcome = commit_terminal(record, exit, &backend, &inner).await;
 
     if outcome.persistence_dirty {
         backend.quota.block_spawns();
@@ -1188,15 +1602,26 @@ async fn monitor_task(
 
     let id = record.id().clone();
     let mut inner = inner.lock().await;
-    inner.push_notice(TaskNotice::Task {
-        id: id.clone(),
-        command: record.meta().command.clone(),
-        description: record.meta().description.clone(),
-        status: outcome.status.clone(),
-        output_tail: outcome.tail,
-        stdout_overwritten: outcome.stdout_overwritten,
-        stderr_overwritten: outcome.stderr_overwritten,
-    });
+    if record.meta().is_subagent() {
+        inner.subagent_notices.insert(
+            id.clone(),
+            TaskNotice::Subagent {
+                id: id.clone(),
+                agent_name: record.meta().agent_name().into(),
+                status: outcome.status.clone(),
+            },
+        );
+    } else {
+        inner.push_notice(TaskNotice::Task {
+            id: id.clone(),
+            command: record.meta().command().to_owned(),
+            description: record.meta().description.clone(),
+            status: outcome.status.clone(),
+            output_tail: outcome.tail,
+            stdout_overwritten: outcome.stdout_overwritten,
+            stderr_overwritten: outcome.stderr_overwritten,
+        });
+    }
     inner.running_count -= 1;
     inner.record_terminal(id, entry.summary(outcome.status));
     inner.publish();
@@ -1205,9 +1630,48 @@ async fn monitor_task(
 /// Flush the rings, snapshot the notice tail/overwrite totals, and atomically
 /// commit the terminal manifest. A flush or save failure degrades the task to
 /// `Failed` rather than reporting a clean exit whose output was not persisted.
-async fn commit_terminal(record: &Arc<TaskRecord>, exit: TaskExit) -> TerminalOutcome {
+async fn commit_terminal(
+    record: &Arc<TaskRecord>,
+    mut exit: TaskExit,
+    backend: &Backend,
+    inner: &Mutex<RegistryState>,
+) -> TerminalOutcome {
+    let mut result_bytes = 0;
+    if let TaskExit::Completed { answer } = &exit {
+        let bytes = answer.len() as u64;
+        let reserved = backend.quota.reserve_bytes(bytes).await;
+        {
+            let mut state = inner.lock().await;
+            enqueue_expirations(&mut state, reserved.expirations);
+            state.publish();
+        }
+        match reserved.reservation {
+            Ok(reservation) => match record.write_result(answer.clone()).await {
+                Ok(()) => {
+                    reservation.commit();
+                    result_bytes = bytes;
+                }
+                Err(error) => {
+                    // Preserve the charge until cleanup can prove that no partial file remains.
+                    if record.discard_uncommitted_result().await.is_err() {
+                        reservation.commit();
+                        backend.quota.block_spawns();
+                    }
+                    exit = TaskExit::Failed {
+                        message: format!("subagent result save failed: {error}"),
+                    };
+                }
+            },
+            Err(error) => {
+                exit = TaskExit::Failed {
+                    message: format!("subagent result quota: {error}"),
+                }
+            }
+        }
+    }
     let at = jiff::Timestamp::now();
     let intended = match exit {
+        TaskExit::Completed { .. } => TaskStatus::Completed { at },
         TaskExit::Exited { code } => TaskStatus::Exited { code, at },
         TaskExit::Killed => TaskStatus::Killed { at },
         TaskExit::Failed { message } => TaskStatus::Failed { message, at },
@@ -1232,6 +1696,10 @@ async fn commit_terminal(record: &Arc<TaskRecord>, exit: TaskExit) -> TerminalOu
     }
     let mut candidate = guard.current().clone();
     candidate.status = intended.clone();
+    candidate.result_bytes = result_bytes;
+    if record.meta().is_subagent() {
+        candidate.notice = Some(crate::manifest::NoticeDelivery::Pending);
+    }
     let commit_error = if flush_ok {
         guard.commit(candidate).await.err()
     } else {
@@ -1247,7 +1715,7 @@ async fn commit_terminal(record: &Arc<TaskRecord>, exit: TaskExit) -> TerminalOu
         // Settle the runtime exactly once even when no manifest write works.
         // Then retry persisting that same in-memory Failed state best-effort.
         guard
-            .fail_in_memory(failed.clone())
+            .fail_in_memory(failed.clone(), result_bytes)
             .expect("Running can always degrade to Failed");
         let degraded = guard.current().clone();
         if let Err(retry_error) = guard.commit(degraded).await {
@@ -1294,3 +1762,7 @@ async fn terminal_tail(record: &TaskRecord) -> String {
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registry_subagent_tests.rs"]
+mod subagent_tests;

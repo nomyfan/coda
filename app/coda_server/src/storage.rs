@@ -1,8 +1,12 @@
 use crate::jsonb::Json;
-use crate::schema::{messages, runtime_snapshots, sessions, thread_checkpoints};
+use crate::schema::{
+    aborted_executions, messages, runtime_snapshots, sessions, task_notice_receipts,
+    thread_checkpoints,
+};
 use coda_agent::HistoryEntry;
 use coda_agent::ThreadId;
-use coda_agent::agent::{ReplyTarget, ThreadStateMap};
+use coda_agent::agent::ThreadStateMap;
+use coda_agent::execution::{CleanupReceipt, ExecutionIdentity, ScopeAbort};
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
 use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
@@ -515,7 +519,7 @@ impl WorkspaceStorage {
                         thread_checkpoints::agent_name,
                         thread_checkpoints::parent_thread_id,
                         thread_checkpoints::derivation_key,
-                        thread_checkpoints::reply_target,
+                        thread_checkpoints::active_execution,
                         thread_checkpoints::resume_point,
                         thread_checkpoints::suspended_at,
                     ))
@@ -615,12 +619,16 @@ impl WorkspaceStorage {
                         .execute(conn)
                         .await?;
 
-                    let reply_target = checkpoint.reply_target.clone().map(|Json(mut target)| {
-                        if let Some(mapped) = thread_ids.get(&target.sender_thread_id) {
-                            target.sender_thread_id = mapped.clone();
-                        }
-                        Json(target)
-                    });
+                    let reply_target =
+                        checkpoint.active_execution.clone().map(|Json(mut target)| {
+                            if let coda_agent::execution::CompletionTarget::Caller(reply) =
+                                &mut target.completion
+                                && let Some(mapped) = thread_ids.get(&reply.sender_thread_id)
+                            {
+                                reply.sender_thread_id = mapped.clone();
+                            }
+                            Json(target)
+                        });
                     diesel::insert_into(thread_checkpoints::table)
                         .values((
                             thread_checkpoints::workspace_id.eq(&self.workspace_id),
@@ -632,7 +640,7 @@ impl WorkspaceStorage {
                                 .as_ref()
                                 .map(|parent| &thread_ids[parent])),
                             thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
-                            thread_checkpoints::reply_target.eq(reply_target),
+                            thread_checkpoints::active_execution.eq(reply_target),
                             thread_checkpoints::resume_point.eq(&checkpoint.resume_point),
                             thread_checkpoints::suspended_at.eq(checkpoint.suspended_at),
                             thread_checkpoints::message_count.eq(count as i32),
@@ -1014,7 +1022,7 @@ struct StoredThreadRow {
     agent_name: String,
     parent_thread_id: Option<String>,
     derivation_key: Option<String>,
-    reply_target: Option<Json<ReplyTarget>>,
+    active_execution: Option<Json<coda_agent::execution::StoredExecution>>,
     resume_point: Json<StoredResumePoint>,
     suspended_at: jiff_diesel::Timestamp,
 }
@@ -1022,7 +1030,7 @@ struct StoredThreadRow {
 /// The first thread a persisted snapshot would put back to work on the next
 /// open, if any — matching what `Session::open` treats as a resuming session.
 fn queued_work(snapshot: &StoredRuntimeSnapshot) -> Option<String> {
-    if let Some(thread_id) = snapshot.active_threads.values().next() {
+    if let Some(thread_id) = snapshot.active_threads.keys().next() {
         return Some(thread_id.clone());
     }
     snapshot
@@ -1101,103 +1109,142 @@ impl PgSessionStorage {
         &self,
         thread_id: &str,
         checkpoint: StoredCheckpoint,
+        identity: Option<ExecutionIdentity>,
     ) -> Result<(), String> {
         let mut conn = self.conn().await?;
         conn.transaction(async |conn| {
-            let stored_count: Option<i32> = thread_checkpoints::table
-                .find((&self.workspace_id, &self.session_id, thread_id))
-                .select(thread_checkpoints::message_count)
-                .first(conn)
+            self.write_checkpoint_on(conn, thread_id, checkpoint, identity.as_ref())
                 .await
-                .optional()?;
-            let stored_count = stored_count.unwrap_or(0) as usize;
-
-            // History is append-only, which is what makes appending the tail
-            // equivalent to rewriting the thread. A shorter checkpoint means
-            // someone rewrote history without resetting the count, and appending
-            // from the old count would drop messages silently.
-            if checkpoint.messages.len() < stored_count {
-                return Err(SaveError::Rejected(format!(
-                    "thread {thread_id} has {stored_count} stored messages but the checkpoint \
-                     carries {}; message history is append-only",
-                    checkpoint.messages.len()
-                )));
-            }
-
-            for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
-                let (message_id, role) = message_row_identity(&entry.message);
-                let origin = match &entry.message {
-                    Message::User(message) => message.origin.as_ref(),
-                    _ => None,
-                };
-                diesel::insert_into(messages::table)
-                    .values((
-                        messages::workspace_id.eq(&self.workspace_id),
-                        messages::session_id.eq(&self.session_id),
-                        messages::thread_id.eq(thread_id),
-                        messages::seq.eq((stored_count + offset) as i32),
-                        messages::message_id.eq(message_id.as_uuid()),
-                        messages::turn_id.eq(entry.turn_id.as_uuid()),
-                        messages::role.eq(role),
-                        messages::origin_message_id
-                            .eq(origin.map(|origin| origin.message_id.as_uuid())),
-                        messages::origin_call_id.eq(origin.map(|origin| origin.call_id.as_str())),
-                        messages::payload.eq(Json(&entry.message)),
-                        // Tool state rides on the row that recorded it, so
-                        // `message_count` governs it too and the two cannot
-                        // drift apart.
-                        messages::state.eq(Json(&entry.state)),
-                    ))
-                    .execute(conn)
-                    .await?;
-            }
-
-            let state = (
-                thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
-                thread_checkpoints::parent_thread_id.eq(&checkpoint.parent_thread_id),
-                thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
-                thread_checkpoints::reply_target.eq(checkpoint.reply_target.as_ref().map(Json)),
-                thread_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
-                thread_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
-                thread_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
-                thread_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
-            );
-            diesel::insert_into(thread_checkpoints::table)
-                .values((
-                    thread_checkpoints::workspace_id.eq(&self.workspace_id),
-                    thread_checkpoints::session_id.eq(&self.session_id),
-                    thread_checkpoints::thread_id.eq(thread_id),
-                    state.clone(),
-                ))
-                .on_conflict((
-                    thread_checkpoints::workspace_id,
-                    thread_checkpoints::session_id,
-                    thread_checkpoints::thread_id,
-                ))
-                .do_update()
-                .set(state)
-                .execute(conn)
-                .await?;
-
-            touch(conn, &self.workspace_id, &self.session_id).await?;
-            Ok(())
         })
         .await
-        .map_err(|err| match err {
+        .map_err(|error| match error {
             SaveError::Rejected(message) => message,
-            SaveError::Db(err) => format!("failed to save the checkpoint of {thread_id}: {err}"),
+            SaveError::Db(error) => format!("failed to save checkpoint: {error}"),
         })
+    }
+
+    async fn write_checkpoint_on(
+        &self,
+        conn: &mut AsyncPgConnection,
+        thread_id: &str,
+        checkpoint: StoredCheckpoint,
+        identity: Option<&ExecutionIdentity>,
+    ) -> Result<(), SaveError> {
+        sessions::table
+            .find((&self.workspace_id, &self.session_id))
+            .for_update()
+            .select(sessions::session_id)
+            .first::<String>(conn)
+            .await?;
+        if let Some(identity) = identity {
+            let closed = diesel::select(diesel::dsl::exists(aborted_executions::table.find((
+                &self.workspace_id,
+                &self.session_id,
+                &identity.thread_id,
+                &identity.invocation_id,
+            ))))
+            .get_result::<bool>(conn)
+            .await?;
+            if closed {
+                return Err(SaveError::Rejected("execution was aborted".into()));
+            }
+        }
+        let stored_count: Option<i32> = thread_checkpoints::table
+            .find((&self.workspace_id, &self.session_id, thread_id))
+            .select(thread_checkpoints::message_count)
+            .first(conn)
+            .await
+            .optional()?;
+        let stored_count = stored_count.unwrap_or(0) as usize;
+
+        // History is append-only, which is what makes appending the tail
+        // equivalent to rewriting the thread. A shorter checkpoint means
+        // someone rewrote history without resetting the count, and appending
+        // from the old count would drop messages silently.
+        if checkpoint.messages.len() < stored_count {
+            return Err(SaveError::Rejected(format!(
+                "thread {thread_id} has {stored_count} stored messages but the checkpoint \
+                     carries {}; message history is append-only",
+                checkpoint.messages.len()
+            )));
+        }
+
+        for (offset, entry) in checkpoint.messages[stored_count..].iter().enumerate() {
+            let (message_id, role) = message_row_identity(&entry.message);
+            let origin = match &entry.message {
+                Message::User(message) => message.origin.as_ref(),
+                _ => None,
+            };
+            diesel::insert_into(messages::table)
+                .values((
+                    messages::workspace_id.eq(&self.workspace_id),
+                    messages::session_id.eq(&self.session_id),
+                    messages::thread_id.eq(thread_id),
+                    messages::seq.eq((stored_count + offset) as i32),
+                    messages::message_id.eq(message_id.as_uuid()),
+                    messages::turn_id.eq(entry.turn_id.as_uuid()),
+                    messages::role.eq(role),
+                    messages::origin_message_id
+                        .eq(origin.map(|origin| origin.message_id.as_uuid())),
+                    messages::origin_call_id.eq(origin.map(|origin| origin.call_id.as_str())),
+                    messages::payload.eq(Json(&entry.message)),
+                    // Tool state rides on the row that recorded it, so
+                    // `message_count` governs it too and the two cannot
+                    // drift apart.
+                    messages::state.eq(Json(&entry.state)),
+                ))
+                .execute(conn)
+                .await?;
+        }
+
+        let state = (
+            thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
+            thread_checkpoints::parent_thread_id.eq(&checkpoint.parent_thread_id),
+            thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
+            thread_checkpoints::active_execution.eq(checkpoint.active_execution.as_ref().map(Json)),
+            thread_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
+            thread_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
+            thread_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
+            thread_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
+        );
+        diesel::insert_into(thread_checkpoints::table)
+            .values((
+                thread_checkpoints::workspace_id.eq(&self.workspace_id),
+                thread_checkpoints::session_id.eq(&self.session_id),
+                thread_checkpoints::thread_id.eq(thread_id),
+                state.clone(),
+            ))
+            .on_conflict((
+                thread_checkpoints::workspace_id,
+                thread_checkpoints::session_id,
+                thread_checkpoints::thread_id,
+            ))
+            .do_update()
+            .set(state)
+            .execute(conn)
+            .await?;
+
+        touch(conn, &self.workspace_id, &self.session_id).await?;
+        Ok(())
     }
 
     async fn read_checkpoint(&self, thread_id: &str) -> Result<Option<StoredCheckpoint>, String> {
         let mut conn = self.conn().await?;
+        self.read_checkpoint_on(&mut conn, thread_id).await
+    }
+
+    async fn read_checkpoint_on(
+        &self,
+        conn: &mut AsyncPgConnection,
+        thread_id: &str,
+    ) -> Result<Option<StoredCheckpoint>, String> {
         let state = thread_checkpoints::table
             .find((&self.workspace_id, &self.session_id, thread_id))
             .select((
                 thread_checkpoints::agent_name,
                 thread_checkpoints::parent_thread_id,
                 thread_checkpoints::derivation_key,
-                thread_checkpoints::reply_target,
+                thread_checkpoints::active_execution,
                 thread_checkpoints::resume_point,
                 thread_checkpoints::suspended_at,
             ))
@@ -1205,10 +1252,10 @@ impl PgSessionStorage {
                 String,
                 Option<String>,
                 Option<String>,
-                Option<Json<ReplyTarget>>,
+                Option<Json<coda_agent::execution::StoredExecution>>,
                 Json<StoredResumePoint>,
                 jiff_diesel::Timestamp,
-            )>(&mut conn)
+            )>(&mut *conn)
             .await
             .optional()
             .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?;
@@ -1233,7 +1280,7 @@ impl PgSessionStorage {
             )
             .order(messages::seq)
             .select((messages::turn_id, messages::payload, messages::state))
-            .load::<(uuid::Uuid, Json<Message>, Json<ThreadStateMap>)>(&mut conn)
+            .load::<(uuid::Uuid, Json<Message>, Json<ThreadStateMap>)>(&mut *conn)
             .await
             .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
             .into_iter()
@@ -1249,7 +1296,7 @@ impl PgSessionStorage {
             agent_name,
             parent_thread_id,
             derivation_key,
-            reply_target: reply_target.map(Json::into_inner),
+            active_execution: reply_target.map(Json::into_inner),
             messages,
             resume_point: resume_point.into_inner(),
             suspended_at: suspended_at.to_jiff(),
@@ -1543,12 +1590,169 @@ async fn touch(
 }
 
 impl SessionStorage for PgSessionStorage {
+    fn has_notice_receipt(
+        &self,
+        task_id: coda_core::task::TaskId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            diesel::select(diesel::dsl::exists(task_notice_receipts::table.find((
+                &self.workspace_id,
+                &self.session_id,
+                task_id.as_str(),
+            ))))
+            .get_result::<bool>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+    fn admit_task_notice(
+        &self,
+        task_id: coda_core::task::TaskId,
+        checkpoint: StoredCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            conn.transaction::<_, SaveError, _>(async |conn| {
+                sessions::table
+                    .find((&self.workspace_id, &self.session_id))
+                    .for_update()
+                    .select(sessions::session_id)
+                    .first::<String>(conn)
+                    .await?;
+                let inserted = diesel::insert_into(task_notice_receipts::table)
+                    .values((
+                        task_notice_receipts::workspace_id.eq(&self.workspace_id),
+                        task_notice_receipts::session_id.eq(&self.session_id),
+                        task_notice_receipts::task_id.eq(task_id.as_str()),
+                        task_notice_receipts::message_id.eq(task_id.notice_message_id().as_uuid()),
+                    ))
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .await?;
+                if inserted > 0 {
+                    self.write_checkpoint_on(conn, &self.session_id, checkpoint, None)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| match error {
+                SaveError::Rejected(message) => message,
+                SaveError::Db(error) => error.to_string(),
+            })
+        })
+    }
+
+    fn save_execution_checkpoint(
+        &self,
+        identity: ExecutionIdentity,
+        checkpoint: StoredCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.write_checkpoint(&identity.thread_id.clone(), checkpoint, Some(identity))
+                .await
+        })
+    }
+    fn load_background_checkpoints(
+        &self,
+        _session_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredCheckpoint>, String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let ids = thread_checkpoints::table
+                .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
+                .filter(thread_checkpoints::session_id.eq(&self.session_id))
+                .filter(thread_checkpoints::active_execution.is_not_null())
+                .select(thread_checkpoints::thread_id)
+                .load::<String>(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut checkpoints = vec![];
+            for id in ids {
+                if let Some(checkpoint) = self.read_checkpoint_on(&mut conn, &id).await?
+                    && checkpoint
+                        .active_execution
+                        .as_ref()
+                        .is_some_and(|e| e.background_task().is_some())
+                {
+                    checkpoints.push(checkpoint);
+                }
+            }
+            Ok(checkpoints)
+        })
+    }
+    fn abort_scope(
+        &self,
+        scope: ScopeAbort,
+    ) -> Pin<Box<dyn Future<Output = Result<CleanupReceipt, String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            conn.transaction::<_, SaveError, _>(async |conn| {
+                sessions::table
+                    .find((&self.workspace_id, &self.session_id))
+                    .for_update()
+                    .select(sessions::session_id)
+                    .first::<String>(conn)
+                    .await?;
+                for member in &scope.members {
+                    diesel::insert_into(aborted_executions::table)
+                        .values((
+                            aborted_executions::workspace_id.eq(&self.workspace_id),
+                            aborted_executions::session_id.eq(&self.session_id),
+                            aborted_executions::thread_id.eq(&member.thread_id),
+                            aborted_executions::invocation_id.eq(&member.invocation_id),
+                        ))
+                        .on_conflict_do_nothing()
+                        .execute(conn)
+                        .await?;
+                    if let Some(mut checkpoint) = self
+                        .read_checkpoint_on(conn, &member.thread_id)
+                        .await
+                        .map_err(SaveError::Rejected)?
+                        && checkpoint
+                            .active_execution
+                            .as_ref()
+                            .is_some_and(|e| e.background_task() == Some(&scope.task_id))
+                    {
+                        coda_agent::execution::abort_checkpoint(&mut checkpoint, &scope.reason);
+                        self.write_checkpoint_on(conn, &member.thread_id, checkpoint, None)
+                            .await?;
+                    }
+                }
+                if let Some(Json(mut snapshot)) = runtime_snapshots::table
+                    .find((&self.workspace_id, &self.session_id))
+                    .select(runtime_snapshots::snapshot)
+                    .first::<Json<StoredRuntimeSnapshot>>(conn)
+                    .await
+                    .optional()?
+                {
+                    coda_agent::execution::remove_scope_messages(&mut snapshot, &scope.members);
+                    diesel::update(
+                        runtime_snapshots::table.find((&self.workspace_id, &self.session_id)),
+                    )
+                    .set(runtime_snapshots::snapshot.eq(Json(snapshot)))
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(CleanupReceipt {
+                    task_id: scope.task_id.clone(),
+                })
+            })
+            .await
+            .map_err(|error| match error {
+                SaveError::Rejected(message) => message,
+                SaveError::Db(error) => error.to_string(),
+            })
+        })
+    }
+
     fn save_checkpoint(
         &self,
         thread_id: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move { self.write_checkpoint(&thread_id, checkpoint).await })
+        Box::pin(async move { self.write_checkpoint(&thread_id, checkpoint, None).await })
     }
 
     fn load_checkpoint(
@@ -1574,6 +1778,43 @@ impl SessionStorage for PgSessionStorage {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             conn.transaction(async |conn| {
+                sessions::table
+                    .find((&self.workspace_id, &self.session_id))
+                    .for_update()
+                    .select(sessions::session_id)
+                    .first::<String>(conn)
+                    .await?;
+                let aborted: Vec<_> = aborted_executions::table
+                    .filter(aborted_executions::workspace_id.eq(&self.workspace_id))
+                    .filter(aborted_executions::session_id.eq(&self.session_id))
+                    .select((
+                        aborted_executions::thread_id,
+                        aborted_executions::invocation_id,
+                    ))
+                    .load::<(String, String)>(conn)
+                    .await?
+                    .into_iter()
+                    .map(|(thread_id, invocation_id)| coda_core::task::ScopeMember {
+                        thread_id,
+                        invocation_id,
+                    })
+                    .collect();
+                let active = thread_checkpoints::table
+                    .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
+                    .filter(thread_checkpoints::session_id.eq(&self.session_id))
+                    .select((
+                        thread_checkpoints::thread_id,
+                        thread_checkpoints::active_execution,
+                    ))
+                    .load::<(String, Option<Json<coda_agent::execution::StoredExecution>>)>(conn)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(thread, execution)| {
+                        execution.map(|e| (thread, e.into_inner().invocation_id))
+                    })
+                    .collect();
+                let mut snapshot = snapshot;
+                coda_agent::execution::fence_snapshot(&mut snapshot, &aborted, &active);
                 diesel::insert_into(runtime_snapshots::table)
                     .values((
                         runtime_snapshots::workspace_id.eq(&self.workspace_id),

@@ -10,7 +10,7 @@ use coda_core::tool::{Tool, ToolCallContext, ToolResult};
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
-use coda_process::{BackgroundProcesses, TaskId};
+use coda_process::{BackgroundTasks, TaskId};
 
 fn unknown_task(id: &str) -> String {
     format!(
@@ -37,11 +37,11 @@ pub struct TaskOutputToolParams {
 
 pub struct TaskOutputTool {
     schema: Schema,
-    background: Arc<BackgroundProcesses>,
+    background: Arc<BackgroundTasks>,
 }
 
 impl TaskOutputTool {
-    pub fn new(background: Arc<BackgroundProcesses>) -> Self {
+    pub fn new(background: Arc<BackgroundTasks>) -> Self {
         TaskOutputTool {
             schema: schemars::schema_for!(TaskOutputToolParams),
             background,
@@ -58,9 +58,8 @@ impl Tool for TaskOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Read a background task's status and the output it produced since \
-         the previous read. Each call returns only new output; call again \
-         later for more."
+        "Read a background task. Shell output is incremental; subagent results \
+         include the complete final answer and can be read repeatedly."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -128,11 +127,11 @@ pub struct TaskKillToolParams {
 
 pub struct TaskKillTool {
     schema: Schema,
-    background: Arc<BackgroundProcesses>,
+    background: Arc<BackgroundTasks>,
 }
 
 impl TaskKillTool {
-    pub fn new(background: Arc<BackgroundProcesses>) -> Self {
+    pub fn new(background: Arc<BackgroundTasks>) -> Self {
         TaskKillTool {
             schema: schemars::schema_for!(TaskKillToolParams),
             background,
@@ -149,9 +148,8 @@ impl Tool for TaskKillTool {
     }
 
     fn description(&self) -> &str {
-        "Terminate a background task (SIGKILL to its whole process group). \
-         Idempotent: for a task that already finished, reports its final \
-         status."
+        "Stop a background task and the work it owns, including synchronous \
+         subagents and background shell processes. Repeated stops are harmless."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -162,7 +160,7 @@ impl Tool for TaskKillTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let background = self.background.clone();
         async move {
@@ -170,7 +168,12 @@ impl Tool for TaskKillTool {
                 Ok(id) => id,
                 Err(msg) => return Ok(msg),
             };
-            match background.kill(&id).await {
+            let result = if ctx.background_task.as_ref() == Some(&id) {
+                background.request_kill(&id).await
+            } else {
+                background.kill(&id).await
+            };
+            match result {
                 Ok(None) => Ok(unknown_task(&params.id)),
                 Ok(Some(status)) => Ok(format!("Task {}: {}.", params.id, status.describe())),
                 Err(e) => Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
@@ -192,16 +195,54 @@ mod tests {
     }
 
     fn meta(command: &str) -> TaskMeta {
-        TaskMeta {
-            command: command.into(),
-            description: "test task".into(),
-            agent_name: "coda".into(),
-        }
+        TaskMeta::shell(command.into(), "test task".into(), "coda".into())
+    }
+
+    #[tokio::test]
+    async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
+        let background = Arc::new(BackgroundTasks::temporary().unwrap());
+        let id = coda_process::TaskId::new();
+        let own_id = id.clone();
+        let tool = TaskKillTool::new(background.clone());
+        let meta = coda_process::TaskMeta {
+            kind: coda_process::TaskKind::Subagent {
+                agent_name: "worker".into(),
+            },
+            description: "self stop".into(),
+            parent_task_id: None,
+            origin: Default::default(),
+        };
+        background
+            .spawn_identified(id.clone(), meta, move |_| async move {
+                let mut ctx = ToolCallContext::default();
+                ctx.background_task = Some(own_id.clone());
+                tool.execute(
+                    TaskKillToolParams {
+                        id: own_id.to_string(),
+                    },
+                    ctx,
+                )
+                .await
+                .unwrap();
+                coda_process::TaskExit::Killed
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            background.wait_terminal(&id),
+        )
+        .await
+        .expect("self stop must not wait on its own monitor");
+        assert!(matches!(
+            background.read(&id).await.unwrap().unwrap().status,
+            coda_process::TaskStatus::Killed { .. }
+        ));
     }
 
     #[tokio::test]
     async fn task_output_reads_incrementally_and_reports_expiry() {
-        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+        let background = Arc::new(BackgroundTasks::temporary().unwrap());
         let id = background
             .spawn(bash("echo first; sleep 39.01"), meta("stream"))
             .await
@@ -258,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_kill_terminates_and_is_idempotent() {
-        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+        let background = Arc::new(BackgroundTasks::temporary().unwrap());
         let id = background
             .spawn(bash("sleep 39.21"), meta("victim"))
             .await

@@ -120,6 +120,8 @@ export type HistoryMessage =
   | { TaskNotice: TaskNoticeMessage };
 
 export type PendingApproval = {
+  task_id: string | null;
+  agent_path: string[];
   thread_id: string;
   agent_name: string;
   /** The assistant message that asked for these calls — the batch's identity.
@@ -285,7 +287,26 @@ type Snapshot = {
 /** One background task, as the dashboard lists it. `status` is the server's
  * humanized label; `running` is what the UI groups on, so the client never
  * parses that label. */
+export type TaskStatus =
+  | "Running"
+  | "WaitingApproval"
+  | "Cancelling"
+  | { Completed: { at: string } }
+  | { Exited: { code: number | null; at: string } }
+  | { Killed: { at: string } }
+  | { Failed: { message: string; at: string } }
+  | { Interrupted: { at: string } };
+export type TaskResult =
+  | { state: "unknown" }
+  | { state: "pending" | "expired"; status: string }
+  | { state: "available"; status: string; answer: string }
+  | { state: "error"; message: string };
 export type TaskSummary = {
+  kind: { kind: "shell"; command: string } | { kind: "subagent"; agent_name: string };
+  task_status: TaskStatus;
+  parent_task_id: string | null;
+  subtree_active: boolean;
+  result_available: boolean;
   id: string;
   command: string;
   description: string;
@@ -416,6 +437,18 @@ export type RpcRequests = {
    * answer with the id it minted for the user message, letting the client key
    * that message the same way the server does. Rejects with SESSION_NOT_IDLE
    * while another turn is active, including one awaiting approval. */
+  resume: RpcRequest<
+    {
+      allow_patterns?: [string, string][];
+      workspace_id: string;
+      session_id: string;
+      agent_name: string;
+      thread_id: string;
+      decision: ResumeDecision;
+    },
+    { accepted: boolean }
+  >;
+  get_task_result: RpcRequest<SessionRef & { task_id: string }, TaskResult>;
   task: RpcRequest<
     {
       workspace_id: string;
@@ -449,13 +482,6 @@ export type RpcRequests = {
  * is the `Notif` schema the typed `RpcClient` keys `notify(...)` on.
  */
 export type RpcNotifications = {
-  resume: {
-    workspace_id: string;
-    session_id: string;
-    agent_name: string;
-    thread_id: string;
-    decision: ResumeDecision;
-  };
   abort: SessionRef;
   /** Stop a background task. Fire-and-forget like `abort`: the answer is the
    * task list, which the server pushes on its own. */
@@ -474,6 +500,20 @@ export type RpcPushes = {
 };
 
 export type WireEvent =
+  | {
+      type: "approval_removed";
+      agent_name: string;
+      thread_id: string;
+      parent_message_id: string;
+      task_id: string | null;
+    }
+  | {
+      type: "background_error";
+      agent_name: string;
+      thread_id: string;
+      task_id: string;
+      message: string;
+    }
   | {
       type: "llm_start";
       agent_name: string;
@@ -569,7 +609,7 @@ export function outcomeText(outcome: ToolCallOutcome): string {
 }
 
 export function approvalKey(approval: PendingApproval): string {
-  return `${approval.agent_name}:${approval.thread_id}`;
+  return `${approval.thread_id}:${approval.parent_message_id}`;
 }
 
 /**

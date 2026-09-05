@@ -37,11 +37,7 @@ impl SessionQuota {
 }
 
 fn meta() -> TaskMeta {
-    TaskMeta {
-        command: "c".into(),
-        description: "d".into(),
-        agent_name: "coda".into(),
-    }
+    TaskMeta::shell("c".into(), "d".into(), "coda".into())
 }
 
 fn archive() -> (tempfile::TempDir, Arc<TaskArchive>) {

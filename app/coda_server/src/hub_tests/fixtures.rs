@@ -85,9 +85,7 @@ impl LLMProvider for TestProvider {
                     .iter()
                     .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "read_todos"));
                 if has_result {
-                    Self::completed(assistant(
-                        "should not settle: resync should have fired first",
-                    ))
+                    Self::completed(assistant("completed after live resync"))
                 } else {
                     let mut msg = assistant("");
                     msg.tool_calls = (0..(RelayConfig::default().max_message_tier_events + 10))
@@ -479,7 +477,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Option<Arc<coda_process::BackgroundProcesses>>,
+        background: Option<Arc<coda_process::BackgroundTasks>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls
@@ -802,7 +800,7 @@ pub(super) async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState
 
 /// The entry's background task registry, so a test can start and settle tasks
 /// the way `shell` would.
-pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundProcesses> {
+pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundTasks> {
     let entry = hub.get_entry(&key()).expect("a live entry");
     let guard = entry.inner.clone().lock_owned().await;
     guard
@@ -820,11 +818,7 @@ pub(super) fn spool_dir(opener: &TestOpener, key: &SessionKey) -> std::path::Pat
 
 /// Metadata for a test task.
 pub(super) fn task_meta(command: &str) -> coda_process::TaskMeta {
-    coda_process::TaskMeta {
-        command: command.into(),
-        description: "test task".into(),
-        agent_name: "coda".into(),
-    }
+    coda_process::TaskMeta::shell(command.into(), "test task".into(), "coda".into())
 }
 
 /// Await the next `RelayEvent` matching `pred`, skipping others.

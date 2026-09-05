@@ -19,7 +19,7 @@ use crate::{
     ToolCallResolution,
 };
 use coda_core::llm::{LLMProvider, Message, MessageId, TaskNoticeOutcome, TurnId};
-use coda_process::BackgroundProcesses;
+use coda_process::BackgroundTasks;
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,7 +167,7 @@ pub struct SessionBuilder<'a, P: LLMProvider + Clone> {
 /// `Option` would conflate with `SelfBuilt`.
 enum BackgroundSource {
     SelfBuilt,
-    Injected(Option<Arc<BackgroundProcesses>>),
+    Injected(Option<Arc<BackgroundTasks>>),
 }
 
 impl<P: LLMProvider + Clone> Default for SessionBuilder<'_, P> {
@@ -225,7 +225,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     ///
     /// Without this call the session builds a private registry and
     /// [`Session::shutdown`] tears it down once the runtime has exited.
-    pub fn background(mut self, registry: Option<Arc<BackgroundProcesses>>) -> Self {
+    pub fn background(mut self, registry: Option<Arc<BackgroundTasks>>) -> Self {
         self.background = BackgroundSource::Injected(registry);
         self
     }
@@ -267,7 +267,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         let (background, owns_background) =
             match std::mem::replace(&mut self.background, BackgroundSource::Injected(None)) {
                 BackgroundSource::Injected(registry) => (registry, false),
-                BackgroundSource::SelfBuilt => match BackgroundProcesses::temporary() {
+                BackgroundSource::SelfBuilt => match BackgroundTasks::temporary() {
                     Ok(registry) => (Some(Arc::new(registry)), true),
                     Err(error) => {
                         tracing::warn!(%error, "could not create a temporary background archive");
@@ -289,6 +289,53 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .take()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        // Background executions never resume after a process restart. Check both
+        // archives and checkpoints: either side may be the last durable write.
+        let mut interrupted: HashMap<coda_core::task::TaskId, Vec<coda_core::task::ScopeMember>> =
+            match &background {
+                Some(registry) => registry.recovered_scopes().await.into_iter().collect(),
+                None => HashMap::new(),
+            };
+        for checkpoint in storage
+            .load_background_checkpoints(&session_id)
+            .await
+            .map_err(OpenError::Storage)?
+        {
+            if let Some(execution) = checkpoint.active_execution
+                && let Some(id) = execution.background_task()
+            {
+                let members = interrupted.entry(id.clone()).or_default();
+                let member = coda_core::task::ScopeMember {
+                    thread_id: checkpoint.thread_id,
+                    invocation_id: execution.invocation_id,
+                };
+                if !members.contains(&member) {
+                    members.push(member);
+                }
+            }
+        }
+        for (task_id, members) in interrupted {
+            storage
+                .abort_scope(crate::execution::ScopeAbort {
+                    task_id: task_id.clone(),
+                    members: members.clone(),
+                    reason: "Background execution interrupted by server restart".into(),
+                })
+                .await
+                .map_err(OpenError::Storage)?;
+            if let Some(registry) = &background
+                && registry
+                    .contains(&task_id)
+                    .await
+                    .map_err(|e| OpenError::Storage(e.to_string()))?
+            {
+                registry
+                    .record_scope(&task_id, members, false)
+                    .await
+                    .map_err(|e| OpenError::Storage(e.to_string()))?;
+            }
+        }
+
         // Load resumed state BEFORE bootstrap so we can (a) surface root history
         // via `resumed_messages` and (b) detect pending approvals on *any*
         // agent in the snapshot, not just the root.
@@ -296,7 +343,25 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .load_session_snapshot(&session_id)
             .await
             .map_err(OpenError::Storage)?;
-        let snapshot: Option<AgentRuntimeSnapshot> = stored_snapshot.map(Into::into);
+        let mut snapshot: Option<AgentRuntimeSnapshot> = stored_snapshot.map(Into::into);
+        if let Some(checkpoint) = storage
+            .load_checkpoint(&session_id)
+            .await
+            .map_err(OpenError::Storage)?
+            && checkpoint.active_execution.is_some()
+            && checkpoint.messages.iter().any(|entry| {
+                matches!(&entry.message, Message::TaskNotice(_))
+                    && checkpoint
+                        .messages
+                        .last()
+                        .is_some_and(|last| last.turn_id == entry.turn_id)
+            })
+        {
+            snapshot
+                .get_or_insert_with(Default::default)
+                .active_threads
+                .insert(session_id.clone(), root_name.clone());
+        }
 
         // Turn tags stay server-side: callers get the conversation, not the
         // control-flow metadata around it.
@@ -378,30 +443,21 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             let Some(decision) = resume_decisions.remove(&approval.thread_id) else {
                 continue;
             };
-            if resume_targets
-                .insert(
-                    approval.agent_name.clone(),
-                    ResumeTarget {
-                        thread_id: ThreadId::from(approval.thread_id.clone()),
-                        decision,
-                    },
-                )
-                .is_some()
-            {
-                // One agent task drives one thread at a time, so a second
-                // suspended thread for the same agent cannot be resumed in this
-                // run; it stays parked and is offered again on the next open.
-                warn!(
-                    "agent {} has more than one suspended thread; resuming only {}",
-                    approval.agent_name, approval.thread_id
-                );
-            }
+            resume_targets.insert(
+                approval.thread_id.clone(),
+                ResumeTarget {
+                    agent_name: approval.agent_name.clone(),
+                    thread_id: ThreadId::from(approval.thread_id.clone()),
+                    decision,
+                },
+            );
         }
         for thread_id in resume_decisions.keys() {
             warn!("discarding a resume decision for unsuspended thread {thread_id}");
         }
 
         let mut runtime = AgentRuntime::new(storage, session_id.clone());
+        runtime.background = background.clone();
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
         let events_rx = runtime.subscribe();
@@ -455,6 +511,15 @@ async fn collect_pending_approvals(
             )));
         }
         pending.push(PendingApproval {
+            task_id: stored
+                .active_execution
+                .as_ref()
+                .and_then(|e| e.background_task().cloned()),
+            agent_path: stored
+                .active_execution
+                .as_ref()
+                .map(|e| e.agent_path.clone())
+                .unwrap_or_else(|| vec![stored.agent_name.clone()]),
             thread_id: stored.thread_id,
             agent_name: stored.agent_name,
             parent_message_id,
@@ -475,7 +540,7 @@ struct SessionInner {
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
     events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
-    background: Option<Arc<BackgroundProcesses>>,
+    background: Option<Arc<BackgroundTasks>>,
     /// Self-built registry (no [`SessionBuilder::background`]): `shutdown`
     /// tears it down once the runtime has confirmedly exited. An injected
     /// registry is never touched — its external owner manages its lifecycle.
@@ -491,6 +556,23 @@ pub struct Session {
 impl Session {
     pub fn builder<'a, P: LLMProvider + Clone + 'static>() -> SessionBuilder<'a, P> {
         SessionBuilder::new()
+    }
+
+    pub fn pending_approvals(&self) -> Vec<PendingApproval> {
+        self.inner.runtime.pending_approvals()
+    }
+    pub fn has_background_work(&self) -> bool {
+        self.inner.runtime.has_background_work()
+    }
+
+    pub async fn live_snapshot(
+        &self,
+    ) -> Result<(Vec<Message>, Vec<PendingApproval>, bool), String> {
+        let messages = self.inner.runtime.live_messages().await?;
+        let approvals = self.pending_approvals();
+        let running =
+            self.inner.runtime.root_turn_active() && !approvals.iter().any(|a| a.task_id.is_none());
+        Ok((messages, approvals, running))
     }
 
     pub fn session_id(&self) -> &str {
@@ -550,6 +632,18 @@ impl Session {
         content: impl Into<String>,
     ) -> Result<(), SendCommandError> {
         self.send_task(message_id, content.into(), Vec::new(), Some(outcomes))
+            .await
+    }
+
+    pub async fn send_background_notice(
+        &self,
+        task_id: coda_core::task::TaskId,
+        outcomes: Vec<TaskNoticeOutcome>,
+        content: String,
+    ) -> Result<bool, String> {
+        self.inner
+            .runtime
+            .admit_background_notice(self.inner.root_name.clone(), task_id, outcomes, content)
             .await
     }
 
@@ -647,11 +741,17 @@ impl Session {
     /// guarantees that none of them is still running once this returns.
     /// The session's background task registry (injected or self-built), or
     /// `None` for a session running without background work.
-    pub fn background(&self) -> Option<&Arc<BackgroundProcesses>> {
+    pub fn background(&self) -> Option<&Arc<BackgroundTasks>> {
         self.inner.background.as_ref()
     }
 
     pub async fn shutdown(&self, mode: Shutdown) -> bool {
+        if self.inner.owns_background
+            && let Some(background) = &self.inner.background
+        {
+            background.close_spawns().await;
+        }
+        self.inner.runtime.stop_background().await;
         let stopped_as_requested = self.stop_runtime(mode).await;
         // `stop_runtime` never returns while agent tasks are still running: a
         // bounded wait force-aborts stragglers. Its result reports the policy

@@ -1,26 +1,56 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { ListChecks, Square, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import type { TaskSummary } from "@/lib/protocol";
+import type { TaskSummary, TaskResult } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
-import { killBackgroundTask, selectActiveBackgroundTasks, useCodaStore } from "@/store/session";
+import {
+  getBackgroundTaskResult,
+  killBackgroundTask,
+  selectActiveBackgroundTasks,
+  useCodaStore,
+} from "@/store/session";
 
 /** Running first, then most recently started — the ones still worth watching
  * stay at the top as older ones settle beneath them. */
 export function orderTasks(tasks: TaskSummary[]): TaskSummary[] {
-  return [...tasks].sort((a, b) => {
-    if (a.running !== b.running) {
-      return a.running ? -1 : 1;
+  const sorted = [...tasks].sort((a, b) => {
+    if (a.subtree_active !== b.subtree_active) {
+      return a.subtree_active ? -1 : 1;
     }
     return b.started_at.localeCompare(a.started_at);
   });
+  const ids = new Set(tasks.map((task) => task.id));
+  return sorted
+    .filter((task) => !task.parent_task_id || !ids.has(task.parent_task_id))
+    .flatMap((parent) => [parent, ...sorted.filter((child) => child.parent_task_id === parent.id)]);
 }
 
 function TaskRow({ task }: { task: TaskSummary }) {
   const started = formatClockTime(task.started_at);
+  const label = task.kind.kind === "subagent" ? task.kind.agent_name : task.command;
+  const [result, setResult] = useState<TaskResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const showResult = async () => {
+    setLoading(true);
+    try {
+      setResult(await getBackgroundTaskResult(task.id));
+    } catch (error) {
+      setResult({
+        state: "error",
+        message: error instanceof Error ? error.message : "Could not load result",
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
   return (
-    <li className="rounded-md border border-border/60 px-2.5 py-2">
+    <li
+      className={cn(
+        "rounded-md border border-border/60 px-2.5 py-2",
+        task.parent_task_id && "ml-4",
+      )}
+    >
       <div className="flex items-center gap-2">
         <span
           aria-hidden
@@ -29,17 +59,17 @@ function TaskRow({ task }: { task: TaskSummary }) {
             task.running ? "animate-pulse bg-primary" : "bg-muted-foreground/40",
           )}
         />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs" title={task.command}>
-          {task.command}
+        <span className="min-w-0 flex-1 truncate font-mono text-xs" title={label}>
+          {label}
         </span>
-        {task.running ? (
+        {task.subtree_active ? (
           <Button
             variant="ghost"
             size="icon"
             className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
             onClick={() => killBackgroundTask(task.id)}
             title="Stop this task"
-            aria-label={`Stop ${task.command}`}
+            aria-label={`Stop ${label}`}
           >
             <Square className="size-3" />
           </Button>
@@ -56,6 +86,26 @@ function TaskRow({ task }: { task: TaskSummary }) {
         {/* Only worth naming when it wasn't the session's own agent. */}
         {task.agent_name && task.agent_name !== "coda" ? <span>· {task.agent_name}</span> : null}
       </div>
+      {task.kind.kind === "subagent" && !task.running ? (
+        <div className="mt-2">
+          <Button variant="ghost" size="sm" disabled={loading} onClick={showResult}>
+            {loading ? "Loading…" : result ? "Refresh result" : "View result"}
+          </Button>
+          {result ? (
+            <div className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs">
+              {result.state === "available"
+                ? result.answer
+                : result.state === "expired"
+                  ? "Result expired"
+                  : result.state === "unknown"
+                    ? "Task not found"
+                    : result.state === "error"
+                      ? result.message
+                      : result.status}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </li>
   );
 }
@@ -64,7 +114,7 @@ function TaskList({ tasks }: { tasks: TaskSummary[] }) {
   if (tasks.length === 0) {
     return (
       <p className="px-1 py-6 text-center text-xs text-muted-foreground">
-        No background tasks yet. Long-running shell commands run here instead of holding up the
+        No background tasks yet. Background agents and shell commands can keep working alongside the
         conversation.
       </p>
     );

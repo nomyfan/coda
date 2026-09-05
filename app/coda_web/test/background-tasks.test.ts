@@ -176,6 +176,11 @@ test("the task list arrives with the snapshot and is replaced by its own push", 
 test("running tasks sort ahead of settled ones, newest first", () => {
   const task = (id: string, running: boolean, startedAt: string): TaskSummary => ({
     id,
+    kind: { kind: "shell", command: id },
+    task_status: running ? "Running" : { Exited: { code: 0, at: startedAt } },
+    parent_task_id: null,
+    subtree_active: running,
+    result_available: false,
     command: id,
     description: "",
     agent_name: "coda",
@@ -220,5 +225,36 @@ test("one notice covering several tasks is titled by count, not by the first one
       // A single command would be misleading when the notice covers two.
       detail: undefined,
     }),
+  ]);
+});
+
+test("an active shell stays immediately below its completed subagent parent", () => {
+  const task = (id: string, startedAt: string): TaskSummary => ({
+    id,
+    kind: { kind: "shell", command: id },
+    command: id,
+    task_status: "Running",
+    description: "",
+    agent_name: "worker",
+    status: "running",
+    running: true,
+    subtree_active: true,
+    parent_task_id: null,
+    result_available: false,
+    started_at: startedAt,
+  });
+  const parent: TaskSummary = {
+    ...task("parent", "2026-09-01T00:00:00Z"),
+    kind: { kind: "subagent", agent_name: "worker" },
+    running: false,
+    result_available: true,
+    task_status: { Completed: { at: "2026-09-01T00:00:01Z" } },
+  };
+  const child = { ...task("child", "2026-09-01T00:00:03Z"), parent_task_id: "parent" };
+  const other = task("other", "2026-09-01T00:00:02Z");
+  expect(orderTasks([child, other, parent]).map((task) => task.id)).toEqual([
+    "other",
+    "parent",
+    "child",
   ]);
 });

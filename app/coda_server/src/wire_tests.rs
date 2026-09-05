@@ -29,6 +29,7 @@ fn open_session_params_defaults_takeover_off() {
 #[test]
 fn resume_params_roundtrips() {
     let params = ResumeParams {
+        allow_patterns: vec![],
         workspace_id: "coda".into(),
         session_id: "s1".into(),
         agent_name: "coda".into(),
@@ -200,6 +201,8 @@ fn model_selection_roundtrips() {
 #[test]
 fn pending_approval_wire_suggests_shell_allow_patterns() {
     let approval = PendingApproval {
+        task_id: None,
+        agent_path: vec![],
         thread_id: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
@@ -234,6 +237,8 @@ fn pending_approval_wire_suggests_shell_allow_patterns() {
 #[test]
 fn pending_approval_wire_skips_compound_shell_calls() {
     let approval = PendingApproval {
+        task_id: None,
+        agent_path: vec![],
         thread_id: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
@@ -253,6 +258,8 @@ fn pending_approval_wire_skips_compound_shell_calls() {
 #[test]
 fn pending_approval_wire_skips_shell_calls_with_only_comments() {
     let approval = PendingApproval {
+        task_id: None,
+        agent_path: vec![],
         thread_id: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
@@ -272,6 +279,8 @@ fn pending_approval_wire_skips_shell_calls_with_only_comments() {
 #[test]
 fn pending_approval_wire_skips_unresolvable_shell_calls() {
     let approval = PendingApproval {
+        task_id: None,
+        agent_path: vec![],
         thread_id: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
@@ -437,4 +446,36 @@ fn skill_catalog_roundtrips() {
         serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
     assert_eq!(back.skills[0].name, "code-review");
     assert_eq!(back.skills[0].description, "Review the current diff");
+}
+
+#[test]
+fn background_control_events_match_the_web_json_fixture() {
+    let task_id: coda_core::task::TaskId = "bg_00000000000000000000000000000001".parse().unwrap();
+    let events = vec![
+        WireEvent::ApprovalRemoved {
+            agent_name: "coda".into(),
+            thread_id: "s1".into(),
+            parent_message_id: uuid::Uuid::from_u128(1).into(),
+            task_id: None,
+        },
+        WireEvent::ApprovalRemoved {
+            agent_name: "worker".into(),
+            thread_id: "child".into(),
+            parent_message_id: uuid::Uuid::from_u128(2).into(),
+            task_id: Some(task_id.clone()),
+        },
+        WireEvent::BackgroundError {
+            agent_name: "worker".into(),
+            thread_id: "child".into(),
+            task_id,
+            message: "checkpoint failed".into(),
+        },
+    ];
+    let serialized = serde_json::to_string(&events).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../coda_web/test/fixtures/background-events.json"
+    ))
+    .unwrap();
+    assert_eq!(actual, fixture);
 }

@@ -22,7 +22,7 @@ use coda_agent::{
     runtime::SendCommandError,
 };
 use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
-use coda_process::{ArchiveDir, BackgroundProcesses, TaskNotice, TaskSummary};
+use coda_process::{ArchiveDir, BackgroundTasks, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};
@@ -55,6 +55,7 @@ pub enum SessionCommand {
         images: Vec<String>,
     },
     Resume {
+        allow_patterns: Vec<(String, String)>,
         agent_name: String,
         thread_id: String,
         decision: ResumeDecision,
@@ -89,6 +90,9 @@ pub enum SessionCommand {
     /// SIGKILL a background task's process group. Needs no live runtime — the
     /// registry belongs to the entry — so it works while a turn is in flight,
     /// which is exactly when a user watching a runaway task wants it.
+    GetTaskResult {
+        task_id: String,
+    },
     KillTask {
         task_id: String,
     },
@@ -167,7 +171,10 @@ pub enum CommandOutcome {
     /// A `Task` was accepted, carrying the id minted for the user message it
     /// became. The request dispatcher answers the client with it so the client
     /// and the server name that message the same way.
-    TaskAccepted { message_id: MessageId },
+    TaskAccepted {
+        message_id: MessageId,
+    },
+    TaskResult(crate::wire::TaskResultWire),
     /// The command was not applied: stale connection, invalid state, or the
     /// session did not accept it (e.g. runtime channel closed). Logged;
     /// nothing to send. For a `SetModel`, the request dispatcher reads this as
@@ -214,10 +221,15 @@ pub enum CommandOutcome {
     /// The messages themselves are not here on purpose — the client gets them
     /// from the snapshot pushed alongside, so only one path writes the
     /// transcript and it cannot render them twice.
-    Compacted { applied: bool },
+    Compacted {
+        applied: bool,
+    },
     /// A `Compact` that wrote nothing: the conversation moved on while the
     /// summary was being generated, or the write failed.
-    CompactionAbandoned { stale: bool, reason: String },
+    CompactionAbandoned {
+        stale: bool,
+        reason: String,
+    },
     /// A `Compact` refused because the root thread has nothing to summarize.
     CompactionEmpty,
     /// The replacement runtime was valid, but persisting its effort failed;
@@ -277,6 +289,14 @@ pub enum CompactError {
 /// Builds sessions for the relay. Injected at construction: configuration is
 /// available on every instance, so commands never need to carry build logic.
 pub trait SessionOpener: Send + Sync + 'static {
+    fn persist_allow_patterns<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        _patterns: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Open (or resume) the session for `key`, seeded with `decisions` for any
     /// pending approvals carried over from a prior suspension.
     ///
@@ -290,7 +310,7 @@ pub trait SessionOpener: Send + Sync + 'static {
         reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Option<Arc<BackgroundProcesses>>,
+        background: Option<Arc<BackgroundTasks>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>>;
 
     /// Open the on-disk archive holding `key`'s background task output. Its
@@ -503,7 +523,7 @@ pub fn event_settles_turn(event: &WireEvent, root_name: &str) -> bool {
             message,
             ..
         } => agent_name == root_name && message.tool_calls.is_empty() && !message.aborted,
-        WireEvent::Suspended { .. } => true,
+        WireEvent::Suspended { approval, .. } => approval.task_id.is_none(),
         WireEvent::Aborted { agent_name, .. } | WireEvent::Error { agent_name, .. } => {
             agent_name == root_name
         }
@@ -778,7 +798,7 @@ struct EntryState {
     /// for the same reason `permission_mode` does, and more: a task belongs to
     /// the session, so it has to outlive the `SetModel` rebuild that replaces
     /// the whole runtime underneath it.
-    background: Option<Option<Arc<BackgroundProcesses>>>,
+    background: Option<Option<Arc<BackgroundTasks>>>,
     /// Task notices waiting for a turn to deliver them in. Drained from the
     /// registry as soon as they appear; each one opens its own turn, so they
     /// queue here whenever the session is busy. A non-empty queue keeps the
@@ -942,6 +962,9 @@ impl SessionHub {
         let entries = entries.clone();
         let entry = entry.clone();
         async move {
+            if let Some(background) = &background {
+                background.close_spawns().await;
+            }
             if let Some(session) = session {
                 // Every mode used here waits unbounded for the runtime to
                 // fully stop (no `Shutdown::Graceful { on_timeout: Return }`),
@@ -1023,6 +1046,9 @@ impl SessionHub {
         let opener = self.opener.clone();
         let entry = entry.clone();
         tokio::spawn(async move {
+            if let Some(background) = &background {
+                background.close_spawns().await;
+            }
             if let Some(session) = session {
                 // Abort rather than graceful: a turn still in flight gets cut
                 // off instead of finishing, so no checkpoint is written back
@@ -1116,12 +1142,24 @@ impl SessionHub {
         // deliver. The registry check also waits out detached archive/quota
         // work, which can stage an expiration after its original waiter was
         // cancelled.
+        if matches!(&state.phase, EntryPhase::Live(live) if live.session.has_background_work()) {
+            return None;
+        }
         if !state.pending_notices.is_empty() {
             return None;
         }
         if let Some(Some(background)) = state.background.clone() {
             let fresh = background.take_notices_if_quiescent().await?;
-            state.pending_notices.extend(fresh);
+            for notice in fresh {
+                if let TaskNotice::Subagent { id, .. } = &notice
+                    && state.pending_notices.iter().any(
+                        |n| matches!(n, TaskNotice::Subagent { id: queued, .. } if queued == id),
+                    )
+                {
+                    continue;
+                }
+                state.pending_notices.push_back(notice);
+            }
             if !state.pending_notices.is_empty() {
                 return None;
             }
@@ -1142,12 +1180,12 @@ impl SessionHub {
         &self,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
-    ) -> Option<Arc<BackgroundProcesses>> {
+    ) -> Option<Arc<BackgroundTasks>> {
         if let Some(background) = &state.background {
             return background.clone();
         }
         let opened = match self.opener.background_archive(&entry.key) {
-            Ok(archive) => BackgroundProcesses::session_backed(archive)
+            Ok(archive) => BackgroundTasks::session_backed(archive)
                 .await
                 .map_err(|e| e.to_string()),
             Err(error) => Err(error),
@@ -1186,7 +1224,16 @@ impl SessionHub {
         // have been drained by then, and the rest would each get a turn.
         if let Some(Some(background)) = state.background.clone() {
             let fresh = background.take_notices().await;
-            state.pending_notices.extend(fresh);
+            for notice in fresh {
+                if let TaskNotice::Subagent { id, .. } = &notice
+                    && state.pending_notices.iter().any(
+                        |n| matches!(n, TaskNotice::Subagent { id: queued, .. } if queued == id),
+                    )
+                {
+                    continue;
+                }
+                state.pending_notices.push_back(notice);
+            }
         }
         if state.pending_notices.is_empty() {
             return false;
@@ -1207,24 +1254,75 @@ impl SessionHub {
         // turn ran are one interruption, not one each; what cannot be merged is
         // a notice that arrives after this has gone out, and that one simply
         // gets the next turn.
-        let notices: Vec<TaskNotice> = state.pending_notices.drain(..).collect();
-        let text = notices
+        let notices: Vec<TaskNotice> = if matches!(
+            state.pending_notices.front(),
+            Some(TaskNotice::Subagent { .. })
+        ) {
+            vec![state.pending_notices.pop_front().expect("notice exists")]
+        } else {
+            let count = state
+                .pending_notices
+                .iter()
+                .take_while(|n| !matches!(n, TaskNotice::Subagent { .. }))
+                .count();
+            state.pending_notices.drain(..count).collect()
+        };
+        let durable_id = notices.first().and_then(|notice| match notice {
+            TaskNotice::Subagent { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        let mut text = notices
             .iter()
             .map(TaskNotice::render)
             .collect::<Vec<_>>()
             .join("\n\n");
-        let outcomes: Vec<_> = notices.iter().map(TaskNotice::outcome).collect();
-        let message_id = MessageId::new();
-        if let Err(err) = live
-            .session
-            .send_task_notice(message_id, outcomes.clone(), text.clone())
-            .await
+        if let Some(id) = &durable_id
+            && let Some(Some(background)) = &state.background
         {
-            warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notices: {err}");
-            // Keep them, in order: the session refusing now says nothing about
-            // later, and dropping them would lose the only record that those
-            // tasks ended.
-            state.pending_notices.extend(notices);
+            match background.read(id).await {
+                Ok(Some(result)) => {
+                    text.push_str("\n\n");
+                    text.push_str(&result.stdout);
+                }
+                _ => {
+                    state.pending_notices.extend(notices);
+                    return false;
+                }
+            }
+        }
+        let outcomes: Vec<_> = notices.iter().map(TaskNotice::outcome).collect();
+        let message_id = durable_id
+            .as_ref()
+            .map(|id| id.notice_message_id())
+            .unwrap_or_default();
+        let sent = match &durable_id {
+            Some(id) => {
+                live.session
+                    .send_background_notice(id.clone(), outcomes.clone(), text.clone())
+                    .await
+            }
+            None => live
+                .session
+                .send_task_notice(message_id, outcomes.clone(), text.clone())
+                .await
+                .map(|_| true)
+                .map_err(|e| e.to_string()),
+        };
+        let started = match sent {
+            Ok(started) => started,
+            Err(err) => {
+                warn!(workspace_id = %key.0, session_id = %key.1, "failed to deliver task notices: {err}");
+                state.pending_notices.extend(notices);
+                return false;
+            }
+        };
+        if let Some(id) = &durable_id
+            && let Some(Some(background)) = &state.background
+            && let Err(error) = background.acknowledge_notice(id).await
+        {
+            warn!(%error, "could not acknowledge task notice; receipt prevents duplicate delivery");
+        }
+        if !started {
             return false;
         }
         let notice = TaskNoticeMessage::new(message_id, outcomes, text);
@@ -1349,7 +1447,8 @@ impl SessionHub {
             let EntryPhase::Live(live) = &state.phase else {
                 return CommandOutcome::Ignored;
             };
-            if live.turn_running
+            if live.session.has_background_work()
+                || live.turn_running
                 || !live.pending_approvals.is_empty()
                 || live.unsettled_user_message.is_some()
             {
@@ -1462,7 +1561,11 @@ impl SessionHub {
             };
             // A rewind rewrites the very history a running compaction is
             // summarizing, and rebuilds the runtime under it.
-            if compacting || live.turn_running || !live.pending_approvals.is_empty() {
+            if compacting
+                || live.session.has_background_work()
+                || live.turn_running
+                || !live.pending_approvals.is_empty()
+            {
                 warn!(workspace_id = %key.0, session_id = %key.1, "ignoring rewind while the session is busy");
                 return CommandOutcome::NotIdle;
             }
@@ -1555,24 +1658,84 @@ impl SessionHub {
         &self,
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
-        key: &SessionKey,
         agent_name: String,
         thread_id: String,
         decision: ResumeDecision,
+        allow_patterns: Vec<(String, String)>,
     ) -> CommandOutcome {
+        let key = &entry.key;
         let background = self.ensure_background(entry, state).await;
         match &mut state.phase {
             EntryPhase::Live(live) => {
+                let parent_message_id = decision.parent_message_id;
+                let Some(approval) = live.session.pending_approvals().into_iter().find(|a| {
+                    a.thread_id == thread_id
+                        && a.parent_message_id == parent_message_id
+                        && a.agent_name == agent_name
+                }) else {
+                    return CommandOutcome::Ignored;
+                };
+                let patterns: Vec<_> = allow_patterns
+                    .into_iter()
+                    .filter(|(id, _)| {
+                        approval
+                            .calls
+                            .iter()
+                            .any(|call| &call.id == id && call.name == "shell")
+                            && decision.resolutions.iter().any(|(call_id, resolution)| {
+                                call_id == id
+                                    && matches!(resolution, coda_agent::ToolCallResolution::Execute)
+                            })
+                    })
+                    .map(|(_, pattern)| pattern)
+                    .collect();
                 if let Err(err) = live.session.resume(&agent_name, &thread_id, decision).await {
                     warn!(workspace_id = %key.0, session_id = %key.1, "failed to resume: {err}");
                     return CommandOutcome::Ignored;
                 }
-                live.turn_running = true;
-                live.pending_approvals
-                    .retain(|approval| approval.thread_id != thread_id);
+                if let Err(error) = self.opener.persist_allow_patterns(key, patterns).await {
+                    warn!(%error, "could not persist accepted approval patterns");
+                }
+                if approval.task_id.is_none() {
+                    live.turn_running = true;
+                }
+                live.pending_approvals.retain(|a| {
+                    a.thread_id != thread_id || a.parent_message_id != parent_message_id
+                });
                 CommandOutcome::Ok
             }
             EntryPhase::Pending(pending) => {
+                let Some(approval) = pending.approvals.iter().find(|a| {
+                    a.thread_id == thread_id
+                        && a.agent_name == agent_name
+                        && a.parent_message_id == decision.parent_message_id
+                        && pending.needed.contains(&thread_id)
+                }) else {
+                    return CommandOutcome::Ignored;
+                };
+                let mut ids = HashSet::new();
+                if decision.resolutions.iter().any(|(id, _)| {
+                    !ids.insert(id) || !approval.calls.iter().any(|call| &call.id == id)
+                }) {
+                    return CommandOutcome::Ignored;
+                }
+                let patterns = allow_patterns
+                    .into_iter()
+                    .filter(|(id, _)| {
+                        approval
+                            .calls
+                            .iter()
+                            .any(|call| &call.id == id && call.name == "shell")
+                            && decision.resolutions.iter().any(|(call_id, resolution)| {
+                                call_id == id
+                                    && matches!(resolution, coda_agent::ToolCallResolution::Execute)
+                            })
+                    })
+                    .map(|(_, pattern)| pattern)
+                    .collect();
+                if let Err(error) = self.opener.persist_allow_patterns(key, patterns).await {
+                    warn!(%error, "could not persist accepted approval patterns");
+                }
                 pending.needed.remove(&thread_id);
                 pending.decisions.insert(thread_id, decision);
                 if !pending.needed.is_empty() {
@@ -1651,7 +1814,7 @@ impl SessionHub {
             return CommandOutcome::Unchanged;
         }
         // The session is rebuilt with a new RunConfig; only safe while idle.
-        if live.turn_running {
+        if live.session.has_background_work() || live.turn_running {
             warn!(workspace_id = %key.0, session_id = %key.1, "ignoring set_model while a turn is running");
             return CommandOutcome::TurnRunning;
         }
@@ -1839,6 +2002,58 @@ impl SessionRelay for SessionHub {
             // Taken by value rather than through `state` below: it is the one
             // command that has to drop the guard partway through.
             let command = match command {
+                SessionCommand::GetTaskResult { task_id } => {
+                    use crate::wire::TaskResultWire as ResultWire;
+                    let Some(Some(background)) = guard.background.clone() else {
+                        return CommandOutcome::TaskResult(ResultWire::Unknown);
+                    };
+                    let Ok(id) = task_id.parse() else {
+                        return CommandOutcome::TaskResult(ResultWire::Unknown);
+                    };
+                    drop(guard);
+                    let result = match background.read_subagent_result(&id).await {
+                        Ok(None) => ResultWire::Unknown,
+                        Ok(Some(read)) if read.note.is_some() => ResultWire::Expired {
+                            status: read.status.describe(),
+                        },
+                        Ok(Some(read)) if read.status.is_running() => ResultWire::Pending {
+                            status: read.status.describe(),
+                        },
+                        Ok(Some(read)) => ResultWire::Available {
+                            status: read.status.describe(),
+                            answer: read.stdout,
+                        },
+                        Err(error) => ResultWire::Error {
+                            message: error.to_string(),
+                        },
+                    };
+                    if self.lock_entry_for_conn(&key, conn_id).await.is_none() {
+                        return CommandOutcome::Ignored;
+                    }
+                    return CommandOutcome::TaskResult(result);
+                }
+                SessionCommand::KillTask { task_id } => {
+                    let Some(Some(background)) = guard.background.clone() else {
+                        return CommandOutcome::Ignored;
+                    };
+                    let Ok(id) = task_id.parse() else {
+                        return CommandOutcome::Ignored;
+                    };
+                    let result = background.request_kill(&id).await;
+                    drop(guard);
+                    if !matches!(result, Ok(Some(_))) {
+                        return CommandOutcome::Ignored;
+                    }
+                    let result = background.kill(&id).await;
+                    if self.lock_entry_for_conn(&key, conn_id).await.is_none() {
+                        return CommandOutcome::Ignored;
+                    }
+                    return if matches!(result, Ok(Some(_))) {
+                        CommandOutcome::Ok
+                    } else {
+                        CommandOutcome::Ignored
+                    };
+                }
                 SessionCommand::Compact { instructions } => {
                     return self.handle_compact(&entry, guard, &key, instructions).await;
                 }
@@ -1850,12 +2065,20 @@ impl SessionRelay for SessionHub {
                     Self::handle_task(state, &key, task, images).await
                 }
                 SessionCommand::Resume {
+                    allow_patterns,
                     agent_name,
                     thread_id,
                     decision,
                 } => {
-                    self.handle_resume(&entry, state, &key, agent_name, thread_id, decision)
-                        .await
+                    self.handle_resume(
+                        &entry,
+                        state,
+                        agent_name,
+                        thread_id,
+                        decision,
+                        allow_patterns,
+                    )
+                    .await
                 }
                 SessionCommand::Rewind {
                     target,
@@ -1886,23 +2109,8 @@ impl SessionRelay for SessionHub {
                     info!(workspace_id = %key.0, session_id = %key.1, "permission mode set to {mode:?}");
                     CommandOutcome::Ok
                 }
-                SessionCommand::KillTask { task_id } => {
-                    let Some(Some(background)) = state.background.clone() else {
-                        return CommandOutcome::Ignored;
-                    };
-                    let Ok(parsed) = task_id.parse() else {
-                        return CommandOutcome::Ignored;
-                    };
-                    match background.kill(&parsed).await {
-                        // Killing an already-finished task is not an error:
-                        // the list the user clicked from can be a moment stale.
-                        Ok(Some(_)) => CommandOutcome::Ok,
-                        Ok(None) => CommandOutcome::Ignored,
-                        Err(error) => {
-                            warn!(workspace_id = %key.0, session_id = %key.1, "failed to kill task: {error}");
-                            CommandOutcome::Ignored
-                        }
-                    }
+                SessionCommand::GetTaskResult { .. } | SessionCommand::KillTask { .. } => {
+                    unreachable!("handled outside entry lock")
                 }
                 SessionCommand::Compact { .. } => unreachable!("taken by the guard above"),
             }
@@ -2007,7 +2215,8 @@ impl SessionRelay for SessionHub {
             let gate = match &guard.phase {
                 _ if guard.compacting => ForkGate::Busy,
                 EntryPhase::Live(live) => {
-                    if live.turn_running
+                    if live.session.has_background_work()
+                        || live.turn_running
                         || !live.pending_approvals.is_empty()
                         || live.unsettled_user_message.is_some()
                     {
@@ -2209,7 +2418,7 @@ fn compose_snapshot(
             );
             Some(SnapshotPayload {
                 messages,
-                pending_approvals: live.pending_approvals.clone(),
+                pending_approvals: live.session.pending_approvals(),
                 provider_id: live.provider_id.clone(),
                 reasoning_effort: live.reasoning_effort.clone(),
                 permission_mode,
@@ -2256,7 +2465,7 @@ fn compose_snapshot(
 fn spawn_notice_watcher(
     entries: Entries,
     entry: Arc<SessionEntry>,
-    background: Arc<BackgroundProcesses>,
+    background: Arc<BackgroundTasks>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let mut rx = background.summaries();
@@ -2295,10 +2504,10 @@ fn spawn_notice_watcher(
                     return;
                 }
             }
-            if rx.changed().await.is_err() {
-                return;
-            }
-            changed = true;
+            changed = tokio::select! {
+                update = rx.changed() => { if update.is_err() { return; } true }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => false,
+            };
         }
     })
     .abort_handle()
@@ -2344,6 +2553,33 @@ fn spawn_event_pipeline(
 /// write that failed says the opposite, and a caller that waits unbounded on a
 /// runtime it just declared broken can wait forever — with the key locked
 /// behind it.
+async fn refresh_live_snapshot(state: &mut EntryState) {
+    let EntryPhase::Live(live) = &mut state.phase else {
+        return;
+    };
+    match live.session.live_snapshot().await {
+        Ok((messages, approvals, running)) => {
+            live.snapshot = messages;
+            if live
+                .unsettled_user_message
+                .as_ref()
+                .is_some_and(|(_, message)| {
+                    live.snapshot
+                        .iter()
+                        .any(|m| m.message_id() == message.message_id())
+                })
+            {
+                live.unsettled_user_message = None;
+            }
+            live.pending_approvals = approvals;
+            live.turn_running = running;
+            live.log.clear();
+            push_snapshot(state);
+        }
+        Err(error) => warn!(%error, "could not refresh live session; runtime continues"),
+    }
+}
+
 async fn force_resync(
     entries: &Entries,
     entry: &Arc<SessionEntry>,
@@ -2382,17 +2618,8 @@ async fn run_forwarder(
         }
         match item {
             SessionStreamItem::Lagged(n) => {
-                // The stream has a gap: the in-memory snapshot can no longer
-                // be trusted to fold correctly.
-                force_resync(
-                    &entries,
-                    &entry,
-                    guard,
-                    Shutdown::graceful_unbounded(),
-                    format!("session event stream lagged by {n}"),
-                )
-                .await;
-                return;
+                warn!(dropped = n, "refreshing a lagged live session");
+                refresh_live_snapshot(state).await;
             }
             SessionStreamItem::Event(event) => {
                 // Capture the approval before the event moves into the wire
@@ -2410,7 +2637,20 @@ async fn run_forwarder(
                 {
                     live.turn_running = true;
                 }
-                live.log.push(wire.clone());
+                let persisted_message = match &wire {
+                    WireEvent::LlmEnd { message, .. } => Some(message.message_id),
+                    WireEvent::ToolCallEnd { message, .. } => Some(message.message_id),
+                    WireEvent::CompactionEnd { message, .. } => Some(message.message_id),
+                    _ => None,
+                };
+                let already_captured = persisted_message.is_some_and(|id| {
+                    live.snapshot
+                        .iter()
+                        .any(|message| message.message_id() == id)
+                });
+                if !already_captured {
+                    live.log.push(wire.clone());
+                }
                 if let Some(attachment) = &state.attached {
                     let _ = attachment
                         .tx
@@ -2437,16 +2677,28 @@ async fn run_forwarder(
                     .await;
                     return;
                 }
+                if let Some(approval) = &suspended {
+                    live.pending_approvals.retain(|a| {
+                        a.thread_id != approval.thread_id
+                            || a.parent_message_id != approval.parent_message_id
+                    });
+                    live.pending_approvals.push(approval.clone());
+                }
+                if let WireEvent::ApprovalRemoved {
+                    thread_id,
+                    parent_message_id,
+                    ..
+                } = &wire
+                {
+                    live.pending_approvals.retain(|a| {
+                        &a.thread_id != thread_id || &a.parent_message_id != parent_message_id
+                    });
+                }
                 if event_settles_turn(&wire, &root_name) {
                     // `suspended` is moved by the match below; read before it.
                     let awaits_approval = suspended.is_some();
-                    match suspended {
-                        Some(approval) => live.pending_approvals.push(approval),
-                        // Any other settlement is final: the turn those
-                        // approvals belonged to is over, and a decision for
-                        // them has no thread left to wake. Kept around, they
-                        // would hold admission and fork at `NotIdle` forever.
-                        None => live.pending_approvals.clear(),
+                    if suspended.is_none() {
+                        live.pending_approvals.retain(|a| a.task_id.is_some());
                     }
                     live.turn_running = fold_settled_turn(
                         &mut live.snapshot,
@@ -2459,6 +2711,7 @@ async fn run_forwarder(
                     // one. Checked before the bookkeeping below, so a session
                     // that is about to keep working is not recorded as having
                     // finished unattended.
+                    refresh_live_snapshot(state).await;
                     let delivered = SessionHub::deliver_pending_notices(state, &entry.key).await;
                     let EntryPhase::Live(live) = &mut state.phase else {
                         return;
@@ -2483,21 +2736,7 @@ async fn run_forwarder(
                         return;
                     }
                 } else if live.log.message_tier_overflowed() {
-                    // The turn hasn't settled and won't stop buffering
-                    // message-tier history (which can't be evicted without
-                    // corrupting the fold); force the same forced-resync path
-                    // as a lagged stream rather than grow unbounded.
-                    let max = live.log.limits.max_message_tier_events;
-                    let reason = format!("event log exceeded {max} buffered message-tier events");
-                    force_resync(
-                        &entries,
-                        &entry,
-                        guard,
-                        Shutdown::graceful_unbounded(),
-                        reason,
-                    )
-                    .await;
-                    return;
+                    refresh_live_snapshot(state).await;
                 }
             }
         }

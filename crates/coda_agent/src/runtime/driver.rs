@@ -28,7 +28,9 @@ use crate::{
         AgentRunConfig, EnvelopeBody, PendingReply, PendingToolCall, PreparedToolCall, Receiver,
         ReplyTarget, ResumePoint, ThreadStateMap, ToolExecutionMetadata, ToolExecutionState,
     },
-    compaction, message_view,
+    compaction,
+    execution::{ExecutionIdentity, StoredExecution},
+    message_view,
     persist::StoredCheckpoint,
     runtime::AgentRuntime,
 };
@@ -63,6 +65,7 @@ const WIND_UP_LIMIT: std::time::Duration = std::time::Duration::from_millis(400)
 #[instrument(skip_all, fields(agent = %agent.name))]
 pub(crate) async fn run_agent(
     runtime: AgentRuntime,
+    driver_thread: ThreadId,
     active: (Option<ThreadId>, Option<ResumeDecision>),
     mut agent: Agent,
     mut control_rx: mpsc::Receiver<AgentControl>,
@@ -147,6 +150,7 @@ pub(crate) async fn run_agent(
                 biased;
                 cmd = control_rx.recv() => {
                     match cmd {
+                        Some(AgentControl::StopScope) => { active_thread = None; deferred.clear(); break; }
                         Some(AgentControl::Exit) | None => {
                             // Restore thread_id into active_thread so the
                             // snapshot preserves it for restart-based resume.
@@ -203,7 +207,7 @@ pub(crate) async fn run_agent(
             (next_envelope.to.thread_id.clone(), Some(next_envelope))
         };
 
-        let cancel = CancellationToken::new();
+        let cancel = runtime.execution_cancel(&thread_id);
         active_thread = Some(thread_id.clone());
         let turn = runtime
             .turn_gate
@@ -217,6 +221,7 @@ pub(crate) async fn run_agent(
             thread_id: thread_id.clone(),
             turn,
             reply_target: None,
+            execution: runtime.execution(&thread_id),
             origin_thread: None,
         };
         let mut run_fut = std::pin::pin!(agent_loop.run(envelope));
@@ -233,6 +238,7 @@ pub(crate) async fn run_agent(
                 // reading a single one could spend it on a repeat `Exit`.
                 let ret = loop {
                     let cancelled = match cmd {
+                        Some(AgentControl::StopScope) => { should_exit = true; cancel.cancel(); true }
                         Some(AgentControl::Abort) | None => {
                             cancel.cancel();
                             true
@@ -253,6 +259,7 @@ pub(crate) async fn run_agent(
                     }
                 };
                 match ret {
+                    Ok(TurnOutcome::Retired) => return,
                     Ok(TurnOutcome::ExitAcquired | TurnOutcome::Completed) => {
                         active_thread = None;
                         awaiting_replies = None;
@@ -290,6 +297,7 @@ pub(crate) async fn run_agent(
             ret = &mut run_fut => {
                 let mut should_exit = false;
                 match ret {
+                    Ok(TurnOutcome::Retired) => return,
                     Ok(TurnOutcome::ExitAcquired) => {
                         should_exit = true;
                         active_thread = None;
@@ -339,7 +347,7 @@ pub(crate) async fn run_agent(
         envelopes.push(envelope);
     }
     runtime
-        .save_agent_snapshot(agent.name.clone(), envelopes, active_thread)
+        .save_agent_snapshot(agent.name.clone(), driver_thread, envelopes, active_thread)
         .await;
     info!("Agent {} has exited", agent.name);
 }
@@ -606,6 +614,7 @@ struct TurnEnd {
     /// The result handed back to the caller. Sub-agents only; a root agent has
     /// nobody to answer.
     reply: Option<Envelope>,
+    output: Option<ToolOutput>,
 }
 
 /// How a single call to the model finished.
@@ -618,6 +627,8 @@ enum GenerationOutcome {
 /// What the agent turn produced, distinguishing suspension from normal
 /// completion so the outer loop knows whether to preserve `active_thread`.
 enum TurnOutcome {
+    /// A completed foreground caller has handed off its Reply and retired its driver.
+    Retired,
     /// The turn completed normally; the agent is idle.
     Completed,
     /// The agent suspended for approval. The outer loop moves `active_thread`
@@ -658,6 +669,7 @@ struct AgentLoop<'a, C: LLMProvider + Clone> {
     /// the previous one still carry the turn they are cleaning up.
     turn: TurnId,
     reply_target: Option<ReplyTarget>,
+    execution: Option<StoredExecution>,
     /// How this thread was addressed by whoever spawned it. Unlike
     /// `reply_target` these outlive the call that set them: they are the thread's
     /// place in the tree, not a pending obligation.
@@ -696,6 +708,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         {
             Ok(stored) => stored,
             Err(err) => {
+                if let Some(execution) = &self.execution {
+                    self.runtime.checkpoint_failed(
+                        ExecutionIdentity {
+                            thread_id: self.thread_id.0.clone(),
+                            invocation_id: execution.invocation_id.clone(),
+                        },
+                        err.clone(),
+                    );
+                }
                 self.runtime
                     .emit_event(
                         self.agent.name.clone(),
@@ -713,7 +734,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         let (mut resume_point, mut suspended_at): (ResumePoint, jiff::Timestamp) =
             if let Some(stored) = stored {
                 self.agent.restore_history(stored.messages).await;
-                self.reply_target = stored.reply_target;
+                if self.execution.is_none() {
+                    self.execution = stored.active_execution;
+                    if let Some(execution) = &self.execution {
+                        self.runtime
+                            .restore_execution(&self.thread_id, execution.clone());
+                    }
+                }
+                self.reply_target = self
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.reply_target().cloned());
                 self.origin_thread = stored.parent_thread_id.zip(stored.derivation_key).map(
                     |(parent_thread_id, derivation_key)| OriginThread {
                         parent_thread_id,
@@ -730,13 +761,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 self.origin_thread = None;
                 (ResumePoint::Generation, jiff::Timestamp::default())
             };
+        self.runtime
+            .register_root_state(&self.thread_id, self.agent.state.clone());
         // A restored thread carries the turn its last message was written
         // under; a fresh one carries none yet and keeps the turn this loop was
         // entered with (the session's active turn) until its prompt lands.
         self.turn = self.thread_turn().await;
 
         if let Some(envelope) = envelope {
-            let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. });
+            let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. })
+                || (matches!(envelope.body, EnvelopeBody::ToolCall { .. })
+                    && self
+                        .execution
+                        .as_ref()
+                        .is_some_and(|e| e.background_task().is_some()));
             match self.handle_envelope(resume_point, envelope).await {
                 EnvelopeOutcome::Next(rp) => {
                     resume_point = rp;
@@ -799,7 +837,13 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             // Checked every time round rather than once on entry: the mark can
             // arrive while this thread is mid-turn, and a thread woken by a
             // reply comes back through here to find it.
-            if self.runtime.turn_gate.is_cancelled(turn) {
+            if self.runtime.execution_stopped(&self.thread_id)
+                || (self
+                    .execution
+                    .as_ref()
+                    .is_none_or(|e| e.background_task().is_none())
+                    && self.runtime.turn_gate.is_cancelled(turn))
+            {
                 match self.wind_up(std::mem::take(&mut resume_point)).await {
                     WindUp::Waiting(rp) => resume_point = rp,
                     WindUp::Ended(end) => {
@@ -850,6 +894,15 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 } => {
                     let has_pending = !pending_approval_calls.is_empty();
                     let pending = PendingApproval {
+                        task_id: self
+                            .execution
+                            .as_ref()
+                            .and_then(|e| e.background_task().cloned()),
+                        agent_path: self
+                            .execution
+                            .as_ref()
+                            .map(|e| e.agent_path.clone())
+                            .unwrap_or_else(|| vec![self.agent.name.clone()]),
                         thread_id: self.thread_id.as_ref().to_string(),
                         agent_name: self.agent.name.to_string(),
                         parent_message_id,
@@ -882,13 +935,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
             &resume_point,
             ResumePoint::ToolExecution(state) if !state.pending_replies.is_empty()
         );
+        let retires = owed.reply.is_some()
+            && self
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.background_task().is_none());
         let persisted = self
             .persist_and_announce(resume_point, suspended_at, owed)
             .await;
         if announced_ending && persisted && self.runtime.is_root_thread(&self.thread_id) {
             self.runtime.turn_gate.close(self.thread_turn().await);
         }
-        Ok(if exit_acquired {
+        Ok(if retires && persisted {
+            TurnOutcome::Retired
+        } else if exit_acquired {
             TurnOutcome::ExitAcquired
         } else if suspended && persisted {
             TurnOutcome::Suspended
@@ -915,7 +975,20 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         suspended_at: jiff::Timestamp,
         owed: TurnEnd,
     ) -> bool {
-        if let Err(err) = self.save_checkpoint(resume_point, suspended_at).await {
+        let finished = owed.output.is_some();
+        if let Err(err) = self
+            .save_checkpoint(resume_point, suspended_at, finished)
+            .await
+        {
+            if let Some(execution) = &self.execution {
+                self.runtime.checkpoint_failed(
+                    ExecutionIdentity {
+                        thread_id: self.thread_id.0.clone(),
+                        invocation_id: execution.invocation_id.clone(),
+                    },
+                    err.clone(),
+                );
+            }
             error!(
                 "Failed to save checkpoint for thread {}: {}",
                 self.thread_id.as_ref(),
@@ -931,6 +1004,12 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .await;
             return false;
         }
+        if finished && self.runtime.is_root_thread(&self.thread_id) {
+            self.runtime.turn_gate.close(self.turn);
+        }
+        if let (Some(execution), Some(output)) = (&self.execution, &owed.output) {
+            self.runtime.complete_background(execution, output.clone());
+        }
         if let Some(event) = owed.event {
             self.runtime
                 .emit_event(
@@ -939,6 +1018,19 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     self.turn,
                     event,
                 )
+                .await;
+        }
+        if owed.reply.is_some()
+            && self
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.background_task().is_none())
+        {
+            // Retire before the Reply releases the call ledger. A stateful caller
+            // can then immediately reopen from this checkpoint without the old
+            // driver deleting its replacement's handle or snapshot.
+            self.runtime
+                .retire_foreground_driver(&self.agent.name, &self.thread_id)
                 .await;
         }
         // Last, always: the reply is what lets the caller move on, so anything
@@ -955,6 +1047,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         &self,
         resume_point: ResumePoint,
         suspended_at: jiff::Timestamp,
+        finished: bool,
     ) -> Result<(), String> {
         let stored = StoredCheckpoint {
             thread_id: self.thread_id.as_ref().to_string(),
@@ -967,15 +1060,32 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 .origin_thread
                 .as_ref()
                 .map(|origin| origin.derivation_key.clone()),
-            reply_target: self.reply_target.clone(),
+            active_execution: if finished {
+                None
+            } else {
+                self.execution.clone()
+            },
             messages: self.agent.history().await,
             resume_point: resume_point.into(),
             suspended_at,
         };
-        self.runtime
-            .session_storage
-            .save_checkpoint(self.thread_id.as_ref().to_string(), stored)
-            .await
+        if let Some(execution) = &self.execution {
+            self.runtime
+                .session_storage
+                .save_execution_checkpoint(
+                    ExecutionIdentity {
+                        thread_id: self.thread_id.0.clone(),
+                        invocation_id: execution.invocation_id.clone(),
+                    },
+                    stored,
+                )
+                .await
+        } else {
+            self.runtime
+                .session_storage
+                .save_checkpoint(self.thread_id.0.clone(), stored)
+                .await
+        }
     }
 
     /// Bring a cancelled thread to a stop without inventing anything.
@@ -1173,7 +1283,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 };
                 // `None` for a root task, whose sender is the user rather than
                 // a calling agent.
-                self.reply_target = reply_target_from_envelope(&envelope);
+                self.reply_target = self
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.reply_target().cloned())
+                    .or_else(|| {
+                        reply_target_from_envelope(&envelope).filter(|_| {
+                            self.execution
+                                .as_ref()
+                                .is_none_or(|e| e.background_task().is_none())
+                        })
+                    });
                 self.agent.add_opening_message(turn_id, user).await;
                 EnvelopeOutcome::Next(ResumePoint::Generation)
             }
@@ -1263,7 +1383,17 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                                     ResumePoint::ToolExecution(tool_execution),
                                 );
                             }
-                            self.reply_target = reply_target_from_envelope(&envelope);
+                            self.reply_target = self
+                                .execution
+                                .as_ref()
+                                .and_then(|e| e.reply_target().cloned())
+                                .or_else(|| {
+                                    reply_target_from_envelope(&envelope).filter(|_| {
+                                        self.execution
+                                            .as_ref()
+                                            .is_none_or(|e| e.background_task().is_none())
+                                    })
+                                });
                             if let Some((turn_id, user)) = opening_user_message(&envelope.body) {
                                 self.agent.add_opening_message(turn_id, user).await;
                             }
@@ -1593,7 +1723,9 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 request_tools.push(descriptor);
             }
         }
-        request_tools.extend(self.agent.subagents.descriptors());
+        request_tools.extend(self.agent.subagents.descriptors(
+            self.runtime.is_root_thread(&self.thread_id) && self.runtime.background.is_some(),
+        ));
         (request_tools, snapshot)
     }
 
@@ -1796,6 +1928,7 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
         aborted: bool,
     ) -> TurnEnd {
         TurnEnd {
+            output: Some(output.clone()),
             event,
             reply: target.map(|target| {
                 Envelope::with_id(|id| Envelope {
@@ -1866,6 +1999,35 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                     continue;
                 }
 
+                let arguments = match serde_json::from_str::<SubagentArguments>(
+                    tc.tool_call.arguments.as_deref().unwrap_or("{}"),
+                ) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        self.add_tool_message(ToolMessage::new(
+                            tc.tool_call.id.clone(),
+                            tc.tool_call.name.clone(),
+                            ToolOutput::Err(format!("Invalid subagent parameters: {error}")),
+                            tc.outcome.clone(),
+                            None,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+                if arguments.run_in_background && !self.runtime.is_root_thread(&self.thread_id) {
+                    self.add_tool_message(ToolMessage::new(
+                        tc.tool_call.id.clone(),
+                        tc.tool_call.name.clone(),
+                        ToolOutput::Err(
+                            "Only the root thread can start a background subagent".into(),
+                        ),
+                        tc.outcome.clone(),
+                        None,
+                    ))
+                    .await;
+                    continue;
+                }
                 let origin = MessageOrigin {
                     message_id: tool_execution.parent_message_id,
                     call_id: tc.tool_call.id.clone(),
@@ -1903,15 +2065,37 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                         parent_message_id: origin.message_id,
                         derivation_key: derivation_key.clone(),
                         turn_id,
-                        // Sub-agent tools always take {"task": "..."} — extract the string.
-                        task: serde_json::from_str::<serde_json::Value>(
-                            tc.tool_call.arguments.as_deref().unwrap_or("{}"),
-                        )
-                        .ok()
-                        .and_then(|v| v["task"].as_str().map(String::from))
-                        .unwrap_or_default(),
+                        task: arguments.task,
                     },
                 });
+                if arguments.run_in_background {
+                    let runtime = self.runtime.clone();
+                    let parent = self.thread_id.clone();
+                    let dispatched = tokio::spawn(async move {
+                        runtime
+                            .dispatch_background(subagent_tool_call_envelope, origin, parent)
+                            .await
+                    })
+                    .await;
+                    let output = match dispatched {
+                        Ok(Ok(id)) => ToolOutput::Ok(format!(
+                            "Started background subagent task {id}. Continue your work; its complete result will notify you. Use task_output to read it or task_kill to stop it."
+                        )),
+                        Ok(Err(error)) => ToolOutput::Err(error),
+                        Err(error) => {
+                            ToolOutput::Err(format!("Background dispatch stopped: {error}"))
+                        }
+                    };
+                    self.add_tool_message(ToolMessage::new(
+                        tc.tool_call.id.clone(),
+                        tc.tool_call.name.clone(),
+                        output,
+                        tc.outcome.clone(),
+                        None,
+                    ))
+                    .await;
+                    continue;
+                }
                 let call_envelope_id = subagent_tool_call_envelope.id.clone();
                 let ret = self.runtime.send_message(subagent_tool_call_envelope).await;
                 if let Err(err) = ret {
@@ -1966,6 +2150,22 @@ impl<'a, C: LLMProvider + Clone> AgentLoop<'a, C> {
                 // without touching its siblings.
                 let call_state = Arc::new(CallState::new(committed.clone()));
                 let mut ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
+                ctx.background_task = self
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.background_task().cloned());
+                ctx.origin = coda_core::task::TaskOrigin {
+                    thread_id: self.thread_id.0.clone(),
+                    message_origin: Some(MessageOrigin {
+                        message_id: tool_execution.parent_message_id,
+                        call_id: tc.tool_call.id.clone(),
+                    }),
+                    agent_path: self
+                        .execution
+                        .as_ref()
+                        .map(|e| e.agent_path.clone())
+                        .unwrap_or_else(|| vec![self.agent.name.clone()]),
+                };
                 let invoker = match &tc.metadata {
                     Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools }) => {
                         Some(AgentToolInvoker::new(
@@ -2172,7 +2372,7 @@ fn origin_thread_from_envelope(envelope: &Envelope) -> Option<OriginThread> {
     }
 }
 
-fn reply_target_from_envelope(envelope: &Envelope) -> Option<ReplyTarget> {
+pub(super) fn reply_target_from_envelope(envelope: &Envelope) -> Option<ReplyTarget> {
     match (&envelope.from, &envelope.body) {
         (Sender::Agent { name, thread_id }, EnvelopeBody::ToolCall { call_id, .. }) => {
             Some(ReplyTarget {
@@ -2209,3 +2409,10 @@ fn concurrent_stateful_subagents(
 #[cfg(test)]
 #[path = "driver_tests/mod.rs"]
 mod tests;
+
+#[derive(serde::Deserialize)]
+struct SubagentArguments {
+    task: String,
+    #[serde(default)]
+    run_in_background: bool,
+}

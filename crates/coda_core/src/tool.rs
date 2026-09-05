@@ -134,6 +134,9 @@ impl ArtifactSink for UnboundedArtifactSink {
 #[derive(Clone)]
 pub struct ToolCallContext {
     pub cancel: CancellationToken,
+    /// Background subagent owning this call, inherited by synchronous descendants.
+    pub background_task: Option<crate::task::TaskId>,
+    pub origin: crate::task::TaskOrigin,
     /// Where a tool keeps anything that has to outlive the call — see
     /// [`ThreadState`].
     pub state: Arc<dyn ThreadState>,
@@ -147,6 +150,8 @@ impl ToolCallContext {
     pub fn new(cancel: CancellationToken, state: Arc<dyn ThreadState>) -> Self {
         Self {
             cancel,
+            background_task: None,
+            origin: crate::task::TaskOrigin::default(),
             state,
             artifacts: Arc::new(UnboundedArtifactSink::default()),
             invoker: None,
@@ -280,6 +285,8 @@ impl HostCallScope {
         });
         let context = ToolCallContext {
             cancel,
+            background_task: self.0.outer.background_task.clone(),
+            origin: self.0.outer.origin.clone(),
             state: state.clone(),
             artifacts: artifacts.clone(),
             invoker: None,

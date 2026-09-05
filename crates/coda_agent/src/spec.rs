@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use coda_process::BackgroundProcesses;
+use coda_process::BackgroundTasks;
 use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
 
 use crate::agent::{
@@ -241,7 +241,7 @@ impl AgentTeam {
         &self,
         default_workspace: &str,
         file_locks: Arc<KeyedLock<String>>,
-        background: Option<Arc<BackgroundProcesses>>,
+        background: Option<Arc<BackgroundTasks>>,
     ) -> HashMap<String, Agent> {
         let all = || std::iter::once(&self.root).chain(&self.subagents);
         let by_name: HashMap<&str, &AgentSpec> = all().map(|s| (s.name.as_str(), s)).collect();
@@ -391,7 +391,7 @@ mod tests {
             ..spec("sub")
         };
         let team = AgentTeam::new(root, vec![sub]).unwrap();
-        let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+        let background = Arc::new(BackgroundTasks::temporary().unwrap());
         let agents = team.build(
             ".",
             coda_tools::shared_file_locks(),
@@ -541,7 +541,7 @@ mod tests {
         team.build(
             "/root",
             coda_tools::shared_file_locks(),
-            Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
+            Some(Arc::new(BackgroundTasks::temporary().unwrap())),
         );
 
         let mut got = seen.lock().unwrap().clone();
@@ -592,7 +592,7 @@ mod tests {
             .build(
                 "/root",
                 coda_tools::shared_file_locks(),
-                Some(Arc::new(BackgroundProcesses::temporary().unwrap())),
+                Some(Arc::new(BackgroundTasks::temporary().unwrap())),
             );
         let agent = &agents["coda"];
 
