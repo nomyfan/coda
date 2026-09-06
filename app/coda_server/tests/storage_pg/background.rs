@@ -360,17 +360,6 @@ async fn root_task_read_receipt_survives_reopen_and_rewind_but_not_fork() {
     let task = TaskId::new();
     let user_id = MessageId::new();
     let turn = TurnId::from(user_id);
-    let mut child = checkpoint("child", vec![entry(turn, observed_read(&task))]);
-    child.parent_pid = Some("root".into());
-    child.derivation_key = Some("child".into());
-    storage
-        .save_checkpoint("child".into(), child)
-        .await
-        .unwrap();
-    assert!(
-        !storage.has_notice_receipt(task.clone()).await.unwrap(),
-        "non-root reads cannot acknowledge root delivery"
-    );
     let root = checkpoint(
         "root",
         vec![
@@ -445,4 +434,25 @@ async fn failed_checkpoint_rolls_back_the_task_read_receipt() {
             .len(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owning_process_task_read_receipt_is_persisted() {
+    let pool = pool().await;
+    let workspace = workspace_id("owner_task_read");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    let task = TaskId::new();
+    let mut child = checkpoint(
+        "child",
+        vec![entry(TurnId::from(MessageId::new()), observed_read(&task))],
+    );
+    child.parent_pid = Some("root".into());
+    child.derivation_key = Some("child".into());
+    storage
+        .save_checkpoint("child".into(), child)
+        .await
+        .unwrap();
+    let reopened = PgSessionStorage::new(pool, &workspace, "root");
+    assert!(reopened.has_notice_receipt(task).await.unwrap());
 }

@@ -235,9 +235,6 @@ pub struct MemoryStorage {
 
 impl MemoryStorage {
     async fn record_task_reads(&self, checkpoint: &StoredCheckpoint, stored_count: usize) {
-        if checkpoint.parent_pid.is_some() {
-            return;
-        }
         let mut receipts = self.notice_receipts.lock().await;
         for entry in checkpoint.messages.iter().skip(stored_count) {
             if let coda_core::llm::Message::Tool(tool) = &entry.message

@@ -1191,8 +1191,7 @@ impl PgSessionStorage {
                 ))
                 .execute(conn)
                 .await?;
-            if pid == self.session_id
-                && let Message::Tool(tool) = &entry.message
+            if let Message::Tool(tool) = &entry.message
                 && let Some(task_id) = &tool.observed_task
             {
                 // The result and its delivery receipt commit or roll back together.

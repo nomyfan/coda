@@ -76,8 +76,11 @@ pub(super) async fn start(
     (runtime, storage, background, events)
 }
 
-pub(super) async fn start_storage<S: SessionStorage + Clone + 'static>(
-    provider: BackgroundProvider,
+pub(super) async fn start_storage<
+    S: SessionStorage + Clone + 'static,
+    P: LLMProvider + Clone + 'static,
+>(
+    provider: P,
     storage: S,
 ) -> (
     ProcessRuntime,

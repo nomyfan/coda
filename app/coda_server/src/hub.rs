@@ -1250,7 +1250,7 @@ impl SessionHub {
         {
             return false;
         }
-        // A terminal task_output already in root's checkpoint supersedes the
+        // A terminal task_output acknowledged in a checkpoint supersedes the
         // queued shell notice. An uncertain receipt lookup leaves the queue
         // intact for the watcher's next retry.
         let mut observed = std::collections::HashSet::new();

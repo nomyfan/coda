@@ -1203,8 +1203,26 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             Some(started_at),
         )
         .with_artifacts(if succeeded { artifacts } else { Vec::new() });
-        if succeeded && !aborted && self.runtime.is_root_process(&self.process.pid) {
-            message.observed_task = observed_task;
+        if succeeded
+            && !aborted
+            && let Some(task) = observed_task
+        {
+            let can_acknowledge = if self.runtime.is_root_process(&self.process.pid) {
+                true
+            } else if let Some(background) = &self.runtime.background {
+                match background.owns_shell(&task, &self.process.pid.0).await {
+                    Ok(owned) => owned,
+                    Err(error) => {
+                        tracing::warn!(%error, %task, "could not check shell result ownership");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if can_acknowledge {
+                message.observed_task = Some(task);
+            }
         }
         self.add_message_with_state(message, recorded).await;
         aborted
