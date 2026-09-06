@@ -1,6 +1,6 @@
-//! High-level session facade over [`AgentRuntime`].
+//! High-level session facade over [`ProcessRuntime`].
 //!
-//! `Session` wraps an `AgentRuntime` and exposes a small API tailored for the
+//! `Session` wraps an `ProcessRuntime` and exposes a small API tailored for the
 //! common case: one root agent with some subagents, send a task, consume
 //! events, resume when suspended, shut down cleanly. Both sync and async HITL
 //! flows use the same surface — the only difference lives in the caller's
@@ -12,14 +12,14 @@
 use crate::agent::{EnvelopeBody, Receiver};
 use crate::persist::{StoredResumePoint, StoredRuntimeSnapshot};
 use crate::runtime::{
-    AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
+    ProcessRuntime, ProcessRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
 };
 use crate::{
-    AgentEvent, AgentTeam, Envelope, PendingApproval, ResumeDecision, RunConfig, Sender, ThreadId,
+    AgentEvent, AgentTeam, Envelope, PendingApproval, ProcessId, ResumeDecision, RunConfig, Sender,
     ToolCallResolution,
 };
 use coda_core::llm::{LLMProvider, Message, MessageId, TaskNoticeOutcome, TurnId};
-use coda_process::BackgroundTasks;
+use coda_execution::BackgroundTasks;
 use coda_tools::KeyedLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ impl EventOrigin {
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub origin: EventOrigin,
-    pub thread_id: ThreadId,
+    pub thread_id: ProcessId,
     /// The submission this event belongs to. Shared by every agent the turn
     /// reaches, so a consumer can settle per turn without working out the call
     /// tree for itself.
@@ -195,7 +195,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     }
 
     /// Register the validated [`AgentTeam`] to run, and the workspace its tools
-    /// build against. The team is borrowed and built into fresh agents at
+    /// build against. The team is borrowed and built into session-bound programs at
     /// [`open`](SessionBuilder::open); the team carries its own root, so there is
     /// no root name to pass and no way to name a root that isn't present.
     pub fn team(mut self, team: &'a AgentTeam, workspace_dir: &str) -> Self {
@@ -343,7 +343,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             .load_session_snapshot(&session_id)
             .await
             .map_err(OpenError::Storage)?;
-        let mut snapshot: Option<AgentRuntimeSnapshot> = stored_snapshot.map(Into::into);
+        let mut snapshot: Option<ProcessRuntimeSnapshot> = stored_snapshot.map(Into::into);
         if let Some(checkpoint) = storage
             .load_checkpoint(&session_id)
             .await
@@ -447,7 +447,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                 approval.thread_id.clone(),
                 ResumeTarget {
                     agent_name: approval.agent_name.clone(),
-                    thread_id: ThreadId::from(approval.thread_id.clone()),
+                    thread_id: ProcessId::from(approval.thread_id.clone()),
                     decision,
                 },
             );
@@ -456,7 +456,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             warn!("discarding a resume decision for unsuspended thread {thread_id}");
         }
 
-        let mut runtime = AgentRuntime::new(storage, session_id.clone());
+        let mut runtime = ProcessRuntime::new(storage, session_id.clone());
         runtime.background = background.clone();
         // CRITICAL: subscribe before bootstrap so no events are lost between
         // spawn and the caller's first `recv`.
@@ -534,12 +534,12 @@ async fn collect_pending_approvals(
 }
 
 struct SessionInner {
-    runtime: AgentRuntime,
+    runtime: ProcessRuntime,
     root_name: String,
     session_id: String,
     resumed_messages: Option<Vec<Message>>,
     has_resuming_agents: bool,
-    events_rx: Mutex<broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>>,
+    events_rx: Mutex<broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>>,
     background: Option<Arc<BackgroundTasks>>,
     /// Self-built registry (no [`SessionBuilder::background`]): `shutdown`
     /// tears it down once the runtime has confirmedly exited. An injected
@@ -667,7 +667,7 @@ impl Session {
         images: Vec<String>,
         notice: Option<Vec<TaskNoticeOutcome>>,
     ) -> Result<(), SendCommandError> {
-        let thread_id = ThreadId::from(self.inner.session_id.clone());
+        let thread_id = ProcessId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
         self.inner
             .runtime
@@ -717,7 +717,7 @@ impl Session {
                 from: Sender::User,
                 to: Receiver {
                     name: agent_name.to_string(),
-                    thread_id: ThreadId::from(thread_id.to_string()),
+                    thread_id: ProcessId::from(thread_id.to_string()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(decision),
@@ -813,7 +813,7 @@ impl Session {
 
     fn wrap_event(
         &self,
-        (name, thread_id, turn_id, kind): (String, ThreadId, TurnId, AgentEvent),
+        (name, thread_id, turn_id, kind): (String, ProcessId, TurnId, AgentEvent),
     ) -> SessionEvent {
         let origin = if name == self.inner.root_name {
             EventOrigin::Root

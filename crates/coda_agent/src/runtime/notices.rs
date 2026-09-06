@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::Receiver;
 use coda_core::task::TaskId;
 
-impl AgentRuntime {
+impl ProcessRuntime {
     /// Persist the root opening and its receipt before waking the driver.
     pub(crate) async fn admit_background_notice(
         &self,
@@ -38,7 +38,7 @@ impl AgentRuntime {
                 from: Sender::User,
                 to: Receiver {
                     name: root_name.clone(),
-                    thread_id: ThreadId::from(self.session_id.clone()),
+                    thread_id: ProcessId::from(self.session_id.clone()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Task {

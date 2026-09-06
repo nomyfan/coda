@@ -819,7 +819,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
             from: Sender::User,
             to: Receiver {
                 name: first.agent_name.clone(),
-                thread_id: ThreadId::from(first.thread_id.clone()),
+                thread_id: ProcessId::from(first.thread_id.clone()),
             },
             reply_to: None,
             body: EnvelopeBody::Resume(crate::ResumeDecision {

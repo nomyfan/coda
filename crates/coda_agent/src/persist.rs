@@ -1,7 +1,7 @@
 //! Serialization-layer types for checkpoints and runtime snapshots.
 //!
 //! These `Stored*` types carry `Serialize`/`Deserialize` and define the on-disk
-//! format. Internal runtime types (`ResumePoint`, `AgentRuntimeSnapshot`, etc.)
+//! format. Internal runtime types (`ResumePoint`, `ProcessRuntimeSnapshot`, etc.)
 //! are free to evolve independently; conversion happens at the load/save
 //! boundary via `From` impls.
 
@@ -15,7 +15,7 @@ use crate::agent::{
     Envelope, HistoryEntry, PendingReply, PendingToolCall, PreparedToolCall, ResumePoint,
     ToolExecutionState,
 };
-use crate::runtime::AgentRuntimeSnapshot;
+use crate::runtime::ProcessRuntimeSnapshot;
 
 // ---------------------------------------------------------------------------
 // StoredCheckpoint
@@ -163,8 +163,8 @@ impl From<ResumePoint> for StoredResumePoint {
     }
 }
 
-impl From<AgentRuntimeSnapshot> for StoredRuntimeSnapshot {
-    fn from(s: AgentRuntimeSnapshot) -> Self {
+impl From<ProcessRuntimeSnapshot> for StoredRuntimeSnapshot {
+    fn from(s: ProcessRuntimeSnapshot) -> Self {
         StoredRuntimeSnapshot {
             drained_envelopes: s.drained_envelopes,
             agent_drained_envelopes: s.agent_drained_envelopes,
@@ -227,9 +227,9 @@ impl From<StoredResumePoint> for ResumePoint {
     }
 }
 
-impl From<StoredRuntimeSnapshot> for AgentRuntimeSnapshot {
+impl From<StoredRuntimeSnapshot> for ProcessRuntimeSnapshot {
     fn from(s: StoredRuntimeSnapshot) -> Self {
-        AgentRuntimeSnapshot {
+        ProcessRuntimeSnapshot {
             drained_envelopes: s.drained_envelopes,
             agent_drained_envelopes: s.agent_drained_envelopes,
             active_threads: s.active_threads,

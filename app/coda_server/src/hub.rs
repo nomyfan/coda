@@ -22,7 +22,7 @@ use coda_agent::{
     runtime::SendCommandError,
 };
 use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
-use coda_process::{ArchiveDir, BackgroundTasks, TaskNotice, TaskSummary};
+use coda_execution::{ArchiveDir, BackgroundTasks, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};
@@ -2037,13 +2037,13 @@ impl SessionRelay for SessionHub {
                     drop(guard);
                     let result = match background.read_result(&id).await {
                         Ok(None) => ResultWire::Unknown,
-                        Ok(Some(coda_process::TaskResult::Expired { status })) => {
+                        Ok(Some(coda_execution::TaskResult::Expired { status })) => {
                             ResultWire::Expired { status }
                         }
-                        Ok(Some(coda_process::TaskResult::Pending { status })) => {
+                        Ok(Some(coda_execution::TaskResult::Pending { status })) => {
                             ResultWire::Pending { status }
                         }
-                        Ok(Some(coda_process::TaskResult::Available { status, output })) => {
+                        Ok(Some(coda_execution::TaskResult::Available { status, output })) => {
                             ResultWire::Available { status, output }
                         }
                         Err(error) => ResultWire::Error {

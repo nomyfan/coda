@@ -7,7 +7,7 @@ use super::super::*;
 use coda_agent::persist::StoredRuntimeSnapshot;
 use coda_agent::runtime::{MemoryStorage, SessionStorage};
 use coda_agent::{
-    AgentSpec, AgentTeam, ModelProfile, RunConfig, SubAgentMode, ThreadId, ToolApprovalMode,
+    AgentSpec, AgentTeam, ModelProfile, ProcessId, RunConfig, SubAgentMode, ToolApprovalMode,
 };
 use coda_core::llm::{
     AssistantMessage, ChatCompletionRequest, CompactionMessage, CompactionOutcome, CompletionUsage,
@@ -513,8 +513,8 @@ impl TestOpener {
 
 /// The thread the `explore` sub-agent runs in: stateful, so it is derived once
 /// from the root thread (whose id is the session id) and stays put.
-pub(super) fn explore_thread() -> ThreadId {
-    ThreadId::from_uuid5(&ThreadId::from(key().1), "explore")
+pub(super) fn explore_thread() -> ProcessId {
+    ProcessId::from_uuid5(&ProcessId::from(key().1), "explore")
 }
 
 impl SessionOpener for TestOpener {
@@ -525,7 +525,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Option<Arc<coda_process::BackgroundTasks>>,
+        background: Option<Arc<coda_execution::BackgroundTasks>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls
@@ -566,9 +566,9 @@ impl SessionOpener for TestOpener {
         })
     }
 
-    fn background_archive(&self, key: &SessionKey) -> Result<coda_process::ArchiveDir, String> {
+    fn background_archive(&self, key: &SessionKey) -> Result<coda_execution::ArchiveDir, String> {
         let dir = self.background_root.path().join(&key.0).join(&key.1);
-        coda_process::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
+        coda_execution::ArchiveDir::open_or_create_root(&dir).map_err(|e| e.to_string())
     }
 
     /// Stands in for the SQL delete plus the spool removal. `MemoryStorage`
@@ -848,7 +848,7 @@ pub(super) async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState
 
 /// The entry's background task registry, so a test can start and settle tasks
 /// the way `shell` would.
-pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundTasks> {
+pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_execution::BackgroundTasks> {
     let entry = hub.get_entry(&key()).expect("a live entry");
     let guard = entry.inner.clone().lock_owned().await;
     guard
@@ -865,8 +865,8 @@ pub(super) fn spool_dir(opener: &TestOpener, key: &SessionKey) -> std::path::Pat
 }
 
 /// Metadata for a test task.
-pub(super) fn task_meta(command: &str) -> coda_process::TaskMeta {
-    coda_process::TaskMeta::shell(command.into(), "test task".into(), "coda".into())
+pub(super) fn task_meta(command: &str) -> coda_execution::TaskMeta {
+    coda_execution::TaskMeta::shell(command.into(), "test task".into(), "coda".into())
 }
 
 /// Await the next `RelayEvent` matching `pred`, skipping others.

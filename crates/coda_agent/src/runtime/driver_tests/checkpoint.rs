@@ -32,7 +32,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
 
     let config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
 
-    let mut runtime = AgentRuntime::new(MemoryStorage::default(), "test-session".into());
+    let mut runtime = ProcessRuntime::new(MemoryStorage::default(), "test-session".into());
     runtime
         .bootstrap(agents, None, HashMap::new(), config)
         .await
@@ -40,7 +40,7 @@ async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
 
     runtime
         .send_message(user_task(
-            &ThreadId::from("test-session".to_string()),
+            &ProcessId::from("test-session".to_string()),
             "hello",
         ))
         .await

@@ -3,7 +3,7 @@ use super::super::fixtures::assistant;
 use crate::runtime::{SessionStorage, StoredResumePoint};
 use crate::{AgentSpec, AgentTeam, ModelProfile, RunConfig, runtime::MemoryStorage};
 use coda_core::llm::RequestMessage;
-use coda_process::BackgroundTasks;
+use coda_execution::BackgroundTasks;
 use tokio::sync::Notify;
 
 #[derive(Clone, Default)]
@@ -66,10 +66,10 @@ impl LLMProvider for BackgroundProvider {
 pub(super) async fn start(
     provider: BackgroundProvider,
 ) -> (
-    AgentRuntime,
+    ProcessRuntime,
     MemoryStorage,
     Arc<BackgroundTasks>,
-    tokio::sync::broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>,
+    tokio::sync::broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>,
 ) {
     let storage = MemoryStorage::default();
     let (runtime, background, events) = start_storage(provider, storage.clone()).await;
@@ -80,9 +80,9 @@ pub(super) async fn start_storage<S: SessionStorage + Clone + 'static>(
     provider: BackgroundProvider,
     storage: S,
 ) -> (
-    AgentRuntime,
+    ProcessRuntime,
     Arc<BackgroundTasks>,
-    tokio::sync::broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>,
+    tokio::sync::broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>,
 ) {
     let background = Arc::new(BackgroundTasks::temporary().unwrap());
     let spec = |name: &str, prompt: &str, subagents: Vec<String>| AgentSpec {
@@ -110,7 +110,7 @@ pub(super) async fn start_storage<S: SessionStorage + Clone + 'static>(
         coda_tools::shared_file_locks(),
         Some(background.clone()),
     );
-    let mut runtime = AgentRuntime::new(storage.clone(), "background-session".into());
+    let mut runtime = ProcessRuntime::new(storage.clone(), "background-session".into());
     runtime.background = Some(background.clone());
     let events = runtime.subscribe();
     runtime

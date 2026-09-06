@@ -4,7 +4,7 @@ use crate::schema::{
     thread_checkpoints,
 };
 use coda_agent::HistoryEntry;
-use coda_agent::ThreadId;
+use coda_agent::ProcessId;
 use coda_agent::agent::ThreadStateMap;
 use coda_agent::execution::{CleanupReceipt, ExecutionIdentity, ScopeAbort};
 use coda_agent::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
@@ -1071,7 +1071,7 @@ fn remap_thread_ids(
             let Some(new_parent) = mapped.get(parent).cloned() else {
                 return true;
             };
-            let derived = ThreadId::from_uuid5(&ThreadId::from(new_parent), key);
+            let derived = ProcessId::from_uuid5(&ProcessId::from(new_parent), key);
             mapped.insert(thread.thread_id.clone(), derived.as_ref().to_string());
             false
         });
@@ -1726,10 +1726,10 @@ impl SessionStorage for PgSessionStorage {
                         .read_checkpoint_on(conn, &member.thread_id)
                         .await
                         .map_err(SaveError::Rejected)?
-                        && checkpoint
-                            .active_execution
-                            .as_ref()
-                            .is_some_and(|e| e.background_task() == Some(&scope.task_id))
+                        && checkpoint.active_execution.as_ref().is_some_and(|e| {
+                            e.background_task() == Some(&scope.task_id)
+                                && e.invocation_id == member.invocation_id
+                        })
                     {
                         coda_agent::execution::abort_checkpoint(&mut checkpoint, &scope.reason);
                         self.write_checkpoint_on(conn, &member.thread_id, checkpoint, None)
@@ -1743,7 +1743,23 @@ impl SessionStorage for PgSessionStorage {
                     .await
                     .optional()?
                 {
-                    coda_agent::execution::remove_scope_messages(&mut snapshot, &scope.members);
+                    let active = thread_checkpoints::table
+                        .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
+                        .filter(thread_checkpoints::session_id.eq(&self.session_id))
+                        .select((
+                            thread_checkpoints::thread_id,
+                            thread_checkpoints::active_execution,
+                        ))
+                        .load::<(String, Option<Json<coda_agent::execution::StoredExecution>>)>(
+                            conn,
+                        )
+                        .await?
+                        .into_iter()
+                        .filter_map(|(pid, execution)| {
+                            execution.map(|e| (pid, e.into_inner().invocation_id))
+                        })
+                        .collect();
+                    coda_agent::execution::fence_snapshot(&mut snapshot, &scope.members, &active);
                     diesel::update(
                         runtime_snapshots::table.find((&self.workspace_id, &self.session_id)),
                     )

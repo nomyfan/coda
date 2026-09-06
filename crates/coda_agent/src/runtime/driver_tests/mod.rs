@@ -5,6 +5,7 @@ mod approval;
 mod auto_compact;
 mod checkpoint;
 mod concurrency;
+mod contracts;
 mod orphaned_reply;
 mod ptc;
 mod stale_replay;

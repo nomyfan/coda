@@ -21,6 +21,9 @@ use futures::{Stream, stream};
 use serde_json::json;
 use tokio::time::timeout;
 
+#[path = "session/backpressure.rs"]
+mod backpressure;
+
 // ---------------------------------------------------------------------------
 // FakeProvider — a mock LLMProvider that routes based on message content
 // ---------------------------------------------------------------------------
@@ -1189,7 +1192,7 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
         .expect("a self-built session has a registry")
         .spawn(
             cmd,
-            coda_process::TaskMeta::shell("sleep".into(), "owned task".into(), "coda".into()),
+            coda_execution::TaskMeta::shell("sleep".into(), "owned task".into(), "coda".into()),
         )
         .await
         .expect("spawn background task");

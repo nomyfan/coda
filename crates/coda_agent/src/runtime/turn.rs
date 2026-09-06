@@ -1,9 +1,9 @@
 //! The two pieces of pure session-scheduling state: the single-flight slot for
 //! the active turn, and the ledger of calls still owed an answer. Both are
 //! plain in-memory state machines; deciding *when* they change — and what else
-//! changes with them (broadcasts, storage) — stays with `AgentRuntime`.
+//! changes with them (broadcasts, storage) — stays with `ProcessRuntime`.
 
-use crate::ThreadId;
+use crate::ProcessId;
 use coda_core::llm::TurnId;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -98,10 +98,8 @@ impl TurnGate {
         }
     }
 
-    /// Whether this turn has been asked to stop. Agents read the mark rather
-    /// than deciding for themselves which turn an abort meant: a stateless
-    /// agent's `Agent` instance is reused across threads, so while it sits idle
-    /// its own `current_turn()` still names the previous one.
+    /// Whether this execution turn was stopped; idle processes can still
+    /// retain an earlier turn in their history.
     pub(super) fn is_cancelled(&self, turn: TurnId) -> bool {
         self.slot
             .lock()
@@ -121,18 +119,18 @@ impl TurnGate {
 /// would make a caller write its result for it.
 #[derive(Default)]
 pub(super) struct CallLedger {
-    unanswered: Mutex<HashMap<ThreadId, usize>>,
+    unanswered: Mutex<HashMap<ProcessId, usize>>,
 }
 
 impl CallLedger {
-    pub(super) fn clear(&self, thread: &ThreadId) {
+    pub(super) fn clear(&self, thread: &ProcessId) {
         self.unanswered
             .lock()
             .expect("unanswered calls")
             .remove(thread);
     }
 
-    pub(super) fn try_begin(&self, thread_id: &ThreadId) -> bool {
+    pub(super) fn try_begin(&self, thread_id: &ProcessId) -> bool {
         let mut unanswered = self.unanswered.lock().expect("unanswered calls");
         if unanswered.contains_key(thread_id) {
             return false;
@@ -142,7 +140,7 @@ impl CallLedger {
     }
 
     /// Note that a call has gone out to `thread_id` and has not been answered.
-    pub(super) fn begin(&self, thread_id: &ThreadId) {
+    pub(super) fn begin(&self, thread_id: &ProcessId) {
         *self
             .unanswered
             .lock()
@@ -152,7 +150,7 @@ impl CallLedger {
     }
 
     /// Note that one of `thread_id`'s callers has taken its answer.
-    pub(super) fn end(&self, thread_id: &ThreadId) {
+    pub(super) fn end(&self, thread_id: &ProcessId) {
         let mut unanswered = self.unanswered.lock().expect("unanswered calls");
         if let Some(count) = unanswered.get_mut(thread_id) {
             *count -= 1;
@@ -167,7 +165,7 @@ impl CallLedger {
     /// `false` means nothing here will ever produce that answer — the work went
     /// away with a previous process — and the caller is free to write the call
     /// off rather than wait forever.
-    pub(super) fn is_answering(&self, thread_id: &ThreadId) -> bool {
+    pub(super) fn is_answering(&self, thread_id: &ProcessId) -> bool {
         self.unanswered
             .lock()
             .expect("unanswered calls")

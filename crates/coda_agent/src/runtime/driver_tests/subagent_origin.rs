@@ -39,7 +39,7 @@ fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<Agent
 /// opens work in a thread, in order.
 async fn origins_in_thread(
     storage: &MemoryStorage,
-    thread_id: &ThreadId,
+    thread_id: &ProcessId,
 ) -> Vec<Option<MessageOrigin>> {
     storage
         .load_checkpoint(thread_id.as_ref())
@@ -59,7 +59,7 @@ async fn origins_in_thread(
 /// `(message id, the ids of the calls it issued)`.
 async fn tool_calling_assistants(
     storage: &MemoryStorage,
-    thread_id: &ThreadId,
+    thread_id: &ProcessId,
 ) -> Vec<(MessageId, Vec<String>)> {
     storage
         .load_checkpoint(thread_id.as_ref())
@@ -185,11 +185,14 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     .expect("timed out waiting for the root agent to finish");
     assert_eq!(done, "main done");
     assert_eq!(
-        harness.runtime.agents.lock().await.len(),
+        harness.runtime.processes.lock().await.len(),
         1,
         "stateful drivers retire too; the next invocation restores its checkpoint"
     );
-    assert_eq!(harness.runtime.executions.lock().unwrap().threads.len(), 1);
+    assert_eq!(
+        harness.runtime.executions.lock().unwrap().processes.len(),
+        1
+    );
     harness.shutdown().await;
 
     let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
@@ -203,7 +206,7 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
 
     // Both invocations share one thread, and each opening message points back at
     // the assistant message that issued it.
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.thread_id, "explore");
     assert_eq!(
         origins_in_thread(&harness.storage, &explore_thread).await,
         vec![
@@ -381,7 +384,7 @@ async fn every_thread_records_how_its_parent_addressed_it() {
             .expect("a thread with a parent also records how it was derived");
         // The recorded pair is not a note about the id — it reproduces it.
         assert_eq!(
-            ThreadId::from_uuid5(&ThreadId::from(parent_thread_id.clone()), derivation_key)
+            ProcessId::from_uuid5(&ProcessId::from(parent_thread_id.clone()), derivation_key)
                 .as_ref(),
             checkpoint.thread_id,
             "{} does not derive from its recorded parent",
@@ -440,10 +443,10 @@ async fn stateless_invocations_reusing_a_call_id_get_separate_threads() {
     );
     assert_eq!(parents[0].1, parents[1].1, "both calls reuse one call id");
 
-    let threads: Vec<ThreadId> = parents
+    let threads: Vec<ProcessId> = parents
         .iter()
         .map(|(message_id, _)| {
-            ThreadId::from_uuid5(
+            ProcessId::from_uuid5(
                 &harness.thread_id,
                 &MessageOrigin {
                     message_id: *message_id,
@@ -538,7 +541,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     .expect("timed out waiting for completion after resume");
     harness.shutdown().await;
 
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.thread_id, "explore");
     assert_eq!(
         origins_in_thread(&harness.storage, &explore_thread).await,
         vec![Some(MessageOrigin {
@@ -617,7 +620,7 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         );
     };
     // Derived from what the parent already holds — nothing here reads the child.
-    let derived = ThreadId::from_uuid5(
+    let derived = ProcessId::from_uuid5(
         &harness.thread_id,
         &MessageOrigin {
             message_id: parked.parent_message_id,

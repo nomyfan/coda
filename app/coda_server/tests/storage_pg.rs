@@ -10,7 +10,7 @@
 //! `(workspace_id, session_id)` and `WorkspaceStorage` is workspace-scoped, so
 //! tests never see each other's rows and can run in parallel without cleanup.
 
-use coda_agent::ThreadId;
+use coda_agent::ProcessId;
 use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
 use coda_agent::persist::{
     StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint, StoredRuntimeSnapshot,
@@ -186,7 +186,7 @@ fn queued_task(thread_id: &str, task: &str) -> Envelope {
         from: Sender::User,
         to: Receiver {
             name: "coda".to_string(),
-            thread_id: ThreadId::from(thread_id.to_string()),
+            thread_id: ProcessId::from(thread_id.to_string()),
         },
         reply_to: None,
         body: EnvelopeBody::Task {
@@ -313,7 +313,7 @@ async fn a_saved_thread_comes_back_whole() {
         derivation_key: Some(opening_call.derivation_key()),
         active_execution: Some(coda_agent::execution::StoredExecution {
             invocation_id: "env-1".into(),
-            scope: coda_agent::execution::ExecutionScope::Foreground { turn_id: turn },
+            scope: coda_agent::execution::ProcessGroupId::Foreground { turn_id: turn },
             agent_path: vec!["coda".into(), "explore".into()],
             completion: coda_agent::execution::CompletionTarget::Caller(ReplyTarget {
                 envelope_id: "env-1".to_string(),
@@ -1980,7 +1980,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
     let workspace = workspace_id("fork-remap");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
-    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+    let explore = ProcessId::from_uuid5(&ProcessId::from("source-session".to_string()), "explore");
 
     let (first, second, third) = (
         TurnId::from(MessageId::new()),
@@ -2051,7 +2051,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
         .await
         .unwrap();
 
-    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let new_explore = ProcessId::from_uuid5(&ProcessId::from(forked.session_id.clone()), "explore");
     let mut expected = vec![
         (forked.session_id.clone(), 5),
         (new_explore.as_ref().to_string(), 2),
@@ -2102,7 +2102,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
     let workspace = workspace_id("fork-cut");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
-    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+    let explore = ProcessId::from_uuid5(&ProcessId::from("source-session".to_string()), "explore");
 
     let (kept, dropped) = (
         TurnId::from(MessageId::new()),
@@ -2158,7 +2158,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
         .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
         .await
         .expect("the message that opened a turn");
-    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let new_explore = ProcessId::from_uuid5(&ProcessId::from(forked.session_id.clone()), "explore");
     let mut expected = vec![
         (forked.session_id.clone(), 2),
         (new_explore.as_ref().to_string(), 1),

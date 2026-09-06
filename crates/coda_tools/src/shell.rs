@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
-use coda_process::{BackgroundTasks, TaskMeta};
+use coda_execution::{BackgroundTasks, TaskMeta};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;

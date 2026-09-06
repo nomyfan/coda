@@ -2,8 +2,8 @@ use super::*;
 use crate::execution::ScopeAbort;
 use coda_core::{llm::ToolOutput, task::TaskId};
 
-impl AgentRuntime {
-    pub(crate) async fn stop_scope(&self, id: &TaskId, error: Option<String>) {
+impl ProcessRuntime {
+    pub(crate) async fn stop_background_group(&self, id: &TaskId, error: Option<String>) {
         let (owns_stop, mut stopped) = {
             let mut state = self.executions.lock().expect("executions");
             let Some(scope) = state.background.get_mut(id) else {
@@ -21,30 +21,40 @@ impl AgentRuntime {
             while !*stopped.borrow_and_update() && stopped.changed().await.is_ok() {}
             return;
         }
-        let (members, removed) = {
+        let (members, retired, removed) = {
             let mut state = self.executions.lock().expect("executions");
             let scope = state.background.get(id).expect("scope owns stop");
             let members = scope.members.clone();
-            for member in &members {
+            let retired: Vec<_> = members
+                .iter()
+                .filter(|member| {
+                    state
+                        .processes
+                        .get(&member.thread_id)
+                        .is_none_or(|e| e.stored.invocation_id == member.invocation_id)
+                })
+                .cloned()
+                .collect();
+            for member in &retired {
                 state.quarantined.insert(member.thread_id.clone());
-                if let Some(execution) = state.threads.get(&member.thread_id) {
+                if let Some(execution) = state.processes.get(&member.thread_id) {
                     execution.cancel.cancel();
                 }
             }
             let keys: Vec<_> = state
                 .approvals
                 .keys()
-                .filter(|(thread, _)| members.iter().any(|m| &m.thread_id == thread))
+                .filter(|(thread, _)| retired.iter().any(|m| &m.thread_id == thread))
                 .cloned()
                 .collect();
             let removed: Vec<_> = keys
                 .into_iter()
                 .filter_map(|key| state.approvals.remove(&key))
                 .collect();
-            (members, removed)
+            (members, retired, removed)
         };
         for approval in removed {
-            let thread = ThreadId::from(approval.thread_id.clone());
+            let thread = ProcessId::from(approval.thread_id.clone());
             let turn = TurnId::from(approval.parent_message_id);
             let _ = self.global_event_tx.send((
                 approval.agent_name,
@@ -63,14 +73,14 @@ impl AgentRuntime {
         let _ = background.request_kill(id).await;
         let _ = background.record_scope(id, members.clone(), true).await;
         let handles: Vec<_> = {
-            let drivers = self.agents.lock().await;
-            members
+            let drivers = self.processes.lock().await;
+            retired
                 .iter()
                 .filter_map(|member| drivers.get(&member.thread_id).cloned())
                 .collect()
         };
         for handle in &handles {
-            let _ = handle.send_command(AgentControl::StopScope).await;
+            let _ = handle.send_command(ProcessControl::StopGroup).await;
         }
         for mut handle in handles {
             if !*handle.finished.borrow()
@@ -86,16 +96,24 @@ impl AgentRuntime {
         }
         background.kill_children(id).await;
         {
-            let mut drivers = self.agents.lock().await;
-            for member in &members {
+            let mut drivers = self.processes.lock().await;
+            for member in &retired {
                 drivers.remove(&member.thread_id);
-                self.calls.clear(&ThreadId::from(member.thread_id.clone()));
+                self.calls.clear(&ProcessId::from(member.thread_id.clone()));
             }
         }
         {
             let mut snapshot = self.snapshot.lock().await;
             let mut stored = snapshot.clone().into();
-            crate::execution::remove_scope_messages(&mut stored, &members);
+            let active = self
+                .executions
+                .lock()
+                .expect("executions")
+                .processes
+                .iter()
+                .map(|(pid, e)| (pid.clone(), e.stored.invocation_id.clone()))
+                .collect();
+            crate::execution::fence_snapshot(&mut stored, &members, &active);
             *snapshot = stored.into();
         }
         let reason = self
@@ -112,7 +130,7 @@ impl AgentRuntime {
             reason: reason.clone(),
         };
         let runtime = self.clone();
-        self.agent_tasks
+        self.process_tasks
             .lock()
             .expect("runtime tasks")
             .spawn(async move {
@@ -135,9 +153,9 @@ impl AgentRuntime {
                             .await;
                         let mut state = runtime.executions.lock().expect("executions");
                         state.background.remove(&abort.task_id);
-                        for member in &abort.members {
+                        for member in &retired {
                             state.quarantined.remove(&member.thread_id);
-                            state.threads.remove(&member.thread_id);
+                            state.processes.remove(&member.thread_id);
                         }
                         break;
                     }
@@ -171,7 +189,7 @@ impl AgentRuntime {
     }
 }
 
-async fn background_cleanup(runtime: &AgentRuntime, abort: &ScopeAbort) -> Result<(), String> {
+async fn background_cleanup(runtime: &ProcessRuntime, abort: &ScopeAbort) -> Result<(), String> {
     for member in &abort.members {
         runtime
             .session_storage

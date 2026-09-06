@@ -1,18 +1,85 @@
 use super::*;
 use coda_agent::execution::{
-    CompletionTarget, ExecutionIdentity, ExecutionScope, ScopeAbort, StoredExecution,
+    CompletionTarget, ExecutionIdentity, ProcessGroupId, ScopeAbort, StoredExecution,
 };
 use coda_core::task::{ScopeMember, TaskId};
 
 fn execution(task: &TaskId, invocation: &str) -> StoredExecution {
     StoredExecution {
         invocation_id: invocation.into(),
-        scope: ExecutionScope::Background {
+        scope: ProcessGroupId::Background {
             task_id: task.clone(),
         },
         completion: CompletionTarget::BackgroundTask(task.clone()),
         agent_path: vec!["coda".into(), "worker".into()],
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
+    let pool = pool().await;
+    let workspace = workspace_id("reused_process");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool, &workspace, "root");
+    let old = TaskId::new();
+    let new = TaskId::new();
+    let mut child = checkpoint("child", vec![]);
+    child.agent_name = "worker".into();
+    child.parent_thread_id = Some("root".into());
+    child.derivation_key = Some("worker".into());
+    child.active_execution = Some(execution(&new, "new-invocation"));
+    storage
+        .save_checkpoint("child".into(), child.clone())
+        .await
+        .unwrap();
+    let mut queued = queued_task("child", "new work");
+    queued.id = "new-invocation".into();
+    storage
+        .save_session_snapshot(
+            "root".into(),
+            StoredRuntimeSnapshot {
+                active_threads: [("child".into(), "worker".into())].into(),
+                drained_envelopes: [("child".into(), vec![queued])].into(),
+                agent_drained_envelopes: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .abort_scope(ScopeAbort {
+            task_id: old,
+            members: vec![ScopeMember {
+                thread_id: "child".into(),
+                invocation_id: "old-invocation".into(),
+            }],
+            reason: "old group failed".into(),
+        })
+        .await
+        .unwrap();
+    let current = storage.load_checkpoint("child").await.unwrap().unwrap();
+    assert_eq!(
+        current.active_execution.unwrap().invocation_id,
+        "new-invocation"
+    );
+    let snapshot = storage
+        .load_session_snapshot("root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.active_threads.contains_key("child"));
+    assert_eq!(snapshot.drained_envelopes["child"][0].id, "new-invocation");
+    assert!(
+        storage
+            .save_execution_checkpoint(
+                ExecutionIdentity {
+                    thread_id: "child".into(),
+                    invocation_id: "old-invocation".into(),
+                },
+                child
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -146,7 +213,7 @@ async fn notice_receipt_is_atomic_idempotent_and_survives_rewind() {
     );
     opening.active_execution = Some(StoredExecution {
         invocation_id: "notice-invocation".into(),
-        scope: ExecutionScope::Foreground {
+        scope: ProcessGroupId::Foreground {
             turn_id: TurnId::from(message_id),
         },
         completion: CompletionTarget::RootTurn,

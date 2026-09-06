@@ -508,8 +508,8 @@ pub struct Snapshot {
 /// to parse the label.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummaryWire {
-    pub task_status: coda_process::TaskStatus,
-    pub kind: coda_process::TaskKind,
+    pub task_status: coda_execution::TaskStatus,
+    pub kind: coda_execution::TaskKind,
     pub parent_task_id: Option<coda_core::task::TaskId>,
     pub subtree_active: bool,
     pub result_available: bool,
@@ -523,8 +523,8 @@ pub struct TaskSummaryWire {
     pub started_at: String,
 }
 
-impl From<coda_process::TaskSummary> for TaskSummaryWire {
-    fn from(summary: coda_process::TaskSummary) -> Self {
+impl From<coda_execution::TaskSummary> for TaskSummaryWire {
+    fn from(summary: coda_execution::TaskSummary) -> Self {
         Self {
             task_status: summary.status.clone(),
             kind: summary.kind,
@@ -714,14 +714,14 @@ mod tests;
 pub enum TaskResultWire {
     Unknown,
     Pending {
-        status: coda_process::TaskStatus,
+        status: coda_execution::TaskStatus,
     },
     Available {
-        status: coda_process::TaskStatus,
-        output: coda_process::TaskResultOutput,
+        status: coda_execution::TaskStatus,
+        output: coda_execution::TaskResultOutput,
     },
     Expired {
-        status: coda_process::TaskStatus,
+        status: coda_execution::TaskStatus,
     },
     Error {
         message: String,

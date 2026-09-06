@@ -434,7 +434,7 @@ fn shared_subagent_is_allowed() {
         ".",
         coda_tools::shared_file_locks(),
         Some(std::sync::Arc::new(
-            coda_process::BackgroundTasks::temporary().unwrap(),
+            coda_execution::BackgroundTasks::temporary().unwrap(),
         )),
     );
     assert!(agents.contains_key("shared"));

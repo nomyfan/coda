@@ -75,36 +75,36 @@ ActiveExecution
 
 ## Interfaces
 
-以下为目标内部接口草案，表示职责边界；参数结构沿用现有任务内容、来源和结果类型，不新增面向 LLM 的 API。
+以下记录内部接口及职责边界；参数结构沿用现有任务内容、来源和结果类型，不新增面向 LLM 的 API。`AgentTeam::build` 的资源参数保持原有形状。
 
 ```rust
 // 根据已校验声明和 session 资源构建可复用程序，不分配实例 memory。
 fn AgentTeam::build(...) -> HashMap<String, Arc<Program>>;
 
-// 在当前待执行批次产生启动副作用前，找出所有重复 stateful 目标调用。
-// 纯检查，不占用实例；driver 为这些调用逐一记录拒绝结果，不提交给 invoke。
+// 在当前待执行批次产生启动副作用前，找出所有重复 stateful 目标名称。
+// 纯检查，不占用实例；driver 为命中这些目标的调用逐一记录拒绝结果。
 fn preflight_stateful_calls(
     program: &Program, calls: &VecDeque<PendingToolCall>,
-) -> HashSet<CallId>;
+) -> HashSet<String>;
 
 // 验证调用目标及启动资格，选择新实例或现有 stateful 实例并提交工作。
 // 仅接收经过 driver 批次预检的调用；仍检查实时 busy 等准入条件。
 // 返回前台回复关联或后台 TaskId；退出中、未知目标、实例忙或清理阻塞时失败。
 async fn ProcessRuntime::invoke(
-    &self, caller: ProcessId, call: SubagentInvocation,
-) -> Result<InvocationReceipt, DispatchError>;
+    &self, caller: &ProcessId, call: SubagentInvocation,
+) -> Result<InvocationReceipt, String>;
 
 // Running 时投递或恢复已登记 process；Exiting 时将已准入执行的消息保存到 snapshot。
 // Exiting 不启动 driver；Closed 才拒绝交付。成功表示接收，不保证退出期落盘成功。
 async fn ProcessRuntime::deliver(
     &self, envelope: Envelope,
-) -> Result<(), DispatchError>;
+) -> Result<(), SendCommandError>;
 
-// 关闭分组准入并取消相关执行；清理失败时保留隔离状态，禁止受影响实例复用。
-// 只作用于匹配的 execution 身份，不影响该 pid 后续的其他执行。
-async fn ProcessRuntime::stop_group(
-    &self, group: ProcessGroupId,
-) -> Result<(), CleanupError>;
+// 关闭后台组准入并停止其执行；持久清理由 runtime 跟踪并重试。
+// 返回不代表持久清理结束；has_background_work 在清理完成前保持 true。
+async fn ProcessRuntime::stop_background_group(
+    &self, task_id: &TaskId, error: Option<String>,
+);
 ```
 
 - `InvocationReceipt` 区分前台待回复关联与后台 TaskId。前台 driver 先提交整批调用，再等待所有 pending replies，不在循环中等待每个子调用完成。
@@ -125,6 +125,7 @@ async fn ProcessRuntime::stop_group(
 
 - Exiting 的保存职责在 runtime 的 `deliver`，不依赖父 driver 存活；前台子调用在 graceful shutdown 期间完成的 Reply 必须走此路径，不能因父 handle 已回收而当作目标不存在拒绝。执行有效性检查保留 checkpoint/pending reply 关联，不能仅以在线表是否有目标判断。
 - 退出切换与消息交付需要有明确先后顺序：已入 inbox 的消息由 driver 退出快照收集；进入 Exiting 后的消息由 runtime 缓存。snapshot 更新及最终保存不得相互覆盖。到 Closed 前应等待消息生产者退出并完成已有收集/保存流程；有界强制终止仍遵循现有取消和清理规则，不保证未生成结果的交付。
+- 交付锁不覆盖等待 inbox 容量：先在锁内选择接收方，锁外 reserve 容量，再回到锁内检查生命周期并同步入队。等待期间若进入 Exiting，不论 reserve 成功还是接收方已关闭，都转入归档；进入 Closed 则拒绝。不能用跨 process 的锁包住有界 channel 的 send().await，否则一批快速回复会阻塞父 process 继续分发，连 shutdown 也无法启动。
 - `deliver` 的 `Ok` 表示已投递或已接收到恢复缓冲，不表示任务执行完成。退出期 snapshot 保存失败沿用现有告警和返回行为，不默默丢弃内存中的 envelope，也不把本轮重构解释成新增持久交付保证；更强的存储失败策略另行设计。
 - Exiting 缓存不绕过迟到回复 fencing、审批有效性或后台冷启动清理：前台可恢复消息照常恢复，已终止后台执行的消息仍按既有规则清理。
 
@@ -167,21 +168,38 @@ async fn ProcessRuntime::stop_group(
 
 ## Implementation Roadmap
 
-- [ ] [行为基线] 检查并补足同 pid 跨执行分组、旧清理/迟到回复、答案完成后 shell 仍存活，以及同批重复 stateful 调用全部拒绝的回归用例。
+- [x] [行为基线] 检查并补足同 pid 跨执行分组、旧清理/迟到回复、答案完成后 shell 仍存活，以及同批重复 stateful 调用全部拒绝的回归用例。
   - Purpose：先固定最容易因概念整理而改变的取消与复用边界。
   - Verification：有针对性的 runtime/background 测试；重复 stateful 项无模型调用或后台任务创建，混合前后台也全部拒绝；无冲突目标仍执行，同名 stateless 的原并发 barrier 用例继续通过。
-- [ ] [crate 命名] 将目录及 package 改为 coda_execution，同步 Cargo.lock、依赖、代码和当前架构文档。
+- [x] [crate 命名] 将目录及 package 改为 coda_execution，同步 Cargo.lock、依赖、代码和当前架构文档。
   - Purpose：先消除 OS 执行 crate 与逻辑 process 的命名冲突，不搬迁职责。
   - Verification：workspace 构建、clippy、测试及 pg-tests 全目标编译。
-- [ ] [定义与状态] AgentTeam 构建 Arc<Program>；将 AgentState 和历史操作归入 Process；模型请求构造使用 Program 与实例 memory。
+- [x] [定义与状态] AgentTeam 构建 Arc<Program>；将 AgentState 和历史操作归入 Process；模型请求构造使用 Program 与实例 memory。
   - Purpose：工具按 session 构建，process memory 独立；先让现有 driver 使用新对象并保持可编译。
   - Verification：spec、消息视图、compaction、工具状态隔离和并发测试。
-- [ ] [路由与恢复] 引入 ProcessId，runtime 表按 pid 管理；固定 driver 身份，移除 Agent::for_thread 及多 thread 选择结构，更新 checkpoint 转换和服务端调用。
+- [x] [路由与恢复] 引入 ProcessId，runtime 表按 pid 管理；固定 driver 身份，移除 Agent::for_thread 及多 thread 选择结构，更新 checkpoint 转换和服务端调用。
   - Purpose：运行时直接管理 process，完整保留恢复与实时快照能力。
   - Verification：审批、checkpoint、stale replay、orphaned reply、server hub 及 fork/rewind 测试；补充父 driver 已退出、子调用在 graceful shutdown 期间返回 Reply，消息进入持久 snapshot 且重开后正常消费的场景。覆盖退出切换时的 inbox/runtime 缓存收集、新调用被拒绝、Closed 后返回错误，以及 snapshot 保存失败保持现有返回和告警行为。
-- [ ] [执行分组] 整理 Scope 为执行期 ProcessGroupId，统一调用准入与成员身份检查；保留前后台完成、通知和资源清理差异。
+- [x] [执行分组] 整理 Scope 为执行期 ProcessGroupId，统一调用准入与成员身份检查；保留前后台完成、通知和资源清理差异。
   - Purpose：分组能直接解释取消行为，同时不引入新后台权限或实例选择方式。
   - Verification：后台 lifecycle/persistence/approval、清理 fencing、通知 receipt 与 shell 所有权测试。
-- [ ] [集成与文档] 清理过时命名和注释，更新 AGENTS.md 架构说明；审阅 prompts，只有模型所需规则实际变化时才调整。
+- [x] [集成与文档] 清理过时命名和注释，更新 AGENTS.md 架构说明；审阅 prompts，只有模型所需规则实际变化时才调整。
   - Purpose：新维护者无需了解旧 Agent/thread 中间层即可理解执行模型。
   - Verification：最终运行 cargo clippy、cargo test、cargo check -p coda_server --features pg-tests --all-targets；存储行为变更时在确认可用的临时数据库运行 pg-tests，未运行则明确记录。若修改 web 代码，追加其 lint/test。
+
+## Deviations from Design
+
+- 预检沿用“返回重复目标名称、逐项拒绝”的纯函数形式，不新增 CallId 包装；invoke 保留现有错误文本，消息分发继续使用 SendCommandError。
+- 前台取消继续使用 request_abort，后台取消明确命名为 stop_background_group，不加通用 stop_group 转发层。持久清理继续异步重试，完成性由现有状态查询表达；没有新增同步 CleanupError API。
+- Envelope 保留用于首次启动及 snapshot 恢复的 program 名称元数据；在线 driver 固定 pid，Program 本身不参与收信。存储和事件中的 thread 字段仍保持原有格式。
+- 旧组清理路径原先存在仅按 pid 删除的操作，本轮按已确认的 execution 身份契约补齐内存与 PostgreSQL fencing；尚未结束持久清理的组继续阻止会话维护操作。
+- 已审阅默认 system prompt 和 templates 的委派、取消与恢复规则。模型可见操作未变化，无需修改提示词；架构说明已更新到 AGENTS.md。
+
+## Implementation Validation
+
+- 分支：`refactor/agent-process-model`；需求与设计初始提交：`52029be1`。
+- 已通过 `cargo clippy`（无警告）、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`。
+- 已使用项目指定的本地 `coda_test` 数据库执行 `cargo test --features pg-tests`，47 个 PostgreSQL 存储测试全部通过；已有的一个 provider 测试保持 ignored。
+- 新增验证覆盖独立 process 的 memory 隔离、同批 stateful 前后台重复调用全部拒绝、退出后的 Reply 恢复及单次消费、snapshot 写失败保留内存消息，以及旧组清理对新 invocation 的内存与数据库隔离。
+- P1 背压回归：通过公开 Session API 一次提交 32 个立即完成的 stateless 子调用，验证所有回复被接收且 shutdown 有界返回；另以满 inbox 确定性验证 request_exit 不等待容量，以及退出后接收方关闭或容量可用时都只归档一次。该确定性用例在修复前因 request_exit 超时失败。
+- 未修改 web 代码；本轮不涉及部署或远程推送，实现改动保留在工作区供审查。

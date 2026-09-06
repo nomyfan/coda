@@ -1,18 +1,23 @@
 mod cleanup;
 mod driver;
+mod groups;
+mod invocation;
 mod notices;
-mod scopes;
 mod turn;
+
+#[cfg(test)]
+#[path = "runtime/delivery_tests.rs"]
+mod delivery_tests;
 
 use crate::agent::EnvelopeBody;
 use crate::persist::{StoredCheckpoint, StoredResumePoint, StoredRuntimeSnapshot};
-use crate::{Agent, AgentEvent, Envelope, ResumeDecision, RunConfig, Sender, ThreadId};
+use crate::{AgentEvent, Envelope, Process, ProcessId, Program, ResumeDecision, RunConfig, Sender};
 use coda_core::llm::{LLMProvider, TurnId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
@@ -21,9 +26,9 @@ use tracing::{info, warn};
 use turn::{CallLedger, TurnAlreadyActive, TurnGate};
 
 #[derive(Clone)]
-enum AgentControl {
+enum ProcessControl {
     Abort,
-    StopScope,
+    StopGroup,
     /// Shutdown the agent gracefully.
     Exit,
 }
@@ -63,25 +68,17 @@ impl std::fmt::Display for SendCommandError {
 impl std::error::Error for SendCommandError {}
 
 #[derive(Clone)]
-struct AgentHandle {
-    control_sender: mpsc::Sender<AgentControl>,
+struct ProcessHandle {
+    control_sender: mpsc::Sender<ProcessControl>,
     message_sender: mpsc::Sender<Envelope>,
     abort: tokio::task::AbortHandle,
     finished: tokio::sync::watch::Receiver<bool>,
 }
 
-impl AgentHandle {
-    async fn send_command(&self, cmd: AgentControl) -> Result<(), SendCommandError> {
+impl ProcessHandle {
+    async fn send_command(&self, cmd: ProcessControl) -> Result<(), SendCommandError> {
         self.control_sender
             .send(cmd)
-            .await
-            .map_err(|_| SendCommandError::ChannelClosed)
-    }
-
-    /// Send a message to this agent, triggering a new turn.
-    pub(crate) async fn send_message(&self, envelope: Envelope) -> Result<(), SendCommandError> {
-        self.message_sender
-            .send(envelope)
             .await
             .map_err(|_| SendCommandError::ChannelClosed)
     }
@@ -364,16 +361,24 @@ impl SessionStorage for MemoryStorage {
             for member in &scope.members {
                 aborted.insert((member.thread_id.clone(), member.invocation_id.clone()));
                 if let Some(checkpoint) = checkpoints.get_mut(&member.thread_id)
-                    && checkpoint
-                        .active_execution
-                        .as_ref()
-                        .is_some_and(|e| e.background_task() == Some(&scope.task_id))
+                    && checkpoint.active_execution.as_ref().is_some_and(|e| {
+                        e.background_task() == Some(&scope.task_id)
+                            && e.invocation_id == member.invocation_id
+                    })
                 {
                     crate::execution::abort_checkpoint(checkpoint, &scope.reason);
                 }
             }
+            let active = checkpoints
+                .iter()
+                .filter_map(|(pid, cp)| {
+                    cp.active_execution
+                        .as_ref()
+                        .map(|e| (pid.clone(), e.invocation_id.clone()))
+                })
+                .collect();
             for snapshot in snapshots.values_mut() {
-                crate::execution::remove_scope_messages(snapshot, &scope.members);
+                crate::execution::fence_snapshot(snapshot, &scope.members, &active);
             }
             Ok(crate::execution::CleanupReceipt {
                 task_id: scope.task_id,
@@ -483,23 +488,30 @@ impl SessionStorage for MemoryStorage {
 
 #[derive(Clone, Default)]
 pub(crate) struct ExitBarrier {
-    inner: Arc<AtomicBool>,
+    inner: Arc<AtomicU8>,
 }
 
 impl ExitBarrier {
     fn enter_exiting(&self) -> bool {
         self.inner
-            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .compare_exchange(0, 1, Ordering::Release, Ordering::Acquire)
             .is_ok()
     }
 
     fn is_exiting(&self) -> bool {
-        self.inner.load(Ordering::Acquire)
+        self.inner.load(Ordering::Acquire) != 0
+    }
+    fn is_closed(&self) -> bool {
+        self.inner.load(Ordering::Acquire) == 2
+    }
+
+    fn close(&self) {
+        self.inner.store(2, Ordering::Release);
     }
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct AgentRuntimeSnapshot {
+pub struct ProcessRuntimeSnapshot {
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
     /// Thread id → agent name for drivers that exited with unfinished work.
@@ -516,14 +528,14 @@ pub struct AgentRuntimeSnapshot {
 /// exactly those cases, leaving the thread suspended forever.
 pub(crate) struct ResumeTarget {
     pub agent_name: String,
-    pub thread_id: ThreadId,
+    pub thread_id: ProcessId,
     pub decision: ResumeDecision,
 }
 
-/// Every envelope [`AgentRuntime::bootstrap`] is about to put back. Within an
+/// Every envelope [`ProcessRuntime::bootstrap`] is about to put back. Within an
 /// thread, inbox contents precede messages captured during the final drain;
 /// thread ids are sorted to keep recovery validation deterministic.
-fn replayed_envelopes(snapshot: &AgentRuntimeSnapshot) -> Vec<&Envelope> {
+fn replayed_envelopes(snapshot: &ProcessRuntimeSnapshot) -> Vec<&Envelope> {
     let mut names: Vec<&String> = snapshot
         .agent_drained_envelopes
         .keys()
@@ -556,7 +568,7 @@ fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
 /// an answer on arrival — but only after it has restored the finished turn the
 /// answer names, leaving that turn on the books with nothing to end it.
 fn drop_stale_envelopes(
-    snapshot: &mut AgentRuntimeSnapshot,
+    snapshot: &mut ProcessRuntimeSnapshot,
     checkpoints: &HashMap<String, StoredCheckpoint>,
 ) {
     for (name, envelopes) in snapshot
@@ -598,11 +610,11 @@ fn drop_stale_envelopes(
 
 type DriverFactory = Arc<
     dyn Fn(
-            AgentRuntime,
-            ThreadId,
-            Option<ThreadId>,
+            ProcessRuntime,
+            Process,
+            bool,
             Option<ResumeDecision>,
-            mpsc::Receiver<AgentControl>,
+            mpsc::Receiver<ProcessControl>,
             mpsc::Receiver<Envelope>,
         ) -> Pin<Box<dyn Future<Output = String> + Send>>
         + Send
@@ -610,33 +622,35 @@ type DriverFactory = Arc<
 >;
 
 #[derive(Clone)]
-pub(crate) struct AgentRuntime {
+pub(crate) struct ProcessRuntime {
     session_id: String,
     /// Drivers are addressed by thread, including concurrent calls to one agent.
-    agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
-    agent_tasks: Arc<std::sync::Mutex<JoinSet<String>>>,
+    processes: Arc<Mutex<HashMap<String, ProcessHandle>>>,
+    process_tasks: Arc<std::sync::Mutex<JoinSet<String>>>,
+    programs: Arc<HashMap<String, Arc<Program>>>,
     driver_factories: Arc<HashMap<String, DriverFactory>>,
     wait_gate: Arc<Mutex<()>>,
+    delivery_gate: Arc<Mutex<()>>,
     /// Global event bus — all agents forward their events here.
-    global_event_tx: broadcast::Sender<(String, ThreadId, TurnId, AgentEvent)>,
+    global_event_tx: broadcast::Sender<(String, ProcessId, TurnId, AgentEvent)>,
     pub(crate) session_storage: Arc<dyn SessionStorage>,
     exit_barrier: ExitBarrier,
-    snapshot: Arc<Mutex<AgentRuntimeSnapshot>>,
+    snapshot: Arc<Mutex<ProcessRuntimeSnapshot>>,
     turn_gate: Arc<TurnGate>,
     calls: Arc<CallLedger>,
-    pub(crate) background: Option<Arc<coda_process::BackgroundTasks>>,
-    executions: Arc<std::sync::Mutex<scopes::Executions>>,
+    pub(crate) background: Option<Arc<coda_execution::BackgroundTasks>>,
+    executions: Arc<std::sync::Mutex<groups::Executions>>,
     approval_status_gate: Arc<Mutex<()>>,
-    root_state: Arc<std::sync::Mutex<Option<Arc<Mutex<crate::agent::AgentState>>>>>,
+    root_state: Arc<std::sync::Mutex<Option<Arc<Mutex<crate::process::ProcessMemory>>>>>,
 }
 
-impl AgentRuntime {
+impl ProcessRuntime {
     pub(crate) fn register_root_state(
         &self,
-        thread: &ThreadId,
-        state: Arc<Mutex<crate::agent::AgentState>>,
+        thread: &ProcessId,
+        state: Arc<Mutex<crate::process::ProcessMemory>>,
     ) {
-        if self.is_root_thread(thread) {
+        if self.is_root_process(thread) {
             *self.root_state.lock().expect("root state") = Some(state);
         }
     }
@@ -658,36 +672,38 @@ impl AgentRuntime {
         // drops events, which consumers can only partially recover from. A
         // margin against scheduling delays, not a response to an observed failure.
         let (global_event_tx, _) = broadcast::channel(256);
-        AgentRuntime {
+        ProcessRuntime {
             session_id,
-            agents: Arc::new(Mutex::new(HashMap::new())),
-            agent_tasks: Arc::new(std::sync::Mutex::new(JoinSet::new())),
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            process_tasks: Arc::new(std::sync::Mutex::new(JoinSet::new())),
+            programs: Arc::new(HashMap::new()),
             driver_factories: Arc::new(HashMap::new()),
             wait_gate: Arc::new(Mutex::new(())),
+            delivery_gate: Arc::new(Mutex::new(())),
             global_event_tx,
             session_storage: Arc::new(session_storage),
             exit_barrier: ExitBarrier::default(),
-            snapshot: Arc::new(Mutex::new(AgentRuntimeSnapshot::default())),
+            snapshot: Arc::new(Mutex::new(ProcessRuntimeSnapshot::default())),
             turn_gate: Arc::new(TurnGate::default()),
             calls: Arc::new(CallLedger::default()),
             background: None,
             approval_status_gate: Arc::new(Mutex::new(())),
             root_state: Arc::new(std::sync::Mutex::new(None)),
-            executions: Arc::new(std::sync::Mutex::new(scopes::Executions::default())),
+            executions: Arc::new(std::sync::Mutex::new(groups::Executions::default())),
         }
     }
 
     /// The session's root thread, the only one whose turn endings end the turn
     /// itself — a sub-agent thread finishes its own work many times within one.
-    pub(crate) fn is_root_thread(&self, thread_id: &ThreadId) -> bool {
+    pub(crate) fn is_root_process(&self, thread_id: &ProcessId) -> bool {
         thread_id.as_ref() == self.session_id
     }
 
     /// Whether the turn a parked thread belongs to has been asked to stop. Its
     /// own agent cannot answer this — it is sitting idle with no turn in hand —
     /// so the thread's last stored message names the turn instead.
-    pub(crate) async fn thread_turn_cancelled(&self, thread_id: &ThreadId) -> bool {
-        match self.turn_of_thread(thread_id.as_ref()).await {
+    pub(crate) async fn process_turn_cancelled(&self, thread_id: &ProcessId) -> bool {
+        match self.turn_of_process(thread_id.as_ref()).await {
             Some(turn) => self.turn_gate.is_cancelled(turn),
             None => false,
         }
@@ -714,7 +730,7 @@ impl AgentRuntime {
 
     /// The turn a stored thread was last working on, or `None` if it has no
     /// history to name one.
-    async fn turn_of_thread(&self, thread_id: &str) -> Option<TurnId> {
+    async fn turn_of_process(&self, thread_id: &str) -> Option<TurnId> {
         last_turn(&self.checkpoint_of(thread_id).await?)
     }
 
@@ -728,7 +744,7 @@ impl AgentRuntime {
     /// undelivered answer or restore a turn nothing will finish.
     async fn recovery_checkpoints(
         &self,
-        snapshot: &AgentRuntimeSnapshot,
+        snapshot: &ProcessRuntimeSnapshot,
     ) -> Result<HashMap<String, StoredCheckpoint>, String> {
         let mut consulted: Vec<String> = snapshot
             .active_threads
@@ -781,7 +797,7 @@ impl AgentRuntime {
     /// [`Self::send_message`], so this is the only place that can record them.
     fn register_resumed_work(
         &self,
-        snapshot: &AgentRuntimeSnapshot,
+        snapshot: &ProcessRuntimeSnapshot,
         checkpoints: &HashMap<String, StoredCheckpoint>,
     ) -> Result<(), String> {
         // Active threads and replayed envelopes are independent evidence for
@@ -802,7 +818,7 @@ impl AgentRuntime {
                 .and_then(|e| e.reply_target())
                 .is_some()
             {
-                self.calls.begin(&ThreadId::from(thread_id.clone()));
+                self.calls.begin(&ProcessId::from(thread_id.clone()));
             }
         }
         let replayed = replayed_envelopes(snapshot);
@@ -886,7 +902,7 @@ impl AgentRuntime {
     pub(crate) async fn emit_event(
         &self,
         agent_name: String,
-        thread_id: ThreadId,
+        thread_id: ProcessId,
         turn_id: TurnId,
         event: AgentEvent,
     ) {
@@ -968,26 +984,26 @@ impl AgentRuntime {
     /// nothing will pick up again.
     pub(crate) async fn bootstrap(
         &mut self,
-        agents: HashMap<String, Agent>,
-        mut snapshot: Option<AgentRuntimeSnapshot>,
+        agents: HashMap<String, Arc<Program>>,
+        mut snapshot: Option<ProcessRuntimeSnapshot>,
         mut resume_targets: HashMap<String, ResumeTarget>,
         config: RunConfig<impl LLMProvider + Clone>,
     ) -> Result<bool, String> {
+        self.programs = Arc::new(agents.clone());
         self.driver_factories = Arc::new(
             agents
-                .into_iter()
-                .map(|(name, agent)| {
+                .into_keys()
+                .map(|name| {
                     let config = config.resolve(&name);
-                    let factory: DriverFactory = Arc::new(
-                        move |runtime, thread_id, active, decision, control, inbox| {
-                            let agent = agent.for_thread();
+                    let factory: DriverFactory =
+                        Arc::new(move |runtime, process, active, decision, control, inbox| {
+                            let thread_id = process.pid.clone();
                             let config = config.clone();
                             Box::pin(async move {
-                                driver::run_agent(
+                                driver::run_process(
                                     runtime,
-                                    thread_id.clone(),
                                     (active, decision),
-                                    agent,
+                                    process,
                                     control,
                                     inbox,
                                     config,
@@ -995,8 +1011,7 @@ impl AgentRuntime {
                                 .await;
                                 thread_id.0
                             })
-                        },
-                    );
+                        });
                     (name, factory)
                 })
                 .collect(),
@@ -1045,12 +1060,11 @@ impl AgentRuntime {
         }
         for (thread, name) in threads {
             let target = resume_targets.remove(&thread);
-            let active = (target.is_some() || snapshot.active_threads.contains_key(&thread))
-                .then(|| ThreadId::from(thread.clone()));
+            let active = target.is_some() || snapshot.active_threads.contains_key(&thread);
             let envelopes = inboxes.remove(&thread).unwrap_or_default();
             self.start_driver(
                 &name,
-                ThreadId::from(thread),
+                ProcessId::from(thread),
                 active,
                 target.map(|t| t.decision),
                 envelopes,
@@ -1062,12 +1076,12 @@ impl AgentRuntime {
     }
 
     /// Subscribe to events from all agents
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)> {
         self.global_event_tx.subscribe()
     }
 
-    async fn broadcast_command(&self, cmd: AgentControl) {
-        let agents: Vec<_> = self.agents.lock().await.values().cloned().collect();
+    async fn broadcast_command(&self, cmd: ProcessControl) {
+        let agents: Vec<_> = self.processes.lock().await.values().cloned().collect();
         for entry in agents {
             let err = entry.send_command(cmd.clone()).await;
             if let Err(e) = err {
@@ -1082,7 +1096,7 @@ impl AgentRuntime {
     /// approval stays parked, so the pending decision survives into the next
     /// process instead of being written off on the way out.
     pub(crate) async fn cancel_in_flight(&self) {
-        self.broadcast_command(AgentControl::Abort).await;
+        self.broadcast_command(ProcessControl::Abort).await;
     }
 
     /// Stop the active turn on the user's behalf.
@@ -1095,12 +1109,12 @@ impl AgentRuntime {
         let threads: Vec<_> = {
             let state = self.executions.lock().expect("executions");
             state
-                .threads
+                .processes
                 .iter()
                 .filter(|(_, e)| {
                     matches!(
                         e.stored.scope,
-                        crate::execution::ExecutionScope::Foreground { .. }
+                        crate::execution::ProcessGroupId::Foreground { .. }
                     )
                 })
                 .map(|(thread, e)| {
@@ -1110,21 +1124,24 @@ impl AgentRuntime {
                 .collect()
         };
         let handles: Vec<_> = {
-            let drivers = self.agents.lock().await;
+            let drivers = self.processes.lock().await;
             threads
                 .iter()
                 .filter_map(|thread| drivers.get(thread).cloned())
                 .collect()
         };
         for handle in handles {
-            let _ = handle.send_command(AgentControl::Abort).await;
+            let _ = handle.send_command(ProcessControl::Abort).await;
         }
     }
 
     /// Request this runtime to exit all agent loops.
     pub(crate) async fn request_exit(&self) {
-        self.exit_barrier.enter_exiting();
-        self.broadcast_command(AgentControl::Exit).await;
+        {
+            let _delivery = self.delivery_gate.lock().await;
+            self.exit_barrier.enter_exiting();
+        }
+        self.broadcast_command(ProcessControl::Exit).await;
     }
 
     /// Send a message to a specific agent, registering the turn it opens first
@@ -1140,6 +1157,18 @@ impl AgentRuntime {
         } else {
             None
         };
+        if self.exit_barrier.is_closed()
+            || (self.exit_barrier.is_exiting()
+                && matches!(
+                    envelope.body,
+                    EnvelopeBody::Task { .. } | EnvelopeBody::ToolCall { .. }
+                ))
+        {
+            if let Some(turn) = opened {
+                self.turn_gate.close(turn);
+            }
+            return Err(SendCommandError::ChannelClosed);
+        }
         let dispatched = matches!(envelope.body, EnvelopeBody::ToolCall { .. })
             .then(|| envelope.to.thread_id.clone());
         if let Some(thread_id) = &dispatched
@@ -1164,7 +1193,7 @@ impl AgentRuntime {
                     return Err(SendCommandError::StaleApproval);
                 }
                 if state
-                    .threads
+                    .processes
                     .get(envelope.to.thread_id.as_ref())
                     .is_some_and(|e| e.cancel.is_cancelled())
                 {
@@ -1177,7 +1206,7 @@ impl AgentRuntime {
                     self.refresh_approval_status(id).await;
                 }
                 let turn = self
-                    .turn_of_thread(&approval.thread_id)
+                    .turn_of_process(&approval.thread_id)
                     .await
                     .unwrap_or_else(|| TurnId::from(decision.parent_message_id));
                 self.emit_event(
@@ -1198,7 +1227,7 @@ impl AgentRuntime {
                 if matches!(envelope.body, EnvelopeBody::ToolCall { .. })
                     && let Some(execution) = self.execution(&envelope.to.thread_id)
                     && let Some(id) = execution.background_task()
-                    && let Err(error) = self.persist_scope_members(id).await
+                    && let Err(error) = self.persist_group_members(id).await
                 {
                     self.checkpoint_failed(
                         crate::execution::ExecutionIdentity {
@@ -1224,34 +1253,34 @@ impl AgentRuntime {
         sent
     }
 
-    async fn retire_foreground_driver(&self, agent_name: &str, thread_id: &ThreadId) {
-        self.save_agent_snapshot(agent_name.into(), thread_id.clone(), vec![], None)
+    async fn retire_foreground_driver(&self, agent_name: &str, thread_id: &ProcessId) {
+        self.save_process_snapshot(agent_name.into(), thread_id.clone(), vec![], false)
             .await;
-        self.agents.lock().await.remove(thread_id.as_ref());
+        self.processes.lock().await.remove(thread_id.as_ref());
         self.executions
             .lock()
             .expect("executions")
-            .threads
+            .processes
             .remove(thread_id.as_ref());
     }
 
     async fn start_driver(
         &self,
         name: &str,
-        thread_id: ThreadId,
-        active: Option<ThreadId>,
+        thread_id: ProcessId,
+        active: bool,
         decision: Option<ResumeDecision>,
         envelopes: Vec<Envelope>,
-    ) -> Result<AgentHandle, SendCommandError> {
+    ) -> Result<ProcessHandle, SendCommandError> {
         {
-            let mut tasks = self.agent_tasks.lock().expect("driver tasks");
+            let mut tasks = self.process_tasks.lock().expect("driver tasks");
             while let Some(result) = tasks.try_join_next() {
                 if let Err(error) = result {
                     warn!(%error, "Agent task failed to join");
                 }
             }
         }
-        let mut handles = self.agents.lock().await;
+        let mut handles = self.processes.lock().await;
         if let Some(handle) = handles.get(thread_id.as_ref()) {
             return Ok(handle.clone());
         }
@@ -1269,7 +1298,7 @@ impl AgentRuntime {
         let (finished_tx, finished) = tokio::sync::watch::channel(false);
         let work = factory(
             self.clone(),
-            thread_id.clone(),
+            Process::new(thread_id.clone(), self.programs[name].clone()),
             active,
             decision,
             control,
@@ -1277,14 +1306,14 @@ impl AgentRuntime {
         );
         let completion = DriverFinished(finished_tx);
         let abort = self
-            .agent_tasks
+            .process_tasks
             .lock()
             .expect("driver tasks")
             .spawn(async move {
                 let _completion = completion;
                 work.await
             });
-        let handle = AgentHandle {
+        let handle = ProcessHandle {
             control_sender,
             message_sender,
             abort,
@@ -1295,41 +1324,65 @@ impl AgentRuntime {
     }
 
     async fn deliver(&self, envelope: Envelope) -> Result<(), SendCommandError> {
-        if self.exit_barrier.is_exiting() {
-            let receiver = envelope.to.thread_id.0.clone();
-            let mut snapshot = self.snapshot.lock().await;
-            snapshot
-                .drained_envelopes
-                .entry(receiver)
-                .or_default()
-                .push(envelope);
-            if let Err(err) = self
-                .session_storage
-                .save_session_snapshot(self.session_id.clone(), snapshot.clone().into())
-                .await
-            {
-                warn!("Failed to persist session snapshot on buffered message: {err}");
+        let mut reservation: Option<Result<mpsc::OwnedPermit<Envelope>, SendCommandError>> = None;
+        loop {
+            let delivery = self.delivery_gate.lock().await;
+            if self.exit_barrier.is_closed() {
+                return Err(SendCommandError::ChannelClosed);
             }
-            return Ok(());
+            if self.exit_barrier.is_exiting() {
+                drop(reservation);
+                let receiver = envelope.to.thread_id.0.clone();
+                let mut snapshot = self.snapshot.lock().await;
+                snapshot
+                    .drained_envelopes
+                    .entry(receiver)
+                    .or_default()
+                    .push(envelope);
+                if let Err(err) = self
+                    .session_storage
+                    .save_session_snapshot(self.session_id.clone(), snapshot.clone().into())
+                    .await
+                {
+                    warn!("Failed to persist session snapshot on buffered message: {err}");
+                }
+                return Ok(());
+            }
+            if let Some(permit) = reservation {
+                permit?.send(envelope);
+                return Ok(());
+            }
+            let handle = self
+                .start_driver(
+                    &envelope.to.name,
+                    envelope.to.thread_id.clone(),
+                    false,
+                    None,
+                    vec![],
+                )
+                .await?;
+            // A full parent inbox must not prevent it from dispatching the rest
+            // of its batch, or prevent shutdown from starting. Only enqueueing,
+            // not waiting for capacity, is serialized with the exit transition.
+            drop(delivery);
+            reservation = Some(
+                handle
+                    .message_sender
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| SendCommandError::ChannelClosed),
+            );
+            // Recheck exit even if the receiver closed while we waited: an
+            // accepted Reply then belongs in the snapshot, not a closed inbox.
         }
-        let handle = self
-            .start_driver(
-                &envelope.to.name,
-                envelope.to.thread_id.clone(),
-                None,
-                None,
-                vec![],
-            )
-            .await?;
-        handle.send_message(envelope).await
     }
 
-    pub(crate) async fn save_agent_snapshot(
+    pub(crate) async fn save_process_snapshot(
         &self,
         agent_name: String,
-        driver_thread: ThreadId,
+        driver_thread: ProcessId,
         envelopes: Vec<Envelope>,
-        active_thread: Option<ThreadId>,
+        active: bool,
     ) {
         if self
             .execution(&driver_thread)
@@ -1348,13 +1401,10 @@ impl AgentRuntime {
                 .agent_drained_envelopes
                 .insert(driver_thread.0.clone(), envelopes);
         }
-        match active_thread {
-            Some(thread_id) => {
-                snapshot.active_threads.insert(thread_id.0, agent_name);
-            }
-            None => {
-                snapshot.active_threads.remove(driver_thread.as_ref());
-            }
+        if active {
+            snapshot.active_threads.insert(driver_thread.0, agent_name);
+        } else {
+            snapshot.active_threads.remove(driver_thread.as_ref());
         }
         if let Err(err) = self
             .session_storage
@@ -1371,10 +1421,13 @@ impl AgentRuntime {
     /// reach, and an in-flight turn no chance to save what it had.
     pub(crate) async fn wait_for_settle(&self, duration: Duration) -> bool {
         let _wait = self.wait_gate.lock().await;
-        if self.agent_tasks.lock().expect("driver tasks").is_empty() {
+        if self.process_tasks.lock().expect("driver tasks").is_empty() {
+            let _delivery = self.delivery_gate.lock().await;
+            self.persist_snapshot(Some(duration)).await;
+            self.exit_barrier.close();
             return true;
         }
-        if timeout(duration, Self::drain(&self.agent_tasks))
+        if timeout(duration, Self::drain(&self.process_tasks))
             .await
             .is_err()
         {
@@ -1382,7 +1435,9 @@ impl AgentRuntime {
             // belongs to whoever ends them.
             return false;
         }
+        let _delivery = self.delivery_gate.lock().await;
         self.persist_snapshot(Some(duration)).await;
+        self.exit_barrier.close();
         true
     }
 
@@ -1402,33 +1457,42 @@ impl AgentRuntime {
     /// only for callers that would rather hang than cut an in-flight turn short.
     pub(crate) async fn wait_for_exit(&self, timeout_duration: Option<Duration>) -> bool {
         let _wait = self.wait_gate.lock().await;
-        if self.agent_tasks.lock().expect("driver tasks").is_empty() {
+        if self.process_tasks.lock().expect("driver tasks").is_empty() {
+            let _delivery = self.delivery_gate.lock().await;
+            self.persist_snapshot(timeout_duration).await;
+            self.exit_barrier.close();
             return true;
         }
 
         let ret = match timeout_duration {
-            Some(duration) => timeout(duration, Self::drain(&self.agent_tasks))
+            Some(duration) => timeout(duration, Self::drain(&self.process_tasks))
                 .await
                 .is_ok(),
             None => {
-                Self::drain(&self.agent_tasks).await;
+                Self::drain(&self.process_tasks).await;
                 true
             }
         };
         if !ret {
             warn!("aborting agent tasks that outstayed the shutdown deadline");
-            self.agent_tasks.lock().expect("driver tasks").abort_all();
-            Self::drain(&self.agent_tasks).await;
+            self.process_tasks.lock().expect("driver tasks").abort_all();
+            Self::drain(&self.process_tasks).await;
         }
+        let _delivery = self.delivery_gate.lock().await;
         self.persist_snapshot(timeout_duration).await;
+        self.exit_barrier.close();
 
         ret
     }
 
-    async fn drain(agent_tasks: &std::sync::Mutex<JoinSet<String>>) {
-        while let Some(result) =
-            std::future::poll_fn(|cx| agent_tasks.lock().expect("driver tasks").poll_join_next(cx))
-                .await
+    async fn drain(process_tasks: &std::sync::Mutex<JoinSet<String>>) {
+        while let Some(result) = std::future::poll_fn(|cx| {
+            process_tasks
+                .lock()
+                .expect("driver tasks")
+                .poll_join_next(cx)
+        })
+        .await
         {
             match result {
                 Ok(agent_name) => info!("Agent {} exited", agent_name),

@@ -9,14 +9,14 @@ use crate::{
     agent::HistoryEntry,
     persist::{StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint},
     runtime::{
-        AgentRuntimeSnapshot, MemoryStorage, ResumeTarget, SendCommandError, SessionStorage,
+        MemoryStorage, ProcessRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
     },
 };
 use coda_core::llm::{Message, ToolCall, UserMessage};
 use std::{collections::HashMap, sync::Arc};
 use tokio::time::{Duration, timeout};
 
-fn user_task(to: &ThreadId) -> Envelope {
+fn user_task(to: &ProcessId) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
@@ -41,19 +41,19 @@ fn turn_of(envelope: &Envelope) -> TurnId {
     TurnId::from(*message_id)
 }
 
-fn active(runtime: &AgentRuntime) -> Option<TurnId> {
+fn active(runtime: &ProcessRuntime) -> Option<TurnId> {
     runtime.turn_gate.active_id()
 }
 
-fn cancelled(runtime: &AgentRuntime) -> bool {
+fn cancelled(runtime: &ProcessRuntime) -> bool {
     active(runtime).is_some_and(|turn| runtime.turn_gate.is_cancelled(turn))
 }
 
 #[tokio::test]
 async fn a_second_task_is_rejected_and_abort_marks_the_active_turn() {
-    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
-    let first = user_task(&ThreadId::from("session".to_string()));
-    let second = user_task(&ThreadId::from("session".to_string()));
+    let runtime = ProcessRuntime::new(MemoryStorage::default(), "session".into());
+    let first = user_task(&ProcessId::from("session".to_string()));
+    let second = user_task(&ProcessId::from("session".to_string()));
     runtime.turn_gate.open(turn_of(&first)).expect("open first");
     assert!(matches!(
         runtime.send_message(second).await,
@@ -71,10 +71,10 @@ async fn a_second_task_is_rejected_and_abort_marks_the_active_turn() {
 /// since every later abort would keep marking it.
 #[tokio::test]
 async fn a_delivery_that_fails_leaves_no_turn_behind() {
-    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
+    let runtime = ProcessRuntime::new(MemoryStorage::default(), "session".into());
 
     let sent = runtime
-        .send_message(user_task(&ThreadId::from("session".to_string())))
+        .send_message(user_task(&ProcessId::from("session".to_string())))
         .await;
 
     assert!(matches!(sent, Err(SendCommandError::AgentNotFound)));
@@ -509,7 +509,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
         .await
         .expect("save current checkpoint");
 
-    let snapshot = AgentRuntimeSnapshot {
+    let snapshot = ProcessRuntimeSnapshot {
         active_threads: HashMap::from([(current_thread.into(), "explore".into())]),
         ..Default::default()
     };
@@ -517,7 +517,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
         current_thread.into(),
         ResumeTarget {
             agent_name: "explore".into(),
-            thread_id: ThreadId::from(current_thread.to_string()),
+            thread_id: ProcessId::from(current_thread.to_string()),
             decision: ResumeDecision {
                 parent_message_id,
                 resolutions: vec![(call.id, ToolCallResolution::Execute)],
@@ -544,7 +544,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
     )
     .expect("valid team")
     .build(".", coda_tools::shared_file_locks(), test_registry());
-    let mut runtime = AgentRuntime::new(storage, "session".into());
+    let mut runtime = ProcessRuntime::new(storage, "session".into());
     runtime
         .bootstrap(
             agents,
@@ -566,10 +566,10 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
 
 #[tokio::test]
 async fn repeated_recovery_evidence_registers_one_turn() {
-    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
-    let task = user_task(&ThreadId::from("session".to_string()));
+    let runtime = ProcessRuntime::new(MemoryStorage::default(), "session".into());
+    let task = user_task(&ProcessId::from("session".to_string()));
     let turn = turn_of(&task);
-    let snapshot = AgentRuntimeSnapshot {
+    let snapshot = ProcessRuntimeSnapshot {
         drained_envelopes: HashMap::from([("coda".into(), vec![task.clone(), task])]),
         ..Default::default()
     };
@@ -587,10 +587,10 @@ async fn repeated_recovery_evidence_registers_one_turn() {
 
 #[tokio::test]
 async fn recovery_rejects_multiple_turns() {
-    let runtime = AgentRuntime::new(MemoryStorage::default(), "session".into());
-    let first = user_task(&ThreadId::from("session".to_string()));
-    let second = user_task(&ThreadId::from("session".to_string()));
-    let snapshot = AgentRuntimeSnapshot {
+    let runtime = ProcessRuntime::new(MemoryStorage::default(), "session".into());
+    let first = user_task(&ProcessId::from("session".to_string()));
+    let second = user_task(&ProcessId::from("session".to_string()));
+    let snapshot = ProcessRuntimeSnapshot {
         drained_envelopes: HashMap::from([("coda".into(), vec![first, second])]),
         ..Default::default()
     };

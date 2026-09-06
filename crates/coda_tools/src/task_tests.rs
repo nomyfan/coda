@@ -1,5 +1,5 @@
 use super::*;
-use coda_process::TaskMeta;
+use coda_execution::TaskMeta;
 use tokio::process::Command;
 
 fn bash(command: &str) -> Command {
@@ -15,11 +15,11 @@ fn meta(command: &str) -> TaskMeta {
 #[tokio::test]
 async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
     let background = Arc::new(BackgroundTasks::temporary().unwrap());
-    let id = coda_process::TaskId::new();
+    let id = coda_execution::TaskId::new();
     let own_id = id.clone();
     let tool = TaskKillTool::new(background.clone());
-    let meta = coda_process::TaskMeta {
-        kind: coda_process::TaskKind::Subagent {
+    let meta = coda_execution::TaskMeta {
+        kind: coda_execution::TaskKind::Subagent {
             agent_name: "worker".into(),
         },
         description: "self stop".into(),
@@ -38,7 +38,7 @@ async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
             )
             .await
             .unwrap();
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -50,7 +50,7 @@ async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
     .expect("self stop must not wait on its own monitor");
     assert!(matches!(
         background.read(&id).await.unwrap().unwrap().status,
-        coda_process::TaskStatus::Killed { .. }
+        coda_execution::TaskStatus::Killed { .. }
     ));
 }
 
@@ -162,9 +162,9 @@ async fn task_output_never_records_a_terminal_read_after_paginated_loss() {
     let background = Arc::new(BackgroundTasks::temporary().unwrap());
     let id = background
         .spawn_with(meta("overwritten output"), |ctx| async move {
-            let bytes = vec![b'x'; coda_process::DEFAULT_STREAM_CAPACITY as usize + 7];
+            let bytes = vec![b'x'; coda_execution::DEFAULT_STREAM_CAPACITY as usize + 7];
             ctx.append_stdout(&bytes).await.unwrap();
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();
@@ -191,7 +191,7 @@ async fn task_output_never_records_a_terminal_read_after_paginated_loss() {
             .iter()
             .any(|notice| matches!(
                 notice,
-                coda_process::TaskNotice::Task { id: notice_id, .. } if notice_id == &id
+                coda_execution::TaskNotice::Task { id: notice_id, .. } if notice_id == &id
             ))
     );
     background.shutdown().await;
@@ -203,7 +203,7 @@ async fn task_output_only_records_a_complete_terminal_read() {
     let id = background
         .spawn_with(meta("large output"), |ctx| async move {
             ctx.append_stdout(&vec![b'x'; 200 * 1024]).await.unwrap();
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();

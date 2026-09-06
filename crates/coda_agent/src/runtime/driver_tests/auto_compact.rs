@@ -176,7 +176,7 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
     ] {
         let config = config_with_threshold(TestProvider::default(), 1_000);
         let storage = MemoryStorage::default();
-        let thread_id = ThreadId::new();
+        let thread_id = ProcessId::new();
         storage
             .save_checkpoint(
                 thread_id.as_ref().to_string(),
@@ -375,7 +375,7 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
     wait_for_root_answer(&mut harness, "second done").await;
     harness.shutdown().await;
 
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.thread_id, "explore");
     let explore_history = harness
         .storage
         .load_checkpoint(explore_thread.as_ref())

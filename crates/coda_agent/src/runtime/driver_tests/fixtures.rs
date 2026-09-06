@@ -1,13 +1,13 @@
 //! Shared fixtures for the driver tests: local tools, a fake LLM provider
 //! scripted by system prompt, storage stand-ins, and the `Harness` that drives
-//! an `AgentRuntime` and lets a test await its events.
+//! an `ProcessRuntime` and lets a test await its events.
 
 use super::super::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
+    AgentEvent, AgentSpec, AgentTeam, ModelProfile, Program, RunConfig, Sender, StoredCheckpoint,
     StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::{
-        AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
+        ProcessRuntime, ProcessRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
     },
 };
 use coda_core::{
@@ -30,9 +30,9 @@ use tokio::{
 /// A throwaway background-task registry, for the driver tests that only need
 /// `AgentTeam::build` to have one. Each call gets its own, so nothing leaks
 /// between tests.
-pub(super) fn test_registry() -> Option<std::sync::Arc<coda_process::BackgroundTasks>> {
+pub(super) fn test_registry() -> Option<std::sync::Arc<coda_execution::BackgroundTasks>> {
     Some(std::sync::Arc::new(
-        coda_process::BackgroundTasks::temporary().unwrap(),
+        coda_execution::BackgroundTasks::temporary().unwrap(),
     ))
 }
 
@@ -65,10 +65,15 @@ pub(super) struct TestStorage {
     /// Writes still allowed through before every later one fails.
     budget: Arc<Mutex<Option<usize>>>,
     fail_loads: Arc<Mutex<bool>>,
+    fail_snapshots: Arc<Mutex<bool>>,
 }
 
 impl TestStorage {
-    pub(super) async fn checkpoint(&self, thread_id: &ThreadId) -> Option<StoredCheckpoint> {
+    pub(super) async fn fail_snapshot_writes(&self, fail: bool) {
+        *self.fail_snapshots.lock().await = fail;
+    }
+
+    pub(super) async fn checkpoint(&self, thread_id: &ProcessId) -> Option<StoredCheckpoint> {
         self.checkpoints
             .lock()
             .await
@@ -196,6 +201,9 @@ impl SessionStorage for TestStorage {
         snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
+            if *self.fail_snapshots.lock().await {
+                return Err("injected snapshot failure".into());
+            }
             self.snapshots.lock().await.insert(session_id, snapshot);
             Ok(())
         })
@@ -1179,7 +1187,7 @@ fn describe_tools(messages: &[RequestMessage]) -> String {
     tools.join("|")
 }
 
-pub(super) fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
+pub(super) fn user_task(thread_id: &ProcessId, task: &str) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
@@ -1220,9 +1228,9 @@ pub(super) fn test_config(
 }
 
 pub(super) struct Harness<S> {
-    pub(super) runtime: AgentRuntime,
-    events: tokio::sync::broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>,
-    pub(super) thread_id: ThreadId,
+    pub(super) runtime: ProcessRuntime,
+    events: tokio::sync::broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>,
+    pub(super) thread_id: ProcessId,
     pub(super) storage: S,
 }
 
@@ -1258,7 +1266,7 @@ where
 
     pub(super) async fn start_agents(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         initial_task: &str,
@@ -1276,21 +1284,21 @@ where
     /// `RunConfig` itself (an auto-compaction threshold, say).
     pub(super) async fn start_with_config(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         config: RunConfig<TestProvider>,
         initial_task: &str,
     ) -> Self {
-        Self::start_with_config_at(storage, agents, config, ThreadId::new(), initial_task).await
+        Self::start_with_config_at(storage, agents, config, ProcessId::new(), initial_task).await
     }
 
     pub(super) async fn start_with_config_at(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         config: RunConfig<TestProvider>,
-        thread_id: ThreadId,
+        thread_id: ProcessId,
         initial_task: &str,
     ) -> Self {
-        let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
+        let mut runtime = ProcessRuntime::new(storage.clone(), thread_id.as_ref().to_string());
         runtime
             .bootstrap(agents, None, HashMap::new(), config)
             .await
@@ -1328,7 +1336,7 @@ where
                 from: Sender::User,
                 to: Receiver {
                     name: approval.agent_name.clone(),
-                    thread_id: ThreadId::from(approval.thread_id.clone()),
+                    thread_id: ProcessId::from(approval.thread_id.clone()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision {
@@ -1346,12 +1354,12 @@ where
     /// pending approvals it collected).
     pub(super) async fn restart(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
     ) -> Self {
-        let snapshot: Option<AgentRuntimeSnapshot> = self
+        let snapshot: Option<ProcessRuntimeSnapshot> = self
             .storage
             .load_session_snapshot(self.thread_id.as_ref())
             .await
@@ -1366,7 +1374,7 @@ where
     /// session a fork just minted starts out in exactly this state.
     pub(super) async fn restart_without_snapshot(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
@@ -1377,11 +1385,11 @@ where
 
     async fn restart_from(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
-        snapshot: Option<AgentRuntimeSnapshot>,
+        snapshot: Option<ProcessRuntimeSnapshot>,
     ) -> Self {
         let config = test_config(provider, approval);
         let session_id = self.thread_id.as_ref().to_string();
@@ -1392,14 +1400,14 @@ where
                     thread_id.clone(),
                     ResumeTarget {
                         agent_name: agent,
-                        thread_id: ThreadId(thread_id),
+                        thread_id: ProcessId(thread_id),
                         decision,
                     },
                 )
             })
             .collect();
 
-        let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
+        let mut runtime = ProcessRuntime::new(self.storage.clone(), session_id.clone());
         let events = runtime.subscribe();
         runtime
             .bootstrap(agents, snapshot, resume_targets, config)
@@ -1409,14 +1417,14 @@ where
         Self {
             runtime,
             events,
-            thread_id: ThreadId(session_id),
+            thread_id: ProcessId(session_id),
             storage: self.storage.clone(),
         }
     }
 
     /// The turn tag is dropped here: almost every test cares about who emitted
     /// what, not which submission it belonged to.
-    pub(super) async fn next_event(&mut self) -> (String, ThreadId, AgentEvent) {
+    pub(super) async fn next_event(&mut self) -> (String, ProcessId, AgentEvent) {
         let (agent_name, thread_id, _turn, event) =
             self.events.recv().await.expect("receive event");
         (agent_name, thread_id, event)
