@@ -32,7 +32,7 @@
 - 保留审批归属、取消传播、checkpoint 失败后的清理与隔离、后台完成通知及去重、冷启动不恢复后台执行，以及 fork/rewind 等已有约束。
 - 同批重复调用同一 stateful 实例时，启动前识别并拒绝全部重复项，其他调用可继续；退出期间停止新调用准入，但仍接收并保存已有执行的有效在途消息，保留重开恢复路径及现有存储失败处理。
 - 有界 inbox 的背压不得阻止其他 process 分发调用或启动 shutdown；回复数量超过 inbox 容量时，整批执行仍能完成，并保留退出切换时的消息归档保证。
-- 允许必要的内部 API、序列化及持久化格式破坏性变化，无需兼容层；本轮将 Rust、JSON、wire、前端和数据库中的逻辑 process 身份统一为 `pid` / `parent_pid` / `sender_pid`，在线快照统一为 `active_processes`，checkpoint 表统一为 `process_checkpoints`。不保留 serde 别名或双套命名；旧版本 JSON/磁盘归档不保证可读，数据库结构通过 migration 改名。工具名称和行为保持不变。
+- 允许必要的内部 API、序列化及持久化格式破坏性变化，无需兼容层；本轮将 Rust、JSON、wire、前端和数据库中的逻辑 process 身份统一为 `pid` / `parent_pid` / `sender_pid`，在线快照统一为 `active_processes`，checkpoint 表统一为 `process_checkpoints`。不保留 serde 别名或双套命名；数据库结构及 runtime 自有 JSON 元数据通过同一 migration 改名，不改写消息或工具输出；磁盘归档不在 SQL migration 范围内。工具名称和行为保持不变。
 - 若后续改变模型需要理解的运行规则，同步更新默认 system prompt 和相关 templates。
 
 ## Success Criteria

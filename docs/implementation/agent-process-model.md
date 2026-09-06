@@ -145,7 +145,7 @@ async fn ProcessRuntime::stop_background_group(
 5. **答案完成不等于资源全部结束。** 后台 subagent 回答后，其拥有的后台 shell 可能仍运行；保留 task 的终态结果与 subtree_active 的区别及停止入口。root 的普通后台 shell 保持原有 registry 行为，不为命名统一增加 agent group。
 6. **错误清理强于回收优化。** checkpoint 失败先关闭组、撤销审批、取消工作和隔离成员；只有持久清理成功才允许复用。正常回复前的 driver 退休、call ledger 释放顺序保持不变。
 7. **跨重启行为不扩展。** 冷启动清理未完成后台执行并记录 Interrupted；通知 receipt、完整结果读取去重和 fork/rewind 对 receipt 的规则不变。
-8. **各层统一 process 命名。** Rust、JSON、wire、前端和数据库均使用 `pid` / `parent_pid` / `sender_pid`，快照使用 `active_processes`，checkpoint 表使用 `process_checkpoints`；不使用 serde rename/alias 保留旧身份字段。数据库通过可回滚的 migration 重命名表、列及约束，再由 diesel CLI 生成 schema.rs。旧 JSON 快照和任务归档不保证可读，不自动删除或转换历史数据；新旧客户端和服务端需一起更新。
+8. **各层统一 process 命名。** Rust、JSON、wire、前端和数据库均使用 `pid` / `parent_pid` / `sender_pid`，快照使用 `active_processes`，checkpoint 表使用 `process_checkpoints`；不使用 serde rename/alias 保留旧身份字段。数据库通过可回滚的 migration 重命名表、列及约束，再由 diesel CLI 生成 schema.rs。同一 migration 定点转换 runtime snapshot 的活动进程表、两个 envelope 队列中的收发地址，以及 checkpoint 的 Caller 回复目标；down 执行逆向转换。保留队列顺序及消息、工具输出内容，不递归替换任意 JSON 键；已经使用新字段的数据保持不变。磁盘归档不在 SQL migration 范围内；客户端和服务端需一起更新。
 
 ## Requirement Review
 
@@ -206,4 +206,6 @@ async fn ProcessRuntime::stop_background_group(
 - 新增验证覆盖独立 process 的 memory 隔离、同批 stateful 前后台重复调用全部拒绝、退出后的 Reply 恢复及单次消费、snapshot 写失败保留内存消息，以及旧组清理对新 invocation 的内存与数据库隔离。
 - P1 背压回归：通过公开 Session API 一次提交 32 个立即完成的 stateless 子调用，验证所有回复被接收且 shutdown 有界返回；另以满 inbox 确定性验证 request_exit 不等待容量，以及退出后接收方关闭或容量可用时都只归档一次。该确定性用例在修复前因 request_exit 超时失败。
 - 前端协议类型、审批和事件消费同步使用 pid；lint、138 个测试及 typecheck 通过。
-- process 身份 migration 已在本地测试数据库验证应用、回滚和重应用，schema.rs 由 diesel CLI 生成，47 个 PostgreSQL 存储测试再次通过。
+- process 身份 migration 包含数据库 JSON 元数据转换；回归用例在事务临时表执行实际 up/down/up SQL，覆盖旧与新 snapshot、空闲 snapshot、两个 envelope 队列、回复目标、队列顺序及不改写消息内容。schema.rs 由 diesel CLI 生成。
+
+- JSON 迁移修正后通过 Rust 必需检查及 48 个 PostgreSQL 存储测试；原 migration 已在 coda_test 和 coda 回滚后重应用，并以只读查询确认 coda 的 snapshot 活动表、envelope 地址和 Caller 回复目标已完成转换。

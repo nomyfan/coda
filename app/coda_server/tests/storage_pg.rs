@@ -2648,3 +2648,6 @@ async fn a_fork_inherits_the_state_its_kept_turns_recorded() {
 
 #[path = "storage_pg/background.rs"]
 mod background;
+
+#[path = "storage_pg/process_migration.rs"]
+mod process_migration;
