@@ -1005,6 +1005,9 @@ async fn chatty_process_overflows_ring_and_reports_overwrite() {
             let read = reg.read(&id).await.unwrap().expect("task known");
             seen += read.stdout.len();
             if !read.status.is_running() && read.stdout.is_empty() {
+                // Archive reads can see terminal status before the monitor enqueues
+                // the notice. The summaries watch is the completion barrier.
+                reg.wait_terminal(&id).await;
                 break read.status;
             }
             tokio::task::yield_now().await;
@@ -1055,6 +1058,9 @@ async fn process_task_streams_output_and_notifies_on_exit() {
             stdout.push_str(&read.stdout);
             stderr.push_str(&read.stderr);
             if !read.status.is_running() {
+                // Archive reads can see terminal status before the monitor enqueues
+                // the notice. The summaries watch is the completion barrier.
+                reg.wait_terminal(&id).await;
                 break read.status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
