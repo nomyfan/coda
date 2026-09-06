@@ -33,7 +33,7 @@ fn resume_params_roundtrips() {
         workspace_id: "coda".into(),
         session_id: "s1".into(),
         agent_name: "coda".into(),
-        thread_id: "t1".into(),
+        pid: "t1".into(),
         decision: ResumeDecision {
             parent_message_id: MessageId::new(),
             resolutions: vec![("call_1".into(), ToolCallResolution::Execute)],
@@ -42,7 +42,7 @@ fn resume_params_roundtrips() {
     let back: ResumeParams =
         serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
     assert_eq!(back.agent_name, "coda");
-    assert_eq!(back.thread_id, "t1");
+    assert_eq!(back.pid, "t1");
     assert_eq!(back.decision.resolutions.len(), 1);
 }
 
@@ -203,7 +203,7 @@ fn pending_approval_wire_suggests_shell_allow_patterns() {
     let approval = PendingApproval {
         task_id: None,
         agent_path: vec![],
-        thread_id: "t1".into(),
+        pid: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![
@@ -239,7 +239,7 @@ fn pending_approval_wire_skips_compound_shell_calls() {
     let approval = PendingApproval {
         task_id: None,
         agent_path: vec![],
-        thread_id: "t1".into(),
+        pid: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
@@ -260,7 +260,7 @@ fn pending_approval_wire_skips_shell_calls_with_only_comments() {
     let approval = PendingApproval {
         task_id: None,
         agent_path: vec![],
-        thread_id: "t1".into(),
+        pid: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
@@ -281,7 +281,7 @@ fn pending_approval_wire_skips_unresolvable_shell_calls() {
     let approval = PendingApproval {
         task_id: None,
         agent_path: vec![],
-        thread_id: "t1".into(),
+        pid: "t1".into(),
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
@@ -391,7 +391,7 @@ fn event_params_roundtrips() {
         session_id: "s1".into(),
         event: WireEvent::LlmContentChunk {
             agent_name: "coda".into(),
-            thread_id: "t1".into(),
+            pid: "t1".into(),
             content: "hi".into(),
         },
     };
@@ -454,19 +454,19 @@ fn background_control_events_match_the_web_json_fixture() {
     let events = vec![
         WireEvent::ApprovalRemoved {
             agent_name: "coda".into(),
-            thread_id: "s1".into(),
+            pid: "s1".into(),
             parent_message_id: uuid::Uuid::from_u128(1).into(),
             task_id: None,
         },
         WireEvent::ApprovalRemoved {
             agent_name: "worker".into(),
-            thread_id: "child".into(),
+            pid: "child".into(),
             parent_message_id: uuid::Uuid::from_u128(2).into(),
             task_id: Some(task_id.clone()),
         },
         WireEvent::BackgroundError {
             agent_name: "worker".into(),
-            thread_id: "child".into(),
+            pid: "child".into(),
             task_id,
             message: "checkpoint failed".into(),
         },

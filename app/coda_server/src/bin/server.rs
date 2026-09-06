@@ -11,8 +11,8 @@ use coda_agent::{
     compaction, runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
+use coda_execution::{ArchiveDir, BackgroundRootLock, BackgroundTasks};
 use coda_openai::OpenAICompatible;
-use coda_process::{ArchiveDir, BackgroundRootLock, BackgroundTasks};
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
 };
@@ -142,7 +142,7 @@ struct WorkspaceState {
     /// prebuilt tools in `agent_team` stay open; torn down on shutdown.
     mcp_servers: McpServers,
     /// Validated team rooted at the top-level `coda` agent, with all
-    /// file-configured sub-agents. Built into fresh `Agent` instances for every
+    /// file-configured sub-agents. Built into session-bound `Program` definitions for every
     /// session. The `coda` spec holds the shared system prompt the `AGENTS.md`
     /// watcher updates, so live and newly opened sessions both pick up changes on
     /// their next turn.
@@ -777,7 +777,7 @@ async fn send_open_error<T: Transport>(
 ) {
     let event = WireEvent::Error {
         agent_name: String::new(),
-        thread_id: session_id.to_string(),
+        pid: session_id.to_string(),
         message: format!("failed to open session: {err}"),
     };
     send_event(
@@ -1652,7 +1652,7 @@ async fn dispatch_request(
                     conn_id,
                     SessionCommand::Resume {
                         agent_name: params.agent_name,
-                        thread_id: params.thread_id,
+                        pid: params.pid,
                         decision: params.decision,
                         allow_patterns: params.allow_patterns,
                     },

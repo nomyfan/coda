@@ -1,6 +1,6 @@
-//! Which thread a sub-agent invocation runs in, and what it records about
+//! Which process a sub-agent invocation runs in, and what it records about
 //! who called it: stateful vs. stateless derivation, reused call ids, nested
-//! delegation, and turn tagging across threads.
+//! delegation, and turn tagging across processes.
 
 use super::super::*;
 use super::fixtures::*;
@@ -36,13 +36,10 @@ fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<Agent
 }
 
 /// The `(parent message id, call id)` pair recorded on each user message that
-/// opens work in a thread, in order.
-async fn origins_in_thread(
-    storage: &MemoryStorage,
-    thread_id: &ThreadId,
-) -> Vec<Option<MessageOrigin>> {
+/// opens work in a process, in order.
+async fn origins_in_thread(storage: &MemoryStorage, pid: &ProcessId) -> Vec<Option<MessageOrigin>> {
     storage
-        .load_checkpoint(thread_id.as_ref())
+        .load_checkpoint(pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("thread was checkpointed")
@@ -55,14 +52,14 @@ async fn origins_in_thread(
         .collect()
 }
 
-/// Every assistant message in a thread that issued tool calls, as
+/// Every assistant message in a process that issued tool calls, as
 /// `(message id, the ids of the calls it issued)`.
 async fn tool_calling_assistants(
     storage: &MemoryStorage,
-    thread_id: &ThreadId,
+    pid: &ProcessId,
 ) -> Vec<(MessageId, Vec<String>)> {
     storage
-        .load_checkpoint(thread_id.as_ref())
+        .load_checkpoint(pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("thread was checkpointed")
@@ -153,7 +150,7 @@ async fn stateless_subagent_replies_after_local_tool_execution() {
     harness.shutdown().await;
 }
 
-/// A stateful sub-agent keeps one thread across calls, so two invocations pile
+/// A stateful sub-agent keeps one process across calls, so two invocations pile
 /// their messages into the same history. What tells them apart is the origin
 /// recorded on each opening message — and it has to be the *pair*
 /// `(parent message id, call id)`, because this script reuses one call id for
@@ -185,14 +182,17 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     .expect("timed out waiting for the root agent to finish");
     assert_eq!(done, "main done");
     assert_eq!(
-        harness.runtime.agents.lock().await.len(),
+        harness.runtime.processes.lock().await.len(),
         1,
         "stateful drivers retire too; the next invocation restores its checkpoint"
     );
-    assert_eq!(harness.runtime.executions.lock().unwrap().threads.len(), 1);
+    assert_eq!(
+        harness.runtime.executions.lock().unwrap().processes.len(),
+        1
+    );
     harness.shutdown().await;
 
-    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    let parents = tool_calling_assistants(&harness.storage, &harness.pid).await;
     assert_eq!(
         parents.len(),
         2,
@@ -201,9 +201,9 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     // The premise of the test: the two calls are indistinguishable by call id.
     assert_eq!(parents[0].1, parents[1].1);
 
-    // Both invocations share one thread, and each opening message points back at
+    // Both invocations share one process, and each opening message points back at
     // the assistant message that issued it.
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.pid, "explore");
     assert_eq!(
         origins_in_thread(&harness.storage, &explore_thread).await,
         vec![
@@ -219,9 +219,9 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     );
 }
 
-/// One submission's work fans out across threads — the root's, a stateful
+/// One submission's work fans out across processes — the root's, a stateful
 /// sub-agent's, a nested stateless one's — and a rewind has to find all of it
-/// starting from the submission alone. So every message any of those threads
+/// starting from the submission alone. So every message any of those processes
 /// writes while serving one task carries that task's turn.
 #[tokio::test]
 async fn one_submission_tags_every_thread_it_reaches() {
@@ -276,7 +276,7 @@ async fn one_submission_tags_every_thread_it_reaches() {
     // The turn is named by the root user message that opened it.
     let root = harness
         .storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("root thread was checkpointed");
@@ -303,8 +303,8 @@ async fn one_submission_tags_every_thread_it_reaches() {
     }
 }
 
-/// Thread ids are derived one-way, so the parent/child structure exists only
-/// implicitly unless it is written down. Each thread records who spawned it and
+/// Process ids are derived one-way, so the parent/child structure exists only
+/// implicitly unless it is written down. Each process records who spawned it and
 /// the name its own id came from, which is enough to walk the tree top-down —
 /// what a fork needs, since moving a session under a new root changes every
 /// derived id beneath it.
@@ -363,16 +363,16 @@ async fn every_thread_records_how_its_parent_addressed_it() {
     let threads = harness.storage.all_checkpoints().await;
     assert_eq!(threads.len(), 3, "expected root + explore + probe threads");
 
-    // Exactly one thread has no parent, and it is the session's root.
+    // Exactly one process has no parent, and it is the session's root.
     let roots: Vec<&String> = threads
         .iter()
-        .filter(|c| c.parent_thread_id.is_none())
-        .map(|c| &c.thread_id)
+        .filter(|c| c.parent_pid.is_none())
+        .map(|c| &c.pid)
         .collect();
-    assert_eq!(roots, vec![harness.thread_id.as_ref()]);
+    assert_eq!(roots, vec![harness.pid.as_ref()]);
 
     for checkpoint in &threads {
-        let Some(parent_thread_id) = &checkpoint.parent_thread_id else {
+        let Some(parent_pid) = &checkpoint.parent_pid else {
             continue;
         };
         let derivation_key = checkpoint
@@ -381,13 +381,12 @@ async fn every_thread_records_how_its_parent_addressed_it() {
             .expect("a thread with a parent also records how it was derived");
         // The recorded pair is not a note about the id — it reproduces it.
         assert_eq!(
-            ThreadId::from_uuid5(&ThreadId::from(parent_thread_id.clone()), derivation_key)
-                .as_ref(),
-            checkpoint.thread_id,
+            ProcessId::from_uuid5(&ProcessId::from(parent_pid.clone()), derivation_key).as_ref(),
+            checkpoint.pid,
             "{} does not derive from its recorded parent",
             checkpoint.agent_name
         );
-        // A stateful thread is addressed by agent name so repeat calls land on
+        // A stateful process is addressed by agent name so repeat calls land on
         // it; a stateless one by the invocation, so they never do.
         match checkpoint.agent_name.as_str() {
             "explore" => assert_eq!(derivation_key, "explore"),
@@ -400,9 +399,9 @@ async fn every_thread_records_how_its_parent_addressed_it() {
     }
 }
 
-/// Each stateless invocation must get its own thread. Deriving that thread from
+/// Each stateless invocation must get its own process. Deriving that process from
 /// the call id alone breaks when a provider reuses call ids — and nothing ever
-/// deletes a thread's checkpoint, so the second invocation would load the first
+/// deletes a process's checkpoint, so the second invocation would load the first
 /// one's conversation instead of starting clean. This script reuses one call id
 /// across two invocations to pin that down.
 #[tokio::test]
@@ -432,7 +431,7 @@ async fn stateless_invocations_reusing_a_call_id_get_separate_threads() {
     .expect("timed out waiting for the root agent to finish");
     harness.shutdown().await;
 
-    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    let parents = tool_calling_assistants(&harness.storage, &harness.pid).await;
     assert_eq!(
         parents.len(),
         2,
@@ -440,11 +439,11 @@ async fn stateless_invocations_reusing_a_call_id_get_separate_threads() {
     );
     assert_eq!(parents[0].1, parents[1].1, "both calls reuse one call id");
 
-    let threads: Vec<ThreadId> = parents
+    let threads: Vec<ProcessId> = parents
         .iter()
         .map(|(message_id, _)| {
-            ThreadId::from_uuid5(
-                &harness.thread_id,
+            ProcessId::from_uuid5(
+                &harness.pid,
                 &MessageOrigin {
                     message_id: *message_id,
                     call_id: "call_explore".into(),
@@ -455,8 +454,8 @@ async fn stateless_invocations_reusing_a_call_id_get_separate_threads() {
         .collect();
     assert_ne!(threads[0], threads[1], "invocations shared a thread id");
 
-    // Each thread holds exactly its own invocation: had they collided, one
-    // thread would hold both opening messages and the other none.
+    // Each process holds exactly its own invocation: had they collided, one
+    // process would hold both opening messages and the other none.
     for thread in &threads {
         assert_eq!(
             origins_in_thread(&harness.storage, thread).await.len(),
@@ -498,7 +497,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     harness.shutdown().await;
 
     // Captured before the restart, from the run that issued the call.
-    let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
+    let parents = tool_calling_assistants(&harness.storage, &harness.pid).await;
     let [(parent_message_id, _)] = parents.as_slice() else {
         panic!("expected exactly one tool-calling assistant message, got {parents:?}");
     };
@@ -511,7 +510,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
             HashMap::from([(
                 pending.agent_name.clone(),
                 (
-                    pending.thread_id.clone(),
+                    pending.pid.clone(),
                     ResumeDecision {
                         parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
@@ -538,7 +537,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     .expect("timed out waiting for completion after resume");
     harness.shutdown().await;
 
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.pid, "explore");
     assert_eq!(
         origins_in_thread(&harness.storage, &explore_thread).await,
         vec![Some(MessageOrigin {
@@ -548,7 +547,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
     );
 }
 
-/// A thread waiting on a sub-agent must be able to name that sub-agent's thread
+/// A process waiting on a sub-agent must be able to name that sub-agent's process
 /// from its own state alone. It cannot look the child up: a child that is still
 /// generating has not written a checkpoint yet, as the parked root below shows.
 /// Turn cancellation rests on this — it is how an interrupted turn tells a
@@ -586,7 +585,7 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         loop {
             if let Some(checkpoint) = harness
                 .storage
-                .load_checkpoint(harness.thread_id.as_ref())
+                .load_checkpoint(harness.pid.as_ref())
                 .await
                 .expect("load checkpoint")
                 && let StoredResumePoint::ToolExecution(state) = checkpoint.resume_point
@@ -617,8 +616,8 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         );
     };
     // Derived from what the parent already holds — nothing here reads the child.
-    let derived = ThreadId::from_uuid5(
-        &harness.thread_id,
+    let derived = ProcessId::from_uuid5(
+        &harness.pid,
         &MessageOrigin {
             message_id: parked.parent_message_id,
             call_id: pending.call_id.clone(),
@@ -648,5 +647,5 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         .into_iter()
         .find(|checkpoint| checkpoint.agent_name == "explore")
         .expect("explore checkpointed once it answered");
-    assert_eq!(derived.as_ref(), child.thread_id);
+    assert_eq!(derived.as_ref(), child.pid);
 }

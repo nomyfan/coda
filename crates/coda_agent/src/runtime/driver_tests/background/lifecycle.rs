@@ -2,7 +2,7 @@ use super::super::super::*;
 use super::super::fixtures::user_task;
 use super::fixtures::*;
 use crate::runtime::{SessionStorage, StoredResumePoint};
-use coda_process::TaskStatus;
+use coda_execution::TaskStatus;
 use tokio::time::{Duration, timeout};
 #[tokio::test]
 async fn background_tree_outlives_root_turn_and_delivers_complete_result_once() {
@@ -11,7 +11,7 @@ async fn background_tree_outlives_root_turn_and_delivers_complete_result_once() 
         let (runtime, storage, background, mut events) = start(provider.clone()).await;
         runtime
             .send_message(user_task(
-                &ThreadId::from("background-session".to_string()),
+                &ProcessId::from("background-session".to_string()),
                 "start",
             ))
             .await
@@ -99,7 +99,7 @@ async fn kill_cancels_synchronous_child_without_waiting_for_its_reply() {
         let (runtime, storage, background, _) = start(provider.clone()).await;
         runtime
             .send_message(user_task(
-                &ThreadId::from("background-session".to_string()),
+                &ProcessId::from("background-session".to_string()),
                 "start",
             ))
             .await
@@ -136,7 +136,7 @@ async fn kill_cancels_synchronous_child_without_waiting_for_its_reply() {
 async fn non_root_background_parameter_is_rejected_without_starting_the_child() {
     timeout(Duration::from_secs(5), async {
         let (runtime, storage, background, mut events) = start(BackgroundProvider { nested_background: true, ..Default::default() }).await;
-        runtime.send_message(user_task(&ThreadId::from("background-session".to_string()), "start")).await.unwrap();
+        runtime.send_message(user_task(&ProcessId::from("background-session".to_string()), "start")).await.unwrap();
         loop { let (_, _, _, event) = events.recv().await.unwrap(); if matches!(event, AgentEvent::LLMEnd(ref a) if a.content == "root is free") { break; } }
         let id = background.summaries().borrow()[0].id.parse().unwrap();
         background.wait_terminal(&id).await;
@@ -155,7 +155,7 @@ async fn stateful_calls_are_busy_across_foreground_and_background_dispatch() {
     timeout(Duration::from_secs(5), async {
         let provider = BackgroundProvider::default();
         let (runtime, _, background, mut events) = start(provider.clone()).await;
-        let root = ThreadId::from("background-session".to_string());
+        let root = ProcessId::from("background-session".to_string());
         runtime
             .send_message(user_task(&root, "start"))
             .await
@@ -175,11 +175,11 @@ async fn stateful_calls_are_busy_across_foreground_and_background_dispatch() {
             id,
             from: Sender::Agent {
                 name: "coda".into(),
-                thread_id: root.clone(),
+                pid: root.clone(),
             },
             to: Receiver {
                 name: "worker".into(),
-                thread_id: ThreadId::from_uuid5(&root, "worker"),
+                pid: ProcessId::from_uuid5(&root, "worker"),
             },
             reply_to: None,
             body: EnvelopeBody::ToolCall {
@@ -201,7 +201,7 @@ async fn stateful_calls_are_busy_across_foreground_and_background_dispatch() {
                 .unwrap_err()
                 .contains("busy")
         );
-        let non_root = ThreadId::from_uuid5(&root, "coda");
+        let non_root = ProcessId::from_uuid5(&root, "coda");
         assert!(
             runtime
                 .dispatch_background(envelope, origin, non_root)

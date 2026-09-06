@@ -14,83 +14,80 @@ pub enum WireEvent {
     #[serde(rename = "approval_removed")]
     ApprovalRemoved {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         parent_message_id: MessageId,
         task_id: Option<coda_core::task::TaskId>,
     },
     #[serde(rename = "background_error")]
     BackgroundError {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         task_id: coda_core::task::TaskId,
         message: String,
     },
     #[serde(rename = "llm_start")]
     LlmStart {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         model: String,
     },
     #[serde(rename = "llm_chunk")]
     LlmContentChunk {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         content: String,
     },
     #[serde(rename = "llm_reasoning_chunk")]
     LlmReasoningChunk {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         content: String,
     },
     #[serde(rename = "llm_end")]
     LlmEnd {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         message: AssistantMessage,
     },
     #[serde(rename = "tool_start")]
     ToolCallStart {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         call: ToolCall,
     },
     #[serde(rename = "tool_end")]
     ToolCallEnd {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         message: ToolMessage,
     },
     /// An auto-compaction has begun. Live-only, like `tool_start`.
     #[serde(rename = "compaction_start")]
-    CompactionStart {
-        agent_name: String,
-        thread_id: String,
-    },
+    CompactionStart { agent_name: String, pid: String },
     /// An auto-compaction's outcome: the summary it wrote, or the record of
     /// why it wrote none.
     #[serde(rename = "compaction_end")]
     CompactionEnd {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         message: CompactionMessage,
     },
     #[serde(rename = "suspended")]
     Suspended {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         approval: PendingApprovalWire,
     },
     #[serde(rename = "aborted")]
     Aborted {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         target: AbortedTargetWire,
     },
     #[serde(rename = "error")]
     Error {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         message: String,
     },
     /// This turn's content could not be written to the database. Deliberately
@@ -99,7 +96,7 @@ pub enum WireEvent {
     #[serde(rename = "persist_failed")]
     PersistFailed {
         agent_name: String,
-        thread_id: String,
+        pid: String,
         message: String,
     },
 }
@@ -128,82 +125,79 @@ impl WireEvent {
             EventOrigin::Root => root_name.to_string(),
             EventOrigin::Sub { name } => name.clone(),
         };
-        let thread_id = event.thread_id.as_ref().to_string();
+        let pid = event.pid.as_ref().to_string();
 
         match event.kind {
             AgentEvent::ApprovalRemoved {
-                thread_id,
+                pid,
                 parent_message_id,
                 task_id,
             } => WireEvent::ApprovalRemoved {
                 agent_name,
-                thread_id,
+                pid,
                 parent_message_id,
                 task_id,
             },
             AgentEvent::BackgroundError { task_id, message } => WireEvent::BackgroundError {
                 agent_name,
-                thread_id,
+                pid,
                 task_id,
                 message,
             },
             AgentEvent::LLMStart(request) => WireEvent::LlmStart {
                 agent_name,
-                thread_id,
+                pid,
                 model: request.model,
             },
             AgentEvent::LLMContentChunk(content) => WireEvent::LlmContentChunk {
                 agent_name,
-                thread_id,
+                pid,
                 content,
             },
             AgentEvent::LLMReasoningChunk(content) => WireEvent::LlmReasoningChunk {
                 agent_name,
-                thread_id,
+                pid,
                 content,
             },
             AgentEvent::LLMEnd(message) => WireEvent::LlmEnd {
                 agent_name,
-                thread_id,
+                pid,
                 message,
             },
             AgentEvent::ToolCallStart(call) => WireEvent::ToolCallStart {
                 agent_name,
-                thread_id,
+                pid,
                 call,
             },
             AgentEvent::ToolCallEnd(message) => WireEvent::ToolCallEnd {
                 agent_name,
-                thread_id,
+                pid,
                 message,
             },
-            AgentEvent::CompactionStart => WireEvent::CompactionStart {
-                agent_name,
-                thread_id,
-            },
+            AgentEvent::CompactionStart => WireEvent::CompactionStart { agent_name, pid },
             AgentEvent::CompactionEnd(message) => WireEvent::CompactionEnd {
                 agent_name,
-                thread_id,
+                pid,
                 message,
             },
             AgentEvent::Suspended(approval) => WireEvent::Suspended {
                 agent_name,
-                thread_id,
+                pid,
                 approval: PendingApprovalWire::from_agent(approval),
             },
             AgentEvent::Aborted(target) => WireEvent::Aborted {
                 agent_name,
-                thread_id,
+                pid,
                 target: target.into(),
             },
             AgentEvent::Error(message) => WireEvent::Error {
                 agent_name,
-                thread_id,
+                pid,
                 message,
             },
             AgentEvent::PersistFailed(message) => WireEvent::PersistFailed {
                 agent_name,
-                thread_id,
+                pid,
                 message,
             },
         }
@@ -266,7 +260,7 @@ pub struct RewindParams {
     pub images: Vec<String>,
 }
 
-/// `resume` params — answer a suspended tool call. `agent_name`/`thread_id` come
+/// `resume` params — answer a suspended tool call. `agent_name`/`pid` come
 /// from the [`PendingApprovalWire`] carried by a `Suspended` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeParams {
@@ -275,7 +269,7 @@ pub struct ResumeParams {
     pub workspace_id: String,
     pub session_id: String,
     pub agent_name: String,
-    pub thread_id: String,
+    pub pid: String,
     pub decision: ResumeDecision,
 }
 
@@ -508,8 +502,8 @@ pub struct Snapshot {
 /// to parse the label.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummaryWire {
-    pub task_status: coda_process::TaskStatus,
-    pub kind: coda_process::TaskKind,
+    pub task_status: coda_execution::TaskStatus,
+    pub kind: coda_execution::TaskKind,
     pub parent_task_id: Option<coda_core::task::TaskId>,
     pub subtree_active: bool,
     pub result_available: bool,
@@ -523,8 +517,8 @@ pub struct TaskSummaryWire {
     pub started_at: String,
 }
 
-impl From<coda_process::TaskSummary> for TaskSummaryWire {
-    fn from(summary: coda_process::TaskSummary) -> Self {
+impl From<coda_execution::TaskSummary> for TaskSummaryWire {
+    fn from(summary: coda_execution::TaskSummary) -> Self {
         Self {
             task_status: summary.status.clone(),
             kind: summary.kind,
@@ -665,7 +659,7 @@ impl From<crate::hub::SessionStatusEvent> for SessionStatusWire {
 pub struct PendingApprovalWire {
     pub task_id: Option<coda_core::task::TaskId>,
     pub agent_path: Vec<String>,
-    pub thread_id: String,
+    pub pid: String,
     pub agent_name: String,
     /// Identifies the batch; the client echoes it back in `resume` so a stale
     /// decision can be told apart from a live one.
@@ -687,7 +681,7 @@ impl PendingApprovalWire {
         Self {
             task_id: approval.task_id,
             agent_path: approval.agent_path,
-            thread_id: approval.thread_id,
+            pid: approval.pid,
             agent_name: approval.agent_name,
             parent_message_id: approval.parent_message_id,
             calls: approval.calls,
@@ -714,14 +708,14 @@ mod tests;
 pub enum TaskResultWire {
     Unknown,
     Pending {
-        status: coda_process::TaskStatus,
+        status: coda_execution::TaskStatus,
     },
     Available {
-        status: coda_process::TaskStatus,
-        output: coda_process::TaskResultOutput,
+        status: coda_execution::TaskStatus,
+        output: coda_execution::TaskResultOutput,
     },
     Expired {
-        status: coda_process::TaskStatus,
+        status: coda_execution::TaskStatus,
     },
     Error {
         message: String,

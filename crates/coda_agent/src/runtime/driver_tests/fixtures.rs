@@ -1,13 +1,13 @@
 //! Shared fixtures for the driver tests: local tools, a fake LLM provider
 //! scripted by system prompt, storage stand-ins, and the `Harness` that drives
-//! an `AgentRuntime` and lets a test await its events.
+//! an `ProcessRuntime` and lets a test await its events.
 
 use super::super::*;
 use crate::{
-    AgentEvent, AgentSpec, AgentTeam, ModelProfile, RunConfig, Sender, StoredCheckpoint,
+    AgentEvent, AgentSpec, AgentTeam, ModelProfile, Program, RunConfig, Sender, StoredCheckpoint,
     StoredRuntimeSnapshot, SubAgentMode, ToolApprovalMode, ToolCallResolution,
     runtime::{
-        AgentRuntime, AgentRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
+        ProcessRuntime, ProcessRuntimeSnapshot, ResumeTarget, SessionStorage, StoredResumePoint,
     },
 };
 use coda_core::{
@@ -30,9 +30,9 @@ use tokio::{
 /// A throwaway background-task registry, for the driver tests that only need
 /// `AgentTeam::build` to have one. Each call gets its own, so nothing leaks
 /// between tests.
-pub(super) fn test_registry() -> Option<std::sync::Arc<coda_process::BackgroundTasks>> {
+pub(super) fn test_registry() -> Option<std::sync::Arc<coda_execution::BackgroundTasks>> {
     Some(std::sync::Arc::new(
-        coda_process::BackgroundTasks::temporary().unwrap(),
+        coda_execution::BackgroundTasks::temporary().unwrap(),
     ))
 }
 
@@ -65,15 +65,16 @@ pub(super) struct TestStorage {
     /// Writes still allowed through before every later one fails.
     budget: Arc<Mutex<Option<usize>>>,
     fail_loads: Arc<Mutex<bool>>,
+    fail_snapshots: Arc<Mutex<bool>>,
 }
 
 impl TestStorage {
-    pub(super) async fn checkpoint(&self, thread_id: &ThreadId) -> Option<StoredCheckpoint> {
-        self.checkpoints
-            .lock()
-            .await
-            .get(thread_id.as_ref())
-            .cloned()
+    pub(super) async fn fail_snapshot_writes(&self, fail: bool) {
+        *self.fail_snapshots.lock().await = fail;
+    }
+
+    pub(super) async fn checkpoint(&self, pid: &ProcessId) -> Option<StoredCheckpoint> {
+        self.checkpoints.lock().await.get(pid.as_ref()).cloned()
     }
 
     /// Let the next `writes` checkpoint writes through, then fail every one
@@ -117,7 +118,7 @@ impl WriteGate {
 impl SessionStorage for TestStorage {
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
@@ -142,21 +143,21 @@ impl SessionStorage for TestStorage {
             if let Some(open) = open {
                 open.notified().await;
             }
-            self.checkpoints.lock().await.insert(thread_id, checkpoint);
+            self.checkpoints.lock().await.insert(pid, checkpoint);
             Ok(())
         })
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
-        let thread_id = thread_id.to_owned();
+        let pid = pid.to_owned();
         Box::pin(async move {
             if *self.fail_loads.lock().await {
                 return Err("checkpoint load is unavailable".to_string());
             }
-            let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
+            let checkpoint = self.checkpoints.lock().await.get(&pid).cloned();
             Ok(checkpoint)
         })
     }
@@ -185,7 +186,7 @@ impl SessionStorage for TestStorage {
                 })
                 .cloned()
                 .collect();
-            checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+            checkpoints.sort_by(|a, b| a.pid.cmp(&b.pid));
             Ok(checkpoints)
         })
     }
@@ -196,6 +197,9 @@ impl SessionStorage for TestStorage {
         snapshot: StoredRuntimeSnapshot,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
+            if *self.fail_snapshots.lock().await {
+                return Err("injected snapshot failure".into());
+            }
             self.snapshots.lock().await.insert(session_id, snapshot);
             Ok(())
         })
@@ -700,7 +704,7 @@ impl LLMProvider for TestProvider {
             },
             // A root that delegates once per turn to a stateful "explore",
             // which itself goes over threshold on its second invocation —
-            // exercises auto-compaction on a sub-agent thread too.
+            // exercises auto-compaction on a sub-agent process too.
             "auto-compact-subagent-main" => match last_user(&request.messages) {
                 Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
                     Self::completed(AssistantMessage {
@@ -1179,13 +1183,13 @@ fn describe_tools(messages: &[RequestMessage]) -> String {
     tools.join("|")
 }
 
-pub(super) fn user_task(thread_id: &ThreadId, task: &str) -> Envelope {
+pub(super) fn user_task(pid: &ProcessId, task: &str) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
         to: Receiver {
             name: "coda".into(),
-            thread_id: thread_id.clone(),
+            pid: pid.clone(),
         },
         reply_to: None,
         body: EnvelopeBody::Task {
@@ -1220,9 +1224,9 @@ pub(super) fn test_config(
 }
 
 pub(super) struct Harness<S> {
-    pub(super) runtime: AgentRuntime,
-    events: tokio::sync::broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>,
-    pub(super) thread_id: ThreadId,
+    pub(super) runtime: ProcessRuntime,
+    events: tokio::sync::broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>,
+    pub(super) pid: ProcessId,
     pub(super) storage: S,
 }
 
@@ -1258,7 +1262,7 @@ where
 
     pub(super) async fn start_agents(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         initial_task: &str,
@@ -1276,21 +1280,21 @@ where
     /// `RunConfig` itself (an auto-compaction threshold, say).
     pub(super) async fn start_with_config(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         config: RunConfig<TestProvider>,
         initial_task: &str,
     ) -> Self {
-        Self::start_with_config_at(storage, agents, config, ThreadId::new(), initial_task).await
+        Self::start_with_config_at(storage, agents, config, ProcessId::new(), initial_task).await
     }
 
     pub(super) async fn start_with_config_at(
         storage: S,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         config: RunConfig<TestProvider>,
-        thread_id: ThreadId,
+        pid: ProcessId,
         initial_task: &str,
     ) -> Self {
-        let mut runtime = AgentRuntime::new(storage.clone(), thread_id.as_ref().to_string());
+        let mut runtime = ProcessRuntime::new(storage.clone(), pid.as_ref().to_string());
         runtime
             .bootstrap(agents, None, HashMap::new(), config)
             .await
@@ -1300,7 +1304,7 @@ where
         let harness = Self {
             runtime,
             events,
-            thread_id,
+            pid,
             storage,
         };
         harness.send_task(initial_task).await;
@@ -1309,12 +1313,12 @@ where
 
     pub(super) async fn send_task(&self, task: &str) {
         self.runtime
-            .send_message(user_task(&self.thread_id, task))
+            .send_message(user_task(&self.pid, task))
             .await
             .expect("send task");
     }
 
-    /// Answer a suspension exactly as a client would: addressed to the thread
+    /// Answer a suspension exactly as a client would: addressed to the process
     /// that announced it, naming the batch it announced. Sending the same
     /// `approval` twice is therefore a faithful duplicate submit.
     pub(super) async fn send_resume(
@@ -1328,7 +1332,7 @@ where
                 from: Sender::User,
                 to: Receiver {
                     name: approval.agent_name.clone(),
-                    thread_id: ThreadId::from(approval.thread_id.clone()),
+                    pid: ProcessId::from(approval.pid.clone()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision {
@@ -1342,18 +1346,18 @@ where
 
     /// Restart the harness from storage, injecting resume decisions for agents
     /// that suspended in the previous run (keyed by agent name, carrying the
-    /// thread each one is parked on — what `Session::open` derives from the
+    /// process each one is parked on — what `Session::open` derives from the
     /// pending approvals it collected).
     pub(super) async fn restart(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
     ) -> Self {
-        let snapshot: Option<AgentRuntimeSnapshot> = self
+        let snapshot: Option<ProcessRuntimeSnapshot> = self
             .storage
-            .load_session_snapshot(self.thread_id.as_ref())
+            .load_session_snapshot(self.pid.as_ref())
             .await
             .unwrap_or_default()
             .map(Into::into);
@@ -1366,7 +1370,7 @@ where
     /// session a fork just minted starts out in exactly this state.
     pub(super) async fn restart_without_snapshot(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
@@ -1377,29 +1381,29 @@ where
 
     async fn restart_from(
         &self,
-        agents: HashMap<String, Agent>,
+        agents: HashMap<String, Arc<Program>>,
         provider: TestProvider,
         approval: ToolApprovalMode,
         resume_targets: HashMap<String, (String, ResumeDecision)>,
-        snapshot: Option<AgentRuntimeSnapshot>,
+        snapshot: Option<ProcessRuntimeSnapshot>,
     ) -> Self {
         let config = test_config(provider, approval);
-        let session_id = self.thread_id.as_ref().to_string();
+        let session_id = self.pid.as_ref().to_string();
         let resume_targets = resume_targets
             .into_iter()
-            .map(|(agent, (thread_id, decision))| {
+            .map(|(agent, (pid, decision))| {
                 (
-                    thread_id.clone(),
+                    pid.clone(),
                     ResumeTarget {
                         agent_name: agent,
-                        thread_id: ThreadId(thread_id),
+                        pid: ProcessId(pid),
                         decision,
                     },
                 )
             })
             .collect();
 
-        let mut runtime = AgentRuntime::new(self.storage.clone(), session_id.clone());
+        let mut runtime = ProcessRuntime::new(self.storage.clone(), session_id.clone());
         let events = runtime.subscribe();
         runtime
             .bootstrap(agents, snapshot, resume_targets, config)
@@ -1409,17 +1413,16 @@ where
         Self {
             runtime,
             events,
-            thread_id: ThreadId(session_id),
+            pid: ProcessId(session_id),
             storage: self.storage.clone(),
         }
     }
 
     /// The turn tag is dropped here: almost every test cares about who emitted
     /// what, not which submission it belonged to.
-    pub(super) async fn next_event(&mut self) -> (String, ThreadId, AgentEvent) {
-        let (agent_name, thread_id, _turn, event) =
-            self.events.recv().await.expect("receive event");
-        (agent_name, thread_id, event)
+    pub(super) async fn next_event(&mut self) -> (String, ProcessId, AgentEvent) {
+        let (agent_name, pid, _turn, event) = self.events.recv().await.expect("receive event");
+        (agent_name, pid, event)
     }
 
     pub(super) async fn shutdown(&self) {

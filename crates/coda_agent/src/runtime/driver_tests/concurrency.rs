@@ -67,9 +67,9 @@ impl LLMProvider for ParallelProvider {
 
 async fn parallel_invocations(background_enabled: bool) {
     let background =
-        background_enabled.then(|| Arc::new(coda_process::BackgroundTasks::temporary().unwrap()));
+        background_enabled.then(|| Arc::new(coda_execution::BackgroundTasks::temporary().unwrap()));
     let storage = MemoryStorage::default();
-    let root = ThreadId::from("parallel-session".to_string());
+    let root = ProcessId::from("parallel-session".to_string());
     let agents = AgentTeam::new(
         AgentSpec {
             name: "coda".into(),
@@ -90,7 +90,7 @@ async fn parallel_invocations(background_enabled: bool) {
     )
     .unwrap()
     .build(".", coda_tools::shared_file_locks(), background.clone());
-    let mut runtime = AgentRuntime::new(storage.clone(), root.as_ref().into());
+    let mut runtime = ProcessRuntime::new(storage.clone(), root.as_ref().into());
     runtime.background = background.clone();
     let mut events = runtime.subscribe();
     runtime
@@ -144,19 +144,19 @@ async fn parallel_invocations(background_enabled: bool) {
     }
     if !background_enabled {
         assert_eq!(
-            runtime.agents.lock().await.len(),
+            runtime.processes.lock().await.len(),
             1,
             "only the root driver stays live"
         );
         assert_eq!(
-            runtime.executions.lock().unwrap().threads.len(),
+            runtime.executions.lock().unwrap().processes.len(),
             1,
             "completed invocations release their execution records"
         );
     }
     if !background_enabled {
         assert!(
-            runtime.agent_tasks.lock().unwrap().len() <= 5,
+            runtime.process_tasks.lock().unwrap().len() <= 5,
             "completed JoinSet entries must not accumulate across turns"
         );
         assert!(
@@ -180,15 +180,15 @@ async fn parallel_invocations(background_enabled: bool) {
     assert_eq!(
         workers
             .iter()
-            .map(|worker| &worker.thread_id)
+            .map(|worker| &worker.pid)
             .collect::<HashSet<_>>()
             .len(),
         turns * 2
     );
-    assert_ne!(workers[0].thread_id, workers[1].thread_id);
+    assert_ne!(workers[0].pid, workers[1].pid);
     for worker in workers {
         assert_eq!(worker.messages.len(), 2);
-        assert_eq!(worker.parent_thread_id.as_deref(), Some(root.as_ref()));
+        assert_eq!(worker.parent_pid.as_deref(), Some(root.as_ref()));
     }
 }
 

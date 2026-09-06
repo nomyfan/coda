@@ -520,7 +520,7 @@ name = "coda_agent"
 version = "0.1.0"
 dependencies = [
  "coda_core",
- "coda_process",
+ "coda_execution",
  "coda_tools",
  "futures",
  "jiff",
@@ -546,6 +546,22 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "coda_execution"
+version = "0.1.0"
+dependencies = [
+ "coda_core",
+ "jiff",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -577,22 +593,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coda_process"
-version = "0.1.0"
-dependencies = [
- "coda_core",
- "jiff",
- "libc",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "coda_ptc"
 version = "0.1.0"
 dependencies = [
@@ -614,9 +614,9 @@ dependencies = [
  "clap",
  "coda_agent",
  "coda_core",
+ "coda_execution",
  "coda_mcp",
  "coda_openai",
- "coda_process",
  "coda_skills",
  "coda_tools",
  "diesel",
@@ -655,7 +655,7 @@ name = "coda_tools"
 version = "0.1.0"
 dependencies = [
  "coda_core",
- "coda_process",
+ "coda_execution",
  "coda_ptc",
  "diffy",
  "libc",

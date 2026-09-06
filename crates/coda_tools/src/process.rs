@@ -4,7 +4,7 @@
 use std::process::Output;
 
 use coda_core::tool::CancellationToken;
-use coda_process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
+use coda_execution::{GroupedChild, PIPE_DRAIN_TIMEOUT};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::{AbortHandle, JoinHandle};

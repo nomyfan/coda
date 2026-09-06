@@ -48,7 +48,7 @@ async fn restart_interrupts_an_uncommitted_result_and_preserves_cleanup_members(
     let id = TaskId::new();
     let record = archive.create_unreserved(&id, &subagent()).await.unwrap();
     let member = ScopeMember {
-        thread_id: "child".into(),
+        pid: "child".into(),
         invocation_id: "invocation".into(),
     };
     {

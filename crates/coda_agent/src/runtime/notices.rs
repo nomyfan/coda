@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::Receiver;
 use coda_core::task::TaskId;
 
-impl AgentRuntime {
+impl ProcessRuntime {
     /// Persist the root opening and its receipt before waking the driver.
     pub(crate) async fn admit_background_notice(
         &self,
@@ -38,7 +38,7 @@ impl AgentRuntime {
                 from: Sender::User,
                 to: Receiver {
                     name: root_name.clone(),
-                    thread_id: ThreadId::from(self.session_id.clone()),
+                    pid: ProcessId::from(self.session_id.clone()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Task {
@@ -66,16 +66,16 @@ impl AgentRuntime {
                     .load_checkpoint(&self.session_id)
                     .await?
                     .unwrap_or(StoredCheckpoint {
-                        thread_id: self.session_id.clone(),
+                        pid: self.session_id.clone(),
                         agent_name: root_name,
-                        parent_thread_id: None,
+                        parent_pid: None,
                         derivation_key: None,
                         active_execution: None,
                         messages: vec![],
                         resume_point: StoredResumePoint::Generation,
                         suspended_at: jiff::Timestamp::default(),
                     });
-                checkpoint.active_execution = self.execution(&envelope.to.thread_id);
+                checkpoint.active_execution = self.execution(&envelope.to.pid);
                 checkpoint.messages.push(crate::HistoryEntry::new(
                     turn,
                     coda_core::llm::Message::TaskNotice(coda_core::llm::TaskNoticeMessage::new(

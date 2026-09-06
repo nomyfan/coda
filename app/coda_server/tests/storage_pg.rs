@@ -10,7 +10,7 @@
 //! `(workspace_id, session_id)` and `WorkspaceStorage` is workspace-scoped, so
 //! tests never see each other's rows and can run in parallel without cleanup.
 
-use coda_agent::ThreadId;
+use coda_agent::ProcessId;
 use coda_agent::agent::{EnvelopeBody, Receiver, ReplyTarget};
 use coda_agent::persist::{
     StoredCheckpoint, StoredPreparedToolCall, StoredResumePoint, StoredRuntimeSnapshot,
@@ -90,7 +90,7 @@ struct RowVersion {
 #[derive(QueryableByName)]
 struct ThreadSeqRow {
     #[diesel(sql_type = Text)]
-    thread_id: String,
+    pid: String,
     #[diesel(sql_type = Integer)]
     seq: i32,
 }
@@ -134,11 +134,11 @@ async fn seed_session(pool: &DbPool, workspace: &str, session: &str) {
 
 /// A thread state with nothing interesting in it, so a test can show only the
 /// fields it is about.
-fn checkpoint(thread_id: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint {
+fn checkpoint(pid: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint {
     StoredCheckpoint {
-        thread_id: thread_id.to_string(),
+        pid: pid.to_string(),
         agent_name: "coda".to_string(),
-        parent_thread_id: None,
+        parent_pid: None,
         derivation_key: None,
         active_execution: None,
         messages,
@@ -180,13 +180,13 @@ fn summary_message(cutoff: MessageId, content: &str) -> Message {
 
 /// A task that reached the agent's inbox but not its history — what a snapshot
 /// holds when the process stops between the two.
-fn queued_task(thread_id: &str, task: &str) -> Envelope {
+fn queued_task(pid: &str, task: &str) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
         to: Receiver {
             name: "coda".to_string(),
-            thread_id: ThreadId::from(thread_id.to_string()),
+            pid: ProcessId::from(pid.to_string()),
         },
         reply_to: None,
         body: EnvelopeBody::Task {
@@ -216,8 +216,8 @@ async fn deleting_a_session_takes_its_threads_messages_and_snapshot_with_it() {
 
     for session in ["doomed", "keeper"] {
         diesel::sql_query(
-            "insert into thread_checkpoints
-                (workspace_id, session_id, thread_id, agent_name, resume_point,
+            "insert into process_checkpoints
+                (workspace_id, session_id, pid, agent_name, resume_point,
                  suspended_at, message_count, pending_approval)
              values ($1, $2, $2, 'coda', '\"Generation\"'::jsonb, now(), 1, false)",
         )
@@ -228,7 +228,7 @@ async fn deleting_a_session_takes_its_threads_messages_and_snapshot_with_it() {
         .unwrap();
         diesel::sql_query(
             "insert into messages
-                (workspace_id, session_id, thread_id, seq, message_id, turn_id, role, payload)
+                (workspace_id, session_id, pid, seq, message_id, turn_id, role, payload)
              values ($1, $2, $2, 0, gen_random_uuid(), gen_random_uuid(), 'user', '{}'::jsonb)",
         )
         .bind::<Text, _>(&workspace)
@@ -255,7 +255,7 @@ async fn deleting_a_session_takes_its_threads_messages_and_snapshot_with_it() {
 
     // Everything owned by the deleted session is gone, and the sibling session
     // is untouched — the cascade follows the composite key, not just the id.
-    for table in ["thread_checkpoints", "messages", "runtime_snapshots"] {
+    for table in ["process_checkpoints", "messages", "runtime_snapshots"] {
         let surviving: Vec<String> = diesel::sql_query(format!(
             "select session_id from {table} where workspace_id = $1"
         ))
@@ -276,8 +276,8 @@ async fn a_thread_cannot_belong_to_a_session_that_does_not_exist() {
     let workspace = workspace_id("orphan");
 
     let orphan = diesel::sql_query(
-        "insert into thread_checkpoints
-            (workspace_id, session_id, thread_id, agent_name, resume_point,
+        "insert into process_checkpoints
+            (workspace_id, session_id, pid, agent_name, resume_point,
              suspended_at, message_count, pending_approval)
          values ($1, 'never-opened', 'never-opened', 'coda', '\"Generation\"'::jsonb,
                  now(), 0, false)",
@@ -309,16 +309,16 @@ async fn a_saved_thread_comes_back_whole() {
     let suspended_at = jiff::Timestamp::now();
     let saved = StoredCheckpoint {
         agent_name: "explore".to_string(),
-        parent_thread_id: Some("chat".to_string()),
+        parent_pid: Some("chat".to_string()),
         derivation_key: Some(opening_call.derivation_key()),
         active_execution: Some(coda_agent::execution::StoredExecution {
             invocation_id: "env-1".into(),
-            scope: coda_agent::execution::ExecutionScope::Foreground { turn_id: turn },
+            scope: coda_agent::execution::ProcessGroupId::Foreground { turn_id: turn },
             agent_path: vec!["coda".into(), "explore".into()],
             completion: coda_agent::execution::CompletionTarget::Caller(ReplyTarget {
                 envelope_id: "env-1".to_string(),
                 sender_name: "coda".to_string(),
-                sender_thread_id: "chat".to_string(),
+                sender_pid: "chat".to_string(),
                 call_id: "call_explore".to_string(),
             }),
         }),
@@ -371,9 +371,9 @@ async fn a_saved_thread_comes_back_whole() {
         .unwrap()
         .expect("the checkpoint was just saved");
 
-    assert_eq!(loaded.thread_id, "explore-thread");
+    assert_eq!(loaded.pid, "explore-thread");
     assert_eq!(loaded.agent_name, "explore");
-    assert_eq!(loaded.parent_thread_id.as_deref(), Some("chat"));
+    assert_eq!(loaded.parent_pid.as_deref(), Some("chat"));
     assert_eq!(
         loaded.derivation_key,
         Some(opening_call.derivation_key()),
@@ -404,7 +404,7 @@ async fn a_saved_thread_comes_back_whole() {
     let row = diesel::sql_query(
         "select role, turn_id, origin_message_id, origin_call_id, pending_approval, message_count
            from messages
-           join thread_checkpoints using (workspace_id, session_id, thread_id)
+           join process_checkpoints using (workspace_id, session_id, pid)
           where workspace_id = $1 and seq = 0",
     )
     .bind::<Text, _>(&workspace)
@@ -907,9 +907,9 @@ async fn one_submission_is_recoverable_across_every_thread_it_reached() {
     // One predicate collects a submission's whole fan-out — no walking `origin`
     // up the thread tree. This is what a rewind will truncate on.
     let reached: Vec<(String, i32)> = diesel::sql_query(
-        "select thread_id, seq from messages
+        "select pid, seq from messages
           where workspace_id = $1 and session_id = 'chat' and turn_id = $2
-          order by thread_id, seq",
+          order by pid, seq",
     )
     .bind::<Text, _>(&workspace)
     .bind::<diesel::sql_types::Uuid, _>(first.as_uuid())
@@ -917,7 +917,7 @@ async fn one_submission_is_recoverable_across_every_thread_it_reached() {
     .await
     .unwrap()
     .into_iter()
-    .map(|row| (row.thread_id, row.seq))
+    .map(|row| (row.pid, row.seq))
     .collect();
 
     assert_eq!(
@@ -1015,7 +1015,7 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
                 StoredRuntimeSnapshot {
                     drained_envelopes: Default::default(),
                     agent_drained_envelopes: Default::default(),
-                    active_threads: [(thread.to_string(), "explore".to_string())].into(),
+                    active_processes: [(thread.to_string(), "explore".to_string())].into(),
                 },
             )
             .await
@@ -1029,7 +1029,7 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
         .expect("a snapshot was saved");
     assert_eq!(
         loaded
-            .active_threads
+            .active_processes
             .get("second-thread")
             .map(String::as_str),
         Some("explore"),
@@ -1438,7 +1438,7 @@ async fn a_deleted_session_leaves_the_list_and_is_reopenable() {
 #[derive(QueryableByName)]
 struct ThreadCountRow {
     #[diesel(sql_type = Text)]
-    thread_id: String,
+    pid: String,
     #[diesel(sql_type = Integer)]
     message_count: i32,
 }
@@ -1500,7 +1500,7 @@ async fn seed_two_turn_session(
             "explore-thread".to_string(),
             StoredCheckpoint {
                 agent_name: "explore".to_string(),
-                parent_thread_id: Some("chat".to_string()),
+                parent_pid: Some("chat".to_string()),
                 derivation_key: Some("explore".to_string()),
                 ..checkpoint(
                     "explore-thread",
@@ -1540,7 +1540,7 @@ async fn seed_two_turn_session(
             "probe-thread".to_string(),
             StoredCheckpoint {
                 agent_name: "probe".to_string(),
-                parent_thread_id: Some("chat".to_string()),
+                parent_pid: Some("chat".to_string()),
                 derivation_key: Some(probe_call.derivation_key()),
                 ..checkpoint(
                     "probe-thread",
@@ -1567,7 +1567,7 @@ async fn seed_two_turn_session(
             StoredRuntimeSnapshot {
                 drained_envelopes: Default::default(),
                 agent_drained_envelopes: Default::default(),
-                active_threads: Default::default(),
+                active_processes: Default::default(),
             },
         )
         .await
@@ -1576,30 +1576,28 @@ async fn seed_two_turn_session(
     (first, second, first_root, second_root)
 }
 
-async fn thread_ids_and_seqs(pool: &DbPool, workspace: &str) -> Vec<(String, i32)> {
-    diesel::sql_query(
-        "select thread_id, seq from messages where workspace_id = $1 order by thread_id, seq",
-    )
-    .bind::<Text, _>(workspace)
-    .load::<ThreadSeqRow>(&mut conn(pool).await)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| (row.thread_id, row.seq))
-    .collect()
+async fn pids_and_seqs(pool: &DbPool, workspace: &str) -> Vec<(String, i32)> {
+    diesel::sql_query("select pid, seq from messages where workspace_id = $1 order by pid, seq")
+        .bind::<Text, _>(workspace)
+        .load::<ThreadSeqRow>(&mut conn(pool).await)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.pid, row.seq))
+        .collect()
 }
 
 async fn thread_counts(pool: &DbPool, workspace: &str) -> Vec<(String, i32)> {
     diesel::sql_query(
-        "select thread_id, message_count from thread_checkpoints
-          where workspace_id = $1 order by thread_id",
+        "select pid, message_count from process_checkpoints
+          where workspace_id = $1 order by pid",
     )
     .bind::<Text, _>(workspace)
     .load::<ThreadCountRow>(&mut conn(pool).await)
     .await
     .unwrap()
     .into_iter()
-    .map(|row| (row.thread_id, row.message_count))
+    .map(|row| (row.pid, row.message_count))
     .collect()
 }
 
@@ -1635,7 +1633,7 @@ async fn a_rewind_drops_the_discarded_turn_from_every_thread_it_reached() {
     // the stateful thread keeps the turn that came before it, the stateless
     // thread had nothing else and its row goes.
     assert_eq!(
-        thread_ids_and_seqs(&pool, &workspace).await,
+        pids_and_seqs(&pool, &workspace).await,
         vec![
             ("chat".to_string(), 0),
             ("chat".to_string(), 1),
@@ -1703,10 +1701,10 @@ async fn a_rewound_thread_keeps_growing_from_where_it_was_cut() {
         "the replacement turn must follow the surviving history exactly once"
     );
     assert_eq!(
-        thread_ids_and_seqs(&pool, &workspace)
+        pids_and_seqs(&pool, &workspace)
             .await
             .into_iter()
-            .filter(|(thread_id, _)| thread_id == "chat")
+            .filter(|(pid, _)| pid == "chat")
             .map(|(_, seq)| seq)
             .collect::<Vec<_>>(),
         vec![0, 1, 2, 3],
@@ -1726,7 +1724,7 @@ async fn rewinding_to_the_opening_message_leaves_no_session_state_behind() {
     // Every thread is emptied, so every thread record goes with it — including
     // the root's. The session itself survives and reopens as a blank one.
     assert_eq!(row_count(&pool, "messages", &workspace).await, 0);
-    assert_eq!(row_count(&pool, "thread_checkpoints", &workspace).await, 0);
+    assert_eq!(row_count(&pool, "process_checkpoints", &workspace).await, 0);
     assert_eq!(row_count(&pool, "sessions", &workspace).await, 1);
     assert!(storage.load_checkpoint("chat").await.unwrap().is_none());
 }
@@ -1737,7 +1735,7 @@ async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
     let workspace = workspace_id("rewind-busy");
     let (_, _, _, second_root) = seed_two_turn_session(&pool, &workspace).await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
-    let before = thread_ids_and_seqs(&pool, &workspace).await;
+    let before = pids_and_seqs(&pool, &workspace).await;
 
     // A sub-agent waiting on an approval, which the `pending_approval` column
     // would flag — and one waiting on a tool result, which it would not. Both
@@ -1771,8 +1769,8 @@ async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
         // so the second case really is a thread the `pending_approval` flag does
         // not mark, rather than one whose fixture merely forgot to set it.
         diesel::sql_query(
-            "update thread_checkpoints set resume_point = $2, pending_approval = $3
-              where workspace_id = $1 and thread_id = 'explore-thread'",
+            "update process_checkpoints set resume_point = $2, pending_approval = $3
+              where workspace_id = $1 and pid = 'explore-thread'",
         )
         .bind::<Text, _>(&workspace)
         .bind::<diesel::sql_types::Jsonb, _>(serde_json::to_value(&parked).unwrap())
@@ -1784,11 +1782,11 @@ async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
         assert_eq!(
             storage.rewind_to(second_root).await.unwrap_err(),
             RewindError::ThreadBusy {
-                thread_id: "explore-thread".to_string()
+                pid: "explore-thread".to_string()
             }
         );
         assert_eq!(
-            thread_ids_and_seqs(&pool, &workspace).await,
+            pids_and_seqs(&pool, &workspace).await,
             before,
             "a refused rewind must not have deleted anything"
         );
@@ -1801,7 +1799,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_rewound_to() {
     let workspace = workspace_id("rewind-target");
     let (_, _, _, _) = seed_two_turn_session(&pool, &workspace).await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "chat");
-    let before = thread_ids_and_seqs(&pool, &workspace).await;
+    let before = pids_and_seqs(&pool, &workspace).await;
 
     let root = storage.load_checkpoint("chat").await.unwrap().unwrap();
     let assistant_id = match &root.messages[1].message {
@@ -1827,7 +1825,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_rewound_to() {
             RewindError::TargetNotFound
         );
     }
-    assert_eq!(thread_ids_and_seqs(&pool, &workspace).await, before);
+    assert_eq!(pids_and_seqs(&pool, &workspace).await, before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1867,8 +1865,8 @@ async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
     // the truncation would punch a hole rather than take a tail.
     let mut conn = conn(&pool).await;
     diesel::sql_query(
-        "insert into thread_checkpoints
-            (workspace_id, session_id, thread_id, agent_name, resume_point,
+        "insert into process_checkpoints
+            (workspace_id, session_id, pid, agent_name, resume_point,
              suspended_at, message_count, pending_approval)
          values ($1, 'chat', 'interleaved', 'explore', '\"Generation\"'::jsonb,
                  now(), 3, false)",
@@ -1880,7 +1878,7 @@ async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
     for (seq, turn) in [(0, first), (1, second), (2, first)] {
         diesel::sql_query(
             "insert into messages
-                (workspace_id, session_id, thread_id, seq, message_id, turn_id, role, payload)
+                (workspace_id, session_id, pid, seq, message_id, turn_id, role, payload)
              values ($1, 'chat', 'interleaved', $2, gen_random_uuid(), $3, 'assistant', '{}'::jsonb)",
         )
         .bind::<Text, _>(&workspace)
@@ -1890,16 +1888,16 @@ async fn a_truncation_that_would_leave_a_gap_is_rolled_back() {
         .await
         .unwrap();
     }
-    let before = thread_ids_and_seqs(&pool, &workspace).await;
+    let before = pids_and_seqs(&pool, &workspace).await;
 
     assert_eq!(
         storage.rewind_to(second_root).await.unwrap_err(),
         RewindError::HistoryNotContiguous {
-            thread_id: "interleaved".to_string()
+            pid: "interleaved".to_string()
         }
     );
     assert_eq!(
-        thread_ids_and_seqs(&pool, &workspace).await,
+        pids_and_seqs(&pool, &workspace).await,
         before,
         "the whole transaction rolls back, including the root thread's deletions"
     );
@@ -1920,8 +1918,8 @@ async fn sessions_in(pool: &DbPool, workspace: &str) -> Vec<String> {
 /// Every thread of one session with its message count, ordered by id.
 async fn threads_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(String, i32)> {
     diesel::sql_query(
-        "select thread_id, message_count from thread_checkpoints
-          where workspace_id = $1 and session_id = $2 order by thread_id",
+        "select pid, message_count from process_checkpoints
+          where workspace_id = $1 and session_id = $2 order by pid",
     )
     .bind::<Text, _>(workspace)
     .bind::<Text, _>(session)
@@ -1929,15 +1927,15 @@ async fn threads_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(Strin
     .await
     .unwrap()
     .into_iter()
-    .map(|row| (row.thread_id, row.message_count))
+    .map(|row| (row.pid, row.message_count))
     .collect()
 }
 
-/// One session's messages as `(thread_id, seq)`, ordered.
+/// One session's messages as `(pid, seq)`, ordered.
 async fn messages_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(String, i32)> {
     diesel::sql_query(
-        "select thread_id, seq from messages
-          where workspace_id = $1 and session_id = $2 order by thread_id, seq",
+        "select pid, seq from messages
+          where workspace_id = $1 and session_id = $2 order by pid, seq",
     )
     .bind::<Text, _>(workspace)
     .bind::<Text, _>(session)
@@ -1945,7 +1943,7 @@ async fn messages_of(pool: &DbPool, workspace: &str, session: &str) -> Vec<(Stri
     .await
     .unwrap()
     .into_iter()
-    .map(|row| (row.thread_id, row.seq))
+    .map(|row| (row.pid, row.seq))
     .collect()
 }
 
@@ -1957,7 +1955,7 @@ async fn rows_mentioning(pool: &DbPool, workspace: &str, session: &str, needle: 
         "select (select count(*) from messages m
                   where m.workspace_id = $1 and m.session_id = $2
                     and m::text like '%' || $3 || '%')
-              + (select count(*) from thread_checkpoints t
+              + (select count(*) from process_checkpoints t
                   where t.workspace_id = $1 and t.session_id = $2
                     and t::text like '%' || $3 || '%') as count",
     )
@@ -1975,12 +1973,12 @@ async fn rows_mentioning(pool: &DbPool, workspace: &str, session: &str, needle: 
 /// This is the design's load-bearing pair: thread ids are rebuilt under the new
 /// root, and the retained turns leave every thread a contiguous prefix.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
+async fn a_fork_rebuilds_pids_and_keeps_each_thread_a_prefix() {
     let pool = pool().await;
     let workspace = workspace_id("fork-remap");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
-    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+    let explore = ProcessId::from_uuid5(&ProcessId::from("source-session".to_string()), "explore");
 
     let (first, second, third) = (
         TurnId::from(MessageId::new()),
@@ -2022,9 +2020,9 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
         .save_checkpoint(
             explore.as_ref().to_string(),
             StoredCheckpoint {
-                thread_id: explore.as_ref().to_string(),
+                pid: explore.as_ref().to_string(),
                 agent_name: "explore".to_string(),
-                parent_thread_id: Some("source-session".to_string()),
+                parent_pid: Some("source-session".to_string()),
                 derivation_key: Some("explore".to_string()),
                 active_execution: None,
                 messages: vec![
@@ -2051,7 +2049,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
         .await
         .unwrap();
 
-    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let new_explore = ProcessId::from_uuid5(&ProcessId::from(forked.session_id.clone()), "explore");
     let mut expected = vec![
         (forked.session_id.clone(), 5),
         (new_explore.as_ref().to_string(), 2),
@@ -2102,7 +2100,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
     let workspace = workspace_id("fork-cut");
     seed_session(&pool, &workspace, "source-session").await;
     let storage = PgSessionStorage::new(pool.clone(), &workspace, "source-session");
-    let explore = ThreadId::from_uuid5(&ThreadId::from("source-session".to_string()), "explore");
+    let explore = ProcessId::from_uuid5(&ProcessId::from("source-session".to_string()), "explore");
 
     let (kept, dropped) = (
         TurnId::from(MessageId::new()),
@@ -2142,9 +2140,9 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
         .save_checkpoint(
             explore.as_ref().to_string(),
             StoredCheckpoint {
-                thread_id: explore.as_ref().to_string(),
+                pid: explore.as_ref().to_string(),
                 agent_name: "explore".to_string(),
-                parent_thread_id: Some("source-session".to_string()),
+                parent_pid: Some("source-session".to_string()),
                 derivation_key: Some("explore".to_string()),
                 messages: vec![entry(kept, sub_reply)],
                 ..checkpoint(explore.as_ref(), vec![])
@@ -2158,7 +2156,7 @@ async fn only_a_user_message_of_the_root_thread_can_be_a_cut() {
         .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
         .await
         .expect("the message that opened a turn");
-    let new_explore = ThreadId::from_uuid5(&ThreadId::from(forked.session_id.clone()), "explore");
+    let new_explore = ProcessId::from_uuid5(&ProcessId::from(forked.session_id.clone()), "explore");
     let mut expected = vec![
         (forked.session_id.clone(), 2),
         (new_explore.as_ref().to_string(), 1),
@@ -2238,7 +2236,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
             .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
             .await,
         Err(ForkError::ThreadBusy {
-            thread_id: "source-session".to_string()
+            pid: "source-session".to_string()
         })
     );
     assert_eq!(
@@ -2246,7 +2244,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
             .fork_session("source-session", ForkCut::All, ForkSource::Cold)
             .await,
         Err(ForkError::ThreadBusy {
-            thread_id: "source-session".to_string()
+            pid: "source-session".to_string()
         }),
         "a full copy is held to the same resting point"
     );
@@ -2358,7 +2356,7 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
                     vec![queued_task("source-session", "and one more thing")],
                 )]
                 .into(),
-                active_threads: Default::default(),
+                active_processes: Default::default(),
             },
         )
         .await
@@ -2370,7 +2368,7 @@ async fn forking_a_cold_session_with_queued_work_changes_nothing() {
             .fork_session("source-session", ForkCut::At(cut), ForkSource::Cold)
             .await,
         Err(ForkError::SourceNotIdle {
-            thread_id: "source-session".to_string()
+            pid: "source-session".to_string()
         })
     );
     assert_eq!(
@@ -2650,3 +2648,6 @@ async fn a_fork_inherits_the_state_its_kept_turns_recorded() {
 
 #[path = "storage_pg/background.rs"]
 mod background;
+
+#[path = "storage_pg/process_migration.rs"]
+mod process_migration;

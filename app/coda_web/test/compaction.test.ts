@@ -569,7 +569,7 @@ test("compaction_start shows a pending shimmer entry that compaction_end replace
   const started = reduceEvent(session(), {
     type: "compaction_start",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
   });
   expect(started.entries).toHaveLength(1);
   expect(started.entries[0]).toMatchObject({ kind: "compaction", status: "compacting" });
@@ -577,7 +577,7 @@ test("compaction_start shows a pending shimmer entry that compaction_end replace
   const finished = reduceEvent(started, {
     type: "compaction_end",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: {
       message_id: "summary-1",
       outcome: { type: "summary", cutoff: "covered-1" },
@@ -599,7 +599,7 @@ test("a sub-agent's compaction never reaches the transcript", () => {
   const started = reduceEvent(session(), {
     type: "compaction_start",
     agent_name: "explore",
-    thread_id: "child-thread",
+    pid: "child-thread",
   });
   expect(started.entries).toEqual([]);
 });
@@ -611,14 +611,14 @@ test("an abort after compaction_start clears the pending shimmer", () => {
   const started = reduceEvent(session(), {
     type: "compaction_start",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
   });
   expect(started.entries).toHaveLength(1);
 
   const aborted = reduceEvent(started, {
     type: "aborted",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     target: { reason: "generation" },
   });
   expect(aborted.entries.some((entry) => entry.kind === "compaction")).toBe(false);

@@ -44,9 +44,9 @@ async fn session_with_one_turn(
     (hub, events, message_id)
 }
 
-async fn stored_messages(storage: &SlowStorage, thread_id: &str) -> Vec<Message> {
+async fn stored_messages(storage: &SlowStorage, pid: &str) -> Vec<Message> {
     storage
-        .load_checkpoint(thread_id)
+        .load_checkpoint(pid)
         .await
         .expect("load checkpoint")
         .map(|checkpoint| {
@@ -351,7 +351,7 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -384,7 +384,7 @@ async fn a_rebuild_that_fails_after_the_truncation_sends_the_client_back_for_a_f
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
+                coda_execution::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()

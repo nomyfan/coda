@@ -491,7 +491,7 @@ async fn overflowing_tool_calls_refresh_snapshot_without_stopping_background_wor
     let id = background
         .spawn_with(task_meta("survives resync"), |ctx| async move {
             ctx.cancelled().cancelled().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -605,7 +605,7 @@ async fn failed_resume_does_not_stick_turn_running() {
             SessionCommand::Resume {
                 allow_patterns: vec![],
                 agent_name: "ghost".into(),
-                thread_id: "t-ghost".into(),
+                pid: "t-ghost".into(),
                 decision: ResumeDecision {
                     parent_message_id: MessageId::new(),
                     resolutions: vec![],

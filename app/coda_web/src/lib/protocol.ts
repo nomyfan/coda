@@ -122,7 +122,7 @@ export type HistoryMessage =
 export type PendingApproval = {
   task_id: string | null;
   agent_path: string[];
-  thread_id: string;
+  pid: string;
   agent_name: string;
   /** The assistant message that asked for these calls — the batch's identity.
    * Echoed back in `resume` so the server can tell a stale decision (a second
@@ -455,7 +455,7 @@ export type RpcRequests = {
       workspace_id: string;
       session_id: string;
       agent_name: string;
-      thread_id: string;
+      pid: string;
       decision: ResumeDecision;
     },
     { accepted: boolean }
@@ -515,83 +515,83 @@ export type WireEvent =
   | {
       type: "approval_removed";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       parent_message_id: string;
       task_id: string | null;
     }
   | {
       type: "background_error";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       task_id: string;
       message: string;
     }
   | {
       type: "llm_start";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       model: string;
     }
   | {
       type: "llm_chunk";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       content: string;
     }
   | {
       type: "llm_reasoning_chunk";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       content: string;
     }
   | {
       type: "llm_end";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       message: AssistantMessage;
     }
   | {
       type: "tool_start";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       call: ToolCall;
     }
   | {
       type: "tool_end";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       message: ToolMessage;
     }
   /** An auto-compaction has begun. Live-only, like `tool_start`. */
   | {
       type: "compaction_start";
       agent_name: string;
-      thread_id: string;
+      pid: string;
     }
   /** An auto-compaction's outcome: the summary it wrote, or the record of why
    * it wrote none. */
   | {
       type: "compaction_end";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       message: CompactionMessage;
     }
   | {
       type: "suspended";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       approval: PendingApproval;
     }
   | {
       type: "aborted";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       target: { reason: "generation" } | { reason: "tool_calls"; call_ids: string[] };
     }
   | {
       type: "error";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       message: string;
     }
   /** This turn's content never reached the database. Deliberately not a
@@ -601,7 +601,7 @@ export type WireEvent =
   | {
       type: "persist_failed";
       agent_name: string;
-      thread_id: string;
+      pid: string;
       message: string;
     };
 
@@ -621,7 +621,7 @@ export function outcomeText(outcome: ToolCallOutcome): string {
 }
 
 export function approvalKey(approval: PendingApproval): string {
-  return `${approval.thread_id}:${approval.parent_message_id}`;
+  return `${approval.pid}:${approval.parent_message_id}`;
 }
 
 /**

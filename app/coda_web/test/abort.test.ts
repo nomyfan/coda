@@ -25,11 +25,11 @@ function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   } as OpenedSession;
 }
 
-function approval(threadId: string): PendingApproval {
+function approval(pid: string): PendingApproval {
   return {
     task_id: null,
     agent_path: ["coda"],
-    thread_id: threadId,
+    pid: pid,
     agent_name: "coda",
     parent_message_id: "m-batch",
     calls: [],
@@ -51,7 +51,7 @@ test("a root abort buries the turn's pending approval", () => {
   const after = reduceEvent(suspended, {
     type: "aborted",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     target: { reason: "generation" },
   });
 
@@ -68,7 +68,7 @@ test("a root error buries the turn's pending approval too", () => {
   const after = reduceEvent(suspended, {
     type: "error",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "provider unreachable",
   });
 
@@ -81,7 +81,7 @@ test("a sub-agent abort settles nothing and keeps approvals", () => {
   const after = reduceEvent(suspended, {
     type: "aborted",
     agent_name: "explore",
-    thread_id: "child-thread",
+    pid: "child-thread",
     target: { reason: "generation" },
   });
 
@@ -103,14 +103,14 @@ test("background approvals preserve root execution and root abort preserves thei
   const suspended = reduceEvent(started, {
     type: "suspended",
     agent_name: "child",
-    thread_id: "child",
+    pid: "child",
     approval: pending,
   });
   expect(suspended.running).toBe(true);
   const aborted = reduceEvent(suspended, {
     type: "aborted",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     target: { reason: "generation" },
   });
   expect(aborted.approvals).toEqual([pending]);
@@ -138,7 +138,7 @@ test("removing one approval batch leaves another thread and reused call ID intac
   const after = reduceEvent(before, {
     type: "approval_removed",
     agent_name: "worker",
-    thread_id: "a",
+    pid: "a",
     parent_message_id: "batch-a",
     task_id: "bg_a",
   });
@@ -147,7 +147,7 @@ test("removing one approval batch leaves another thread and reused call ID intac
   const stale = reduceEvent(after, {
     type: "approval_removed",
     agent_name: "worker",
-    thread_id: "b",
+    pid: "b",
     parent_message_id: "older-batch",
     task_id: "bg_b",
   });
@@ -159,7 +159,7 @@ test("serialized control events remove foreground/background approvals without l
   const approvals = controlEvents
     .filter((event) => event.type === "approval_removed")
     .map((event) => ({
-      ...approval(event.thread_id),
+      ...approval(event.pid),
       parent_message_id: event.parent_message_id,
       task_id: event.task_id,
     }));
@@ -206,13 +206,13 @@ test.each(["abort", "complete"])(
         ? reduceEvent(before, {
             type: "aborted",
             agent_name: "coda",
-            thread_id: "s1",
+            pid: "s1",
             target: { reason: "generation" },
           })
         : reduceEvent(before, {
             type: "llm_end",
             agent_name: "coda",
-            thread_id: "s1",
+            pid: "s1",
             message: {
               message_id: "done",
               content: "done",

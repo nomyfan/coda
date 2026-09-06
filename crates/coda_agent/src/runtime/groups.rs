@@ -1,11 +1,11 @@
 use super::*;
 use crate::PendingApproval;
-use crate::execution::{CompletionTarget, ExecutionIdentity, ExecutionScope, StoredExecution};
+use crate::execution::{CompletionTarget, ExecutionIdentity, ProcessGroupId, StoredExecution};
 use coda_core::{
     llm::{MessageOrigin, ToolOutput},
     task::{ScopeMember, TaskId},
 };
-use coda_process::{TaskExit, TaskKind, TaskMeta, TaskOrigin};
+use coda_execution::{TaskExit, TaskKind, TaskMeta, TaskOrigin};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ pub(super) struct LiveExecution {
     pub cancel: CancellationToken,
 }
 
-pub(super) struct BackgroundScope {
+pub(super) struct BackgroundGroup {
     pub members: Vec<ScopeMember>,
     pub completion: Option<oneshot::Sender<ToolOutput>>,
     pub closed: bool,
@@ -26,15 +26,15 @@ pub(super) struct BackgroundScope {
 
 #[derive(Default)]
 pub(super) struct Executions {
-    pub threads: HashMap<String, LiveExecution>,
+    pub processes: HashMap<String, LiveExecution>,
     pub closing: bool,
     pub notice_wakeups: HashMap<TaskId, Envelope>,
-    pub background: HashMap<TaskId, BackgroundScope>,
+    pub background: HashMap<TaskId, BackgroundGroup>,
     pub quarantined: HashSet<String>,
     pub approvals: HashMap<(String, coda_core::llm::MessageId), PendingApproval>,
 }
 
-impl AgentRuntime {
+impl ProcessRuntime {
     pub(crate) fn root_turn_active(&self) -> bool {
         self.turn_gate.active_id().is_some()
             && self
@@ -57,11 +57,7 @@ impl AgentRuntime {
 
     pub fn has_background_work(&self) -> bool {
         let state = self.executions.lock().expect("executions");
-        !state.quarantined.is_empty()
-            || state
-                .background
-                .values()
-                .any(|s| !s.stopping || !*s.stopped.borrow())
+        !state.quarantined.is_empty() || !state.background.is_empty()
     }
 
     pub(crate) async fn stop_background(&self) {
@@ -78,7 +74,7 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn persist_scope_members(&self, id: &TaskId) -> Result<(), String> {
+    pub(crate) async fn persist_group_members(&self, id: &TaskId) -> Result<(), String> {
         let members = self
             .executions
             .lock()
@@ -96,21 +92,37 @@ impl AgentRuntime {
             .map_err(|e| e.to_string())
     }
 
-    async fn retire_scope(&self, id: &TaskId) -> bool {
-        let members = {
-            let state = self.executions.lock().expect("executions");
-            let Some(scope) = state.background.get(id) else {
+    async fn retire_background_group(&self, id: &TaskId) -> bool {
+        let (members, stopped) = {
+            let mut state = self.executions.lock().expect("executions");
+            let Some(scope) = state.background.get_mut(id) else {
                 return false;
             };
             if scope.stopping {
                 return false;
             }
-            scope.members.clone()
+            scope.stopping = true;
+            let stopped = scope.stopped.clone();
+            let candidates = scope.members.clone();
+            let members: Vec<_> = candidates
+                .iter()
+                .filter(|member| {
+                    state
+                        .processes
+                        .get(&member.pid)
+                        .is_some_and(|e| e.stored.invocation_id == member.invocation_id)
+                })
+                .cloned()
+                .collect();
+            for member in &members {
+                state.quarantined.insert(member.pid.clone());
+            }
+            (members, stopped)
         };
         for member in &members {
-            let handle = self.agents.lock().await.get(&member.thread_id).cloned();
+            let handle = self.processes.lock().await.get(&member.pid).cloned();
             if let Some(mut handle) = handle {
-                let _ = handle.send_command(AgentControl::StopScope).await;
+                let _ = handle.send_command(ProcessControl::StopGroup).await;
                 if !*handle.finished.borrow()
                     && timeout(Duration::from_secs(3), handle.finished.changed())
                         .await
@@ -121,14 +133,16 @@ impl AgentRuntime {
                 while !*handle.finished.borrow_and_update()
                     && handle.finished.changed().await.is_ok()
                 {}
-                self.agents.lock().await.remove(&member.thread_id);
+                self.processes.lock().await.remove(&member.pid);
             }
         }
         let mut state = self.executions.lock().expect("executions");
         for member in members {
-            state.threads.remove(&member.thread_id);
+            state.processes.remove(&member.pid);
+            state.quarantined.remove(&member.pid);
         }
         state.background.remove(id);
+        stopped.send_replace(true);
         true
     }
 
@@ -147,44 +161,46 @@ impl AgentRuntime {
             let runtime = self.clone();
             let id = id.clone();
             tokio::spawn(async move {
-                runtime.stop_scope(&id, Some(error.to_string())).await;
+                runtime
+                    .stop_background_group(&id, Some(error.to_string()))
+                    .await;
             });
         }
     }
 
-    pub(crate) fn execution(&self, thread: &ThreadId) -> Option<StoredExecution> {
+    pub(crate) fn execution(&self, thread: &ProcessId) -> Option<StoredExecution> {
         self.executions
             .lock()
             .expect("executions")
-            .threads
+            .processes
             .get(thread.as_ref())
             .map(|e| e.stored.clone())
     }
 
-    pub(crate) fn execution_cancel(&self, thread: &ThreadId) -> CancellationToken {
+    pub(crate) fn execution_cancel(&self, thread: &ProcessId) -> CancellationToken {
         self.executions
             .lock()
             .expect("executions")
-            .threads
+            .processes
             .get(thread.as_ref())
             .map(|e| e.cancel.child_token())
             .unwrap_or_default()
     }
 
-    pub(crate) fn execution_stopped(&self, thread: &ThreadId) -> bool {
+    pub(crate) fn execution_stopped(&self, thread: &ProcessId) -> bool {
         self.executions
             .lock()
             .expect("executions")
-            .threads
+            .processes
             .get(thread.as_ref())
             .is_some_and(|e| e.cancel.is_cancelled())
     }
 
-    pub(crate) fn restore_execution(&self, thread: &ThreadId, stored: StoredExecution) {
+    pub(crate) fn restore_execution(&self, thread: &ProcessId, stored: StoredExecution) {
         self.executions
             .lock()
             .expect("executions")
-            .threads
+            .processes
             .entry(thread.0.clone())
             .or_insert_with(|| LiveExecution {
                 stored,
@@ -194,7 +210,7 @@ impl AgentRuntime {
 
     pub(super) fn register_execution(&self, envelope: &Envelope) -> Result<(), SendCommandError> {
         let mut state = self.executions.lock().expect("executions");
-        if state.quarantined.contains(envelope.to.thread_id.as_ref()) {
+        if state.quarantined.contains(envelope.to.pid.as_ref()) {
             return Err(SendCommandError::AwaitingCleanup);
         }
         let stored = match &envelope.body {
@@ -204,7 +220,7 @@ impl AgentRuntime {
                 }
                 StoredExecution {
                     invocation_id: envelope.id.clone(),
-                    scope: ExecutionScope::Foreground {
+                    scope: ProcessGroupId::Foreground {
                         turn_id: TurnId::from(*message_id),
                     },
                     completion: CompletionTarget::RootTurn,
@@ -213,24 +229,22 @@ impl AgentRuntime {
             }
             EnvelopeBody::ToolCall { turn_id, .. } => {
                 if state
-                    .threads
-                    .get(envelope.to.thread_id.as_ref())
+                    .processes
+                    .get(envelope.to.pid.as_ref())
                     .is_some_and(|e| e.stored.invocation_id == envelope.id)
                 {
                     return Ok(());
                 }
                 let mut path = vec![];
                 let scope = match &envelope.from {
-                    Sender::Agent { thread_id, .. } => {
-                        state.threads.get(thread_id.as_ref()).map(|e| {
-                            path = e.stored.agent_path.clone();
-                            e.stored.scope.clone()
-                        })
-                    }
+                    Sender::Agent { pid, .. } => state.processes.get(pid.as_ref()).map(|e| {
+                        path = e.stored.agent_path.clone();
+                        e.stored.scope.clone()
+                    }),
                     _ => None,
                 }
-                .unwrap_or(ExecutionScope::Foreground { turn_id: *turn_id });
-                if let ExecutionScope::Background { task_id } = &scope {
+                .unwrap_or(ProcessGroupId::Foreground { turn_id: *turn_id });
+                if let ProcessGroupId::Background { task_id } = &scope {
                     let scope = state
                         .background
                         .get_mut(task_id)
@@ -239,7 +253,7 @@ impl AgentRuntime {
                         return Err(SendCommandError::ScopeClosed);
                     }
                     scope.members.push(ScopeMember {
-                        thread_id: envelope.to.thread_id.0.clone(),
+                        pid: envelope.to.pid.0.clone(),
                         invocation_id: envelope.id.clone(),
                     });
                 }
@@ -256,8 +270,8 @@ impl AgentRuntime {
             }
             EnvelopeBody::Resume(_) | EnvelopeBody::Reply { .. } => {
                 if state
-                    .threads
-                    .get(envelope.to.thread_id.as_ref())
+                    .processes
+                    .get(envelope.to.pid.as_ref())
                     .is_some_and(|e| {
                         e.stored.background_task().is_some() && e.cancel.is_cancelled()
                     })
@@ -267,8 +281,8 @@ impl AgentRuntime {
                 return Ok(());
             }
         };
-        state.threads.insert(
-            envelope.to.thread_id.0.clone(),
+        state.processes.insert(
+            envelope.to.pid.0.clone(),
             LiveExecution {
                 stored,
                 cancel: CancellationToken::new(),
@@ -281,9 +295,12 @@ impl AgentRuntime {
         &self,
         envelope: Envelope,
         origin: MessageOrigin,
-        parent: ThreadId,
+        parent: ProcessId,
     ) -> Result<TaskId, String> {
-        if !self.is_root_thread(&parent) {
+        if self.exit_barrier.is_exiting() {
+            return Err("runtime is shutting down".into());
+        }
+        if !self.is_root_process(&parent) {
             return Err("only the root thread can start a background subagent".into());
         }
         let background = self
@@ -300,7 +317,7 @@ impl AgentRuntime {
             .unwrap_or_default();
         path.push(envelope.to.name.clone());
         let (sender, receiver) = oneshot::channel();
-        let thread = envelope.to.thread_id.clone();
+        let thread = envelope.to.pid.clone();
         {
             let mut executions = self.executions.lock().expect("executions");
             if executions.closing {
@@ -313,12 +330,12 @@ impl AgentRuntime {
                 return Err("subagent thread is busy".into());
             }
             let member = ScopeMember {
-                thread_id: thread.0.clone(),
+                pid: thread.0.clone(),
                 invocation_id: envelope.id.clone(),
             };
             executions.background.insert(
                 id.clone(),
-                BackgroundScope {
+                BackgroundGroup {
                     members: vec![member],
                     completion: Some(sender),
                     closed: false,
@@ -327,12 +344,12 @@ impl AgentRuntime {
                     stopped: tokio::sync::watch::channel(false).0,
                 },
             );
-            executions.threads.insert(
+            executions.processes.insert(
                 thread.0.clone(),
                 LiveExecution {
                     stored: StoredExecution {
                         invocation_id: envelope.id.clone(),
-                        scope: ExecutionScope::Background {
+                        scope: ProcessGroupId::Background {
                             task_id: id.clone(),
                         },
                         completion: CompletionTarget::BackgroundTask(id.clone()),
@@ -354,21 +371,21 @@ impl AgentRuntime {
             },
             parent_task_id: None,
             origin: TaskOrigin {
-                thread_id: parent.0,
+                pid: parent.0,
                 message_origin: Some(origin),
                 agent_path: path.clone(),
             },
         };
         let spawned = background.spawn_identified(id.clone(), meta, move |context| async move {
-            if let Err(error) = runtime.persist_scope_members(&task_id).await {
-                runtime.stop_scope(&task_id, Some(error)).await;
-            } else if let Err(error) = runtime.deliver(envelope).await { runtime.stop_scope(&task_id, Some(error.to_string())).await; }
+            if let Err(error) = runtime.persist_group_members(&task_id).await {
+                runtime.stop_background_group(&task_id, Some(error)).await;
+            } else if let Err(error) = runtime.deliver(envelope).await { runtime.stop_background_group(&task_id, Some(error.to_string())).await; }
             let cancelled = context.cancelled();
             let output = tokio::select! {
                 biased;
                 result = receiver => result.unwrap_or_else(|_| ToolOutput::Err("background execution lost its completion".into())),
                 _ = cancelled.cancelled() => {
-                    runtime.stop_scope(&task_id, None).await;
+                    runtime.stop_background_group(&task_id, None).await;
                     ToolOutput::Err(runtime.executions.lock().expect("executions").background.get(&task_id).and_then(|s| s.reason.clone()).unwrap_or_else(|| "Killed by user".into()))
                 }
             };
@@ -381,18 +398,18 @@ impl AgentRuntime {
         if let Err(error) = spawned {
             let mut state = self.executions.lock().expect("executions");
             state.background.remove(&id);
-            state.threads.remove(thread.as_ref());
+            state.processes.remove(thread.as_ref());
             self.calls.end(&thread);
             return Err(error.to_string());
         }
         let runtime = self.clone();
         let task = id.clone();
-        self.agent_tasks
+        self.process_tasks
             .lock()
             .expect("runtime tasks")
             .spawn(async move {
                 background.wait_terminal(&task).await;
-                if runtime.retire_scope(&task).await {
+                if runtime.retire_background_group(&task).await {
                     runtime.calls.end(&thread);
                 }
                 format!("background scope {task}")
@@ -405,8 +422,8 @@ impl AgentRuntime {
             .executions
             .lock()
             .expect("executions")
-            .threads
-            .get(&identity.thread_id)
+            .processes
+            .get(&identity.pid)
             .filter(|e| e.stored.invocation_id == identity.invocation_id)
             .and_then(|e| e.stored.background_task().cloned());
         if let Some(task) = task {
@@ -417,7 +434,7 @@ impl AgentRuntime {
                     scope.reason = Some(error.clone());
                 }
                 for execution in state
-                    .threads
+                    .processes
                     .values()
                     .filter(|e| e.stored.background_task() == Some(&task))
                 {
@@ -426,7 +443,7 @@ impl AgentRuntime {
             }
             let runtime = self.clone();
             tokio::spawn(async move {
-                runtime.stop_scope(&task, Some(error)).await;
+                runtime.stop_background_group(&task, Some(error)).await;
             });
         }
     }
@@ -445,3 +462,7 @@ impl AgentRuntime {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "groups_tests.rs"]
+mod tests;

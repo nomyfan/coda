@@ -6,7 +6,7 @@ use coda_core::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecutionScope {
+pub enum ProcessGroupId {
     Foreground { turn_id: TurnId },
     Background { task_id: TaskId },
 }
@@ -21,7 +21,7 @@ pub enum CompletionTarget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredExecution {
     pub invocation_id: String,
-    pub scope: ExecutionScope,
+    pub scope: ProcessGroupId,
     pub completion: CompletionTarget,
     pub agent_path: Vec<String>,
 }
@@ -36,7 +36,7 @@ impl StoredExecution {
 
     pub fn background_task(&self) -> Option<&TaskId> {
         match &self.scope {
-            ExecutionScope::Background { task_id } => Some(task_id),
+            ProcessGroupId::Background { task_id } => Some(task_id),
             _ => None,
         }
     }
@@ -44,7 +44,7 @@ impl StoredExecution {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionIdentity {
-    pub thread_id: String,
+    pub pid: String,
     pub invocation_id: String,
 }
 
@@ -99,42 +99,34 @@ pub fn abort_checkpoint(checkpoint: &mut crate::StoredCheckpoint, reason: &str) 
     checkpoint.active_execution = None;
 }
 
-pub fn remove_scope_messages(snapshot: &mut crate::StoredRuntimeSnapshot, members: &[ScopeMember]) {
-    let belongs = |thread: &str| members.iter().any(|member| member.thread_id == thread);
-    snapshot.active_threads.retain(|thread, _| !belongs(thread));
-    for (thread, envelopes) in snapshot
-        .drained_envelopes
-        .iter_mut()
-        .chain(snapshot.agent_drained_envelopes.iter_mut())
-    {
-        if belongs(thread) {
-            envelopes.clear();
-        } else {
-            envelopes.retain(|envelope| !belongs(envelope.to.thread_id.as_ref()) && !matches!(&envelope.from, crate::Sender::Agent { thread_id, .. } if belongs(thread_id.as_ref())));
-        }
-    }
-}
-
-/// Filter late snapshots without deleting a later invocation on the same stateful thread.
+/// Filter late snapshots without deleting a later invocation on the same stateful process.
 pub fn fence_snapshot(
     snapshot: &mut crate::StoredRuntimeSnapshot,
     aborted: &[ScopeMember],
     active: &std::collections::HashMap<String, String>,
 ) {
-    snapshot.active_threads.retain(|thread, _| {
-        !aborted.iter().any(|member| {
-            &member.thread_id == thread
+    let fenced = |pid: &str| {
+        aborted.iter().any(|member| {
+            member.pid == pid
                 && active
-                    .get(thread)
+                    .get(pid)
                     .is_none_or(|invocation| invocation == &member.invocation_id)
         })
-    });
+    };
+    snapshot.active_processes.retain(|pid, _| !fenced(pid));
     for envelopes in snapshot
         .drained_envelopes
         .values_mut()
         .chain(snapshot.agent_drained_envelopes.values_mut())
     {
         envelopes.retain(|envelope| {
+            // Resume has no invocation reply_to. Preserve a newer execution's
+            // decision here; recovery checks its approval batch before replay.
+            if matches!(&envelope.body, crate::agent::EnvelopeBody::Resume(_))
+                && fenced(envelope.to.pid.as_ref())
+            {
+                return false;
+            }
             !aborted.iter().any(|member| {
                 envelope.id == member.invocation_id
                     || envelope.reply_to.as_ref() == Some(&member.invocation_id)

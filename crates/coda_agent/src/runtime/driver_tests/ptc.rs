@@ -305,7 +305,7 @@ async fn outer_approval_preserves_the_generation_snapshot() {
     let approval = wait_for_suspension(&mut harness).await;
 
     let checkpoint = storage
-        .checkpoint(&harness.thread_id)
+        .checkpoint(&harness.pid)
         .await
         .expect("suspended checkpoint");
     let StoredResumePoint::PendingApproval {
@@ -353,7 +353,7 @@ async fn discovery_approval_preserves_the_generation_snapshot() {
     let approval = wait_for_suspension(&mut harness).await;
 
     let checkpoint = storage
-        .checkpoint(&harness.thread_id)
+        .checkpoint(&harness.pid)
         .await
         .expect("suspended checkpoint");
     let StoredResumePoint::PendingApproval {

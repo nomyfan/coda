@@ -105,7 +105,7 @@ async fn a_first_turn_can_compact_after_its_completed_tool_batch() {
 
     let history = harness
         .storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("checkpoint exists")
@@ -176,14 +176,14 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
     ] {
         let config = config_with_threshold(TestProvider::default(), 1_000);
         let storage = MemoryStorage::default();
-        let thread_id = ThreadId::new();
+        let pid = ProcessId::new();
         storage
             .save_checkpoint(
-                thread_id.as_ref().to_string(),
+                pid.as_ref().to_string(),
                 StoredCheckpoint {
-                    thread_id: thread_id.as_ref().to_string(),
+                    pid: pid.as_ref().to_string(),
                     agent_name: "coda".to_string(),
-                    parent_thread_id: None,
+                    parent_pid: None,
                     derivation_key: None,
                     active_execution: None,
                     messages: malformed_history(usage),
@@ -197,7 +197,7 @@ async fn malformed_history_never_reaches_llm_start_on_usage_fast_paths() {
             .expect("valid team")
             .build(".", coda_tools::shared_file_locks(), test_registry());
         let mut harness =
-            Harness::start_with_config_at(storage, agents, config, thread_id, "new task").await;
+            Harness::start_with_config_at(storage, agents, config, pid, "new task").await;
 
         timeout(Duration::from_secs(2), async {
             loop {
@@ -241,7 +241,7 @@ async fn mid_turn_auto_compaction_prefers_a_turn_then_falls_back_inside_it() {
 
     let history = harness
         .storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("checkpoint exists")
@@ -347,7 +347,7 @@ async fn auto_compaction_emits_a_start_event_before_the_result() {
     harness.shutdown().await;
 }
 
-/// Auto-compaction runs on a sub-agent thread exactly the same way it runs on
+/// Auto-compaction runs on a sub-agent process exactly the same way it runs on
 /// the root: `explore` is stateful and invoked once per root turn, so its own
 /// history carries two turn tags by its second invocation — its second
 /// invocation crosses threshold after its own tool call, compacting through
@@ -375,7 +375,7 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
     wait_for_root_answer(&mut harness, "second done").await;
     harness.shutdown().await;
 
-    let explore_thread = ThreadId::from_uuid5(&harness.thread_id, "explore");
+    let explore_thread = ProcessId::from_uuid5(&harness.pid, "explore");
     let explore_history = harness
         .storage
         .load_checkpoint(explore_thread.as_ref())
@@ -446,7 +446,7 @@ async fn a_failed_attempt_is_retried_at_the_next_check_in_the_same_turn() {
 
     let history = harness
         .storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("checkpoint exists")
@@ -547,7 +547,7 @@ async fn a_compaction_survives_the_generation_that_failed_right_after_it() {
 
     let history = harness
         .storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("checkpoint exists")

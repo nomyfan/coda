@@ -58,7 +58,7 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
     background
         .spawn_with(task_meta("sleep"), move |_ctx| async move {
             held.notified().await;
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -81,7 +81,7 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
+                coda_execution::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err(),
@@ -113,7 +113,7 @@ async fn release_check_cannot_overtake_a_published_completion_notice() {
     background
         .spawn_with(task_meta("race"), move |_ctx| async move {
             task_finish.notified().await;
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();
@@ -171,7 +171,7 @@ async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -200,7 +200,7 @@ async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
+                coda_execution::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()
@@ -232,7 +232,7 @@ async fn shutdown_all_waits_for_an_in_flight_delete() {
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn stream_ended_release_closes_the_external_registry_before_map_removal() 
             ctx.cancelled().cancelled().await;
             task_cancelled.notify_one();
             task_finish.notified().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .unwrap();
@@ -324,7 +324,7 @@ async fn stream_ended_release_closes_the_external_registry_before_map_removal() 
     assert!(
         background
             .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
+                coda_execution::TaskExit::Exited { code: Some(0) }
             })
             .await
             .is_err()
@@ -352,7 +352,7 @@ async fn a_finished_task_opens_a_turn_of_its_own() {
     let background = background_of(&hub).await;
     background
         .spawn_with(task_meta("echo hi"), |_ctx| async {
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -406,7 +406,7 @@ async fn a_notice_arriving_mid_turn_waits_for_the_turn_to_end() {
     let background = background_of(&hub).await;
     background
         .spawn_with(task_meta("echo hi"), |_ctx| async {
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -464,7 +464,7 @@ async fn a_model_switch_keeps_the_running_tasks() {
     let id = before
         .spawn_with(task_meta("sleep"), move |_ctx| async move {
             held.notified().await;
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .expect("spawn");
@@ -522,7 +522,7 @@ async fn killing_a_task_from_the_client_settles_it() {
     let id = background
         .spawn_with(task_meta("sleep"), |ctx| async move {
             ctx.cancelled().cancelled().await;
-            coda_process::TaskExit::Killed
+            coda_execution::TaskExit::Killed
         })
         .await
         .expect("spawn");
@@ -607,7 +607,7 @@ async fn notices_that_pile_up_during_a_turn_arrive_as_one() {
     for i in 0..3 {
         background
             .spawn_with(task_meta(&format!("echo {i}")), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
+                coda_execution::TaskExit::Exited { code: Some(0) }
             })
             .await
             .expect("spawn");
@@ -678,7 +678,7 @@ async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
         let meta = |name: &str| {
             let mut meta = task_meta(name);
             if subagents {
-                meta.kind = coda_process::TaskKind::Subagent {
+                meta.kind = coda_execution::TaskKind::Subagent {
                     agent_name: name.into(),
                 };
             }
@@ -691,11 +691,11 @@ async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
                 release.notified().await;
                 ctx.append_stdout(b"complete output").await.unwrap();
                 if subagents {
-                    coda_process::TaskExit::Completed {
+                    coda_execution::TaskExit::Completed {
                         answer: "complete subagent answer".into(),
                     }
                 } else {
-                    coda_process::TaskExit::Exited { code: Some(0) }
+                    coda_execution::TaskExit::Exited { code: Some(0) }
                 }
             })
             .await
@@ -706,7 +706,7 @@ async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
                 ctx.append_stdout(b"partial output before kill")
                     .await
                     .unwrap();
-                coda_process::TaskExit::Killed
+                coda_execution::TaskExit::Killed
             })
             .await
             .unwrap();
@@ -725,7 +725,7 @@ async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
         let unread = if include_unread {
             let id = background
                 .spawn_with(task_meta("unread"), |_| async {
-                    coda_process::TaskExit::Exited { code: Some(0) }
+                    coda_execution::TaskExit::Exited { code: Some(0) }
                 })
                 .await
                 .unwrap();
@@ -792,7 +792,7 @@ async fn reading_terminal_status_after_draining_running_output_suppresses_notice
             ctx.append_stdout(b"all output before exit").await.unwrap();
             written.notify_one();
             release.notified().await;
-            coda_process::TaskExit::Exited { code: Some(0) }
+            coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();

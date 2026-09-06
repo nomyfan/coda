@@ -1,4 +1,8 @@
 pub mod agent;
+pub mod process;
+pub mod program;
+pub use process::{Process, ProcessId};
+pub use program::Program;
 pub mod compaction;
 pub mod execution;
 pub mod message_view;
@@ -8,10 +12,9 @@ pub mod session;
 pub mod spec;
 
 pub use agent::{
-    AbortedTarget, Agent, AgentEvent, Envelope, HistoryEntry, ModelProfile, PendingApproval,
+    AbortedTarget, AgentEvent, Envelope, HistoryEntry, ModelProfile, PendingApproval,
     ResumeDecision, RunConfig, SUBAGENT_TOOL_PREFIX, Sender, SharedSystemPrompt, SubAgentMode,
-    SubAgentTool, SystemPrompt, ThreadId, ToolApprovalMode, ToolCallResolution, VarsProvider,
-    substitute,
+    SubAgentTool, SystemPrompt, ToolApprovalMode, ToolCallResolution, VarsProvider, substitute,
 };
 pub use persist::{StoredCheckpoint, StoredRuntimeSnapshot};
 pub use session::{

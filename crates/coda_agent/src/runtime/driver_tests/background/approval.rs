@@ -1,7 +1,7 @@
 use super::super::super::*;
 use super::super::fixtures::user_task;
 use super::fixtures::*;
-use coda_process::TaskStatus;
+use coda_execution::TaskStatus;
 use tokio::time::{Duration, timeout};
 #[tokio::test]
 async fn background_approval_blocks_new_input_and_cancellation_revokes_only_its_batch() {
@@ -11,7 +11,7 @@ async fn background_approval_blocks_new_input_and_cancellation_revokes_only_its_
             ..Default::default()
         };
         let (runtime, _, background, mut events) = start(provider.clone()).await;
-        let root = ThreadId::from("background-session".to_string());
+        let root = ProcessId::from("background-session".to_string());
         runtime
             .send_message(user_task(&root, "start"))
             .await
@@ -50,7 +50,7 @@ async fn background_approval_blocks_new_input_and_cancellation_revokes_only_its_
                 from: Sender::User,
                 to: Receiver {
                     name: approval.agent_name,
-                    thread_id: ThreadId::from(approval.thread_id),
+                    pid: ProcessId::from(approval.pid),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision {

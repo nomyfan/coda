@@ -1,7 +1,7 @@
 //! Serialization-layer types for checkpoints and runtime snapshots.
 //!
 //! These `Stored*` types carry `Serialize`/`Deserialize` and define the on-disk
-//! format. Internal runtime types (`ResumePoint`, `AgentRuntimeSnapshot`, etc.)
+//! format. Internal runtime types (`ResumePoint`, `ProcessRuntimeSnapshot`, etc.)
 //! are free to evolve independently; conversion happens at the load/save
 //! boundary via `From` impls.
 
@@ -15,15 +15,15 @@ use crate::agent::{
     Envelope, HistoryEntry, PendingReply, PendingToolCall, PreparedToolCall, ResumePoint,
     ToolExecutionState,
 };
-use crate::runtime::AgentRuntimeSnapshot;
+use crate::runtime::ProcessRuntimeSnapshot;
 
 // ---------------------------------------------------------------------------
 // StoredCheckpoint
 // ---------------------------------------------------------------------------
 
-/// On-disk representation of a single agent thread's state.
+/// On-disk representation of a single agent process's state.
 ///
-/// Everything here is one of two things: the thread's conversation — including
+/// Everything here is one of two things: the process's conversation — including
 /// the tool state its messages recorded — or something that only makes sense
 /// *now*, like where a suspended run picks up and who is owed a reply.
 ///
@@ -31,15 +31,15 @@ use crate::runtime::AgentRuntimeSnapshot;
 /// a rewind are both defined over turns: they choose a set of messages and keep
 /// or drop them. A field that carries its newest value regardless is a field
 /// those two will hand to a history that no longer explains it. Anything a
-/// thread accumulates therefore goes on the message that produced it, where the
+/// process accumulates therefore goes on the message that produced it, where the
 /// same cut reaches it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCheckpoint {
-    pub thread_id: String,
+    pub pid: String,
     pub agent_name: String,
-    /// The thread that spawned this one, and the name its `thread_id` was
-    /// derived from (`uuid5(parent_thread_id, derivation_key)`). Both `None` on
-    /// the root thread, so "no parent" is what identifies the root.
+    /// The process that spawned this one, and the name its `pid` was
+    /// derived from (`uuid5(parent_pid, derivation_key)`). Both `None` on
+    /// the root process, so "no parent" is what identifies the root.
     ///
     /// The derivation is one-way, so without recording these the parent/child
     /// structure can only be re-guessed; a fork, which has to rebuild every
@@ -47,7 +47,7 @@ pub struct StoredCheckpoint {
     /// from `active_execution`, which names the same parent but only for the span of
     /// one call and is cleared as soon as the reply is sent.
     #[serde(default)]
-    pub parent_thread_id: Option<String>,
+    pub parent_pid: Option<String>,
     #[serde(default)]
     pub derivation_key: Option<String>,
     #[serde(default)]
@@ -105,8 +105,8 @@ pub struct StoredPreparedToolCall {
 pub struct StoredRuntimeSnapshot {
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
-    /// Thread id → agent name; inbox maps above are also keyed by thread id.
-    pub active_threads: HashMap<String, String>,
+    /// Process id → agent name; inbox maps above are also keyed by process id.
+    pub active_processes: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,12 +163,12 @@ impl From<ResumePoint> for StoredResumePoint {
     }
 }
 
-impl From<AgentRuntimeSnapshot> for StoredRuntimeSnapshot {
-    fn from(s: AgentRuntimeSnapshot) -> Self {
+impl From<ProcessRuntimeSnapshot> for StoredRuntimeSnapshot {
+    fn from(s: ProcessRuntimeSnapshot) -> Self {
         StoredRuntimeSnapshot {
             drained_envelopes: s.drained_envelopes,
             agent_drained_envelopes: s.agent_drained_envelopes,
-            active_threads: s.active_threads,
+            active_processes: s.active_processes,
         }
     }
 }
@@ -227,12 +227,12 @@ impl From<StoredResumePoint> for ResumePoint {
     }
 }
 
-impl From<StoredRuntimeSnapshot> for AgentRuntimeSnapshot {
+impl From<StoredRuntimeSnapshot> for ProcessRuntimeSnapshot {
     fn from(s: StoredRuntimeSnapshot) -> Self {
-        AgentRuntimeSnapshot {
+        ProcessRuntimeSnapshot {
             drained_envelopes: s.drained_envelopes,
             agent_drained_envelopes: s.agent_drained_envelopes,
-            active_threads: s.active_threads,
+            active_processes: s.active_processes,
         }
     }
 }

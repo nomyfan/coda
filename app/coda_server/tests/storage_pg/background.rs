@@ -1,18 +1,93 @@
 use super::*;
 use coda_agent::execution::{
-    CompletionTarget, ExecutionIdentity, ExecutionScope, ScopeAbort, StoredExecution,
+    CompletionTarget, ExecutionIdentity, ProcessGroupId, ScopeAbort, StoredExecution,
 };
 use coda_core::task::{ScopeMember, TaskId};
 
 fn execution(task: &TaskId, invocation: &str) -> StoredExecution {
     StoredExecution {
         invocation_id: invocation.into(),
-        scope: ExecutionScope::Background {
+        scope: ProcessGroupId::Background {
             task_id: task.clone(),
         },
         completion: CompletionTarget::BackgroundTask(task.clone()),
         agent_path: vec!["coda".into(), "worker".into()],
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
+    let pool = pool().await;
+    let workspace = workspace_id("reused_process");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool, &workspace, "root");
+    let old = TaskId::new();
+    let new = TaskId::new();
+    let mut child = checkpoint("child", vec![]);
+    child.agent_name = "worker".into();
+    child.parent_pid = Some("root".into());
+    child.derivation_key = Some("worker".into());
+    child.active_execution = Some(execution(&new, "new-invocation"));
+    storage
+        .save_checkpoint("child".into(), child.clone())
+        .await
+        .unwrap();
+    let mut queued = queued_task("child", "new work");
+    queued.id = "new-invocation".into();
+    let mut resume = queued_task("child", "new approval");
+    resume.body = EnvelopeBody::Resume(coda_agent::ResumeDecision {
+        parent_message_id: MessageId::new(),
+        resolutions: vec![],
+    });
+    let resume_id = resume.id.clone();
+    storage
+        .save_session_snapshot(
+            "root".into(),
+            StoredRuntimeSnapshot {
+                active_processes: [("child".into(), "worker".into())].into(),
+                drained_envelopes: [("child".into(), vec![queued, resume.clone()])].into(),
+                agent_drained_envelopes: [("child".into(), vec![resume])].into(),
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .abort_scope(ScopeAbort {
+            task_id: old,
+            members: vec![ScopeMember {
+                pid: "child".into(),
+                invocation_id: "old-invocation".into(),
+            }],
+            reason: "old group failed".into(),
+        })
+        .await
+        .unwrap();
+    let current = storage.load_checkpoint("child").await.unwrap().unwrap();
+    assert_eq!(
+        current.active_execution.unwrap().invocation_id,
+        "new-invocation"
+    );
+    let snapshot = storage
+        .load_session_snapshot("root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.active_processes.contains_key("child"));
+    assert_eq!(snapshot.drained_envelopes["child"][0].id, "new-invocation");
+    assert_eq!(snapshot.drained_envelopes["child"][1].id, resume_id);
+    assert_eq!(snapshot.agent_drained_envelopes["child"][0].id, resume_id);
+    assert!(
+        storage
+            .save_execution_checkpoint(
+                ExecutionIdentity {
+                    pid: "child".into(),
+                    invocation_id: "old-invocation".into(),
+                },
+                child
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -36,7 +111,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         vec![entry(turn, Message::Assistant(assistant.clone()))],
     );
     child.agent_name = "worker".into();
-    child.parent_thread_id = Some("root".into());
+    child.parent_pid = Some("root".into());
     child.derivation_key = Some("child".into());
     child.active_execution = Some(execution(&task, "child-invocation"));
     child.resume_point = StoredResumePoint::PendingApproval {
@@ -48,7 +123,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         pending_calls: vec![],
     };
     let identity = ExecutionIdentity {
-        thread_id: "child".into(),
+        pid: "child".into(),
         invocation_id: "child-invocation".into(),
     };
     storage
@@ -64,14 +139,21 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .unwrap();
     let mut queued = queued_task("child", "must never replay");
     queued.id = identity.invocation_id.clone();
+    let mut resume = queued_task("child", "old approval");
+    resume.body = EnvelopeBody::Resume(coda_agent::ResumeDecision {
+        parent_message_id: assistant.message_id,
+        resolutions: vec![],
+    });
+    assert_ne!(resume.id, identity.invocation_id);
+    assert!(resume.reply_to.is_none());
     let snapshot = StoredRuntimeSnapshot {
-        active_threads: [
+        active_processes: [
             ("child".into(), "worker".into()),
             ("unrelated".into(), "worker".into()),
         ]
         .into(),
-        drained_envelopes: [("child".into(), vec![queued])].into(),
-        agent_drained_envelopes: Default::default(),
+        drained_envelopes: [("child".into(), vec![queued, resume.clone()])].into(),
+        agent_drained_envelopes: [("child".into(), vec![resume])].into(),
     };
     storage
         .save_session_snapshot("root".into(), snapshot.clone())
@@ -81,13 +163,30 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .abort_scope(ScopeAbort {
             task_id: task,
             members: vec![ScopeMember {
-                thread_id: identity.thread_id.clone(),
+                pid: identity.pid.clone(),
                 invocation_id: identity.invocation_id.clone(),
             }],
             reason: "checkpoint failed".into(),
         })
         .await
         .unwrap();
+    let cleaned_snapshot = storage
+        .load_session_snapshot("root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cleaned_snapshot
+            .drained_envelopes
+            .values()
+            .all(Vec::is_empty)
+    );
+    assert!(
+        cleaned_snapshot
+            .agent_drained_envelopes
+            .values()
+            .all(Vec::is_empty)
+    );
     let clean = storage.load_checkpoint("child").await.unwrap().unwrap();
     assert!(clean.active_execution.is_none());
     assert!(matches!(clean.resume_point, StoredResumePoint::Generation));
@@ -109,9 +208,10 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .await
         .unwrap()
         .unwrap();
-    assert!(!snapshot.active_threads.contains_key("child"));
-    assert!(snapshot.active_threads.contains_key("unrelated"));
+    assert!(!snapshot.active_processes.contains_key("child"));
+    assert!(snapshot.active_processes.contains_key("unrelated"));
     assert!(snapshot.drained_envelopes.values().all(Vec::is_empty));
+    assert!(snapshot.agent_drained_envelopes.values().all(Vec::is_empty));
     assert!(
         storage
             .load_checkpoint("unrelated")
@@ -146,7 +246,7 @@ async fn notice_receipt_is_atomic_idempotent_and_survives_rewind() {
     );
     opening.active_execution = Some(StoredExecution {
         invocation_id: "notice-invocation".into(),
-        scope: ExecutionScope::Foreground {
+        scope: ProcessGroupId::Foreground {
             turn_id: TurnId::from(message_id),
         },
         completion: CompletionTarget::RootTurn,
@@ -260,17 +360,6 @@ async fn root_task_read_receipt_survives_reopen_and_rewind_but_not_fork() {
     let task = TaskId::new();
     let user_id = MessageId::new();
     let turn = TurnId::from(user_id);
-    let mut child = checkpoint("child", vec![entry(turn, observed_read(&task))]);
-    child.parent_thread_id = Some("root".into());
-    child.derivation_key = Some("child".into());
-    storage
-        .save_checkpoint("child".into(), child)
-        .await
-        .unwrap();
-    assert!(
-        !storage.has_notice_receipt(task.clone()).await.unwrap(),
-        "non-root reads cannot acknowledge root delivery"
-    );
     let root = checkpoint(
         "root",
         vec![
@@ -345,4 +434,25 @@ async fn failed_checkpoint_rolls_back_the_task_read_receipt() {
             .len(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owning_process_task_read_receipt_is_persisted() {
+    let pool = pool().await;
+    let workspace = workspace_id("owner_task_read");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    let task = TaskId::new();
+    let mut child = checkpoint(
+        "child",
+        vec![entry(TurnId::from(MessageId::new()), observed_read(&task))],
+    );
+    child.parent_pid = Some("root".into());
+    child.derivation_key = Some("child".into());
+    storage
+        .save_checkpoint("child".into(), child)
+        .await
+        .unwrap();
+    let reopened = PgSessionStorage::new(pool, &workspace, "root");
+    assert!(reopened.has_notice_receipt(task).await.unwrap());
 }

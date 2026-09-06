@@ -130,7 +130,7 @@ test("a tool_end after a reconnect still finds its generation span", () => {
   const after = reduceEvent(reattached, {
     type: "tool_end",
     agent_name: "coda",
-    thread_id: "t",
+    pid: "t",
     message: toolReply("t1", "call_1", 2, 3),
   });
 
@@ -143,19 +143,19 @@ test("a live tool_end uses the span its llm_end recorded", () => {
   const generated = reduceEvent(session(), {
     type: "llm_end",
     agent_name: "coda",
-    thread_id: "t",
+    pid: "t",
     message: toolCallOnly("a1", "call_1", 0, 2),
   });
   const started = reduceEvent(generated, {
     type: "tool_start",
     agent_name: "coda",
-    thread_id: "t",
+    pid: "t",
     call: { id: "call_1", name: "shell", arguments: null },
   });
   const after = reduceEvent(started, {
     type: "tool_end",
     agent_name: "coda",
-    thread_id: "t",
+    pid: "t",
     message: toolReply("t1", "call_1", 2, 3),
   });
 

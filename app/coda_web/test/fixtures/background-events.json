@@ -2,21 +2,21 @@
   {
     "type": "approval_removed",
     "agent_name": "coda",
-    "thread_id": "s1",
+    "pid": "s1",
     "parent_message_id": "00000000-0000-0000-0000-000000000001",
     "task_id": null
   },
   {
     "type": "approval_removed",
     "agent_name": "worker",
-    "thread_id": "child",
+    "pid": "child",
     "parent_message_id": "00000000-0000-0000-0000-000000000002",
     "task_id": "bg_00000000000000000000000000000001"
   },
   {
     "type": "background_error",
     "agent_name": "worker",
-    "thread_id": "child",
+    "pid": "child",
     "task_id": "bg_00000000000000000000000000000001",
     "message": "checkpoint failed"
   }

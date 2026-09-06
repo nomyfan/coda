@@ -91,7 +91,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
 
     let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
+            if let Some(checkpoint) = harness.storage.checkpoint(&harness.pid).await
                 && matches!(
                     checkpoint.resume_point,
                     crate::persist::StoredResumePoint::Generation
@@ -168,7 +168,7 @@ async fn abort_settles_cancel_aware_tool_with_partial_output() {
 
     let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
+            if let Some(checkpoint) = harness.storage.checkpoint(&harness.pid).await
                 && matches!(
                     checkpoint.resume_point,
                     crate::persist::StoredResumePoint::Generation
@@ -259,7 +259,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
 
     let checkpoint = timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(checkpoint) = harness.storage.checkpoint(&harness.thread_id).await
+            if let Some(checkpoint) = harness.storage.checkpoint(&harness.pid).await
                 && let Some(Message::Assistant(message)) =
                     checkpoint.messages.last().map(|entry| &entry.message)
                 && message.aborted
@@ -275,7 +275,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     result.expect("timed out waiting for generation abort");
     harness
         .runtime
-        .send_message(user_task(&harness.thread_id, "next"))
+        .send_message(user_task(&harness.pid, "next"))
         .await
         .expect("a durably aborted turn releases the next task");
     harness.shutdown().await;
@@ -293,7 +293,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     ));
 }
 
-/// An abort travels up the call tree, not across it: each thread waits for the
+/// An abort travels up the call tree, not across it: each process waits for the
 /// sub-agents it already dispatched to answer for themselves. The deepest one
 /// here cannot write, so nothing above it may declare the turn over — its work
 /// is not in storage yet, and the whole point of announcing last is that what
@@ -382,7 +382,7 @@ async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
     .expect("the root never announced the abort once the write landed");
 
     assert!(
-        storage.checkpoint(&harness.thread_id).await.is_some(),
+        storage.checkpoint(&harness.pid).await.is_some(),
         "the root's own state should be durable too"
     );
     harness.shutdown().await;
@@ -581,7 +581,7 @@ async fn a_settle_wait_leaves_the_stragglers_running() {
     );
     let checkpoint = harness
         .storage
-        .checkpoint(&harness.thread_id)
+        .checkpoint(&harness.pid)
         .await
         .expect("the cancelled generation saved nothing");
     assert!(

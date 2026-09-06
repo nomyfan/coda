@@ -79,7 +79,7 @@ export type TranscriptEntry = {
    * line, not by an id, because `compact` answers without one. */
   pendingCompact?: boolean;
   agentName?: string;
-  threadId?: string;
+  pid?: string;
   title?: string;
   /** Short summary of what a tool acts on (file basename, shell command, …). */
   detail?: string;
@@ -366,18 +366,18 @@ function addStored(list: StoredServer[], url: string): StoredServer[] {
   return list.some((server) => server.url === url) ? list : [...list, { url }];
 }
 
-function liveKey(agentName: string, threadId: string) {
-  return `${agentName}:${threadId}`;
+function liveKey(agentName: string, pid: string) {
+  return `${agentName}:${pid}`;
 }
 
 /** Reasoning streams under its own live key so it never merges with the answer entry. */
-function reasoningLiveKey(agentName: string, threadId: string) {
-  return `reasoning:${liveKey(agentName, threadId)}`;
+function reasoningLiveKey(agentName: string, pid: string) {
+  return `reasoning:${liveKey(agentName, pid)}`;
 }
 
 /** An in-flight auto-compaction, under its own live key for the same reason. */
-function compactionLiveKey(agentName: string, threadId: string) {
-  return `compaction:${liveKey(agentName, threadId)}`;
+function compactionLiveKey(agentName: string, pid: string) {
+  return `compaction:${liveKey(agentName, pid)}`;
 }
 
 function addActivity(session: OpenedSession, entry: Omit<ActivityEntry, "id">): OpenedSession {
@@ -716,7 +716,7 @@ function finishToolEntry(
     ),
     script: entries[index].script,
     agentName: event.agent_name,
-    threadId: event.thread_id,
+    pid: event.pid,
   };
   return {
     ...session,
@@ -729,7 +729,7 @@ function addOrUpdateAssistantChunk(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "llm_chunk" }>,
 ): OpenedSession {
-  const key = liveKey(event.agent_name, event.thread_id);
+  const key = liveKey(event.agent_name, event.pid);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
   if (index >= 0) {
     const entries = [...session.entries];
@@ -752,7 +752,7 @@ function addOrUpdateAssistantChunk(
         id: newId("assistant"),
         kind: "assistant",
         agentName: event.agent_name,
-        threadId: event.thread_id,
+        pid: event.pid,
         content: event.content,
         liveKey: key,
         isFinalResponse: false,
@@ -765,7 +765,7 @@ function addOrUpdateReasoningChunk(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "llm_reasoning_chunk" }>,
 ): OpenedSession {
-  const key = reasoningLiveKey(event.agent_name, event.thread_id);
+  const key = reasoningLiveKey(event.agent_name, event.pid);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
   if (index >= 0) {
     const entries = [...session.entries];
@@ -786,7 +786,7 @@ function addOrUpdateReasoningChunk(
         id: newId("reasoning"),
         kind: "reasoning",
         agentName: event.agent_name,
-        threadId: event.thread_id,
+        pid: event.pid,
         title: "Thinking",
         content: event.content,
         status: "thinking",
@@ -804,10 +804,10 @@ function addOrUpdateReasoningChunk(
 function finishReasoning(
   session: OpenedSession,
   agentName: string,
-  threadId: string,
+  pid: string,
   updates: Partial<TranscriptEntry> = {},
 ): OpenedSession {
-  const key = reasoningLiveKey(agentName, threadId);
+  const key = reasoningLiveKey(agentName, pid);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
   if (index < 0) {
     return session;
@@ -825,10 +825,10 @@ function finishReasoning(
 function finishLiveEntry(
   session: OpenedSession,
   agentName: string,
-  threadId: string,
+  pid: string,
   updates: Partial<TranscriptEntry> = {},
 ): OpenedSession {
-  const key = liveKey(agentName, threadId);
+  const key = liveKey(agentName, pid);
   const index = session.entries.findIndex((entry) => entry.liveKey === key);
   if (index < 0) {
     return session;
@@ -848,9 +848,9 @@ function finishLiveEntry(
 function discardCompactionLiveEntry(
   session: OpenedSession,
   agentName: string,
-  threadId: string,
+  pid: string,
 ): OpenedSession {
-  const key = compactionLiveKey(agentName, threadId);
+  const key = compactionLiveKey(agentName, pid);
   if (!session.entries.some((entry) => entry.liveKey === key)) {
     return session;
   }
@@ -864,10 +864,10 @@ function finishAssistant(
   session: OpenedSession,
   event: Extract<WireEvent, { type: "llm_end" }>,
 ): OpenedSession {
-  const key = liveKey(event.agent_name, event.thread_id);
+  const key = liveKey(event.agent_name, event.pid);
   const isFinalResponse = event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
-    return finishLiveEntry(session, event.agent_name, event.thread_id, {
+    return finishLiveEntry(session, event.agent_name, event.pid, {
       messageId: event.message.message_id,
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
@@ -885,7 +885,7 @@ function finishAssistant(
           kind: "assistant",
           messageId: event.message.message_id,
           agentName: event.agent_name,
-          threadId: event.thread_id,
+          pid: event.pid,
           content: event.message.content,
           status: event.message.aborted ? "aborted" : undefined,
           isFinalResponse,
@@ -938,7 +938,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
     case "llm_chunk":
       // Answer content marks the end of the reasoning phase.
       return addOrUpdateAssistantChunk(
-        finishReasoning(session, event.agent_name, event.thread_id, {
+        finishReasoning(session, event.agent_name, event.pid, {
           endedAt: new Date().toISOString(),
         }),
         event,
@@ -959,7 +959,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
       const finished = {
         ...addActivity(
           finishAssistant(
-            finishReasoning(session, event.agent_name, event.thread_id, {
+            finishReasoning(session, event.agent_name, event.pid, {
               startedAt: event.message.started_at,
               endedAt: event.message.reasoning_ended_at,
             }),
@@ -1009,7 +1009,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
             id: newId("tool-call"),
             kind: "tool_call",
             agentName: event.agent_name,
-            threadId: event.thread_id,
+            pid: event.pid,
             callId: event.call.id,
             title: event.call.name,
             detail: describeTool(event.call.name, event.call.arguments),
@@ -1043,10 +1043,10 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
             id: newId("compaction"),
             kind: "compaction",
             agentName: event.agent_name,
-            threadId: event.thread_id,
+            pid: event.pid,
             content: "",
             status: "compacting",
-            liveKey: compactionLiveKey(event.agent_name, event.thread_id),
+            liveKey: compactionLiveKey(event.agent_name, event.pid),
           },
         ],
       };
@@ -1056,7 +1056,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
       }
       const failed = event.message.outcome.type === "failed";
       const [finished] = historyToEntries({ Compaction: event.message }, {}, {});
-      const key = compactionLiveKey(event.agent_name, event.thread_id);
+      const key = compactionLiveKey(event.agent_name, event.pid);
       const index = session.entries.findIndex((entry) => entry.liveKey === key);
       // Replace the pending shimmer entry in place when its `compaction_start`
       // was seen; otherwise append fresh (e.g. that event was chunk-tier and
@@ -1081,7 +1081,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         detail: `${event.task_id}: ${event.message}`,
       });
     case "approval_removed": {
-      const key = `${event.thread_id}:${event.parent_message_id}`;
+      const key = `${event.pid}:${event.parent_message_id}`;
       const drafts = { ...session.drafts };
       const allowDrafts = { ...session.allowDrafts };
       delete drafts[key];
@@ -1110,12 +1110,12 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
       const updated = addActivity(
         discardCompactionLiveEntry(
           finishLiveEntry(
-            finishReasoning(session, event.agent_name, event.thread_id),
+            finishReasoning(session, event.agent_name, event.pid),
             event.agent_name,
-            event.thread_id,
+            event.pid,
           ),
           event.agent_name,
-          event.thread_id,
+          event.pid,
         ),
         {
           tone: "warning",
@@ -1131,7 +1131,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
             id: newId("aborted"),
             kind: "system",
             agentName: event.agent_name,
-            threadId: event.thread_id,
+            pid: event.pid,
             status: "aborted",
             content:
               event.target.reason === "generation"
@@ -1150,9 +1150,9 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
     case "error": {
       const updated = addActivity(
         finishLiveEntry(
-          finishReasoning(session, event.agent_name, event.thread_id),
+          finishReasoning(session, event.agent_name, event.pid),
           event.agent_name,
-          event.thread_id,
+          event.pid,
         ),
         {
           tone: "danger",
@@ -1168,7 +1168,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
             id: newId("error"),
             kind: "error",
             agentName: event.agent_name,
-            threadId: event.thread_id,
+            pid: event.pid,
             content: event.message,
           },
         ],
@@ -3684,7 +3684,7 @@ export async function submitApprovals() {
         workspace_id: session.workspaceId,
         session_id: session.sessionId,
         agent_name: approval.agent_name,
-        thread_id: approval.thread_id,
+        pid: approval.pid,
         allow_patterns: allowPatterns,
         decision: {
           parent_message_id: approval.parent_message_id,

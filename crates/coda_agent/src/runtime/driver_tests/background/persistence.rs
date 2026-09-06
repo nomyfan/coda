@@ -3,7 +3,7 @@ use super::super::fixtures::{assistant, user_task};
 use super::fixtures::*;
 use crate::runtime::{MemoryStorage, SessionStorage, StoredResumePoint};
 use crate::{AgentSpec, AgentTeam, ModelProfile, RunConfig};
-use coda_process::TaskStatus;
+use coda_execution::TaskStatus;
 use tokio::time::{Duration, timeout};
 #[tokio::test]
 async fn child_checkpoint_failure_finishes_scope_but_quarantines_until_abort_is_durable() {
@@ -13,10 +13,10 @@ async fn child_checkpoint_failure_finishes_scope_but_quarantines_until_abort_is_
         storage.block_cleanup.store(true, std::sync::atomic::Ordering::SeqCst);
         let provider = BackgroundProvider { approval: true, ..Default::default() };
         let (runtime, background, _) = start_storage(provider.clone(), storage.clone()).await;
-        runtime.send_message(user_task(&ThreadId::from("background-session".to_string()), "start")).await.unwrap();
+        runtime.send_message(user_task(&ProcessId::from("background-session".to_string()), "start")).await.unwrap();
         provider.child_started.notified().await;
         let id: coda_core::task::TaskId = background.summaries().borrow()[0].id.parse().unwrap();
-        let independent = background.spawn_with(coda_process::TaskMeta::shell("unrelated".into(), "unrelated".into(), "coda".into()), |ctx| async move { ctx.cancelled().cancelled().await; coda_process::TaskExit::Killed }).await.unwrap();
+        let independent = background.spawn_with(coda_execution::TaskMeta::shell("unrelated".into(), "unrelated".into(), "coda".into()), |ctx| async move { ctx.cancelled().cancelled().await; coda_execution::TaskExit::Killed }).await.unwrap();
         provider.child_release.notify_one();
         background.wait_terminal(&id).await;
         assert!(matches!(background.read(&id).await.unwrap().unwrap().status, TaskStatus::Failed { message, .. } if message.contains("injected child")));
@@ -28,10 +28,10 @@ async fn child_checkpoint_failure_finishes_scope_but_quarantines_until_abort_is_
         storage.block_cleanup.store(false, std::sync::atomic::Ordering::SeqCst);
         while runtime.has_background_work() { tokio::task::yield_now().await; }
         assert!(!background.has_pending_cleanup().await);
-        let checkpoint = storage.load_checkpoint(&old_child.thread_id).await.unwrap().unwrap();
+        let checkpoint = storage.load_checkpoint(&old_child.pid).await.unwrap().unwrap();
         assert!(checkpoint.active_execution.is_none());
         assert!(matches!(checkpoint.resume_point, StoredResumePoint::Generation));
-        assert!(storage.save_execution_checkpoint(crate::execution::ExecutionIdentity { thread_id: old_child.thread_id.clone(), invocation_id: execution.invocation_id }, old_child).await.is_err(), "late writes cannot restore stale tool execution");
+        assert!(storage.save_execution_checkpoint(crate::execution::ExecutionIdentity { pid: old_child.pid.clone(), invocation_id: execution.invocation_id }, old_child).await.is_err(), "late writes cannot restore stale tool execution");
         background.kill(&independent).await.unwrap();
         runtime.request_exit().await;
         runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
@@ -48,7 +48,7 @@ async fn ambiguous_notice_commit_retries_the_same_opening_and_wakes_root_once() 
             start_storage(provider.clone(), storage.clone()).await;
         runtime
             .send_message(user_task(
-                &ThreadId::from("background-session".to_string()),
+                &ProcessId::from("background-session".to_string()),
                 "start",
             ))
             .await
@@ -127,13 +127,13 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .save_checkpoint(
             "child".into(),
             crate::StoredCheckpoint {
-                thread_id: "child".into(),
+                pid: "child".into(),
                 agent_name: "child".into(),
-                parent_thread_id: Some(root.into()),
+                parent_pid: Some(root.into()),
                 derivation_key: Some("child".into()),
                 active_execution: Some(crate::execution::StoredExecution {
                     invocation_id: "old-execution".into(),
-                    scope: crate::execution::ExecutionScope::Background {
+                    scope: crate::execution::ProcessGroupId::Background {
                         task_id: task.clone(),
                     },
                     completion: crate::execution::CompletionTarget::BackgroundTask(task),
@@ -160,7 +160,7 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .save_session_snapshot(
             root.into(),
             crate::StoredRuntimeSnapshot {
-                active_threads: [("child".into(), "child".into())].into(),
+                active_processes: [("child".into(), "child".into())].into(),
                 drained_envelopes: Default::default(),
                 agent_drained_envelopes: Default::default(),
             },

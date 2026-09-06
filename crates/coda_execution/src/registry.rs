@@ -1082,6 +1082,16 @@ impl BackgroundTasks {
         Ok(self.backend.archive.open(id).await?.is_some())
     }
 
+    /// Whether this process started the shell task whose result it read.
+    pub async fn owns_shell(&self, id: &TaskId, pid: &str) -> Result<bool, TaskAccessError> {
+        Ok(self
+            .backend
+            .archive
+            .open(id)
+            .await?
+            .is_some_and(|record| !record.meta().is_subagent() && record.meta().origin.pid == pid))
+    }
+
     pub async fn kill_children(&self, id: &TaskId) {
         let children: Vec<_> = self
             .inner

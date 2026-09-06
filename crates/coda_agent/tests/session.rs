@@ -21,6 +21,9 @@ use futures::{Stream, stream};
 use serde_json::json;
 use tokio::time::timeout;
 
+#[path = "session/backpressure.rs"]
+mod backpressure;
+
 // ---------------------------------------------------------------------------
 // FakeProvider — a mock LLMProvider that routes based on message content
 // ---------------------------------------------------------------------------
@@ -37,8 +40,8 @@ fn last_user_text(messages: &[RequestMessage]) -> &str {
         .unwrap_or("")
 }
 
-/// The most recent result of one named tool, if the thread holds one. Distinct
-/// from [`has_tool_results`]: a thread several turns in always holds *some* tool
+/// The most recent result of one named tool, if the process holds one. Distinct
+/// from [`has_tool_results`]: a process several turns in always holds *some* tool
 /// message, so a branch that must fire once per turn has to name its own.
 fn tool_result(messages: &[RequestMessage], name: &str) -> Option<String> {
     messages.iter().rev().find_map(|message| match message {
@@ -130,7 +133,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
         //     turn, so a test can watch state travel through the runtime.
         if user_text.contains("plan the work") {
             // Keyed on *this* tool's result, not on any tool result: by the
-            // second turn the thread already holds tool messages from the first.
+            // second turn the process already holds tool messages from the first.
             if tool_result(&request.messages, "write_todos").is_some() {
                 return completed(AssistantMessage {
                     content: "planned".into(),
@@ -835,7 +838,7 @@ async fn should_execute_tool_after_approval_resume() {
     session
         .resume(
             &pending.agent_name,
-            &pending.thread_id,
+            &pending.pid,
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
@@ -963,7 +966,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
     // A process killed before its first snapshot leaves this durable shape; so
     // does a fresh fork after it starts work and reaches this suspension.
     for checkpoint in source.all_checkpoints().await {
-        cold.save_checkpoint(checkpoint.thread_id.clone(), checkpoint)
+        cold.save_checkpoint(checkpoint.pid.clone(), checkpoint)
             .await
             .expect("copy checkpoint");
     }
@@ -992,7 +995,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
         }
     };
     assert_eq!(discovered.len(), 1);
-    assert_eq!(discovered[0].thread_id, pending.thread_id);
+    assert_eq!(discovered[0].pid, pending.pid);
 
     let resumed = Session::builder()
         .storage(cold)
@@ -1000,7 +1003,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
         .run_config(run_config(approval))
         .session_id(session_id)
         .resume_decisions(HashMap::from([(
-            pending.thread_id.clone(),
+            pending.pid.clone(),
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
@@ -1189,7 +1192,7 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
         .expect("a self-built session has a registry")
         .spawn(
             cmd,
-            coda_process::TaskMeta::shell("sleep".into(), "owned task".into(), "coda".into()),
+            coda_execution::TaskMeta::shell("sleep".into(), "owned task".into(), "coda".into()),
         )
         .await
         .expect("spawn background task");

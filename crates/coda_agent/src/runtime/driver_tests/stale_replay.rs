@@ -8,7 +8,7 @@ use crate::{
     AgentEvent, AgentSpec, AgentTeam, ResumeDecision, SubAgentMode, ToolApprovalMode,
     agent::HistoryEntry,
     persist::{StoredResumePoint, StoredToolExecutionState},
-    runtime::{AgentRuntimeSnapshot, MemoryStorage, SendCommandError, SessionStorage},
+    runtime::{MemoryStorage, ProcessRuntimeSnapshot, SendCommandError, SessionStorage},
 };
 use coda_core::llm::{Message, MessageId, ToolCall, ToolCallOutcome, ToolOutput, UserMessage};
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ const EXPLORE_THREAD: &str = "explore-thread";
 /// Stands in for the id of the envelope that carried a sub-agent call out.
 const DISPATCH: &str = "dispatch-envelope";
 
-type Events = broadcast::Receiver<(String, ThreadId, TurnId, AgentEvent)>;
+type Events = broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>;
 
 fn team() -> AgentTeam {
     AgentTeam::new(
@@ -76,9 +76,9 @@ async fn store_root(
         .save_checkpoint(
             SESSION.to_string(),
             StoredCheckpoint {
-                thread_id: SESSION.to_string(),
+                pid: SESSION.to_string(),
                 agent_name: "coda".into(),
-                parent_thread_id: None,
+                parent_pid: None,
                 derivation_key: None,
                 active_execution: None,
                 messages,
@@ -96,11 +96,11 @@ fn explore_reply(dispatched_by: &str) -> Envelope {
         id,
         from: Sender::Agent {
             name: "explore".into(),
-            thread_id: ThreadId::from(EXPLORE_THREAD.to_string()),
+            pid: ProcessId::from(EXPLORE_THREAD.to_string()),
         },
         to: Receiver {
             name: "coda".into(),
-            thread_id: ThreadId::from(SESSION.to_string()),
+            pid: ProcessId::from(SESSION.to_string()),
         },
         reply_to: Some(dispatched_by.to_string()),
         body: EnvelopeBody::Reply {
@@ -126,8 +126,8 @@ fn awaiting(parent_message_id: MessageId, dispatched_by: &str) -> StoredResumePo
     })
 }
 
-fn snapshot_holding(envelope: Envelope) -> AgentRuntimeSnapshot {
-    AgentRuntimeSnapshot {
+fn snapshot_holding(envelope: Envelope) -> ProcessRuntimeSnapshot {
+    ProcessRuntimeSnapshot {
         agent_drained_envelopes: HashMap::from([("coda".to_string(), vec![envelope])]),
         ..Default::default()
     }
@@ -137,9 +137,9 @@ fn snapshot_holding(envelope: Envelope) -> AgentRuntimeSnapshot {
 /// missed.
 async fn bootstrapped(
     storage: impl SessionStorage + Clone + 'static,
-    snapshot: AgentRuntimeSnapshot,
-) -> (AgentRuntime, Events) {
-    let mut runtime = AgentRuntime::new(storage, SESSION.to_string());
+    snapshot: ProcessRuntimeSnapshot,
+) -> (ProcessRuntime, Events) {
+    let mut runtime = ProcessRuntime::new(storage, SESSION.to_string());
     let events = runtime.subscribe();
     runtime
         .bootstrap(
@@ -169,7 +169,7 @@ async fn root_answers(events: &mut Events) {
 }
 
 fn root_task() -> Envelope {
-    user_task(&ThreadId::from(SESSION.to_string()), "carry on")
+    user_task(&ProcessId::from(SESSION.to_string()), "carry on")
 }
 
 /// The turn this reply belonged to is over: the root took the answer and
@@ -188,7 +188,7 @@ async fn a_reply_the_root_already_took_opens_no_turn() {
     assert!(
         !runtime
             .calls
-            .is_answering(&ThreadId::from(EXPLORE_THREAD.to_string())),
+            .is_answering(&ProcessId::from(EXPLORE_THREAD.to_string())),
         "the answer was already taken, so nothing is owed for it"
     );
     assert!(
@@ -239,7 +239,7 @@ async fn a_reply_to_an_earlier_call_that_reused_the_id_is_not_its_answer() {
     assert!(
         !runtime
             .calls
-            .is_answering(&ThreadId::from(EXPLORE_THREAD.to_string())),
+            .is_answering(&ProcessId::from(EXPLORE_THREAD.to_string())),
         "an answer from a previous invocation was taken for the current one"
     );
 }
@@ -286,7 +286,7 @@ async fn a_checkpoint_that_cannot_be_read_refuses_the_recovery() {
     store_root(&storage, messages, StoredResumePoint::Generation).await;
     storage.fail_checkpoint_loads().await;
 
-    let mut runtime = AgentRuntime::new(storage, SESSION.to_string());
+    let mut runtime = ProcessRuntime::new(storage, SESSION.to_string());
     let error = runtime
         .bootstrap(
             team().build(".", coda_tools::shared_file_locks(), test_registry()),
@@ -301,7 +301,7 @@ async fn a_checkpoint_that_cannot_be_read_refuses_the_recovery() {
 }
 
 /// Same rule for the other envelope that re-opens no work of its own: a
-/// decision the thread it was meant for has already acted on.
+/// decision the process it was meant for has already acted on.
 #[tokio::test]
 async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
     let storage = MemoryStorage::default();
@@ -312,11 +312,11 @@ async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
         from: Sender::User,
         to: Receiver {
             name: "coda".into(),
-            thread_id: ThreadId::from(SESSION.to_string()),
+            pid: ProcessId::from(SESSION.to_string()),
         },
         reply_to: None,
         body: EnvelopeBody::Resume(ResumeDecision {
-            // Irrelevant here: the thread is parked on `Generation`, so the
+            // Irrelevant here: the process is parked on `Generation`, so the
             // envelope is dropped before any batch is compared.
             parent_message_id: MessageId::new(),
             resolutions: vec![],
@@ -333,4 +333,57 @@ async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
         ),
         "the session refused a new task"
     );
+}
+
+#[tokio::test]
+async fn replayed_resumes_must_match_the_current_approval_batch() {
+    for matches_current_batch in [false, true] {
+        let storage = TestStorage::default();
+        let parent_message_id = MessageId::new();
+        let (turn, messages) = dispatched(parent_message_id);
+        store_root(
+            &storage,
+            messages,
+            StoredResumePoint::PendingApproval {
+                parent_message_id,
+                pending_approval_calls: vec![crate::persist::StoredPreparedToolCall {
+                    tool_call: ToolCall {
+                        id: "call_explore".into(),
+                        name: "agent__explore".into(),
+                        arguments: Some(r#"{"task":"inspect"}"#.into()),
+                    },
+                    metadata: None,
+                }],
+                pending_calls: vec![],
+            },
+        )
+        .await;
+        let held = storage.hold_checkpoints_of("coda").await;
+        let mut resume = root_task();
+        resume.body = EnvelopeBody::Resume(ResumeDecision {
+            parent_message_id: if matches_current_batch {
+                parent_message_id
+            } else {
+                MessageId::new()
+            },
+            resolutions: vec![],
+        });
+        let snapshot = ProcessRuntimeSnapshot {
+            drained_envelopes: [(SESSION.into(), vec![resume.clone()])].into(),
+            agent_drained_envelopes: [(SESSION.into(), vec![resume])].into(),
+            ..Default::default()
+        };
+        let (runtime, _events) = bootstrapped(storage, snapshot).await;
+        assert_eq!(
+            runtime.turn_gate.active_id(),
+            matches_current_batch.then_some(turn)
+        );
+        assert_eq!(
+            runtime.processes.lock().await.is_empty(),
+            !matches_current_batch
+        );
+        held.release().await;
+        runtime.request_exit().await;
+        runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
+    }
 }

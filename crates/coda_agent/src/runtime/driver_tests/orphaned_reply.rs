@@ -53,7 +53,7 @@ async fn a_new_task_does_not_wait_for_a_sub_agent_that_no_longer_exists() {
     timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = storage
-                .load_checkpoint(harness.thread_id.as_ref())
+                .load_checkpoint(harness.pid.as_ref())
                 .await
                 .expect("load checkpoint")
                 && matches!(checkpoint.resume_point, StoredResumePoint::ToolExecution(ref state) if !state.pending_replies.is_empty())
