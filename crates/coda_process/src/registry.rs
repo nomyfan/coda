@@ -23,7 +23,7 @@ use coda_core::task::TaskId;
 
 /// Concurrent `Running` tasks per session.
 const MAX_RUNNING: usize = 16;
-/// Terminal tasks retained for reads; beyond this the oldest is reclaimed.
+/// Terminal summaries in the live overview; older tasks remain in the archive.
 const MAX_TERMINAL: usize = 32;
 /// Full notices (with output tail) buffered; older ones degrade into the
 /// overflow aggregate.
@@ -1002,8 +1002,6 @@ impl BackgroundTasks {
                 _ => "output fully consumed; nothing more to read".to_owned(),
             };
             return Ok(Some(TaskRead {
-                // Output may have been drained while Running and reclaimed
-                // at exit, before root could read the terminal status.
                 complete: matches!(state.disposition, OutputDisposition::Consumed { .. })
                     && !state.output_lost,
                 status,
@@ -1054,11 +1052,6 @@ impl BackgroundTasks {
             .await
             .map_err(TaskAccessError::from)?;
         drop(guard);
-
-        // If this read drained a terminal task, reclaim its output.
-        if terminal && !out.has_more && !err.has_more {
-            let _ = backend.quota.finalize_consumed(&record).await;
-        }
 
         Ok(Some(TaskRead {
             complete,
@@ -1587,8 +1580,8 @@ struct TerminalOutcome {
 
 /// Awaits the task's work and commits the terminal state — the single writer of
 /// that transition. Order (load-bearing): terminal manifest commit first, then
-/// quota finalize (Consumed cleanup or victim registration), then (under the
-/// registry lock) notice enqueue, bookkeeping, and the summaries publish *last*
+/// quota eviction registration, then (under the registry lock) notice enqueue,
+/// bookkeeping, and the summaries publish *last*
 /// so a watcher seeing zero running already has the notice drainable.
 async fn monitor_task(
     inner: Arc<Mutex<RegistryState>>,
@@ -1604,8 +1597,7 @@ async fn monitor_task(
         backend.quota.block_spawns();
     }
 
-    // Reclaim (Consumed) or register as an eviction victim. Cleanup failure is
-    // only logged: the completion notice and summary must still publish.
+    // Register for quota eviction before publishing completion.
     if let Err(e) = backend.quota.finalize_terminal(record).await {
         tracing::warn!(task = record.id().as_str(), error = %e, "task output finalize failed");
     }

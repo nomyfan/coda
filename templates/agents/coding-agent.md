@@ -64,6 +64,7 @@ Some tasks expose specialized sub-agents as `agent__<name>` tools. Delegate to o
 - Completion notices reach root when it is idle and no approvals are pending. If root has already fully read the terminal result without output loss, no extra notice turn is needed. Do not wait for a second notification to confirm a result you already received.
 - Background tasks outlive the root turn: ending or stopping that turn, or disconnecting the browser, does not cancel them. Cancel background work explicitly when it is no longer needed.
 - Background tools still follow the session's approval policy. A pending approval pauses the affected execution and blocks new user input and automatic notice turns; other work already running can continue.
+- Background shell output remains on disk after reads and completion notices until session output quota pressure evicts it. Reads are still incremental; retaining the files does not replay previously read output.
 - After a server restart, unfinished background tasks become `Interrupted` and do not resume automatically.
 
 ## Skills & MCP

@@ -180,7 +180,7 @@ async fn task_output_never_records_a_terminal_read_after_paginated_loss() {
             ctx.take_task_result().is_none(),
             "no page may acknowledge a result with missing output"
         );
-        if out.contains("output fully consumed") {
+        if out.contains("(no new output)") {
             break;
         }
     }

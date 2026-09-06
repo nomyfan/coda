@@ -105,7 +105,7 @@ impl StreamManifest {
 pub enum OutputDisposition {
     /// Rings still present and readable.
     Retained,
-    /// Fully read by the model, then rings deleted.
+    /// Evicted to reclaim quota after being fully read; rings deleted.
     Consumed { at: jiff::Timestamp },
     /// Evicted to reclaim quota before being fully read; rings deleted.
     Expired {

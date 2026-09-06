@@ -401,7 +401,61 @@ async fn create_failure_does_not_lose_prior_expiration_fact() {
 }
 
 #[tokio::test]
-async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
+async fn shell_output_survives_reads_and_completion_notices() {
+    for read_while_running in [true, false] {
+        let reg = BackgroundTasks::temporary().unwrap();
+        let ready = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let task_finish = finish.clone();
+        let id = reg
+            .spawn_with(meta("retained output"), move |ctx| async move {
+                ctx.append_stdout(b"hello").await.unwrap();
+                ctx.append_stderr(b"warning").await.unwrap();
+                task_ready.notify_one();
+                task_finish.notified().await;
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .unwrap();
+        ready.notified().await;
+        if read_while_running {
+            let read = reg.read(&id).await.unwrap().unwrap();
+            assert_eq!(read.stdout, "hello");
+            assert_eq!(read.stderr, "warning");
+            assert!(!read.complete);
+        }
+        finish.notify_one();
+        reg.wait_terminal(&id).await;
+        let notices = reg.take_notices().await;
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            TaskNotice::Task { id: notice_id, output_tail, .. }
+                if notice_id == &id && output_tail == "hello"
+        )));
+        let read = reg.read(&id).await.unwrap().unwrap();
+        assert!(read.complete);
+        assert_eq!(read.stdout, if read_while_running { "" } else { "hello" });
+        assert_eq!(read.stderr, if read_while_running { "" } else { "warning" });
+        let again = reg.read(&id).await.unwrap().unwrap();
+        assert!(again.complete);
+        assert!(again.stdout.is_empty() && again.stderr.is_empty());
+
+        let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
+        assert_eq!(
+            record.lock_commit().await.current().disposition,
+            OutputDisposition::Retained
+        );
+        assert_eq!(record.files().stdout.tail(10).await.unwrap(), b"hello");
+        assert_eq!(record.files().stderr.tail(10).await.unwrap(), b"warning");
+        assert!(reg.backend.quota.retained_contains(&id));
+        assert_eq!(reg.backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
+        reg.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_read_flushes_incomplete_utf8_and_retains_output() {
     let reg = BackgroundTasks::temporary().unwrap();
     let ready = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
@@ -430,7 +484,12 @@ async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
     assert_eq!(terminal.stdout, "\u{FFFD}");
     assert!(terminal.note.is_none());
     let consumed = reg.read(&id).await.unwrap().unwrap();
-    assert!(consumed.note.as_deref().unwrap().contains("fully consumed"));
+    assert!(consumed.stdout.is_empty());
+    assert!(consumed.complete);
+    assert!(consumed.note.is_none());
+    let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
+    assert_eq!(record.files().stdout.tail(10).await.unwrap(), [0xE2]);
+    assert!(reg.backend.quota.retained_contains(&id));
 }
 
 #[tokio::test]

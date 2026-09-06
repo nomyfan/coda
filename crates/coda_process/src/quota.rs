@@ -734,87 +734,33 @@ impl SessionQuota {
         }
     }
 
-    /// After a task's terminal manifest is committed (commit lock released),
-    /// recheck: fully consumed → Consumed cleanup + release; otherwise register
-    /// it as an evictable victim (its reservation stays until evicted/consumed).
+    /// Register a terminal task for eviction when a new task needs quota.
+    /// Reading output does not release its reservation or delete its rings.
     pub async fn finalize_terminal(&self, record: &Arc<TaskRecord>) -> Result<(), ArchiveError> {
-        self.finalize_owned(record.clone(), false).await
-    }
-
-    /// After a cursor commit, release a terminal task that just became fully
-    /// consumed. A no-op while Running or not yet fully read.
-    pub async fn finalize_consumed(&self, record: &Arc<TaskRecord>) -> Result<(), ArchiveError> {
-        self.finalize_owned(record.clone(), true).await
-    }
-
-    async fn finalize_owned(
-        &self,
-        record: Arc<TaskRecord>,
-        consumed_only: bool,
-    ) -> Result<(), ArchiveError> {
+        let record = record.clone();
         let quota = self.clone();
         let activity = self.begin_activity();
         tokio::spawn(async move {
             let _activity = activity;
             let _transaction = quota.transaction.lock().await;
-            quota.finalize(&record, consumed_only).await
+            let guard = record.lock_commit().await;
+            let current = guard.current();
+            if current.status.is_running()
+                || current.disposition != OutputDisposition::Retained
+                || current.notice == Some(super::manifest::NoticeDelivery::Pending)
+                || current.cleanup_pending
+            {
+                return;
+            }
+            quota.register_retained(
+                record.id(),
+                record.capacities(),
+                current.result_bytes,
+                current.status.terminal_at().unwrap_or(record.started_at()),
+            );
         })
         .await
-        .map_err(|error| ArchiveError::corrupt(format!("quota finalize stopped: {error}")))?
-    }
-
-    async fn finalize(
-        &self,
-        record: &Arc<TaskRecord>,
-        consumed_only: bool,
-    ) -> Result<(), ArchiveError> {
-        let mut guard = record.lock_commit().await;
-        let current = guard.current().clone();
-        if current.status.is_running()
-            || current.disposition != OutputDisposition::Retained
-            || current.notice == Some(super::manifest::NoticeDelivery::Pending)
-            || current.cleanup_pending
-        {
-            return Ok(());
-        }
-        let stdout_total = record.files().stdout.logical_range().await.1;
-        let stderr_total = record.files().stderr.logical_range().await.1;
-        let fully_consumed = !record.meta().is_subagent()
-            && current.stdout_cursor == stdout_total
-            && current.stderr_cursor == stderr_total
-            && current.stdout_carry.is_empty()
-            && current.stderr_carry.is_empty();
-
-        if fully_consumed {
-            let caps = record.capacities();
-            let mut candidate = current.clone();
-            candidate.disposition = OutputDisposition::Consumed {
-                at: jiff::Timestamp::now(),
-            };
-            if let Err(error) = guard.commit(candidate).await {
-                if !consumed_only {
-                    let caps = record.capacities();
-                    let terminal_at = current.status.terminal_at().unwrap_or(record.started_at());
-                    drop(guard);
-                    self.register_retained(record.id(), caps, current.result_bytes, terminal_at);
-                }
-                return Err(error);
-            }
-            if let Err(error) = self.delete_rings(&guard).await {
-                drop(guard);
-                self.register_residual(record.id(), caps.0 + caps.1);
-                return Err(error);
-            }
-            drop(guard);
-            self.release(record.id(), caps);
-        } else if !consumed_only {
-            // Not fully read: keep it as an eviction victim.
-            let caps = record.capacities();
-            let terminal_at = current.status.terminal_at().unwrap_or(record.started_at());
-            drop(guard);
-            self.register_retained(record.id(), caps, current.result_bytes, terminal_at);
-        }
-        Ok(())
+        .map_err(|error| ArchiveError::corrupt(format!("quota finalize stopped: {error}")))
     }
 
     fn register_retained(
@@ -832,17 +778,6 @@ impl SessionQuota {
                 stdout_capacity: caps.0,
                 stderr_capacity: caps.1,
                 result_bytes,
-            });
-        }
-    }
-
-    fn register_residual(&self, id: &TaskId, reserved_bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.retained.retain(|entry| entry.id != *id);
-        if !inner.residual_deletes.iter().any(|entry| entry.id == *id) {
-            inner.residual_deletes.push(ResidualIndexEntry {
-                id: id.clone(),
-                reserved_bytes,
             });
         }
     }
@@ -902,13 +837,6 @@ impl SessionQuota {
             pause.release.notified().await;
         }
         guard.delete_rings().await
-    }
-
-    /// Release a task's reservation and drop it from the victim index.
-    fn release(&self, id: &TaskId, caps: (u64, u64)) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.reserved = inner.reserved.saturating_sub(caps.0 + caps.1);
-        inner.retained.retain(|r| r.id != *id);
     }
 }
 
