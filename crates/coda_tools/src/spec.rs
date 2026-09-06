@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
 
-use coda_process::BackgroundProcesses;
+use coda_process::BackgroundTasks;
 
 use crate::locks::KeyedLock;
 use crate::{
@@ -28,7 +28,7 @@ pub struct BuildContext {
     /// [`background_specs`] and `shell`'s `run_in_background` with it. That is
     /// a capability, not a permission — backgrounding changes how long a
     /// command may run, so the call still faces the usual approval policy.
-    pub background: Option<Arc<BackgroundProcesses>>,
+    pub background: Option<Arc<BackgroundTasks>>,
 }
 
 impl BuildContext {
@@ -79,7 +79,7 @@ impl ToolSpec for ShellToolSpec {
 /// Both specs carry the registry instead of reading it off the context:
 /// [`background_specs`] is their only constructor and only runs when there is
 /// one, so neither can exist without a registry.
-pub(crate) struct TaskOutputToolSpec(Arc<BackgroundProcesses>);
+pub(crate) struct TaskOutputToolSpec(Arc<BackgroundTasks>);
 
 impl ToolSpec for TaskOutputToolSpec {
     fn name(&self) -> &str {
@@ -90,7 +90,7 @@ impl ToolSpec for TaskOutputToolSpec {
     }
 }
 
-pub(crate) struct TaskKillToolSpec(Arc<BackgroundProcesses>);
+pub(crate) struct TaskKillToolSpec(Arc<BackgroundTasks>);
 
 impl ToolSpec for TaskKillToolSpec {
     fn name(&self) -> &str {
@@ -264,7 +264,7 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
 /// anything to follow up on is the only question, and `shell`'s
 /// `run_in_background` answers it the same way, so the three appear and
 /// disappear together.
-pub fn background_specs(background: Option<&Arc<BackgroundProcesses>>) -> Vec<Box<dyn ToolSpec>> {
+pub fn background_specs(background: Option<&Arc<BackgroundTasks>>) -> Vec<Box<dyn ToolSpec>> {
     match background {
         Some(registry) => vec![
             Box::new(TaskOutputToolSpec(registry.clone())),

@@ -1,6 +1,15 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    aborted_executions (workspace_id, session_id, thread_id, invocation_id) {
+        workspace_id -> Text,
+        session_id -> Text,
+        thread_id -> Text,
+        invocation_id -> Text,
+    }
+}
+
+diesel::table! {
     messages (workspace_id, session_id, thread_id, seq) {
         workspace_id -> Text,
         session_id -> Text,
@@ -38,6 +47,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    task_notice_receipts (workspace_id, session_id, task_id) {
+        workspace_id -> Text,
+        session_id -> Text,
+        task_id -> Text,
+        message_id -> Uuid,
+    }
+}
+
+diesel::table! {
     thread_checkpoints (workspace_id, session_id, thread_id) {
         workspace_id -> Text,
         session_id -> Text,
@@ -45,7 +63,7 @@ diesel::table! {
         agent_name -> Text,
         parent_thread_id -> Nullable<Text>,
         derivation_key -> Nullable<Text>,
-        reply_target -> Nullable<Jsonb>,
+        active_execution -> Nullable<Jsonb>,
         resume_point -> Jsonb,
         suspended_at -> Timestamptz,
         message_count -> Int4,
@@ -54,8 +72,10 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
+    aborted_executions,
     messages,
     runtime_snapshots,
     sessions,
+    task_notice_receipts,
     thread_checkpoints,
 );

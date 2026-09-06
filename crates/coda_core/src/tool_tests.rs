@@ -31,6 +31,19 @@ fn limits() -> HostEffectLimits {
 }
 
 #[test]
+fn host_calls_inherit_the_background_owner() {
+    let task = crate::task::TaskId::new();
+    let outer = ToolCallContext {
+        background_task: Some(task.clone()),
+        ..ToolCallContext::default()
+    };
+    let scope = HostCallScope::new(outer, limits());
+    let call = scope.begin_tool_call(CancellationToken::new());
+    assert_eq!(call.context().background_task, Some(task));
+    assert!(call.context().invoker().is_none());
+}
+
+#[test]
 fn staged_state_is_last_write_wins_and_commits_outer_once() {
     let state = Arc::new(RecordingState::default());
     let outer = ToolCallContext::new(CancellationToken::new(), state.clone());

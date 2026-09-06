@@ -7,8 +7,8 @@ fn tool() -> ShellTool {
 
 /// A shell tool plus the registry it was built against, so background tests
 /// can observe and tear down what they start.
-fn tool_with_background(allow_background: bool) -> (ShellTool, Arc<BackgroundProcesses>) {
-    let background = Arc::new(BackgroundProcesses::temporary().unwrap());
+fn tool_with_background(allow_background: bool) -> (ShellTool, Arc<BackgroundTasks>) {
+    let background = Arc::new(BackgroundTasks::temporary().unwrap());
     let tool = ShellTool::new(
         std::env::temp_dir().to_string_lossy().into_owned(),
         "coda".to_string(),

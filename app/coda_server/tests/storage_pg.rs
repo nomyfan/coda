@@ -140,7 +140,7 @@ fn checkpoint(thread_id: &str, messages: Vec<HistoryEntry>) -> StoredCheckpoint 
         agent_name: "coda".to_string(),
         parent_thread_id: None,
         derivation_key: None,
-        reply_target: None,
+        active_execution: None,
         messages,
         resume_point: StoredResumePoint::Generation,
         suspended_at: jiff::Timestamp::default(),
@@ -311,11 +311,16 @@ async fn a_saved_thread_comes_back_whole() {
         agent_name: "explore".to_string(),
         parent_thread_id: Some("chat".to_string()),
         derivation_key: Some(opening_call.derivation_key()),
-        reply_target: Some(ReplyTarget {
-            envelope_id: "env-1".to_string(),
-            sender_name: "coda".to_string(),
-            sender_thread_id: "chat".to_string(),
-            call_id: "call_explore".to_string(),
+        active_execution: Some(coda_agent::execution::StoredExecution {
+            invocation_id: "env-1".into(),
+            scope: coda_agent::execution::ExecutionScope::Foreground { turn_id: turn },
+            agent_path: vec!["coda".into(), "explore".into()],
+            completion: coda_agent::execution::CompletionTarget::Caller(ReplyTarget {
+                envelope_id: "env-1".to_string(),
+                sender_name: "coda".to_string(),
+                sender_thread_id: "chat".to_string(),
+                call_id: "call_explore".to_string(),
+            }),
         }),
         resume_point: StoredResumePoint::PendingApproval {
             parent_message_id: MessageId::new(),
@@ -375,7 +380,9 @@ async fn a_saved_thread_comes_back_whole() {
         "the derivation key is what lets a fork rebuild this thread's id"
     );
     assert_eq!(
-        loaded.reply_target.map(|target| target.envelope_id),
+        loaded.active_execution.and_then(|execution| execution
+            .reply_target()
+            .map(|target| target.envelope_id.clone())),
         Some("env-1".to_string())
     );
     assert!(matches!(
@@ -1008,7 +1015,7 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
                 StoredRuntimeSnapshot {
                     drained_envelopes: Default::default(),
                     agent_drained_envelopes: Default::default(),
-                    active_threads: [("explore".to_string(), thread.to_string())].into(),
+                    active_threads: [(thread.to_string(), "explore".to_string())].into(),
                 },
             )
             .await
@@ -1021,8 +1028,11 @@ async fn the_runtime_snapshot_is_replaced_not_accumulated() {
         .unwrap()
         .expect("a snapshot was saved");
     assert_eq!(
-        loaded.active_threads.get("explore").map(String::as_str),
-        Some("second-thread"),
+        loaded
+            .active_threads
+            .get("second-thread")
+            .map(String::as_str),
+        Some("explore"),
         "the latest snapshot must win"
     );
     let rows = diesel::sql_query("select count(*) from runtime_snapshots where workspace_id = $1")
@@ -2016,7 +2026,7 @@ async fn a_fork_rebuilds_thread_ids_and_keeps_each_thread_a_prefix() {
                 agent_name: "explore".to_string(),
                 parent_thread_id: Some("source-session".to_string()),
                 derivation_key: Some("explore".to_string()),
-                reply_target: None,
+                active_execution: None,
                 messages: vec![
                     entry(
                         second,
@@ -2637,3 +2647,6 @@ async fn a_fork_inherits_the_state_its_kept_turns_recorded() {
         "and the source keeps its own"
     );
 }
+
+#[path = "storage_pg/background.rs"]
+mod background;

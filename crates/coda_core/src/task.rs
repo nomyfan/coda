@@ -30,9 +30,28 @@ impl fmt::Display for InvalidTaskId {
 impl std::error::Error for InvalidTaskId {}
 
 impl TaskId {
+    /// A delegation replay uses the same id in its session and calling thread.
+    pub fn for_call(session_id: &str, thread_id: &str, origin: &crate::llm::MessageOrigin) -> Self {
+        let identity = serde_json::to_vec(&(session_id, thread_id, origin))
+            .expect("call identity contains only strings and message ids");
+        let namespace = uuid::Uuid::from_u128(0xb385bbce_ac91_471e_b039_556afcbf8701);
+        TaskId(format!(
+            "bg_{}",
+            uuid::Uuid::new_v5(&namespace, &identity).simple()
+        ))
+    }
+
     /// Mint a fresh id from a UUID v4, encoded canonically.
     pub fn new() -> Self {
         TaskId(format!("bg_{}", uuid::Uuid::new_v4().simple()))
+    }
+
+    pub fn notice_message_id(&self) -> crate::llm::MessageId {
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::from_u128(0x605b8944_882a_489f_9abe_7601767537aa),
+            self.as_str().as_bytes(),
+        )
+        .into()
     }
 
     pub fn as_str(&self) -> &str {
@@ -81,9 +100,57 @@ impl<'de> Deserialize<'de> for TaskId {
     }
 }
 
+/// A thread invocation that must be cleaned before the thread can be reused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeMember {
+    pub thread_id: String,
+    pub invocation_id: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TaskOrigin {
+    pub thread_id: String,
+    pub message_origin: Option<crate::llm::MessageOrigin>,
+    pub agent_path: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_identity_is_stable_and_includes_session_thread_and_message() {
+        let origin = crate::llm::MessageOrigin {
+            message_id: crate::llm::MessageId::new(),
+            call_id: "call_1".into(),
+        };
+        let id = TaskId::for_call("session", "parent", &origin);
+        assert_eq!(id, TaskId::for_call("session", "parent", &origin));
+        assert_ne!(id, TaskId::for_call("other", "parent", &origin));
+        assert_ne!(id, TaskId::for_call("session", "other", &origin));
+        assert_ne!(
+            id,
+            TaskId::for_call(
+                "session",
+                "parent",
+                &crate::llm::MessageOrigin {
+                    message_id: crate::llm::MessageId::new(),
+                    call_id: origin.call_id.clone(),
+                }
+            )
+        );
+        assert_ne!(
+            id,
+            TaskId::for_call(
+                "session",
+                "parent",
+                &crate::llm::MessageOrigin {
+                    message_id: origin.message_id,
+                    call_id: "call_2".into(),
+                }
+            )
+        );
+    }
 
     #[test]
     fn new_is_canonical() {

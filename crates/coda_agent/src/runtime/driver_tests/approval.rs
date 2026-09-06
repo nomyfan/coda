@@ -812,12 +812,32 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
 
     // The duplicate submit: the same approval answered a second time, landing
     // on the batch the thread moved on to.
-    harness.send_resume(&first, first_decision).await;
-
-    // It must be ignored, and the second batch re-announced unchanged.
-    let reannounced = timeout(Duration::from_secs(2), next_suspension(&mut harness))
-        .await
-        .expect("the stale resume was applied instead of ignored");
+    let stale = harness
+        .runtime
+        .send_message(Envelope::with_id(|id| Envelope {
+            id,
+            from: Sender::User,
+            to: Receiver {
+                name: first.agent_name.clone(),
+                thread_id: ThreadId::from(first.thread_id.clone()),
+            },
+            reply_to: None,
+            body: EnvelopeBody::Resume(crate::ResumeDecision {
+                parent_message_id: first.parent_message_id,
+                resolutions: first_decision,
+            }),
+        }))
+        .await;
+    assert!(matches!(
+        stale,
+        Err(crate::runtime::SendCommandError::StaleApproval)
+    ));
+    let reannounced = harness
+        .runtime
+        .pending_approvals()
+        .into_iter()
+        .find(|a| a.thread_id == second.thread_id)
+        .unwrap();
     assert_eq!(reannounced.parent_message_id, second.parent_message_id);
 
     // Answering the batch that is actually parked still works.

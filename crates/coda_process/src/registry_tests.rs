@@ -8,11 +8,7 @@ use tokio::sync::Notify;
 const TAIL_BUF_CAP: usize = DEFAULT_STREAM_CAPACITY as usize;
 
 fn meta(command: &str) -> TaskMeta {
-    TaskMeta {
-        command: command.into(),
-        description: "test task".into(),
-        agent_name: "coda".into(),
-    }
+    TaskMeta::shell(command.into(), "test task".into(), "coda".into())
 }
 
 fn running_count(rx: &watch::Receiver<Arc<[TaskSummary]>>) -> usize {
@@ -22,7 +18,7 @@ fn running_count(rx: &watch::Receiver<Arc<[TaskSummary]>>) -> usize {
 /// spawn publishes the running task before returning the id.
 #[tokio::test]
 async fn spawn_publishes_keepalive_before_returning() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let rx = reg.summaries();
     assert_eq!(running_count(&rx), 0);
     let gate = Arc::new(Notify::new());
@@ -45,17 +41,19 @@ async fn spawn_publishes_keepalive_before_returning() {
 /// drainable (publish is the last step of the commit).
 #[tokio::test]
 async fn notice_is_enqueued_before_zero_is_visible() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let mut rx = reg.summaries();
     let gate = Arc::new(Notify::new());
     let g = gate.clone();
-    reg.spawn_with(meta("quick"), |ctx| async move {
-        ctx.append_stdout(b"done!").await.unwrap();
-        g.notified().await;
-        TaskExit::Exited { code: Some(0) }
-    })
-    .await
-    .unwrap();
+    let id = reg
+        .spawn_with(meta("quick"), |ctx| async move {
+            ctx.append_stdout(b"done!").await.unwrap();
+            ctx.append_stderr(b"stderr-marker").await.unwrap();
+            g.notified().await;
+            TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
     gate.notify_one();
     loop {
         rx.changed().await.unwrap();
@@ -67,15 +65,29 @@ async fn notice_is_enqueued_before_zero_is_visible() {
     assert_eq!(notices.len(), 1);
     assert!(matches!(
         &notices[0],
-        TaskNotice::Task { status: TaskStatus::Exited { code: Some(0), .. }, output_tail, .. }
-            if output_tail == "done!"
+        TaskNotice::Task {
+            status: TaskStatus::Exited { code: Some(0), .. },
+            ..
+        }
     ));
+    let rendered = notices[0].render();
+    assert!(rendered.contains(&format!("Use task_output with id {id}")));
+    assert!(rendered.contains("exited with code 0"));
+    let serialized = serde_json::to_string(&notices[0]).unwrap();
+    for notice in [&rendered, &serialized] {
+        assert!(!notice.contains("done!"));
+        assert!(!notice.contains("stderr-marker"));
+        assert!(!notice.contains("output_tail"));
+    }
+    let read = reg.read(&id).await.unwrap().unwrap();
+    assert_eq!(read.stdout, "done!");
+    assert_eq!(read.stderr, "stderr-marker");
 }
 
 /// kill vs natural exit: exactly one terminal state, one notice.
 #[tokio::test]
 async fn kill_racing_natural_exit_settles_once() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let id = reg
         .spawn_with(meta("racy"), |ctx| async move {
             let cancel = ctx.cancelled();
@@ -102,7 +114,7 @@ async fn kill_racing_natural_exit_settles_once() {
 /// in the returned batch; afterwards spawn is rejected.
 #[tokio::test]
 async fn shutdown_returns_notices_of_killed_tasks_and_closes() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let id = reg
         .spawn_with(meta("forever"), |ctx| async move {
             ctx.cancelled().cancelled().await;
@@ -129,7 +141,7 @@ async fn shutdown_returns_notices_of_killed_tasks_and_closes() {
 
 #[tokio::test]
 async fn running_limit_rejects_spawn() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let gate = Arc::new(Notify::new());
     for _ in 0..MAX_RUNNING {
         let g = gate.clone();
@@ -154,7 +166,7 @@ async fn running_limit_rejects_spawn() {
 
 #[tokio::test]
 async fn rejected_process_spawn_has_no_command_side_effects() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     reg.shutdown().await;
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("should-not-exist");
@@ -177,7 +189,7 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
+    let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
@@ -201,16 +213,12 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
 
 #[tokio::test]
 async fn oversized_task_metadata_is_rejected_before_work_starts() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let started = Arc::new(AtomicBool::new(false));
     let work_started = started.clone();
     let error = reg
         .spawn_with(
-            TaskMeta {
-                command: "x".repeat(64 * 1024),
-                description: "too large".into(),
-                agent_name: "coda".into(),
-            },
+            TaskMeta::shell("x".repeat(64 * 1024), "too large".into(), "coda".into()),
             move |_ctx| {
                 work_started.store(true, Ordering::SeqCst);
                 async { TaskExit::Exited { code: Some(0) } }
@@ -235,7 +243,7 @@ async fn shutdown_waits_for_detached_create_transaction() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
+    let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
@@ -279,7 +287,7 @@ async fn quiescent_drain_waits_for_detached_quota_expiration() {
         2 * DEFAULT_STREAM_CAPACITY,
         archive.clone(),
     );
-    let reg = Arc::new(BackgroundProcesses::new(Arc::new(Backend {
+    let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
         archive,
         quota: quota.clone(),
         temp: None,
@@ -335,9 +343,7 @@ async fn quiescent_drain_waits_for_detached_quota_expiration() {
 async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let reg = BackgroundProcesses::session_backed(root.clone())
-        .await
-        .unwrap();
+    let reg = BackgroundTasks::session_backed(root.clone()).await.unwrap();
     let id = reg
         .spawn_with(meta("restart"), |ctx| async move {
             ctx.append_stdout(b"before restart").await.unwrap();
@@ -355,7 +361,7 @@ async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
     )));
     drop(reg);
 
-    let reopened = BackgroundProcesses::session_backed(root).await.unwrap();
+    let reopened = BackgroundTasks::session_backed(root).await.unwrap();
     assert!(
         reopened.take_notices().await.is_empty(),
         "normal restart unexpectedly replayed a completion notice"
@@ -376,7 +382,7 @@ async fn create_failure_does_not_lose_prior_expiration_fact() {
         2 * DEFAULT_STREAM_CAPACITY,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::new(Arc::new(Backend {
+    let reg = BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
@@ -411,8 +417,62 @@ async fn create_failure_does_not_lose_prior_expiration_fact() {
 }
 
 #[tokio::test]
-async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+async fn shell_output_survives_reads_and_completion_notices() {
+    for read_while_running in [true, false] {
+        let reg = BackgroundTasks::temporary().unwrap();
+        let ready = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let task_ready = ready.clone();
+        let task_finish = finish.clone();
+        let id = reg
+            .spawn_with(meta("retained output"), move |ctx| async move {
+                ctx.append_stdout(b"hello").await.unwrap();
+                ctx.append_stderr(b"warning").await.unwrap();
+                task_ready.notify_one();
+                task_finish.notified().await;
+                TaskExit::Exited { code: Some(0) }
+            })
+            .await
+            .unwrap();
+        ready.notified().await;
+        if read_while_running {
+            let read = reg.read(&id).await.unwrap().unwrap();
+            assert_eq!(read.stdout, "hello");
+            assert_eq!(read.stderr, "warning");
+            assert!(!read.complete);
+        }
+        finish.notify_one();
+        reg.wait_terminal(&id).await;
+        let notices = reg.take_notices().await;
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            TaskNotice::Task { id: notice_id, .. }
+                if notice_id == &id
+        )));
+        let read = reg.read(&id).await.unwrap().unwrap();
+        assert!(read.complete);
+        assert_eq!(read.stdout, if read_while_running { "" } else { "hello" });
+        assert_eq!(read.stderr, if read_while_running { "" } else { "warning" });
+        let again = reg.read(&id).await.unwrap().unwrap();
+        assert!(again.complete);
+        assert!(again.stdout.is_empty() && again.stderr.is_empty());
+
+        let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
+        assert_eq!(
+            record.lock_commit().await.current().disposition,
+            OutputDisposition::Retained
+        );
+        assert_eq!(record.files().stdout.tail(10).await.unwrap(), b"hello");
+        assert_eq!(record.files().stderr.tail(10).await.unwrap(), b"warning");
+        assert!(reg.backend.quota.retained_contains(&id));
+        assert_eq!(reg.backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
+        reg.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_read_flushes_incomplete_utf8_and_retains_output() {
+    let reg = BackgroundTasks::temporary().unwrap();
     let ready = Arc::new(Notify::new());
     let finish = Arc::new(Notify::new());
     let task_ready = ready.clone();
@@ -440,7 +500,12 @@ async fn terminal_read_flushes_incomplete_utf8_before_consuming_output() {
     assert_eq!(terminal.stdout, "\u{FFFD}");
     assert!(terminal.note.is_none());
     let consumed = reg.read(&id).await.unwrap().unwrap();
-    assert!(consumed.note.as_deref().unwrap().contains("fully consumed"));
+    assert!(consumed.stdout.is_empty());
+    assert!(consumed.complete);
+    assert!(consumed.note.is_none());
+    let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
+    assert_eq!(record.files().stdout.tail(10).await.unwrap(), [0xE2]);
+    assert!(reg.backend.quota.retained_contains(&id));
 }
 
 #[tokio::test]
@@ -463,7 +528,7 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     drop(record);
     drop(archive);
 
-    let reg = BackgroundProcesses::session_backed(root).await.unwrap();
+    let reg = BackgroundTasks::session_backed(root).await.unwrap();
     let backend = &reg.backend;
     assert!(backend.quota.retained_contains(&id));
     assert_eq!(backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
@@ -477,7 +542,6 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     let TaskNotice::Task {
         id: noticed,
         status,
-        output_tail,
         ..
     } = notices.first().expect("an interrupted task notifies")
     else {
@@ -485,7 +549,6 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     };
     assert_eq!(noticed, &id);
     assert!(matches!(status, TaskStatus::Interrupted { .. }));
-    assert_eq!(output_tail, "saved");
 }
 
 #[tokio::test]
@@ -500,7 +563,7 @@ async fn shutdown_retries_dirty_in_memory_failed_manifest() {
         SESSION_QUOTA_BYTES,
         archive.clone(),
     );
-    let reg = BackgroundProcesses::new(Arc::new(Backend {
+    let reg = BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
         quota,
         temp: None,
@@ -554,7 +617,7 @@ async fn shutdown_retries_dirty_in_memory_failed_manifest() {
 /// reported as lost bytes, never re-read or skipped.
 #[tokio::test]
 async fn read_reports_lost_bytes_after_truncation() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let gate = Arc::new(Notify::new());
     let g = gate.clone();
     let id = reg
@@ -605,10 +668,59 @@ async fn read_reports_lost_bytes_after_truncation() {
         "the whole retained window is drained"
     );
     // Cursor is at total_written now: nothing further, nothing repeated.
+    reg.kill(&id).await.unwrap();
     let read = reg.read(&id).await.unwrap().unwrap();
     assert_eq!(read.stdout.len(), 0);
     assert_eq!(read.stdout_lost, 0);
+    assert!(!read.complete, "loss while running still counts after exit");
     reg.shutdown().await;
+}
+
+#[tokio::test]
+async fn paginated_loss_prevents_complete_reads_even_after_reopen() {
+    for stderr in [false, true] {
+        for reopen in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
+            let mut reg = BackgroundTasks::session_backed(root.clone()).await.unwrap();
+            let id = reg
+                .spawn_with(meta("paginated loss"), move |ctx| async move {
+                    let bytes = vec![b'x'; TAIL_BUF_CAP + 7];
+                    if stderr {
+                        ctx.append_stderr(&bytes).await.unwrap();
+                    } else {
+                        ctx.append_stdout(&bytes).await.unwrap();
+                    }
+                    TaskExit::Exited { code: Some(0) }
+                })
+                .await
+                .unwrap();
+            reg.wait_terminal(&id).await;
+
+            let first = reg.read(&id).await.unwrap().unwrap();
+            assert_eq!(first.stdout_lost + first.stderr_lost, 7);
+            assert!(!first.complete);
+            let mut drained = first.stdout.len() + first.stderr.len();
+            if reopen {
+                reg.shutdown().await;
+                drop(reg);
+                reg = BackgroundTasks::session_backed(root).await.unwrap();
+            }
+            while drained < TAIL_BUF_CAP {
+                let page = reg.read(&id).await.unwrap().unwrap();
+                assert_eq!(page.stdout_lost + page.stderr_lost, 0);
+                let bytes = page.stdout.len() + page.stderr.len();
+                assert!(bytes > 0);
+                drained += bytes;
+                assert!(
+                    !page.complete,
+                    "earlier loss must survive pagination: stderr={stderr}, reopen={reopen}, drained={drained}"
+                );
+            }
+            assert_eq!(drained, TAIL_BUF_CAP);
+            reg.shutdown().await;
+        }
+    }
 }
 
 /// Reopened summaries and newly interrupted crash leftovers occupy the same
@@ -645,7 +757,7 @@ async fn recovered_terminal_entries_share_the_live_overview_cap() {
         .unwrap();
     drop(archive);
 
-    let reg = BackgroundProcesses::session_backed(root).await.unwrap();
+    let reg = BackgroundTasks::session_backed(root).await.unwrap();
     assert_eq!(reg.summaries().borrow().len(), MAX_TERMINAL);
     assert!(
         reg.summaries()
@@ -693,7 +805,7 @@ async fn recovered_terminal_entries_share_the_live_overview_cap() {
 /// memory reclamation is decoupled from disk retention.
 #[tokio::test]
 async fn terminal_entries_are_reclaimed_beyond_cap() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let mut first_id = None;
     for i in 0..(MAX_TERMINAL + 1) {
         let id = reg
@@ -742,7 +854,7 @@ async fn terminal_entries_are_reclaimed_beyond_cap() {
 /// aggregate itself is never dropped.
 #[tokio::test]
 async fn notice_overflow_degrades_into_aggregate() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     for i in 0..(MAX_FULL_NOTICES + 3) {
         let id = reg
             .spawn_with(meta(&format!("n{i}")), |_ctx| async {
@@ -787,7 +899,7 @@ async fn notice_overflow_degrades_into_aggregate() {
 /// with work still running.
 #[tokio::test]
 async fn concurrent_shutdowns_share_the_barrier() {
-    let reg = Arc::new(BackgroundProcesses::temporary().unwrap());
+    let reg = Arc::new(BackgroundTasks::temporary().unwrap());
     reg.spawn_with(meta("forever"), |ctx| async move {
         ctx.cancelled().cancelled().await;
         TaskExit::Killed
@@ -876,7 +988,7 @@ async fn assert_pids_die(pids: &[i32]) {
 /// window, and the completion notice reports the storage-level overwrite.
 #[tokio::test]
 async fn chatty_process_overflows_ring_and_reports_overwrite() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     // ~10 bytes/line × 200_000 ≈ 2 MiB, well past the 512 KiB ring.
     let id = reg
         .spawn(
@@ -893,6 +1005,9 @@ async fn chatty_process_overflows_ring_and_reports_overwrite() {
             let read = reg.read(&id).await.unwrap().expect("task known");
             seen += read.stdout.len();
             if !read.status.is_running() && read.stdout.is_empty() {
+                // Archive reads can see terminal status before the monitor enqueues
+                // the notice. The summaries watch is the completion barrier.
+                reg.wait_terminal(&id).await;
                 break read.status;
             }
             tokio::task::yield_now().await;
@@ -904,24 +1019,30 @@ async fn chatty_process_overflows_ring_and_reports_overwrite() {
     assert!(seen > 0, "streamed some output");
 
     let notices = reg.take_notices().await;
-    let overwritten = notices.iter().find_map(|n| match n {
-        TaskNotice::Task {
+    assert!(notices.iter().any(|notice| matches!(
+        notice, TaskNotice::Task { id: notice_id, .. } if notice_id == &id
+    )));
+    let Some(TaskResult::Available {
+        output: TaskResultOutput::Shell {
             stdout_overwritten, ..
-        } => Some(*stdout_overwritten),
-        _ => None,
-    });
+        },
+        ..
+    }) = reg.read_result(&id).await.unwrap()
+    else {
+        panic!("expected shell output")
+    };
     assert!(
-        overwritten.is_some_and(|o| o > 0),
-        "producing >1 ring of output overwrote earlier bytes: {overwritten:?}"
+        stdout_overwritten > 0,
+        "producing >1 ring of output overwrote earlier bytes"
     );
     reg.shutdown().await;
 }
 
 /// spawn → incremental reads observe streamed output → natural exit
-/// commits the code and produces a notice carrying the tail.
+/// commits the code and produces a completion notice.
 #[tokio::test]
 async fn process_task_streams_output_and_notifies_on_exit() {
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let id = reg
         .spawn(
             bash("echo out-marker; echo err-marker >&2; exit 3"),
@@ -937,6 +1058,9 @@ async fn process_task_streams_output_and_notifies_on_exit() {
             stdout.push_str(&read.stdout);
             stderr.push_str(&read.stderr);
             if !read.status.is_running() {
+                // Archive reads can see terminal status before the monitor enqueues
+                // the notice. The summaries watch is the completion barrier.
+                reg.wait_terminal(&id).await;
                 break read.status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -962,8 +1086,8 @@ async fn process_task_streams_output_and_notifies_on_exit() {
     assert_eq!(notices.len(), 1);
     assert!(matches!(
         &notices[0],
-        TaskNotice::Task { id: nid, status: TaskStatus::Exited { code: Some(3), .. }, output_tail, .. }
-            if *nid == id && output_tail.contains("out-marker")
+        TaskNotice::Task { id: nid, status: TaskStatus::Exited { code: Some(3), .. }, .. }
+            if *nid == id
     ));
     reg.shutdown().await;
 }
@@ -975,7 +1099,7 @@ async fn kill_kills_the_whole_process_group() {
     let pidfile = std::env::temp_dir().join(format!("coda-bg-group-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let command = format!(
         "sleep 38.21 & echo \"$$ $!\" > '{}'; wait",
         pidfile.display()
@@ -1008,7 +1132,7 @@ async fn kill_after_leader_exit_reports_killed() {
         std::env::temp_dir().join(format!("coda-bg-exited-leader-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let command = format!(
         "sleep 38.31 & echo \"$$ $!\" > '{}'; exit 0",
         pidfile.display()
@@ -1052,7 +1176,7 @@ async fn kill_settles_promptly_when_a_descendant_escapes_the_group() {
     let ready = std::env::temp_dir().join(format!("coda-bg-escape-{}", std::process::id()));
     let _ = std::fs::remove_file(&ready);
 
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let command = format!(
         "perl -MPOSIX -e 'POSIX::setsid(); open my $f, \">\", $ARGV[0]; print $f $$; close $f; exec \"sleep\", \"38.41\"' '{}' & wait",
         ready.display()
@@ -1079,7 +1203,7 @@ async fn shutdown_leaves_no_process_residue() {
     let pidfile = std::env::temp_dir().join(format!("coda-bg-shutdown-{}", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
 
-    let reg = BackgroundProcesses::temporary().unwrap();
+    let reg = BackgroundTasks::temporary().unwrap();
     let command = format!(
         "sleep 38.61 & echo \"$$ $!\" > '{}'; wait",
         pidfile.display()

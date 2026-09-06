@@ -207,9 +207,11 @@ export function transcriptRenderItems(entries: TranscriptEntry[]): TranscriptRen
 export const Transcript = memo(function Transcript({
   workspace,
   suppressed,
+  onViewTaskResult,
 }: {
   workspace?: string;
   suppressed: boolean;
+  onViewTaskResult?: (taskId: string) => void;
 }) {
   const liveEntries = useCodaStore(selectActiveEntries);
   const liveRunning = useCodaStore(selectActiveRunning);
@@ -334,7 +336,11 @@ export const Transcript = memo(function Transcript({
                   )}
                 >
                   {item.type === "entry" ? (
-                    <TranscriptItem entry={item.entry} forkable={item.entry.id !== firstUserId} />
+                    <TranscriptItem
+                      entry={item.entry}
+                      forkable={item.entry.id !== firstUserId}
+                      onViewTaskResult={onViewTaskResult}
+                    />
                   ) : (
                     <AssistantTurnBubble
                       entries={item.entries}
@@ -1206,9 +1212,11 @@ function UserMessageBubble({ entry, forkable }: { entry: TranscriptEntry; forkab
 const TranscriptItem = memo(function TranscriptItem({
   entry,
   forkable,
+  onViewTaskResult,
 }: {
   entry: TranscriptEntry;
   forkable?: boolean;
+  onViewTaskResult?: (taskId: string) => void;
 }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
 
@@ -1224,7 +1232,7 @@ const TranscriptItem = memo(function TranscriptItem({
             <Button
               variant="quiet"
               size="sm"
-              className="h-auto w-full justify-start gap-2 px-0 py-0 text-left"
+              className="h-auto w-full justify-start gap-2 px-0 py-0 text-left hover:bg-transparent"
               title={toolResultOpen ? "Hide task output" : "Show task output"}
             >
               <SquareTerminal className="size-3.5 shrink-0 text-muted-foreground" />
@@ -1242,6 +1250,33 @@ const TranscriptItem = memo(function TranscriptItem({
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent>
+            {onViewTaskResult ? (
+              <div className="mt-2 space-y-2">
+                {entry.taskOutcomes?.map((outcome, index) =>
+                  outcome.type === "finished" ? (
+                    <div
+                      key={`${outcome.task_id}:${index}`}
+                      className="flex items-center gap-2 rounded-md bg-background/60 p-2"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-mono text-xs" title={outcome.command}>
+                          {outcome.command}
+                        </p>
+                        <p className="text-xs text-muted-foreground">{outcome.status}</p>
+                      </div>
+                      <Button
+                        variant="quiet"
+                        size="sm"
+                        className="h-6 shrink-0 px-2 text-xs"
+                        onClick={() => onViewTaskResult(outcome.task_id)}
+                      >
+                        View result
+                      </Button>
+                    </div>
+                  ) : null,
+                )}
+              </div>
+            ) : null}
             <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
               {entry.content}
             </pre>

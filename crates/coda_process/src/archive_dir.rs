@@ -21,7 +21,7 @@ use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode,
 use rustix::io::Errno;
 use rustix::process::geteuid;
 
-use super::task_id::TaskId;
+use coda_core::task::TaskId;
 
 /// Fault in the archive layer. `Corrupt` marks a structurally invalid on-disk
 /// state (wrong type, bad mode) that must not be silently repaired.
@@ -68,6 +68,8 @@ pub enum ArchiveFileName {
     MetaTmp,
     StdoutRing,
     StderrRing,
+    Result,
+    ResultTmp,
 }
 
 impl ArchiveFileName {
@@ -77,6 +79,8 @@ impl ArchiveFileName {
             ArchiveFileName::MetaTmp => "meta.json.tmp",
             ArchiveFileName::StdoutRing => "stdout.ring",
             ArchiveFileName::StderrRing => "stderr.ring",
+            ArchiveFileName::Result => "result.txt",
+            ArchiveFileName::ResultTmp => "result.txt.tmp",
         }
     }
 }
@@ -187,6 +191,11 @@ impl ArchiveDir {
         verify_regular(&fd)?;
         verify_mode(&fd, 0o600)?;
         Ok(std::fs::File::from(fd))
+    }
+
+    pub fn sync(&self) -> Result<(), ArchiveError> {
+        fs::fsync(self.fd.as_fd())?;
+        Ok(())
     }
 
     /// `renameat` within this directory — the manifest temp→final commit step.

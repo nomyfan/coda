@@ -61,6 +61,8 @@ pub struct ResumeDecision {
 /// This is the public-facing type returned via [`AgentEvent::Suspended`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
+    pub task_id: Option<coda_core::task::TaskId>,
+    pub agent_path: Vec<String>,
     pub thread_id: String,
     pub agent_name: String,
     /// The assistant message that asked for these calls, which is what
@@ -337,6 +339,15 @@ impl Envelope {
 /// Events produced by `Agent::run` and `Agent::resume`.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    ApprovalRemoved {
+        thread_id: String,
+        parent_message_id: MessageId,
+        task_id: Option<coda_core::task::TaskId>,
+    },
+    BackgroundError {
+        task_id: coda_core::task::TaskId,
+        message: String,
+    },
     LLMStart(ChatCompletionRequest),
     LLMContentChunk(String),
     /// A chunk of the model's reasoning / chain-of-thought text (reasoning
@@ -585,6 +596,18 @@ pub(crate) struct AgentRunConfig<P> {
 }
 
 impl Agent {
+    /// Share configuration and tools, but give each driver its own thread state.
+    pub(crate) fn for_thread(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            mode: self.mode.clone(),
+            system_prompt: self.system_prompt.clone(),
+            state: Arc::new(Mutex::new(AgentState::default())),
+            tools: self.tools.clone(),
+            subagents: self.subagents.clone(),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -606,7 +629,10 @@ impl Agent {
         debug!("Adding turn-opening message: {:?}", message);
         let mut state = self.state.lock().await;
         state.current_turn = Some(turn_id);
-        state.messages.push(HistoryEntry::new(turn_id, message));
+        let persisted_notice = matches!(&message, Message::TaskNotice(notice) if state.messages.iter().any(|entry| matches!(&entry.message, Message::TaskNotice(existing) if existing.message_id == notice.message_id)));
+        if !persisted_notice {
+            state.messages.push(HistoryEntry::new(turn_id, message));
+        }
     }
 
     /// Append a message to the current turn. Used for assistant and tool
@@ -715,6 +741,13 @@ impl Agent {
 }
 
 impl AgentState {
+    pub(crate) fn messages(&self) -> Vec<Message> {
+        self.messages
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
     /// Replace the thread, rebuilding the derived snapshot from what arrived.
     /// An empty history therefore clears it, which is what keeps an `Agent`
     /// reused for another thread from handing over the last one's state.
@@ -793,7 +826,7 @@ impl SubAgents {
         self.0.iter().find(|agent| agent.name == bare).cloned()
     }
 
-    pub fn descriptors(&self) -> Vec<ToolDefinition> {
+    pub fn descriptors(&self, background: bool) -> Vec<ToolDefinition> {
         self.0
             .iter()
             .map(|subagent| ToolDefinition {
@@ -806,7 +839,8 @@ impl SubAgents {
                 } else {
                     subagent.description.to_string()
                 },
-                parameter_schema: json!({
+                parameter_schema: {
+                    let mut schema = json!({
                     "type": "object",
                     "properties": {
                         "task": {
@@ -815,7 +849,10 @@ impl SubAgents {
                         },
                     },
                     "required": ["task"],
-                }),
+                });
+                    if background { schema["properties"]["run_in_background"] = json!({"type":"boolean", "default":false, "description":"Start a background task and return its task ID immediately. Its complete result will notify you when finished."}); }
+                    schema
+                },
             })
             .collect()
     }

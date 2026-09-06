@@ -473,9 +473,9 @@ async fn burst_of_chunks_survives_replay_and_fold() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
+async fn overflowing_tool_calls_refresh_snapshot_without_stopping_background_work() {
     let (hub, _) = hub_with("runaway", ToolApprovalMode::Auto);
-    let attach1 = hub
+    let attached = hub
         .attach(
             key(),
             1,
@@ -485,18 +485,12 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
             false,
         )
         .await
-        .expect("attach");
-    let mut events1 = attach1.events;
+        .unwrap();
+    let mut events = attached.events;
     let background = background_of(&hub).await;
-    let cancelled = Arc::new(tokio::sync::Notify::new());
-    let finish = Arc::new(tokio::sync::Notify::new());
-    let task_cancelled = cancelled.clone();
-    let task_finish = finish.clone();
-    background
-        .spawn_with(task_meta("resync barrier"), move |ctx| async move {
+    let id = background
+        .spawn_with(task_meta("survives resync"), |ctx| async move {
             ctx.cancelled().cancelled().await;
-            task_cancelled.notify_one();
-            task_finish.notified().await;
             coda_process::TaskExit::Killed
         })
         .await
@@ -510,43 +504,28 @@ async fn runaway_tool_calls_force_resync_instead_of_unbounded_log() {
         },
     )
     .await;
-
-    // The log crosses the configured message-tier cap long before the
-    // fan-out turn could ever settle; the client is told to resync rather
-    // than the hub buffering all of it in memory.
-    next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), cancelled.notified())
-        .await
-        .expect("forced resync did not close the external registry");
-    assert!(
-        hub.get_entry(&key()).is_some(),
-        "forced resync removed the map entry before registry shutdown completed"
-    );
-    finish.notify_one();
-    wait_released(&hub).await;
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Snapshot(_))
+    })
+    .await;
+    next_matching(&mut events, is_settling_llm_end).await;
     assert!(
         background
-            .spawn_with(task_meta("too late"), |_ctx| async {
-                coda_process::TaskExit::Exited { code: Some(0) }
-            })
+            .read(&id)
             .await
-            .is_err()
+            .unwrap()
+            .unwrap()
+            .status
+            .is_running()
     );
-
-    // Reopening reads the checkpoint the runtime saved once its (now
-    // exit-barriered) tool execution batch finished.
-    let attach2 = hub
-        .attach(
-            key(),
-            2,
-            "prov".into(),
-            None,
-            PermissionMode::default(),
-            false,
-        )
-        .await
-        .expect("re-attach");
-    assert!(!attach2.snapshot.turn_running);
+    let entry = hub.get_entry(&key()).unwrap();
+    let guard = entry.inner.lock().await;
+    let EntryPhase::Live(live) = &guard.phase else {
+        panic!("resync must retain runtime")
+    };
+    assert!(!live.log.message_tier_overflowed());
+    drop(guard);
+    hub.shutdown_all().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -624,6 +603,7 @@ async fn failed_resume_does_not_stick_turn_running() {
             key(),
             1,
             SessionCommand::Resume {
+                allow_patterns: vec![],
                 agent_name: "ghost".into(),
                 thread_id: "t-ghost".into(),
                 decision: ResumeDecision {
@@ -651,14 +631,9 @@ async fn failed_resume_does_not_stick_turn_running() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lagged_stream_drains_session_and_closes_client() {
-    // A lagged event stream means the in-memory view has a gap; the hub
-    // must drain the session behind a checkpoint barrier and end the
-    // client stream with `Closed` so it re-attaches from the persisted
-    // state. Injected via a parallel forwarder — the real pump makes lag
-    // (deliberately) hard to reproduce.
+async fn lagged_stream_refreshes_snapshot_and_keeps_runtime_attached() {
     let (hub, _) = hub_with("reply", ToolApprovalMode::Auto);
-    let attach1 = hub
+    let attached = hub
         .attach(
             key(),
             1,
@@ -668,38 +643,40 @@ async fn lagged_stream_drains_session_and_closes_client() {
             false,
         )
         .await
-        .expect("attach");
-    let mut events1 = attach1.events;
-
-    let entry = hub.get_entry(&key()).expect("entry");
+        .unwrap();
+    let mut events = attached.events;
+    let entry = hub.get_entry(&key()).unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_forwarder(
+    let forwarder = tokio::spawn(run_forwarder(
         hub.entries.clone(),
-        entry,
+        entry.clone(),
         rx,
         "coda".into(),
         0,
         hub.opener.clone(),
         hub.status_tx.clone(),
     ));
-    tx.send(SessionStreamItem::Lagged(42)).expect("inject lag");
-
-    next_matching(&mut events1, |e| matches!(e, RelayEvent::Closed)).await;
-    wait_released(&hub).await;
-
-    // Reopening reads the authoritative persisted checkpoint.
-    let attach2 = hub
-        .attach(
+    tx.send(SessionStreamItem::Lagged(42)).unwrap();
+    next_matching(&mut events, |event| {
+        matches!(event, RelayEvent::Snapshot(_))
+    })
+    .await;
+    assert!(Arc::ptr_eq(&entry, &hub.get_entry(&key()).unwrap()));
+    forwarder.abort();
+    assert!(matches!(
+        hub.command(
             key(),
-            2,
-            "prov".into(),
-            None,
-            PermissionMode::default(),
-            true,
+            1,
+            SessionCommand::Task {
+                task: "still works".into(),
+                images: vec![]
+            }
         )
-        .await
-        .expect("re-attach");
-    assert!(!attach2.snapshot.turn_running);
+        .await,
+        CommandOutcome::TaskAccepted { .. }
+    ));
+    next_matching(&mut events, is_settling_llm_end).await;
+    hub.shutdown_all().await;
 }
 
 /// A checkpoint the database refuses leaves the in-memory view describing a

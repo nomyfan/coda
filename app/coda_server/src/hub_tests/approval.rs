@@ -68,6 +68,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
             key(),
             2,
             SessionCommand::Resume {
+                allow_patterns: vec![],
                 agent_name: approval.agent_name.clone(),
                 thread_id: approval.thread_id.clone(),
                 decision: ResumeDecision {

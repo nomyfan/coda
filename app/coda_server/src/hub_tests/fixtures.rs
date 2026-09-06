@@ -53,6 +53,47 @@ impl LLMProvider for TestProvider {
         }
         match system.as_str() {
             "reply" => Self::completed(assistant("done")),
+            "read-task-results" | "read-running-task-result" => {
+                let read_count = request
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, RequestMessage::Tool(_)))
+                    .count();
+                let expected_reads = if system == "read-running-task-result" {
+                    2
+                } else {
+                    1
+                };
+                if read_count >= expected_reads {
+                    Self::completed(assistant("read both terminal results"))
+                } else {
+                    let ids: Vec<String> = request
+                        .messages
+                        .iter()
+                        .find_map(|m| match m {
+                            RequestMessage::User(user) => {
+                                Some(serde_json::from_str(user.first_text().unwrap()).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let gate = self.gate.clone();
+                    Box::pin(stream::once(async move {
+                        gate.notified().await;
+                        let mut answer = assistant("");
+                        answer.tool_calls = ids
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, id)| ToolCall {
+                                id: format!("read_{read_count}_{i}"),
+                                name: "task_output".into(),
+                                arguments: Some(serde_json::json!({"id":id}).to_string()),
+                            })
+                            .collect();
+                        Ok(LLMStreamEvent::Completed(Box::new(answer)))
+                    }))
+                }
+            }
             "hold" => {
                 let gate = self.gate.clone();
                 Box::pin(
@@ -85,9 +126,7 @@ impl LLMProvider for TestProvider {
                     .iter()
                     .any(|m| matches!(m, RequestMessage::Tool(t) if t.name == "read_todos"));
                 if has_result {
-                    Self::completed(assistant(
-                        "should not settle: resync should have fired first",
-                    ))
+                    Self::completed(assistant("completed after live resync"))
                 } else {
                     let mut msg = assistant("");
                     msg.tool_calls = (0..(RelayConfig::default().max_message_tier_events + 10))
@@ -235,6 +274,13 @@ impl SlowStorage {
 }
 
 impl SessionStorage for SlowStorage {
+    fn has_notice_receipt(
+        &self,
+        task_id: coda_core::task::TaskId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+        self.inner.has_notice_receipt(task_id)
+    }
+
     fn save_checkpoint(
         &self,
         thread_id: String,
@@ -479,7 +525,7 @@ impl SessionOpener for TestOpener {
         _reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
-        background: Option<Arc<coda_process::BackgroundProcesses>>,
+        background: Option<Arc<coda_process::BackgroundTasks>>,
     ) -> Pin<Box<dyn Future<Output = Result<Session, OpenError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls
@@ -802,7 +848,7 @@ pub(super) async fn with_live<R>(hub: &SessionHub, f: impl FnOnce(&mut LiveState
 
 /// The entry's background task registry, so a test can start and settle tasks
 /// the way `shell` would.
-pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundProcesses> {
+pub(super) async fn background_of(hub: &SessionHub) -> Arc<coda_process::BackgroundTasks> {
     let entry = hub.get_entry(&key()).expect("a live entry");
     let guard = entry.inner.clone().lock_owned().await;
     guard
@@ -820,11 +866,7 @@ pub(super) fn spool_dir(opener: &TestOpener, key: &SessionKey) -> std::path::Pat
 
 /// Metadata for a test task.
 pub(super) fn task_meta(command: &str) -> coda_process::TaskMeta {
-    coda_process::TaskMeta {
-        command: command.into(),
-        description: "test task".into(),
-        agent_name: "coda".into(),
-    }
+    coda_process::TaskMeta::shell(command.into(), "test task".into(), "coda".into())
 }
 
 /// Await the next `RelayEvent` matching `pred`, skipping others.

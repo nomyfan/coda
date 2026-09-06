@@ -1,26 +1,71 @@
-import { memo } from "react";
-import { ListChecks, Square, X } from "lucide-react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { ChevronRight, ListChecks, RefreshCw, Square, X } from "lucide-react";
 
+import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
-import type { TaskSummary } from "@/lib/protocol";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import type { TaskSummary, TaskResult, TaskStatus } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
-import { killBackgroundTask, selectActiveBackgroundTasks, useCodaStore } from "@/store/session";
+import {
+  getBackgroundTaskResult,
+  killBackgroundTask,
+  selectActiveBackgroundTasks,
+  useCodaStore,
+} from "@/store/session";
 
 /** Running first, then most recently started — the ones still worth watching
  * stay at the top as older ones settle beneath them. */
 export function orderTasks(tasks: TaskSummary[]): TaskSummary[] {
-  return [...tasks].sort((a, b) => {
-    if (a.running !== b.running) {
-      return a.running ? -1 : 1;
+  const sorted = [...tasks].sort((a, b) => {
+    if (a.subtree_active !== b.subtree_active) {
+      return a.subtree_active ? -1 : 1;
     }
     return b.started_at.localeCompare(a.started_at);
   });
+  const ids = new Set(tasks.map((task) => task.id));
+  return sorted
+    .filter((task) => !task.parent_task_id || !ids.has(task.parent_task_id))
+    .flatMap((parent) => [parent, ...sorted.filter((child) => child.parent_task_id === parent.id)]);
 }
 
-function TaskRow({ task }: { task: TaskSummary }) {
+export type TaskResultRequest = { taskId: string };
+
+function TaskRow({
+  task,
+  resultRequest,
+}: {
+  task: TaskSummary;
+  resultRequest?: TaskResultRequest;
+}) {
+  const rowRef = useRef<HTMLLIElement>(null);
+  const [resultOpen, setResultOpen] = useState(false);
   const started = formatClockTime(task.started_at);
+  const label = task.kind.kind === "subagent" ? task.kind.agent_name : task.command;
+  const metadata = (
+    <span className="flex min-w-0 items-center gap-2 text-[0.6875rem] font-normal text-muted-foreground">
+      <span className={cn("shrink-0", task.running && "text-foreground")}>{task.status}</span>
+      {started ? <span className="shrink-0">· started {started}</span> : null}
+      {/* Only worth naming when it wasn't the session's own agent. */}
+      {task.agent_name && task.agent_name !== "coda" ? (
+        <span className="truncate">· {task.agent_name}</span>
+      ) : null}
+    </span>
+  );
+  useEffect(() => {
+    // Desktop and mobile lists are both mounted; only the visible one handles
+    // a transcript request so we do not fetch or scroll the hidden copy.
+    if (!resultRequest || !rowRef.current?.getClientRects().length) return;
+    setResultOpen(true);
+    rowRef.current.scrollIntoView({ block: "nearest" });
+  }, [resultRequest]);
   return (
-    <li className="rounded-md border border-border/60 px-2.5 py-2">
+    <li
+      ref={rowRef}
+      className={cn(
+        "rounded-md border border-border/60 px-2.5 py-2",
+        task.parent_task_id && "ml-4",
+      )}
+    >
       <div className="flex items-center gap-2">
         <span
           aria-hidden
@@ -29,17 +74,17 @@ function TaskRow({ task }: { task: TaskSummary }) {
             task.running ? "animate-pulse bg-primary" : "bg-muted-foreground/40",
           )}
         />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs" title={task.command}>
-          {task.command}
+        <span className="min-w-0 flex-1 truncate font-mono text-xs" title={label}>
+          {label}
         </span>
-        {task.running ? (
+        {task.subtree_active ? (
           <Button
             variant="ghost"
             size="icon"
             className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
             onClick={() => killBackgroundTask(task.id)}
             title="Stop this task"
-            aria-label={`Stop ${task.command}`}
+            aria-label={`Stop ${label}`}
           >
             <Square className="size-3" />
           </Button>
@@ -50,29 +95,201 @@ function TaskRow({ task }: { task: TaskSummary }) {
           {task.description}
         </p>
       ) : null}
-      <div className="mt-1 flex items-center gap-2 text-[0.6875rem] text-muted-foreground">
-        <span className={cn(task.running && "text-foreground")}>{task.status}</span>
-        {started ? <span>· started {started}</span> : null}
-        {/* Only worth naming when it wasn't the session's own agent. */}
-        {task.agent_name && task.agent_name !== "coda" ? <span>· {task.agent_name}</span> : null}
-      </div>
+      {!task.running ? (
+        <Collapsible className="mt-1" open={resultOpen} onOpenChange={setResultOpen}>
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="group h-auto min-h-6 w-full justify-between px-0 py-1 text-left hover:bg-transparent"
+              aria-label="Task result"
+            >
+              {metadata}
+              <ChevronRight className="size-3 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <TaskResultDetails taskId={task.id} request={resultRequest} />
+          </CollapsibleContent>
+        </Collapsible>
+      ) : (
+        <div className="mt-1">{metadata}</div>
+      )}
     </li>
   );
 }
 
-function TaskList({ tasks }: { tasks: TaskSummary[] }) {
-  if (tasks.length === 0) {
+function taskStatusLabel(status: TaskStatus): string {
+  if (typeof status === "string") return status;
+  if ("Exited" in status) {
+    return status.Exited.code === null
+      ? "Exited without an exit code"
+      : `Exited with code ${status.Exited.code}`;
+  }
+  if ("Failed" in status) return `Failed: ${status.Failed.message}`;
+  if ("Killed" in status) return "Killed";
+  if ("Interrupted" in status) return "Interrupted";
+  return "Completed";
+}
+
+export function TaskResultContent({ result }: { result: TaskResult }) {
+  if (result.state !== "available") {
+    return (
+      <p className="whitespace-pre-wrap text-muted-foreground">
+        {result.state === "expired"
+          ? "Result expired"
+          : result.state === "unknown"
+            ? "Task not found"
+            : result.state === "error"
+              ? result.message
+              : taskStatusLabel(result.status)}
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <p className="whitespace-pre-wrap text-muted-foreground">{taskStatusLabel(result.status)}</p>
+      {result.output.kind === "subagent" ? (
+        <Markdown className="text-xs">{result.output.answer}</Markdown>
+      ) : (
+        <>
+          <ShellOutput
+            label="stdout"
+            text={result.output.stdout}
+            overwritten={result.output.stdout_overwritten}
+          />
+          <ShellOutput
+            label="stderr"
+            text={result.output.stderr}
+            overwritten={result.output.stderr_overwritten}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+function ShellOutput({
+  label,
+  text,
+  overwritten,
+}: {
+  label: string;
+  text: string;
+  overwritten: number;
+}) {
+  return (
+    <section className="min-w-0">
+      <h3 className="mb-1 font-mono font-medium">{label}</h3>
+      {overwritten > 0 ? (
+        <p className="mb-1 text-muted-foreground">
+          {overwritten.toLocaleString()} bytes of earlier output were overwritten.
+        </p>
+      ) : null}
+      <pre className="whitespace-pre-wrap break-words rounded bg-muted/40 p-2 font-mono text-xs">
+        {text || "(no output)"}
+      </pre>
+    </section>
+  );
+}
+
+function TaskResultDetails({ taskId, request }: { taskId: string; request?: TaskResultRequest }) {
+  const [result, setResult] = useState<TaskResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const requestVersion = useRef(0);
+  const loadResult = useCallback(async () => {
+    const version = ++requestVersion.current;
+    setLoading(true);
+    try {
+      const next = await getBackgroundTaskResult(taskId);
+      if (version === requestVersion.current) setResult(next);
+    } catch (error) {
+      if (version === requestVersion.current)
+        setResult({
+          state: "error",
+          message: error instanceof Error ? error.message : "Could not load result",
+        });
+    } finally {
+      if (version === requestVersion.current) setLoading(false);
+    }
+  }, [taskId]);
+  useEffect(() => {
+    void loadResult();
+    return () => {
+      requestVersion.current += 1;
+    };
+  }, [loadResult, request]);
+  return (
+    <>
+      <div className="flex justify-end">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 text-muted-foreground"
+          disabled={loading}
+          onClick={loadResult}
+          title={loading ? "Loading result…" : "Refresh result"}
+          aria-label={loading ? "Loading result" : "Refresh result"}
+        >
+          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+        </Button>
+      </div>
+      <div className="mt-1 max-h-72 overflow-auto break-words text-xs" aria-live="polite">
+        {result ? (
+          <TaskResultContent result={result} />
+        ) : (
+          <p className="text-muted-foreground">Loading result…</p>
+        )}
+      </div>
+    </>
+  );
+}
+
+function ArchivedTaskResult({ request }: { request: TaskResultRequest }) {
+  const ref = useRef<HTMLLIElement>(null);
+  const [visibleRequest, setVisibleRequest] = useState<TaskResultRequest>();
+  useEffect(() => {
+    if (!ref.current?.getClientRects().length) return;
+    setVisibleRequest(request);
+    ref.current.scrollIntoView({ block: "nearest" });
+  }, [request]);
+  return (
+    <li ref={ref} className="rounded-md border border-border/60 px-2.5 py-2">
+      <p className="text-xs font-medium">Archived task</p>
+      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{request.taskId}</p>
+      {visibleRequest ? (
+        <TaskResultDetails key={request.taskId} taskId={request.taskId} request={visibleRequest} />
+      ) : null}
+    </li>
+  );
+}
+
+function TaskList({
+  tasks,
+  resultRequest,
+}: {
+  tasks: TaskSummary[];
+  resultRequest?: TaskResultRequest;
+}) {
+  if (tasks.length === 0 && !resultRequest) {
     return (
       <p className="px-1 py-6 text-center text-xs text-muted-foreground">
-        No background tasks yet. Long-running shell commands run here instead of holding up the
+        No background tasks yet. Background agents and shell commands can keep working alongside the
         conversation.
       </p>
     );
   }
   return (
     <ul className="flex flex-col gap-1.5">
+      {resultRequest && !tasks.some((task) => task.id === resultRequest.taskId) ? (
+        <ArchivedTaskResult key={resultRequest.taskId} request={resultRequest} />
+      ) : null}
       {tasks.map((task) => (
-        <TaskRow key={task.id} task={task} />
+        <TaskRow
+          key={task.id}
+          task={task}
+          resultRequest={resultRequest?.taskId === task.id ? resultRequest : undefined}
+        />
       ))}
     </ul>
   );
@@ -106,9 +323,11 @@ function PanelHeader({ onClose }: { onClose: () => void }) {
 export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
   open,
   onClose,
+  resultRequest,
 }: {
   open: boolean;
   onClose: () => void;
+  resultRequest?: TaskResultRequest;
 }) {
   const tasks = orderTasks(useCodaStore(selectActiveBackgroundTasks));
 
@@ -120,7 +339,7 @@ export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
         <aside className="hidden w-[20rem] shrink-0 flex-col overflow-hidden rounded-lg border bg-background p-2.5 lg:flex">
           <PanelHeader onClose={onClose} />
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <TaskList tasks={tasks} />
+            <TaskList tasks={tasks} resultRequest={resultRequest} />
           </div>
         </aside>
       ) : null}
@@ -144,7 +363,7 @@ export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
       >
         <PanelHeader onClose={onClose} />
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <TaskList tasks={tasks} />
+          {open ? <TaskList tasks={tasks} resultRequest={resultRequest} /> : null}
         </div>
       </div>
     </>

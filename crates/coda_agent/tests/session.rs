@@ -1189,11 +1189,7 @@ async fn should_kill_owned_background_tasks_on_shutdown() {
         .expect("a self-built session has a registry")
         .spawn(
             cmd,
-            coda_process::TaskMeta {
-                command: "sleep".into(),
-                description: "owned task".into(),
-                agent_name: "coda".into(),
-            },
+            coda_process::TaskMeta::shell("sleep".into(), "owned task".into(), "coda".into()),
         )
         .await
         .expect("spawn background task");

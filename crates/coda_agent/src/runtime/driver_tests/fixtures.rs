@@ -30,9 +30,9 @@ use tokio::{
 /// A throwaway background-task registry, for the driver tests that only need
 /// `AgentTeam::build` to have one. Each call gets its own, so nothing leaks
 /// between tests.
-pub(super) fn test_registry() -> Option<std::sync::Arc<coda_process::BackgroundProcesses>> {
+pub(super) fn test_registry() -> Option<std::sync::Arc<coda_process::BackgroundTasks>> {
     Some(std::sync::Arc::new(
-        coda_process::BackgroundProcesses::temporary().unwrap(),
+        coda_process::BackgroundTasks::temporary().unwrap(),
     ))
 }
 
@@ -1389,8 +1389,9 @@ where
             .into_iter()
             .map(|(agent, (thread_id, decision))| {
                 (
-                    agent,
+                    thread_id.clone(),
                     ResumeTarget {
+                        agent_name: agent,
                         thread_id: ThreadId(thread_id),
                         decision,
                     },

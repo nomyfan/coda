@@ -37,11 +37,7 @@ impl SessionQuota {
 }
 
 fn meta() -> TaskMeta {
-    TaskMeta {
-        command: "c".into(),
-        description: "d".into(),
-        agent_name: "coda".into(),
-    }
+    TaskMeta::shell("c".into(), "d".into(), "coda".into())
 }
 
 fn archive() -> (tempfile::TempDir, Arc<TaskArchive>) {
@@ -147,6 +143,12 @@ async fn fully_consumed_victim_becomes_consumed_not_expired() {
     let inv = scan_inventory(archive.root()).unwrap();
     let quota = SessionQuota::from_inventory(&inv, limit, archive.clone());
 
+    quota
+        .reserve_for_test(limit)
+        .await
+        .reservation
+        .unwrap()
+        .commit();
     // One terminal task, fully read (cursor == total).
     let id = TaskId::new();
     let rec = archive.create_unreserved(&id, &meta()).await.unwrap();
@@ -163,8 +165,23 @@ async fn fully_consumed_victim_becomes_consumed_not_expired() {
         g.commit(cand).await.unwrap();
     }
     quota.finalize_terminal(&rec).await.unwrap();
-    // finalize_terminal already consumed it (fully read) → reservation freed.
-    assert_eq!(quota.reserved(), 0, "fully consumed released at finalize");
+    assert_eq!(quota.reserved(), limit, "read output stays charged");
+    assert_eq!(rec.files().stdout.tail(10).await.unwrap(), b"abc");
+    assert_eq!(
+        rec.lock_commit().await.current().disposition,
+        OutputDisposition::Retained
+    );
+
+    let outcome = quota.reserve_for_test(limit).await;
+    assert!(
+        outcome.expirations.is_empty(),
+        "read output expires silently"
+    );
+    outcome.reservation.unwrap().commit();
+    assert_eq!(quota.reserved(), limit);
+    for name in ["stdout.ring", "stderr.ring"] {
+        assert!(!_tmp.path().join(id.as_str()).join(name).exists());
+    }
     let g = rec.lock_commit().await;
     assert!(matches!(
         g.current().disposition,

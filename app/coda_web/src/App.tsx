@@ -1,6 +1,6 @@
-import { Folder, ListChecks, Menu } from "lucide-react";
+import { Folder, ListChecks, Menu, PanelLeft } from "lucide-react";
 
-import { BackgroundTasksPanel } from "@/components/background-tasks";
+import { BackgroundTasksPanel, type TaskResultRequest } from "@/components/background-tasks";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   abort,
@@ -166,12 +166,16 @@ function WorkspaceTargetSelect({
 function WorkspaceHeader({
   sessionTitle,
   onOpenSidebar,
+  serversCollapsed,
+  onToggleServers,
   onToggleTasks,
   runningTasks,
   showTasks,
 }: {
   sessionTitle?: string;
   onOpenSidebar: () => void;
+  serversCollapsed: boolean;
+  onToggleServers: () => void;
   onToggleTasks: () => void;
   runningTasks: number;
   showTasks: boolean;
@@ -187,6 +191,17 @@ function WorkspaceHeader({
       >
         <Menu className="size-4" />
       </button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="hidden size-6 shrink-0 text-muted-foreground lg:inline-flex"
+        onClick={onToggleServers}
+        title={serversCollapsed ? "Expand servers" : "Collapse servers"}
+        aria-label={serversCollapsed ? "Expand servers" : "Collapse servers"}
+        aria-expanded={!serversCollapsed}
+      >
+        <PanelLeft className="size-4" />
+      </Button>
       <div className="min-w-0 flex-1 overflow-hidden text-sm">
         {sessionTitle ? (
           <span className="block truncate font-medium" title={sessionTitle}>
@@ -277,7 +292,26 @@ export default function App() {
   } | null>(null);
   const [newSessionMode, setNewSessionMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [serversCollapsed, setServersCollapsed] = useState(false);
   const [tasksOpen, setTasksOpen] = useState(false);
+  const [taskResultRequest, setTaskResultRequest] = useState<
+    TaskResultRequest & { sessionScope: string }
+  >();
+  const handleTasksOpenChange = useCallback((open: boolean) => {
+    setTaskResultRequest(undefined);
+    setTasksOpen(open);
+  }, []);
+  const taskSessionScope = JSON.stringify([activeServer, activeKey]);
+  const handleViewTaskResult = useCallback(
+    (taskId: string) => {
+      setTaskResultRequest({ taskId, sessionScope: taskSessionScope });
+      setTasksOpen(true);
+    },
+    [taskSessionScope],
+  );
+  useEffect(() => {
+    setTaskResultRequest(undefined);
+  }, [activeServer, activeKey]);
   const runningTaskCount = useCodaStore(selectActiveRunningTaskCount);
 
   const selectedServerUrl = newSessionTarget?.serverUrl ?? activeServer ?? "";
@@ -436,6 +470,7 @@ export default function App() {
   return (
     <div className="relative flex h-dvh min-h-0 overflow-hidden bg-background lg:min-h-[600px] lg:gap-1 lg:bg-muted/70 lg:p-1">
       <Sidebar
+        desktopCollapsed={serversCollapsed}
         mobileOpen={sidebarOpen}
         onMobileOpenChange={setSidebarOpen}
         newSessionTarget={newSessionTarget}
@@ -456,11 +491,17 @@ export default function App() {
                 <WorkspaceHeader
                   sessionTitle={activeSessionTitle}
                   onOpenSidebar={() => setSidebarOpen(true)}
-                  onToggleTasks={() => setTasksOpen((open) => !open)}
+                  serversCollapsed={serversCollapsed}
+                  onToggleServers={() => setServersCollapsed((collapsed) => !collapsed)}
+                  onToggleTasks={() => handleTasksOpenChange(!tasksOpen)}
                   runningTasks={runningTaskCount}
                   showTasks={Boolean(activeKey) && !showingNewSession}
                 />
-                <Transcript suppressed={showingNewSession} workspace={selectedWorkspace} />
+                <Transcript
+                  suppressed={showingNewSession}
+                  workspace={selectedWorkspace}
+                  onViewTaskResult={handleViewTaskResult}
+                />
               </div>
               <div className="relative z-20 shrink-0 pb-[env(safe-area-inset-bottom)]">
                 {!showingNewSession && activePersistError ? (
@@ -553,7 +594,14 @@ export default function App() {
               </div>
             )}
           </div>
-          <BackgroundTasksPanel open={tasksOpen} onClose={() => setTasksOpen(false)} />
+          <BackgroundTasksPanel
+            key={taskSessionScope}
+            open={tasksOpen}
+            onClose={() => handleTasksOpenChange(false)}
+            resultRequest={
+              taskResultRequest?.sessionScope === taskSessionScope ? taskResultRequest : undefined
+            }
+          />
         </div>
       </section>
     </div>

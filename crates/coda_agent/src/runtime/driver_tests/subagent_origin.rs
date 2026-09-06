@@ -184,6 +184,12 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
     .await
     .expect("timed out waiting for the root agent to finish");
     assert_eq!(done, "main done");
+    assert_eq!(
+        harness.runtime.agents.lock().await.len(),
+        1,
+        "stateful drivers retire too; the next invocation restores its checkpoint"
+    );
+    assert_eq!(harness.runtime.executions.lock().unwrap().threads.len(), 1);
     harness.shutdown().await;
 
     let parents = tool_calling_assistants(&harness.storage, &harness.thread_id).await;
