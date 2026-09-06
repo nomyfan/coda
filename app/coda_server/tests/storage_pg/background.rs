@@ -34,13 +34,19 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
         .unwrap();
     let mut queued = queued_task("child", "new work");
     queued.id = "new-invocation".into();
+    let mut resume = queued_task("child", "new approval");
+    resume.body = EnvelopeBody::Resume(coda_agent::ResumeDecision {
+        parent_message_id: MessageId::new(),
+        resolutions: vec![],
+    });
+    let resume_id = resume.id.clone();
     storage
         .save_session_snapshot(
             "root".into(),
             StoredRuntimeSnapshot {
                 active_processes: [("child".into(), "worker".into())].into(),
-                drained_envelopes: [("child".into(), vec![queued])].into(),
-                agent_drained_envelopes: Default::default(),
+                drained_envelopes: [("child".into(), vec![queued, resume.clone()])].into(),
+                agent_drained_envelopes: [("child".into(), vec![resume])].into(),
             },
         )
         .await
@@ -68,6 +74,8 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
         .unwrap();
     assert!(snapshot.active_processes.contains_key("child"));
     assert_eq!(snapshot.drained_envelopes["child"][0].id, "new-invocation");
+    assert_eq!(snapshot.drained_envelopes["child"][1].id, resume_id);
+    assert_eq!(snapshot.agent_drained_envelopes["child"][0].id, resume_id);
     assert!(
         storage
             .save_execution_checkpoint(
@@ -131,14 +139,21 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .unwrap();
     let mut queued = queued_task("child", "must never replay");
     queued.id = identity.invocation_id.clone();
+    let mut resume = queued_task("child", "old approval");
+    resume.body = EnvelopeBody::Resume(coda_agent::ResumeDecision {
+        parent_message_id: assistant.message_id,
+        resolutions: vec![],
+    });
+    assert_ne!(resume.id, identity.invocation_id);
+    assert!(resume.reply_to.is_none());
     let snapshot = StoredRuntimeSnapshot {
         active_processes: [
             ("child".into(), "worker".into()),
             ("unrelated".into(), "worker".into()),
         ]
         .into(),
-        drained_envelopes: [("child".into(), vec![queued])].into(),
-        agent_drained_envelopes: Default::default(),
+        drained_envelopes: [("child".into(), vec![queued, resume.clone()])].into(),
+        agent_drained_envelopes: [("child".into(), vec![resume])].into(),
     };
     storage
         .save_session_snapshot("root".into(), snapshot.clone())
@@ -155,6 +170,23 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         })
         .await
         .unwrap();
+    let cleaned_snapshot = storage
+        .load_session_snapshot("root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cleaned_snapshot
+            .drained_envelopes
+            .values()
+            .all(Vec::is_empty)
+    );
+    assert!(
+        cleaned_snapshot
+            .agent_drained_envelopes
+            .values()
+            .all(Vec::is_empty)
+    );
     let clean = storage.load_checkpoint("child").await.unwrap().unwrap();
     assert!(clean.active_execution.is_none());
     assert!(matches!(clean.resume_point, StoredResumePoint::Generation));
@@ -179,6 +211,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
     assert!(!snapshot.active_processes.contains_key("child"));
     assert!(snapshot.active_processes.contains_key("unrelated"));
     assert!(snapshot.drained_envelopes.values().all(Vec::is_empty));
+    assert!(snapshot.agent_drained_envelopes.values().all(Vec::is_empty));
     assert!(
         storage
             .load_checkpoint("unrelated")

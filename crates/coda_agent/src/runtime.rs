@@ -595,7 +595,12 @@ fn drop_stale_envelopes(
                         Some(&pending.call_envelope_id) == envelope.reply_to.as_ref()
                     })
                 }
-                (EnvelopeBody::Resume(_), Some(StoredResumePoint::PendingApproval { .. })) => true,
+                (
+                    EnvelopeBody::Resume(decision),
+                    Some(StoredResumePoint::PendingApproval {
+                        parent_message_id, ..
+                    }),
+                ) => decision.parent_message_id == *parent_message_id,
                 _ => false,
             };
             if !awaited {

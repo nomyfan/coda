@@ -127,7 +127,7 @@ async fn ProcessRuntime::stop_background_group(
 - 退出切换与消息交付需要有明确先后顺序：已入 inbox 的消息由 driver 退出快照收集；进入 Exiting 后的消息由 runtime 缓存。snapshot 更新及最终保存不得相互覆盖。到 Closed 前应等待消息生产者退出并完成已有收集/保存流程；有界强制终止仍遵循现有取消和清理规则，不保证未生成结果的交付。
 - 交付锁不覆盖等待 inbox 容量：先在锁内选择接收方，锁外 reserve 容量，再回到锁内检查生命周期并同步入队。等待期间若进入 Exiting，不论 reserve 成功还是接收方已关闭，都转入归档；进入 Closed 则拒绝。不能用跨 process 的锁包住有界 channel 的 send().await，否则一批快速回复会阻塞父 process 继续分发，连 shutdown 也无法启动。
 - `deliver` 的 `Ok` 表示已投递或已接收到恢复缓冲，不表示任务执行完成。退出期 snapshot 保存失败沿用现有告警和返回行为，不默默丢弃内存中的 envelope，也不把本轮重构解释成新增持久交付保证；更强的存储失败策略另行设计。
-- Exiting 缓存不绕过迟到回复 fencing、审批有效性或后台冷启动清理：前台可恢复消息照常恢复，已终止后台执行的消息仍按既有规则清理。
+- Exiting 缓存不绕过迟到回复 fencing、审批有效性或后台冷启动清理：前台可恢复消息照常恢复，已终止后台执行的消息仍按既有规则清理。Resume 没有 invocation reply_to，fencing 仅在目标没有后续执行时移除它；恢复前必须匹配 checkpoint 的审批 parent_message_id，旧批次决定不得启动 driver 或恢复 turn。
 
 信任边界与校验归属：
 

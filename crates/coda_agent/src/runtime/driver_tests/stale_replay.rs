@@ -334,3 +334,56 @@ async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
         "the session refused a new task"
     );
 }
+
+#[tokio::test]
+async fn replayed_resumes_must_match_the_current_approval_batch() {
+    for matches_current_batch in [false, true] {
+        let storage = TestStorage::default();
+        let parent_message_id = MessageId::new();
+        let (turn, messages) = dispatched(parent_message_id);
+        store_root(
+            &storage,
+            messages,
+            StoredResumePoint::PendingApproval {
+                parent_message_id,
+                pending_approval_calls: vec![crate::persist::StoredPreparedToolCall {
+                    tool_call: ToolCall {
+                        id: "call_explore".into(),
+                        name: "agent__explore".into(),
+                        arguments: Some(r#"{"task":"inspect"}"#.into()),
+                    },
+                    metadata: None,
+                }],
+                pending_calls: vec![],
+            },
+        )
+        .await;
+        let held = storage.hold_checkpoints_of("coda").await;
+        let mut resume = root_task();
+        resume.body = EnvelopeBody::Resume(ResumeDecision {
+            parent_message_id: if matches_current_batch {
+                parent_message_id
+            } else {
+                MessageId::new()
+            },
+            resolutions: vec![],
+        });
+        let snapshot = ProcessRuntimeSnapshot {
+            drained_envelopes: [(SESSION.into(), vec![resume.clone()])].into(),
+            agent_drained_envelopes: [(SESSION.into(), vec![resume])].into(),
+            ..Default::default()
+        };
+        let (runtime, _events) = bootstrapped(storage, snapshot).await;
+        assert_eq!(
+            runtime.turn_gate.active_id(),
+            matches_current_batch.then_some(turn)
+        );
+        assert_eq!(
+            runtime.processes.lock().await.is_empty(),
+            !matches_current_batch
+        );
+        held.release().await;
+        runtime.request_exit().await;
+        runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
+    }
+}

@@ -105,20 +105,28 @@ pub fn fence_snapshot(
     aborted: &[ScopeMember],
     active: &std::collections::HashMap<String, String>,
 ) {
-    snapshot.active_processes.retain(|thread, _| {
-        !aborted.iter().any(|member| {
-            &member.pid == thread
+    let fenced = |pid: &str| {
+        aborted.iter().any(|member| {
+            member.pid == pid
                 && active
-                    .get(thread)
+                    .get(pid)
                     .is_none_or(|invocation| invocation == &member.invocation_id)
         })
-    });
+    };
+    snapshot.active_processes.retain(|pid, _| !fenced(pid));
     for envelopes in snapshot
         .drained_envelopes
         .values_mut()
         .chain(snapshot.agent_drained_envelopes.values_mut())
     {
         envelopes.retain(|envelope| {
+            // Resume has no invocation reply_to. Preserve a newer execution's
+            // decision here; recovery checks its approval batch before replay.
+            if matches!(&envelope.body, crate::agent::EnvelopeBody::Resume(_))
+                && fenced(envelope.to.pid.as_ref())
+            {
+                return false;
+            }
             !aborted.iter().any(|member| {
                 envelope.id == member.invocation_id
                     || envelope.reply_to.as_ref() == Some(&member.invocation_id)
