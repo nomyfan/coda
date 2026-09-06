@@ -118,17 +118,17 @@ pub trait SessionStorage: Send + Sync {
         _identity: crate::execution::ExecutionIdentity,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        self.save_checkpoint(checkpoint.thread_id.clone(), checkpoint)
+        self.save_checkpoint(checkpoint.pid.clone(), checkpoint)
     }
 
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>>;
 
     /// Load every checkpoint in this session that is waiting for tool approval.
@@ -188,17 +188,17 @@ impl SessionStorage for Arc<dyn SessionStorage> {
 
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        (**self).save_checkpoint(thread_id, checkpoint)
+        (**self).save_checkpoint(pid, checkpoint)
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
-        (**self).load_checkpoint(thread_id)
+        (**self).load_checkpoint(pid)
     }
 
     fn load_pending_approval_checkpoints(
@@ -235,7 +235,7 @@ pub struct MemoryStorage {
 
 impl MemoryStorage {
     async fn record_task_reads(&self, checkpoint: &StoredCheckpoint, stored_count: usize) {
-        if checkpoint.parent_thread_id.is_some() {
+        if checkpoint.parent_pid.is_some() {
             return;
         }
         let mut receipts = self.notice_receipts.lock().await;
@@ -248,12 +248,12 @@ impl MemoryStorage {
         }
     }
 
-    /// Every checkpoint written so far, sorted by thread id. For assertions
-    /// about a session as a whole (its thread tree), where the caller cannot
-    /// name the threads up front because their ids are derived.
+    /// Every checkpoint written so far, sorted by process id. For assertions
+    /// about a session as a whole (its process tree), where the caller cannot
+    /// name the processes up front because their ids are derived.
     pub async fn all_checkpoints(&self) -> Vec<StoredCheckpoint> {
         let mut checkpoints: Vec<_> = self.checkpoints.lock().await.values().cloned().collect();
-        checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+        checkpoints.sort_by(|a, b| a.pid.cmp(&b.pid));
         checkpoints
     }
 
@@ -265,10 +265,10 @@ impl MemoryStorage {
         let mut current = checkpoint;
         let mut visited = std::collections::HashSet::new();
         loop {
-            if current.thread_id == session_id {
+            if current.pid == session_id {
                 return true;
             }
-            let Some(parent_id) = current.parent_thread_id.as_ref() else {
+            let Some(parent_id) = current.parent_pid.as_ref() else {
                 return false;
             };
             if parent_id == session_id {
@@ -301,7 +301,7 @@ impl SessionStorage for MemoryStorage {
             let mut checkpoints = self.checkpoints.lock().await;
             let mut receipts = self.notice_receipts.lock().await;
             if receipts.insert(task_id) {
-                checkpoints.insert(checkpoint.thread_id.clone(), checkpoint);
+                checkpoints.insert(checkpoint.pid.clone(), checkpoint);
             }
             Ok(())
         })
@@ -337,15 +337,15 @@ impl SessionStorage for MemoryStorage {
                 .aborted
                 .lock()
                 .await
-                .contains(&(identity.thread_id.clone(), identity.invocation_id))
+                .contains(&(identity.pid.clone(), identity.invocation_id))
             {
                 return Err("execution was aborted".into());
             }
             let stored_count = checkpoints
-                .get(&identity.thread_id)
+                .get(&identity.pid)
                 .map_or(0, |cp| cp.messages.len());
             self.record_task_reads(&checkpoint, stored_count).await;
-            checkpoints.insert(identity.thread_id, checkpoint);
+            checkpoints.insert(identity.pid, checkpoint);
             Ok(())
         })
     }
@@ -359,8 +359,8 @@ impl SessionStorage for MemoryStorage {
             let mut snapshots = self.snapshots.lock().await;
             let mut aborted = self.aborted.lock().await;
             for member in &scope.members {
-                aborted.insert((member.thread_id.clone(), member.invocation_id.clone()));
-                if let Some(checkpoint) = checkpoints.get_mut(&member.thread_id)
+                aborted.insert((member.pid.clone(), member.invocation_id.clone()));
+                if let Some(checkpoint) = checkpoints.get_mut(&member.pid)
                     && checkpoint.active_execution.as_ref().is_some_and(|e| {
                         e.background_task() == Some(&scope.task_id)
                             && e.invocation_id == member.invocation_id
@@ -388,27 +388,25 @@ impl SessionStorage for MemoryStorage {
 
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             let mut checkpoints = self.checkpoints.lock().await;
-            let stored_count = checkpoints
-                .get(&thread_id)
-                .map_or(0, |cp| cp.messages.len());
+            let stored_count = checkpoints.get(&pid).map_or(0, |cp| cp.messages.len());
             self.record_task_reads(&checkpoint, stored_count).await;
-            checkpoints.insert(thread_id, checkpoint);
+            checkpoints.insert(pid, checkpoint);
             Ok(())
         })
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
-        let thread_id = thread_id.to_owned();
+        let pid = pid.to_owned();
         Box::pin(async move {
-            let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
+            let checkpoint = self.checkpoints.lock().await.get(&pid).cloned();
             Ok(checkpoint)
         })
     }
@@ -434,7 +432,7 @@ impl SessionStorage for MemoryStorage {
                 })
                 .cloned()
                 .collect();
-            checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+            checkpoints.sort_by(|a, b| a.pid.cmp(&b.pid));
             Ok(checkpoints)
         })
     }
@@ -452,8 +450,8 @@ impl SessionStorage for MemoryStorage {
                 .lock()
                 .await
                 .iter()
-                .map(|(thread_id, invocation_id)| coda_core::task::ScopeMember {
-                    thread_id: thread_id.clone(),
+                .map(|(pid, invocation_id)| coda_core::task::ScopeMember {
+                    pid: pid.clone(),
                     invocation_id: invocation_id.clone(),
                 })
                 .collect();
@@ -514,27 +512,27 @@ impl ExitBarrier {
 pub struct ProcessRuntimeSnapshot {
     pub drained_envelopes: HashMap<String, Vec<Envelope>>,
     pub agent_drained_envelopes: HashMap<String, Vec<Envelope>>,
-    /// Thread id → agent name for drivers that exited with unfinished work.
-    pub active_threads: HashMap<String, String>,
+    /// Process id → agent name for drivers that exited with unfinished work.
+    pub active_processes: HashMap<String, String>,
 }
 
-/// A caller's answer to one agent's pending approval, addressed to the thread
+/// A caller's answer to one agent's pending approval, addressed to the process
 /// that is actually parked on it.
 ///
-/// The thread comes from the *checkpoint* that holds the `PendingApproval`, not
+/// The process comes from the *checkpoint* that holds the `PendingApproval`, not
 /// from the runtime snapshot: the snapshot is written when an agent exits, so it
 /// is missing entirely for a session that was killed mid-approval or minted by a
 /// fork. Routing a decision through the snapshot dropped it on the floor in
-/// exactly those cases, leaving the thread suspended forever.
+/// exactly those cases, leaving the process suspended forever.
 pub(crate) struct ResumeTarget {
     pub agent_name: String,
-    pub thread_id: ProcessId,
+    pub pid: ProcessId,
     pub decision: ResumeDecision,
 }
 
-/// Every envelope [`ProcessRuntime::bootstrap`] is about to put back. Within an
-/// thread, inbox contents precede messages captured during the final drain;
-/// thread ids are sorted to keep recovery validation deterministic.
+/// Every envelope [`ProcessRuntime::bootstrap`] is about to put back. Within a
+/// process, inbox contents precede messages captured during the final drain;
+/// process ids are sorted to keep recovery validation deterministic.
 fn replayed_envelopes(snapshot: &ProcessRuntimeSnapshot) -> Vec<&Envelope> {
     let mut names: Vec<&String> = snapshot
         .agent_drained_envelopes
@@ -556,7 +554,7 @@ fn replayed_envelopes(snapshot: &ProcessRuntimeSnapshot) -> Vec<&Envelope> {
         .collect()
 }
 
-/// The turn a stored thread was last working on.
+/// The turn a stored process was last working on.
 fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
     checkpoint.messages.last().map(|entry| entry.turn_id)
 }
@@ -564,7 +562,7 @@ fn last_turn(checkpoint: &StoredCheckpoint) -> Option<TurnId> {
 /// Throw away the replayed envelopes their recipient is no longer waiting for.
 ///
 /// Nothing rewrites a snapshot until an agent exits, so a second crash hands
-/// back envelopes the first recovery already delivered. The thread drops such
+/// back envelopes the first recovery already delivered. The process drops such
 /// an answer on arrival — but only after it has restored the finished turn the
 /// answer names, leaving that turn on the books with nothing to end it.
 fn drop_stale_envelopes(
@@ -577,8 +575,8 @@ fn drop_stale_envelopes(
         .chain(snapshot.drained_envelopes.iter_mut())
     {
         envelopes.retain(|envelope| {
-            // Whether the thread this envelope is addressed to is still waiting for it. A
-            // thread with no checkpoint at all is not: it has no state to take an answer
+            // Whether the process this envelope is addressed to is still waiting for it. A
+            // process with no checkpoint at all is not: it has no state to take an answer
             // into.
             //
             // Answers are matched by the envelope that carried the call out: a `call_id`
@@ -587,7 +585,7 @@ fn drop_stale_envelopes(
             let awaited = match (
                 &envelope.body,
                 checkpoints
-                    .get(envelope.to.thread_id.as_ref())
+                    .get(envelope.to.pid.as_ref())
                     .map(|checkpoint| &checkpoint.resume_point),
             ) {
                 // These carry the work they open, so nothing has to be waiting for them.
@@ -624,7 +622,7 @@ type DriverFactory = Arc<
 #[derive(Clone)]
 pub(crate) struct ProcessRuntime {
     session_id: String,
-    /// Drivers are addressed by thread, including concurrent calls to one agent.
+    /// Drivers are addressed by process, including concurrent calls to one agent.
     processes: Arc<Mutex<HashMap<String, ProcessHandle>>>,
     process_tasks: Arc<std::sync::Mutex<JoinSet<String>>>,
     programs: Arc<HashMap<String, Arc<Program>>>,
@@ -693,26 +691,26 @@ impl ProcessRuntime {
         }
     }
 
-    /// The session's root thread, the only one whose turn endings end the turn
-    /// itself — a sub-agent thread finishes its own work many times within one.
-    pub(crate) fn is_root_process(&self, thread_id: &ProcessId) -> bool {
-        thread_id.as_ref() == self.session_id
+    /// The session's root process, the only one whose turn endings end the turn
+    /// itself — a sub-agent process finishes its own work many times within one.
+    pub(crate) fn is_root_process(&self, pid: &ProcessId) -> bool {
+        pid.as_ref() == self.session_id
     }
 
-    /// Whether the turn a parked thread belongs to has been asked to stop. Its
+    /// Whether the turn a parked process belongs to has been asked to stop. Its
     /// own agent cannot answer this — it is sitting idle with no turn in hand —
-    /// so the thread's last stored message names the turn instead.
-    pub(crate) async fn process_turn_cancelled(&self, thread_id: &ProcessId) -> bool {
-        match self.turn_of_process(thread_id.as_ref()).await {
+    /// so the process's last stored message names the turn instead.
+    pub(crate) async fn process_turn_cancelled(&self, pid: &ProcessId) -> bool {
+        match self.turn_of_process(pid.as_ref()).await {
             Some(turn) => self.turn_gate.is_cancelled(turn),
             None => false,
         }
     }
 
-    /// Ask a named turn to stop when a thread receives overlapping internal
+    /// Ask a named turn to stop when a process receives overlapping internal
     /// work it cannot safely start yet.
     ///
-    /// The broadcast matters as much as the mark: a thread parked on an
+    /// The broadcast matters as much as the mark: a process parked on an
     /// approval has no envelope coming to wake it, so without a nudge it would
     /// sit there while the turn it belongs to waits to be wound up.
     pub(crate) async fn cancel_turn(&self, turn: TurnId) {
@@ -720,22 +718,22 @@ impl ProcessRuntime {
         self.request_abort().await;
     }
 
-    async fn checkpoint_of(&self, thread_id: &str) -> Option<StoredCheckpoint> {
+    async fn checkpoint_of(&self, pid: &str) -> Option<StoredCheckpoint> {
         self.session_storage
-            .load_checkpoint(thread_id)
+            .load_checkpoint(pid)
             .await
             .ok()
             .flatten()
     }
 
-    /// The turn a stored thread was last working on, or `None` if it has no
+    /// The turn a stored process was last working on, or `None` if it has no
     /// history to name one.
-    async fn turn_of_process(&self, thread_id: &str) -> Option<TurnId> {
-        last_turn(&self.checkpoint_of(thread_id).await?)
+    async fn turn_of_process(&self, pid: &str) -> Option<TurnId> {
+        last_turn(&self.checkpoint_of(pid).await?)
     }
 
     /// The stored checkpoints recovery has to consult, loaded once each — one
-    /// thread can be named by the active-thread map and by several envelopes at
+    /// process can be named by the active-process map and by several envelopes at
     /// once. Only the recipients of answers are consulted: a `Task` or
     /// `ToolCall` is judged by what it carries, not by the state it lands in.
     ///
@@ -747,7 +745,7 @@ impl ProcessRuntime {
         snapshot: &ProcessRuntimeSnapshot,
     ) -> Result<HashMap<String, StoredCheckpoint>, String> {
         let mut consulted: Vec<String> = snapshot
-            .active_threads
+            .active_processes
             .keys()
             .cloned()
             .chain(
@@ -759,21 +757,21 @@ impl ProcessRuntime {
                             EnvelopeBody::Reply { .. } | EnvelopeBody::Resume(_)
                         )
                     })
-                    .map(|envelope| envelope.to.thread_id.as_ref().to_string()),
+                    .map(|envelope| envelope.to.pid.as_ref().to_string()),
             )
             .collect();
         consulted.sort_unstable();
         consulted.dedup();
 
         let mut checkpoints = HashMap::with_capacity(consulted.len());
-        for thread_id in consulted {
+        for pid in consulted {
             let loaded = self
                 .session_storage
-                .load_checkpoint(&thread_id)
+                .load_checkpoint(&pid)
                 .await
-                .map_err(|err| format!("failed to load checkpoint for {thread_id}: {err}"))?;
+                .map_err(|err| format!("failed to load checkpoint for {pid}: {err}"))?;
             if let Some(checkpoint) = loaded {
-                checkpoints.insert(thread_id, checkpoint);
+                checkpoints.insert(pid, checkpoint);
             }
         }
         Ok(checkpoints)
@@ -784,14 +782,14 @@ impl ProcessRuntime {
     /// restart has to find the turn, and internal inbox arbitration has to find
     /// the calls.
     ///
-    /// Only work that will really run counts: threads the snapshot parked
+    /// Only work that will really run counts: processes the snapshot parked
     /// mid-turn, and envelopes about to be replayed. A turn nothing will pick up
     /// again must stay out of the active slot, or the session would reject new
     /// work forever.
     ///
     /// The call ledger is rebuilt by the rule that keeps it balanced: register
     /// one obligation for every [`CallLedger::end`] still to come. Those are a
-    /// reply already in flight, a thread whose stored checkpoint still names a
+    /// reply already in flight, a process whose stored checkpoint still names a
     /// reply target, and a dispatched call its recipient has not picked up yet.
     /// Replayed envelopes go straight into an agent's inbox rather than through
     /// [`Self::send_message`], so this is the only place that can record them.
@@ -800,17 +798,17 @@ impl ProcessRuntime {
         snapshot: &ProcessRuntimeSnapshot,
         checkpoints: &HashMap<String, StoredCheckpoint>,
     ) -> Result<(), String> {
-        // Active threads and replayed envelopes are independent evidence for
+        // Active processes and replayed envelopes are independent evidence for
         // the same turn; `TurnGate::restore` verifies that they agree.
-        for thread_id in snapshot.active_threads.keys() {
-            let Some(checkpoint) = checkpoints.get(thread_id) else {
+        for pid in snapshot.active_processes.keys() {
+            let Some(checkpoint) = checkpoints.get(pid) else {
                 continue;
             };
             if let Some(turn) = last_turn(checkpoint) {
                 self.turn_gate.restore(turn)?;
             }
             // A stored reply target outlives only an unanswered call: it is
-            // taken before the checkpoint that precedes the reply, so a thread
+            // taken before the checkpoint that precedes the reply, so a process
             // that already answered has none.
             if checkpoint
                 .active_execution
@@ -818,7 +816,7 @@ impl ProcessRuntime {
                 .and_then(|e| e.reply_target())
                 .is_some()
             {
-                self.calls.begin(&ProcessId::from(thread_id.clone()));
+                self.calls.begin(&ProcessId::from(pid.clone()));
             }
         }
         let replayed = replayed_envelopes(snapshot);
@@ -829,24 +827,24 @@ impl ProcessRuntime {
                 }
                 EnvelopeBody::ToolCall { turn_id, .. } => {
                     self.turn_gate.restore(*turn_id)?;
-                    self.calls.begin(&envelope.to.thread_id);
+                    self.calls.begin(&envelope.to.pid);
                 }
                 EnvelopeBody::Reply { .. } => {
                     if let Some(turn) = checkpoints
-                        .get(envelope.to.thread_id.as_ref())
+                        .get(envelope.to.pid.as_ref())
                         .and_then(last_turn)
                     {
                         self.turn_gate.restore(turn)?;
                     }
                     // An answer nobody has taken yet still settles an obligation
                     // when its caller does take it.
-                    if let Sender::Agent { thread_id, .. } = &envelope.from {
-                        self.calls.begin(thread_id);
+                    if let Sender::Agent { pid, .. } = &envelope.from {
+                        self.calls.begin(pid);
                     }
                 }
                 EnvelopeBody::Resume(_) => {
                     if let Some(turn) = checkpoints
-                        .get(envelope.to.thread_id.as_ref())
+                        .get(envelope.to.pid.as_ref())
                         .and_then(last_turn)
                     {
                         self.turn_gate.restore(turn)?;
@@ -860,13 +858,13 @@ impl ProcessRuntime {
     /// Put back the turn and outstanding reply each decision-routed resume is
     /// about to continue.
     ///
-    /// [`Self::register_resumed_work`] sees only threads the snapshot named, and
+    /// [`Self::register_resumed_work`] sees only processes the snapshot named, and
     /// the sessions this routing exists for — killed mid-approval, or minted by
     /// a fork — have no snapshot naming them. Left out of the active slot, the
     /// resumed work would run outside single-flight: a task submitted alongside
     /// it would open a second turn, and an abort would find nothing to mark.
     ///
-    /// Bootstrap removes these agents from `snapshot.active_threads` first, so
+    /// Bootstrap removes these agents from `snapshot.active_processes` first, so
     /// this path also restores the reply obligation that snapshot recovery
     /// would otherwise have registered for a sub-agent.
     async fn restore_resumed_turns(
@@ -874,13 +872,13 @@ impl ProcessRuntime {
         resume_targets: &HashMap<String, ResumeTarget>,
     ) -> Result<(), String> {
         for target in resume_targets.values() {
-            let thread_id = target.thread_id.as_ref();
+            let pid = target.pid.as_ref();
             let checkpoint = self
                 .session_storage
-                .load_checkpoint(thread_id)
+                .load_checkpoint(pid)
                 .await
-                .map_err(|err| format!("failed to load checkpoint for {thread_id}: {err}"))?
-                .ok_or_else(|| format!("missing checkpoint for resumed thread {thread_id}"))?;
+                .map_err(|err| format!("failed to load checkpoint for {pid}: {err}"))?
+                .ok_or_else(|| format!("missing checkpoint for resumed thread {pid}"))?;
             if let Some(turn) = last_turn(&checkpoint) {
                 self.turn_gate.restore(turn)?;
             }
@@ -890,7 +888,7 @@ impl ProcessRuntime {
                 .and_then(|e| e.reply_target())
                 .is_some()
             {
-                self.calls.begin(&target.thread_id);
+                self.calls.begin(&target.pid);
             }
         }
         Ok(())
@@ -902,12 +900,12 @@ impl ProcessRuntime {
     pub(crate) async fn emit_event(
         &self,
         agent_name: String,
-        thread_id: ProcessId,
+        pid: ProcessId,
         turn_id: TurnId,
         event: AgentEvent,
     ) {
         let task = self
-            .execution(&thread_id)
+            .execution(&pid)
             .and_then(|e| e.background_task().cloned());
         if let AgentEvent::Suspended(approval) = &event {
             let mut state = self.executions.lock().expect("executions");
@@ -918,7 +916,7 @@ impl ProcessRuntime {
                 return;
             }
             state.approvals.insert(
-                (approval.thread_id.clone(), approval.parent_message_id),
+                (approval.pid.clone(), approval.parent_message_id),
                 approval.clone(),
             );
         }
@@ -930,7 +928,7 @@ impl ProcessRuntime {
                 let keys: Vec<_> = state
                     .approvals
                     .keys()
-                    .filter(|(thread, _)| thread == thread_id.as_ref())
+                    .filter(|(thread, _)| thread == pid.as_ref())
                     .cloned()
                     .collect();
                 keys.into_iter()
@@ -940,10 +938,10 @@ impl ProcessRuntime {
             for approval in removed {
                 let _ = self.global_event_tx.send((
                     agent_name.clone(),
-                    thread_id.clone(),
+                    pid.clone(),
                     turn_id,
                     AgentEvent::ApprovalRemoved {
-                        thread_id: approval.thread_id,
+                        pid: approval.pid,
                         parent_message_id: approval.parent_message_id,
                         task_id: approval.task_id,
                     },
@@ -958,7 +956,7 @@ impl ProcessRuntime {
                 AgentEvent::PersistFailed(message) => {
                     let _ = self.global_event_tx.send((
                         agent_name,
-                        thread_id,
+                        pid,
                         turn_id,
                         AgentEvent::BackgroundError {
                             task_id: task_id.clone(),
@@ -971,15 +969,13 @@ impl ProcessRuntime {
                 _ => return,
             }
         }
-        let _ = self
-            .global_event_tx
-            .send((agent_name, thread_id, turn_id, event));
+        let _ = self.global_event_tx.send((agent_name, pid, turn_id, event));
     }
 
     /// Start the agents, putting back whatever the snapshot left mid-flight and
     /// whatever the caller's resume decisions answer.
     ///
-    /// Reports whether any of it will actually run — a thread to resume or an
+    /// Reports whether any of it will actually run — a process to resume or an
     /// envelope to replay. Only known here, once recovery has thrown out what
     /// nothing will pick up again.
     pub(crate) async fn bootstrap(
@@ -997,7 +993,7 @@ impl ProcessRuntime {
                     let config = config.resolve(&name);
                     let factory: DriverFactory =
                         Arc::new(move |runtime, process, active, decision, control, inbox| {
-                            let thread_id = process.pid.clone();
+                            let pid = process.pid.clone();
                             let config = config.clone();
                             Box::pin(async move {
                                 driver::run_process(
@@ -1009,7 +1005,7 @@ impl ProcessRuntime {
                                     config,
                                 )
                                 .await;
-                                thread_id.0
+                                pid.0
                             })
                         });
                     (name, factory)
@@ -1020,7 +1016,7 @@ impl ProcessRuntime {
         let mut resuming = !resume_targets.is_empty();
         if let Some(snapshot) = snapshot.as_mut() {
             snapshot
-                .active_threads
+                .active_processes
                 .retain(|_, name| self.driver_factories.contains_key(name));
             for envelopes in snapshot
                 .agent_drained_envelopes
@@ -1030,7 +1026,7 @@ impl ProcessRuntime {
                 envelopes.retain(|envelope| self.driver_factories.contains_key(&envelope.to.name));
             }
             for target in resume_targets.values() {
-                snapshot.active_threads.remove(target.thread_id.as_ref());
+                snapshot.active_processes.remove(target.pid.as_ref());
             }
             let checkpoints = self.recovery_checkpoints(snapshot).await?;
             if checkpoints.values().any(|checkpoint| {
@@ -1044,23 +1040,23 @@ impl ProcessRuntime {
             drop_stale_envelopes(snapshot, &checkpoints);
             self.register_resumed_work(snapshot, &checkpoints)?;
             resuming |=
-                !snapshot.active_threads.is_empty() || !replayed_envelopes(snapshot).is_empty();
+                !snapshot.active_processes.is_empty() || !replayed_envelopes(snapshot).is_empty();
         }
         self.restore_resumed_turns(&resume_targets).await?;
         let snapshot = snapshot.unwrap_or_default();
-        let mut threads = snapshot.active_threads.clone();
+        let mut threads = snapshot.active_processes.clone();
         let mut inboxes: HashMap<String, Vec<Envelope>> = HashMap::new();
         for envelope in replayed_envelopes(&snapshot) {
-            let thread = envelope.to.thread_id.as_ref().to_owned();
+            let thread = envelope.to.pid.as_ref().to_owned();
             threads.insert(thread.clone(), envelope.to.name.clone());
             inboxes.entry(thread).or_default().push(envelope.clone());
         }
         for target in resume_targets.values() {
-            threads.insert(target.thread_id.0.clone(), target.agent_name.clone());
+            threads.insert(target.pid.0.clone(), target.agent_name.clone());
         }
         for (thread, name) in threads {
             let target = resume_targets.remove(&thread);
-            let active = target.is_some() || snapshot.active_threads.contains_key(&thread);
+            let active = target.is_some() || snapshot.active_processes.contains_key(&thread);
             let envelopes = inboxes.remove(&thread).unwrap_or_default();
             self.start_driver(
                 &name,
@@ -1092,7 +1088,7 @@ impl ProcessRuntime {
 
     /// Cancel whatever is running without marking any turn.
     ///
-    /// This is teardown, not the user taking a turn back: a thread parked on an
+    /// This is teardown, not the user taking a turn back: a process parked on an
     /// approval stays parked, so the pending decision survives into the next
     /// process instead of being written off on the way out.
     pub(crate) async fn cancel_in_flight(&self) {
@@ -1169,17 +1165,17 @@ impl ProcessRuntime {
             }
             return Err(SendCommandError::ChannelClosed);
         }
-        let dispatched = matches!(envelope.body, EnvelopeBody::ToolCall { .. })
-            .then(|| envelope.to.thread_id.clone());
-        if let Some(thread_id) = &dispatched
-            && !self.calls.try_begin(thread_id)
+        let dispatched =
+            matches!(envelope.body, EnvelopeBody::ToolCall { .. }).then(|| envelope.to.pid.clone());
+        if let Some(pid) = &dispatched
+            && !self.calls.try_begin(pid)
         {
             return Err(SendCommandError::ThreadBusy);
         }
         if let EnvelopeBody::Resume(decision) = &envelope.body {
             let removed = {
                 let mut state = self.executions.lock().expect("executions");
-                let key = (envelope.to.thread_id.0.clone(), decision.parent_message_id);
+                let key = (envelope.to.pid.0.clone(), decision.parent_message_id);
                 let approval = state
                     .approvals
                     .get(&key)
@@ -1194,7 +1190,7 @@ impl ProcessRuntime {
                 }
                 if state
                     .processes
-                    .get(envelope.to.thread_id.as_ref())
+                    .get(envelope.to.pid.as_ref())
                     .is_some_and(|e| e.cancel.is_cancelled())
                 {
                     return Err(SendCommandError::ScopeClosed);
@@ -1206,15 +1202,15 @@ impl ProcessRuntime {
                     self.refresh_approval_status(id).await;
                 }
                 let turn = self
-                    .turn_of_process(&approval.thread_id)
+                    .turn_of_process(&approval.pid)
                     .await
                     .unwrap_or_else(|| TurnId::from(decision.parent_message_id));
                 self.emit_event(
                     approval.agent_name,
-                    envelope.to.thread_id.clone(),
+                    envelope.to.pid.clone(),
                     turn,
                     AgentEvent::ApprovalRemoved {
-                        thread_id: approval.thread_id,
+                        pid: approval.pid,
                         parent_message_id: approval.parent_message_id,
                         task_id: approval.task_id,
                     },
@@ -1225,13 +1221,13 @@ impl ProcessRuntime {
         let sent = match self.register_execution(&envelope) {
             Ok(()) => {
                 if matches!(envelope.body, EnvelopeBody::ToolCall { .. })
-                    && let Some(execution) = self.execution(&envelope.to.thread_id)
+                    && let Some(execution) = self.execution(&envelope.to.pid)
                     && let Some(id) = execution.background_task()
                     && let Err(error) = self.persist_group_members(id).await
                 {
                     self.checkpoint_failed(
                         crate::execution::ExecutionIdentity {
-                            thread_id: envelope.to.thread_id.0.clone(),
+                            pid: envelope.to.pid.0.clone(),
                             invocation_id: execution.invocation_id.clone(),
                         },
                         error,
@@ -1246,28 +1242,28 @@ impl ProcessRuntime {
             if let Some(turn) = opened {
                 self.turn_gate.close(turn);
             }
-            if let Some(thread_id) = &dispatched {
-                self.calls.end(thread_id);
+            if let Some(pid) = &dispatched {
+                self.calls.end(pid);
             }
         }
         sent
     }
 
-    async fn retire_foreground_driver(&self, agent_name: &str, thread_id: &ProcessId) {
-        self.save_process_snapshot(agent_name.into(), thread_id.clone(), vec![], false)
+    async fn retire_foreground_driver(&self, agent_name: &str, pid: &ProcessId) {
+        self.save_process_snapshot(agent_name.into(), pid.clone(), vec![], false)
             .await;
-        self.processes.lock().await.remove(thread_id.as_ref());
+        self.processes.lock().await.remove(pid.as_ref());
         self.executions
             .lock()
             .expect("executions")
             .processes
-            .remove(thread_id.as_ref());
+            .remove(pid.as_ref());
     }
 
     async fn start_driver(
         &self,
         name: &str,
-        thread_id: ProcessId,
+        pid: ProcessId,
         active: bool,
         decision: Option<ResumeDecision>,
         envelopes: Vec<Envelope>,
@@ -1281,7 +1277,7 @@ impl ProcessRuntime {
             }
         }
         let mut handles = self.processes.lock().await;
-        if let Some(handle) = handles.get(thread_id.as_ref()) {
+        if let Some(handle) = handles.get(pid.as_ref()) {
             return Ok(handle.clone());
         }
         let factory = self
@@ -1298,7 +1294,7 @@ impl ProcessRuntime {
         let (finished_tx, finished) = tokio::sync::watch::channel(false);
         let work = factory(
             self.clone(),
-            Process::new(thread_id.clone(), self.programs[name].clone()),
+            Process::new(pid.clone(), self.programs[name].clone()),
             active,
             decision,
             control,
@@ -1319,7 +1315,7 @@ impl ProcessRuntime {
             abort,
             finished,
         };
-        handles.insert(thread_id.0.clone(), handle.clone());
+        handles.insert(pid.0.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -1332,7 +1328,7 @@ impl ProcessRuntime {
             }
             if self.exit_barrier.is_exiting() {
                 drop(reservation);
-                let receiver = envelope.to.thread_id.0.clone();
+                let receiver = envelope.to.pid.0.clone();
                 let mut snapshot = self.snapshot.lock().await;
                 snapshot
                     .drained_envelopes
@@ -1355,7 +1351,7 @@ impl ProcessRuntime {
             let handle = self
                 .start_driver(
                     &envelope.to.name,
-                    envelope.to.thread_id.clone(),
+                    envelope.to.pid.clone(),
                     false,
                     None,
                     vec![],
@@ -1380,31 +1376,29 @@ impl ProcessRuntime {
     pub(crate) async fn save_process_snapshot(
         &self,
         agent_name: String,
-        driver_thread: ProcessId,
+        driver_pid: ProcessId,
         envelopes: Vec<Envelope>,
         active: bool,
     ) {
         if self
-            .execution(&driver_thread)
+            .execution(&driver_pid)
             .is_some_and(|e| e.background_task().is_some())
-            && self.execution_stopped(&driver_thread)
+            && self.execution_stopped(&driver_pid)
         {
             return;
         }
         let mut snapshot = self.snapshot.lock().await;
         if envelopes.is_empty() {
-            snapshot
-                .agent_drained_envelopes
-                .remove(driver_thread.as_ref());
+            snapshot.agent_drained_envelopes.remove(driver_pid.as_ref());
         } else {
             snapshot
                 .agent_drained_envelopes
-                .insert(driver_thread.0.clone(), envelopes);
+                .insert(driver_pid.0.clone(), envelopes);
         }
         if active {
-            snapshot.active_threads.insert(driver_thread.0, agent_name);
+            snapshot.active_processes.insert(driver_pid.0, agent_name);
         } else {
-            snapshot.active_threads.remove(driver_thread.as_ref());
+            snapshot.active_processes.remove(driver_pid.as_ref());
         }
         if let Err(err) = self
             .session_storage

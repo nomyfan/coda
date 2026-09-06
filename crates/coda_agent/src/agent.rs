@@ -45,20 +45,20 @@ pub enum ToolCallResolution {
 pub struct ResumeDecision {
     /// The batch being answered, echoed from
     /// [`PendingApproval::parent_message_id`]. A decision naming a batch the
-    /// thread has already run is stale and is ignored rather than applied to
+    /// process has already run is stale and is ignored rather than applied to
     /// whatever is parked now.
     pub parent_message_id: MessageId,
     pub resolutions: Vec<(String, ToolCallResolution)>,
 }
 
-/// Lightweight view of an agent thread waiting for approval.
+/// Lightweight view of an agent process waiting for approval.
 ///
 /// This is the public-facing type returned via [`AgentEvent::Suspended`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub task_id: Option<coda_core::task::TaskId>,
     pub agent_path: Vec<String>,
-    pub thread_id: String,
+    pub pid: String,
     pub agent_name: String,
     /// The assistant message that asked for these calls, which is what
     /// identifies the batch. A `call_id` cannot: it is only unique within one
@@ -72,7 +72,7 @@ pub struct PendingApproval {
 pub struct ReplyTarget {
     pub envelope_id: String,
     pub sender_name: String,
-    pub sender_thread_id: String,
+    pub sender_pid: String,
     pub call_id: String,
 }
 
@@ -144,10 +144,10 @@ pub enum ResumePoint {
 /// Tool state recorded by one message — see [`ThreadState`](coda_core::tool::ThreadState).
 pub type ThreadStateMap = BTreeMap<String, serde_json::Value>;
 
-/// One message in a thread's history, tagged with the turn it belongs to.
+/// One message in a process's history, tagged with the turn it belongs to.
 ///
 /// `turn_id` sits out here rather than inside `Message` for the same reason
-/// `thread_id` does: it describes where the message falls in the session's
+/// `pid` does: it describes where the message falls in the session's
 /// control flow, not what the message says. Keeping it out also means the
 /// provider adapter — which builds assistant messages and has no idea what a
 /// turn is — never has to supply it.
@@ -155,7 +155,7 @@ pub type ThreadStateMap = BTreeMap<String, serde_json::Value>;
 pub struct HistoryEntry {
     pub turn_id: TurnId,
     pub message: Message,
-    /// What the call recorded in this message wrote to the thread's tool state.
+    /// What the call recorded in this message wrote to the process's tool state.
     /// On the entry rather than in a list of its own, so a fork or a rewind
     /// reaches it by the rule that already moves messages.
     #[serde(default, skip_serializing_if = "ThreadStateMap::is_empty")]
@@ -188,13 +188,13 @@ pub enum Sender {
     /// Message from the user.
     User,
     /// Message from another agent.
-    Agent { name: String, thread_id: ProcessId },
+    Agent { name: String, pid: ProcessId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receiver {
     pub name: String,
-    pub thread_id: ProcessId,
+    pub pid: ProcessId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,12 +218,12 @@ pub enum EnvelopeBody {
     /// Call agent as a tool
     ToolCall {
         call_id: String,
-        /// The assistant message in the calling thread whose tool call this is.
+        /// The assistant message in the calling process whose tool call this is.
         /// Paired with `call_id` it forms the [`MessageOrigin`] the receiving
-        /// thread stamps on its opening message; only the parent id travels
+        /// process stamps on its opening message; only the parent id travels
         /// here, since `call_id` is already alongside it.
         parent_message_id: MessageId,
-        /// The name the caller derived the receiving thread's id from. Sent so
+        /// The name the caller derived the receiving process's id from. Sent so
         /// the receiver can record how it was addressed without re-deriving it
         /// (which would mean knowing the caller's mode for it).
         derivation_key: String,
@@ -237,7 +237,7 @@ pub enum EnvelopeBody {
     Reply {
         call_id: String,
         output: ToolOutput,
-        /// Whether the answering thread was interrupted rather than finishing
+        /// Whether the answering process was interrupted rather than finishing
         /// its work. Only the answerer knows this, and the caller needs it to
         /// record the call as aborted instead of merely failed.
         aborted: bool,
@@ -270,7 +270,7 @@ impl Envelope {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     ApprovalRemoved {
-        thread_id: String,
+        pid: String,
         parent_message_id: MessageId,
         task_id: Option<coda_core::task::TaskId>,
     },
@@ -292,7 +292,7 @@ pub enum AgentEvent {
     /// An auto-compaction's outcome: the summary it wrote, or the record of
     /// why it wrote none. Appended outside the normal message flow.
     CompactionEnd(CompactionMessage),
-    /// Emitted when tool calls require human approval. The agent thread exits
+    /// Emitted when tool calls require human approval. The agent process exits
     /// after this event. The caller should shut down the session, collect
     /// decisions, and open a new session with `resume_decisions` to continue.
     Suspended(PendingApproval),
@@ -448,7 +448,7 @@ pub struct ModelProfile<P> {
     /// Reasoning effort sent on each generation request. `None` leaves the
     /// provider default untouched; `Some("off")` turns thinking off.
     pub reasoning_effort: Option<String>,
-    /// The token count at which the root thread automatically compacts
+    /// The token count at which the root process automatically compacts
     /// context mid-turn. Already resolved by the caller — no default here.
     pub auto_compact_threshold_tokens: u32,
 }

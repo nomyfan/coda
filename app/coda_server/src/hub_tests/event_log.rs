@@ -18,7 +18,7 @@ fn tool_message(id: &str, text: &str) -> ToolMessage {
 fn llm_end(agent: &str, message: AssistantMessage) -> WireEvent {
     WireEvent::LlmEnd {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         message,
     }
 }
@@ -26,7 +26,7 @@ fn llm_end(agent: &str, message: AssistantMessage) -> WireEvent {
 fn tool_end(agent: &str, message: ToolMessage) -> WireEvent {
     WireEvent::ToolCallEnd {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         message,
     }
 }
@@ -34,7 +34,7 @@ fn tool_end(agent: &str, message: ToolMessage) -> WireEvent {
 fn chunk(agent: &str, text: &str) -> WireEvent {
     WireEvent::LlmContentChunk {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         content: text.into(),
     }
 }
@@ -205,7 +205,7 @@ fn settle_ignores_aborted_llm_end() {
     assert!(event_settles_turn(
         &WireEvent::Aborted {
             agent_name: "coda".into(),
-            thread_id: "t".into(),
+            pid: "t".into(),
             target: crate::wire::AbortedTargetWire::Generation,
         },
         "coda"

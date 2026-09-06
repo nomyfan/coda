@@ -57,7 +57,7 @@ pub enum SessionCommand {
     Resume {
         allow_patterns: Vec<(String, String)>,
         agent_name: String,
-        thread_id: String,
+        pid: String,
         decision: ResumeDecision,
     },
     /// Discard `target` and everything after it, then start a fresh turn from
@@ -1683,7 +1683,7 @@ impl SessionHub {
         entry: &Arc<SessionEntry>,
         state: &mut EntryState,
         agent_name: String,
-        thread_id: String,
+        pid: String,
         decision: ResumeDecision,
         allow_patterns: Vec<(String, String)>,
     ) -> CommandOutcome {
@@ -1693,7 +1693,7 @@ impl SessionHub {
             EntryPhase::Live(live) => {
                 let parent_message_id = decision.parent_message_id;
                 let Some(approval) = live.session.pending_approvals().into_iter().find(|a| {
-                    a.thread_id == thread_id
+                    a.pid == pid
                         && a.parent_message_id == parent_message_id
                         && a.agent_name == agent_name
                 }) else {
@@ -1713,7 +1713,7 @@ impl SessionHub {
                     })
                     .map(|(_, pattern)| pattern)
                     .collect();
-                if let Err(err) = live.session.resume(&agent_name, &thread_id, decision).await {
+                if let Err(err) = live.session.resume(&agent_name, &pid, decision).await {
                     warn!(workspace_id = %key.0, session_id = %key.1, "failed to resume: {err}");
                     return CommandOutcome::Ignored;
                 }
@@ -1723,17 +1723,16 @@ impl SessionHub {
                 if approval.task_id.is_none() {
                     live.turn_running = true;
                 }
-                live.pending_approvals.retain(|a| {
-                    a.thread_id != thread_id || a.parent_message_id != parent_message_id
-                });
+                live.pending_approvals
+                    .retain(|a| a.pid != pid || a.parent_message_id != parent_message_id);
                 CommandOutcome::Ok
             }
             EntryPhase::Pending(pending) => {
                 let Some(approval) = pending.approvals.iter().find(|a| {
-                    a.thread_id == thread_id
+                    a.pid == pid
                         && a.agent_name == agent_name
                         && a.parent_message_id == decision.parent_message_id
-                        && pending.needed.contains(&thread_id)
+                        && pending.needed.contains(&pid)
                 }) else {
                     return CommandOutcome::Ignored;
                 };
@@ -1760,8 +1759,8 @@ impl SessionHub {
                 if let Err(error) = self.opener.persist_allow_patterns(key, patterns).await {
                     warn!(%error, "could not persist accepted approval patterns");
                 }
-                pending.needed.remove(&thread_id);
-                pending.decisions.insert(thread_id, decision);
+                pending.needed.remove(&pid);
+                pending.decisions.insert(pid, decision);
                 if !pending.needed.is_empty() {
                     return CommandOutcome::Ok;
                 }
@@ -1791,10 +1790,7 @@ impl SessionHub {
                         CommandOutcome::Ok
                     }
                     Err(OpenError::PendingApprovalsRequired(more)) => {
-                        pending.needed = more
-                            .iter()
-                            .map(|approval| approval.thread_id.clone())
-                            .collect();
+                        pending.needed = more.iter().map(|approval| approval.pid.clone()).collect();
                         pending.approvals = more.clone();
                         CommandOutcome::StillPending(more)
                     }
@@ -1970,7 +1966,7 @@ impl SessionRelay for SessionHub {
                             reasoning_effort,
                             needed: approvals
                                 .iter()
-                                .map(|approval| approval.thread_id.clone())
+                                .map(|approval| approval.pid.clone())
                                 .collect(),
                             decisions: HashMap::new(),
                             approvals,
@@ -2090,18 +2086,11 @@ impl SessionRelay for SessionHub {
                 SessionCommand::Resume {
                     allow_patterns,
                     agent_name,
-                    thread_id,
+                    pid,
                     decision,
                 } => {
-                    self.handle_resume(
-                        &entry,
-                        state,
-                        agent_name,
-                        thread_id,
-                        decision,
-                        allow_patterns,
-                    )
-                    .await
+                    self.handle_resume(&entry, state, agent_name, pid, decision, allow_patterns)
+                        .await
                 }
                 SessionCommand::Rewind {
                     target,
@@ -2455,7 +2444,7 @@ fn compose_snapshot(
             pending_approvals: pending
                 .approvals
                 .iter()
-                .filter(|approval| pending.needed.contains(&approval.thread_id))
+                .filter(|approval| pending.needed.contains(&approval.pid))
                 .cloned()
                 .collect(),
             provider_id: pending.provider_id.clone(),
@@ -2702,20 +2691,18 @@ async fn run_forwarder(
                 }
                 if let Some(approval) = &suspended {
                     live.pending_approvals.retain(|a| {
-                        a.thread_id != approval.thread_id
-                            || a.parent_message_id != approval.parent_message_id
+                        a.pid != approval.pid || a.parent_message_id != approval.parent_message_id
                     });
                     live.pending_approvals.push(approval.clone());
                 }
                 if let WireEvent::ApprovalRemoved {
-                    thread_id,
+                    pid,
                     parent_message_id,
                     ..
                 } = &wire
                 {
-                    live.pending_approvals.retain(|a| {
-                        &a.thread_id != thread_id || &a.parent_message_id != parent_message_id
-                    });
+                    live.pending_approvals
+                        .retain(|a| &a.pid != pid || &a.parent_message_id != parent_message_id);
                 }
                 if event_settles_turn(&wire, &root_name) {
                     // `suspended` is moved by the match below; read before it.

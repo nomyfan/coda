@@ -53,7 +53,7 @@ impl TurnGate {
         Ok(())
     }
 
-    /// Restore one piece of evidence for an active turn. Several threads and
+    /// Restore one piece of evidence for an active turn. Several processes and
     /// envelopes may name the same turn; a different id violates single-flight.
     pub(super) fn restore(&self, turn: TurnId) -> Result<(), String> {
         let mut active = self.slot.lock().expect("active turn");
@@ -109,12 +109,12 @@ impl TurnGate {
     }
 }
 
-/// Calls dispatched to a thread that has not been answered yet, counted per
-/// thread.
+/// Calls dispatched to a process that has not been answered yet, counted per
+/// process.
 ///
 /// The count spans the whole obligation — from the call going out to the
 /// caller consuming the answer — rather than just the wait in the inbox. A
-/// thread that already took its envelope and is now itself waiting on a
+/// process that already took its envelope and is now itself waiting on a
 /// sub-agent of its own is still working, and treating it as gone is what
 /// would make a caller write its result for it.
 #[derive(Default)]
@@ -130,45 +130,45 @@ impl CallLedger {
             .remove(thread);
     }
 
-    pub(super) fn try_begin(&self, thread_id: &ProcessId) -> bool {
+    pub(super) fn try_begin(&self, pid: &ProcessId) -> bool {
         let mut unanswered = self.unanswered.lock().expect("unanswered calls");
-        if unanswered.contains_key(thread_id) {
+        if unanswered.contains_key(pid) {
             return false;
         }
-        unanswered.insert(thread_id.clone(), 1);
+        unanswered.insert(pid.clone(), 1);
         true
     }
 
-    /// Note that a call has gone out to `thread_id` and has not been answered.
-    pub(super) fn begin(&self, thread_id: &ProcessId) {
+    /// Note that a call has gone out to `pid` and has not been answered.
+    pub(super) fn begin(&self, pid: &ProcessId) {
         *self
             .unanswered
             .lock()
             .expect("unanswered calls")
-            .entry(thread_id.clone())
+            .entry(pid.clone())
             .or_insert(0) += 1;
     }
 
-    /// Note that one of `thread_id`'s callers has taken its answer.
-    pub(super) fn end(&self, thread_id: &ProcessId) {
+    /// Note that one of `pid`'s callers has taken its answer.
+    pub(super) fn end(&self, pid: &ProcessId) {
         let mut unanswered = self.unanswered.lock().expect("unanswered calls");
-        if let Some(count) = unanswered.get_mut(thread_id) {
+        if let Some(count) = unanswered.get_mut(pid) {
             *count -= 1;
             if *count == 0 {
-                unanswered.remove(thread_id);
+                unanswered.remove(pid);
             }
         }
     }
 
-    /// Whether this thread still owes somebody an answer in this process.
+    /// Whether this process still owes somebody an answer in this process.
     ///
     /// `false` means nothing here will ever produce that answer — the work went
     /// away with a previous process — and the caller is free to write the call
     /// off rather than wait forever.
-    pub(super) fn is_answering(&self, thread_id: &ProcessId) -> bool {
+    pub(super) fn is_answering(&self, pid: &ProcessId) -> bool {
         self.unanswered
             .lock()
             .expect("unanswered calls")
-            .contains_key(thread_id)
+            .contains_key(pid)
     }
 }

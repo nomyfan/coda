@@ -308,9 +308,9 @@ fn accepts_subagent_name_at_the_prefixed_tool_limit() {
 }
 
 /// A freshly built agent has run nothing, so it is in no turn — and asking
-/// must not start one. The driver asks on entry, before the thread's first
+/// must not start one. The driver asks on entry, before the process's first
 /// prompt has landed; answering by minting a turn both reported an
-/// invariant break that had not happened and left the thread stamped with
+/// invariant break that had not happened and left the process stamped with
 /// a turn no message belongs to.
 #[tokio::test]
 async fn a_fresh_agent_is_in_no_turn_and_asking_does_not_open_one() {

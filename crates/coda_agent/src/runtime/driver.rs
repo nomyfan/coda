@@ -76,9 +76,9 @@ pub(crate) async fn run_process(
         "Agent {} is running (model: {})",
         process.program.name, config.profile.label
     );
-    let thread_id = process.pid.clone();
+    let pid = process.pid.clone();
     let (mut active, resume_decision) = active;
-    // When a resume decision is provided alongside the active thread, turn it into
+    // When a resume decision is provided alongside the active process, turn it into
     // a Resume envelope for the first iteration so the process drops straight from
     // PendingApproval into ToolExecution without re-emitting `Suspended`.
     let mut pending_resume_envelope: Option<Envelope> = match (active, resume_decision) {
@@ -87,7 +87,7 @@ pub(crate) async fn run_process(
             from: Sender::User,
             to: Receiver {
                 name: process.program.name.clone(),
-                thread_id: thread_id.clone(),
+                pid: pid.clone(),
             },
             reply_to: None,
             body: EnvelopeBody::Resume(decision),
@@ -110,14 +110,14 @@ pub(crate) async fn run_process(
     // Envelopes this process refused because a turn was still winding up. They
     // keep their arrival order and go back in once it has.
     let mut deferred: VecDeque<Envelope> = VecDeque::new();
-    // The thread parked waiting on sub-agent answers, and the turn it is
+    // The process parked waiting on sub-agent answers, and the turn it is
     // waiting for. While one is set, only what arrives on the wire may reach
     // this process: replaying a held envelope would walk straight back into the
     // case that deferred it.
     let mut awaiting_replies: Option<TurnId> = None;
     loop {
         // First: if we have a queued resume envelope, run with it.
-        // Otherwise: if there's an active thread to continue, just run it without waiting for a new envelope.
+        // Otherwise: if there's an active process to continue, just run it without waiting for a new envelope.
         let envelope = if let Some(envelope) = pending_resume_envelope.take() {
             Some(envelope)
         } else if std::mem::take(&mut active) {
@@ -137,7 +137,7 @@ pub(crate) async fn run_process(
             let wind_up_limit = awaiting_replies
                 .as_ref()
                 .filter(|turn| {
-                    runtime.is_root_process(&thread_id) && runtime.turn_gate.is_cancelled(**turn)
+                    runtime.is_root_process(&pid) && runtime.turn_gate.is_cancelled(**turn)
                 })
                 .is_some();
 
@@ -160,7 +160,7 @@ pub(crate) async fn run_process(
                             // stopped — and no envelope is coming to wake it,
                             // since the user answered with an abort instead of
                             // a decision. Drive it back in so it can wind up.
-                            if suspended && runtime.process_turn_cancelled(&thread_id).await {
+                            if suspended && runtime.process_turn_cancelled(&pid).await {
                                 suspended = false;
                                 active = true;
                             }
@@ -184,7 +184,7 @@ pub(crate) async fn run_process(
                     runtime
                         .emit_event(
                             process.program.name.clone(),
-                            thread_id.clone(),
+                            pid.clone(),
                             turn,
                             AgentEvent::PersistFailed(
                                 "sub-agents did not finish saving after the turn was stopped"
@@ -199,13 +199,13 @@ pub(crate) async fn run_process(
             Some(next_envelope)
         };
 
-        let cancel = runtime.execution_cancel(&thread_id);
+        let cancel = runtime.execution_cancel(&pid);
         active = true;
         let turn = runtime
             .turn_gate
             .active_id()
             .unwrap_or_else(|| TurnId::from(MessageId::new()));
-        process.execution = runtime.execution(&thread_id);
+        process.execution = runtime.execution(&pid);
         let mut agent_loop = ProcessLoop {
             runtime: runtime.clone(),
             process: &mut process,
@@ -259,7 +259,7 @@ pub(crate) async fn run_process(
                     }
                     Ok(TurnOutcome::Deferred { envelope, awaiting }) => {
                         active = false;
-                        // The queue only holds the envelope while this thread is
+                        // The queue only holds the envelope while this process is
                         // known to be waiting, so the wait has to be recorded
                         // before it goes back.
                         awaiting_replies = awaiting;
@@ -270,7 +270,7 @@ pub(crate) async fn run_process(
                         // Otherwise it parks — unless the abort was the user
                         // taking the turn back, which nothing but a wind-up ends
                         // and no envelope is coming to prompt.
-                        if !should_exit && !runtime.process_turn_cancelled(&thread_id).await {
+                        if !should_exit && !runtime.process_turn_cancelled(&pid).await {
                             suspended = std::mem::take(&mut active);
                         }
                     }
@@ -299,7 +299,7 @@ pub(crate) async fn run_process(
                     }
                     Ok(TurnOutcome::Deferred { envelope, awaiting }) => {
                         active = false;
-                        // The queue only holds the envelope while this thread is
+                        // The queue only holds the envelope while this process is
                         // known to be waiting, so the wait has to be recorded
                         // before it goes back.
                         awaiting_replies = awaiting;
@@ -330,7 +330,7 @@ pub(crate) async fn run_process(
         envelopes.push(envelope);
     }
     runtime
-        .save_process_snapshot(process.program.name.clone(), thread_id, envelopes, active)
+        .save_process_snapshot(process.program.name.clone(), pid, envelopes, active)
         .await;
     info!("Agent {} has exited", process.program.name);
 }
@@ -513,9 +513,9 @@ fn execute_javascript_tool_discovery(
     )
 }
 
-/// One tool call's window onto the thread's state.
+/// One tool call's window onto the process's state.
 ///
-/// `committed` is the thread as the whole batch was dispatched — shared, so
+/// `committed` is the process as the whole batch was dispatched — shared, so
 /// sibling calls running concurrently never observe each other. `recorded` is
 /// what *this* call has written, which only it can see until the runtime anchors
 /// it to the message recording the call.
@@ -570,14 +570,14 @@ impl ThreadState for CallState {
 enum EnvelopeOutcome {
     Next(ResumePoint),
     Done(ResumePoint, Box<TurnEnd>),
-    /// Refused: the turn in flight is not finished with this thread, either
+    /// Refused: the turn in flight is not finished with this process, either
     /// because sub-agents still owe it answers or because it is parked on an
     /// approval nobody answered. The turn winds up first; whoever holds the
     /// envelope tries again once it has.
     Deferred(Box<Envelope>, ResumePoint),
 }
 
-/// Where a cancelled thread got to.
+/// Where a cancelled process got to.
 enum WindUp {
     /// Still owed real replies from sub-agents it already dispatched. It parks
     /// with them recorded, and each reply brings it back to try again.
@@ -616,9 +616,9 @@ enum TurnOutcome {
     Completed,
     /// Parked for approval; preserve the wait if the driver exits.
     Suspended,
-    /// The turn is not over: this thread dispatched sub-agent calls and is
+    /// The turn is not over: this process dispatched sub-agent calls and is
     /// parked until their answers arrive. The process goes back to its inbox, but
-    /// only replies may reach that thread while its other envelopes wait. Carries the
+    /// only replies may reach that process while its other envelopes wait. Carries the
     /// turn so the wait can be capped once that turn has been asked to stop.
     AwaitingReplies(TurnId),
     /// The envelope was handed back unconsumed. It is held until the turn in
@@ -627,7 +627,7 @@ enum TurnOutcome {
     /// `awaiting` carries what a wind-up that could not finish would otherwise
     /// have reported as [`Self::AwaitingReplies`]: the turn still owed answers.
     /// Both halves have to travel together, because the envelope only stays put
-    /// while the thread is known to be waiting — otherwise the queue hands it
+    /// while the process is known to be waiting — otherwise the queue hands it
     /// straight back to the refusal that returned it.
     Deferred {
         envelope: Box<Envelope>,
@@ -642,18 +642,18 @@ struct ProcessLoop<'a, C: LLMProvider + Clone> {
     process: &'a mut Process,
     cancel: CancellationToken,
     config: AgentRunConfig<C>,
-    /// The turn every event this thread emits belongs to. Refreshed whenever an
+    /// The turn every event this process emits belongs to. Refreshed whenever an
     /// incoming envelope opens new work; events raised while cleaning up after
     /// the previous one still carry the turn they are cleaning up.
     turn: TurnId,
 }
 
 impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
-    /// The turn this thread's history places it in, falling back to the turn
+    /// The turn this process's history places it in, falling back to the turn
     /// the loop was entered with.
     ///
     /// A new process has no recorded turn until its opening message lands.
-    async fn thread_turn(&self) -> TurnId {
+    async fn process_turn(&self) -> TurnId {
         self.process.current_turn().await.unwrap_or(self.turn)
     }
 
@@ -672,7 +672,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 if let Some(execution) = &self.process.execution {
                     self.runtime.checkpoint_failed(
                         ExecutionIdentity {
-                            thread_id: self.process.pid.0.clone(),
+                            pid: self.process.pid.0.clone(),
                             invocation_id: execution.invocation_id.clone(),
                         },
                         err.clone(),
@@ -707,9 +707,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     .execution
                     .as_ref()
                     .and_then(|e| e.reply_target().cloned());
-                self.process.origin = stored.parent_thread_id.zip(stored.derivation_key).map(
-                    |(parent_thread_id, derivation_key)| ProcessOrigin {
-                        parent_thread_id,
+                self.process.origin = stored.parent_pid.zip(stored.derivation_key).map(
+                    |(parent_pid, derivation_key)| ProcessOrigin {
+                        parent_pid,
                         derivation_key,
                     },
                 );
@@ -724,10 +724,10 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         self.process.resume_point = resume_point;
         self.runtime
             .register_root_state(&self.process.pid, self.process.state.clone());
-        // A restored thread carries the turn its last message was written
+        // A restored process carries the turn its last message was written
         // under; a fresh one carries none yet and keeps the turn this loop was
         // entered with (the session's active turn) until its prompt lands.
-        self.turn = self.thread_turn().await;
+        self.turn = self.process_turn().await;
 
         if let Some(envelope) = envelope {
             let is_user_task = matches!(envelope.body, EnvelopeBody::Task { .. })
@@ -741,7 +741,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             match self.handle_envelope(current, envelope).await {
                 EnvelopeOutcome::Next(rp) => {
                     self.process.resume_point = rp;
-                    self.turn = self.thread_turn().await;
+                    self.turn = self.process_turn().await;
                     // Persist the user prompt immediately so a mid-turn snapshot
                     // (reconnect, crash) already contains it; the event stream
                     // never carries user messages. Restricted to root user tasks
@@ -765,7 +765,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 EnvelopeOutcome::Deferred(envelope, rp) => {
                     // Deferring means the turn in flight has just been asked to
                     // stop, so it winds up here rather than waiting to be
-                    // entered again — the envelope has to come back to a thread
+                    // entered again — the envelope has to come back to a process
                     // that is no longer holding the old turn's work, or it would
                     // walk into the same refusal and defer forever. Whether that
                     // wind-up ends the turn or only parks it, the state goes to
@@ -781,7 +781,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         && announced_ending
                         && self.runtime.is_root_process(&self.process.pid)
                     {
-                        self.runtime.turn_gate.close(self.thread_turn().await);
+                        self.runtime.turn_gate.close(self.process_turn().await);
                     }
                     return Ok(TurnOutcome::Deferred { envelope, awaiting });
                 }
@@ -798,7 +798,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 break;
             }
             // Checked every time round rather than once on entry: the mark can
-            // arrive while this thread is mid-turn, and a thread woken by a
+            // arrive while this process is mid-turn, and a process woken by a
             // reply comes back through here to find it.
             if self.runtime.execution_stopped(&self.process.pid)
                 || (self
@@ -870,7 +870,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                             .as_ref()
                             .map(|e| e.agent_path.clone())
                             .unwrap_or_else(|| vec![self.process.program.name.clone()]),
-                        thread_id: self.process.pid.as_ref().to_string(),
+                        pid: self.process.pid.as_ref().to_string(),
                         agent_name: self.process.program.name.to_string(),
                         parent_message_id,
                         calls: pending_approval_calls
@@ -894,7 +894,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         }
 
         // A turn is over when the root announces an ending for it. Suspension
-        // announces one too but the turn is only parked, and a thread that
+        // announces one too but the turn is only parked, and a process that
         // broke out to wait for sub-agent replies announces nothing at all —
         // both leave the turn on the books.
         let announced_ending = owed.event.is_some() && !suspended;
@@ -912,7 +912,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             .persist_and_announce(self.process.resume_point.clone(), suspended_at, owed)
             .await;
         if announced_ending && persisted && self.runtime.is_root_process(&self.process.pid) {
-            self.runtime.turn_gate.close(self.thread_turn().await);
+            self.runtime.turn_gate.close(self.process_turn().await);
         }
         Ok(if retires && persisted {
             TurnOutcome::Retired
@@ -930,7 +930,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         })
     }
 
-    /// Make this thread's state durable, then hand out what the turn owes the
+    /// Make this process's state durable, then hand out what the turn owes the
     /// outside world. Every checkpoint write in `run` goes through here, so the
     /// ordering holds by construction rather than by each call site remembering
     /// it — and an empty `owed` is an ordinary input, not a special case.
@@ -952,7 +952,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             if let Some(execution) = &self.process.execution {
                 self.runtime.checkpoint_failed(
                     ExecutionIdentity {
-                        thread_id: self.process.pid.0.clone(),
+                        pid: self.process.pid.0.clone(),
                         invocation_id: execution.invocation_id.clone(),
                     },
                     err.clone(),
@@ -1004,7 +1004,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 .await;
         }
         // Last, always: the reply is what lets the caller move on, so anything
-        // this thread wants seen must already be out before it goes.
+        // this process wants seen must already be out before it goes.
         if let Some(reply) = owed.reply
             && let Err(err) = self.runtime.send_message(reply).await
         {
@@ -1020,13 +1020,13 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         finished: bool,
     ) -> Result<(), String> {
         let stored = StoredCheckpoint {
-            thread_id: self.process.pid.as_ref().to_string(),
+            pid: self.process.pid.as_ref().to_string(),
             agent_name: self.process.program.name.to_string(),
-            parent_thread_id: self
+            parent_pid: self
                 .process
                 .origin
                 .as_ref()
-                .map(|origin| origin.parent_thread_id.clone()),
+                .map(|origin| origin.parent_pid.clone()),
             derivation_key: self
                 .process
                 .origin
@@ -1046,7 +1046,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 .session_storage
                 .save_execution_checkpoint(
                     ExecutionIdentity {
-                        thread_id: self.process.pid.0.clone(),
+                        pid: self.process.pid.0.clone(),
                         invocation_id: execution.invocation_id.clone(),
                     },
                     stored,
@@ -1060,9 +1060,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         }
     }
 
-    /// Bring a cancelled thread to a stop without inventing anything.
+    /// Bring a cancelled process to a stop without inventing anything.
     ///
-    /// Calls that never left this thread are written off here — nothing else
+    /// Calls that never left this process are written off here — nothing else
     /// will ever produce a result for them. Calls already dispatched to a
     /// sub-agent are not: that sub-agent is winding up too and will answer for
     /// itself. Answering on its behalf is exactly the break this protocol
@@ -1110,7 +1110,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     /// several passes — one per reply still owed — and the marker has to name
     /// everything the abort caught, not just what the last pass touched.
     async fn interrupted_calls(&self) -> Vec<String> {
-        let turn = self.thread_turn().await;
+        let turn = self.process_turn().await;
         self.process
             .history()
             .await
@@ -1129,7 +1129,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
 
     /// Whether the sub-agent this call went to is still working on it here.
     ///
-    /// The thread is derived the way the dispatch derived it rather than looked
+    /// The process is derived the way the dispatch derived it rather than looked
     /// up, because a sub-agent that has not reached a write point yet owns no
     /// checkpoint to find. `false` means the work went away with an earlier
     /// process and no answer is ever coming.
@@ -1242,11 +1242,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         resume_point: ResumePoint,
         envelope: Envelope,
     ) -> EnvelopeOutcome {
-        // Only a `ToolCall` states this thread's place in the tree; other
+        // Only a `ToolCall` states this process's place in the tree; other
         // envelopes say nothing about it, so they leave whatever the checkpoint
         // restored intact rather than clearing it.
-        if let Some(origin_thread) = origin_thread_from_envelope(&envelope) {
-            self.process.origin = Some(origin_thread);
+        if let Some(origin) = process_origin_from_envelope(&envelope) {
+            self.process.origin = Some(origin);
         }
         match resume_point {
             ResumePoint::Generation => {
@@ -1287,8 +1287,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                             // The obligation ends here rather than at delivery:
                             // until the answer has actually been taken, the
                             // caller must still treat it as coming.
-                            if let Sender::Agent { thread_id, .. } = &envelope.from {
-                                self.runtime.calls.end(thread_id);
+                            if let Sender::Agent { pid, .. } = &envelope.from {
+                                self.runtime.calls.end(pid);
                             }
                             if let Some(pos) = tool_execution
                                 .pending_replies
@@ -1341,7 +1341,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                                 .await;
                             }
                             if !still_answering.is_empty() {
-                                // A second call reached the same thread while
+                                // A second call reached the same process while
                                 // its first call still has live children. Stop
                                 // the turn and let those children answer before
                                 // retrying the held call. A root Task cannot
@@ -1352,7 +1352,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                                     EnvelopeBody::ToolCall { .. }
                                 ));
                                 tool_execution.pending_replies = still_answering;
-                                self.runtime.cancel_turn(self.thread_turn().await).await;
+                                self.runtime.cancel_turn(self.process_turn().await).await;
                                 return EnvelopeOutcome::Deferred(
                                     Box::new(envelope),
                                     ResumePoint::ToolExecution(tool_execution),
@@ -1397,14 +1397,14 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             } => {
                 match &envelope.body {
                     EnvelopeBody::ToolCall { .. } => {
-                        // Another call arrived for a thread parked on an
+                        // Another call arrived for a process parked on an
                         // approval. Discarding the parked calls
                         // here and carrying straight on would end the turn
                         // without ever ending it: nothing announces that it
                         // stopped, so wind it up before retrying the envelope.
                         //
                         // Unlike the sub-agent case there is nobody to tell: a
-                        // thread parked on an approval has dispatched nothing,
+                        // process parked on an approval has dispatched nothing,
                         // so the only work to stop is its own, and it is already
                         // running. Marking the turn would only leave a stale
                         // abort in this process's own control queue for the
@@ -1430,7 +1430,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         // *earlier* batch would reject this one outright. That
                         // is not hypothetical: a second submit of the same
                         // approval (a double click, a retry after a reconnect)
-                        // arrives once this thread has run those calls and
+                        // arrives once this process has run those calls and
                         // suspended on the model's next batch.
                         //
                         // The batch is identified by the assistant message that
@@ -1522,7 +1522,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     }
 
     /// Checked once per entry into [`ResumePoint::Generation`], on every
-    /// thread. Once the last recorded usage reaches the profile's threshold,
+    /// process. Once the last recorded usage reaches the profile's threshold,
     /// asks [`compaction::cutoff`] for a complete turn boundary or, when the
     /// current turn itself has grown too large, a complete tool-batch boundary.
     /// A fresh task-opening user message remains protected until the process has
@@ -1540,7 +1540,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             return Ok(());
         }
         let history = self.process.history().await;
-        let current_turn = self.thread_turn().await;
+        let current_turn = self.process_turn().await;
         let protect_from = message_view::model_view(&history)
             .last()
             .filter(|entry| {
@@ -1590,7 +1590,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 &summary,
             ),
             Err(reason) => {
-                warn!(thread_id = %self.process.pid.as_ref(), "auto-compaction failed: {reason}");
+                warn!(pid = %self.process.pid.as_ref(), "auto-compaction failed: {reason}");
                 compaction::failure_message(&reason)
             }
         };
@@ -1707,7 +1707,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     }
 
     async fn handle_generation(&mut self) -> ProcessLoopState {
-        let thread_id = self.process.pid.clone();
+        let pid = self.process.pid.clone();
         let messages = match self.process.messages().await {
             Ok(messages) => messages,
             Err(error) => return self.generation_failed(error.to_string()),
@@ -1725,7 +1725,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         self.runtime
             .emit_event(
                 self.process.program.name.clone(),
-                thread_id.clone(),
+                pid.clone(),
                 self.turn,
                 AgentEvent::LLMStart(request.clone()),
             )
@@ -1764,7 +1764,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                             ended_at,
                         };
                         self.process.add_message(Message::Assistant(message.clone())).await;
-                        self.runtime.emit_event(self.process.program.name.clone(), thread_id.clone(), self.turn, AgentEvent::LLMEnd(message)).await;
+                        self.runtime.emit_event(self.process.program.name.clone(), pid.clone(), self.turn, AgentEvent::LLMEnd(message)).await;
                     }
                     break GenerationOutcome::Aborted;
                 }
@@ -1775,11 +1775,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                                 reasoning_ended_at = Some(jiff::Timestamp::now());
                             }
                             partial_content.push_str(&chunk);
-                            self.runtime.emit_event(self.process.program.name.clone(), thread_id.clone(), self.turn,AgentEvent::LLMContentChunk(chunk)).await;
+                            self.runtime.emit_event(self.process.program.name.clone(), pid.clone(), self.turn,AgentEvent::LLMContentChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::ReasoningChunk(chunk))) => {
                             partial_reasoning.push_str(&chunk);
-                            self.runtime.emit_event(self.process.program.name.clone(), thread_id.clone(), self.turn,AgentEvent::LLMReasoningChunk(chunk)).await;
+                            self.runtime.emit_event(self.process.program.name.clone(), pid.clone(), self.turn,AgentEvent::LLMReasoningChunk(chunk)).await;
                         }
                         Some(Ok(LLMStreamEvent::Completed(message))) => break GenerationOutcome::Completed(message),
                         Some(Err(err)) => break GenerationOutcome::Failed(err.to_string()),
@@ -1836,7 +1836,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         self.runtime
             .emit_event(
                 self.process.program.name.clone(),
-                thread_id,
+                pid,
                 self.turn,
                 AgentEvent::LLMEnd(assistant_message.clone()),
             )
@@ -1895,7 +1895,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     }
 
     /// Package a turn ending: what to announce, plus `output` handed back to
-    /// whoever called this thread as a tool. A root process has no caller — its
+    /// whoever called this process as a tool. A root process has no caller — its
     /// `target` is `None` and `output` goes nowhere.
     fn turn_end(
         &self,
@@ -1912,11 +1912,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     id,
                     from: Sender::Agent {
                         name: self.process.program.name.clone(),
-                        thread_id: self.process.pid.clone(),
+                        pid: self.process.pid.clone(),
                     },
                     to: Receiver {
                         name: target.sender_name,
-                        thread_id: ProcessId::from(target.sender_thread_id),
+                        pid: ProcessId::from(target.sender_pid),
                     },
                     reply_to: Some(target.envelope_id),
                     body: EnvelopeBody::Reply {
@@ -1930,7 +1930,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     }
 
     fn generation_failed(&mut self, error: String) -> ProcessLoopState {
-        error!(thread_id = %self.process.pid.as_ref(), "generation failed: {error}");
+        error!(pid = %self.process.pid.as_ref(), "generation failed: {error}");
         let target = self.process.reply_target.take();
         // A sub-agent's failure travels as its reply; only a root process, with
         // nobody to answer, announces it as an event.
@@ -1951,8 +1951,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         // The timestamp records when execution began, for the result's duration.
         // Handed to every sub-agent dispatched below so their messages group with
         // the submission that ultimately caused them.
-        let turn_id = self.thread_turn().await;
-        // One view of the thread for the whole batch, taken before any of it
+        let turn_id = self.process_turn().await;
+        // One view of the process for the whole batch, taken before any of it
         // runs. A tool that derives its state from the conversation reads this
         // rather than keeping a store, so it must not be able to observe its
         // siblings landing — the batch runs concurrently and has no order to
@@ -2090,7 +2090,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     .as_ref()
                     .and_then(|e| e.background_task().cloned());
                 ctx.origin = coda_core::task::TaskOrigin {
-                    thread_id: self.process.pid.0.clone(),
+                    pid: self.process.pid.0.clone(),
                     message_origin: Some(MessageOrigin {
                         message_id: tool_execution.parent_message_id,
                         call_id: tc.tool_call.id.clone(),
@@ -2257,8 +2257,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
 /// names the turn it begins. A sub-agent invocation mints its own message id
 /// here — this is that message's only construction point, so there is no second
 /// copy to stay in sync with — inherits the caller's turn, and records the
-/// calling thread's tool call as its origin, which is what later lets a rewind
-/// tell this invocation's messages from another invocation's in the same thread.
+/// calling process's tool call as its origin, which is what later lets a rewind
+/// tell this invocation's messages from another invocation's in the same process.
 ///
 /// A root task normally becomes a user message; when the runtime opened the
 /// turn to report a finished background task, it becomes a notice instead.
@@ -2301,14 +2301,14 @@ fn opening_user_message(body: &EnvelopeBody) -> Option<(TurnId, Message)> {
     }
 }
 
-/// This thread's place under its caller, as announced by a `ToolCall` envelope.
-/// `None` for anything else, since only being called as a tool gives a thread a
+/// This process's place under its caller, as announced by a `ToolCall` envelope.
+/// `None` for anything else, since only being called as a tool gives a process a
 /// parent.
-fn origin_thread_from_envelope(envelope: &Envelope) -> Option<ProcessOrigin> {
+fn process_origin_from_envelope(envelope: &Envelope) -> Option<ProcessOrigin> {
     match (&envelope.from, &envelope.body) {
-        (Sender::Agent { thread_id, .. }, EnvelopeBody::ToolCall { derivation_key, .. }) => {
+        (Sender::Agent { pid, .. }, EnvelopeBody::ToolCall { derivation_key, .. }) => {
             Some(ProcessOrigin {
-                parent_thread_id: thread_id.as_ref().to_string(),
+                parent_pid: pid.as_ref().to_string(),
                 derivation_key: derivation_key.clone(),
             })
         }
@@ -2318,11 +2318,11 @@ fn origin_thread_from_envelope(envelope: &Envelope) -> Option<ProcessOrigin> {
 
 pub(super) fn reply_target_from_envelope(envelope: &Envelope) -> Option<ReplyTarget> {
     match (&envelope.from, &envelope.body) {
-        (Sender::Agent { name, thread_id }, EnvelopeBody::ToolCall { call_id, .. }) => {
+        (Sender::Agent { name, pid }, EnvelopeBody::ToolCall { call_id, .. }) => {
             Some(ReplyTarget {
                 envelope_id: envelope.id.clone(),
                 sender_name: name.clone(),
-                sender_thread_id: thread_id.as_ref().to_string(),
+                sender_pid: pid.as_ref().to_string(),
                 call_id: call_id.clone(),
             })
         }

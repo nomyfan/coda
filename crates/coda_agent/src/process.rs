@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessOrigin {
-    pub parent_thread_id: String,
+    pub parent_pid: String,
     pub derivation_key: String,
 }
 
@@ -27,7 +27,7 @@ pub struct Process {
     pub(crate) origin: Option<ProcessOrigin>,
 }
 
-/// A thread's history and what the runtime derives from it.
+/// A process's history and what the runtime derives from it.
 ///
 /// Every field is private: `state` only stays true to `messages` because
 /// [`restore`](Self::restore) and [`record`](Self::record) are the sole way to
@@ -43,7 +43,7 @@ pub(crate) struct ProcessMemory {
     state: ThreadStateMap,
     /// The turn newly appended messages belong to. Advances only when a user
     /// message is appended (see [`Process::add_opening_message`]); `None` only before
-    /// this thread has any history at all.
+    /// this process has any history at all.
     current_turn: Option<TurnId>,
 }
 
@@ -56,18 +56,18 @@ impl Default for ProcessId {
     }
 }
 
-/// Namespace for hashing a non-UUID thread id into a usable uuid5 namespace.
-/// Arbitrary but fixed: changing it changes every derived thread id.
-const NON_UUID_THREAD_NAMESPACE: Uuid = Uuid::from_u128(0x3f7a1c62_5be4_4d0f_9a31_c6d84b7e02f5);
+/// Namespace for hashing a non-UUID process id into a usable uuid5 namespace.
+/// Arbitrary but fixed: changing it changes every derived process id.
+const NON_UUID_PROCESS_NAMESPACE: Uuid = Uuid::from_u128(0x3f7a1c62_5be4_4d0f_9a31_c6d84b7e02f5);
 
 impl ProcessId {
     pub fn new() -> Self {
         ProcessId(Uuid::new_v4().to_string())
     }
 
-    /// Derive a child thread id from its parent and a name.
+    /// Derive a child process id from its parent and a name.
     ///
-    /// A parent id that isn't a UUID — the root thread id is the client-supplied
+    /// A parent id that isn't a UUID — the root process id is the client-supplied
     /// session id, which is only required to be a safe string — is hashed into a
     /// namespace rather than falling back to the nil one. Falling back would
     /// give every such session the *same* namespace, so two sessions would
@@ -75,7 +75,7 @@ impl ProcessId {
     /// children" would silently stop holding.
     pub fn from_uuid5(namespace: &ProcessId, name: &str) -> Self {
         let ns = Uuid::parse_str(&namespace.0)
-            .unwrap_or_else(|_| Uuid::new_v5(&NON_UUID_THREAD_NAMESPACE, namespace.0.as_bytes()));
+            .unwrap_or_else(|_| Uuid::new_v5(&NON_UUID_PROCESS_NAMESPACE, namespace.0.as_bytes()));
         ProcessId(Uuid::new_v5(&ns, name.as_bytes()).to_string())
     }
 }
@@ -109,7 +109,7 @@ impl Process {
         &self.program.name
     }
 
-    /// Append a user message and make its turn this thread's current one, in a
+    /// Append a user message and make its turn this process's current one, in a
     /// single critical section.
     ///
     /// Advancing the turn is deliberately tied to appending the user message
@@ -152,21 +152,21 @@ impl Process {
         );
     }
 
-    /// The turn this thread is in: what a message appended now is tagged with,
+    /// The turn this process is in: what a message appended now is tagged with,
     /// and what a sub-agent call hands down so the callee's messages group with
     /// the submission that ultimately caused them.
     ///
-    /// `None` while the thread has no history — a thread opened but not yet
+    /// `None` while the process has no history — a process opened but not yet
     /// prompted is in no turn, and asking is not an error. Callers on that path
-    /// (the driver entering a fresh thread) supply the turn they were entered
+    /// (the driver entering a fresh process) supply the turn they were entered
     /// with instead. Read-only, deliberately: this used to go through
-    /// [`ProcessMemory::stamp`], so merely *asking* on a fresh thread minted a
+    /// [`ProcessMemory::stamp`], so merely *asking* on a fresh process minted a
     /// throwaway turn and logged its invariant break.
     pub async fn current_turn(&self) -> Option<TurnId> {
         self.state.lock().await.current_turn
     }
 
-    /// The request this thread's history makes: the system prompt, then the
+    /// The request this process's history makes: the system prompt, then the
     /// part of history a compaction left visible, lowered to what a provider
     /// accepts.
     pub async fn messages(&self) -> Result<Vec<RequestMessage>, message_view::InvalidHistory> {
@@ -190,7 +190,7 @@ impl Process {
         self.state.lock().await.messages.clone()
     }
 
-    /// The most recent recorded token usage on this thread, read without
+    /// The most recent recorded token usage on this process, read without
     /// cloning the transcript.
     pub async fn last_usage(&self) -> Option<CompletionUsage> {
         let state = self.state.lock().await;
@@ -214,7 +214,7 @@ impl Process {
         state.current_turn = state.messages.last().map(|entry| entry.turn_id);
     }
 
-    /// This thread's recorded state so far, reduced to one value per kind.
+    /// This process's recorded state so far, reduced to one value per kind.
     /// Last-wins, because every entry is a complete value rather than a delta.
     pub async fn state_snapshot(&self) -> ThreadStateMap {
         self.state.lock().await.state.clone()
@@ -274,8 +274,8 @@ impl ProcessMemory {
     /// [`Process::current_turn`], which reports "no turn yet" rather than minting
     /// one, so the error below stays a report of a real invariant break.
     ///
-    /// `current_turn` is `None` only before a thread has any history, and an
-    /// assistant or tool message can't be the first thing in a thread — one
+    /// `current_turn` is `None` only before a process has any history, and an
+    /// assistant or tool message can't be the first thing in a process — one
     /// always follows the user message that prompted it. Should that ever break,
     /// keeping the message under a fresh turn beats dropping it: a mis-grouped
     /// message is a rewind inaccuracy, a missing tool result is history the
@@ -294,13 +294,13 @@ impl ProcessMemory {
 }
 
 #[cfg(test)]
-mod thread_id_tests {
+mod process_id_tests {
     use super::*;
 
-    /// The root thread id is whatever session id the client chose, and it is not
+    /// The root process id is whatever session id the client chose, and it is not
     /// required to be a UUID — the web client falls back to a non-UUID form
     /// whenever `crypto.randomUUID` is unavailable, which is every plain-HTTP
-    /// origin. Two such sessions must still derive distinct child threads.
+    /// origin. Two such sessions must still derive distinct child processes.
     #[test]
     fn non_uuid_parents_derive_distinct_children() {
         let one = ProcessId::from("session-mf3k2x".to_string());
@@ -313,7 +313,7 @@ mod thread_id_tests {
     }
 
     /// Deriving from a parent that *is* a UUID must keep using it as the
-    /// namespace directly, so existing stateful thread ids are unaffected by the
+    /// namespace directly, so existing stateful process ids are unaffected by the
     /// non-UUID handling above.
     #[test]
     fn uuid_parent_is_used_as_the_namespace_directly() {
@@ -327,7 +327,7 @@ mod thread_id_tests {
 }
 
 #[cfg(test)]
-mod thread_state_tests {
+mod process_state_tests {
     use super::*;
     use coda_core::llm::{ToolCallOutcome, ToolMessage, ToolOutput};
     use serde_json::json;

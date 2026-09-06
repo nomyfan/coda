@@ -101,7 +101,7 @@ async fn partial_stream_error_does_not_enter_history_or_checkpoint() {
     .expect("timed out waiting for partial stream error");
 
     let checkpoint = storage
-        .checkpoint(&harness.thread_id)
+        .checkpoint(&harness.pid)
         .await
         .expect("user task should remain checkpointed");
     assert!(matches!(
@@ -241,7 +241,7 @@ async fn user_task_is_checkpointed_before_turn_completes() {
 
     let checkpoint = harness
         .storage
-        .checkpoint(&harness.thread_id)
+        .checkpoint(&harness.pid)
         .await
         .expect("user task was not checkpointed at turn start");
     assert!(matches!(
@@ -408,7 +408,7 @@ async fn a_root_checkpoint_load_failure_reports_and_releases_the_turn() {
 
     harness
         .runtime
-        .send_message(user_task(&harness.thread_id, "try again"))
+        .send_message(user_task(&harness.pid, "try again"))
         .await
         .expect("the failed root loop left its turn registered");
     harness.shutdown().await;
@@ -462,7 +462,7 @@ async fn an_unexpected_envelope_that_cannot_be_stored_reports_once() {
             from: Sender::User,
             to: Receiver {
                 name: "coda".into(),
-                thread_id: harness.thread_id.clone(),
+                pid: harness.pid.clone(),
             },
             reply_to: None,
             body: EnvelopeBody::Reply {
@@ -514,7 +514,7 @@ async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
     timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = storage
-                .load_checkpoint(harness.thread_id.as_ref())
+                .load_checkpoint(harness.pid.as_ref())
                 .await
                 .expect("load checkpoint")
                 && matches!(checkpoint.resume_point, StoredResumePoint::ToolExecution(ref state) if !state.pending_replies.is_empty())
@@ -530,7 +530,7 @@ async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
     harness.runtime.request_exit().await;
     let sent = harness
         .runtime
-        .send_message(user_task(&harness.thread_id, "t2"))
+        .send_message(user_task(&harness.pid, "t2"))
         .await;
     assert!(matches!(sent, Err(SendCommandError::TurnAlreadyActive)));
     harness

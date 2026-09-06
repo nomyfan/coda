@@ -200,9 +200,7 @@ async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
 /// parked, and both callers get the same refusal.
 #[tokio::test]
 async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
-    let busy = ForkError::ThreadBusy {
-        thread_id: "s1".into(),
-    };
+    let busy = ForkError::ThreadBusy { pid: "s1".into() };
 
     let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
     opener.fork_error = Some(busy.clone());
@@ -237,9 +235,7 @@ async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
 #[tokio::test]
 async fn a_cold_source_holding_queued_work_refuses_like_a_busy_one() {
     let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
-    opener.fork_error = Some(ForkError::SourceNotIdle {
-        thread_id: "s1".into(),
-    });
+    opener.fork_error = Some(ForkError::SourceNotIdle { pid: "s1".into() });
     let (hub, _) = hub_and_opener(opener);
 
     assert!(matches!(hub.fork(key(), None).await, ForkOutcome::NotIdle));

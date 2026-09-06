@@ -6,13 +6,13 @@
 
 ## Scope
 
-- 本轮完成内部结构整理及 `coda_process` → `coda_execution`，保留已有可观察行为。
+- 本轮完成结构整理、`coda_process` → `coda_execution` 及各层身份字段统一；保留执行行为，允许协议与存储格式变更。
 - 不新增模型可调用的 spawn/send/wait 工具，不改变 stateful/stateless、后台启动资格、审批、通知和 fork/rewind 规则。
 - source code 是 `AgentSpec` 的概念定位，不增加名为 `SourceCode` 的包装类型。
 
 ## Validation Findings
 
-以下结论来自静态读码；本轮未运行测试或修改实现。
+以下结论来自设计前的静态读码；实现验证记录见文末。
 
 - `spec.rs::AgentTeam::new/build` 已分别完成声明校验和工具构建；build 目前还提前分配了实例状态，可去除这部分。
 - `runtime.rs::bootstrap/start_driver` 已按 thread 创建独立 driver；`Agent::for_thread` 分配独立状态。不是每个 program 只有一个串行 driver。
@@ -30,7 +30,7 @@
 | 分组寿命 | process 永久属于某组，或每次 execution 指定组 | execution 指定组，保持 stateful 跨轮复用及现有取消行为；不是严格的 Unix process group |
 | 分组实现 | 新建通用 GroupManager，或整理现有 executions/scopes | 整理现有运行时登记与清理，不引入独立管理服务，也不强行统一前后台所有细节 |
 | 调用方式 | 本轮改成显式 pid API，或保留名称寻址和复用 | 保留外部调用方式，内部把实例选择与运行拆开；新工具 API 留作后续行为变更 |
-| 持久化命名 | 全部 thread 字段改成 process，或仅重构运行时 | 保留现有 SQL/协议字段名称，避免无行为价值的迁移；内部使用 ProcessId，边界显式转换，不提供旧 Rust 类型兼容别名 |
+| 持久化命名 | 原方案保留 SQL/JSON/wire 的 thread 名称，以 serde 映射到 Rust pid；或各层统一命名 | 用户确认统一各层命名，移除旧字段映射，避免维护两套术语。接受 wire 和持久化格式破坏性变更；数据库用 migration 改名，不提供旧格式兼容层 |
 
 ## Components
 
@@ -145,7 +145,7 @@ async fn ProcessRuntime::stop_background_group(
 5. **答案完成不等于资源全部结束。** 后台 subagent 回答后，其拥有的后台 shell 可能仍运行；保留 task 的终态结果与 subtree_active 的区别及停止入口。root 的普通后台 shell 保持原有 registry 行为，不为命名统一增加 agent group。
 6. **错误清理强于回收优化。** checkpoint 失败先关闭组、撤销审批、取消工作和隔离成员；只有持久清理成功才允许复用。正常回复前的 driver 退休、call ledger 释放顺序保持不变。
 7. **跨重启行为不扩展。** 冷启动清理未完成后台执行并记录 Interrupted；通知 receipt、完整结果读取去重和 fork/rewind 对 receipt 的规则不变。
-8. **存储与协议保持原有形状。** `thread_id` 等字段仍是逻辑 process 身份的边界表示，避免纯命名 SQL 迁移；调整 Rust 类型及转换即可。若实现发现语义性字段变更确实必要，再修订设计，不手改生成的 schema.rs。
+8. **各层统一 process 命名。** Rust、JSON、wire、前端和数据库均使用 `pid` / `parent_pid` / `sender_pid`，快照使用 `active_processes`，checkpoint 表使用 `process_checkpoints`；不使用 serde rename/alias 保留旧身份字段。数据库通过可回滚的 migration 重命名表、列及约束，再由 diesel CLI 生成 schema.rs。旧 JSON 快照和任务归档不保证可读，不自动删除或转换历史数据；新旧客户端和服务端需一起更新。
 
 ## Requirement Review
 
@@ -155,7 +155,7 @@ async fn ProcessRuntime::stop_background_group(
 - 将“默认前台分组”明确为按 turn 建立；成员归属 execution，idle process 不永久属于旧组。
 - 将“subagent 启动以 spawn 理解”细化为新实例 spawn、已有 stateful 实例继续调用，避免与保留隐式复用规则矛盾。
 - 区分后台答案完成与其拥有资源全部结束，要求旧组清理不能伤及复用 pid 的新执行。
-- 明确保留 SQL/协议 thread 字段名称，也不强制 envelope/channel 改名为 pipe；本轮重点是状态和执行职责。
+- 明确统一 SQL/JSON/协议的 process 身份字段，不保留双套名称；不强制 envelope/channel 改名为 pipe。
 - 补充保留同批重复 stateful 调用全部拒绝，以及退出期间接收并保存有效在途消息的行为；分别由 driver 批次预检与 runtime 退出交付路径保证。
 
 ## Risks / Open Questions
@@ -164,9 +164,12 @@ async fn ProcessRuntime::stop_background_group(
 - 去除 driver 的 active_thread/suspended_thread 等变量时，可能误删审批及回复等待阶段；以固定 pid 加执行阶段表达，保留 replay 和 pending reply 测试。
 - Program 工具及动态知识句柄存在共享状态，不能声称 Arc<Program> 即代表全部依赖只读；用双 session 注册表隔离与同 workspace 文件锁测试验证共享范围。
 - `coda_execution` 名称覆盖 OS 进程和后台注册，但仍含 subagent 任务数据；本轮接受这条现有边界，不扩展成通用执行框架。
-- 需用户审阅的设计取舍：按执行期分组、保留外部调用及字段名称；显式 spawn/pid API 仍是后续议题。
+- 已确认按执行期分组、保留工具调用方式并统一各层身份字段；显式 spawn/pid 工具接口仍是后续议题。
 
 ## Implementation Roadmap
+
+- [x] [统一身份命名] 移除 serde 旧字段映射，同步 wire、前端及存储调用；新增表/列改名 migration 并生成 schema。
+  - Verification：Rust 必需检查、PostgreSQL 存储测试，以及前端 lint/test/typecheck；检索确认活动源码无旧身份字段。
 
 - [x] [行为基线] 检查并补足同 pid 跨执行分组、旧清理/迟到回复、答案完成后 shell 仍存活，以及同批重复 stateful 调用全部拒绝的回归用例。
   - Purpose：先固定最容易因概念整理而改变的取消与复用边界。
@@ -191,7 +194,7 @@ async fn ProcessRuntime::stop_background_group(
 
 - 预检沿用“返回重复目标名称、逐项拒绝”的纯函数形式，不新增 CallId 包装；invoke 保留现有错误文本，消息分发继续使用 SendCommandError。
 - 前台取消继续使用 request_abort，后台取消明确命名为 stop_background_group，不加通用 stop_group 转发层。持久清理继续异步重试，完成性由现有状态查询表达；没有新增同步 CleanupError API。
-- Envelope 保留用于首次启动及 snapshot 恢复的 program 名称元数据；在线 driver 固定 pid，Program 本身不参与收信。存储和事件中的 thread 字段仍保持原有格式。
+- Envelope 保留用于首次启动及 snapshot 恢复的 program 名称元数据；在线 driver 固定 pid，Program 本身不参与收信。存储和事件身份字段按用户确认统一使用 pid，不保留旧字段映射。
 - 旧组清理路径原先存在仅按 pid 删除的操作，本轮按已确认的 execution 身份契约补齐内存与 PostgreSQL fencing；尚未结束持久清理的组继续阻止会话维护操作。
 - 已审阅默认 system prompt 和 templates 的委派、取消与恢复规则。模型可见操作未变化，无需修改提示词；架构说明已更新到 AGENTS.md。
 
@@ -202,4 +205,5 @@ async fn ProcessRuntime::stop_background_group(
 - 已使用项目指定的本地 `coda_test` 数据库执行 `cargo test --features pg-tests`，47 个 PostgreSQL 存储测试全部通过；已有的一个 provider 测试保持 ignored。
 - 新增验证覆盖独立 process 的 memory 隔离、同批 stateful 前后台重复调用全部拒绝、退出后的 Reply 恢复及单次消费、snapshot 写失败保留内存消息，以及旧组清理对新 invocation 的内存与数据库隔离。
 - P1 背压回归：通过公开 Session API 一次提交 32 个立即完成的 stateless 子调用，验证所有回复被接收且 shutdown 有界返回；另以满 inbox 确定性验证 request_exit 不等待容量，以及退出后接收方关闭或容量可用时都只归档一次。该确定性用例在修复前因 request_exit 超时失败。
-- 未修改 web 代码；本轮不涉及部署或远程推送，实现改动保留在工作区供审查。
+- 前端协议类型、审批和事件消费同步使用 pid；lint、138 个测试及 typecheck 通过。
+- process 身份 migration 已在本地测试数据库验证应用、回滚和重应用，schema.rs 由 diesel CLI 生成，47 个 PostgreSQL 存储测试再次通过。

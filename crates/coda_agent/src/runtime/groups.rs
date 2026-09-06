@@ -109,18 +109,18 @@ impl ProcessRuntime {
                 .filter(|member| {
                     state
                         .processes
-                        .get(&member.thread_id)
+                        .get(&member.pid)
                         .is_some_and(|e| e.stored.invocation_id == member.invocation_id)
                 })
                 .cloned()
                 .collect();
             for member in &members {
-                state.quarantined.insert(member.thread_id.clone());
+                state.quarantined.insert(member.pid.clone());
             }
             (members, stopped)
         };
         for member in &members {
-            let handle = self.processes.lock().await.get(&member.thread_id).cloned();
+            let handle = self.processes.lock().await.get(&member.pid).cloned();
             if let Some(mut handle) = handle {
                 let _ = handle.send_command(ProcessControl::StopGroup).await;
                 if !*handle.finished.borrow()
@@ -133,13 +133,13 @@ impl ProcessRuntime {
                 while !*handle.finished.borrow_and_update()
                     && handle.finished.changed().await.is_ok()
                 {}
-                self.processes.lock().await.remove(&member.thread_id);
+                self.processes.lock().await.remove(&member.pid);
             }
         }
         let mut state = self.executions.lock().expect("executions");
         for member in members {
-            state.processes.remove(&member.thread_id);
-            state.quarantined.remove(&member.thread_id);
+            state.processes.remove(&member.pid);
+            state.quarantined.remove(&member.pid);
         }
         state.background.remove(id);
         stopped.send_replace(true);
@@ -210,7 +210,7 @@ impl ProcessRuntime {
 
     pub(super) fn register_execution(&self, envelope: &Envelope) -> Result<(), SendCommandError> {
         let mut state = self.executions.lock().expect("executions");
-        if state.quarantined.contains(envelope.to.thread_id.as_ref()) {
+        if state.quarantined.contains(envelope.to.pid.as_ref()) {
             return Err(SendCommandError::AwaitingCleanup);
         }
         let stored = match &envelope.body {
@@ -230,19 +230,17 @@ impl ProcessRuntime {
             EnvelopeBody::ToolCall { turn_id, .. } => {
                 if state
                     .processes
-                    .get(envelope.to.thread_id.as_ref())
+                    .get(envelope.to.pid.as_ref())
                     .is_some_and(|e| e.stored.invocation_id == envelope.id)
                 {
                     return Ok(());
                 }
                 let mut path = vec![];
                 let scope = match &envelope.from {
-                    Sender::Agent { thread_id, .. } => {
-                        state.processes.get(thread_id.as_ref()).map(|e| {
-                            path = e.stored.agent_path.clone();
-                            e.stored.scope.clone()
-                        })
-                    }
+                    Sender::Agent { pid, .. } => state.processes.get(pid.as_ref()).map(|e| {
+                        path = e.stored.agent_path.clone();
+                        e.stored.scope.clone()
+                    }),
                     _ => None,
                 }
                 .unwrap_or(ProcessGroupId::Foreground { turn_id: *turn_id });
@@ -255,7 +253,7 @@ impl ProcessRuntime {
                         return Err(SendCommandError::ScopeClosed);
                     }
                     scope.members.push(ScopeMember {
-                        thread_id: envelope.to.thread_id.0.clone(),
+                        pid: envelope.to.pid.0.clone(),
                         invocation_id: envelope.id.clone(),
                     });
                 }
@@ -273,7 +271,7 @@ impl ProcessRuntime {
             EnvelopeBody::Resume(_) | EnvelopeBody::Reply { .. } => {
                 if state
                     .processes
-                    .get(envelope.to.thread_id.as_ref())
+                    .get(envelope.to.pid.as_ref())
                     .is_some_and(|e| {
                         e.stored.background_task().is_some() && e.cancel.is_cancelled()
                     })
@@ -284,7 +282,7 @@ impl ProcessRuntime {
             }
         };
         state.processes.insert(
-            envelope.to.thread_id.0.clone(),
+            envelope.to.pid.0.clone(),
             LiveExecution {
                 stored,
                 cancel: CancellationToken::new(),
@@ -319,7 +317,7 @@ impl ProcessRuntime {
             .unwrap_or_default();
         path.push(envelope.to.name.clone());
         let (sender, receiver) = oneshot::channel();
-        let thread = envelope.to.thread_id.clone();
+        let thread = envelope.to.pid.clone();
         {
             let mut executions = self.executions.lock().expect("executions");
             if executions.closing {
@@ -332,7 +330,7 @@ impl ProcessRuntime {
                 return Err("subagent thread is busy".into());
             }
             let member = ScopeMember {
-                thread_id: thread.0.clone(),
+                pid: thread.0.clone(),
                 invocation_id: envelope.id.clone(),
             };
             executions.background.insert(
@@ -373,7 +371,7 @@ impl ProcessRuntime {
             },
             parent_task_id: None,
             origin: TaskOrigin {
-                thread_id: parent.0,
+                pid: parent.0,
                 message_origin: Some(origin),
                 agent_path: path.clone(),
             },
@@ -425,7 +423,7 @@ impl ProcessRuntime {
             .lock()
             .expect("executions")
             .processes
-            .get(&identity.thread_id)
+            .get(&identity.pid)
             .filter(|e| e.stored.invocation_id == identity.invocation_id)
             .and_then(|e| e.stored.background_task().cloned());
         if let Some(task) = task {

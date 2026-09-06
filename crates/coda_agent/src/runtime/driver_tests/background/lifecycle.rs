@@ -175,11 +175,11 @@ async fn stateful_calls_are_busy_across_foreground_and_background_dispatch() {
             id,
             from: Sender::Agent {
                 name: "coda".into(),
-                thread_id: root.clone(),
+                pid: root.clone(),
             },
             to: Receiver {
                 name: "worker".into(),
-                thread_id: ProcessId::from_uuid5(&root, "worker"),
+                pid: ProcessId::from_uuid5(&root, "worker"),
             },
             reply_to: None,
             body: EnvelopeBody::ToolCall {

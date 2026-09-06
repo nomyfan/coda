@@ -22,7 +22,7 @@ fn user_task(to: &ProcessId) -> Envelope {
         from: Sender::User,
         to: Receiver {
             name: "coda".into(),
-            thread_id: to.clone(),
+            pid: to.clone(),
         },
         reply_to: None,
         body: EnvelopeBody::Task {
@@ -149,7 +149,7 @@ async fn a_turn_waiting_on_a_subagent_stays_active() {
     let parked = timeout(Duration::from_secs(2), async {
         loop {
             if let Some(checkpoint) = storage
-                .load_checkpoint(harness.thread_id.as_ref())
+                .load_checkpoint(harness.pid.as_ref())
                 .await
                 .expect("load checkpoint")
                 && matches!(checkpoint.resume_point, StoredResumePoint::ToolExecution(ref state) if !state.pending_replies.is_empty())
@@ -264,10 +264,7 @@ async fn a_task_is_rejected_while_an_approval_is_pending() {
     .await
     .expect("timed out waiting for approval suspension");
     let running = active(&harness.runtime).expect("approval keeps the turn active");
-    let sent = harness
-        .runtime
-        .send_message(user_task(&harness.thread_id))
-        .await;
+    let sent = harness.runtime.send_message(user_task(&harness.pid)).await;
     assert!(matches!(sent, Err(SendCommandError::TurnAlreadyActive)));
     assert_eq!(active(&harness.runtime), Some(running));
 
@@ -311,7 +308,7 @@ async fn a_restart_puts_the_interrupted_turn_back() {
     .await
     .expect("timed out waiting for approval suspension");
     let interrupted = storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("root thread was checkpointed")
@@ -335,7 +332,7 @@ async fn a_restart_puts_the_interrupted_turn_back() {
             HashMap::from([(
                 pending.agent_name.clone(),
                 (
-                    pending.thread_id.clone(),
+                    pending.pid.clone(),
                     ResumeDecision {
                         parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
@@ -392,7 +389,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
     .await
     .expect("timed out waiting for approval suspension");
     let interrupted = storage
-        .load_checkpoint(harness.thread_id.as_ref())
+        .load_checkpoint(harness.pid.as_ref())
         .await
         .expect("load checkpoint")
         .expect("root thread was checkpointed")
@@ -414,7 +411,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
             HashMap::from([(
                 pending.agent_name.clone(),
                 (
-                    pending.thread_id.clone(),
+                    pending.pid.clone(),
                     ResumeDecision {
                         parent_message_id: pending.parent_message_id,
                         resolutions: vec![(
@@ -431,7 +428,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
     assert!(matches!(
         reopened
             .runtime
-            .send_message(user_task(&reopened.thread_id))
+            .send_message(user_task(&reopened.pid))
             .await,
         Err(SendCommandError::TurnAlreadyActive)
     ));
@@ -457,9 +454,9 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
         .save_checkpoint(
             old_thread.into(),
             StoredCheckpoint {
-                thread_id: old_thread.into(),
+                pid: old_thread.into(),
                 agent_name: "explore".into(),
-                parent_thread_id: Some("session".into()),
+                parent_pid: Some("session".into()),
                 derivation_key: Some("old-call".into()),
                 active_execution: None,
                 messages: vec![HistoryEntry::new(
@@ -476,9 +473,9 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
         .save_checkpoint(
             current_thread.into(),
             StoredCheckpoint {
-                thread_id: current_thread.into(),
+                pid: current_thread.into(),
                 agent_name: "explore".into(),
-                parent_thread_id: Some("session".into()),
+                parent_pid: Some("session".into()),
                 derivation_key: Some("current-call".into()),
                 active_execution: None,
                 messages: vec![
@@ -510,14 +507,14 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
         .expect("save current checkpoint");
 
     let snapshot = ProcessRuntimeSnapshot {
-        active_threads: HashMap::from([(current_thread.into(), "explore".into())]),
+        active_processes: HashMap::from([(current_thread.into(), "explore".into())]),
         ..Default::default()
     };
     let resume_targets = HashMap::from([(
         current_thread.into(),
         ResumeTarget {
             agent_name: "explore".into(),
-            thread_id: ProcessId::from(current_thread.to_string()),
+            pid: ProcessId::from(current_thread.to_string()),
             decision: ResumeDecision {
                 parent_message_id,
                 resolutions: vec![(call.id, ToolCallResolution::Execute)],

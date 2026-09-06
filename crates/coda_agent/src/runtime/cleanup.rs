@@ -30,21 +30,21 @@ impl ProcessRuntime {
                 .filter(|member| {
                     state
                         .processes
-                        .get(&member.thread_id)
+                        .get(&member.pid)
                         .is_none_or(|e| e.stored.invocation_id == member.invocation_id)
                 })
                 .cloned()
                 .collect();
             for member in &retired {
-                state.quarantined.insert(member.thread_id.clone());
-                if let Some(execution) = state.processes.get(&member.thread_id) {
+                state.quarantined.insert(member.pid.clone());
+                if let Some(execution) = state.processes.get(&member.pid) {
                     execution.cancel.cancel();
                 }
             }
             let keys: Vec<_> = state
                 .approvals
                 .keys()
-                .filter(|(thread, _)| retired.iter().any(|m| &m.thread_id == thread))
+                .filter(|(thread, _)| retired.iter().any(|m| &m.pid == thread))
                 .cloned()
                 .collect();
             let removed: Vec<_> = keys
@@ -54,14 +54,14 @@ impl ProcessRuntime {
             (members, retired, removed)
         };
         for approval in removed {
-            let thread = ProcessId::from(approval.thread_id.clone());
+            let thread = ProcessId::from(approval.pid.clone());
             let turn = TurnId::from(approval.parent_message_id);
             let _ = self.global_event_tx.send((
                 approval.agent_name,
                 thread,
                 turn,
                 AgentEvent::ApprovalRemoved {
-                    thread_id: approval.thread_id,
+                    pid: approval.pid,
                     parent_message_id: approval.parent_message_id,
                     task_id: approval.task_id,
                 },
@@ -76,7 +76,7 @@ impl ProcessRuntime {
             let drivers = self.processes.lock().await;
             retired
                 .iter()
-                .filter_map(|member| drivers.get(&member.thread_id).cloned())
+                .filter_map(|member| drivers.get(&member.pid).cloned())
                 .collect()
         };
         for handle in &handles {
@@ -98,8 +98,8 @@ impl ProcessRuntime {
         {
             let mut drivers = self.processes.lock().await;
             for member in &retired {
-                drivers.remove(&member.thread_id);
-                self.calls.clear(&ProcessId::from(member.thread_id.clone()));
+                drivers.remove(&member.pid);
+                self.calls.clear(&ProcessId::from(member.pid.clone()));
             }
         }
         {
@@ -144,7 +144,7 @@ impl ProcessRuntime {
                         && background_cleanup(&runtime, &abort).await.is_ok()
                     {
                         // The monitor must consume the failure reason before this scope
-                        // is forgotten or its stateful threads become reusable.
+                        // is forgotten or its stateful processes become reusable.
                         runtime
                             .background
                             .as_ref()
@@ -154,8 +154,8 @@ impl ProcessRuntime {
                         let mut state = runtime.executions.lock().expect("executions");
                         state.background.remove(&abort.task_id);
                         for member in &retired {
-                            state.quarantined.remove(&member.thread_id);
-                            state.processes.remove(&member.thread_id);
+                            state.quarantined.remove(&member.pid);
+                            state.processes.remove(&member.pid);
                         }
                         break;
                     }
@@ -191,10 +191,7 @@ impl ProcessRuntime {
 
 async fn background_cleanup(runtime: &ProcessRuntime, abort: &ScopeAbort) -> Result<(), String> {
     for member in &abort.members {
-        runtime
-            .session_storage
-            .load_checkpoint(&member.thread_id)
-            .await?;
+        runtime.session_storage.load_checkpoint(&member.pid).await?;
     }
     runtime
         .background

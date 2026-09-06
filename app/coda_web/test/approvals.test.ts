@@ -7,7 +7,7 @@ function approval(...callIds: string[]): PendingApproval {
   return {
     task_id: null,
     agent_path: ["coda"],
-    thread_id: "s1",
+    pid: "s1",
     agent_name: "coda",
     parent_message_id: "m-batch-1",
     calls: callIds.map((id) => ({ id, name: "ls", arguments: "{}" })),

@@ -44,9 +44,9 @@ async fn session_with_one_turn(
     (hub, events, message_id)
 }
 
-async fn stored_messages(storage: &SlowStorage, thread_id: &str) -> Vec<Message> {
+async fn stored_messages(storage: &SlowStorage, pid: &str) -> Vec<Message> {
     storage
-        .load_checkpoint(thread_id)
+        .load_checkpoint(pid)
         .await
         .expect("load checkpoint")
         .map(|checkpoint| {

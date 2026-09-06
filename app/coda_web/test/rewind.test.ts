@@ -79,7 +79,7 @@ test("applyRewound rebuilds the transcript and appends the edited message", () =
   const before = session({
     entries: [userEntry("m1", "first"), userEntry("m2", "second")],
     usage: [{ agentName: "coda", usage: { prompt_tokens: 900, completion_tokens: 0 } }],
-    approvals: [{ thread_id: "t", agent_name: "coda", calls: [], suspended_at: "" }],
+    approvals: [{ pid: "t", agent_name: "coda", calls: [], suspended_at: "" }],
     drafts: { a: {} },
     allowDrafts: { a: {} },
     pendingCallInfo: { call_1: { id: "call_1", name: "shell", arguments: null } },

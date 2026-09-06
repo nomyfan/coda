@@ -13,7 +13,7 @@ use tokio::time::{Duration, timeout};
 fn llm_end(agent: &str) -> WireEvent {
     WireEvent::LlmEnd {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         message: assistant("done"),
     }
 }
@@ -21,7 +21,7 @@ fn llm_end(agent: &str) -> WireEvent {
 fn aborted(agent: &str) -> WireEvent {
     WireEvent::Aborted {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         target: AbortedTargetWire::Generation,
     }
 }
@@ -29,7 +29,7 @@ fn aborted(agent: &str) -> WireEvent {
 fn errored(agent: &str) -> WireEvent {
     WireEvent::Error {
         agent_name: agent.into(),
-        thread_id: "t".into(),
+        pid: "t".into(),
         message: "boom".into(),
     }
 }

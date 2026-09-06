@@ -73,12 +73,8 @@ impl TestStorage {
         *self.fail_snapshots.lock().await = fail;
     }
 
-    pub(super) async fn checkpoint(&self, thread_id: &ProcessId) -> Option<StoredCheckpoint> {
-        self.checkpoints
-            .lock()
-            .await
-            .get(thread_id.as_ref())
-            .cloned()
+    pub(super) async fn checkpoint(&self, pid: &ProcessId) -> Option<StoredCheckpoint> {
+        self.checkpoints.lock().await.get(pid.as_ref()).cloned()
     }
 
     /// Let the next `writes` checkpoint writes through, then fail every one
@@ -122,7 +118,7 @@ impl WriteGate {
 impl SessionStorage for TestStorage {
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
@@ -147,21 +143,21 @@ impl SessionStorage for TestStorage {
             if let Some(open) = open {
                 open.notified().await;
             }
-            self.checkpoints.lock().await.insert(thread_id, checkpoint);
+            self.checkpoints.lock().await.insert(pid, checkpoint);
             Ok(())
         })
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
-        let thread_id = thread_id.to_owned();
+        let pid = pid.to_owned();
         Box::pin(async move {
             if *self.fail_loads.lock().await {
                 return Err("checkpoint load is unavailable".to_string());
             }
-            let checkpoint = self.checkpoints.lock().await.get(&thread_id).cloned();
+            let checkpoint = self.checkpoints.lock().await.get(&pid).cloned();
             Ok(checkpoint)
         })
     }
@@ -190,7 +186,7 @@ impl SessionStorage for TestStorage {
                 })
                 .cloned()
                 .collect();
-            checkpoints.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+            checkpoints.sort_by(|a, b| a.pid.cmp(&b.pid));
             Ok(checkpoints)
         })
     }
@@ -708,7 +704,7 @@ impl LLMProvider for TestProvider {
             },
             // A root that delegates once per turn to a stateful "explore",
             // which itself goes over threshold on its second invocation —
-            // exercises auto-compaction on a sub-agent thread too.
+            // exercises auto-compaction on a sub-agent process too.
             "auto-compact-subagent-main" => match last_user(&request.messages) {
                 Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
                     Self::completed(AssistantMessage {
@@ -1187,13 +1183,13 @@ fn describe_tools(messages: &[RequestMessage]) -> String {
     tools.join("|")
 }
 
-pub(super) fn user_task(thread_id: &ProcessId, task: &str) -> Envelope {
+pub(super) fn user_task(pid: &ProcessId, task: &str) -> Envelope {
     Envelope::with_id(|id| Envelope {
         id,
         from: Sender::User,
         to: Receiver {
             name: "coda".into(),
-            thread_id: thread_id.clone(),
+            pid: pid.clone(),
         },
         reply_to: None,
         body: EnvelopeBody::Task {
@@ -1230,7 +1226,7 @@ pub(super) fn test_config(
 pub(super) struct Harness<S> {
     pub(super) runtime: ProcessRuntime,
     events: tokio::sync::broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>,
-    pub(super) thread_id: ProcessId,
+    pub(super) pid: ProcessId,
     pub(super) storage: S,
 }
 
@@ -1295,10 +1291,10 @@ where
         storage: S,
         agents: HashMap<String, Arc<Program>>,
         config: RunConfig<TestProvider>,
-        thread_id: ProcessId,
+        pid: ProcessId,
         initial_task: &str,
     ) -> Self {
-        let mut runtime = ProcessRuntime::new(storage.clone(), thread_id.as_ref().to_string());
+        let mut runtime = ProcessRuntime::new(storage.clone(), pid.as_ref().to_string());
         runtime
             .bootstrap(agents, None, HashMap::new(), config)
             .await
@@ -1308,7 +1304,7 @@ where
         let harness = Self {
             runtime,
             events,
-            thread_id,
+            pid,
             storage,
         };
         harness.send_task(initial_task).await;
@@ -1317,12 +1313,12 @@ where
 
     pub(super) async fn send_task(&self, task: &str) {
         self.runtime
-            .send_message(user_task(&self.thread_id, task))
+            .send_message(user_task(&self.pid, task))
             .await
             .expect("send task");
     }
 
-    /// Answer a suspension exactly as a client would: addressed to the thread
+    /// Answer a suspension exactly as a client would: addressed to the process
     /// that announced it, naming the batch it announced. Sending the same
     /// `approval` twice is therefore a faithful duplicate submit.
     pub(super) async fn send_resume(
@@ -1336,7 +1332,7 @@ where
                 from: Sender::User,
                 to: Receiver {
                     name: approval.agent_name.clone(),
-                    thread_id: ProcessId::from(approval.thread_id.clone()),
+                    pid: ProcessId::from(approval.pid.clone()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision {
@@ -1350,7 +1346,7 @@ where
 
     /// Restart the harness from storage, injecting resume decisions for agents
     /// that suspended in the previous run (keyed by agent name, carrying the
-    /// thread each one is parked on — what `Session::open` derives from the
+    /// process each one is parked on — what `Session::open` derives from the
     /// pending approvals it collected).
     pub(super) async fn restart(
         &self,
@@ -1361,7 +1357,7 @@ where
     ) -> Self {
         let snapshot: Option<ProcessRuntimeSnapshot> = self
             .storage
-            .load_session_snapshot(self.thread_id.as_ref())
+            .load_session_snapshot(self.pid.as_ref())
             .await
             .unwrap_or_default()
             .map(Into::into);
@@ -1392,15 +1388,15 @@ where
         snapshot: Option<ProcessRuntimeSnapshot>,
     ) -> Self {
         let config = test_config(provider, approval);
-        let session_id = self.thread_id.as_ref().to_string();
+        let session_id = self.pid.as_ref().to_string();
         let resume_targets = resume_targets
             .into_iter()
-            .map(|(agent, (thread_id, decision))| {
+            .map(|(agent, (pid, decision))| {
                 (
-                    thread_id.clone(),
+                    pid.clone(),
                     ResumeTarget {
                         agent_name: agent,
-                        thread_id: ProcessId(thread_id),
+                        pid: ProcessId(pid),
                         decision,
                     },
                 )
@@ -1417,7 +1413,7 @@ where
         Self {
             runtime,
             events,
-            thread_id: ProcessId(session_id),
+            pid: ProcessId(session_id),
             storage: self.storage.clone(),
         }
     }
@@ -1425,9 +1421,8 @@ where
     /// The turn tag is dropped here: almost every test cares about who emitted
     /// what, not which submission it belonged to.
     pub(super) async fn next_event(&mut self) -> (String, ProcessId, AgentEvent) {
-        let (agent_name, thread_id, _turn, event) =
-            self.events.recv().await.expect("receive event");
-        (agent_name, thread_id, event)
+        let (agent_name, pid, _turn, event) = self.events.recv().await.expect("receive event");
+        (agent_name, pid, event)
     }
 
     pub(super) async fn shutdown(&self) {

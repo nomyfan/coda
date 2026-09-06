@@ -21,11 +21,11 @@ async fn exiting_retains_an_envelope_when_snapshot_persistence_fails() {
         id,
         from: Sender::Agent {
             name: "worker".into(),
-            thread_id: ProcessId::new(),
+            pid: ProcessId::new(),
         },
         to: Receiver {
             name: "coda".into(),
-            thread_id: "session".to_string().into(),
+            pid: "session".to_string().into(),
         },
         reply_to: Some("accepted-call".into()),
         body: EnvelopeBody::Reply {
@@ -201,24 +201,24 @@ async fn reply_after_parent_exit_is_saved_and_consumed_on_reopen() {
         let harness = Harness::start_agents(storage.clone(), team.build(".", coda_tools::shared_file_locks(), test_registry()),
             TestProvider::with_hold_subagent(release.clone()), ToolApprovalMode::Auto, "start").await;
         loop {
-            if let Some(cp) = storage.load_checkpoint(harness.thread_id.as_ref()).await.unwrap()
+            if let Some(cp) = storage.load_checkpoint(harness.pid.as_ref()).await.unwrap()
                 && matches!(cp.resume_point, crate::persist::StoredResumePoint::ToolExecution(ref s) if !s.pending_replies.is_empty()) { break; }
             tokio::task::yield_now().await;
         }
-        let mut parent = harness.runtime.processes.lock().await.get(harness.thread_id.as_ref()).unwrap().finished.clone();
+        let mut parent = harness.runtime.processes.lock().await.get(harness.pid.as_ref()).unwrap().finished.clone();
         harness.runtime.request_exit().await;
         while !*parent.borrow_and_update() { parent.changed().await.unwrap(); }
         release.notify_one();
         assert!(harness.runtime.wait_for_exit(Some(Duration::from_secs(2))).await);
-        let snapshot = storage.load_session_snapshot(harness.thread_id.as_ref()).await.unwrap().unwrap();
+        let snapshot = storage.load_session_snapshot(harness.pid.as_ref()).await.unwrap().unwrap();
         assert!(snapshot.drained_envelopes.values().flatten().any(|e| matches!(e.body, EnvelopeBody::Reply { .. })));
-        assert!(harness.runtime.send_message(user_task(&harness.thread_id, "closed")).await.is_err());
+        assert!(harness.runtime.send_message(user_task(&harness.pid, "closed")).await.is_err());
         let mut reopened = harness.restart(team.build(".", coda_tools::shared_file_locks(), test_registry()),
             TestProvider::default(), ToolApprovalMode::Auto, HashMap::new()).await;
         loop {
             if matches!(reopened.next_event().await.2, AgentEvent::LLMEnd(ref a) if a.content == "main done") { break; }
         }
-        let checkpoint = storage.load_checkpoint(harness.thread_id.as_ref()).await.unwrap().unwrap();
+        let checkpoint = storage.load_checkpoint(harness.pid.as_ref()).await.unwrap().unwrap();
         assert_eq!(checkpoint.messages.iter().filter(|e| matches!(&e.message, Message::Tool(t) if t.id == "call_explore")).count(), 1);
         reopened.shutdown().await;
     }).await.expect("shutdown reply must survive without restarting its child");

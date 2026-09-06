@@ -28,10 +28,10 @@ async fn child_checkpoint_failure_finishes_scope_but_quarantines_until_abort_is_
         storage.block_cleanup.store(false, std::sync::atomic::Ordering::SeqCst);
         while runtime.has_background_work() { tokio::task::yield_now().await; }
         assert!(!background.has_pending_cleanup().await);
-        let checkpoint = storage.load_checkpoint(&old_child.thread_id).await.unwrap().unwrap();
+        let checkpoint = storage.load_checkpoint(&old_child.pid).await.unwrap().unwrap();
         assert!(checkpoint.active_execution.is_none());
         assert!(matches!(checkpoint.resume_point, StoredResumePoint::Generation));
-        assert!(storage.save_execution_checkpoint(crate::execution::ExecutionIdentity { thread_id: old_child.thread_id.clone(), invocation_id: execution.invocation_id }, old_child).await.is_err(), "late writes cannot restore stale tool execution");
+        assert!(storage.save_execution_checkpoint(crate::execution::ExecutionIdentity { pid: old_child.pid.clone(), invocation_id: execution.invocation_id }, old_child).await.is_err(), "late writes cannot restore stale tool execution");
         background.kill(&independent).await.unwrap();
         runtime.request_exit().await;
         runtime.wait_for_exit(Some(Duration::from_secs(2))).await;
@@ -127,9 +127,9 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .save_checkpoint(
             "child".into(),
             crate::StoredCheckpoint {
-                thread_id: "child".into(),
+                pid: "child".into(),
                 agent_name: "child".into(),
-                parent_thread_id: Some(root.into()),
+                parent_pid: Some(root.into()),
                 derivation_key: Some("child".into()),
                 active_execution: Some(crate::execution::StoredExecution {
                     invocation_id: "old-execution".into(),
@@ -160,7 +160,7 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .save_session_snapshot(
             root.into(),
             crate::StoredRuntimeSnapshot {
-                active_threads: [("child".into(), "child".into())].into(),
+                active_processes: [("child".into(), "child".into())].into(),
                 drained_envelopes: Default::default(),
                 agent_drained_envelopes: Default::default(),
             },

@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 /// Origin of a [`SessionEvent`]: the root agent, or a named subagent.
 ///
-/// `thread_id` on the event still disambiguates stateless subagent instances.
+/// `pid` on the event still disambiguates stateless subagent instances.
 #[derive(Debug, Clone)]
 pub enum EventOrigin {
     Root,
@@ -55,7 +55,7 @@ impl EventOrigin {
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub origin: EventOrigin,
-    pub thread_id: ProcessId,
+    pub pid: ProcessId,
     /// The submission this event belongs to. Shared by every agent the turn
     /// reaches, so a consumer can settle per turn without working out the call
     /// tree for itself.
@@ -127,7 +127,7 @@ pub enum OpenError {
     /// One or more agents have a checkpoint in `PendingApproval` state but the
     /// builder's `resume_decisions` did not cover them. The runtime is NOT
     /// started in this case; the caller should collect resume decisions for the
-    /// returned pending approvals (keyed by `thread_id`) and rebuild the session
+    /// returned pending approvals (keyed by `pid`) and rebuild the session
     /// with `SessionBuilder::resume_decisions`.
     PendingApprovalsRequired(Vec<PendingApproval>),
 }
@@ -238,7 +238,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
     }
 
     /// Provide resume decisions for any agents whose restored checkpoint is in
-    /// `PendingApproval` state. Keys are `PendingApproval::thread_id` values
+    /// `PendingApproval` state. Keys are `PendingApproval::pid` values
     /// (use those returned by [`OpenError::PendingApprovalsRequired`]).
     ///
     /// If `open` finds pending-approval checkpoints that are not covered by
@@ -306,7 +306,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             {
                 let members = interrupted.entry(id.clone()).or_default();
                 let member = coda_core::task::ScopeMember {
-                    thread_id: checkpoint.thread_id,
+                    pid: checkpoint.pid,
                     invocation_id: execution.invocation_id,
                 };
                 if !members.contains(&member) {
@@ -359,7 +359,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         {
             snapshot
                 .get_or_insert_with(Default::default)
-                .active_threads
+                .active_processes
                 .insert(session_id.clone(), root_name.clone());
         }
 
@@ -383,7 +383,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             if !available {
                 warn!(
                     "ignoring pending approval on thread {} for unavailable agent {}",
-                    approval.thread_id, approval.agent_name
+                    approval.pid, approval.agent_name
                 );
             }
             available
@@ -394,7 +394,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
         // Auto-reject timed-out pending approvals that the caller didn't cover.
         if let Some(timeout) = run_config.approval_timeout {
             for p in &pending_approvals {
-                if resume_decisions.contains_key(&p.thread_id) {
+                if resume_decisions.contains_key(&p.pid) {
                     continue;
                 }
                 let elapsed_ms = (jiff::Timestamp::now().as_millisecond()
@@ -414,7 +414,7 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
                         })
                         .collect();
                     resume_decisions.insert(
-                        p.thread_id.clone(),
+                        p.pid.clone(),
                         ResumeDecision {
                             parent_message_id: p.parent_message_id,
                             resolutions,
@@ -426,34 +426,34 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
 
         let uncovered: Vec<PendingApproval> = pending_approvals
             .iter()
-            .filter(|c| !resume_decisions.contains_key(&c.thread_id))
+            .filter(|c| !resume_decisions.contains_key(&c.pid))
             .cloned()
             .collect();
         if !uncovered.is_empty() {
             return Err(OpenError::PendingApprovalsRequired(uncovered));
         }
         // Address each decision to the agent whose checkpoint is parked on that
-        // thread. This — not the runtime snapshot — is what makes a resume
-        // reach its thread: the snapshot is only written when an agent exits,
+        // process. This — not the runtime snapshot — is what makes a resume
+        // reach its process: the snapshot is only written when an agent exits,
         // so it is absent for a session that was killed mid-approval and for
         // one a fork just minted. Decisions that match no pending approval are
         // dropped here rather than disappearing silently into bootstrap.
         let mut resume_targets: HashMap<String, ResumeTarget> = HashMap::new();
         for approval in &pending_approvals {
-            let Some(decision) = resume_decisions.remove(&approval.thread_id) else {
+            let Some(decision) = resume_decisions.remove(&approval.pid) else {
                 continue;
             };
             resume_targets.insert(
-                approval.thread_id.clone(),
+                approval.pid.clone(),
                 ResumeTarget {
                     agent_name: approval.agent_name.clone(),
-                    thread_id: ProcessId::from(approval.thread_id.clone()),
+                    pid: ProcessId::from(approval.pid.clone()),
                     decision,
                 },
             );
         }
-        for thread_id in resume_decisions.keys() {
-            warn!("discarding a resume decision for unsuspended thread {thread_id}");
+        for pid in resume_decisions.keys() {
+            warn!("discarding a resume decision for unsuspended thread {pid}");
         }
 
         let mut runtime = ProcessRuntime::new(storage, session_id.clone());
@@ -501,13 +501,13 @@ async fn collect_pending_approvals(
         else {
             return Err(OpenError::Storage(format!(
                 "storage returned non-pending checkpoint {} as awaiting approval",
-                stored.thread_id
+                stored.pid
             )));
         };
         if pending_approval_calls.is_empty() {
             return Err(OpenError::Storage(format!(
                 "storage returned empty approval checkpoint {} as awaiting approval",
-                stored.thread_id
+                stored.pid
             )));
         }
         pending.push(PendingApproval {
@@ -520,7 +520,7 @@ async fn collect_pending_approvals(
                 .as_ref()
                 .map(|e| e.agent_path.clone())
                 .unwrap_or_else(|| vec![stored.agent_name.clone()]),
-            thread_id: stored.thread_id,
+            pid: stored.pid,
             agent_name: stored.agent_name,
             parent_message_id,
             calls: pending_approval_calls
@@ -584,7 +584,7 @@ impl Session {
     }
 
     /// `true` when at least one agent picked up in-flight work at `open` (an
-    /// active thread, or a replayed envelope) and will therefore emit events
+    /// active process, or a replayed envelope) and will therefore emit events
     /// without waiting for a `send`. Callers should enter the event loop
     /// directly instead of prompting for user input first.
     ///
@@ -667,7 +667,7 @@ impl Session {
         images: Vec<String>,
         notice: Option<Vec<TaskNoticeOutcome>>,
     ) -> Result<(), SendCommandError> {
-        let thread_id = ProcessId::from(self.inner.session_id.clone());
+        let pid = ProcessId::from(self.inner.session_id.clone());
         let root_name = self.inner.root_name.clone();
         self.inner
             .runtime
@@ -676,7 +676,7 @@ impl Session {
                 from: Sender::User,
                 to: Receiver {
                     name: root_name,
-                    thread_id,
+                    pid,
                 },
                 reply_to: None,
                 body: EnvelopeBody::Task {
@@ -689,25 +689,24 @@ impl Session {
             .await
     }
 
-    /// Resume a suspended agent by `agent_name` and `thread_id`.
+    /// Resume a suspended agent by `agent_name` and `pid`.
     ///
-    /// The caller gets `agent_name` and `thread_id` from a
+    /// The caller gets `agent_name` and `pid` from a
     /// [`PendingApproval`] (received via [`AgentEvent::Suspended`] or
     /// [`OpenError::PendingApprovalsRequired`]).
     pub async fn resume(
         &self,
         agent_name: &str,
-        thread_id: &str,
+        pid: &str,
         decision: ResumeDecision,
     ) -> Result<(), SendCommandError> {
-        self.send_resume_envelope(agent_name, thread_id, decision)
-            .await
+        self.send_resume_envelope(agent_name, pid, decision).await
     }
 
     async fn send_resume_envelope(
         &self,
         agent_name: &str,
-        thread_id: &str,
+        pid: &str,
         decision: ResumeDecision,
     ) -> Result<(), SendCommandError> {
         self.inner
@@ -717,7 +716,7 @@ impl Session {
                 from: Sender::User,
                 to: Receiver {
                     name: agent_name.to_string(),
-                    thread_id: ProcessId::from(thread_id.to_string()),
+                    pid: ProcessId::from(pid.to_string()),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(decision),
@@ -813,7 +812,7 @@ impl Session {
 
     fn wrap_event(
         &self,
-        (name, thread_id, turn_id, kind): (String, ProcessId, TurnId, AgentEvent),
+        (name, pid, turn_id, kind): (String, ProcessId, TurnId, AgentEvent),
     ) -> SessionEvent {
         let origin = if name == self.inner.root_name {
             EventOrigin::Root
@@ -822,7 +821,7 @@ impl Session {
         };
         SessionEvent {
             origin,
-            thread_id,
+            pid,
             turn_id,
             kind,
         }

@@ -44,7 +44,7 @@ async fn old_group_retirement_and_abort_preserve_a_new_execution() {
         agent_path: vec!["worker".into()],
     };
     let member = ScopeMember {
-        thread_id: pid.0.clone(),
+        pid: pid.0.clone(),
         invocation_id: "old-execution".into(),
     };
     let cancel = CancellationToken::new();
@@ -56,9 +56,9 @@ async fn old_group_retirement_and_abort_preserve_a_new_execution() {
         },
     );
     let checkpoint = StoredCheckpoint {
-        thread_id: pid.0.clone(),
+        pid: pid.0.clone(),
         agent_name: "worker".into(),
-        parent_thread_id: Some("session".into()),
+        parent_pid: Some("session".into()),
         derivation_key: Some("worker".into()),
         active_execution: Some(current.clone()),
         messages: vec![],
@@ -70,7 +70,7 @@ async fn old_group_retirement_and_abort_preserve_a_new_execution() {
         .await
         .unwrap();
     let snapshot = StoredRuntimeSnapshot {
-        active_threads: [(pid.0.clone(), "worker".into())].into(),
+        active_processes: [(pid.0.clone(), "worker".into())].into(),
         drained_envelopes: HashMap::new(),
         agent_drained_envelopes: HashMap::new(),
     };
@@ -131,7 +131,7 @@ async fn old_group_retirement_and_abort_preserve_a_new_execution() {
             .snapshot
             .lock()
             .await
-            .active_threads
+            .active_processes
             .contains_key(pid.as_ref())
     );
     let checkpoint = storage
@@ -149,14 +149,14 @@ async fn old_group_retirement_and_abort_preserve_a_new_execution() {
             .await
             .unwrap()
             .unwrap()
-            .active_threads
+            .active_processes
             .contains_key(pid.as_ref())
     );
     assert!(
         storage
             .save_execution_checkpoint(
                 ExecutionIdentity {
-                    thread_id: pid.0.clone(),
+                    pid: pid.0.clone(),
                     invocation_id: member.invocation_id,
                 },
                 checkpoint

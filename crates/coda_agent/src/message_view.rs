@@ -1,4 +1,4 @@
-//! What a thread shows the model — the model view.
+//! What a process shows the model — the model view.
 //!
 //! [`model_view`] starts at the last compaction summary (if any), then
 //! everything after its recorded `cutoff`, in original order. Storage only
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 /// The model's view of `messages`: the last compaction summary (if any)
 /// leading, then everything after its `cutoff`, minus transcript-only
-/// records. A thread with no summary yet is shown whole.
+/// records. A process with no summary yet is shown whole.
 pub fn model_view(messages: &[HistoryEntry]) -> impl Iterator<Item = &HistoryEntry> + '_ {
     let (summary, tail) = model_view_parts_indexed(messages);
     summary.into_iter().chain(tail).map(|(_, entry)| entry)

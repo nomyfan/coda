@@ -332,7 +332,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
 
   // Reset to the first item whenever the pending set itself changes (a new
   // batch arrives) — but keep position while the user works through a batch.
-  const itemsKey = items.map((item) => `${item.approval.thread_id}:${item.call.id}`).join("|");
+  const itemsKey = items.map((item) => `${item.approval.pid}:${item.call.id}`).join("|");
   const prevKey = useRef(itemsKey);
   useEffect(() => {
     if (prevKey.current !== itemsKey) {

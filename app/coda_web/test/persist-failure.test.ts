@@ -44,7 +44,7 @@ test("a persist failure does not end the turn", () => {
   const after = reduceEvent(running, {
     type: "persist_failed",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "storage is unavailable",
   });
 
@@ -59,7 +59,7 @@ test("the notice survives the reattach the failure itself causes", () => {
   const failed = reduceEvent(session(), {
     type: "persist_failed",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "storage is unavailable",
   });
 
@@ -78,14 +78,14 @@ test("a later turn that finishes normally clears the notice", () => {
   const failed = reduceEvent(session(), {
     type: "persist_failed",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "storage is unavailable",
   });
 
   const recovered = reduceEvent(failed, {
     type: "llm_end",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: answer("m1"),
   });
 
@@ -96,14 +96,14 @@ test("a sub-agent finishing is not the turn finishing, so the notice stays", () 
   const failed = reduceEvent(session(), {
     type: "persist_failed",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "storage is unavailable",
   });
 
   const stillOpen = reduceEvent(failed, {
     type: "llm_end",
     agent_name: "explore",
-    thread_id: "sub",
+    pid: "sub",
     message: answer("m1"),
   });
 
@@ -118,14 +118,14 @@ test("an aborted generation is not a turn ending, so the notice stays", () => {
   const failed = reduceEvent(session(), {
     type: "persist_failed",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: "storage is unavailable",
   });
 
   const interrupted = reduceEvent(failed, {
     type: "llm_end",
     agent_name: "coda",
-    thread_id: "s1",
+    pid: "s1",
     message: { ...answer("m1"), aborted: true },
   });
 

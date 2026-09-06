@@ -116,7 +116,7 @@ test("a task notice flushes the previous turn before it is appended", () => {
     applyEvent(server, "ws", "s1", {
       type: "llm_end",
       agent_name: "coda",
-      thread_id: "s1",
+      pid: "s1",
       message: {
         message_id: "answer-1",
         content: "done",

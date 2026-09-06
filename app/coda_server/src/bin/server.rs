@@ -777,7 +777,7 @@ async fn send_open_error<T: Transport>(
 ) {
     let event = WireEvent::Error {
         agent_name: String::new(),
-        thread_id: session_id.to_string(),
+        pid: session_id.to_string(),
         message: format!("failed to open session: {err}"),
     };
     send_event(
@@ -1652,7 +1652,7 @@ async fn dispatch_request(
                     conn_id,
                     SessionCommand::Resume {
                         agent_name: params.agent_name,
-                        thread_id: params.thread_id,
+                        pid: params.pid,
                         decision: params.decision,
                         allow_patterns: params.allow_patterns,
                     },

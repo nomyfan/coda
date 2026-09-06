@@ -40,7 +40,7 @@ test("a live run_javascript result keeps the generated script", () => {
   const started = reduceEvent(session(), {
     type: "tool_start",
     agent_name: "coda",
-    thread_id: "thread-1",
+    pid: "thread-1",
     call: {
       id: "call-1",
       name: "run_javascript",
@@ -51,7 +51,7 @@ test("a live run_javascript result keeps the generated script", () => {
   const finished = reduceEvent(started, {
     type: "tool_end",
     agent_name: "coda",
-    thread_id: "thread-1",
+    pid: "thread-1",
     message: result(),
   });
 

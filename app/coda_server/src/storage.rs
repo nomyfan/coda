@@ -1,7 +1,7 @@
 use crate::jsonb::Json;
 use crate::schema::{
-    aborted_executions, messages, runtime_snapshots, sessions, task_notice_receipts,
-    thread_checkpoints,
+    aborted_executions, messages, process_checkpoints, runtime_snapshots, sessions,
+    task_notice_receipts,
 };
 use coda_agent::HistoryEntry;
 use coda_agent::ProcessId;
@@ -472,22 +472,22 @@ impl WorkspaceStorage {
                 // Every thread parked at `Generation` is what makes the source a
                 // resting point: nothing is waiting on a tool result, an approval
                 // or a sub-agent reply.
-                let busy: Option<String> = thread_checkpoints::table
+                let busy: Option<String> = process_checkpoints::table
                     .filter(
-                        thread_checkpoints::workspace_id
+                        process_checkpoints::workspace_id
                             .eq(&self.workspace_id)
-                            .and(thread_checkpoints::session_id.eq(source_id))
+                            .and(process_checkpoints::session_id.eq(source_id))
                             .and(
-                                thread_checkpoints::resume_point
+                                process_checkpoints::resume_point
                                     .ne(Json(StoredResumePoint::Generation)),
                             ),
                     )
-                    .select(thread_checkpoints::thread_id)
+                    .select(process_checkpoints::pid)
                     .first(conn)
                     .await
                     .optional()?;
-                if let Some(thread_id) = busy {
-                    return Err(ForkError::ThreadBusy { thread_id });
+                if let Some(pid) = busy {
+                    return Err(ForkError::ThreadBusy { pid });
                 }
 
                 // Checkpoints alone don't prove a cold source is at rest: a task
@@ -501,31 +501,31 @@ impl WorkspaceStorage {
                         .first::<Json<StoredRuntimeSnapshot>>(conn)
                         .await
                         .optional()?
-                    && let Some(thread_id) = queued_work(&snapshot)
+                    && let Some(pid) = queued_work(&snapshot)
                 {
-                    return Err(ForkError::SourceNotIdle { thread_id });
+                    return Err(ForkError::SourceNotIdle { pid });
                 }
 
                 let keep = self.retained_turns(conn, source_id, &cut).await?;
 
-                let checkpoints = thread_checkpoints::table
+                let checkpoints = process_checkpoints::table
                     .filter(
-                        thread_checkpoints::workspace_id
+                        process_checkpoints::workspace_id
                             .eq(&self.workspace_id)
-                            .and(thread_checkpoints::session_id.eq(source_id)),
+                            .and(process_checkpoints::session_id.eq(source_id)),
                     )
                     .select((
-                        thread_checkpoints::thread_id,
-                        thread_checkpoints::agent_name,
-                        thread_checkpoints::parent_thread_id,
-                        thread_checkpoints::derivation_key,
-                        thread_checkpoints::active_execution,
-                        thread_checkpoints::resume_point,
-                        thread_checkpoints::suspended_at,
+                        process_checkpoints::pid,
+                        process_checkpoints::agent_name,
+                        process_checkpoints::parent_pid,
+                        process_checkpoints::derivation_key,
+                        process_checkpoints::active_execution,
+                        process_checkpoints::resume_point,
+                        process_checkpoints::suspended_at,
                     ))
-                    .load::<StoredThreadRow>(conn)
+                    .load::<StoredProcessRow>(conn)
                     .await?;
-                let thread_ids = remap_thread_ids(&checkpoints, source_id, &new_id)?;
+                let pids = remap_pids(&checkpoints, source_id, &new_id)?;
 
                 // How much of each thread survives the cut. Retained turns are
                 // always a prefix, so `max_seq + 1 == count` must hold; checking
@@ -538,16 +538,16 @@ impl WorkspaceStorage {
                             .and(messages::session_id.eq(source_id))
                             .and(messages::turn_id.eq_any(&keep)),
                     )
-                    .group_by(messages::thread_id)
+                    .group_by(messages::pid)
                     .select((
-                        messages::thread_id,
+                        messages::pid,
                         diesel::dsl::count_star(),
                         diesel::dsl::max(messages::seq),
                     ))
                     .load::<(String, i64, Option<i32>)>(conn)
                     .await?
                     .into_iter()
-                    .map(|(thread_id, count, max_seq)| (thread_id, (count, max_seq)))
+                    .map(|(pid, count, max_seq)| (pid, (count, max_seq)))
                     .collect();
 
                 // Strict insert: `do_nothing` on a collision would pour this
@@ -563,7 +563,7 @@ impl WorkspaceStorage {
                     .await?;
 
                 for checkpoint in &checkpoints {
-                    let Some(&(count, max_seq)) = retained.get(&checkpoint.thread_id) else {
+                    let Some(&(count, max_seq)) = retained.get(&checkpoint.pid) else {
                         // Nothing left of this thread: a missing checkpoint and an
                         // empty one restore the same state, and a stateless
                         // thread's id could never be addressed again anyway.
@@ -571,10 +571,10 @@ impl WorkspaceStorage {
                     };
                     if max_seq.map(|max_seq| i64::from(max_seq) + 1) != Some(count) {
                         return Err(ForkError::HistoryNotContiguous {
-                            thread_id: checkpoint.thread_id.clone(),
+                            pid: checkpoint.pid.clone(),
                         });
                     }
-                    let new_thread_id = &thread_ids[&checkpoint.thread_id];
+                    let new_pid = &pids[&checkpoint.pid];
 
                     // Payloads stay inside the database — some carry inline
                     // base64 images. Tool state is just another column, so the
@@ -586,13 +586,13 @@ impl WorkspaceStorage {
                                     messages::workspace_id
                                         .eq(&self.workspace_id)
                                         .and(messages::session_id.eq(source_id))
-                                        .and(messages::thread_id.eq(&checkpoint.thread_id))
+                                        .and(messages::pid.eq(&checkpoint.pid))
                                         .and(messages::turn_id.eq_any(&keep)),
                                 )
                                 .select((
                                     messages::workspace_id,
                                     new_id.as_str().into_sql::<Text>(),
-                                    new_thread_id.as_str().into_sql::<Text>(),
+                                    new_pid.as_str().into_sql::<Text>(),
                                     messages::seq,
                                     messages::message_id,
                                     messages::turn_id,
@@ -606,7 +606,7 @@ impl WorkspaceStorage {
                         .into_columns((
                             messages::workspace_id,
                             messages::session_id,
-                            messages::thread_id,
+                            messages::pid,
                             messages::seq,
                             messages::message_id,
                             messages::turn_id,
@@ -623,28 +623,26 @@ impl WorkspaceStorage {
                         checkpoint.active_execution.clone().map(|Json(mut target)| {
                             if let coda_agent::execution::CompletionTarget::Caller(reply) =
                                 &mut target.completion
-                                && let Some(mapped) = thread_ids.get(&reply.sender_thread_id)
+                                && let Some(mapped) = pids.get(&reply.sender_pid)
                             {
-                                reply.sender_thread_id = mapped.clone();
+                                reply.sender_pid = mapped.clone();
                             }
                             Json(target)
                         });
-                    diesel::insert_into(thread_checkpoints::table)
+                    diesel::insert_into(process_checkpoints::table)
                         .values((
-                            thread_checkpoints::workspace_id.eq(&self.workspace_id),
-                            thread_checkpoints::session_id.eq(&new_id),
-                            thread_checkpoints::thread_id.eq(new_thread_id),
-                            thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
-                            thread_checkpoints::parent_thread_id.eq(checkpoint
-                                .parent_thread_id
-                                .as_ref()
-                                .map(|parent| &thread_ids[parent])),
-                            thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
-                            thread_checkpoints::active_execution.eq(reply_target),
-                            thread_checkpoints::resume_point.eq(&checkpoint.resume_point),
-                            thread_checkpoints::suspended_at.eq(checkpoint.suspended_at),
-                            thread_checkpoints::message_count.eq(count as i32),
-                            thread_checkpoints::pending_approval
+                            process_checkpoints::workspace_id.eq(&self.workspace_id),
+                            process_checkpoints::session_id.eq(&new_id),
+                            process_checkpoints::pid.eq(new_pid),
+                            process_checkpoints::agent_name.eq(&checkpoint.agent_name),
+                            process_checkpoints::parent_pid
+                                .eq(checkpoint.parent_pid.as_ref().map(|parent| &pids[parent])),
+                            process_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
+                            process_checkpoints::active_execution.eq(reply_target),
+                            process_checkpoints::resume_point.eq(&checkpoint.resume_point),
+                            process_checkpoints::suspended_at.eq(checkpoint.suspended_at),
+                            process_checkpoints::message_count.eq(count as i32),
+                            process_checkpoints::pending_approval
                                 .eq(awaits_approval(&checkpoint.resume_point.0)),
                         ))
                         .execute(conn)
@@ -676,7 +674,7 @@ impl WorkspaceStorage {
             messages::workspace_id
                 .eq(&self.workspace_id)
                 .and(messages::session_id.eq(source_id))
-                .and(messages::thread_id.eq(source_id)),
+                .and(messages::pid.eq(source_id)),
         );
         let cut_seq = match cut {
             ForkCut::At(target) => Some(
@@ -718,7 +716,7 @@ impl WorkspaceStorage {
     /// The two derived columns stay in the query rather than becoming N+1 reads:
     /// `has_pending_approval` is an `exists` over the session's threads, and
     /// `first_user_message` is a correlated scalar subquery for the opening
-    /// message of the root thread (whose `thread_id` is the session id). The
+    /// message of the root thread (whose `pid` is the session id). The
     /// epoch conversion is deliberately *not* pushed into SQL — selecting the
     /// `timestamptz` and converting in Rust keeps the whole query inside the
     /// checked DSL instead of dropping to a raw `extract(...)` fragment.
@@ -729,7 +727,7 @@ impl WorkspaceStorage {
                 messages::workspace_id
                     .eq(sessions::workspace_id)
                     .and(messages::session_id.eq(sessions::session_id))
-                    .and(messages::thread_id.eq(sessions::session_id))
+                    .and(messages::pid.eq(sessions::session_id))
                     .and(messages::role.eq("user")),
             )
             .order(messages::seq)
@@ -737,11 +735,11 @@ impl WorkspaceStorage {
             .limit(1)
             .single_value();
         let has_pending_approval = diesel::dsl::exists(
-            thread_checkpoints::table.filter(
-                thread_checkpoints::workspace_id
+            process_checkpoints::table.filter(
+                process_checkpoints::workspace_id
                     .eq(sessions::workspace_id)
-                    .and(thread_checkpoints::session_id.eq(sessions::session_id))
-                    .and(thread_checkpoints::pending_approval),
+                    .and(process_checkpoints::session_id.eq(sessions::session_id))
+                    .and(process_checkpoints::pending_approval),
             ),
         );
 
@@ -890,14 +888,14 @@ pub enum RewindError {
     /// A thread is not parked at a plain generation boundary, so the session
     /// still has work in flight and its persisted state is not a resting point.
     ThreadBusy {
-        thread_id: String,
+        pid: String,
     },
     /// A surviving thread's messages are no longer `[0, count)`. Truncation only
     /// ever removes a tail, so this means that invariant broke upstream; the
     /// transaction is rolled back rather than leaving a history with a hole in
     /// it, which every later save would then append past.
     HistoryNotContiguous {
-        thread_id: String,
+        pid: String,
     },
     Persistence(String),
 }
@@ -906,13 +904,12 @@ impl std::fmt::Display for RewindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TargetNotFound => write!(f, "no such user message in this session"),
-            Self::ThreadBusy { thread_id } => {
-                write!(f, "thread {thread_id} is still mid-turn")
+            Self::ThreadBusy { pid } => {
+                write!(f, "thread {pid} is still mid-turn")
             }
-            Self::HistoryNotContiguous { thread_id } => write!(
-                f,
-                "thread {thread_id} would be left with a gap in its history"
-            ),
+            Self::HistoryNotContiguous { pid } => {
+                write!(f, "thread {pid} would be left with a gap in its history")
+            }
             Self::Persistence(message) => write!(f, "{message}"),
         }
     }
@@ -967,22 +964,22 @@ pub enum ForkError {
     CutNotFound,
     /// A thread is not parked at a plain generation boundary.
     ThreadBusy {
-        thread_id: String,
+        pid: String,
     },
     /// A cold source's runtime snapshot still holds work the next open would
     /// resume. The same source would be refused as busy while live.
     SourceNotIdle {
-        thread_id: String,
+        pid: String,
     },
     /// A thread's retained messages are not `[0, count)`. Retained turns are
     /// always a prefix, so this means that invariant broke upstream.
     HistoryNotContiguous {
-        thread_id: String,
+        pid: String,
     },
     /// A checkpoint's parent was never mapped, so the thread graph is not rooted
     /// at the session.
     OrphanThread {
-        thread_id: String,
+        pid: String,
     },
     Persistence(String),
 }
@@ -992,15 +989,15 @@ impl std::fmt::Display for ForkError {
         match self {
             Self::SourceNotFound => write!(f, "no such session"),
             Self::CutNotFound => write!(f, "no such user message in this session"),
-            Self::ThreadBusy { thread_id } => write!(f, "thread {thread_id} is still mid-turn"),
-            Self::SourceNotIdle { thread_id } => {
-                write!(f, "thread {thread_id} has work queued from a previous run")
+            Self::ThreadBusy { pid } => write!(f, "thread {pid} is still mid-turn"),
+            Self::SourceNotIdle { pid } => {
+                write!(f, "thread {pid} has work queued from a previous run")
             }
-            Self::HistoryNotContiguous { thread_id } => {
-                write!(f, "thread {thread_id} would be copied with a gap")
+            Self::HistoryNotContiguous { pid } => {
+                write!(f, "thread {pid} would be copied with a gap")
             }
-            Self::OrphanThread { thread_id } => {
-                write!(f, "thread {thread_id} has no reachable parent")
+            Self::OrphanThread { pid } => {
+                write!(f, "thread {pid} has no reachable parent")
             }
             Self::Persistence(message) => write!(f, "{message}"),
         }
@@ -1017,10 +1014,10 @@ impl From<diesel::result::Error> for ForkError {
 
 /// A source session's checkpoint row, as a fork reads it.
 #[derive(Queryable)]
-struct StoredThreadRow {
-    thread_id: String,
+struct StoredProcessRow {
+    pid: String,
     agent_name: String,
-    parent_thread_id: Option<String>,
+    parent_pid: Option<String>,
     derivation_key: Option<String>,
     active_execution: Option<Json<coda_agent::execution::StoredExecution>>,
     resume_point: Json<StoredResumePoint>,
@@ -1030,8 +1027,8 @@ struct StoredThreadRow {
 /// The first thread a persisted snapshot would put back to work on the next
 /// open, if any — matching what `Session::open` treats as a resuming session.
 fn queued_work(snapshot: &StoredRuntimeSnapshot) -> Option<String> {
-    if let Some(thread_id) = snapshot.active_threads.keys().next() {
-        return Some(thread_id.clone());
+    if let Some(pid) = snapshot.active_processes.keys().next() {
+        return Some(pid.clone());
     }
     snapshot
         .agent_drained_envelopes
@@ -1039,24 +1036,24 @@ fn queued_work(snapshot: &StoredRuntimeSnapshot) -> Option<String> {
         .chain(snapshot.drained_envelopes.values())
         .flatten()
         .next()
-        .map(|envelope| envelope.to.thread_id.as_ref().to_string())
+        .map(|envelope| envelope.to.pid.as_ref().to_string())
 }
 
 /// Rebuild every thread id under `new_root`.
 ///
 /// Thread ids are derived, not free: the root thread's id *is* the session id,
-/// and each child is `uuid5(parent_thread_id, derivation_key)`. Keeping the old
+/// and each child is `uuid5(parent_pid, derivation_key)`. Keeping the old
 /// ones would leave the new session unable to find its own root history, and
 /// would make a stateful sub-agent miss its thread the next time it is called.
-fn remap_thread_ids(
-    threads: &[StoredThreadRow],
+fn remap_pids(
+    threads: &[StoredProcessRow],
     old_root: &str,
     new_root: &str,
 ) -> Result<HashMap<String, String>, ForkError> {
     let mut mapped = HashMap::from([(old_root.to_string(), new_root.to_string())]);
-    let mut pending: Vec<&StoredThreadRow> = threads
+    let mut pending: Vec<&StoredProcessRow> = threads
         .iter()
-        .filter(|thread| thread.thread_id != old_root)
+        .filter(|thread| thread.pid != old_root)
         .collect();
 
     // Parents before children. The graph is shallow, so rescanning beats
@@ -1064,20 +1061,19 @@ fn remap_thread_ids(
     while !pending.is_empty() {
         let unresolved = pending.len();
         pending.retain(|thread| {
-            let (Some(parent), Some(key)) = (&thread.parent_thread_id, &thread.derivation_key)
-            else {
+            let (Some(parent), Some(key)) = (&thread.parent_pid, &thread.derivation_key) else {
                 return true;
             };
             let Some(new_parent) = mapped.get(parent).cloned() else {
                 return true;
             };
             let derived = ProcessId::from_uuid5(&ProcessId::from(new_parent), key);
-            mapped.insert(thread.thread_id.clone(), derived.as_ref().to_string());
+            mapped.insert(thread.pid.clone(), derived.as_ref().to_string());
             false
         });
         if pending.len() == unresolved {
             return Err(ForkError::OrphanThread {
-                thread_id: pending[0].thread_id.clone(),
+                pid: pending[0].pid.clone(),
             });
         }
     }
@@ -1107,13 +1103,13 @@ impl PgSessionStorage {
     /// Append the thread's new messages and overwrite its state, atomically.
     async fn write_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
         checkpoint: StoredCheckpoint,
         identity: Option<ExecutionIdentity>,
     ) -> Result<(), String> {
         let mut conn = self.conn().await?;
         conn.transaction(async |conn| {
-            self.write_checkpoint_on(conn, thread_id, checkpoint, identity.as_ref())
+            self.write_checkpoint_on(conn, pid, checkpoint, identity.as_ref())
                 .await
         })
         .await
@@ -1126,7 +1122,7 @@ impl PgSessionStorage {
     async fn write_checkpoint_on(
         &self,
         conn: &mut AsyncPgConnection,
-        thread_id: &str,
+        pid: &str,
         checkpoint: StoredCheckpoint,
         identity: Option<&ExecutionIdentity>,
     ) -> Result<(), SaveError> {
@@ -1140,7 +1136,7 @@ impl PgSessionStorage {
             let closed = diesel::select(diesel::dsl::exists(aborted_executions::table.find((
                 &self.workspace_id,
                 &self.session_id,
-                &identity.thread_id,
+                &identity.pid,
                 &identity.invocation_id,
             ))))
             .get_result::<bool>(conn)
@@ -1149,9 +1145,9 @@ impl PgSessionStorage {
                 return Err(SaveError::Rejected("execution was aborted".into()));
             }
         }
-        let stored_count: Option<i32> = thread_checkpoints::table
-            .find((&self.workspace_id, &self.session_id, thread_id))
-            .select(thread_checkpoints::message_count)
+        let stored_count: Option<i32> = process_checkpoints::table
+            .find((&self.workspace_id, &self.session_id, pid))
+            .select(process_checkpoints::message_count)
             .first(conn)
             .await
             .optional()?;
@@ -1163,7 +1159,7 @@ impl PgSessionStorage {
         // from the old count would drop messages silently.
         if checkpoint.messages.len() < stored_count {
             return Err(SaveError::Rejected(format!(
-                "thread {thread_id} has {stored_count} stored messages but the checkpoint \
+                "thread {pid} has {stored_count} stored messages but the checkpoint \
                      carries {}; message history is append-only",
                 checkpoint.messages.len()
             )));
@@ -1179,7 +1175,7 @@ impl PgSessionStorage {
                 .values((
                     messages::workspace_id.eq(&self.workspace_id),
                     messages::session_id.eq(&self.session_id),
-                    messages::thread_id.eq(thread_id),
+                    messages::pid.eq(pid),
                     messages::seq.eq((stored_count + offset) as i32),
                     messages::message_id.eq(message_id.as_uuid()),
                     messages::turn_id.eq(entry.turn_id.as_uuid()),
@@ -1195,7 +1191,7 @@ impl PgSessionStorage {
                 ))
                 .execute(conn)
                 .await?;
-            if thread_id == self.session_id
+            if pid == self.session_id
                 && let Message::Tool(tool) = &entry.message
                 && let Some(task_id) = &tool.observed_task
             {
@@ -1214,26 +1210,27 @@ impl PgSessionStorage {
         }
 
         let state = (
-            thread_checkpoints::agent_name.eq(&checkpoint.agent_name),
-            thread_checkpoints::parent_thread_id.eq(&checkpoint.parent_thread_id),
-            thread_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
-            thread_checkpoints::active_execution.eq(checkpoint.active_execution.as_ref().map(Json)),
-            thread_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
-            thread_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
-            thread_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
-            thread_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
+            process_checkpoints::agent_name.eq(&checkpoint.agent_name),
+            process_checkpoints::parent_pid.eq(&checkpoint.parent_pid),
+            process_checkpoints::derivation_key.eq(&checkpoint.derivation_key),
+            process_checkpoints::active_execution
+                .eq(checkpoint.active_execution.as_ref().map(Json)),
+            process_checkpoints::resume_point.eq(Json(&checkpoint.resume_point)),
+            process_checkpoints::suspended_at.eq(checkpoint.suspended_at.to_diesel()),
+            process_checkpoints::message_count.eq(checkpoint.messages.len() as i32),
+            process_checkpoints::pending_approval.eq(awaits_approval(&checkpoint.resume_point)),
         );
-        diesel::insert_into(thread_checkpoints::table)
+        diesel::insert_into(process_checkpoints::table)
             .values((
-                thread_checkpoints::workspace_id.eq(&self.workspace_id),
-                thread_checkpoints::session_id.eq(&self.session_id),
-                thread_checkpoints::thread_id.eq(thread_id),
+                process_checkpoints::workspace_id.eq(&self.workspace_id),
+                process_checkpoints::session_id.eq(&self.session_id),
+                process_checkpoints::pid.eq(pid),
                 state.clone(),
             ))
             .on_conflict((
-                thread_checkpoints::workspace_id,
-                thread_checkpoints::session_id,
-                thread_checkpoints::thread_id,
+                process_checkpoints::workspace_id,
+                process_checkpoints::session_id,
+                process_checkpoints::pid,
             ))
             .do_update()
             .set(state)
@@ -1244,25 +1241,25 @@ impl PgSessionStorage {
         Ok(())
     }
 
-    async fn read_checkpoint(&self, thread_id: &str) -> Result<Option<StoredCheckpoint>, String> {
+    async fn read_checkpoint(&self, pid: &str) -> Result<Option<StoredCheckpoint>, String> {
         let mut conn = self.conn().await?;
-        self.read_checkpoint_on(&mut conn, thread_id).await
+        self.read_checkpoint_on(&mut conn, pid).await
     }
 
     async fn read_checkpoint_on(
         &self,
         conn: &mut AsyncPgConnection,
-        thread_id: &str,
+        pid: &str,
     ) -> Result<Option<StoredCheckpoint>, String> {
-        let state = thread_checkpoints::table
-            .find((&self.workspace_id, &self.session_id, thread_id))
+        let state = process_checkpoints::table
+            .find((&self.workspace_id, &self.session_id, pid))
             .select((
-                thread_checkpoints::agent_name,
-                thread_checkpoints::parent_thread_id,
-                thread_checkpoints::derivation_key,
-                thread_checkpoints::active_execution,
-                thread_checkpoints::resume_point,
-                thread_checkpoints::suspended_at,
+                process_checkpoints::agent_name,
+                process_checkpoints::parent_pid,
+                process_checkpoints::derivation_key,
+                process_checkpoints::active_execution,
+                process_checkpoints::resume_point,
+                process_checkpoints::suspended_at,
             ))
             .first::<(
                 String,
@@ -1274,10 +1271,10 @@ impl PgSessionStorage {
             )>(&mut *conn)
             .await
             .optional()
-            .map_err(|err| format!("failed to load the state of {thread_id}: {err}"))?;
+            .map_err(|err| format!("failed to load the state of {pid}: {err}"))?;
         let Some((
             agent_name,
-            parent_thread_id,
+            parent_pid,
             derivation_key,
             reply_target,
             resume_point,
@@ -1292,13 +1289,13 @@ impl PgSessionStorage {
                 messages::workspace_id
                     .eq(&self.workspace_id)
                     .and(messages::session_id.eq(&self.session_id))
-                    .and(messages::thread_id.eq(thread_id)),
+                    .and(messages::pid.eq(pid)),
             )
             .order(messages::seq)
             .select((messages::turn_id, messages::payload, messages::state))
             .load::<(uuid::Uuid, Json<Message>, Json<ThreadStateMap>)>(&mut *conn)
             .await
-            .map_err(|err| format!("failed to load the messages of {thread_id}: {err}"))?
+            .map_err(|err| format!("failed to load the messages of {pid}: {err}"))?
             .into_iter()
             .map(|(turn_id, payload, state)| HistoryEntry {
                 turn_id: TurnId::from(MessageId::from(turn_id)),
@@ -1308,9 +1305,9 @@ impl PgSessionStorage {
             .collect();
 
         Ok(Some(StoredCheckpoint {
-            thread_id: thread_id.to_string(),
+            pid: pid.to_string(),
             agent_name,
-            parent_thread_id,
+            parent_pid,
             derivation_key,
             active_execution: reply_target.map(Json::into_inner),
             messages,
@@ -1320,28 +1317,28 @@ impl PgSessionStorage {
     }
 
     async fn read_pending_approval_checkpoints(&self) -> Result<Vec<StoredCheckpoint>, String> {
-        let thread_ids = {
+        let pids = {
             let mut conn = self.conn().await?;
-            thread_checkpoints::table
+            process_checkpoints::table
                 .filter(
-                    thread_checkpoints::workspace_id
+                    process_checkpoints::workspace_id
                         .eq(&self.workspace_id)
-                        .and(thread_checkpoints::session_id.eq(&self.session_id))
-                        .and(thread_checkpoints::pending_approval),
+                        .and(process_checkpoints::session_id.eq(&self.session_id))
+                        .and(process_checkpoints::pending_approval),
                 )
-                .order(thread_checkpoints::thread_id)
-                .select(thread_checkpoints::thread_id)
+                .order(process_checkpoints::pid)
+                .select(process_checkpoints::pid)
                 .load::<String>(&mut conn)
                 .await
                 .map_err(|err| format!("failed to list pending approvals: {err}"))?
         };
 
-        let mut checkpoints = Vec::with_capacity(thread_ids.len());
-        for thread_id in thread_ids {
+        let mut checkpoints = Vec::with_capacity(pids.len());
+        for pid in pids {
             let checkpoint = self
-                .read_checkpoint(&thread_id)
+                .read_checkpoint(&pid)
                 .await?
-                .ok_or_else(|| format!("pending approval checkpoint {thread_id} disappeared"))?;
+                .ok_or_else(|| format!("pending approval checkpoint {pid} disappeared"))?;
             checkpoints.push(checkpoint);
         }
         Ok(checkpoints)
@@ -1369,16 +1366,16 @@ impl PgSessionStorage {
             // under the expected value *is* the compare-and-swap: the row lock
             // it takes also serializes this against a concurrent save.
             let claimed = diesel::update(
-                thread_checkpoints::table.filter(
-                    thread_checkpoints::workspace_id
+                process_checkpoints::table.filter(
+                    process_checkpoints::workspace_id
                         .eq(&self.workspace_id)
-                        .and(thread_checkpoints::session_id.eq(&self.session_id))
-                        .and(thread_checkpoints::thread_id.eq(&self.session_id))
-                        .and(thread_checkpoints::message_count.eq(expected_message_count as i32)),
+                        .and(process_checkpoints::session_id.eq(&self.session_id))
+                        .and(process_checkpoints::pid.eq(&self.session_id))
+                        .and(process_checkpoints::message_count.eq(expected_message_count as i32)),
                 ),
             )
             .set(
-                thread_checkpoints::message_count
+                process_checkpoints::message_count
                     .eq((expected_message_count + messages.len()) as i32),
             )
             .execute(conn)
@@ -1393,7 +1390,7 @@ impl PgSessionStorage {
                     .values((
                         messages::workspace_id.eq(&self.workspace_id),
                         messages::session_id.eq(&self.session_id),
-                        messages::thread_id.eq(&self.session_id),
+                        messages::pid.eq(&self.session_id),
                         messages::seq.eq((expected_message_count + offset) as i32),
                         messages::message_id.eq(message_id.as_uuid()),
                         messages::turn_id.eq(turn_id.as_uuid()),
@@ -1437,7 +1434,7 @@ impl PgSessionStorage {
                     messages::workspace_id
                         .eq(&self.workspace_id)
                         .and(messages::session_id.eq(&self.session_id))
-                        .and(messages::thread_id.eq(&self.session_id))
+                        .and(messages::pid.eq(&self.session_id))
                         .and(messages::message_id.eq(target.as_uuid()))
                         .and(messages::role.eq("user")),
                 )
@@ -1451,22 +1448,22 @@ impl PgSessionStorage {
             // safe: nothing is waiting on a tool result, an approval or a
             // sub-agent reply, so no queued envelope has anyone expecting it and
             // the runtime snapshot below can go.
-            let busy: Option<String> = thread_checkpoints::table
+            let busy: Option<String> = process_checkpoints::table
                 .filter(
-                    thread_checkpoints::workspace_id
+                    process_checkpoints::workspace_id
                         .eq(&self.workspace_id)
-                        .and(thread_checkpoints::session_id.eq(&self.session_id))
+                        .and(process_checkpoints::session_id.eq(&self.session_id))
                         .and(
-                            thread_checkpoints::resume_point
+                            process_checkpoints::resume_point
                                 .ne(Json(StoredResumePoint::Generation)),
                         ),
                 )
-                .select(thread_checkpoints::thread_id)
+                .select(process_checkpoints::pid)
                 .first(conn)
                 .await
                 .optional()?;
-            if let Some(thread_id) = busy {
-                return Err(RewindError::ThreadBusy { thread_id });
+            if let Some(pid) = busy {
+                return Err(RewindError::ThreadBusy { pid });
             }
 
             // A turn is named by the root user message that opened it, and one
@@ -1479,7 +1476,7 @@ impl PgSessionStorage {
                     messages::workspace_id
                         .eq(&self.workspace_id)
                         .and(messages::session_id.eq(&self.session_id))
-                        .and(messages::thread_id.eq(&self.session_id))
+                        .and(messages::pid.eq(&self.session_id))
                         .and(messages::seq.ge(target_seq)),
                 )
                 .select(messages::turn_id)
@@ -1505,29 +1502,29 @@ impl PgSessionStorage {
                         .eq(&self.workspace_id)
                         .and(messages::session_id.eq(&self.session_id)),
                 )
-                .group_by(messages::thread_id)
+                .group_by(messages::pid)
                 .select((
-                    messages::thread_id,
+                    messages::pid,
                     diesel::dsl::count_star(),
                     diesel::dsl::max(messages::seq),
                 ))
                 .load::<(String, i64, Option<i32>)>(conn)
                 .await?
                 .into_iter()
-                .map(|(thread_id, count, max_seq)| (thread_id, (count, max_seq)))
+                .map(|(pid, count, max_seq)| (pid, (count, max_seq)))
                 .collect();
 
-            let threads: Vec<String> = thread_checkpoints::table
+            let threads: Vec<String> = process_checkpoints::table
                 .filter(
-                    thread_checkpoints::workspace_id
+                    process_checkpoints::workspace_id
                         .eq(&self.workspace_id)
-                        .and(thread_checkpoints::session_id.eq(&self.session_id)),
+                        .and(process_checkpoints::session_id.eq(&self.session_id)),
                 )
-                .select(thread_checkpoints::thread_id)
+                .select(process_checkpoints::pid)
                 .load(conn)
                 .await?;
-            for thread_id in threads {
-                let Some(&(count, max_seq)) = remaining.get(&thread_id) else {
+            for pid in threads {
+                let Some(&(count, max_seq)) = remaining.get(&pid) else {
                     // A thread with nothing left has nothing to resume from and
                     // nothing to say. For a stateless thread this is the only
                     // correct outcome — its id was derived from the assistant
@@ -1535,10 +1532,10 @@ impl PgSessionStorage {
                     // ever address the row again — and for a stateful one it is
                     // indistinguishable from keeping an empty row, since a
                     // missing checkpoint and an empty one restore the same state.
-                    diesel::delete(thread_checkpoints::table.find((
+                    diesel::delete(process_checkpoints::table.find((
                         &self.workspace_id,
                         &self.session_id,
-                        &thread_id,
+                        &pid,
                     )))
                     .execute(conn)
                     .await?;
@@ -1550,14 +1547,14 @@ impl PgSessionStorage {
                 // instead of a history with a hole that every later save appends
                 // past.
                 if max_seq.map(|max_seq| i64::from(max_seq) + 1) != Some(count) {
-                    return Err(RewindError::HistoryNotContiguous { thread_id });
+                    return Err(RewindError::HistoryNotContiguous { pid });
                 }
-                diesel::update(thread_checkpoints::table.find((
+                diesel::update(process_checkpoints::table.find((
                     &self.workspace_id,
                     &self.session_id,
-                    &thread_id,
+                    &pid,
                 )))
-                .set(thread_checkpoints::message_count.eq(count as i32))
+                .set(process_checkpoints::message_count.eq(count as i32))
                 .execute(conn)
                 .await?;
             }
@@ -1576,7 +1573,7 @@ impl PgSessionStorage {
                     messages::workspace_id
                         .eq(&self.workspace_id)
                         .and(messages::session_id.eq(&self.session_id))
-                        .and(messages::thread_id.eq(&self.session_id)),
+                        .and(messages::pid.eq(&self.session_id)),
                 )
                 .order(messages::seq)
                 .select(messages::payload)
@@ -1666,7 +1663,7 @@ impl SessionStorage for PgSessionStorage {
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            self.write_checkpoint(&identity.thread_id.clone(), checkpoint, Some(identity))
+            self.write_checkpoint(&identity.pid.clone(), checkpoint, Some(identity))
                 .await
         })
     }
@@ -1676,11 +1673,11 @@ impl SessionStorage for PgSessionStorage {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredCheckpoint>, String>> + Send + '_>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            let ids = thread_checkpoints::table
-                .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
-                .filter(thread_checkpoints::session_id.eq(&self.session_id))
-                .filter(thread_checkpoints::active_execution.is_not_null())
-                .select(thread_checkpoints::thread_id)
+            let ids = process_checkpoints::table
+                .filter(process_checkpoints::workspace_id.eq(&self.workspace_id))
+                .filter(process_checkpoints::session_id.eq(&self.session_id))
+                .filter(process_checkpoints::active_execution.is_not_null())
+                .select(process_checkpoints::pid)
                 .load::<String>(&mut conn)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1716,14 +1713,14 @@ impl SessionStorage for PgSessionStorage {
                         .values((
                             aborted_executions::workspace_id.eq(&self.workspace_id),
                             aborted_executions::session_id.eq(&self.session_id),
-                            aborted_executions::thread_id.eq(&member.thread_id),
+                            aborted_executions::pid.eq(&member.pid),
                             aborted_executions::invocation_id.eq(&member.invocation_id),
                         ))
                         .on_conflict_do_nothing()
                         .execute(conn)
                         .await?;
                     if let Some(mut checkpoint) = self
-                        .read_checkpoint_on(conn, &member.thread_id)
+                        .read_checkpoint_on(conn, &member.pid)
                         .await
                         .map_err(SaveError::Rejected)?
                         && checkpoint.active_execution.as_ref().is_some_and(|e| {
@@ -1732,7 +1729,7 @@ impl SessionStorage for PgSessionStorage {
                         })
                     {
                         coda_agent::execution::abort_checkpoint(&mut checkpoint, &scope.reason);
-                        self.write_checkpoint_on(conn, &member.thread_id, checkpoint, None)
+                        self.write_checkpoint_on(conn, &member.pid, checkpoint, None)
                             .await?;
                     }
                 }
@@ -1743,12 +1740,12 @@ impl SessionStorage for PgSessionStorage {
                     .await
                     .optional()?
                 {
-                    let active = thread_checkpoints::table
-                        .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
-                        .filter(thread_checkpoints::session_id.eq(&self.session_id))
+                    let active = process_checkpoints::table
+                        .filter(process_checkpoints::workspace_id.eq(&self.workspace_id))
+                        .filter(process_checkpoints::session_id.eq(&self.session_id))
                         .select((
-                            thread_checkpoints::thread_id,
-                            thread_checkpoints::active_execution,
+                            process_checkpoints::pid,
+                            process_checkpoints::active_execution,
                         ))
                         .load::<(String, Option<Json<coda_agent::execution::StoredExecution>>)>(
                             conn,
@@ -1781,18 +1778,18 @@ impl SessionStorage for PgSessionStorage {
 
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move { self.write_checkpoint(&thread_id, checkpoint, None).await })
+        Box::pin(async move { self.write_checkpoint(&pid, checkpoint, None).await })
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<StoredCheckpoint>, String>> + Send + '_>> {
-        let thread_id = thread_id.to_string();
-        Box::pin(async move { self.read_checkpoint(&thread_id).await })
+        let pid = pid.to_string();
+        Box::pin(async move { self.read_checkpoint(&pid).await })
     }
 
     fn load_pending_approval_checkpoints(
@@ -1819,24 +1816,18 @@ impl SessionStorage for PgSessionStorage {
                 let aborted: Vec<_> = aborted_executions::table
                     .filter(aborted_executions::workspace_id.eq(&self.workspace_id))
                     .filter(aborted_executions::session_id.eq(&self.session_id))
-                    .select((
-                        aborted_executions::thread_id,
-                        aborted_executions::invocation_id,
-                    ))
+                    .select((aborted_executions::pid, aborted_executions::invocation_id))
                     .load::<(String, String)>(conn)
                     .await?
                     .into_iter()
-                    .map(|(thread_id, invocation_id)| coda_core::task::ScopeMember {
-                        thread_id,
-                        invocation_id,
-                    })
+                    .map(|(pid, invocation_id)| coda_core::task::ScopeMember { pid, invocation_id })
                     .collect();
-                let active = thread_checkpoints::table
-                    .filter(thread_checkpoints::workspace_id.eq(&self.workspace_id))
-                    .filter(thread_checkpoints::session_id.eq(&self.session_id))
+                let active = process_checkpoints::table
+                    .filter(process_checkpoints::workspace_id.eq(&self.workspace_id))
+                    .filter(process_checkpoints::session_id.eq(&self.session_id))
                     .select((
-                        thread_checkpoints::thread_id,
-                        thread_checkpoints::active_execution,
+                        process_checkpoints::pid,
+                        process_checkpoints::active_execution,
                     ))
                     .load::<(String, Option<Json<coda_agent::execution::StoredExecution>>)>(conn)
                     .await?

@@ -76,9 +76,9 @@ async fn store_root(
         .save_checkpoint(
             SESSION.to_string(),
             StoredCheckpoint {
-                thread_id: SESSION.to_string(),
+                pid: SESSION.to_string(),
                 agent_name: "coda".into(),
-                parent_thread_id: None,
+                parent_pid: None,
                 derivation_key: None,
                 active_execution: None,
                 messages,
@@ -96,11 +96,11 @@ fn explore_reply(dispatched_by: &str) -> Envelope {
         id,
         from: Sender::Agent {
             name: "explore".into(),
-            thread_id: ProcessId::from(EXPLORE_THREAD.to_string()),
+            pid: ProcessId::from(EXPLORE_THREAD.to_string()),
         },
         to: Receiver {
             name: "coda".into(),
-            thread_id: ProcessId::from(SESSION.to_string()),
+            pid: ProcessId::from(SESSION.to_string()),
         },
         reply_to: Some(dispatched_by.to_string()),
         body: EnvelopeBody::Reply {
@@ -301,7 +301,7 @@ async fn a_checkpoint_that_cannot_be_read_refuses_the_recovery() {
 }
 
 /// Same rule for the other envelope that re-opens no work of its own: a
-/// decision the thread it was meant for has already acted on.
+/// decision the process it was meant for has already acted on.
 #[tokio::test]
 async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
     let storage = MemoryStorage::default();
@@ -312,11 +312,11 @@ async fn a_resume_for_a_thread_that_is_no_longer_parked_opens_no_turn() {
         from: Sender::User,
         to: Receiver {
             name: "coda".into(),
-            thread_id: ProcessId::from(SESSION.to_string()),
+            pid: ProcessId::from(SESSION.to_string()),
         },
         reply_to: None,
         body: EnvelopeBody::Resume(ResumeDecision {
-            // Irrelevant here: the thread is parked on `Generation`, so the
+            // Irrelevant here: the process is parked on `Generation`, so the
             // envelope is dropped before any batch is compared.
             parent_message_id: MessageId::new(),
             resolutions: vec![],

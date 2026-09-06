@@ -11,11 +11,11 @@ async fn backpressured_reply_is_archived_when_exit_precedes_delivery() {
             id,
             from: Sender::Agent {
                 name: "worker".into(),
-                thread_id: ProcessId::new(),
+                pid: ProcessId::new(),
             },
             to: Receiver {
                 name: "coda".into(),
-                thread_id: "root".to_string().into(),
+                pid: "root".to_string().into(),
             },
             reply_to: Some("accepted-call".into()),
             body: EnvelopeBody::Reply {

@@ -283,7 +283,7 @@ impl SessionStorage for SlowStorage {
 
     fn save_checkpoint(
         &self,
-        thread_id: String,
+        pid: String,
         checkpoint: coda_agent::persist::StoredCheckpoint,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
@@ -302,17 +302,17 @@ impl SessionStorage for SlowStorage {
                 return Err("storage is unavailable".to_string());
             }
             if let Some((slow_thread, delay)) = &self.stall
-                && slow_thread == &thread_id
+                && slow_thread == &pid
             {
                 tokio::time::sleep(*delay).await;
             }
-            self.inner.save_checkpoint(thread_id, checkpoint).await
+            self.inner.save_checkpoint(pid, checkpoint).await
         })
     }
 
     fn load_checkpoint(
         &self,
-        thread_id: &str,
+        pid: &str,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Option<coda_agent::persist::StoredCheckpoint>, String>>
@@ -320,7 +320,7 @@ impl SessionStorage for SlowStorage {
                 + '_,
         >,
     > {
-        self.inner.load_checkpoint(thread_id)
+        self.inner.load_checkpoint(pid)
     }
 
     fn load_pending_approval_checkpoints(
@@ -696,9 +696,9 @@ impl SessionOpener for TestOpener {
                 checkpoint
                     .messages
                     .retain(|entry| !discarded.contains(&entry.turn_id.as_uuid()));
-                let thread_id = checkpoint.thread_id.clone();
+                let pid = checkpoint.pid.clone();
                 self.storage
-                    .save_checkpoint(thread_id, checkpoint)
+                    .save_checkpoint(pid, checkpoint)
                     .await
                     .map_err(RewindError::Persistence)?;
             }
@@ -708,7 +708,7 @@ impl SessionOpener for TestOpener {
                     StoredRuntimeSnapshot {
                         drained_envelopes: HashMap::new(),
                         agent_drained_envelopes: HashMap::new(),
-                        active_threads: HashMap::new(),
+                        active_processes: HashMap::new(),
                     },
                 )
                 .await

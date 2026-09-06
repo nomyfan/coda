@@ -44,11 +44,11 @@ impl ProcessRuntime {
             id,
             from: Sender::Agent {
                 name: program.name.clone(),
-                thread_id: caller.clone(),
+                pid: caller.clone(),
             },
             to: Receiver {
                 name: target.name.clone(),
-                thread_id: pid,
+                pid,
             },
             reply_to: None,
             body: EnvelopeBody::ToolCall {

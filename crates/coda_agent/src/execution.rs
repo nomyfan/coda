@@ -44,7 +44,7 @@ impl StoredExecution {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionIdentity {
-    pub thread_id: String,
+    pub pid: String,
     pub invocation_id: String,
 }
 
@@ -99,15 +99,15 @@ pub fn abort_checkpoint(checkpoint: &mut crate::StoredCheckpoint, reason: &str) 
     checkpoint.active_execution = None;
 }
 
-/// Filter late snapshots without deleting a later invocation on the same stateful thread.
+/// Filter late snapshots without deleting a later invocation on the same stateful process.
 pub fn fence_snapshot(
     snapshot: &mut crate::StoredRuntimeSnapshot,
     aborted: &[ScopeMember],
     active: &std::collections::HashMap<String, String>,
 ) {
-    snapshot.active_threads.retain(|thread, _| {
+    snapshot.active_processes.retain(|thread, _| {
         !aborted.iter().any(|member| {
-            &member.thread_id == thread
+            &member.pid == thread
                 && active
                     .get(thread)
                     .is_none_or(|invocation| invocation == &member.invocation_id)

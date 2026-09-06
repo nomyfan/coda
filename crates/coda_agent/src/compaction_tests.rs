@@ -277,7 +277,7 @@ fn a_preferred_boundary_is_before_the_named_turn_even_when_it_is_not_last() {
     );
 }
 
-/// The thread's very first task is protected before its first generation.
+/// The process's very first task is protected before its first generation.
 #[test]
 fn a_protected_opening_message_with_no_predecessor_has_nothing_to_compact() {
     let only_turn = TurnId::from(MessageId::new());

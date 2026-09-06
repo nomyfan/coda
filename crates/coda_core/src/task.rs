@@ -30,9 +30,9 @@ impl fmt::Display for InvalidTaskId {
 impl std::error::Error for InvalidTaskId {}
 
 impl TaskId {
-    /// A delegation replay uses the same id in its session and calling thread.
-    pub fn for_call(session_id: &str, thread_id: &str, origin: &crate::llm::MessageOrigin) -> Self {
-        let identity = serde_json::to_vec(&(session_id, thread_id, origin))
+    /// A delegation replay uses the same id in its session and calling process.
+    pub fn for_call(session_id: &str, pid: &str, origin: &crate::llm::MessageOrigin) -> Self {
+        let identity = serde_json::to_vec(&(session_id, pid, origin))
             .expect("call identity contains only strings and message ids");
         let namespace = uuid::Uuid::from_u128(0xb385bbce_ac91_471e_b039_556afcbf8701);
         TaskId(format!(
@@ -100,16 +100,16 @@ impl<'de> Deserialize<'de> for TaskId {
     }
 }
 
-/// A thread invocation that must be cleaned before the thread can be reused.
+/// A process invocation that must be cleaned before the process can be reused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeMember {
-    pub thread_id: String,
+    pub pid: String,
     pub invocation_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskOrigin {
-    pub thread_id: String,
+    pub pid: String,
     pub message_origin: Option<crate::llm::MessageOrigin>,
     pub agent_path: Vec<String>,
 }

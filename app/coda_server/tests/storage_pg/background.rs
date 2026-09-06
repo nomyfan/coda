@@ -25,7 +25,7 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
     let new = TaskId::new();
     let mut child = checkpoint("child", vec![]);
     child.agent_name = "worker".into();
-    child.parent_thread_id = Some("root".into());
+    child.parent_pid = Some("root".into());
     child.derivation_key = Some("worker".into());
     child.active_execution = Some(execution(&new, "new-invocation"));
     storage
@@ -38,7 +38,7 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
         .save_session_snapshot(
             "root".into(),
             StoredRuntimeSnapshot {
-                active_threads: [("child".into(), "worker".into())].into(),
+                active_processes: [("child".into(), "worker".into())].into(),
                 drained_envelopes: [("child".into(), vec![queued])].into(),
                 agent_drained_envelopes: Default::default(),
             },
@@ -49,7 +49,7 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
         .abort_scope(ScopeAbort {
             task_id: old,
             members: vec![ScopeMember {
-                thread_id: "child".into(),
+                pid: "child".into(),
                 invocation_id: "old-invocation".into(),
             }],
             reason: "old group failed".into(),
@@ -66,13 +66,13 @@ async fn old_group_abort_preserves_a_reused_process_checkpoint_and_inbox() {
         .await
         .unwrap()
         .unwrap();
-    assert!(snapshot.active_threads.contains_key("child"));
+    assert!(snapshot.active_processes.contains_key("child"));
     assert_eq!(snapshot.drained_envelopes["child"][0].id, "new-invocation");
     assert!(
         storage
             .save_execution_checkpoint(
                 ExecutionIdentity {
-                    thread_id: "child".into(),
+                    pid: "child".into(),
                     invocation_id: "old-invocation".into(),
                 },
                 child
@@ -103,7 +103,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         vec![entry(turn, Message::Assistant(assistant.clone()))],
     );
     child.agent_name = "worker".into();
-    child.parent_thread_id = Some("root".into());
+    child.parent_pid = Some("root".into());
     child.derivation_key = Some("child".into());
     child.active_execution = Some(execution(&task, "child-invocation"));
     child.resume_point = StoredResumePoint::PendingApproval {
@@ -115,7 +115,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         pending_calls: vec![],
     };
     let identity = ExecutionIdentity {
-        thread_id: "child".into(),
+        pid: "child".into(),
         invocation_id: "child-invocation".into(),
     };
     storage
@@ -132,7 +132,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
     let mut queued = queued_task("child", "must never replay");
     queued.id = identity.invocation_id.clone();
     let snapshot = StoredRuntimeSnapshot {
-        active_threads: [
+        active_processes: [
             ("child".into(), "worker".into()),
             ("unrelated".into(), "worker".into()),
         ]
@@ -148,7 +148,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .abort_scope(ScopeAbort {
             task_id: task,
             members: vec![ScopeMember {
-                thread_id: identity.thread_id.clone(),
+                pid: identity.pid.clone(),
                 invocation_id: identity.invocation_id.clone(),
             }],
             reason: "checkpoint failed".into(),
@@ -176,8 +176,8 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         .await
         .unwrap()
         .unwrap();
-    assert!(!snapshot.active_threads.contains_key("child"));
-    assert!(snapshot.active_threads.contains_key("unrelated"));
+    assert!(!snapshot.active_processes.contains_key("child"));
+    assert!(snapshot.active_processes.contains_key("unrelated"));
     assert!(snapshot.drained_envelopes.values().all(Vec::is_empty));
     assert!(
         storage
@@ -328,7 +328,7 @@ async fn root_task_read_receipt_survives_reopen_and_rewind_but_not_fork() {
     let user_id = MessageId::new();
     let turn = TurnId::from(user_id);
     let mut child = checkpoint("child", vec![entry(turn, observed_read(&task))]);
-    child.parent_thread_id = Some("root".into());
+    child.parent_pid = Some("root".into());
     child.derivation_key = Some("child".into());
     storage
         .save_checkpoint("child".into(), child)

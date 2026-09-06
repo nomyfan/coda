@@ -32,7 +32,7 @@
 - 保留审批归属、取消传播、checkpoint 失败后的清理与隔离、后台完成通知及去重、冷启动不恢复后台执行，以及 fork/rewind 等已有约束。
 - 同批重复调用同一 stateful 实例时，启动前识别并拒绝全部重复项，其他调用可继续；退出期间停止新调用准入，但仍接收并保存已有执行的有效在途消息，保留重开恢复路径及现有存储失败处理。
 - 有界 inbox 的背压不得阻止其他 process 分发调用或启动 shutdown；回复数量超过 inbox 容量时，整批执行仍能完成，并保留退出切换时的消息归档保证。
-- 允许必要的内部 API、序列化及持久化格式破坏性变化，无需兼容层；本轮保留现有 SQL/协议的 thread 字段名称，不为纯命名做迁移，也不机械改写用户界面或工具名称。
+- 允许必要的内部 API、序列化及持久化格式破坏性变化，无需兼容层；本轮将 Rust、JSON、wire、前端和数据库中的逻辑 process 身份统一为 `pid` / `parent_pid` / `sender_pid`，在线快照统一为 `active_processes`，checkpoint 表统一为 `process_checkpoints`。不保留 serde 别名或双套命名；旧版本 JSON/磁盘归档不保证可读，数据库结构通过 migration 改名。工具名称和行为保持不变。
 - 若后续改变模型需要理解的运行规则，同步更新默认 system prompt 和相关 templates。
 
 ## Success Criteria
@@ -41,4 +41,5 @@
 - 每份可变上下文、执行恢复状态及通信入口的所有者明确；实例选择和消息路由不依赖无独立职责的 agent 中间层。
 - 相同与不同 program 的独立实例并发、已有实例恢复、前台等待及多个后台分组运行均保持正确；同一实例的重叠调用策略保持现有行为。
 - 取消、审批、持久化恢复和后台结果交付的现有测试继续通过；针对职责迁移产生的实际风险补充验证。
+- 前端同步更新协议使用方，通过 lint、test 和 typecheck。
 - Rust 修改完成后通过 `cargo clippy`、`cargo test` 和 `cargo check -p coda_server --features pg-tests --all-targets`。

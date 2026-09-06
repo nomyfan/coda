@@ -180,15 +180,15 @@ async fn parallel_invocations(background_enabled: bool) {
     assert_eq!(
         workers
             .iter()
-            .map(|worker| &worker.thread_id)
+            .map(|worker| &worker.pid)
             .collect::<HashSet<_>>()
             .len(),
         turns * 2
     );
-    assert_ne!(workers[0].thread_id, workers[1].thread_id);
+    assert_ne!(workers[0].pid, workers[1].pid);
     for worker in workers {
         assert_eq!(worker.messages.len(), 2);
-        assert_eq!(worker.parent_thread_id.as_deref(), Some(root.as_ref()));
+        assert_eq!(worker.parent_pid.as_deref(), Some(root.as_ref()));
     }
 }
 

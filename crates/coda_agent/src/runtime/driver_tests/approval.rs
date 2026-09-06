@@ -16,7 +16,7 @@ use tokio::time::{Duration, timeout};
 
 /// Cancellation cannot interrupt the write that records a suspension, so an
 /// abort can land while a sub-agent parks for approval and the run still ends
-/// parked. The snapshot has to keep that thread — reopening finds a sub-agent's
+/// parked. The snapshot has to keep that process — reopening finds a sub-agent's
 /// approval only through it.
 #[tokio::test]
 async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
@@ -65,7 +65,7 @@ async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
     .expect("the sub-agent never parked for approval");
     harness.shutdown().await;
 
-    // What proves the thread survived: the next process asks again.
+    // What proves the process survived: the next process asks again.
     let mut harness = harness
         .restart(
             team.build(".", coda_tools::shared_file_locks(), test_registry()),
@@ -88,7 +88,7 @@ async fn an_abort_while_a_subagent_suspends_keeps_its_pending_approval() {
 }
 
 /// The user's abort during that same write marks the turn stopped, and nothing
-/// but a wind-up closes it. The parked thread has to be driven back in to do
+/// but a wind-up closes it. The parked process has to be driven back in to do
 /// that — no envelope is coming — or the turn stays open and the session
 /// refuses every later task.
 #[tokio::test]
@@ -175,7 +175,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
     decisions.insert(
         pending.agent_name.clone(),
         (
-            pending.thread_id.clone(),
+            pending.pid.clone(),
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
@@ -250,7 +250,7 @@ async fn pending_approval_supports_mixed_resolutions() {
     .await;
 
     // Phase 1: consume until suspended, collect pending info.
-    let (_pending_thread_id, decisions_map) = {
+    let (_pending_pid, decisions_map) = {
         let result = timeout(Duration::from_secs(2), async {
             loop {
                 let (agent_name, _, event) = harness.next_event().await;
@@ -260,7 +260,7 @@ async fn pending_approval_supports_mixed_resolutions() {
                     decisions.insert(
                         pending.agent_name.clone(),
                         (
-                            pending.thread_id.clone(),
+                            pending.pid.clone(),
                             ResumeDecision {
                                 parent_message_id: pending.parent_message_id,
                                 resolutions: vec![
@@ -281,7 +281,7 @@ async fn pending_approval_supports_mixed_resolutions() {
                             },
                         ),
                     );
-                    return (pending.thread_id, decisions);
+                    return (pending.pid, decisions);
                 }
             }
         })
@@ -369,7 +369,7 @@ async fn reject_pending_approval_via_restart() {
     reject_decisions.insert(
         pending.agent_name.clone(),
         (
-            pending.thread_id.clone(),
+            pending.pid.clone(),
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: reject_ids
@@ -475,9 +475,9 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
 
 /// The runtime snapshot is only written when an agent exits, so a process
 /// killed mid-approval — and a session a fork has just minted — comes back with
-/// checkpoints but no snapshot at all. A decision names the thread it belongs
+/// checkpoints but no snapshot at all. A decision names the process it belongs
 /// to, so it must still reach it: routing it through the snapshot's
-/// `active_threads` dropped it silently and left the thread parked forever,
+/// `active_processes` dropped it silently and left the process parked forever,
 /// with every later approval swallowed the same way.
 #[tokio::test]
 async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
@@ -519,7 +519,7 @@ async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
     let decisions = [(
         pending.agent_name.clone(),
         (
-            pending.thread_id.clone(),
+            pending.pid.clone(),
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
@@ -594,7 +594,7 @@ async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let decisions = [(
         pending.agent_name.clone(),
         (
-            pending.thread_id.clone(),
+            pending.pid.clone(),
             ResumeDecision {
                 parent_message_id: pending.parent_message_id,
                 resolutions: vec![(pending.calls[0].id.clone(), ToolCallResolution::Execute)],
@@ -762,7 +762,7 @@ async fn an_empty_decision_for_the_parked_batch_rejects_it() {
 async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
     // Submitting the same approval twice (a double-clicked button, a retry
     // after a reconnect) sends the first batch's decision a second time. By
-    // then the thread has run those calls and suspended on the model's next
+    // then the process has run those calls and suspended on the model's next
     // batch — and every call in that batch is unnamed by the stale decision,
     // so applying it rejected the lot and told the model the user had refused.
     let team = AgentTeam::new(
@@ -811,7 +811,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
     assert_ne!(second.parent_message_id, first.parent_message_id);
 
     // The duplicate submit: the same approval answered a second time, landing
-    // on the batch the thread moved on to.
+    // on the batch the process moved on to.
     let stale = harness
         .runtime
         .send_message(Envelope::with_id(|id| Envelope {
@@ -819,7 +819,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
             from: Sender::User,
             to: Receiver {
                 name: first.agent_name.clone(),
-                thread_id: ProcessId::from(first.thread_id.clone()),
+                pid: ProcessId::from(first.pid.clone()),
             },
             reply_to: None,
             body: EnvelopeBody::Resume(crate::ResumeDecision {
@@ -836,7 +836,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
         .runtime
         .pending_approvals()
         .into_iter()
-        .find(|a| a.thread_id == second.thread_id)
+        .find(|a| a.pid == second.pid)
         .unwrap();
     assert_eq!(reannounced.parent_message_id, second.parent_message_id);
 

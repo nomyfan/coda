@@ -50,7 +50,7 @@ async fn background_approval_blocks_new_input_and_cancellation_revokes_only_its_
                 from: Sender::User,
                 to: Receiver {
                     name: approval.agent_name,
-                    thread_id: ProcessId::from(approval.thread_id),
+                    pid: ProcessId::from(approval.pid),
                 },
                 reply_to: None,
                 body: EnvelopeBody::Resume(crate::ResumeDecision {
