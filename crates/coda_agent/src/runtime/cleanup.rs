@@ -44,7 +44,7 @@ impl ProcessRuntime {
             let keys: Vec<_> = state
                 .approvals
                 .keys()
-                .filter(|(thread, _)| retired.iter().any(|m| &m.pid == thread))
+                .filter(|(pid, _)| retired.iter().any(|m| &m.pid == pid))
                 .cloned()
                 .collect();
             let removed: Vec<_> = keys
@@ -54,11 +54,11 @@ impl ProcessRuntime {
             (members, retired, removed)
         };
         for approval in removed {
-            let thread = ProcessId::from(approval.pid.clone());
+            let pid = ProcessId::from(approval.pid.clone());
             let turn = TurnId::from(approval.parent_message_id);
             let _ = self.global_event_tx.send((
                 approval.agent_name,
-                thread,
+                pid,
                 turn,
                 AgentEvent::ApprovalRemoved {
                     pid: approval.pid,
