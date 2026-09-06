@@ -51,7 +51,6 @@ import {
   discardedFrom,
   forkActiveSession,
   selectActiveApprovalCount,
-  selectActiveBackgroundTasks,
   selectActiveEditing,
   selectActiveEntries,
   selectActiveForkKey,
@@ -64,7 +63,6 @@ import {
 } from "@/store/session";
 import { parseCompactCommand } from "@/lib/compact-command";
 import {
-  type TaskSummary,
   isSubAgentToolName,
   subAgentDisplayName,
   SUBAGENT_TOOL_PREFIX,
@@ -216,7 +214,6 @@ export const Transcript = memo(function Transcript({
   onViewTaskResult?: (taskId: string) => void;
 }) {
   const liveEntries = useCodaStore(selectActiveEntries);
-  const backgroundTasks = useCodaStore(selectActiveBackgroundTasks);
   const liveRunning = useCodaStore(selectActiveRunning);
   const liveApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeKey = useCodaStore(selectActiveKey);
@@ -343,12 +340,6 @@ export const Transcript = memo(function Transcript({
                       entry={item.entry}
                       forkable={item.entry.id !== firstUserId}
                       onViewTaskResult={onViewTaskResult}
-                      resultTask={backgroundTasks.find(
-                        (task) =>
-                          task.id === item.entry.taskId &&
-                          task.kind.kind === "subagent" &&
-                          task.result_available,
-                      )}
                     />
                   ) : (
                     <AssistantTurnBubble
@@ -1222,11 +1213,9 @@ const TranscriptItem = memo(function TranscriptItem({
   entry,
   forkable,
   onViewTaskResult,
-  resultTask,
 }: {
   entry: TranscriptEntry;
   forkable?: boolean;
-  resultTask?: TaskSummary;
   onViewTaskResult?: (taskId: string) => void;
 }) {
   const [toolResultOpen, setToolResultOpen] = useState(false);
@@ -1236,25 +1225,6 @@ const TranscriptItem = memo(function TranscriptItem({
   }
 
   if (entry.kind === "task_notice") {
-    if (onViewTaskResult && resultTask) {
-      return (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border bg-muted/40 px-3 py-2">
-          <ListChecks className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="text-xs font-medium">{entry.title}</span>
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-            {entry.detail}
-          </span>
-          <Button
-            variant="quiet"
-            size="sm"
-            className="ml-auto h-6 px-2 text-xs"
-            onClick={() => onViewTaskResult(resultTask.id)}
-          >
-            View result
-          </Button>
-        </div>
-      );
-    }
     return (
       <Collapsible open={toolResultOpen} onOpenChange={setToolResultOpen}>
         <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
@@ -1262,7 +1232,7 @@ const TranscriptItem = memo(function TranscriptItem({
             <Button
               variant="quiet"
               size="sm"
-              className="h-auto w-full justify-start gap-2 px-0 py-0 text-left"
+              className="h-auto w-full justify-start gap-2 px-0 py-0 text-left hover:bg-transparent"
               title={toolResultOpen ? "Hide task output" : "Show task output"}
             >
               <SquareTerminal className="size-3.5 shrink-0 text-muted-foreground" />
@@ -1280,6 +1250,33 @@ const TranscriptItem = memo(function TranscriptItem({
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent>
+            {onViewTaskResult ? (
+              <div className="mt-2 space-y-2">
+                {entry.taskOutcomes?.map((outcome, index) =>
+                  outcome.type === "finished" ? (
+                    <div
+                      key={`${outcome.task_id}:${index}`}
+                      className="flex items-center gap-2 rounded-md bg-background/60 p-2"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-mono text-xs" title={outcome.command}>
+                          {outcome.command}
+                        </p>
+                        <p className="text-xs text-muted-foreground">{outcome.status}</p>
+                      </div>
+                      <Button
+                        variant="quiet"
+                        size="sm"
+                        className="h-6 shrink-0 px-2 text-xs"
+                        onClick={() => onViewTaskResult(outcome.task_id)}
+                      >
+                        View result
+                      </Button>
+                    </div>
+                  ) : null,
+                )}
+              </div>
+            ) : null}
             <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
               {entry.content}
             </pre>

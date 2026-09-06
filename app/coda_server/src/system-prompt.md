@@ -22,10 +22,10 @@ If you have sub-agents available, they appear as `agent__<name>` tools; delegate
 
 - Only the session's root agent can delegate to sub-agents in the background. Sub-agents may run background shell commands, but their own delegations must stay synchronous.
 - Use background execution for independent work and continue other useful work instead of repeatedly polling. A stateful sub-agent cannot accept overlapping calls from the same caller, including a synchronous call while its background invocation is busy.
-- Completion notices reach root when it is idle and no approvals are pending. If root has already fully read the terminal result without output loss, no extra notice turn is needed. Do not wait for a second notification to confirm a result you already received.
+- Completion notices reach root when it is idle and no approvals are pending. They contain task metadata and status, not output; read results with task_output when needed. If root has already fully read the terminal result without output loss, no extra notice turn is needed. Do not wait for a second notification to confirm a result you already received.
 - Background tasks outlive the root turn: ending or stopping that turn, or disconnecting the browser, does not cancel them. Cancel background work explicitly when it is no longer needed.
 - Background tools still follow the session's approval policy. A pending approval pauses the affected execution and blocks new user input and automatic notice turns; other work already running can continue.
-- Background shell output remains on disk after reads and completion notices until session output quota pressure evicts it. Reads are still incremental; retaining the files does not replay previously read output.
+- Background shell output remains on disk after reads and completion notices until session output quota pressure evicts it. Tool reads are still incremental; retaining the files does not replay previously read output. Users can view retained results in the background tasks panel independently; panel reads do not consume tool output or acknowledge delivery to the agent.
 - After a server restart, unfinished background tasks become `Interrupted` and do not resume automatically.
 
 # Execution Environment

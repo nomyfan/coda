@@ -25,13 +25,11 @@ use coda_core::task::TaskId;
 const MAX_RUNNING: usize = 16;
 /// Terminal summaries in the live overview; older tasks remain in the archive.
 const MAX_TERMINAL: usize = 32;
-/// Full notices (with output tail) buffered; older ones degrade into the
+/// Individual notices buffered; older ones degrade into the
 /// overflow aggregate.
 const MAX_FULL_NOTICES: usize = 64;
 /// (id, status) pairs the overflow aggregate holds; beyond this only a count.
 const MAX_OVERFLOW_ENTRIES: usize = 256;
-/// Output tail carried by one full notice.
-const NOTICE_TAIL_LIMIT: usize = 4096;
 /// Bytes returned per stream by one `read` (128 KiB); the cursor advances only
 /// over what is actually returned, so a large backlog drains across calls.
 const READ_CHUNK_LIMIT: usize = 128 * 1024;
@@ -194,8 +192,8 @@ impl TaskNoticeFact {
     }
 }
 
-/// A notice awaiting delivery. `Task` carries a bounded output tail and the
-/// storage-level overwrite totals; `OutputExpired` is a separate later fact for
+/// A notice awaiting delivery. Task completions carry metadata only;
+/// `OutputExpired` is a separate later fact for
 /// a task whose retained output the quota evicted; `Overflow` aggregates facts
 /// evicted from the full-notice window so the terminal/expiration *fact*
 /// survives even under a flood.
@@ -211,13 +209,6 @@ pub enum TaskNotice {
         command: String,
         description: String,
         status: TaskStatus,
-        output_tail: String,
-        /// Bytes this stream overwrote due to ring capacity, regardless of
-        /// whether the model had already read them (a storage fact).
-        #[serde(default)]
-        stdout_overwritten: u64,
-        #[serde(default)]
-        stderr_overwritten: u64,
     },
     OutputExpired {
         id: TaskId,
@@ -278,7 +269,7 @@ impl TaskNotice {
                 agent_name,
                 status,
             } => format!(
-                "Background subagent {agent_name} ({id}) {}.",
+                "Background subagent {agent_name} ({id}) {}. Use task_output with id {id} to read the result.",
                 status.describe()
             ),
             TaskNotice::Task {
@@ -286,26 +277,15 @@ impl TaskNotice {
                 command,
                 description,
                 status,
-                output_tail,
-                stdout_overwritten,
-                stderr_overwritten,
             } => {
                 let mut text = format!("Background task {id} finished: {}.", status.describe());
                 text.push_str(&format!("\nCommand: {command}"));
                 if !description.is_empty() {
                     text.push_str(&format!("\nDescription: {description}"));
                 }
-                let overwritten = stdout_overwritten + stderr_overwritten;
-                if overwritten > 0 {
-                    text.push_str(&format!(
-                        "\n({overwritten} bytes of earlier output were overwritten as the task ran)"
-                    ));
-                }
-                if !output_tail.is_empty() {
-                    text.push_str(&format!("\nOutput tail:\n{output_tail}"));
-                } else {
-                    text.push_str("\n(no output)");
-                }
+                text.push_str(&format!(
+                    "\nUse task_output with id {id} to read the output."
+                ));
                 text
             }
             TaskNotice::OutputExpired { id, .. } => {
@@ -749,7 +729,6 @@ impl BackgroundTasks {
             // anyone being told — the process died with the server. That is a
             // terminal fact like any other, so it is queued as a notice and
             // reaches the model the same way a normal completion does.
-            let output_tail = terminal_tail(&record).await;
             let mut inner = self.inner.lock().await;
             if record.meta().is_subagent() {
                 inner.subagent_notices.insert(
@@ -773,9 +752,6 @@ impl BackgroundTasks {
                     command: record.meta().command().to_owned(),
                     description: record.meta().description.clone(),
                     status: status.clone(),
-                    output_tail,
-                    stdout_overwritten: 0,
-                    stderr_overwritten: 0,
                 });
             }
             inner.record_terminal(
@@ -938,24 +914,55 @@ impl BackgroundTasks {
         Ok(id)
     }
 
-    /// Incremental read: output since the previous read plus current status.
-    /// `Ok(None)` for an unknown id; `Err` for a corrupt archive or I/O error. The
-    /// cursor is persisted before any bytes are returned, so a failed save
-    /// yields an error rather than silently advancing the cursor.
-    /// Non-consuming panel access is restricted to immutable subagent results.
-    pub async fn read_subagent_result(
-        &self,
-        id: &TaskId,
-    ) -> Result<Option<TaskRead>, TaskAccessError> {
+    /// Read the retained terminal result without advancing cursors or acknowledging
+    /// notices. Running tasks return Pending; deleted output returns Expired.
+    /// Returns None for an unknown id and an error for corrupt or unreadable output.
+    pub async fn read_result(&self, id: &TaskId) -> Result<Option<TaskResult>, TaskAccessError> {
         let Some(record) = self.backend.archive.open(id).await? else {
             return Ok(None);
         };
-        if !record.meta().is_subagent() {
-            return Ok(None);
+        // Quota eviction takes the same lock through deletion.
+        let guard = record.lock_commit().await;
+        let state = guard.current();
+        let status = state.status.clone();
+        if status.is_running() {
+            return Ok(Some(TaskResult::Pending { status }));
         }
-        self.read(id).await
+        if !state.disposition.rings_present() {
+            return Ok(Some(TaskResult::Expired { status }));
+        }
+        let output = if record.meta().is_subagent() {
+            let answer = if matches!(status, TaskStatus::Completed { .. }) {
+                record.read_result(state.result_bytes).await?
+            } else {
+                status.describe()
+            };
+            TaskResultOutput::Subagent { answer }
+        } else {
+            let (stdout_capacity, stderr_capacity) = record.capacities();
+            let stdout = record
+                .files()
+                .stdout
+                .read_from(0, stdout_capacity as usize)
+                .await?;
+            let stderr = record
+                .files()
+                .stderr
+                .read_from(0, stderr_capacity as usize)
+                .await?;
+            TaskResultOutput::Shell {
+                stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                stdout_overwritten: stdout.lost,
+                stderr_overwritten: stderr.lost,
+            }
+        };
+        Ok(Some(TaskResult::Available { status, output }))
     }
 
+    /// Read shell output incrementally or the complete subagent result.
+    /// Shell cursors are persisted before returning bytes. Unknown ids return
+    /// None; corrupt archives, read failures and cursor save failures return errors.
     pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
         let backend = &self.backend;
         let Some(record) = backend
@@ -1360,6 +1367,35 @@ fn drain_notices(inner: &mut RegistryState) -> Vec<TaskNotice> {
     notices
 }
 
+/// A retained result snapshot for UI reads, independent of the model's cursor.
+#[derive(Debug)]
+pub enum TaskResult {
+    Pending {
+        status: TaskStatus,
+    },
+    Available {
+        status: TaskStatus,
+        output: TaskResultOutput,
+    },
+    Expired {
+        status: TaskStatus,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskResultOutput {
+    Shell {
+        stdout: String,
+        stderr: String,
+        stdout_overwritten: u64,
+        stderr_overwritten: u64,
+    },
+    Subagent {
+        answer: String,
+    },
+}
+
 /// An error from `read`/`kill`, distinct from an unknown id (`Ok(None)`): the
 /// archive entry is present but corrupt, or the I/O failed.
 #[derive(Debug)]
@@ -1568,14 +1604,10 @@ async fn drain_pump(pump: &mut JoinHandle<PumpResult>, slot: &mut Option<PumpRes
     }
 }
 
-/// Snapshot for a task's terminal notice/summary, captured before any cleanup
-/// deletes the ring files.
+/// Committed status for a task's terminal notice and summary.
 struct TerminalOutcome {
     status: TaskStatus,
     persistence_dirty: bool,
-    tail: String,
-    stdout_overwritten: u64,
-    stderr_overwritten: u64,
 }
 
 /// Awaits the task's work and commits the terminal state — the single writer of
@@ -1619,9 +1651,6 @@ async fn monitor_task(
             command: record.meta().command().to_owned(),
             description: record.meta().description.clone(),
             status: outcome.status.clone(),
-            output_tail: outcome.tail,
-            stdout_overwritten: outcome.stdout_overwritten,
-            stderr_overwritten: outcome.stderr_overwritten,
         });
     }
     inner.running_count -= 1;
@@ -1629,7 +1658,7 @@ async fn monitor_task(
     inner.publish();
 }
 
-/// Flush the rings, snapshot the notice tail/overwrite totals, and atomically
+/// Flush the rings and atomically
 /// commit the terminal manifest. A flush or save failure degrades the task to
 /// `Failed` rather than reporting a clean exit whose output was not persisted.
 async fn commit_terminal(
@@ -1678,12 +1707,8 @@ async fn commit_terminal(
         TaskExit::Killed => TaskStatus::Killed { at },
         TaskExit::Failed { message } => TaskStatus::Failed { message, at },
     };
-    // Flush so the terminal manifest's logical range is durable, then snapshot
-    // the overwrite totals and tail before any cleanup can delete the rings.
+    // Flush so the terminal manifest's logical range is durable.
     let flush_ok = record.files().flush().await.is_ok();
-    let stdout_overwritten = record.files().stdout.logical_range().await.0;
-    let stderr_overwritten = record.files().stderr.logical_range().await.0;
-    let tail = terminal_tail(record).await;
 
     let mut guard = record.lock_commit().await;
     if !guard.current().status.is_running() {
@@ -1691,9 +1716,6 @@ async fn commit_terminal(
         return TerminalOutcome {
             status: guard.current().status.clone(),
             persistence_dirty: guard.current().persistence_dirty,
-            tail,
-            stdout_overwritten,
-            stderr_overwritten,
         };
     }
     let mut candidate = guard.current().clone();
@@ -1735,30 +1757,7 @@ async fn commit_terminal(
     TerminalOutcome {
         status,
         persistence_dirty: guard.current().persistence_dirty,
-        tail,
-        stdout_overwritten,
-        stderr_overwritten,
     }
-}
-
-/// The notice tail: the last bytes of stdout, or stderr if stdout is empty.
-async fn terminal_tail(record: &TaskRecord) -> String {
-    let out = record
-        .files()
-        .stdout
-        .tail(NOTICE_TAIL_LIMIT)
-        .await
-        .unwrap_or_default();
-    if !out.is_empty() {
-        return String::from_utf8_lossy(&out).into_owned();
-    }
-    let err = record
-        .files()
-        .stderr
-        .tail(NOTICE_TAIL_LIMIT)
-        .await
-        .unwrap_or_default();
-    String::from_utf8_lossy(&err).into_owned()
 }
 
 #[cfg(test)]
@@ -1768,3 +1767,7 @@ mod tests;
 #[cfg(test)]
 #[path = "registry_subagent_tests.rs"]
 mod subagent_tests;
+
+#[cfg(test)]
+#[path = "registry_result_tests.rs"]
+mod result_tests;

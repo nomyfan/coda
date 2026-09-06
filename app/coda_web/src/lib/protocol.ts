@@ -298,8 +298,20 @@ export type TaskStatus =
   | { Interrupted: { at: string } };
 export type TaskResult =
   | { state: "unknown" }
-  | { state: "pending" | "expired"; status: string }
-  | { state: "available"; status: string; answer: string }
+  | { state: "pending" | "expired"; status: TaskStatus }
+  | {
+      state: "available";
+      status: TaskStatus;
+      output:
+        | { kind: "subagent"; answer: string }
+        | {
+            kind: "shell";
+            stdout: string;
+            stderr: string;
+            stdout_overwritten: number;
+            stderr_overwritten: number;
+          };
+    }
   | { state: "error"; message: string };
 export type TaskSummary = {
   kind: { kind: "shell"; command: string } | { kind: "subagent"; agent_name: string };

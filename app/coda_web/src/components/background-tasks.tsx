@@ -4,7 +4,7 @@ import { ChevronRight, ListChecks, RefreshCw, Square, X } from "lucide-react";
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import type { TaskSummary, TaskResult } from "@/lib/protocol";
+import type { TaskSummary, TaskResult, TaskStatus } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
 import {
   getBackgroundTaskResult,
@@ -51,29 +51,13 @@ function TaskRow({
       ) : null}
     </span>
   );
-  const [result, setResult] = useState<TaskResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const loadResult = useCallback(async () => {
-    setLoading(true);
-    try {
-      setResult(await getBackgroundTaskResult(task.id));
-    } catch (error) {
-      setResult({
-        state: "error",
-        message: error instanceof Error ? error.message : "Could not load result",
-      });
-    } finally {
-      setLoading(false);
-    }
-  }, [task.id]);
   useEffect(() => {
     // Desktop and mobile lists are both mounted; only the visible one handles
     // a transcript request so we do not fetch or scroll the hidden copy.
     if (!resultRequest || !rowRef.current?.getClientRects().length) return;
     setResultOpen(true);
-    void loadResult();
     rowRef.current.scrollIntoView({ block: "nearest" });
-  }, [resultRequest, loadResult]);
+  }, [resultRequest]);
   return (
     <li
       ref={rowRef}
@@ -111,17 +95,8 @@ function TaskRow({
           {task.description}
         </p>
       ) : null}
-      {task.kind.kind === "subagent" && !task.running ? (
-        <Collapsible
-          className="mt-1"
-          open={resultOpen}
-          onOpenChange={(open) => {
-            setResultOpen(open);
-            if (open && !result && !loading) {
-              void loadResult();
-            }
-          }}
-        >
+      {!task.running ? (
+        <Collapsible className="mt-1" open={resultOpen} onOpenChange={setResultOpen}>
           <CollapsibleTrigger asChild>
             <Button
               variant="ghost"
@@ -134,41 +109,157 @@ function TaskRow({
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent>
-            <div className="flex justify-end">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6 text-muted-foreground"
-                disabled={loading}
-                onClick={loadResult}
-                title={loading ? "Loading result…" : "Refresh result"}
-                aria-label={loading ? "Loading result" : "Refresh result"}
-              >
-                <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
-              </Button>
-            </div>
-            {result ? (
-              <div className="mt-1 max-h-72 overflow-auto break-words text-xs">
-                {result.state === "available" ? (
-                  <Markdown className="text-xs">{result.answer}</Markdown>
-                ) : (
-                  <p className="whitespace-pre-wrap">
-                    {result.state === "expired"
-                      ? "Result expired"
-                      : result.state === "unknown"
-                        ? "Task not found"
-                        : result.state === "error"
-                          ? result.message
-                          : result.status}
-                  </p>
-                )}
-              </div>
-            ) : null}
+            <TaskResultDetails taskId={task.id} request={resultRequest} />
           </CollapsibleContent>
         </Collapsible>
       ) : (
         <div className="mt-1">{metadata}</div>
       )}
+    </li>
+  );
+}
+
+function taskStatusLabel(status: TaskStatus): string {
+  if (typeof status === "string") return status;
+  if ("Exited" in status) {
+    return status.Exited.code === null
+      ? "Exited without an exit code"
+      : `Exited with code ${status.Exited.code}`;
+  }
+  if ("Failed" in status) return `Failed: ${status.Failed.message}`;
+  if ("Killed" in status) return "Killed";
+  if ("Interrupted" in status) return "Interrupted";
+  return "Completed";
+}
+
+export function TaskResultContent({ result }: { result: TaskResult }) {
+  if (result.state !== "available") {
+    return (
+      <p className="whitespace-pre-wrap text-muted-foreground">
+        {result.state === "expired"
+          ? "Result expired"
+          : result.state === "unknown"
+            ? "Task not found"
+            : result.state === "error"
+              ? result.message
+              : taskStatusLabel(result.status)}
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <p className="whitespace-pre-wrap text-muted-foreground">{taskStatusLabel(result.status)}</p>
+      {result.output.kind === "subagent" ? (
+        <Markdown className="text-xs">{result.output.answer}</Markdown>
+      ) : (
+        <>
+          <ShellOutput
+            label="stdout"
+            text={result.output.stdout}
+            overwritten={result.output.stdout_overwritten}
+          />
+          <ShellOutput
+            label="stderr"
+            text={result.output.stderr}
+            overwritten={result.output.stderr_overwritten}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+function ShellOutput({
+  label,
+  text,
+  overwritten,
+}: {
+  label: string;
+  text: string;
+  overwritten: number;
+}) {
+  return (
+    <section className="min-w-0">
+      <h3 className="mb-1 font-mono font-medium">{label}</h3>
+      {overwritten > 0 ? (
+        <p className="mb-1 text-muted-foreground">
+          {overwritten.toLocaleString()} bytes of earlier output were overwritten.
+        </p>
+      ) : null}
+      <pre className="whitespace-pre-wrap break-words rounded bg-muted/40 p-2 font-mono text-xs">
+        {text || "(no output)"}
+      </pre>
+    </section>
+  );
+}
+
+function TaskResultDetails({ taskId, request }: { taskId: string; request?: TaskResultRequest }) {
+  const [result, setResult] = useState<TaskResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const requestVersion = useRef(0);
+  const loadResult = useCallback(async () => {
+    const version = ++requestVersion.current;
+    setLoading(true);
+    try {
+      const next = await getBackgroundTaskResult(taskId);
+      if (version === requestVersion.current) setResult(next);
+    } catch (error) {
+      if (version === requestVersion.current)
+        setResult({
+          state: "error",
+          message: error instanceof Error ? error.message : "Could not load result",
+        });
+    } finally {
+      if (version === requestVersion.current) setLoading(false);
+    }
+  }, [taskId]);
+  useEffect(() => {
+    void loadResult();
+    return () => {
+      requestVersion.current += 1;
+    };
+  }, [loadResult, request]);
+  return (
+    <>
+      <div className="flex justify-end">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 text-muted-foreground"
+          disabled={loading}
+          onClick={loadResult}
+          title={loading ? "Loading result…" : "Refresh result"}
+          aria-label={loading ? "Loading result" : "Refresh result"}
+        >
+          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+        </Button>
+      </div>
+      <div className="mt-1 max-h-72 overflow-auto break-words text-xs" aria-live="polite">
+        {result ? (
+          <TaskResultContent result={result} />
+        ) : (
+          <p className="text-muted-foreground">Loading result…</p>
+        )}
+      </div>
+    </>
+  );
+}
+
+function ArchivedTaskResult({ request }: { request: TaskResultRequest }) {
+  const ref = useRef<HTMLLIElement>(null);
+  const [visibleRequest, setVisibleRequest] = useState<TaskResultRequest>();
+  useEffect(() => {
+    if (!ref.current?.getClientRects().length) return;
+    setVisibleRequest(request);
+    ref.current.scrollIntoView({ block: "nearest" });
+  }, [request]);
+  return (
+    <li ref={ref} className="rounded-md border border-border/60 px-2.5 py-2">
+      <p className="text-xs font-medium">Archived task</p>
+      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{request.taskId}</p>
+      {visibleRequest ? (
+        <TaskResultDetails key={request.taskId} taskId={request.taskId} request={visibleRequest} />
+      ) : null}
     </li>
   );
 }
@@ -180,7 +271,7 @@ function TaskList({
   tasks: TaskSummary[];
   resultRequest?: TaskResultRequest;
 }) {
-  if (tasks.length === 0) {
+  if (tasks.length === 0 && !resultRequest) {
     return (
       <p className="px-1 py-6 text-center text-xs text-muted-foreground">
         No background tasks yet. Background agents and shell commands can keep working alongside the
@@ -190,6 +281,9 @@ function TaskList({
   }
   return (
     <ul className="flex flex-col gap-1.5">
+      {resultRequest && !tasks.some((task) => task.id === resultRequest.taskId) ? (
+        <ArchivedTaskResult key={resultRequest.taskId} request={resultRequest} />
+      ) : null}
       {tasks.map((task) => (
         <TaskRow
           key={task.id}
@@ -245,7 +339,7 @@ export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
         <aside className="hidden w-[20rem] shrink-0 flex-col overflow-hidden rounded-lg border bg-background p-2.5 lg:flex">
           <PanelHeader onClose={onClose} />
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <TaskList tasks={tasks} resultRequest={open ? resultRequest : undefined} />
+            <TaskList tasks={tasks} resultRequest={resultRequest} />
           </div>
         </aside>
       ) : null}
@@ -269,7 +363,7 @@ export const BackgroundTasksPanel = memo(function BackgroundTasksPanel({
       >
         <PanelHeader onClose={onClose} />
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <TaskList tasks={tasks} resultRequest={open ? resultRequest : undefined} />
+          {open ? <TaskList tasks={tasks} resultRequest={resultRequest} /> : null}
         </div>
       </div>
     </>

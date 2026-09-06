@@ -294,11 +294,21 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [serversCollapsed, setServersCollapsed] = useState(false);
   const [tasksOpen, setTasksOpen] = useState(false);
-  const [taskResultRequest, setTaskResultRequest] = useState<TaskResultRequest>();
-  const handleViewTaskResult = useCallback((taskId: string) => {
-    setTaskResultRequest({ taskId });
-    setTasksOpen(true);
+  const [taskResultRequest, setTaskResultRequest] = useState<
+    TaskResultRequest & { sessionScope: string }
+  >();
+  const handleTasksOpenChange = useCallback((open: boolean) => {
+    setTaskResultRequest(undefined);
+    setTasksOpen(open);
   }, []);
+  const taskSessionScope = JSON.stringify([activeServer, activeKey]);
+  const handleViewTaskResult = useCallback(
+    (taskId: string) => {
+      setTaskResultRequest({ taskId, sessionScope: taskSessionScope });
+      setTasksOpen(true);
+    },
+    [taskSessionScope],
+  );
   useEffect(() => {
     setTaskResultRequest(undefined);
   }, [activeServer, activeKey]);
@@ -483,7 +493,7 @@ export default function App() {
                   onOpenSidebar={() => setSidebarOpen(true)}
                   serversCollapsed={serversCollapsed}
                   onToggleServers={() => setServersCollapsed((collapsed) => !collapsed)}
-                  onToggleTasks={() => setTasksOpen((open) => !open)}
+                  onToggleTasks={() => handleTasksOpenChange(!tasksOpen)}
                   runningTasks={runningTaskCount}
                   showTasks={Boolean(activeKey) && !showingNewSession}
                 />
@@ -585,9 +595,12 @@ export default function App() {
             )}
           </div>
           <BackgroundTasksPanel
+            key={taskSessionScope}
             open={tasksOpen}
-            onClose={() => setTasksOpen(false)}
-            resultRequest={taskResultRequest}
+            onClose={() => handleTasksOpenChange(false)}
+            resultRequest={
+              taskResultRequest?.sessionScope === taskSessionScope ? taskResultRequest : undefined
+            }
           />
         </div>
       </section>

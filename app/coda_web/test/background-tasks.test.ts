@@ -1,7 +1,14 @@
 import { expect, test, vi } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
-import type { HistoryMessage, TaskNoticeMessage, TaskSummary } from "../src/lib/protocol.ts";
-import { orderTasks } from "../src/components/background-tasks.tsx";
+import type {
+  HistoryMessage,
+  TaskNoticeMessage,
+  TaskSummary,
+  TaskResult,
+} from "../src/lib/protocol.ts";
+import { orderTasks, TaskResultContent } from "../src/components/background-tasks.tsx";
 import { transcriptRenderItems } from "../src/components/transcript.tsx";
 import {
   appendTaskNotice,
@@ -65,6 +72,7 @@ test("a finished background task renders as a notice, not a user bubble", () => 
       kind: "task_notice",
       title: "Background task exited with code 0",
       detail: "cargo build --release",
+      taskOutcomes: finishedNotice.outcomes,
     }),
   ]);
 });
@@ -224,6 +232,7 @@ test("one notice covering several tasks is titled by count, not by the first one
       title: "2 background task updates",
       // A single command would be misleading when the notice covers two.
       detail: undefined,
+      taskOutcomes: merged.TaskNotice.outcomes,
     }),
   ]);
 });
@@ -257,4 +266,62 @@ test("an active shell stays immediately below its completed subagent parent", ()
     "parent",
     "child",
   ]);
+});
+
+test("shell results render each stream as literal text with overwrite counts", () => {
+  const result: TaskResult = {
+    state: "available",
+    status: { Exited: { code: 1, at: "2026-09-06T00:00:00Z" } },
+    output: {
+      kind: "shell",
+      stdout: "**literal** <script>unsafe()</script>",
+      stderr: "build failed",
+      stdout_overwritten: 7,
+      stderr_overwritten: 0,
+    },
+  };
+  const html = renderToStaticMarkup(createElement(TaskResultContent, { result }));
+  expect(html).toContain("Exited with code 1");
+  expect(html).toContain("stdout");
+  expect(html).toContain("stderr");
+  expect(html).toContain("7 bytes of earlier output were overwritten.");
+  expect(html).toContain("**literal** &lt;script&gt;unsafe()&lt;/script&gt;");
+  expect(html).not.toContain("<script>");
+  expect(html).toContain("build failed");
+});
+
+test("subagent answers still render as Markdown", () => {
+  const result: TaskResult = {
+    state: "available",
+    status: { Completed: { at: "2026-09-06T00:00:00Z" } },
+    output: { kind: "subagent", answer: "**done**" },
+  };
+  const html = renderToStaticMarkup(createElement(TaskResultContent, { result }));
+  expect(html).toContain("<strong>done</strong>");
+});
+
+test("empty shell output, expiration, missing tasks and read errors are distinct", () => {
+  const results: [TaskResult, string][] = [
+    [
+      {
+        state: "available",
+        status: { Exited: { code: 0, at: "2026-09-06T00:00:00Z" } },
+        output: {
+          kind: "shell",
+          stdout: "",
+          stderr: "",
+          stdout_overwritten: 0,
+          stderr_overwritten: 0,
+        },
+      },
+      "(no output)",
+    ],
+    [{ state: "expired", status: { Killed: { at: "2026-09-06T00:00:00Z" } } }, "Result expired"],
+    [{ state: "unknown" }, "Task not found"],
+    [{ state: "error", message: "Could not read output" }, "Could not read output"],
+  ];
+  for (const [result, expected] of results) {
+    const html = renderToStaticMarkup(createElement(TaskResultContent, { result }));
+    expect(html).toContain(expected);
+  }
 });

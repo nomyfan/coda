@@ -713,8 +713,17 @@ mod tests;
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TaskResultWire {
     Unknown,
-    Pending { status: String },
-    Available { status: String, answer: String },
-    Expired { status: String },
-    Error { message: String },
+    Pending {
+        status: coda_process::TaskStatus,
+    },
+    Available {
+        status: coda_process::TaskStatus,
+        output: coda_process::TaskResultOutput,
+    },
+    Expired {
+        status: coda_process::TaskStatus,
+    },
+    Error {
+        message: String,
+    },
 }

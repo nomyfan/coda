@@ -45,13 +45,15 @@ async fn notice_is_enqueued_before_zero_is_visible() {
     let mut rx = reg.summaries();
     let gate = Arc::new(Notify::new());
     let g = gate.clone();
-    reg.spawn_with(meta("quick"), |ctx| async move {
-        ctx.append_stdout(b"done!").await.unwrap();
-        g.notified().await;
-        TaskExit::Exited { code: Some(0) }
-    })
-    .await
-    .unwrap();
+    let id = reg
+        .spawn_with(meta("quick"), |ctx| async move {
+            ctx.append_stdout(b"done!").await.unwrap();
+            ctx.append_stderr(b"stderr-marker").await.unwrap();
+            g.notified().await;
+            TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
     gate.notify_one();
     loop {
         rx.changed().await.unwrap();
@@ -63,9 +65,23 @@ async fn notice_is_enqueued_before_zero_is_visible() {
     assert_eq!(notices.len(), 1);
     assert!(matches!(
         &notices[0],
-        TaskNotice::Task { status: TaskStatus::Exited { code: Some(0), .. }, output_tail, .. }
-            if output_tail == "done!"
+        TaskNotice::Task {
+            status: TaskStatus::Exited { code: Some(0), .. },
+            ..
+        }
     ));
+    let rendered = notices[0].render();
+    assert!(rendered.contains(&format!("Use task_output with id {id}")));
+    assert!(rendered.contains("exited with code 0"));
+    let serialized = serde_json::to_string(&notices[0]).unwrap();
+    for notice in [&rendered, &serialized] {
+        assert!(!notice.contains("done!"));
+        assert!(!notice.contains("stderr-marker"));
+        assert!(!notice.contains("output_tail"));
+    }
+    let read = reg.read(&id).await.unwrap().unwrap();
+    assert_eq!(read.stdout, "done!");
+    assert_eq!(read.stderr, "stderr-marker");
 }
 
 /// kill vs natural exit: exactly one terminal state, one notice.
@@ -430,8 +446,8 @@ async fn shell_output_survives_reads_and_completion_notices() {
         let notices = reg.take_notices().await;
         assert!(notices.iter().any(|notice| matches!(
             notice,
-            TaskNotice::Task { id: notice_id, output_tail, .. }
-                if notice_id == &id && output_tail == "hello"
+            TaskNotice::Task { id: notice_id, .. }
+                if notice_id == &id
         )));
         let read = reg.read(&id).await.unwrap().unwrap();
         assert!(read.complete);
@@ -526,7 +542,6 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     let TaskNotice::Task {
         id: noticed,
         status,
-        output_tail,
         ..
     } = notices.first().expect("an interrupted task notifies")
     else {
@@ -534,7 +549,6 @@ async fn reopen_finalizes_interrupted_task_into_quota_index() {
     };
     assert_eq!(noticed, &id);
     assert!(matches!(status, TaskStatus::Interrupted { .. }));
-    assert_eq!(output_tail, "saved");
 }
 
 #[tokio::test]
@@ -1002,21 +1016,27 @@ async fn chatty_process_overflows_ring_and_reports_overwrite() {
     assert!(seen > 0, "streamed some output");
 
     let notices = reg.take_notices().await;
-    let overwritten = notices.iter().find_map(|n| match n {
-        TaskNotice::Task {
+    assert!(notices.iter().any(|notice| matches!(
+        notice, TaskNotice::Task { id: notice_id, .. } if notice_id == &id
+    )));
+    let Some(TaskResult::Available {
+        output: TaskResultOutput::Shell {
             stdout_overwritten, ..
-        } => Some(*stdout_overwritten),
-        _ => None,
-    });
+        },
+        ..
+    }) = reg.read_result(&id).await.unwrap()
+    else {
+        panic!("expected shell output")
+    };
     assert!(
-        overwritten.is_some_and(|o| o > 0),
-        "producing >1 ring of output overwrote earlier bytes: {overwritten:?}"
+        stdout_overwritten > 0,
+        "producing >1 ring of output overwrote earlier bytes"
     );
     reg.shutdown().await;
 }
 
 /// spawn → incremental reads observe streamed output → natural exit
-/// commits the code and produces a notice carrying the tail.
+/// commits the code and produces a completion notice.
 #[tokio::test]
 async fn process_task_streams_output_and_notifies_on_exit() {
     let reg = BackgroundTasks::temporary().unwrap();
@@ -1060,8 +1080,8 @@ async fn process_task_streams_output_and_notifies_on_exit() {
     assert_eq!(notices.len(), 1);
     assert!(matches!(
         &notices[0],
-        TaskNotice::Task { id: nid, status: TaskStatus::Exited { code: Some(3), .. }, output_tail, .. }
-            if *nid == id && output_tail.contains("out-marker")
+        TaskNotice::Task { id: nid, status: TaskStatus::Exited { code: Some(3), .. }, .. }
+            if *nid == id
     ));
     reg.shutdown().await;
 }

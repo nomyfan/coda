@@ -14,9 +14,8 @@ use coda_process::{BackgroundTasks, TaskId};
 
 fn unknown_task(id: &str) -> String {
     format!(
-        "Unknown or expired task id: {id}. Finished tasks are reclaimed \
-         after a while; their final output was delivered in the completion \
-         notice."
+        "Unknown or expired task id: {id}. Retained output is no longer available; \
+         completion notices contain task metadata, not output."
     )
 }
 

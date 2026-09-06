@@ -2035,18 +2035,17 @@ impl SessionRelay for SessionHub {
                         return CommandOutcome::TaskResult(ResultWire::Unknown);
                     };
                     drop(guard);
-                    let result = match background.read_subagent_result(&id).await {
+                    let result = match background.read_result(&id).await {
                         Ok(None) => ResultWire::Unknown,
-                        Ok(Some(read)) if read.note.is_some() => ResultWire::Expired {
-                            status: read.status.describe(),
-                        },
-                        Ok(Some(read)) if read.status.is_running() => ResultWire::Pending {
-                            status: read.status.describe(),
-                        },
-                        Ok(Some(read)) => ResultWire::Available {
-                            status: read.status.describe(),
-                            answer: read.stdout,
-                        },
+                        Ok(Some(coda_process::TaskResult::Expired { status })) => {
+                            ResultWire::Expired { status }
+                        }
+                        Ok(Some(coda_process::TaskResult::Pending { status })) => {
+                            ResultWire::Pending { status }
+                        }
+                        Ok(Some(coda_process::TaskResult::Available { status, output })) => {
+                            ResultWire::Available { status, output }
+                        }
                         Err(error) => ResultWire::Error {
                             message: error.to_string(),
                         },
