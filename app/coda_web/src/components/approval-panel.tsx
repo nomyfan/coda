@@ -44,6 +44,7 @@ import {
   draftCall,
   selectActiveAllowDrafts,
   selectActiveApprovals,
+  selectActiveCanWrite,
   selectActiveDrafts,
   setAllowDraft,
   submitApprovals,
@@ -323,6 +324,7 @@ function AskUserApprovalCall({
 
 export const ApprovalPanel = memo(function ApprovalPanel() {
   const approvals = useCodaStore(selectActiveApprovals);
+  const writable = useCodaStore(selectActiveCanWrite);
   const drafts = useCodaStore(selectActiveDrafts);
   const allowDrafts = useCodaStore(selectActiveAllowDrafts);
   const items: ApprovalItem[] = approvals.flatMap((approval) =>
@@ -388,7 +390,10 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
             {current.approval.agent_path.join(" → ")}
             {current.approval.task_id ? ` · ${current.approval.task_id}` : ""}
           </p>
-          <div className="scrollbar-fine overflow-y-auto px-3 py-2.5 sm:px-4">
+          <fieldset
+            disabled={!writable}
+            className="scrollbar-fine min-w-0 overflow-y-auto px-3 py-2.5 sm:px-4"
+          >
             <ApprovalCall
               key={`${approvalKey(current.approval)}:${current.call.id}`}
               call={current.call}
@@ -401,7 +406,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
               onClearDraft={handleClearDraft}
               onSetAllow={(pattern) => setAllowDraft(current.approval, current.call, pattern)}
             />
-          </div>
+          </fieldset>
           <div className="flex items-center justify-between gap-2 px-3 py-2 sm:px-4">
             <div className="flex items-center gap-1">
               <Button
@@ -424,7 +429,7 @@ export const ApprovalPanel = memo(function ApprovalPanel() {
                 <ChevronRight />
               </Button>
             </div>
-            <Button disabled={!allDecided} onClick={submitApprovals}>
+            <Button disabled={!writable || !allDecided} onClick={submitApprovals}>
               <Check />
               Submit {decidedCount}/{items.length}
             </Button>

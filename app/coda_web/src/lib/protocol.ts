@@ -145,7 +145,12 @@ export type ResumeDecision = {
   resolutions: Array<[string, ToolCallResolution]>;
 };
 
+export type SessionAccess =
+  | { type: "read_write" }
+  | { type: "read_only"; reason: "model_not_configured" | "reasoning_effort_not_supported" };
+
 export type WorkspaceSession = {
+  access: SessionAccess | null;
   id: string;
   name: string | null;
   updated_at_ms?: number | null;
@@ -238,6 +243,7 @@ export const RpcCode = {
   MODEL_LOCKED: -32005,
   /** A command requiring an idle session found a turn in flight or awaiting approval. */
   SESSION_NOT_IDLE: -32006,
+  SESSION_READ_ONLY: -32007,
   UNKNOWN_WORKSPACE: -32010,
   INVALID_SESSION_ID: -32011,
   INVALID_MODEL_SELECTION: -32012,
@@ -264,6 +270,8 @@ export const RpcCode = {
 // both a request result and (historically) a push.
 
 type Snapshot = {
+  access: SessionAccess;
+  background_tasks_error: string | null;
   workspace_id: string;
   session_id: string;
   messages: HistoryMessage[];
@@ -434,7 +442,7 @@ export type RpcRequests = {
     },
     ModelSelectionResult
   >;
-  add_allow_pattern: RpcRequest<{ workspace_id: string; pattern: string }, Record<string, never>>;
+
   delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;
   rename_session: RpcRequest<SessionRef & { name: string | null }, { name: string | null }>;
   /** Copy the session at `cut_message_id` — a root-thread user message — keeping

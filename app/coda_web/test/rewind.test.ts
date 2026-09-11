@@ -41,6 +41,7 @@ function assistantMessage(id: string, content: string, promptTokens?: number): H
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -209,6 +210,7 @@ test("an empty snapshot clears a transcript the rewind took away", () => {
     approvals: [],
     providerId: "prov:model",
     reasoningEffort: null,
+    access: { type: "read_write" },
     turnRunning: false,
   });
 
@@ -253,6 +255,7 @@ test("a snapshot keeps a user message the server has not acknowledged yet", () =
       approvals: [],
       providerId: "prov:model",
       reasoningEffort: null,
+      access: { type: "read_write" },
       turnRunning: false,
     },
   );
@@ -270,6 +273,7 @@ test("a snapshot keeps a user message the server has not acknowledged yet", () =
       approvals: [],
       providerId: "prov:model",
       reasoningEffort: null,
+      access: { type: "read_write" },
       turnRunning: true,
     },
   );
@@ -303,6 +307,7 @@ test("a pending first task keeps the title an empty snapshot would otherwise dro
       approvals: [],
       providerId: "prov:model",
       reasoningEffort: null,
+      access: { type: "read_write" },
       turnRunning: false,
     },
   );

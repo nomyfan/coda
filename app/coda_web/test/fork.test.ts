@@ -14,6 +14,7 @@ import { type HistoryMessage } from "../src/lib/protocol.ts";
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -66,6 +67,7 @@ test("a restored user message carries the id a fork cuts at", () => {
     approvals: [],
     providerId: "prov:model",
     reasoningEffort: null,
+    access: { type: "read_write" },
     turnRunning: false,
   });
 
@@ -85,6 +87,21 @@ test("a second fork of the same session while one is in flight is dropped", asyn
   let fail: (err: unknown) => void = () => {};
   const inFlight = new Promise((_resolve, reject) => (fail = reject));
   codaStore.setState((state) => {
+    state.servers[server] = {
+      url: server,
+      status: "connected",
+      catalog: [
+        {
+          id: "ws",
+          path: "/workspace",
+          sessions: [
+            { id: "s1", name: null, has_pending_approval: false, access: { type: "read_write" } },
+          ],
+        },
+      ],
+      providers: [],
+      sessions: { "ws/s1": session() },
+    };
     state.rpcMap[server] = {
       request: () => {
         sent += 1;
@@ -116,9 +133,17 @@ test("the message a fork cuts at becomes the copy's composer draft", async () =>
     state.servers[server] = {
       url: server,
       status: "connected",
-      catalog: [],
+      catalog: [
+        {
+          id: "ws",
+          path: "/workspace",
+          sessions: [
+            { id: "s1", name: null, has_pending_approval: false, access: { type: "read_write" } },
+          ],
+        },
+      ],
       providers: [],
-      sessions: {},
+      sessions: { "ws/s1": session() },
     };
     state.rpcMap[server] = {
       notify: () => true,

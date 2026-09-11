@@ -52,7 +52,7 @@ type SessionAccess =
     };
 ```
 
-- `SnapshotPayload`、wire `Snapshot`、前端 `SessionSnapshot` 都增加必填 `access`；`Live`、`Pending` 返回 `read_write`。它只说明模型配置是否允许使用会话，原有忙碌、审批、连接权限约束仍然适用。
+- `SnapshotPayload`、wire `Snapshot`、前端 `Snapshot` 都增加必填 `access`；`Live`、`Pending` 返回 `read_write`。它只说明模型配置是否允许使用会话，原有忙碌、审批、连接权限约束仍然适用。
 - `SessionSummaryWire` 和前端 `WorkspaceSession` 同样携带 `access`，让列表在打开会话前也能禁用分叉。现有 `list_sessions` 查询多读取已有的 `model_binding` 列，catalog 使用与打开流程相同的纯判定函数；不逐条打开会话或增加逐条数据库查询。
 - `EntryPhase::ReadOnly(ReadOnlyState)` 持有原 `SessionModelBinding`、原因、根线程历史、所有保存的待审批项，以及可选 `Arc<ArchivedTasks>` 和归档读取错误；不持有 `Session`。
 - 只读状态的 `background`、notice watcher、pending notices 均不创建；`turn_running`、`compacting` 固定为 false。归档句柄随 entry 释放，不拥有子进程。
@@ -68,7 +68,7 @@ type SessionAccess =
 // SessionOpener：返回实际绑定及其可用性；存储故障仍是错误。
 // initial 为 Some 时允许首次创建；None 只查询已有会话，缺失返回不存在。
 async fn resolve_session_model(
-    &self, key: &SessionKey, initial: Option<&SessionModelBinding>,
+    &self, key: &SessionKey, initial: Option<&ModelSelection>,
 ) -> Result<SessionModelResolution, OpenError>;
 
 // SessionOpener：读取根历史及全部待审批项，不恢复执行、不写 checkpoint。
@@ -150,9 +150,9 @@ flowchart TD
 
 - 正常返回快照，连接状态保持 connected；显示固定的只读原因提示和原 selection key。模型不在 catalog 时显示静态文本，不能退回默认模型或空白下拉框。
 - `access` 经 solicited / pushed snapshot 使用同一 reducer；请求打开期间及重连尚未收到新快照时，已有会话的写操作不可用。
-- actions 在入口检查可写状态，再做乐观更新或发送 RPC；覆盖 submit、审批草稿及提交、权限设置、模型设置、编辑、压缩、分叉、停止和附件输入。列表分叉根据 catalog 的 `access` 禁用，已打开会话以最新快照为准；服务端仍独立校验冷分叉，不能依赖客户端标记。
+- actions 在入口检查可写状态，再做乐观更新或发送 RPC；覆盖 submit、审批草稿及提交、权限设置、模型设置、编辑、压缩、分叉、停止和附件输入。列表按钮与分叉 action 共用判定：当前会话以本次附着快照为准，非当前会话使用最新 catalog，不能优先使用历史缓存；重连时清空旧 catalog 的 access，等新 catalog 返回后再启用。服务端仍独立校验冷分叉，不能依赖客户端标记。
 - composer 禁用编辑/发送、附件和相关命令，保留可复制的现有草稿。审批面板继续展示工具参数、问题与选项及翻页，禁用决定、输入、“始终允许”和提交。
-- 只读快照以服务端历史为准，不能继续把未确认的乐观消息或压缩条目显示为运行中。未提交文本保留为本地草稿；不自动重发，也不丢弃持久化待审批内容。
+- 只读快照以服务端历史为准，不能继续把未确认的乐观消息或压缩条目显示为运行中。断线导致 RPC 拒绝时，在清理乐观条目前将文本、图片和发送前最后一条用户消息的 id 保存为本地 `unconfirmedInput`；重连快照按该位置之后的文本及图片核对。已保存则清除待确认输入，未找到或位置已被删除则恢复为 `unsentDraft`。尚在压缩中的快照要等压缩结束再核对。这些状态只保留在内存，不自动重发，也不丢弃持久化待审批内容。
 - 更新 `requestOpenAndApply` 的返回契约为 `SessionAccess | null`，首次发送等后续流程必须确认 read_write，不能把“打开成功”直接当作“可以发送”。
 - 后台面板按快照展示归档状态，禁用停止；重命名、删除不复用“可执行”门禁，仍遵循原有连接和归属限制。
 
@@ -164,10 +164,32 @@ flowchart TD
 
 ## Implementation Roadmap
 
-1. **[无副作用读取]** 提取 checkpoint→审批转换、实现归档只读入口和结果读取。验证含旧后台审批、已删除 agent、未提交结果、过期输出的样本，读取前后保存数据与文件内容不变。
-2. **[服务端状态]** 在 hub 锁内解析绑定，增加 `ReadOnly`、纯历史读取及完整生命周期。验证缺模型/无效 effort 能打开；缺失读取与真正失败可区分；断开释放、接管和并发删除不遗留 entry 或启动 runtime。
-3. **[协议与限制]** 增加快照 access、归档错误和只读错误码，覆盖命令/预检查/冷分叉，移除旧规则 RPC。通过 RPC 验证所有禁用操作无副作用，重命名、删除及终态结果读取可用。
-4. **[前端]** 接入统一状态与 action 门禁，完成提示、原模型展示、审批只读和重连时的乐观状态处理。验证刷新、断线恢复、缺 catalog 模型、图片历史、审批翻页及草稿保留。
-5. **[回归]** 覆盖配置恢复后的正常打开、新会话、普通 Pending 审批、可写会话分叉/删除和后台结果。更新受影响的协议/项目说明；本次只读路径不创建 agent，不改变 agent 可见运行规则，因此无需修改 system prompt 或 templates。
+- [x] **无副作用读取** 提取 checkpoint→审批转换、实现归档只读入口和结果读取。验证含旧后台审批、已删除 agent、未提交结果、过期输出的样本，读取前后保存数据与文件内容不变。
+- [x] **服务端状态** 在 hub 锁内解析绑定，增加 `ReadOnly`、纯历史读取及完整生命周期。验证缺模型/无效 effort 能打开；缺失读取与真正失败可区分；断开释放、接管和并发删除不遗留 entry 或启动 runtime。
+- [x] **协议与限制** 增加快照 access、归档错误和只读错误码，覆盖命令/预检查/冷分叉，移除旧规则 RPC。通过 RPC 验证所有禁用操作无副作用，重命名、删除及终态结果读取可用。
+- [x] **前端** 接入统一状态与 action 门禁，完成提示、原模型展示、审批只读和重连时的乐观状态处理。验证刷新、断线恢复、缺 catalog 模型、图片历史、审批翻页及草稿保留。
+- [x] **回归** 覆盖配置恢复后的正常打开、新会话、普通 Pending 审批、可写会话分叉/删除和后台结果。更新受影响的协议/项目说明；本次只读路径不创建 agent，不改变 agent 可见运行规则，因此无需修改 system prompt 或 templates。
 
-实现后的最终检查：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`、`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`。持久化无写入用例加入 pg-tests，并在独立测试数据库运行 storage_pg；本次设计阶段仅进行代码读取，尚未运行测试或修改业务代码。
+实现后的最终检查：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`、`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`。持久化无写入用例加入 pg-tests，在独立测试数据库运行 storage_pg 和服务端 RPC 测试。
+
+
+## Deviations from Design
+
+- `resolve_session_model` 的初始化参数复用现有 `ModelSelection`，由 `AppOpener` 转成持久化绑定；已有会话仍以数据库中的绑定为准。
+- PostgreSQL 无写入断言放在 `bin/server_tests/read_only.rs`，同时覆盖生产 RPC 和实际存储；CI 的数据库任务扩展为运行完整 `coda_server --features pg-tests`，包括原有 storage_pg。
+- 补充仅在内存保留的 `unconfirmedInput`，在断线清理前保存待确认内容并用重连快照核对；原实现依赖快照到达时乐观条目仍在，真实断线顺序不满足这个前提。
+
+
+## Verification
+
+2026-09-12 完成：
+
+- `cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets` 均通过。
+- 在本地独立 `coda_test` 数据库运行 `cargo test -p coda_server --features pg-tests`，服务端 268 项单元测试、15 项 binary 测试及 49 项 storage_pg 测试通过；其中 2 项新增 RPC 测试直接使用生产 dispatcher 和 PostgreSQL。
+- RPC 回归比较执行数据及行版本，覆盖已移除 agent 的后台审批、全部受限命令、无回包通知、冷分叉、内部重新附着、重命名、删除，以及删除后正常创建新会话。
+- 归档测试覆盖重复读取、未提交结果、损坏与过期输出、未知任务，以及缺失目录和符号链接；检查读取前后文件内容不变。
+- `pnpm --filter coda-web lint`、`pnpm --filter coda-web typecheck`、`pnpm --filter coda-web test` 均通过，前端共 159 项测试。
+- 前端回归覆盖只读与尚未取得快照时的 action 限制、待审批展示、原模型与失效 effort 展示、草稿保留和恢复可写状态。
+- 评审后的定向测试先复现未确认输入丢失与非当前缓存会话分叉失效，再通过真实 RPC 客户端和可控 WebSocket 验证修复；覆盖已保存输入、历史重复文本、图片差异、历史位置删除、明确拒绝、压缩仍在执行，以及新 catalog 尚未返回时的分叉限制。
+
+文档初始提交为 `17df9002`，实现位于分支 `fix/unavailable-model-readonly-session`。

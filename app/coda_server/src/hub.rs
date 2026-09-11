@@ -22,7 +22,7 @@ use coda_agent::{
     runtime::SendCommandError,
 };
 use coda_core::llm::{Message, MessageId, TaskNoticeMessage, TurnId, UserMessage};
-use coda_execution::{ArchiveDir, BackgroundTasks, TaskNotice, TaskSummary};
+use coda_execution::{ArchiveDir, ArchivedTasks, BackgroundTasks, TaskNotice, TaskSummary};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, mpsc, watch};
@@ -30,8 +30,9 @@ use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tracing::{error, info, warn};
 
 use crate::config::{PermissionMode, PermissionModeCell, RelayConfig};
+use crate::session_access::{SessionAccess, SessionModelResolution, UnavailableModel};
 use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError, UnseenOutcome};
-use crate::wire::WireEvent;
+use crate::wire::{ModelSelection, WireEvent};
 
 /// Buffer size per lagging status-broadcast subscriber. A dropped event only
 /// delays a live update; the catalog remains the source of truth.
@@ -126,6 +127,8 @@ pub enum RelayEvent {
 /// What a client needs to render a session at attach time.
 #[derive(Debug, Clone)]
 pub struct SnapshotPayload {
+    pub access: SessionAccess,
+    pub background_tasks_error: Option<String>,
     pub messages: Vec<Message>,
     pub pending_approvals: Vec<PendingApproval>,
     pub provider_id: String,
@@ -166,6 +169,7 @@ pub struct SessionStatusEvent {
 /// Result of [`SessionRelay::command`], driving the connection layer's
 /// client-facing responses.
 pub enum CommandOutcome {
+    ReadOnly(UnavailableModel),
     /// The command was accepted (or was a benign no-op).
     Ok,
     /// A `Task` was accepted, carrying the id minted for the user message it
@@ -241,6 +245,7 @@ pub enum CommandOutcome {
 
 /// Result of [`SessionRelay::fork`].
 pub enum ForkOutcome {
+    ReadOnly(UnavailableModel),
     Forked(ForkedSession),
     /// The source is not at rest — a turn is in flight, something is waiting on
     /// a human, or a task is queued behind the current one.
@@ -286,9 +291,64 @@ pub enum CompactError {
     Storage(String),
 }
 
+/// Persisted messages and approvals, independent of runtime restoration.
+pub struct ReadOnlyHistory {
+    pub messages: Vec<Message>,
+    pub approvals: Vec<PendingApproval>,
+}
+
+impl ReadOnlyHistory {
+    /// Load the persisted view, including approvals for agents no longer configured.
+    pub async fn load(
+        storage: &dyn coda_agent::runtime::SessionStorage,
+        session_id: &str,
+    ) -> Result<Self, OpenError> {
+        let messages = storage
+            .load_checkpoint(session_id)
+            .await
+            .map_err(OpenError::Storage)?
+            .map(|checkpoint| {
+                checkpoint
+                    .messages
+                    .into_iter()
+                    .map(|entry| entry.message)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let approvals = storage
+            .load_pending_approval_checkpoints(session_id)
+            .await
+            .map_err(OpenError::Storage)?
+            .into_iter()
+            .map(PendingApproval::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OpenError::Storage)?;
+        Ok(Self {
+            messages,
+            approvals,
+        })
+    }
+}
+
 /// Builds sessions for the relay. Injected at construction: configuration is
 /// available on every instance, so commands never need to carry build logic.
 pub trait SessionOpener: Send + Sync + 'static {
+    /// Resolve the saved model; initial is used only when creating a session.
+    /// None only reads an existing binding and must not create a session.
+    fn resolve_session_model<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        initial: Option<&'a ModelSelection>,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelResolution, OpenError>> + Send + 'a>>;
+
+    /// Read persisted history and approvals without restoring or changing execution.
+    fn load_read_only_history<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadOnlyHistory, OpenError>> + Send + 'a>>;
+
+    fn archived_tasks(&self, key: &SessionKey) -> Result<Option<ArchivedTasks>, String>;
+
     fn persist_allow_patterns<'a>(
         &'a self,
         _key: &'a SessionKey,
@@ -480,18 +540,20 @@ pub trait SessionRelay: Send + Sync {
     ///
     /// The source is left untouched, so unlike `delete` this needs no
     /// latest-wins check: any connection may fork any session. It is refused
-    /// only when the source is not at rest.
+    /// when the source is not at rest or its model binding is unavailable.
     fn fork<'a>(
         &'a self,
         source: SessionKey,
         cut: Option<MessageId>,
     ) -> Pin<Box<dyn Future<Output = ForkOutcome> + Send + 'a>>;
 
-    /// The provider a live (or pending) session was opened with.
+    /// The attached session's model, or its read-only reason. None means this
+    /// connection does not own an initialized session.
     fn provider_of<'a>(
         &'a self,
         key: SessionKey,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+        conn_id: ConnId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, UnavailableModel>> + Send + 'a>>;
 
     /// Gracefully stop every session (process shutdown).
     fn shutdown_all<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -707,6 +769,14 @@ struct LiveState {
     log: EventLog,
 }
 
+struct ReadOnlyState {
+    model: UnavailableModel,
+    history: ReadOnlyHistory,
+    archive: Option<Arc<ArchivedTasks>>,
+    tasks: Arc<[TaskSummary]>,
+    archive_error: Option<String>,
+}
+
 struct PendingState {
     provider_id: String,
     reasoning_effort: Option<String>,
@@ -723,6 +793,7 @@ enum EntryPhase {
     /// lock (which is what serializes concurrent opens of the same key).
     Uninitialized,
     Live(Box<LiveState>),
+    ReadOnly(ReadOnlyState),
     /// Approvals-gated open: no runtime yet, resume decisions being collected.
     Pending(PendingState),
     /// Shutdown in progress outside the lock; `done` flips true after the
@@ -1131,7 +1202,7 @@ impl SessionHub {
         }
         let idle = match &state.phase {
             EntryPhase::Live(live) => !live.turn_running,
-            EntryPhase::Pending(_) => true,
+            EntryPhase::Pending(_) | EntryPhase::ReadOnly(_) => true,
             _ => false,
         };
         if !idle {
@@ -1936,48 +2007,100 @@ impl SessionRelay for SessionHub {
                 // Only a fresh entry adopts the client's mode; anything
                 // already initialized keeps the one it is running under.
                 state.permission_mode.set(permission_mode);
-                let background = self.ensure_background(&entry, state).await;
-                match self
+                let initial = ModelSelection {
+                    provider_id,
+                    reasoning_effort,
+                };
+                let resolution = match self
                     .opener
-                    .open(
-                        &key,
-                        &provider_id,
-                        reasoning_effort.clone(),
-                        state.permission_mode.clone(),
-                        HashMap::new(),
-                        background,
-                    )
+                    .resolve_session_model(&key, Some(&initial))
                     .await
                 {
-                    Ok(session) => {
-                        state.phase = EntryPhase::Live(self.make_live(
-                            &entry,
-                            session,
-                            provider_id,
-                            reasoning_effort.clone(),
-                            0,
-                        ));
-                        info!(workspace_id = %key.0, session_id = %key.1, "session opened");
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        Self::abandon(&self.entries, &entry, state);
+                        return Err(AttachError::Open(error));
                     }
-                    Err(OpenError::PendingApprovalsRequired(approvals)) => {
-                        let snapshot = self.opener.load_messages(&key).await;
-                        state.phase = EntryPhase::Pending(PendingState {
-                            provider_id,
-                            reasoning_effort,
-                            needed: approvals
-                                .iter()
-                                .map(|approval| approval.pid.clone())
-                                .collect(),
-                            decisions: HashMap::new(),
-                            approvals,
-                            snapshot,
+                };
+                match resolution {
+                    SessionModelResolution::Unavailable(model) => {
+                        let history = match self.opener.load_read_only_history(&key).await {
+                            Ok(history) => history,
+                            Err(error) => {
+                                Self::abandon(&self.entries, &entry, state);
+                                return Err(AttachError::Open(error));
+                            }
+                        };
+                        let (archive, mut archive_error) = match self.opener.archived_tasks(&key) {
+                            Ok(archive) => (archive.map(Arc::new), None),
+                            Err(error) => (None, Some(error)),
+                        };
+                        let tasks = match &archive {
+                            Some(archive) => match archive.overview().await {
+                                Ok(tasks) => tasks,
+                                Err(error) => {
+                                    archive_error = Some(error.to_string());
+                                    Vec::new()
+                                }
+                            },
+                            None => Vec::new(),
+                        };
+                        state.phase = EntryPhase::ReadOnly(ReadOnlyState {
+                            model,
+                            history,
+                            archive,
+                            tasks: tasks.into(),
+                            archive_error,
                         });
                     }
-                    Err(err) => {
-                        // Don't wedge the key: close the half-built registry
-                        // before a fresh attach reopens this archive.
-                        Self::abandon(&self.entries, &entry, state);
-                        return Err(AttachError::Open(err));
+                    SessionModelResolution::Available {
+                        provider_id,
+                        reasoning_effort,
+                    } => {
+                        let background = self.ensure_background(&entry, state).await;
+                        match self
+                            .opener
+                            .open(
+                                &key,
+                                &provider_id,
+                                reasoning_effort.clone(),
+                                state.permission_mode.clone(),
+                                HashMap::new(),
+                                background,
+                            )
+                            .await
+                        {
+                            Ok(session) => {
+                                state.phase = EntryPhase::Live(self.make_live(
+                                    &entry,
+                                    session,
+                                    provider_id,
+                                    reasoning_effort.clone(),
+                                    0,
+                                ));
+                                info!(workspace_id = %key.0, session_id = %key.1, "session opened");
+                            }
+                            Err(OpenError::PendingApprovalsRequired(approvals)) => {
+                                let snapshot = self.opener.load_messages(&key).await;
+                                state.phase = EntryPhase::Pending(PendingState {
+                                    provider_id,
+                                    reasoning_effort,
+                                    needed: approvals
+                                        .iter()
+                                        .map(|approval| approval.pid.clone())
+                                        .collect(),
+                                    decisions: HashMap::new(),
+                                    approvals,
+                                    snapshot,
+                                });
+                            }
+                            Err(err) => {
+                                // Don't wedge the key: close the half-built registry
+                                // before a fresh attach reopens this archive.
+                                Self::abandon(&self.entries, &entry, state);
+                                return Err(AttachError::Open(err));
+                            }
+                        }
                     }
                 }
             }
@@ -1988,7 +2111,7 @@ impl SessionRelay for SessionHub {
                 state.compacting,
                 current_tasks(state),
             )
-            .expect("phase is Live or Pending after initialization");
+            .expect("phase is initialized");
 
             // Register the stream and capture the replay in the same critical
             // section the forwarder appends under: every event lands in the
@@ -2019,34 +2142,70 @@ impl SessionRelay for SessionHub {
             let Some((entry, mut guard)) = self.lock_entry_for_conn(&key, conn_id).await else {
                 return CommandOutcome::Ignored;
             };
+            if let EntryPhase::ReadOnly(read_only) = &guard.phase
+                && !matches!(command, SessionCommand::GetTaskResult { .. })
+            {
+                warn!(workspace_id = %key.0, session_id = %key.1, "rejecting command on read-only session");
+                return CommandOutcome::ReadOnly(read_only.model.clone());
+            }
             // Taken by value rather than through `state` below: it is the one
             // command that has to drop the guard partway through.
             let command = match command {
                 SessionCommand::GetTaskResult { task_id } => {
                     use crate::wire::TaskResultWire as ResultWire;
-                    let Some(Some(background)) = guard.background.clone() else {
-                        return CommandOutcome::TaskResult(ResultWire::Unknown);
+                    let (archive, archive_error) = match &guard.phase {
+                        EntryPhase::ReadOnly(read_only) => {
+                            (read_only.archive.clone(), read_only.archive_error.clone())
+                        }
+                        _ => (None, None),
                     };
+                    let background = guard.background.clone().flatten();
+                    if archive.is_none() && background.is_none() {
+                        return CommandOutcome::TaskResult(match archive_error {
+                            Some(message) => ResultWire::Error { message },
+                            None => ResultWire::Unknown,
+                        });
+                    }
                     let Ok(id) = task_id.parse() else {
                         return CommandOutcome::TaskResult(ResultWire::Unknown);
                     };
                     drop(guard);
-                    let result = match background.read_result(&id).await {
+                    let archived = archive.is_some();
+                    let result = if let Some(archive) = archive {
+                        archive.read_result(&id).await.map_err(|e| e.to_string())
+                    } else {
+                        background
+                            .expect("result source exists")
+                            .read_result(&id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
+                    let result = match result {
                         Ok(None) => ResultWire::Unknown,
                         Ok(Some(coda_execution::TaskResult::Expired { status })) => {
                             ResultWire::Expired { status }
                         }
                         Ok(Some(coda_execution::TaskResult::Pending { status })) => {
-                            ResultWire::Pending { status }
+                            if archived {
+                                ResultWire::Error {
+                                    message:
+                                        "Task was not restored and has no committed terminal result"
+                                            .into(),
+                                }
+                            } else {
+                                ResultWire::Pending { status }
+                            }
                         }
                         Ok(Some(coda_execution::TaskResult::Available { status, output })) => {
                             ResultWire::Available { status, output }
                         }
-                        Err(error) => ResultWire::Error {
-                            message: error.to_string(),
-                        },
+                        Err(message) => ResultWire::Error { message },
                     };
-                    if self.lock_entry_for_conn(&key, conn_id).await.is_none() {
+                    let Some((current, _guard)) = self.lock_entry_for_conn(&key, conn_id).await
+                    else {
+                        return CommandOutcome::Ignored;
+                    };
+                    if !Arc::ptr_eq(&entry, &current) {
                         return CommandOutcome::Ignored;
                     }
                     return CommandOutcome::TaskResult(result);
@@ -2224,6 +2383,26 @@ impl SessionRelay for SessionHub {
             let (entry, mut guard) = self.lock_entry_for_attach(&source).await;
             let borrowed = matches!(guard.phase, EntryPhase::Uninitialized);
 
+            if let EntryPhase::ReadOnly(read_only) = &guard.phase {
+                return ForkOutcome::ReadOnly(read_only.model.clone());
+            }
+            if borrowed {
+                match self.opener.resolve_session_model(&source, None).await {
+                    Ok(SessionModelResolution::Available { .. }) => {}
+                    result => {
+                        Self::leave_entry_gate(&self.entries, &entry, &mut guard, borrowed);
+                        return match result {
+                            Ok(SessionModelResolution::Unavailable(model)) => {
+                                ForkOutcome::ReadOnly(model)
+                            }
+                            Err(error) => {
+                                ForkOutcome::Failed(ForkError::Persistence(error.to_string()))
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+            }
             let gate = match &guard.phase {
                 _ if guard.compacting => ForkGate::Busy,
                 EntryPhase::Live(live) => {
@@ -2278,14 +2457,17 @@ impl SessionRelay for SessionHub {
     fn provider_of<'a>(
         &'a self,
         key: SessionKey,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        conn_id: ConnId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, UnavailableModel>> + Send + 'a>> {
         Box::pin(async move {
-            let entry = self.get_entry(&key)?;
-            let guard = entry.inner.clone().lock_owned().await;
+            let Some((_entry, guard)) = self.lock_entry_for_conn(&key, conn_id).await else {
+                return Ok(None);
+            };
             match &guard.phase {
-                EntryPhase::Live(live) => Some(live.provider_id.clone()),
-                EntryPhase::Pending(pending) => Some(pending.provider_id.clone()),
-                _ => None,
+                EntryPhase::Live(live) => Ok(Some(live.provider_id.clone())),
+                EntryPhase::Pending(pending) => Ok(Some(pending.provider_id.clone())),
+                EntryPhase::ReadOnly(read_only) => Err(read_only.model.clone()),
+                _ => Ok(None),
             }
         })
     }
@@ -2429,6 +2611,8 @@ fn compose_snapshot(
                     .map(|(_, message)| message.clone()),
             );
             Some(SnapshotPayload {
+                access: SessionAccess::ReadWrite,
+                background_tasks_error: None,
                 messages,
                 pending_approvals: live.session.pending_approvals(),
                 provider_id: live.provider_id.clone(),
@@ -2439,7 +2623,23 @@ fn compose_snapshot(
                 background_tasks,
             })
         }
+        EntryPhase::ReadOnly(read_only) => Some(SnapshotPayload {
+            access: SessionAccess::ReadOnly {
+                reason: read_only.model.reason,
+            },
+            background_tasks_error: read_only.archive_error.clone(),
+            messages: read_only.history.messages.clone(),
+            pending_approvals: read_only.history.approvals.clone(),
+            provider_id: read_only.model.binding.selection_key(),
+            reasoning_effort: read_only.model.binding.reasoning_effort.clone(),
+            permission_mode,
+            turn_running: false,
+            compacting: false,
+            background_tasks: read_only.tasks.clone(),
+        }),
         EntryPhase::Pending(pending) => Some(SnapshotPayload {
+            access: SessionAccess::ReadWrite,
+            background_tasks_error: None,
             messages: pending.snapshot.clone(),
             pending_approvals: pending
                 .approvals

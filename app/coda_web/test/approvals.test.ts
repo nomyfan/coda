@@ -18,6 +18,7 @@ function approval(...callIds: string[]): PendingApproval {
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",

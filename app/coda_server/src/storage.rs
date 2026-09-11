@@ -183,6 +183,7 @@ impl UnseenOutcome {
 /// One row of the session list.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SessionSummary {
+    pub model_binding: SessionModelBinding,
     pub session_id: String,
     pub name: Option<String>,
     pub updated_at_ms: u64,
@@ -291,6 +292,25 @@ impl WorkspaceStorage {
                     "failed to read the binding of session {session_id}: {err}"
                 ))
             })
+    }
+
+    pub async fn load_model_binding(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionModelBinding, SessionMetadataError> {
+        let mut conn = self
+            .conn()
+            .await
+            .map_err(SessionMetadataError::Persistence)?;
+        sessions::table
+            .find((&self.workspace_id, session_id))
+            .select(sessions::model_binding)
+            .first::<Json<SessionModelBinding>>(&mut conn)
+            .await
+            .optional()
+            .map_err(|error| SessionMetadataError::Persistence(error.to_string()))?
+            .map(Json::into_inner)
+            .ok_or(SessionMetadataError::SessionNotFound)
     }
 
     pub async fn rename_session(
@@ -752,6 +772,7 @@ impl WorkspaceStorage {
                 has_pending_approval,
                 first_user_message,
                 sessions::unseen_outcome,
+                sessions::model_binding,
             ))
             .order((sessions::updated_at.desc(), sessions::session_id.asc()))
             .load::<(
@@ -761,6 +782,7 @@ impl WorkspaceStorage {
                 bool,
                 Option<Json<Message>>,
                 Option<String>,
+                Json<SessionModelBinding>,
             )>(&mut conn)
             .await
             .map_err(|err| format!("failed to list sessions: {err}"))?;
@@ -775,8 +797,10 @@ impl WorkspaceStorage {
                     has_pending_approval,
                     first_user_message,
                     unseen_outcome,
+                    model_binding,
                 )| {
                     SessionSummary {
+                        model_binding: model_binding.into_inner(),
                         session_id,
                         name,
                         updated_at_ms: updated_at.to_jiff().as_millisecond().max(0) as u64,

@@ -10,7 +10,7 @@
 //! [`Session::runtime`].
 
 use crate::agent::{EnvelopeBody, Receiver};
-use crate::persist::{StoredResumePoint, StoredRuntimeSnapshot};
+use crate::persist::StoredRuntimeSnapshot;
 use crate::runtime::{
     ProcessRuntime, ProcessRuntimeSnapshot, ResumeTarget, SendCommandError, SessionStorage,
 };
@@ -493,42 +493,7 @@ async fn collect_pending_approvals(
         .await
         .map_err(OpenError::Storage)?
     {
-        let StoredResumePoint::PendingApproval {
-            parent_message_id,
-            pending_approval_calls,
-            ..
-        } = stored.resume_point
-        else {
-            return Err(OpenError::Storage(format!(
-                "storage returned non-pending checkpoint {} as awaiting approval",
-                stored.pid
-            )));
-        };
-        if pending_approval_calls.is_empty() {
-            return Err(OpenError::Storage(format!(
-                "storage returned empty approval checkpoint {} as awaiting approval",
-                stored.pid
-            )));
-        }
-        pending.push(PendingApproval {
-            task_id: stored
-                .active_execution
-                .as_ref()
-                .and_then(|e| e.background_task().cloned()),
-            agent_path: stored
-                .active_execution
-                .as_ref()
-                .map(|e| e.agent_path.clone())
-                .unwrap_or_else(|| vec![stored.agent_name.clone()]),
-            pid: stored.pid,
-            agent_name: stored.agent_name,
-            parent_message_id,
-            calls: pending_approval_calls
-                .into_iter()
-                .map(|prepared| prepared.tool_call)
-                .collect(),
-            suspended_at: stored.suspended_at,
-        });
+        pending.push(PendingApproval::try_from(stored).map_err(OpenError::Storage)?);
     }
     Ok(pending)
 }

@@ -50,6 +50,7 @@ import {
   beginEdit,
   discardedFrom,
   forkActiveSession,
+  selectActiveCanWrite,
   selectActiveApprovalCount,
   selectActiveEditing,
   selectActiveEntries,
@@ -653,13 +654,14 @@ function MessageActions({
 function ForkButton({ entry }: { entry: TranscriptEntry }) {
   const key = useCodaStore(selectActiveForkKey);
   const forking = useCodaStore(selectForking(key ?? ""));
+  const writable = useCodaStore(selectActiveCanWrite);
   const [error, setError] = useState<string>();
   return (
     <>
       <Button
         size="icon"
         variant="ghost"
-        disabled={forking}
+        disabled={forking || !writable}
         className="size-7 text-muted-foreground hover:text-foreground"
         title="Branch a copy from before this message"
         aria-label="Branch a copy from before this message"

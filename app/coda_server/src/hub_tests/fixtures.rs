@@ -371,6 +371,8 @@ impl SessionStorage for SlowStorage {
 pub(super) type UnseenOutcomeCalls = Vec<(SessionKey, Option<UnseenOutcome>)>;
 
 pub(super) struct TestOpener {
+    pub(super) unavailable_model: Option<UnavailableModel>,
+    pub(super) fail_read_only_load: bool,
     pub(super) storage: SlowStorage,
     /// Spool root for this test's sessions; dropped with the opener.
     background_root: tempfile::TempDir,
@@ -507,6 +509,8 @@ impl TestOpener {
             fail_effort_update: false,
             fail_open_after_rewind: false,
             rewound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unavailable_model: None,
+            fail_read_only_load: false,
             forks: Arc::new(std::sync::Mutex::new(Vec::new())),
             fork_gate: None,
             fork_error: None,
@@ -533,6 +537,47 @@ pub(super) fn explore_thread() -> ProcessId {
 }
 
 impl SessionOpener for TestOpener {
+    fn resolve_session_model<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        initial: Option<&'a ModelSelection>,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelResolution, OpenError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(match &self.unavailable_model {
+                Some(model) => SessionModelResolution::Unavailable(model.clone()),
+                None => SessionModelResolution::Available {
+                    provider_id: initial
+                        .map(|selection| selection.provider_id.clone())
+                        .unwrap_or_else(|| "p".into()),
+                    reasoning_effort: initial
+                        .and_then(|selection| selection.reasoning_effort.clone()),
+                },
+            })
+        })
+    }
+
+    fn load_read_only_history<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadOnlyHistory, OpenError>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.fail_read_only_load {
+                return Err(OpenError::Storage("injected read failure".into()));
+            }
+            ReadOnlyHistory::load(&self.storage, &key.1).await
+        })
+    }
+
+    fn archived_tasks(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Option<coda_execution::ArchivedTasks>, String> {
+        coda_execution::ArchivedTasks::open_existing(
+            &self.background_root.path().join(&key.0).join(&key.1),
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn open<'a>(
         &'a self,
         key: &'a SessionKey,

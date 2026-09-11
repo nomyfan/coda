@@ -7,6 +7,7 @@ pub mod jsonb;
 pub mod mcp;
 pub mod rpc;
 pub mod schema;
+pub mod session_access;
 pub mod storage;
 pub mod transport;
 pub mod wire;

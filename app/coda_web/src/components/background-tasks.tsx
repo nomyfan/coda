@@ -10,6 +10,7 @@ import {
   getBackgroundTaskResult,
   killBackgroundTask,
   selectActiveBackgroundTasks,
+  selectActiveCanWrite,
   useCodaStore,
 } from "@/store/session";
 
@@ -38,6 +39,7 @@ function TaskRow({
   resultRequest?: TaskResultRequest;
 }) {
   const rowRef = useRef<HTMLLIElement>(null);
+  const writable = useCodaStore(selectActiveCanWrite);
   const [resultOpen, setResultOpen] = useState(false);
   const started = formatClockTime(task.started_at);
   const label = task.kind.kind === "subagent" ? task.kind.agent_name : task.command;
@@ -82,6 +84,7 @@ function TaskRow({
             variant="ghost"
             size="icon"
             className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
+            disabled={!writable}
             onClick={() => killBackgroundTask(task.id)}
             title="Stop this task"
             aria-label={`Stop ${label}`}

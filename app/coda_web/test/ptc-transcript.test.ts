@@ -8,6 +8,7 @@ const code = 'const raw = await tools.read_file({ file_path: "README.md" });\nre
 
 function session(): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -85,6 +86,7 @@ test("a snapshot restores the generated script beside its result", () => {
     approvals: [],
     providerId: "provider:model",
     reasoningEffort: null,
+    access: { type: "read_write" },
     turnRunning: false,
   });
 

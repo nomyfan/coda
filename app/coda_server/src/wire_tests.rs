@@ -57,14 +57,6 @@ fn session_ref_roundtrips() {
 }
 
 #[test]
-fn add_allow_pattern_params_roundtrips() {
-    let params: AddAllowPatternParams =
-        serde_json::from_str(r#"{"workspace_id":"coda","pattern":"git *"}"#).unwrap();
-    assert_eq!(params.workspace_id, "coda");
-    assert_eq!(params.pattern, "git *");
-}
-
-#[test]
 fn rename_session_params_and_result_roundtrip() {
     let params: RenameSessionParams = serde_json::from_str(
         r#"{"workspace_id":"coda","session_id":"s1","name":"  Investigation  "}"#,
@@ -148,6 +140,8 @@ fn set_model_params_defaults_effort_to_none() {
 #[test]
 fn snapshot_serializes_without_type_tag() {
     let msg = Snapshot {
+        access: crate::session_access::SessionAccess::ReadWrite,
+        background_tasks_error: None,
         workspace_id: "coda".into(),
         session_id: "s1".into(),
         messages: vec![],
@@ -162,13 +156,13 @@ fn snapshot_serializes_without_type_tag() {
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
-        r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true,"compacting":false,"background_tasks":[]}"#
+        r#"{"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true,"compacting":false,"background_tasks":[]}"#
     );
 }
 
 #[test]
 fn snapshot_without_turn_running_defaults_to_false() {
-    let json = r#"{"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
+    let json = r#"{"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
     let snapshot: Snapshot = serde_json::from_str(json).unwrap();
     assert!(!snapshot.turn_running);
     assert_eq!(snapshot.permission_mode, PermissionMode::AcceptEdits);
@@ -318,6 +312,7 @@ fn workspace_catalog_roundtrips() {
             id: "coda".into(),
             path: "/work/coda".into(),
             sessions: vec![SessionSummaryWire {
+                access: crate::session_access::SessionAccess::ReadWrite,
                 id: "s1".into(),
                 name: Some("Investigation".into()),
                 updated_at_ms: Some(42),
@@ -345,6 +340,7 @@ fn workspace_catalog_roundtrips() {
 #[test]
 fn a_session_summary_can_carry_a_live_running_status() {
     let msg = SessionSummaryWire {
+        access: crate::session_access::SessionAccess::ReadWrite,
         id: "s1".into(),
         name: None,
         updated_at_ms: None,

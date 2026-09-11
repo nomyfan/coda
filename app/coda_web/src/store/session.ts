@@ -4,6 +4,7 @@ import type { Draft } from "immer";
 import {
   approvalKey,
   type CompletionUsage,
+  type SessionAccess,
   type HistoryMessage,
   type PendingApproval,
   type PermissionMode,
@@ -123,7 +124,18 @@ export type UsageRecord = {
   usage: CompletionUsage;
 };
 
+type UnconfirmedInput = {
+  text: string;
+  images: string[];
+  afterUserMessageId: string | null;
+};
+
 export type OpenedSession = {
+  access: SessionAccess | null;
+  backgroundTasksError?: string | null;
+  unsentDraft?: { text: string; images: string[] };
+  /** A lost reply leaves delivery unknown until the next snapshot. Never resend it automatically. */
+  unconfirmedInput?: UnconfirmedInput;
   key: SessionKey;
   workspaceId: string;
   sessionId: string;
@@ -290,6 +302,7 @@ function blankSession(workspaceId: string, sessionId: string): OpenedSession {
     backgroundTasks: [],
     evicted: false,
     permissionMode: DEFAULT_PERMISSION_MODE,
+    access: null,
     usage: [],
   };
 }
@@ -1204,7 +1217,13 @@ function upsertCatalogSession(catalog: WorkspaceSummary[], workspaceId: string, 
     return {
       ...workspace,
       sessions: [
-        { id: sessionId, name: null, updated_at_ms: null, has_pending_approval: false },
+        {
+          id: sessionId,
+          name: null,
+          updated_at_ms: null,
+          has_pending_approval: false,
+          access: null,
+        },
         ...workspace.sessions,
       ],
     };
@@ -1262,6 +1281,7 @@ function upsertCatalogTitled(
       ...workspace,
       sessions: [
         {
+          access: null,
           id: sessionId,
           name: null,
           updated_at_ms: Date.now(),
@@ -1306,6 +1326,7 @@ function mergeCatalog(
           !present.has(session.sessionId),
       )
       .map((session) => ({
+        access: session.access,
         id: session.sessionId,
         name: null,
         updated_at_ms: Date.now(),
@@ -1375,6 +1396,12 @@ function markConnecting(store: CodaStore, server: string, alias?: string) {
     }
     state.servers[server].alias = alias ?? existing?.alias;
     state.servers[server].status = "connecting";
+    for (const session of Object.values(state.servers[server].sessions)) {
+      if (!session.draft) session.access = null;
+    }
+    for (const workspace of state.servers[server].catalog) {
+      for (const session of workspace.sessions) session.access = null;
+    }
     state.servers[server].error = undefined;
   });
 }
@@ -1398,6 +1425,11 @@ function setServerStatus(
     const current = state.servers[server];
     if (current) {
       current.status = status;
+      if (status !== "connected") {
+        for (const session of Object.values(current.sessions)) {
+          if (!session.draft) session.access = null;
+        }
+      }
       current.error = status === "error" ? error : undefined;
     }
   });
@@ -1627,6 +1659,31 @@ function userMessageText(message: HistoryMessage): string {
     .join("");
 }
 
+function recoverUnconfirmedInput(
+  input: UnconfirmedInput,
+  messages: HistoryMessage[],
+): OpenedSession["unsentDraft"] {
+  const draft = { text: input.text, images: input.images };
+  const after =
+    input.afterUserMessageId === null
+      ? -1
+      : messages.findIndex(
+          (message) => "User" in message && message.User.message_id === input.afterUserMessageId,
+        );
+  // The earlier history may have been rewound elsewhere. Keep the input when
+  // its place in the conversation can no longer be established.
+  if (input.afterUserMessageId !== null && after === -1) return draft;
+  const recorded = messages.slice(after + 1).some((message) => {
+    if (!("User" in message) || userMessageText(message) !== input.text) return false;
+    const images = message.User.parts.flatMap((part) => (part.type === "image" ? [part.url] : []));
+    return (
+      images.length === input.images.length &&
+      images.every((image, index) => image === input.images[index])
+    );
+  });
+  return recorded ? undefined : draft;
+}
+
 /** Everything a snapshot decides about one session.
  *
  * A snapshot is authoritative even when it is empty. That is only sound because
@@ -1650,6 +1707,8 @@ function userMessageText(message: HistoryMessage): string {
 export function applySnapshotToSession(
   session: OpenedSession,
   snapshot: {
+    access: SessionAccess;
+    backgroundTasksError?: string | null;
     messages: HistoryMessage[];
     approvals: PendingApproval[];
     providerId: string;
@@ -1660,6 +1719,8 @@ export function applySnapshotToSession(
     backgroundTasks?: TaskSummary[];
   },
 ): OpenedSession {
+  const readOnly = snapshot.access.type === "read_only";
+  const unconfirmed = session.entries.filter(isPendingUserEntry);
   const drafts: OpenedSession["drafts"] = {};
   const allowDrafts: OpenedSession["allowDrafts"] = {};
   for (const approval of snapshot.approvals) {
@@ -1677,7 +1738,7 @@ export function applySnapshotToSession(
   }
   const argsById = collectToolArgs(snapshot.messages);
   const spansById = collectGenerationSpans(snapshot.messages);
-  const pending = session.entries.filter(isPendingUserEntry);
+  const pending = readOnly ? [] : unconfirmed;
   // A compaction's optimistic copy is reconciled by content: `compact` answers
   // without a message id, so the only thing that retires the copy is the
   // end-of-compaction snapshot carrying the recorded `/compact` line. The start
@@ -1686,6 +1747,7 @@ export function applySnapshotToSession(
   const recordedTexts = new Set(snapshot.messages.map(userMessageText));
   const pendingCompaction = session.entries.filter(
     (entry) =>
+      !readOnly &&
       isPendingCompactionEntry(entry) &&
       (snapshot.compacting === true || !recordedTexts.has(entry.content)),
   );
@@ -1705,6 +1767,15 @@ export function applySnapshotToSession(
     : [];
   return {
     ...session,
+    access: snapshot.access,
+    backgroundTasksError: snapshot.backgroundTasksError,
+    // Compaction persists its input when it finishes, so an in-progress
+    // snapshot cannot yet establish whether that command needs recovery.
+    unsentDraft:
+      session.unconfirmedInput && !snapshot.compacting
+        ? recoverUnconfirmedInput(session.unconfirmedInput, snapshot.messages)
+        : session.unsentDraft,
+    unconfirmedInput: snapshot.compacting ? session.unconfirmedInput : undefined,
     // Rebuilt, not merged: the snapshot is the whole history, so a span it
     // doesn't account for belongs to a call that no longer exists.
     generationSpans: spansById,
@@ -1724,11 +1795,14 @@ export function applySnapshotToSession(
     // turn that is about to start. Taking it at face value reopens the composer
     // and lets a second task go out under the first one — so the pending
     // message speaks for its own turn until the reply that created it lands.
-    running: snapshot.turnRunning || pending.length > 0,
+    running: !readOnly && (snapshot.turnRunning || pending.length > 0),
     compacting: snapshot.compacting ?? false,
     backgroundTasks: snapshot.backgroundTasks ?? session.backgroundTasks,
     evicted: false,
-    editing: reconcileEditing(session.editing, snapshot.messages),
+    editing:
+      readOnly && session.editing
+        ? { ...session.editing, submitting: false }
+        : reconcileEditing(session.editing, snapshot.messages),
     entries: [
       ...snapshot.messages.flatMap((message) => historyToEntries(message, argsById, spansById)),
       ...pending,
@@ -1818,6 +1892,8 @@ function applySnapshot(
   turnRunning: boolean,
   compacting: boolean,
   backgroundTasks: TaskSummary[],
+  access: SessionAccess,
+  backgroundTasksError: string | null,
 ) {
   flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
@@ -1843,7 +1919,10 @@ function applySnapshot(
         first_user_message: null,
       });
     }
+    current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, { access });
     current.sessions[key] = applySnapshotToSession(session, {
+      access,
+      backgroundTasksError,
       messages,
       approvals,
       providerId,
@@ -2197,7 +2276,7 @@ function adoptServerMessageId(server: string, key: SessionKey, entryId: string, 
   });
 }
 
-/** Undo an optimistic user entry whose task never started. The session's title
+/** Remove an optimistic entry after rejection or a lost reply. The session's title
  * and non-draft flag are left as they are — a later catalog refresh corrects
  * them, and unwinding them here could clobber newer server state. */
 function discardOptimisticTask(
@@ -2205,12 +2284,14 @@ function discardOptimisticTask(
   key: SessionKey,
   entryId: string,
   previousRunning: boolean,
+  unconfirmedInput?: UnconfirmedInput,
 ) {
   updateState(codaStore, (state) => {
     const session = draftSession(state, server, key);
     if (!session) {
       return;
     }
+    if (unconfirmedInput) session.unconfirmedInput = unconfirmedInput;
     session.entries = session.entries.filter((e) => e.id !== entryId);
     session.running = previousRunning;
   });
@@ -2245,10 +2326,16 @@ function appendCompactionMessage(
   return entryId;
 }
 
-function discardPendingCompaction(server: string, key: SessionKey, entryId: string) {
+function discardPendingCompaction(
+  server: string,
+  key: SessionKey,
+  entryId: string,
+  unconfirmedInput?: UnconfirmedInput,
+) {
   updateState(codaStore, (state) => {
     const session = draftSession(state, server, key);
     if (session) {
+      if (unconfirmedInput) session.unconfirmedInput = unconfirmedInput;
       session.entries = session.entries.filter((e) => e.id !== entryId);
     }
   });
@@ -2266,12 +2353,21 @@ async function startTurn(
   images: string[],
 ): Promise<boolean> {
   const key = sessionKey(workspaceId, sessionId);
+  const session = codaStore.getState().servers[server]?.sessions[key];
+  if (!session || !sessionIsWritable(session)) return false;
   const previousRunning = codaStore.getState().servers[server]?.sessions[key]?.running ?? false;
+  const submittedInput: UnconfirmedInput = {
+    text,
+    images,
+    afterUserMessageId:
+      session.entries.filter((entry) => entry.kind === "user" && entry.messageId).at(-1)
+        ?.messageId ?? null,
+  };
   const entryId = appendUserMessage(codaStore, server, key, text, images);
   const rpc = rpcFor(server);
   if (!rpc) {
     setServerStatus(codaStore, server, "error", "Connection closed");
-    discardOptimisticTask(server, key, entryId, previousRunning);
+    discardOptimisticTask(server, key, entryId, previousRunning, submittedInput);
     return false;
   }
   try {
@@ -2282,13 +2378,25 @@ async function startTurn(
       images: images.length > 0 ? images : undefined,
     });
     adoptServerMessageId(server, key, entryId, message_id);
+    updateState(codaStore, (state) => {
+      const session = state.servers[server]?.sessions[key];
+      if (session) session.unsentDraft = undefined;
+    });
     return true;
   } catch (err) {
-    discardOptimisticTask(server, key, entryId, previousRunning);
+    discardOptimisticTask(
+      server,
+      key,
+      entryId,
+      previousRunning,
+      isServerError(err) ? undefined : submittedInput,
+    );
     addSessionActivity(server, workspaceId, sessionId, {
       tone: "danger",
-      label: "task rejected",
-      detail: isServerError(err) ? err.message : "Connection lost before the task started",
+      label: isServerError(err) ? "task rejected" : "task delivery unconfirmed",
+      detail: isServerError(err)
+        ? err.message
+        : "Connection lost before confirmation; reconnect to check whether the task was saved.",
     });
     return false;
   }
@@ -2421,6 +2529,10 @@ function openParams(session: OpenedSession, takeover = false) {
  */
 export const codaStore = create<CodaStoreState>(initialStoreState);
 
+export function sessionIsWritable(session: OpenedSession): boolean {
+  return session.draft === true || session.access?.type === "read_write";
+}
+
 // --- Actions (plain functions, stable identity) ------------------------------
 
 /** The JSON-RPC adapter for `server`'s current connection, if any. */
@@ -2494,12 +2606,16 @@ async function requestOpenAndApply(
   server: string,
   session: OpenedSession,
   options: { takeover?: boolean } = {},
-): Promise<boolean> {
+): Promise<SessionAccess | null> {
   const rpc = rpcFor(server);
   if (!rpc) {
     setServerStatus(codaStore, server, "error", "Connection closed");
-    return false;
+    return null;
   }
+  updateState(codaStore, (state) => {
+    const opening = state.servers[server]?.sessions[session.key];
+    if (opening) opening.access = null;
+  });
   try {
     const snap = await rpc.request("open_session", openParams(session, options.takeover));
     applySnapshot(
@@ -2515,11 +2631,13 @@ async function requestOpenAndApply(
       snap.turn_running ?? false,
       snap.compacting ?? false,
       snap.background_tasks ?? [],
+      snap.access,
+      snap.background_tasks_error,
     );
-    return true;
+    return snap.access;
   } catch (err) {
     handleOpenError(server, session.workspaceId, session.sessionId, err);
-    return false;
+    return null;
   }
 }
 
@@ -2530,7 +2648,7 @@ async function requestOpenAndApply(
 async function openBeforeFirstTask(server: string, session: OpenedSession): Promise<boolean> {
   setSessionStarting(codaStore, server, session.key, true);
   try {
-    return await requestOpenAndApply(server, session);
+    return (await requestOpenAndApply(server, session))?.type === "read_write";
   } finally {
     setSessionStarting(codaStore, server, session.key, false);
   }
@@ -2650,6 +2768,8 @@ export function connectServer(rawUrl: string) {
       params.turn_running ?? false,
       params.compacting ?? false,
       params.background_tasks ?? [],
+      params.access,
+      params.background_tasks_error,
     );
   });
   rpc.addMethod("background_tasks", (params) => {
@@ -2882,6 +3002,27 @@ function setForking(key: string, inFlight: boolean) {
   });
 }
 
+/** The current session needs its own snapshot; detached history uses the catalog. */
+export function selectCanForkSession(
+  state: CodaStoreState,
+  server: string,
+  workspaceId: string,
+  sessionId: string,
+): boolean {
+  const current = state.servers[server];
+  if (current?.status !== "connected") return false;
+  const key = sessionKey(workspaceId, sessionId);
+  if (state.activeServer === server && state.activeKey === key) {
+    const session = current.sessions[key];
+    return session?.access?.type === "read_write" && !session.draft && !session.compacting;
+  }
+  return (
+    current.catalog
+      .find((workspace) => workspace.id === workspaceId)
+      ?.sessions.find((session) => session.id === sessionId)?.access?.type === "read_write"
+  );
+}
+
 /**
  * Copy a session into a new one and switch to it. `cutMessageId` names the user
  * message to branch away from — the copy keeps the turns before it — and
@@ -2902,8 +3043,8 @@ export async function forkSession(
   forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const key = forkKey(server, workspaceId, sessionId);
-  const source = codaStore.getState().servers[server]?.sessions[sessionKey(workspaceId, sessionId)];
-  if (codaStore.getState().forking[key] || source?.compacting) {
+  if (!selectCanForkSession(codaStore.getState(), server, workspaceId, sessionId)) return;
+  if (codaStore.getState().forking[key]) {
     return;
   }
   const params = {
@@ -2983,6 +3124,7 @@ export async function forkActiveSession(
   forkDraft?: { text: string; images: string[] },
 ): Promise<void> {
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   // A draft was never opened on the server, so there is nothing to copy.
   if (!active || active.session.draft || active.session.compacting) {
     return;
@@ -3064,6 +3206,7 @@ export function clearActiveSession() {
 export async function sendTask(task: string, images: string[] = []) {
   const text = task.trim();
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   if (!text && images.length === 0) {
     return;
   }
@@ -3077,6 +3220,10 @@ export async function sendTask(task: string, images: string[] = []) {
   // come back `SESSION_NOT_LIVE` while the UI already showed it running
   // (Decision 10).
   if (active.session.draft && !(await openBeforeFirstTask(active.server, active.session))) {
+    updateState(codaStore, (state) => {
+      const session = state.servers[active.server]?.sessions[active.session.key];
+      if (session) session.unsentDraft = { text, images };
+    });
     return;
   }
   await startTurn(
@@ -3095,6 +3242,7 @@ export async function sendTask(task: string, images: string[] = []) {
  * optimistic copy by content. */
 export async function compactActiveSession(instructions: string): Promise<void> {
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   if (
     !active ||
     active.session.draft ||
@@ -3161,7 +3309,20 @@ export async function compactActiveSession(instructions: string): Promise<void> 
       });
     }
   } catch (err) {
-    discardPendingCompaction(server, key, entryId);
+    discardPendingCompaction(
+      server,
+      key,
+      entryId,
+      isServerError(err)
+        ? undefined
+        : {
+            text,
+            images: [],
+            afterUserMessageId:
+              session.entries.filter((entry) => entry.kind === "user" && entry.messageId).at(-1)
+                ?.messageId ?? null,
+          },
+    );
     addSessionActivity(server, session.workspaceId, session.sessionId, {
       tone: "danger",
       label: "compaction rejected",
@@ -3221,7 +3382,7 @@ export async function sendTaskToNewSession(
  * in flight is downstream of what would go. */
 export function beginEdit(messageId: string) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   const { server, session } = active;
@@ -3289,7 +3450,7 @@ export function cancelEdit() {
  * message goes out while its text stays in the box, ready to be sent again. */
 export async function rewindTurn(task: string, images: string[] = []) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   const { server, session } = active;
@@ -3395,6 +3556,7 @@ export async function rewindTurn(task: string, images: string[] = []) {
 
 export function abort() {
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   if (active) {
     notify(active.server, "abort", {
       workspace_id: active.session.workspaceId,
@@ -3424,6 +3586,7 @@ export async function getBackgroundTaskResult(taskId: string) {
 
 export function killBackgroundTask(taskId: string) {
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   if (active) {
     notify(active.server, "kill_task", {
       workspace_id: active.session.workspaceId,
@@ -3437,7 +3600,7 @@ export function killBackgroundTask(taskId: string) {
  * pattern is only sent to the server on submit, so the choice is cancelable. */
 export function setAllowDraft(approval: PendingApproval, call: ToolCall, pattern: string | null) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   setAllowDraftPattern(codaStore, active.server, active.session.key, approval, call, pattern);
@@ -3460,7 +3623,7 @@ export function dismissPersistError() {
 
 export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   if (active.session.draft) {
@@ -3532,6 +3695,7 @@ function setSessionMode(store: CodaStore, server: string, key: SessionKey, mode:
  */
 export function setPermissionMode(mode: PermissionMode) {
   const active = currentActive();
+  if (active && !sessionIsWritable(active.session)) return;
   if (!active || active.session.deleting || active.session.evicted) {
     return;
   }
@@ -3579,7 +3743,7 @@ export function draftCall(
   resolution: ToolCallResolution,
 ) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   setDraftResolution(codaStore, active.server, active.session.key, approval, call, resolution);
@@ -3587,7 +3751,7 @@ export function draftCall(
 
 export function clearDraftCall(approval: PendingApproval, call: ToolCall) {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   clearDraftResolution(codaStore, active.server, active.session.key, approval, call);
@@ -3647,7 +3811,7 @@ const submittingApprovals = new Set<string>();
 
 export async function submitApprovals() {
   const active = currentActive();
-  if (!active) {
+  if (!active || !sessionIsWritable(active.session)) {
     return;
   }
   // Defense in depth behind the takeover mask: an evicted tab's approvals are
@@ -3869,6 +4033,15 @@ export const selectActiveHasImages = (state: CodaStoreState): boolean =>
   (activeSessionOf(state)?.entries ?? EMPTY_ENTRIES).some(
     (entry) => (entry.images?.length ?? 0) > 0,
   );
+export const selectActiveCanWrite = (state: CodaStoreState): boolean => {
+  const session = activeSessionOf(state);
+  return !session || sessionIsWritable(session);
+};
+export const selectActiveAccess = (state: CodaStoreState) => activeSessionOf(state)?.access ?? null;
+export const selectActiveBackgroundTasksError = (state: CodaStoreState) =>
+  activeSessionOf(state)?.backgroundTasksError;
+export const selectActiveUnsentDraft = (state: CodaStoreState) =>
+  activeSessionOf(state)?.unsentDraft;
 export const selectActiveRunning = (state: CodaStoreState) =>
   activeSessionOf(state)?.running ?? false;
 export const selectActiveBackgroundTasks = (state: CodaStoreState) =>
@@ -3931,6 +4104,7 @@ export const selectCanRewind = (state: CodaStoreState): boolean => {
   const session = activeSessionOf(state);
   return (
     !!session &&
+    sessionIsWritable(session) &&
     selectActiveStatus(state) === "connected" &&
     !session.running &&
     !session.compacting &&

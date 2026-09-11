@@ -14,6 +14,7 @@ import {
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -85,6 +86,7 @@ test("a compaction summary becomes a distinct transcript separator", () => {
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });
@@ -106,6 +108,7 @@ test("the authoritative snapshot exposes compaction as busy without inventing a 
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: true,
   });
@@ -317,6 +320,7 @@ test("the start-of-compaction snapshot keeps the optimistic line without running
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: true,
   });
@@ -367,6 +371,7 @@ test("a repeated /compact line stays optimistic until its compaction finishes", 
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: true,
   });
@@ -411,6 +416,7 @@ test("the end-of-compaction snapshot retires the optimistic copy by content", ()
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });
@@ -436,6 +442,7 @@ test("a successful compaction clears usage until the next assistant response", (
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });
@@ -451,6 +458,7 @@ test("a successful compaction clears usage until the next assistant response", (
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });

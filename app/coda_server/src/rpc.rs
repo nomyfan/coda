@@ -64,6 +64,7 @@ pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
 pub const MODEL_LOCKED: i32 = -32005;
 /// A command requiring an idle session found work in flight or parked.
 pub const SESSION_NOT_IDLE: i32 = -32006;
+pub const SESSION_READ_ONLY: i32 = -32007;
 pub const UNKNOWN_WORKSPACE: i32 = -32010;
 pub const INVALID_SESSION_ID: i32 = -32011;
 pub const INVALID_MODEL_SELECTION: i32 = -32012;

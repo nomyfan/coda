@@ -8,6 +8,7 @@ const controlEvents = serializedEvents as WireEvent[];
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -227,6 +228,7 @@ test.each(["abort", "complete"])(
       providerId: "test",
       reasoningEffort: null,
       permissionMode: "accept_edits" as const,
+      access: { type: "read_write" },
       turnRunning: false,
     };
     const after = applySnapshotToSession(settled, snapshot);
