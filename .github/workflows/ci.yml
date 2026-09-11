@@ -6,6 +6,7 @@ on:
       - "main"
     paths-ignore:
       - "*.md"
+      - "docs/**/*.md"
   pull_request:
     # Include `ready_for_review` alongside the defaults so marking a draft PR
     # ready fires the workflow — otherwise the draft-skipped jobs (see the `if`
@@ -14,6 +15,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - "*.md"
+      - "docs/**/*.md"
 
 env:
   CARGO_TERM_COLOR: always
