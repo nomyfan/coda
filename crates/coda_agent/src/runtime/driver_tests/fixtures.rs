@@ -1444,6 +1444,7 @@ where
 /// `explore` sub-agent that owns the `read_todos` tool.
 pub(super) fn explore_read_todos_specs(main_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: main_prompt.into(),
@@ -1452,6 +1453,7 @@ pub(super) fn explore_read_todos_specs(main_prompt: &str) -> (AgentSpec, Vec<Age
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "explore-system".into(),

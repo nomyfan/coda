@@ -2400,8 +2400,7 @@ async fn build_workspace(
         &agent_workspaces,
         &registry,
         agent_files,
-        root_agent.tools,
-        root_agent.subagents,
+        &root_agent,
     )
     .map_err(|e| e.to_string())?;
 

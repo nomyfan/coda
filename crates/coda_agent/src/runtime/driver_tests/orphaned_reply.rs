@@ -15,6 +15,7 @@ use tokio::time::{Duration, timeout};
 fn coda_and_explore(explore_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
     (
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -23,6 +24,7 @@ fn coda_and_explore(explore_prompt: &str) -> (AgentSpec, Vec<AgentSpec>) {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: explore_prompt.into(),

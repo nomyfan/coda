@@ -373,17 +373,25 @@ fn run_in_background_is_only_in_the_schema_once_granted() {
     );
 }
 
-/// A model that invents the parameter anyway gets a foreground run, not an
-/// unobservable task.
 #[tokio::test]
-async fn an_ungranted_run_in_background_flag_runs_in_the_foreground() {
+async fn an_ungranted_background_request_is_rejected_without_running_the_command() {
     let (shell, background) = tool_with_background(false);
-    let out = shell
-        .execute(background_params("echo hi"), ToolCallContext::default())
+    let marker =
+        std::env::temp_dir().join(format!("coda-shell-no-background-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let error = shell
+        .execute(
+            background_params(&format!("touch '{}'", marker.display())),
+            ToolCallContext::default(),
+        )
         .await
-        .expect("command ran");
+        .unwrap_err();
 
-    assert_eq!(out.trim(), "hi");
+    assert!(matches!(error, ToolError::ExecutionError(message) if message.contains("unavailable")));
+    assert!(
+        !marker.exists(),
+        "the rejected command ran in the foreground"
+    );
     assert!(
         background.summaries().borrow().is_empty(),
         "task was started"

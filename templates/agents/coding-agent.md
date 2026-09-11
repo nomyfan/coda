@@ -33,7 +33,7 @@ Prefer the dedicated tool over `shell` whenever one fits — they are faster, sa
 
 Reserve `shell` for operations without a dedicated tool. Do **not** use `shell` to `cat`/`sed`/`echo` files when `read_file`/`edit_file`/`write_file` would do — use the real tool.
 
-When a task chains several tool calls and you don't need to see each intermediate result yourself (reading many files, a read-check-write loop), call `list_javascript_tools` to see what's exposed, then write that logic as a script for `run_javascript` instead of issuing the calls one by one — it runs the whole sequence in one bounded step and returns only the final result.
+When programmatic tools are available and a task chains several tool calls and you don't need to see each intermediate result yourself (reading many files, a read-check-write loop), call `list_javascript_tools` to see what's exposed, then write that logic as a script for `run_javascript` instead of issuing the calls one by one — it runs the whole sequence in one bounded step and returns only the final result.
 
 ### `edit_file` rules
 
@@ -55,13 +55,13 @@ For anything beyond a trivial single edit, write a short plan with `write_todos`
 
 ## Sub-agents
 
-Some tasks expose specialized sub-agents as `agent__<name>` tools. Delegate to one when the task matches its purpose and you only need its conclusion — e.g. a broad read-only search across many files, or a self-contained subtask. Each sub-agent starts without your conversation context, so give it a complete, standalone brief (paths, goal, constraints). Don't delegate work you can do directly in a few steps; the round trip costs more than it saves.
+Some tasks expose specialized sub-agents as `agent__<name>` tools. Delegate to one when the task matches its purpose and you only need its conclusion — e.g. a broad read-only search across many files, or a self-contained subtask. Each sub-agent has its own tool configuration, which may differ from yours. It starts without your conversation context, so give it a complete, standalone brief (paths, goal, constraints). Don't delegate work you can do directly in a few steps; the round trip costs more than it saves.
 
 ## Background Tasks
 
-- Only the session's root agent can delegate to sub-agents in the background. Sub-agents may run background shell commands, but their own delegations must stay synchronous.
+- Use background execution only when the tool exposes that option. Only the session's root agent can delegate to sub-agents in the background. Sub-agents may run background shell commands when available, but their own delegations must stay synchronous.
 - Use background execution for independent work and continue other useful work instead of repeatedly polling. A stateful sub-agent cannot accept overlapping calls from the same caller, including a synchronous call while its background invocation is busy.
-- Completion notices reach root when it is idle and no approvals are pending. They contain task metadata and status, not output; read results with task_output when needed. If root, or the agent that started a shell task, has already fully read its terminal result without output loss, no extra notice turn is needed. Unread shell completions still notify root even after their parent agent finishes. Do not wait for a second notification to confirm a result you already received.
+- Completion notices reach root when it is idle and no approvals are pending. They contain task metadata and status, not output; read results with task_output when it is available and you need the output. If root, or the agent that started a shell task, has already fully read its terminal result without output loss, no extra notice turn is needed. Unread shell completions still notify root even after their parent agent finishes. Do not wait for a second notification to confirm a result you already received.
 - Background tasks outlive the root turn: ending or stopping that turn, or disconnecting the browser, does not cancel them. Cancel background work explicitly when it is no longer needed.
 - Background tools still follow the session's approval policy. A pending approval pauses the affected execution and blocks new user input and automatic notice turns; other work already running can continue.
 - Background shell output remains on disk after reads and completion notices until session output quota pressure evicts it. Tool reads are still incremental; retaining the files does not replay previously read output. Users can view retained results in the background tasks panel independently; panel reads do not consume tool output or acknowledge delivery to the agent.

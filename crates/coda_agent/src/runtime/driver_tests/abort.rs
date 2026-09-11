@@ -33,6 +33,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     let mut harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "abort-main".into(),
@@ -43,6 +44,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "hold-subagent".into(),
@@ -123,6 +125,7 @@ async fn abort_settles_cancel_aware_tool_with_partial_output() {
     let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "abort-cancel-aware-main".into(),
@@ -200,6 +203,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
     let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "abort-generation-main".into(),
@@ -304,6 +308,7 @@ async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
     let mut harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -313,6 +318,7 @@ async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
         },
         vec![
             AgentSpec {
+                capabilities: Default::default(),
                 name: "explore".into(),
                 description: String::new(),
                 system_prompt: "nested-explore".into(),
@@ -321,6 +327,7 @@ async fn a_root_abort_waits_for_the_bottom_of_the_tree() {
                 subagents: vec!["probe".into()],
             },
             AgentSpec {
+                capabilities: Default::default(),
                 name: "probe".into(),
                 description: String::new(),
                 system_prompt: "explore-plain".into(),
@@ -452,6 +459,7 @@ async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
     let mut harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -460,6 +468,7 @@ async fn a_sub_agent_that_never_answers_does_not_pin_the_root() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "explore-plain".into(),
@@ -536,6 +545,7 @@ async fn a_settle_wait_leaves_the_stragglers_running() {
     let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "abort-generation-main".into(),

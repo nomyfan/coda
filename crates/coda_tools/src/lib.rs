@@ -27,8 +27,11 @@ pub use spec::{
 pub use task::{TaskKillTool, TaskOutputTool};
 pub use todo::{ReadTodosTool, TodoItem, WriteTodosTool};
 
-/// Provider-visible synthetic names that ToolSpec implementations may not
-/// claim: the runtime injects these itself, so a spec claiming one would be
-/// registered where the real tool is absent, and replaced where it is not.
-pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] =
-    &[LIST_JAVASCRIPT_TOOLS_TOOL_NAME, "task_output", "task_kill"];
+/// Runtime-owned tool names, forbidden in ordinary tool selections and sub-agent
+/// names: bare-name delegation must never shadow a capability tool.
+pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] = &[
+    RUN_JAVASCRIPT_TOOL_NAME,
+    LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
+    "task_output",
+    "task_kill",
+];

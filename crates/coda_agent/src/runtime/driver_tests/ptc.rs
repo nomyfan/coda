@@ -9,14 +9,14 @@ use coda_core::{
     llm::{RequestMessage, ToolOutput},
     tool::{HostToolInvoker, Tools},
 };
-use coda_tools::{RunJavaScriptToolSpec, ToolSpec, builtin_specs};
+use coda_tools::{ToolSpec, builtin_specs};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::time::{Duration, timeout};
 
-async fn wait_for_final<S>(harness: &mut Harness<S>)
+pub(super) async fn wait_for_final<S>(harness: &mut Harness<S>)
 where
     S: SessionStorage + Clone + 'static,
 {
@@ -35,7 +35,7 @@ where
     .expect("timed out waiting for final response");
 }
 
-async fn wait_for_suspension<S>(harness: &mut Harness<S>) -> crate::PendingApproval
+pub(super) async fn wait_for_suspension<S>(harness: &mut Harness<S>) -> crate::PendingApproval
 where
     S: SessionStorage + Clone + 'static,
 {
@@ -53,6 +53,7 @@ where
 
 fn spec(prompt: &str, tools: Vec<Box<dyn ToolSpec>>) -> AgentSpec {
     AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: prompt.into(),
@@ -152,13 +153,7 @@ async fn runner_is_omitted_when_no_bridge_tool_is_auto_approved() {
 async fn discovery_uses_the_snapshot_intersected_with_live_policy_and_normal_events() {
     let mut harness = Harness::start_with_spec(
         crate::runtime::MemoryStorage::default(),
-        spec(
-            "ptc-list",
-            vec![
-                Box::new(coda_tools::ReadTodosToolSpec),
-                Box::new(RunJavaScriptToolSpec),
-            ],
-        ),
+        spec("ptc-list", vec![Box::new(coda_tools::ReadTodosToolSpec)]),
         TestProvider::default(),
         ToolApprovalMode::Auto,
         "inspect",
@@ -247,13 +242,7 @@ async fn runner_executes_nested_builtin_without_intermediate_tool_messages() {
     let provider = TestProvider::with_recorded_requests(recorded.clone());
     let mut harness = Harness::start_with_spec(
         crate::runtime::MemoryStorage::default(),
-        spec(
-            "ptc-run",
-            vec![
-                Box::new(coda_tools::ReadTodosToolSpec),
-                Box::new(RunJavaScriptToolSpec),
-            ],
-        ),
+        spec("ptc-run", vec![Box::new(coda_tools::ReadTodosToolSpec)]),
         provider,
         ToolApprovalMode::Auto,
         "inspect",
@@ -288,13 +277,7 @@ async fn outer_approval_preserves_the_generation_snapshot() {
     let storage = TestStorage::default();
     let mut harness = Harness::start_with_spec(
         storage.clone(),
-        spec(
-            "ptc-run",
-            vec![
-                Box::new(coda_tools::ReadTodosToolSpec),
-                Box::new(RunJavaScriptToolSpec),
-            ],
-        ),
+        spec("ptc-run", vec![Box::new(coda_tools::ReadTodosToolSpec)]),
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call| {
             call.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME
@@ -336,13 +319,7 @@ async fn discovery_approval_preserves_the_generation_snapshot() {
     let storage = TestStorage::default();
     let mut harness = Harness::start_with_spec(
         storage.clone(),
-        spec(
-            "ptc-list",
-            vec![
-                Box::new(coda_tools::ReadTodosToolSpec),
-                Box::new(RunJavaScriptToolSpec),
-            ],
-        ),
+        spec("ptc-list", vec![Box::new(coda_tools::ReadTodosToolSpec)]),
         TestProvider::default(),
         ToolApprovalMode::RequireWhen(Arc::new(|call| {
             call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
@@ -389,13 +366,7 @@ async fn live_policy_can_shrink_but_not_bypass_the_snapshot() {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let mut harness = Harness::start_with_spec(
         crate::runtime::MemoryStorage::default(),
-        spec(
-            "ptc-run",
-            vec![
-                Box::new(coda_tools::ReadTodosToolSpec),
-                Box::new(RunJavaScriptToolSpec),
-            ],
-        ),
+        spec("ptc-run", vec![Box::new(coda_tools::ReadTodosToolSpec)]),
         TestProvider::with_recorded_requests(recorded.clone()),
         approval,
         "inspect",

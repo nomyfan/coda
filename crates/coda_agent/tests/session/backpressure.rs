@@ -52,6 +52,7 @@ impl coda_core::llm::LLMProvider for BurstProvider {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replies_exceeding_inbox_capacity_do_not_block_dispatch_or_shutdown() {
     let root = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "root".into(),
@@ -60,6 +61,7 @@ async fn replies_exceeding_inbox_capacity_do_not_block_dispatch_or_shutdown() {
         subagents: vec!["worker".into()],
     };
     let child = AgentSpec {
+        capabilities: Default::default(),
         name: "worker".into(),
         description: String::new(),
         system_prompt: "worker".into(),

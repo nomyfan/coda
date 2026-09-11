@@ -1660,9 +1660,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     /// programmatic call and survives approvals/checkpoints.
     fn generation_tools(&self) -> (Vec<ToolDefinition>, Option<Vec<String>>) {
         let descriptors = self.process.program.tools.descriptors();
-        let runner_configured = descriptors
-            .iter()
-            .any(|tool| tool.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME);
+        let ptc_enabled = self
+            .process
+            .program
+            .capabilities
+            .contains(crate::Capability::Ptc);
         let by_name: HashMap<_, _> = descriptors
             .iter()
             .cloned()
@@ -1680,7 +1682,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 (!self.requires_approval(&probe)).then(|| descriptor.clone())
             })
             .collect();
-        let candidate_snapshot = (runner_configured && !eligible.is_empty()).then(|| {
+        let candidate_snapshot = (ptc_enabled && !eligible.is_empty()).then(|| {
             eligible
                 .iter()
                 .map(|tool| tool.name.clone())
@@ -1718,9 +1720,13 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 request_tools.push(descriptor);
             }
         }
-        request_tools.extend(self.process.program.subagents.descriptors(
-            self.runtime.is_root_process(&self.process.pid) && self.runtime.background.is_some(),
-        ));
+        request_tools.extend(
+            self.process.program.subagents.descriptors(
+                self.runtime
+                    .check_background_subagent(&self.process.pid)
+                    .is_ok(),
+            ),
+        );
         (request_tools, snapshot)
     }
 
@@ -1979,6 +1985,10 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         let mut pending_local: HashMap<String, (PendingToolCall, jiff::Timestamp)> = HashMap::new();
         let mut futures = futures::stream::FuturesUnordered::new();
         for tc in &tool_execution.tool_calls {
+            let is_programmatic = matches!(
+                tc.tool_call.name.as_str(),
+                coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME | coda_tools::RUN_JAVASCRIPT_TOOL_NAME
+            );
             if let Some(subagent) = self.process.program.subagents.get(&tc.tool_call.name) {
                 if subagent.mode == SubAgentMode::Stateful
                     && concurrent_stateful.contains(&subagent.name)
@@ -2010,19 +2020,6 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         continue;
                     }
                 };
-                if arguments.run_in_background && !self.runtime.is_root_process(&self.process.pid) {
-                    self.add_tool_message(ToolMessage::new(
-                        tc.tool_call.id.clone(),
-                        tc.tool_call.name.clone(),
-                        ToolOutput::Err(
-                            "Only the root thread can start a background subagent".into(),
-                        ),
-                        tc.outcome.clone(),
-                        None,
-                    ))
-                    .await;
-                    continue;
-                }
                 let ret = self
                     .runtime
                     .invoke(
@@ -2083,7 +2080,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         started_at: jiff::Timestamp::now(),
                     });
                 }
-            } else if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME
+            } else if is_programmatic
                 || self.process.program.tools.get(&tc.tool_call.name).is_some()
             {
                 let started_at = jiff::Timestamp::now();
@@ -2131,7 +2128,19 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     None => None,
                 };
                 let execution: std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> =
-                    if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME {
+                    if is_programmatic
+                        && !self
+                            .process
+                            .program
+                            .capabilities
+                            .contains(crate::Capability::Ptc)
+                    {
+                        Box::pin(async {
+                            Err(ToolError::ExecutionError(
+                                "PTC_UNAVAILABLE: ptc capability is disabled for this agent".into(),
+                            ))
+                        })
+                    } else if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME {
                         execute_javascript_tool_discovery(
                             tc.tool_call.arguments.clone().unwrap_or_default(),
                             invoker,

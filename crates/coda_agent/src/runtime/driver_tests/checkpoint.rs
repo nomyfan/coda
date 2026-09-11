@@ -18,6 +18,7 @@ use tokio::time::{Duration, timeout};
 async fn wait_for_exit_honors_timeout_and_completes_after_exit() {
     let agents = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -58,6 +59,7 @@ async fn partial_stream_error_does_not_enter_history_or_checkpoint() {
     let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "partial-error-main".into(),
@@ -123,6 +125,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     let mut root = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "error-main".into(),
@@ -154,6 +157,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
     let mut parent = Harness::start_with_team(
         MemoryStorage::default(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "error-parent-main".into(),
@@ -162,6 +166,7 @@ async fn llm_errors_surface_for_root_agent_and_reply_to_parent_agent() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "error-subagent".into(),
@@ -215,6 +220,7 @@ async fn user_task_is_checkpointed_before_turn_completes() {
     let mut harness = Harness::start_with_spec(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "abort-generation-main".into(),
@@ -303,6 +309,7 @@ async fn root_turn_cannot_end_while_a_subagent_checkpoint_is_unwritten() {
     let mut harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -311,6 +318,7 @@ async fn root_turn_cannot_end_while_a_subagent_checkpoint_is_unwritten() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "explore-plain".into(),
@@ -346,6 +354,7 @@ async fn plain_root(storage: TestStorage, task: &str) -> Harness<TestStorage> {
     Harness::start_with_spec(
         storage,
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "plain-main".into(),
@@ -484,6 +493,7 @@ async fn an_unexpected_envelope_that_cannot_be_stored_reports_once() {
 async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
     let storage = MemoryStorage::default();
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "main-system".into(),
@@ -492,6 +502,7 @@ async fn an_active_turn_rejects_new_tasks_after_the_exit_barrier() {
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "hold-subagent".into(),

@@ -113,8 +113,11 @@ fn build_team(
         &HashMap::new(),
         registry,
         files,
-        root_tools,
-        root_subagents,
+        &RootAgentFile {
+            tools: root_tools,
+            subagents: root_subagents,
+            ..Default::default()
+        },
     )
 }
 
@@ -538,7 +541,6 @@ fn tool_pattern_expands_to_matching_prebuilt_tools() {
         &registry,
         "explore",
         Some(&include(&["read_file", "mcp__example__*"])),
-        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -558,7 +560,6 @@ fn tool_pattern_dedups_against_literal_overlap() {
         &registry,
         "explore",
         Some(&include(&["mcp__example__search", "mcp__example__*"])),
-        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -575,7 +576,6 @@ fn include_and_exclude_are_resolved_with_exclude_priority() {
             Some(&["read_file", "mcp__example__*", "grep"]),
             &["mcp__example__search", "grep"],
         )),
-        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -600,7 +600,7 @@ fn root_exclude_without_include_filters_the_default_tool_set() {
 }
 
 #[test]
-fn subagent_exclude_without_include_keeps_the_empty_default_tool_set() {
+fn subagent_exclude_without_include_filters_all_registered_tools() {
     let dir = tempfile::tempdir().unwrap();
     write_agent(
         dir.path(),
@@ -608,9 +608,19 @@ fn subagent_exclude_without_include_keeps_the_empty_default_tool_set() {
         "---\ndescription: x\nmode: stateless\ntools:\n  exclude: [shell]\n---\nbody",
     );
     let files = load_agent_files(dir.path()).unwrap();
-    let team = build_team(&ToolRegistry::new(), files, None, None).unwrap();
+    let team = build_team(&registry_with_mcp(), files, None, None).unwrap();
     let agents = team.build(".", coda_tools::shared_file_locks(), None);
-    assert!(agents["worker"].tools.descriptors().is_empty());
+    assert!(agents["worker"].tools.get("shell").is_none());
+    assert!(agents["worker"].tools.get("read_file").is_some());
+    assert!(agents["worker"].tools.get("mcp__example__search").is_some());
+}
+
+#[test]
+fn registry_rejects_runtime_owned_tool_names() {
+    for name in SYNTHETIC_RESERVED_TOOL_NAMES {
+        assert!(matches!(ToolRegistry::new().insert(FakeTool::boxed(name)),
+            Err(ToolRegistryError::ReservedToolName(rejected)) if rejected == *name));
+    }
 }
 
 #[test]
@@ -631,7 +641,6 @@ fn excluding_a_known_tool_outside_the_include_set_is_a_noop() {
         &ToolRegistry::new(),
         "explore",
         Some(&rules(Some(&["read_file"]), &["shell"])),
-        DefaultToolSet::Empty,
     )
     .unwrap();
     let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -644,7 +653,6 @@ fn unknown_exact_exclude_is_an_error() {
         &ToolRegistry::new(),
         "explore",
         Some(&rules(Some(&["read_file"]), &["no_such_tool"])),
-        DefaultToolSet::Empty,
     );
     assert!(matches!(
         result,
@@ -655,13 +663,7 @@ fn unknown_exact_exclude_is_an_error() {
 #[test]
 fn tool_pattern_matching_nothing_is_not_an_error() {
     let registry = registry_with_mcp();
-    let tools = resolve_tools(
-        &registry,
-        "explore",
-        Some(&include(&["mcp__nope__*"])),
-        DefaultToolSet::Empty,
-    )
-    .unwrap();
+    let tools = resolve_tools(&registry, "explore", Some(&include(&["mcp__nope__*"]))).unwrap();
     assert!(tools.is_empty());
 }
 
@@ -670,12 +672,7 @@ fn bare_star_is_not_a_wildcard() {
     // A bare `*` is not a pattern (omit `tools` to get everything); it has
     // no non-empty prefix, so it resolves like a literal and is unknown.
     let registry = registry_with_mcp();
-    let result = resolve_tools(
-        &registry,
-        "explore",
-        Some(&include(&["*"])),
-        DefaultToolSet::Empty,
-    );
+    let result = resolve_tools(&registry, "explore", Some(&include(&["*"])));
     assert!(matches!(
         result,
         Err(LoadError::UnknownTool { tool, .. }) if tool == "*"

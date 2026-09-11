@@ -1,6 +1,7 @@
 ---
 description: Breaks a task into steps and coordinates the researcher and coder sub-agents.
 mode: stateful
+capabilities: []
 tools: [read_todos, write_todos]
 subagents: [researcher, coder]
 ---

@@ -291,6 +291,27 @@ impl ProcessRuntime {
         Ok(())
     }
 
+    pub(crate) fn check_background_subagent(&self, caller: &ProcessId) -> Result<(), String> {
+        if !self.is_root_process(caller) {
+            return Err("Only the root thread can start a background subagent".into());
+        }
+        let execution = self
+            .execution(caller)
+            .ok_or("caller has no active execution")?;
+        let program = execution
+            .agent_path
+            .last()
+            .and_then(|name| self.programs.get(name))
+            .ok_or("caller program is unavailable")?;
+        if !program.capabilities.contains(crate::Capability::Background) {
+            return Err("background capability is disabled for this agent".into());
+        }
+        if self.background.is_none() {
+            return Err("background registry is unavailable".into());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn dispatch_background(
         &self,
         envelope: Envelope,
@@ -300,13 +321,11 @@ impl ProcessRuntime {
         if self.exit_barrier.is_exiting() {
             return Err("runtime is shutting down".into());
         }
-        if !self.is_root_process(&parent) {
-            return Err("only the root thread can start a background subagent".into());
-        }
+        self.check_background_subagent(&parent)?;
         let background = self
             .background
             .clone()
-            .ok_or("background registry is unavailable")?;
+            .expect("background availability was checked");
         let id = TaskId::for_call(&self.session_id, parent.as_ref(), &origin);
         if background.contains(&id).await.map_err(|e| e.to_string())? {
             return Ok(id);

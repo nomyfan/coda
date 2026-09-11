@@ -8,6 +8,7 @@ use super::*;
 
 fn spec(name: &str) -> AgentSpec {
     AgentSpec {
+        capabilities: Default::default(),
         name: name.into(),
         description: String::new(),
         system_prompt: "".into(),
@@ -101,10 +102,9 @@ impl ToolSpec for BackgroundProbeSpec {
     }
 }
 
-/// The follow-up tools are the session's, not an agent's: nobody declares
-/// them and every agent gets them, over one shared registry.
+/// Agents with the default capabilities share the session's background registry.
 #[test]
-fn background_tools_are_injected_for_every_agent_and_share_one_registry() {
+fn default_capabilities_share_one_background_registry() {
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let probe =
         || Box::new(BackgroundProbeSpec { seen: seen.clone() }) as Box<dyn coda_tools::ToolSpec>;
@@ -179,15 +179,15 @@ fn without_background_storage_the_task_tools_are_never_registered() {
 
 /// The injected names are reserved, so nothing can register them by hand.
 #[test]
-fn rejects_a_spec_claiming_an_injected_background_tool_name() {
-    for name in ["task_output", "task_kill"] {
+fn rejects_a_spec_claiming_a_capability_tool_name() {
+    for name in SYNTHETIC_RESERVED_TOOL_NAMES {
         let root = AgentSpec {
             tools: vec![Box::new(NamedSpec(name))],
             ..spec("coda")
         };
         assert!(matches!(
             AgentTeam::new(root, vec![]),
-            Err(BuildError::ReservedToolName { name: claimed, .. }) if claimed == name
+            Err(BuildError::ReservedToolName { name: claimed, .. }) if claimed == *name
         ));
     }
 }
@@ -219,6 +219,7 @@ impl ToolSpec for ReservedToolSpec {
 #[test]
 fn rejects_reserved_synthetic_tool_name_without_a_runner() {
     let root = AgentSpec {
+        capabilities: Capabilities::none(),
         tools: vec![Box::new(ReservedToolSpec)],
         ..spec("coda")
     };

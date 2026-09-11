@@ -86,6 +86,7 @@ async fn an_answered_turn_leaves_the_active_list() {
     let mut harness = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "plain-main".into(),
@@ -125,6 +126,7 @@ async fn a_turn_waiting_on_a_subagent_stays_active() {
     let harness = Harness::start_with_team(
         storage.clone(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -133,6 +135,7 @@ async fn a_turn_waiting_on_a_subagent_stays_active() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "hold-subagent".into(),
@@ -177,6 +180,7 @@ async fn resuming_an_approval_does_not_open_a_second_turn() {
     let mut harness = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "approval-main".into(),
@@ -240,6 +244,7 @@ async fn a_task_is_rejected_while_an_approval_is_pending() {
     let mut harness = Harness::start_with_spec(
         MemoryStorage::default(),
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "interrupt-main".into(),
@@ -360,6 +365,7 @@ async fn a_resume_without_a_snapshot_puts_the_interrupted_turn_back() {
     let storage = MemoryStorage::default();
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let root_running = |system_prompt: &str| AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: system_prompt.into(),
@@ -523,6 +529,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
     )]);
     let agents = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "plain-main".into(),
@@ -531,6 +538,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "abort-generation-main".into(),
