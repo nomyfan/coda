@@ -113,6 +113,7 @@ impl LLMProvider for DuplicateProvider {
 async fn duplicate_stateful_calls_are_all_rejected_before_any_spawn() {
     let background = Arc::new(coda_execution::BackgroundTasks::temporary().unwrap());
     let root = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "root".into(),
@@ -123,6 +124,7 @@ async fn duplicate_stateful_calls_are_all_rejected_before_any_spawn() {
     let children = ["duplicate", "other"]
         .into_iter()
         .map(|name| AgentSpec {
+            capabilities: Default::default(),
             name: name.into(),
             description: String::new(),
             system_prompt: name.into(),
@@ -191,9 +193,11 @@ async fn reply_after_parent_exit_is_saved_and_consumed_on_reopen() {
     timeout(Duration::from_secs(5), async {
         let storage = MemoryStorage::default();
         let team = AgentTeam::new(AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(), description: String::new(), system_prompt: "main-system".into(),
             mode: SubAgentMode::Stateful, tools: vec![], subagents: vec!["explore".into()],
         }, vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(), description: String::new(), system_prompt: "hold-subagent".into(),
             mode: SubAgentMode::Stateless, tools: vec![], subagents: vec![],
         }]).unwrap();

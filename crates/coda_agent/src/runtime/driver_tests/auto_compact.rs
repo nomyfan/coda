@@ -27,6 +27,7 @@ fn config_with_threshold(provider: TestProvider, threshold: u32) -> RunConfig<Te
 
 fn coda_spec(system_prompt: &str, subagents: Vec<String>) -> AgentSpec {
     AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: system_prompt.into(),
@@ -357,6 +358,7 @@ async fn auto_compaction_runs_on_a_subagent_thread_too() {
     let config = config_with_threshold(TestProvider::default(), 1_000);
     let root = coda_spec("auto-compact-subagent-main", vec!["explore".into()]);
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "auto-compact-subagent-explore".into(),

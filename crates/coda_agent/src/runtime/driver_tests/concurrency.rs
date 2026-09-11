@@ -72,6 +72,7 @@ async fn parallel_invocations(background_enabled: bool) {
     let root = ProcessId::from("parallel-session".to_string());
     let agents = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "root".into(),
@@ -80,6 +81,7 @@ async fn parallel_invocations(background_enabled: bool) {
             subagents: vec!["worker".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "worker".into(),
             description: String::new(),
             system_prompt: "worker".into(),

@@ -17,6 +17,7 @@ use tokio::time::{Duration, timeout};
 /// A root plus one `explore` sub-agent that answers without calling any tools.
 fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<AgentSpec>) {
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: main_prompt.into(),
@@ -25,6 +26,7 @@ fn explore_specs(main_prompt: &str, mode: SubAgentMode) -> (AgentSpec, Vec<Agent
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "explore-plain".into(),
@@ -226,6 +228,7 @@ async fn stateful_subagent_records_which_call_opened_each_invocation() {
 #[tokio::test]
 async fn one_submission_tags_every_thread_it_reaches() {
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "main-system".into(),
@@ -234,6 +237,7 @@ async fn one_submission_tags_every_thread_it_reaches() {
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "nested-explore".into(),
@@ -242,6 +246,7 @@ async fn one_submission_tags_every_thread_it_reaches() {
         subagents: vec!["probe".into()],
     };
     let probe = AgentSpec {
+        capabilities: Default::default(),
         name: "probe".into(),
         description: String::new(),
         system_prompt: "explore-plain".into(),
@@ -313,6 +318,7 @@ async fn every_thread_records_how_its_parent_addressed_it() {
     // coda → explore (stateful) → probe (stateless), so the tree is two levels
     // deep and covers both derivation kinds.
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "main-system".into(),
@@ -321,6 +327,7 @@ async fn every_thread_records_how_its_parent_addressed_it() {
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "nested-explore".into(),
@@ -329,6 +336,7 @@ async fn every_thread_records_how_its_parent_addressed_it() {
         subagents: vec!["probe".into()],
     };
     let probe = AgentSpec {
+        capabilities: Default::default(),
         name: "probe".into(),
         description: String::new(),
         system_prompt: "explore-plain".into(),
@@ -556,6 +564,7 @@ async fn subagent_dispatched_after_approval_restart_still_records_its_origin() {
 async fn a_parked_thread_can_name_the_child_it_waits_on() {
     let hold = Arc::new(tokio::sync::Notify::new());
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "main-system".into(),
@@ -564,6 +573,7 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: String::new(),
         system_prompt: "hold-subagent".into(),

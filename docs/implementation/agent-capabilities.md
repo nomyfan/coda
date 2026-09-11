@@ -165,7 +165,7 @@ PTC 的生成逻辑改读 Program.capabilities，不再通过 runner 工具名�
 ## Risks and Validation
 
 - **入口隐藏与实际执行不一致：** 优先覆盖无能力但直接传后台参数、伪造 PTC 调用及恢复旧 PTC 快照的情况；用临时文件或计数工具证明拒绝后没有启动命令或宿主调用。
-- **能力工具被裸名称子 agent 遮蔽：** 在 `spec_tests.rs` 通过 Rust AgentSpec 构造同名子 agent，对四个保留名分别验证构建失败；覆盖 capabilities 全开和全关、普通工具为空、根直接引用、深层引用及未被引用的定义。以 run_javascript 子 agent 加启用 PTC 的父 agent 作为明确回归用例，并验证合法命名的共享子 agent 仍可构建；所有错误都应发生在工具工厂运行前。
+- **能力工具被裸名称子 agent 遮蔽：** 在 `spec_capabilities_tests.rs` 通过 Rust AgentSpec 构造同名子 agent，对四个保留名分别验证构建失败；覆盖 capabilities 全开和全关、普通工具为空、根直接引用、深层引用及未被引用的定义。以 run_javascript 子 agent 加启用 PTC 的父 agent 作为明确回归用例，并验证合法命名的共享子 agent 仍可构建；所有错误都应发生在工具工厂运行前。
 - **无 background 的 agent 仍可能处在后台执行组：** 根可以将它作为后台任务调用；保持 ProcessGroup、ToolCallContext 的任务来源、取消和清理信息完整。只限制它自己创建后台工作的入口。
 - **根关闭 background、子 agent 开启：** session 仍可保存任务、发送完成状态通知及供用户面板查看结果。根不会因此获得 task_output/task_kill；其 prompt 只在工具可用时指引读取结果，通知格式与投递规则保持原样。
 - **默认工具范围扩大：** 旧子 agent 省略 tools 会获得全部普通工具（含 ask_user/MCP）；只写 exclude 也以全部工具为基础。检查现有配置和测试 fixture，专用 agent 显式列出所需工具；审批策略保持现状。
@@ -181,13 +181,24 @@ PTC 的生成逻辑改读 Program.capabilities，不再通过 runner 工具名�
 
 ## Implementation Roadmap
 
-- [ ] **[最小执行链与风险验证]** 增加 Capabilities，贯通 AgentSpec、Program 和工具构建；移出能力工具名并在普通工具和子 agent 名称中统一保护，更新相关 Rust 构建调用点。接通后台委派共用检查、shell 拒绝和两个 PTC 执行检查。
+- [x] **[最小执行链与风险验证]** 增加 Capabilities，贯通 AgentSpec、Program 和工具构建；移出能力工具名并在普通工具和子 agent 名称中统一保护，更新相关 Rust 构建调用点。接通后台委派共用检查、shell 拒绝和两个 PTC 执行检查。
    目的：先通过 Rust AgentSpec 验证保留名冲突在构建时被拒绝及最关键的关闭语义；用现有 harness 验证无副作用拒绝、根调用无 background 的子 agent、非根拒绝后台委派，以及旧快照无法开启已关闭 PTC。
-- [ ] **[文件配置集成]** 接通根/子文件 capabilities 解析、统一普通工具默认值、更新 build_agent_team 与服务端调用点。
+- [x] **[文件配置集成]** 接通根/子文件 capabilities 解析、统一普通工具默认值、更新 build_agent_team 与服务端调用点。
    目的：让 AGENT.md 驱动第一步已验证的执行行为；验证省略、空列表、单项、重复项、非法输入、保留名和 include/exclude，以及 A/B 共享 C 时配置一致。
-- [ ] **[生命周期集成]** 补齐无注册表、混合能力团队、后台组取消/清理、根未开启 background 仍接收通知、SetModel 与恢复场景的回归验证。
+- [x] **[生命周期集成]** 补齐无注册表、混合能力团队、后台组取消/清理、根未开启 background 仍接收通知、SetModel 与恢复场景的回归验证。
    目的：证明 per-agent 开关不会误关闭 session 基础设施；复用现有后台和持久化 harness，不引入新运行时机制。
-- [ ] **[配置与提示词]** 迁移受影响的配置、文档和 prompt，更新 Rust 测试辅助构建器，使其能力选择明确。
+- [x] **[配置与提示词]** 迁移受影响的配置、文档和 prompt，更新 Rust 测试辅助构建器，使其能力选择明确。
    目的：真实配置和模型指引符合新行为；检查所有 run_javascript 工具声明及旧的子 agent 空默认说明。
-- [ ] **[最终检查]** 运行 cargo fmt 检查、`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`。
+- [x] **[最终检查]** 运行 cargo fmt 检查、`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`。
    目的：验证完整工作区和 feature-gated 存储测试仍可构建；仅在需要执行存储集成验证且有临时数据库时，运行相应 pg-tests。
+
+
+## Implementation Validation
+
+- 配置、构建和执行检查已接通。新增测试覆盖根/子一致默认值、显式覆盖、非法输入、四个保留工具名、共享子 agent 的独立配置，以及能力与 session 资源的组合。
+- PTC 的伪造入口和旧审批快照恢复用计数工具验证：关闭能力后两个入口均返回 `PTC_UNAVAILABLE`，宿主调用次数为零。shell 拒绝用标记文件证明命令未启动。
+- 后台集成覆盖调用者能力、无注册表、关闭能力的目标、根关闭能力后接收子 agent 的 shell 完成通知。现有取消、审批和故障清理测试使用关闭能力的同步后代，验证执行组生命周期仍完整。
+- SetModel 测试逐一验证全开、全关、仅 PTC、仅 background；通过重建前后的实际模型请求核对能力工具。
+- 已更新默认 prompt、模板、tracked 示例，以及工作区忽略的 `.coda/agents/` 配置；普通工具声明中的 `run_javascript` 已移除。
+- `cargo test` 通过；现有需要付费 OpenRouter 请求的测试按原有 `ignore` 跳过。`cargo check -p coda_server --features pg-tests --all-targets` 通过；未执行依赖真实数据库的 pg-tests。
+- `cargo fmt --all -- --check`、`cargo clippy` 和 `git diff --check` 均通过。

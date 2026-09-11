@@ -434,6 +434,7 @@ fn simple_spec(system_prompt: &str) -> AgentSpec {
     use coda_tools::ReadTodosToolSpec;
 
     AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: system_prompt.into(),
@@ -578,6 +579,7 @@ async fn should_read_file_via_tool_call() {
     std::fs::write(&file_path, "line one\nline two\n").expect("write temp file");
 
     let spec = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "session-system".into(),
@@ -617,6 +619,7 @@ async fn should_write_and_read_back_file() {
     let file_path = tmp.path().join("roundtrip.txt");
 
     let spec = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "session-system".into(),
@@ -656,6 +659,7 @@ async fn should_write_and_read_back_file() {
 #[tokio::test]
 async fn should_delegate_to_explore_subagent() {
     let coda = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "session-system".into(),
@@ -664,6 +668,7 @@ async fn should_delegate_to_explore_subagent() {
         subagents: vec!["explore".into()],
     };
     let explore = AgentSpec {
+        capabilities: Default::default(),
         name: "explore".into(),
         description: "An explore sub-agent.".into(),
         system_prompt: "You are an exploration assistant.".into(),
@@ -926,6 +931,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "session-system".into(),
@@ -934,6 +940,7 @@ async fn should_find_a_subagent_approval_without_a_runtime_snapshot() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: "An explore sub-agent.".into(),
             system_prompt: "You are an exploration assistant.".into(),
@@ -1027,6 +1034,7 @@ async fn should_ignore_a_removed_agents_approval_across_reopens() {
     let approval = ToolApprovalMode::RequireWhen(Arc::new(|call| call.name == "read_todos"));
     let original_team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "session-system".into(),
@@ -1035,6 +1043,7 @@ async fn should_ignore_a_removed_agents_approval_across_reopens() {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: "An explore sub-agent.".into(),
             system_prompt: "You are an exploration assistant.".into(),
@@ -1113,6 +1122,7 @@ async fn should_ignore_a_removed_agents_approval_across_reopens() {
 #[tokio::test]
 async fn tool_state_survives_the_turn_that_recorded_it() {
     let spec = AgentSpec {
+        capabilities: Default::default(),
         name: "coda".into(),
         description: String::new(),
         system_prompt: "session-system".into(),

@@ -3,6 +3,7 @@ mod fixtures;
 mod abort;
 mod approval;
 mod auto_compact;
+mod capabilities;
 mod checkpoint;
 mod concurrency;
 mod contracts;

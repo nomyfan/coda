@@ -168,6 +168,7 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .await
         .unwrap();
     let spec = |name: &str, subagents: Vec<String>| AgentSpec {
+        capabilities: Default::default(),
         name: name.into(),
         description: String::new(),
         system_prompt: name.into(),

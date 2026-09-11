@@ -23,11 +23,9 @@ pub struct BuildContext {
     /// Name of the agent the tools are built for; echoed in the metadata of
     /// background tasks it starts.
     pub agent_name: String,
-    /// Shared by every agent in one session, and the one thing that decides
-    /// whether background work exists at all: `None` takes both
-    /// [`background_specs`] and `shell`'s `run_in_background` with it. That is
-    /// a capability, not a permission — backgrounding changes how long a
-    /// command may run, so the call still faces the usual approval policy.
+    /// The session's shared registry, provided only to agents with background
+    /// capability. `None` disables background shell execution and follow-up tools;
+    /// background calls still face the usual approval policy.
     pub background: Option<Arc<BackgroundTasks>>,
 }
 
@@ -257,13 +255,8 @@ pub fn builtin_specs() -> Vec<Box<dyn ToolSpec>> {
         .collect()
 }
 
-/// The background follow-up tools, for a session that has a registry — empty
-/// otherwise.
-///
-/// Not declarable in `tools` and not granted per agent: whether there is
-/// anything to follow up on is the only question, and `shell`'s
-/// `run_in_background` answers it the same way, so the three appear and
-/// disappear together.
+/// Background follow-up tools for an agent granted the session's registry.
+/// Pass the same registry as its BuildContext to keep shell and follow-up tools aligned.
 pub fn background_specs(background: Option<&Arc<BackgroundTasks>>) -> Vec<Box<dyn ToolSpec>> {
     match background {
         Some(registry) => vec![
@@ -287,7 +280,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "glob",
     "read_todos",
     "write_todos",
-    "run_javascript",
 ];
 
 /// Resolves a builtin tool name to a fresh [`ToolSpec`]. Returns `None` for any
@@ -304,7 +296,6 @@ pub fn spec_by_name(name: &str) -> Option<Box<dyn ToolSpec>> {
         "glob" => Box::new(GlobToolSpec),
         "read_todos" => Box::new(ReadTodosToolSpec),
         "write_todos" => Box::new(WriteTodosToolSpec),
-        "run_javascript" => Box::new(RunJavaScriptToolSpec),
         _ => return None,
     })
 }

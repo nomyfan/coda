@@ -34,8 +34,7 @@ pub struct ShellTool {
     cwd: String,
     agent_name: String,
     timeout: Duration,
-    /// `None` when the session has no registry: `run_in_background` is then
-    /// absent from the schema, and ignored if the model invents it anyway.
+    /// `None` when background execution is unavailable to this agent.
     background: Option<Arc<BackgroundTasks>>,
 }
 
@@ -99,13 +98,14 @@ impl Tool for ShellTool {
         let cwd = self.cwd.clone();
         let agent_name = self.agent_name.clone();
         let timeout = self.timeout;
-        // An invented flag must not start a task nothing can observe or kill.
-        let background = params
-            .run_in_background
-            .unwrap_or(false)
-            .then(|| self.background.clone())
-            .flatten();
+        let run_in_background = params.run_in_background.unwrap_or(false);
+        let background = run_in_background.then(|| self.background.clone()).flatten();
         async move {
+            if run_in_background && background.is_none() {
+                return Err(ToolError::ExecutionError(
+                    "Background shell execution is unavailable to this agent".into(),
+                ));
+            }
             debug!(description = %params.description, command = %params.command, "Executing shell command");
             // `shell` is the platform-agnostic tool name; `bash` is the current backend.
             let mut cmd = Command::new("bash");

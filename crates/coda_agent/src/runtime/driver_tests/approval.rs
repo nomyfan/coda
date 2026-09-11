@@ -227,6 +227,7 @@ async fn stateless_subagent_replies_after_approval_resume() {
 async fn pending_approval_supports_mixed_resolutions() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "approval-main".into(),
@@ -324,6 +325,7 @@ async fn pending_approval_supports_mixed_resolutions() {
 async fn reject_pending_approval_via_restart() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "interrupt-main".into(),
@@ -415,6 +417,7 @@ async fn reject_pending_approval_via_restart() {
 async fn restart_re_emits_pending_approval_with_original_suspended_at() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "interrupt-main".into(),
@@ -483,6 +486,7 @@ async fn restart_re_emits_pending_approval_with_original_suspended_at() {
 async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "continuation-main".into(),
@@ -558,6 +562,7 @@ async fn an_approval_resumes_a_session_that_never_wrote_a_runtime_snapshot() {
 async fn restart_replays_reasoning_continuation_after_tool_approval() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "continuation-main".into(),
@@ -634,6 +639,7 @@ async fn in_process_resume_after_suspension() {
     // complete normally.
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "interrupt-main".into(),
@@ -708,6 +714,7 @@ async fn in_process_resume_after_suspension() {
 async fn an_empty_decision_for_the_parked_batch_rejects_it() {
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "two-batch-approval".into(),
@@ -767,6 +774,7 @@ async fn a_resume_meant_for_an_earlier_batch_does_not_reject_the_current_one() {
     // so applying it rejected the lot and told the model the user had refused.
     let team = AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "two-batch-approval".into(),

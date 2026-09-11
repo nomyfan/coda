@@ -53,6 +53,14 @@ impl LLMProvider for TestProvider {
         }
         match system.as_str() {
             "reply" => Self::completed(assistant("done")),
+            "list-tools" => Self::completed(assistant(
+                &request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )),
             "read-task-results" | "read-running-task-result" => {
                 let read_count = request
                     .messages
@@ -432,6 +440,7 @@ impl TestOpener {
         Self::with_team(
             AgentTeam::new(
                 AgentSpec {
+                    capabilities: Default::default(),
                     name: "coda".into(),
                     description: String::new(),
                     system_prompt: system_prompt.into(),
@@ -452,6 +461,7 @@ impl TestOpener {
     pub(super) fn delegating(explore_prompt: &str, stall: Option<Duration>) -> Self {
         let team = AgentTeam::new(
             AgentSpec {
+                capabilities: Default::default(),
                 name: "coda".into(),
                 description: String::new(),
                 system_prompt: "delegate".into(),
@@ -460,6 +470,7 @@ impl TestOpener {
                 subagents: vec!["explore".into()],
             },
             vec![AgentSpec {
+                capabilities: Default::default(),
                 name: "explore".into(),
                 description: String::new(),
                 system_prompt: explore_prompt.into(),
@@ -480,7 +491,11 @@ impl TestOpener {
         )
     }
 
-    fn with_team(team: AgentTeam, approval: ToolApprovalMode, storage: SlowStorage) -> Self {
+    pub(super) fn with_team(
+        team: AgentTeam,
+        approval: ToolApprovalMode,
+        storage: SlowStorage,
+    ) -> Self {
         Self {
             storage,
             background_root: tempfile::tempdir().expect("temp spool root"),

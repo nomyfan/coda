@@ -1,6 +1,7 @@
 ---
 description: Read-only investigator. Searches and reads the codebase, never edits.
 mode: stateless
+capabilities: [ptc]
 tools: [read_file, grep, glob, ls, "mcp__time__*"]
 model: "openrouter:openai/gpt-5.4-nano"
 ---

@@ -25,6 +25,7 @@ type Events = broadcast::Receiver<(String, ProcessId, TurnId, AgentEvent)>;
 fn team() -> AgentTeam {
     AgentTeam::new(
         AgentSpec {
+            capabilities: Default::default(),
             name: "coda".into(),
             description: String::new(),
             system_prompt: "main-system".into(),
@@ -33,6 +34,7 @@ fn team() -> AgentTeam {
             subagents: vec!["explore".into()],
         },
         vec![AgentSpec {
+            capabilities: Default::default(),
             name: "explore".into(),
             description: String::new(),
             system_prompt: "explore-plain".into(),

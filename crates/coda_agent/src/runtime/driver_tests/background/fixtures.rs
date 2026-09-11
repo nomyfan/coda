@@ -89,6 +89,13 @@ pub(super) async fn start_storage<
 ) {
     let background = Arc::new(BackgroundTasks::temporary().unwrap());
     let spec = |name: &str, prompt: &str, subagents: Vec<String>| AgentSpec {
+        // The synchronous descendant belongs to the background scope and must
+        // cancel/clean up with it even though it cannot start background work.
+        capabilities: if name == "child" {
+            crate::Capabilities::none()
+        } else {
+            crate::Capabilities::all()
+        },
         name: name.into(),
         description: String::new(),
         system_prompt: prompt.into(),

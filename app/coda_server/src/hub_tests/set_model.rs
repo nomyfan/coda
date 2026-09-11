@@ -7,6 +7,93 @@ use super::fixtures::*;
 use coda_agent::ToolApprovalMode;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn set_model_preserves_capability_tools_in_the_rebuilt_session() {
+    use coda_agent::{AgentSpec, AgentTeam, Capabilities, Capability, SubAgentMode};
+
+    for capabilities in [
+        Capabilities::all(),
+        Capabilities::none(),
+        [Capability::Ptc].into_iter().collect(),
+        [Capability::Background].into_iter().collect(),
+    ] {
+        let team = AgentTeam::new(
+            AgentSpec {
+                capabilities: capabilities.clone(),
+                name: "coda".into(),
+                description: String::new(),
+                system_prompt: "list-tools".into(),
+                mode: SubAgentMode::Stateful,
+                tools: coda_tools::builtin_specs(),
+                subagents: vec![],
+            },
+            vec![],
+        )
+        .unwrap();
+        let (hub, _) = hub_and_opener(TestOpener::with_team(
+            team,
+            ToolApprovalMode::Auto,
+            SlowStorage::default(),
+        ));
+        let mut attach = hub
+            .attach(key(), 1, "prov".into(), None, PermissionMode::Yolo, false)
+            .await
+            .unwrap();
+
+        for rebuilt in [false, true] {
+            if rebuilt {
+                assert!(matches!(
+                    hub.command(
+                        key(),
+                        1,
+                        SessionCommand::SetModel {
+                            provider_id: "prov".into(),
+                            reasoning_effort: Some("high".into()),
+                        }
+                    )
+                    .await,
+                    CommandOutcome::ModelChanged { .. }
+                ));
+            }
+            assert!(matches!(
+                hub.command(
+                    key(),
+                    1,
+                    SessionCommand::Task {
+                        task: "list available tools".into(),
+                        images: vec![],
+                    }
+                )
+                .await,
+                CommandOutcome::TaskAccepted { .. }
+            ));
+            let event = next_matching(&mut attach.events, is_settling_llm_end).await;
+            let RelayEvent::Event(event) = event else {
+                unreachable!()
+            };
+            let WireEvent::LlmEnd { message, .. } = &*event else {
+                unreachable!()
+            };
+            let tools: Vec<_> = message.content.split(',').collect();
+            for (name, capability) in [
+                ("run_javascript", Capability::Ptc),
+                ("list_javascript_tools", Capability::Ptc),
+                ("task_output", Capability::Background),
+                ("task_kill", Capability::Background),
+            ] {
+                assert_eq!(
+                    tools.contains(&name),
+                    capabilities.contains(capability),
+                    "{name}, rebuilt={rebuilt}"
+                );
+            }
+            assert!(tools.contains(&"shell"));
+            wait_idle(&hub).await;
+        }
+        hub.shutdown_all().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn set_model_to_current_selection_is_unchanged() {
     // Re-selecting the model already in effect is a benign no-op the dispatcher
     // reports as idempotent success (Decision 8).

@@ -1,7 +1,7 @@
 //! File-based agent definitions.
 //!
 //! Sub-agents are declared one-per-directory under `.coda/agents/<name>/AGENT.md`:
-//! YAML frontmatter (description, mode, tools, subagents, env, workspace, model,
+//! YAML frontmatter (description, mode, tools, capabilities, subagents, workspace, model,
 //! reasoning_effort) followed by a markdown body used as the agent's system
 //! prompt. They become
 //! sub-agents of the top-level `coda` agent and may reference one another by name
@@ -17,20 +17,22 @@
 //! name, plus any prebuilt tools (MCP, `ask_user`) registered at startup. The
 //! original list form remains an include shorthand. A name ending in `*` over
 //! a non-empty prefix is a pattern (e.g. `mcp__example__*`); a bare `*` is *not*
-//! a wildcard. When include is absent, the root defaults to all tools and a
-//! sub-agent defaults to none. Exclude always wins. An unknown plain name is a
-//! hard error, surfaced at startup; a pattern that matches nothing only warns.
+//! a wildcard. When include is absent, every agent defaults to all ordinary
+//! tools. Exclude always wins. Unknown plain names fail at startup; a pattern
+//! that matches nothing only warns. Capabilities independently add runtime tools.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use coda_agent::{
-    AgentSpec, AgentTeam, BuildError, SharedSystemPrompt, SubAgentMode, SystemPrompt,
+    AgentSpec, AgentTeam, BuildError, Capabilities, SharedSystemPrompt, SubAgentMode, SystemPrompt,
 };
 
 use crate::{WorkspaceKnowledge, make_vars_provider};
 use coda_core::tool::ToolObject;
-use coda_tools::{BUILTIN_TOOL_NAMES, PrebuiltToolSpec, ToolSpec, spec_by_name};
+use coda_tools::{
+    BUILTIN_TOOL_NAMES, PrebuiltToolSpec, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec, spec_by_name,
+};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -56,6 +58,10 @@ pub enum LoadError {
     /// An agent's `tools` list names a tool that is neither built-in nor a
     /// registered prebuilt (MCP / `ask_user`) tool.
     UnknownTool {
+        agent: String,
+        tool: String,
+    },
+    CapabilityTool {
         agent: String,
         tool: String,
     },
@@ -87,6 +93,10 @@ impl std::fmt::Display for LoadError {
             LoadError::UnknownTool { agent, tool } => {
                 write!(f, "agent '{agent}' requests unknown tool '{tool}'")
             }
+            LoadError::CapabilityTool { agent, tool } => write!(
+                f,
+                "agent '{agent}' selects runtime-owned tool '{tool}'; configure capabilities instead of tools"
+            ),
             LoadError::InvalidWorkspace {
                 agent,
                 path,
@@ -110,11 +120,15 @@ impl From<std::io::Error> for LoadError {
 pub enum ToolRegistryError {
     /// A prebuilt tool has the same name as a builtin or an earlier prebuilt.
     DuplicateToolName(String),
+    ReservedToolName(String),
 }
 
 impl std::fmt::Display for ToolRegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ToolRegistryError::ReservedToolName(name) => {
+                write!(f, "tool name '{name}' is reserved by the runtime")
+            }
             ToolRegistryError::DuplicateToolName(name) => write!(
                 f,
                 "duplicate tool name '{name}': tool names must be globally unique"
@@ -144,6 +158,9 @@ impl ToolRegistry {
     /// is rejected instead of silently choosing one implementation.
     pub fn insert(&mut self, tool: Box<dyn ToolObject>) -> Result<(), ToolRegistryError> {
         let name = tool.name().to_string();
+        if SYNTHETIC_RESERVED_TOOL_NAMES.contains(&name.as_str()) {
+            return Err(ToolRegistryError::ReservedToolName(name));
+        }
         if BUILTIN_TOOL_NAMES.contains(&name.as_str()) || self.prebuilt.contains_key(&name) {
             return Err(ToolRegistryError::DuplicateToolName(name));
         }
@@ -225,6 +242,8 @@ impl From<ModeRaw> for SubAgentMode {
 
 #[derive(Deserialize)]
 struct Frontmatter {
+    #[serde(default)]
+    capabilities: Capabilities,
     description: String,
     mode: ModeRaw,
     #[serde(default)]
@@ -247,6 +266,7 @@ struct Frontmatter {
 
 /// A parsed agent file (before tool resolution).
 pub struct AgentFile {
+    capabilities: Capabilities,
     name: String,
     description: String,
     mode: SubAgentMode,
@@ -280,11 +300,12 @@ impl AgentFile {
     }
 }
 
-/// Frontmatter of the optional top-level `.coda/agents/AGENT.md`. Both fields are
-/// `Option` so "absent" (use the default) is distinct from an explicit empty
-/// list (override to nothing).
+/// Frontmatter of the optional top-level `.coda/agents/AGENT.md`. Missing
+/// selections use the defaults; explicit empty lists disable their own category.
 #[derive(Deserialize, Default)]
 struct RootFrontmatter {
+    #[serde(default)]
+    capabilities: Capabilities,
     #[serde(default)]
     tools: Option<ToolSelection>,
     #[serde(default)]
@@ -293,9 +314,10 @@ struct RootFrontmatter {
 
 /// Parsed top-level `coda` configuration. Each field is an explicit override of a
 /// default when `Some`/non-empty; otherwise the built-in behavior applies. See
-/// [`build_agent_team`] (tools, sub-agents) and the system-prompt assembly (body).
+/// [`build_agent_team`] (tools, capabilities, sub-agents) and prompt assembly (body).
 #[derive(Default)]
 pub struct RootAgentFile {
+    pub capabilities: Capabilities,
     pub tools: Option<ToolSelection>,
     pub subagents: Option<Vec<String>>,
     /// The body, used as the root agent's base system prompt; `None` when the
@@ -344,6 +366,7 @@ fn parse_agent_file(name: &str, content: &str) -> Result<AgentFile, LoadError> {
     }
 
     Ok(AgentFile {
+        capabilities: fm.capabilities,
         name: name.to_string(),
         description: fm.description,
         mode: fm.mode.into(),
@@ -415,6 +438,7 @@ fn parse_root_agent_file(content: &str) -> Result<RootAgentFile, LoadError> {
     }
 
     Ok(RootAgentFile {
+        capabilities: fm.capabilities,
         tools: fm.tools,
         subagents: fm.subagents,
         system_prompt: (!body.is_empty()).then(|| body.to_string()),
@@ -456,6 +480,12 @@ fn expand_tool_names(
     };
 
     for name in names {
+        if SYNTHETIC_RESERVED_TOOL_NAMES.contains(&name.as_str()) {
+            return Err(LoadError::CapabilityTool {
+                agent: agent.to_string(),
+                tool: name.clone(),
+            });
+        }
         // A trailing `*` over a non-empty prefix is a pattern; a bare `*` is
         // not (drop the whole `tools` field to get every tool) and falls
         // through to the literal path, where it resolves to nothing.
@@ -479,18 +509,11 @@ fn expand_tool_names(
     Ok(expanded)
 }
 
-#[derive(Clone, Copy)]
-enum DefaultToolSet {
-    All,
-    Empty,
-}
-
 /// Resolve an agent's final declarable tools as `base - exclude`.
 fn resolve_tools(
     registry: &ToolRegistry,
     agent: &str,
     selection: Option<&ToolSelection>,
-    default: DefaultToolSet,
 ) -> Result<Vec<Box<dyn ToolSpec>>, LoadError> {
     let (include, exclude): (Option<&[String]>, &[String]) = match selection {
         None => (None, &[]),
@@ -500,10 +523,7 @@ fn resolve_tools(
 
     let mut names = match include {
         Some(include) => expand_tool_names(registry, agent, include)?,
-        None => match default {
-            DefaultToolSet::All => registry.all_names(),
-            DefaultToolSet::Empty => Vec::new(),
-        },
+        None => registry.all_names(),
     };
     let excluded: HashSet<String> = expand_tool_names(registry, agent, exclude)?
         .into_iter()
@@ -522,9 +542,9 @@ fn resolve_tools(
 
 /// Assemble a validated [`AgentTeam`] rooted at the top-level `coda` agent.
 ///
-/// `root_tools` / `root_subagents` come from the optional `.coda/agents/AGENT.md`
-/// and each *explicitly override* a default when present:
+/// The root configuration comes from the optional `.coda/agents/AGENT.md`:
 /// - tools default to all built-ins + every prebuilt tool;
+/// - capabilities default to all supported capabilities, just as for sub-agents;
 /// - direct sub-agents default to the configured agents that no *other* agent
 ///   references (self-references don't count, so a self-loop still attaches).
 ///
@@ -543,7 +563,6 @@ fn resolve_tools(
 /// root is recorded on the returned team via [`AgentTeam::with_agent_workspaces`].
 /// `agent_workspaces` maps sub-agent names to their resolved workspace; an agent
 /// absent there (and the root) uses `root_workspace`.
-#[allow(clippy::too_many_arguments)]
 pub fn build_agent_team(
     root_workspace: &str,
     root_base: SharedSystemPrompt,
@@ -551,8 +570,7 @@ pub fn build_agent_team(
     agent_workspaces: &HashMap<String, String>,
     registry: &ToolRegistry,
     files: Vec<AgentFile>,
-    root_tools: Option<ToolSelection>,
-    root_subagents: Option<Vec<String>>,
+    root: &RootAgentFile,
 ) -> Result<AgentTeam, LoadError> {
     // Assemble a prompt for an agent rooted at `workspace`: its base body plus a
     // per-turn variable provider carrying that workspace's knowledge handles.
@@ -566,8 +584,8 @@ pub fn build_agent_team(
         SystemPrompt::new(base).with_vars(make_vars_provider(workspace.to_string(), knowledge))
     };
 
-    let roots = match root_subagents {
-        Some(explicit) => explicit,
+    let roots = match &root.subagents {
+        Some(explicit) => explicit.clone(),
         None => {
             let referenced: HashSet<&str> = files
                 .iter()
@@ -586,14 +604,10 @@ pub fn build_agent_team(
         }
     };
 
-    let root_tools = resolve_tools(
-        registry,
-        ROOT_AGENT_NAME,
-        root_tools.as_ref(),
-        DefaultToolSet::All,
-    )?;
+    let root_tools = resolve_tools(registry, ROOT_AGENT_NAME, root.tools.as_ref())?;
 
     let root = AgentSpec {
+        capabilities: root.capabilities.clone(),
         name: ROOT_AGENT_NAME.to_string(),
         description: String::new(),
         system_prompt: assemble(root_base, root_workspace),
@@ -604,18 +618,14 @@ pub fn build_agent_team(
 
     let mut subagents = Vec::with_capacity(files.len());
     for file in files {
-        let tools = resolve_tools(
-            registry,
-            &file.name,
-            file.tools.as_ref(),
-            DefaultToolSet::Empty,
-        )?;
+        let tools = resolve_tools(registry, &file.name, file.tools.as_ref())?;
         let workspace = agent_workspaces
             .get(&file.name)
             .map(String::as_str)
             .unwrap_or(root_workspace);
         let system_prompt = assemble(SharedSystemPrompt::new(file.system_prompt), workspace);
         subagents.push(AgentSpec {
+            capabilities: file.capabilities,
             name: file.name,
             description: file.description,
             system_prompt,
@@ -677,3 +687,7 @@ pub fn resolve_agent_workspace(
 #[cfg(test)]
 #[path = "agents_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agents_capabilities_tests.rs"]
+mod capability_tests;

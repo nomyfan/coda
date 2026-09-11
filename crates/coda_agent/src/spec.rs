@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::Program;
+use crate::{Capabilities, Capability, Program};
 
 use coda_execution::BackgroundTasks;
 use coda_tools::{BuildContext, KeyedLock, SYNTHETIC_RESERVED_TOOL_NAMES, ToolSpec};
@@ -32,6 +32,8 @@ pub enum BuildError {
         /// Provider-visible synthetic name claimed by the configured tool.
         name: String,
     },
+    /// A sub-agent name would shadow a runtime-owned tool through bare-name dispatch.
+    ReservedSubagentName { name: String },
     /// A sub-agent's name, once prefixed for the LLM tool namespace, exceeds the
     /// provider's function-name length limit.
     SubagentNameTooLong { name: String, max: usize },
@@ -69,6 +71,12 @@ impl std::fmt::Display for BuildError {
                     agent, name
                 )
             }
+            BuildError::ReservedSubagentName { name } => {
+                write!(
+                    f,
+                    "Sub-agent name '{name}' is reserved by the runtime; rename the sub-agent"
+                )
+            }
             BuildError::SubagentNameTooLong { name, max } => {
                 write!(
                     f,
@@ -87,6 +95,7 @@ impl std::error::Error for BuildError {}
 /// referenced by name, resolved against the sibling specs held by an
 /// [`AgentTeam`]. The same agent may be a sub-agent of several parents.
 pub struct AgentSpec {
+    pub capabilities: Capabilities,
     pub name: String,
     pub description: String,
     pub system_prompt: SystemPrompt,
@@ -122,6 +131,13 @@ impl AgentTeam {
     /// There is deliberately no way to obtain an `AgentTeam` without passing this
     /// gate.
     pub fn new(root: AgentSpec, mut subagents: Vec<AgentSpec>) -> Result<Self, BuildError> {
+        for subagent in &subagents {
+            if SYNTHETIC_RESERVED_TOOL_NAMES.contains(&subagent.name.as_str()) {
+                return Err(BuildError::ReservedSubagentName {
+                    name: subagent.name.clone(),
+                });
+            }
+        }
         // Index every spec by name, rejecting duplicates across root + subagents.
         let mut by_name: HashMap<&str, &AgentSpec> = HashMap::new();
         for spec in std::iter::once(&root).chain(&subagents) {
@@ -132,6 +148,11 @@ impl AgentTeam {
 
         for spec in std::iter::once(&root).chain(&subagents) {
             for child in &spec.subagents {
+                if SYNTHETIC_RESERVED_TOOL_NAMES.contains(&child.as_str()) {
+                    return Err(BuildError::ReservedSubagentName {
+                        name: child.clone(),
+                    });
+                }
                 if !by_name.contains_key(child.as_str()) {
                     return Err(BuildError::UnknownSubagent {
                         parent: spec.name.clone(),
@@ -232,9 +253,8 @@ impl AgentTeam {
     /// `file_locks` is the deliberate exception to "session-bound resources": the
     /// same registry must reach every call in the process, or concurrent
     /// `edit_file`s from sibling agents or from two sessions over one workspace
-    /// clobber each other. `background` is shared one level down — every agent
-    /// in the session sees the same task registry, since a task belongs to the
-    /// conversation rather than to whichever agent happened to start it.
+    /// clobber each other. Agents with background capability receive the same
+    /// session task registry; disabling it on one agent leaves others unaffected.
     pub fn build(
         &self,
         default_workspace: &str,
@@ -255,10 +275,13 @@ impl AgentTeam {
                 workspace_dir: workspace_dir.to_string(),
                 file_locks: file_locks.clone(),
                 agent_name: spec.name.clone(),
-                background: background.clone(),
+                background: background
+                    .clone()
+                    .filter(|_| spec.capabilities.contains(Capability::Background)),
             };
 
             let mut agent = Program {
+                capabilities: spec.capabilities.clone(),
                 name: spec.name.clone(),
                 mode: spec.mode.clone(),
                 system_prompt: spec.system_prompt.clone(),
@@ -269,10 +292,13 @@ impl AgentTeam {
             for tool_spec in &spec.tools {
                 agent.tools.register(tool_spec.build(&tool_ctx));
             }
-            // Not declarable and not per-agent: these exist whenever the
-            // session has somewhere to run background work.
-            for tool_spec in coda_tools::background_specs(background.as_ref()) {
+            for tool_spec in coda_tools::background_specs(tool_ctx.background.as_ref()) {
                 agent.tools.register(tool_spec.build(&tool_ctx));
+            }
+            if spec.capabilities.contains(Capability::Ptc) {
+                agent
+                    .tools
+                    .register(coda_tools::RunJavaScriptToolSpec.build(&tool_ctx));
             }
             for child in &spec.subagents {
                 // Validated at construction, so the reference always resolves.
@@ -293,3 +319,7 @@ impl AgentTeam {
 #[cfg(test)]
 #[path = "spec_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "spec_capabilities_tests.rs"]
+mod capability_tests;

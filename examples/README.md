@@ -50,10 +50,10 @@ where you launch from.
 | --- | --- |
 | `coda-server.toml` | Multiple providers, per-model `context_window` / `reasoning_efforts` / `input_modalities`, `${VAR}` expansion, workspace declaration. |
 | `workspace/AGENTS.md` | Root **workspace knowledge**, exposed to bodies as the `{{workspace_custom_instructions}}` variable and hot-reloaded on change. |
-| `.coda/agents/AGENT.md` | Root `coda` overrides: an exclude-only `tools` rule (missing include keeps root's all-tools default), explicit `subagents`, plus a custom body that composes the env, `{{skills_guide}}`/`{{workspace_available_skills}}`, and `{{workspace_custom_instructions}}` variables. |
-| `planner/` | A **stateful** orchestrator with a minimal tool set (`read_todos`/`write_todos`) and its own `subagents` — a deeper graph under `coda`. A pure delegator, so its body pulls in the env and custom instructions but **not** the skills variables. |
-| `researcher/` | **Stateless**, read-only tools, an MCP **prefix pattern** (`mcp__time__*`), a per-agent **model override** to a cheaper model, and a body that references the skills variables. |
-| `coder/` | A fuller tool set incl. `shell`, the full env block plus `{{skills_guide}}`/`{{workspace_available_skills}}`, a **reasoning model** override with `reasoning_effort: high`. |
+| `.coda/agents/AGENT.md` | Root `coda` overrides: an exclude-only `tools` rule (missing include keeps the all-ordinary-tools default), explicit `subagents`, plus a custom body that composes the env, `{{skills_guide}}`/`{{workspace_available_skills}}`, and `{{workspace_custom_instructions}}` variables. |
+| `planner/` | A **stateful** orchestrator with a minimal tool set (`read_todos`/`write_todos`), `capabilities: []`, and its own `subagents` — a deeper graph under `coda`. A pure delegator, so its body pulls in the env and custom instructions but **not** the skills variables. |
+| `researcher/` | **Stateless**, read-only tools, only the `ptc` capability, an MCP **prefix pattern** (`mcp__time__*`), a per-agent **model override** to a cheaper model, and a body that references the skills variables. |
+| `coder/` | A fuller tool set incl. `shell`, default capabilities (`background` and `ptc`), the full env block plus `{{skills_guide}}`/`{{workspace_available_skills}}`, a **reasoning model** override with `reasoning_effort: high`. |
 | `docs-writer/` | A **per-agent workspace** (`workspace: ./docs`): its tool root and knowledge come from `docs/`, so its `{{workspace_available_skills}}`/`{{workspace_custom_instructions}}` resolve against `docs/`, not the root. |
 | `docs/AGENTS.md` + `docs/.coda/skills/` | A per-agent workspace carries **its own** knowledge and skills, distinct from the root's. |
 | `.coda/mcp.json` | An MCP server over **stdio** (`mcp-server-time` via `uvx`); referenced from agents as `mcp__<server>__<tool>`. An **http** server uses `{ "type": "http", "url": ... }` instead. |
@@ -67,9 +67,20 @@ where you launch from.
   `AGENTS.md` and `.coda/skills`.
 - A per-agent workspace is a **default cwd, not a sandbox**: tools can still
   reach outside it with an explicit path.
-- **Text hot-reloads; structure does not.** Editing a body, `AGENTS.md`, or a
-  skill is picked up on the next turn. Changing structural frontmatter
-  (`tools`, `subagents`, `mode`, `model`, `workspace`) needs a restart.
+- **Workspace knowledge hot-reloads.** Editing workspace `AGENTS.md` or a
+  skill is picked up on the next turn. Agent bodies and frontmatter
+  (`tools`, `capabilities`, `subagents`, `mode`, `model`, `workspace`) need a restart.
+- **Tools and capabilities have independent defaults for every agent.** Omit
+  `tools` to get all registered ordinary tools (including `ask_user` and MCP),
+  or provide a list / `include` to replace that set. `exclude` subtracts from
+  it; with only `exclude`, the starting set is all ordinary tools. Omit
+  `capabilities` to enable all supported capabilities (`background`, `ptc`),
+  or use a list to select them. An empty list disables that category.
+  A caller's choices do not change its children's configuration.
+- **Capability tools are configured through capabilities.** Remove
+  `run_javascript` from old ordinary tool lists; PTC now comes from `ptc`.
+  `run_javascript`, `list_javascript_tools`, `task_output`, and `task_kill`
+  are reserved names, rejected in ordinary tool lists and as sub-agent names.
 - **MCP and approval are workspace-/session-wide**, not per-agent: `mcp.json`
   and `config.toml` are loaded once from the root workspace and shared.
 - **The permission mode is per session**, picked in the composer

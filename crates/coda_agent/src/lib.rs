@@ -1,4 +1,6 @@
 pub mod agent;
+mod capabilities;
+pub use capabilities::{Capabilities, Capability};
 pub mod process;
 pub mod program;
 pub use process::{Process, ProcessId};
