@@ -123,6 +123,18 @@ fn dir_oflags() -> OFlags {
 }
 
 impl ArchiveDir {
+    /// Open an existing archive without creating directories or changing permissions.
+    pub fn open_existing_root(path: &Path) -> Result<Option<Self>, ArchiveError> {
+        let fd = match fs::open(path, dir_oflags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        verify_dir(&fd)?;
+        verify_mode(&fd, 0o700)?;
+        Ok(Some(Self { fd: Arc::new(fd) }))
+    }
+
     /// Open (creating the path if needed) the session archive root. The path is
     /// server-controlled, not model-controlled; intermediate components are
     /// created with `create_dir_all`, then the leaf is opened `O_NOFOLLOW` and

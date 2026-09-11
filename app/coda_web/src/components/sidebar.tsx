@@ -45,6 +45,7 @@ import {
   renameSession,
   selectActiveKey,
   selectActiveServer,
+  selectCanForkSession,
   selectForking,
   selectSessionListServers,
   useCodaStore,
@@ -326,6 +327,13 @@ function SessionRow({
   const [renamePending, setRenamePending] = useState(false);
   const [renameError, setRenameError] = useState<string>();
   const forkPending = useCodaStore(selectForking(forkKey(serverUrl, workspaceId, session.id)));
+  // Inactive rows already have their catalog entry; avoid searching the whole
+  // catalog for every row on each streamed token.
+  const canFork = useCodaStore((state) =>
+    isActive
+      ? selectCanForkSession(state, serverUrl, workspaceId, session.id)
+      : state.servers[serverUrl]?.status === "connected" && session.access?.type === "read_write",
+  );
   const [forkError, setForkError] = useState<string>();
 
   function startRenaming() {
@@ -484,7 +492,7 @@ function SessionRow({
                 second copy — the server mints a new id per request. The flag is
                 the store's, so the transcript's entries go quiet with it. */}
               <DropdownMenuItem
-                disabled={forkPending}
+                disabled={forkPending || !canFork}
                 onClick={() => {
                   setForkError(undefined);
                   onFork(serverUrl, workspaceId, session.id).catch((error: unknown) =>

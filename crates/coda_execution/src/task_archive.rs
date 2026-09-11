@@ -842,7 +842,7 @@ fn rollback_created_task_blocking(
 
 /// Load and validate a task directory's manifest (blocking). `Ok(None)` for an
 /// absent directory; `Err` for a present-but-invalid one.
-fn load_task_dir(
+pub(crate) fn load_task_dir(
     root: &ArchiveDir,
     id: &TaskId,
 ) -> Result<Option<(ArchiveDir, TaskOutputManifest)>, ArchiveError> {

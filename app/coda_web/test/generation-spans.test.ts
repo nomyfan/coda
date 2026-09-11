@@ -41,6 +41,7 @@ function toolReply(id: string, callId: string, from: number, to: number): ToolMe
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -64,6 +65,7 @@ function snapshot(messages: HistoryMessage[], turnRunning = false) {
     approvals: [],
     providerId: "p",
     reasoningEffort: null,
+    access: { type: "read_write" },
     turnRunning,
   };
 }

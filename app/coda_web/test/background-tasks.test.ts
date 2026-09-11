@@ -21,6 +21,7 @@ import {
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -62,6 +63,7 @@ test("a finished background task renders as a notice, not a user bubble", () => 
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });
@@ -161,6 +163,7 @@ test("the task list arrives with the snapshot and is replaced by its own push", 
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
     backgroundTasks: [running],
@@ -175,6 +178,7 @@ test("the task list arrives with the snapshot and is replaced by its own push", 
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });
@@ -222,6 +226,7 @@ test("one notice covering several tasks is titled by count, not by the first one
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "accept_edits",
+    access: { type: "read_write" },
     turnRunning: false,
     compacting: false,
   });

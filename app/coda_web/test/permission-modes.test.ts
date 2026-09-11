@@ -41,6 +41,7 @@ beforeEach(() => {
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -108,6 +109,7 @@ test("a snapshot's mode replaces the local one", () => {
     providerId: "provider:model",
     reasoningEffort: null,
     permissionMode: "yolo",
+    access: { type: "read_write" },
     turnRunning: true,
   });
 

@@ -1,5 +1,6 @@
 use crate::config::{PermissionMode, ToolApprovalConfig, extract_shell_command};
 use crate::files::FileEntry;
+use crate::session_access::SessionAccess;
 use coda_agent::{AbortedTarget, AgentEvent, EventOrigin, ResumeDecision, SessionEvent};
 use coda_core::llm::{
     AssistantMessage, CompactionMessage, Message, MessageId, Modality, TaskNoticeMessage, ToolCall,
@@ -315,14 +316,6 @@ pub struct RenameSessionParams {
     pub name: Option<String>,
 }
 
-/// `add_allow_pattern` params — append a glob to the shell allow-list; takes
-/// effect immediately for the live session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddAllowPatternParams {
-    pub workspace_id: String,
-    pub pattern: String,
-}
-
 /// `list_files` params — the composer's `@` picker searching one workspace.
 /// `query` is the text typed after the `@` (empty right after it), and `limit`
 /// caps the menu; both have server-side defaults so a bare workspace id works.
@@ -473,6 +466,8 @@ pub struct RewindAccepted {
 /// is really executing under rather than the one this browser remembered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub access: SessionAccess,
+    pub background_tasks_error: Option<String>,
     pub workspace_id: String,
     pub session_id: String,
     pub messages: Vec<Message>,
@@ -620,6 +615,7 @@ pub struct WorkspaceSummaryWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummaryWire {
+    pub access: SessionAccess,
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,

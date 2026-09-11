@@ -20,6 +20,10 @@ import {
   selectActiveReasoningEffort,
   selectActiveEditing,
   selectActiveForkDraft,
+  selectActiveCanWrite,
+  selectActiveAccess,
+  selectActiveBackgroundTasksError,
+  selectActiveUnsentDraft,
   selectActiveKey,
   selectActiveRunning,
   selectActiveServer,
@@ -262,6 +266,10 @@ export default function App() {
   const activeApprovalCount = useCodaStore(selectActiveApprovalCount);
   const activeEditing = useCodaStore(selectActiveEditing);
   const activeForkDraft = useCodaStore(selectActiveForkDraft);
+  const activeCanWrite = useCodaStore(selectActiveCanWrite);
+  const activeAccess = useCodaStore(selectActiveAccess);
+  const backgroundTasksError = useCodaStore(selectActiveBackgroundTasksError);
+  const unsentDraft = useCodaStore(selectActiveUnsentDraft);
   const activeKey = useCodaStore(selectActiveKey);
   const activeStarting = useCodaStore(selectActiveStarting);
   const activeEvicted = useCodaStore(selectActiveEvicted);
@@ -542,6 +550,10 @@ export default function App() {
                           ? `fork-draft:${activeKey}`
                           : "new"
                     }
+                    writable={showingNewSession || activeCanWrite}
+                    access={showingNewSession ? null : activeAccess}
+                    backgroundTasksError={showingNewSession ? undefined : backgroundTasksError}
+                    unsentDraft={showingNewSession ? undefined : unsentDraft}
                     status={
                       showingNewSession ? (selectedServerState?.status ?? "idle") : activeStatus
                     }

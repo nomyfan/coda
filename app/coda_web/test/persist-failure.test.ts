@@ -7,6 +7,7 @@ const at = (seconds: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).to
 
 function session(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
@@ -68,6 +69,7 @@ test("the notice survives the reattach the failure itself causes", () => {
     approvals: [],
     providerId: "p",
     reasoningEffort: null,
+    access: { type: "read_write" },
     turnRunning: false,
   });
 

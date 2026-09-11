@@ -11,8 +11,9 @@ use coda_agent::{
     compaction, runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
-use coda_execution::{ArchiveDir, BackgroundRootLock, BackgroundTasks};
+use coda_execution::{ArchiveDir, ArchivedTasks, BackgroundRootLock, BackgroundTasks};
 use coda_openai::OpenAICompatible;
+use coda_server::session_access::{SessionAccess, SessionModelResolution, UnavailableModel};
 use coda_server::storage::{
     CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
 };
@@ -31,8 +32,8 @@ use coda_server::{
     files::{DEFAULT_LIMIT, FileIndex},
     hub::{
         AttachError, AttachSession, CommandOutcome, CompactError, Compacted, ConnId, DeleteOutcome,
-        ForkOutcome, RelayEvent, SessionCommand, SessionHub, SessionKey, SessionOpener,
-        SessionRelay, SnapshotPayload,
+        ForkOutcome, ReadOnlyHistory, RelayEvent, SessionCommand, SessionHub, SessionKey,
+        SessionOpener, SessionRelay, SnapshotPayload,
     },
     load_workspace_skills,
     mcp::McpServers,
@@ -43,14 +44,14 @@ use coda_server::{
     },
     transport::{Transport, WebSocketTransport},
     wire::{
-        AddAllowPatternParams, BackgroundTasksPush, CompactParams, CompactResult,
-        DeleteSessionParams, EventParams, FileCatalog, ForkAccepted, ForkSessionParams,
-        KillTaskParams, ListFilesParams, ListSkillsParams, ModelSelection, OpenSessionParams,
-        PendingApprovalWire, PermissionModeSelection, ProviderCatalog, ProviderInfoWire,
-        RenameSessionParams, ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef,
-        SessionStatusWire, SessionSummaryWire, SetModelParams, SetPermissionModeParams,
-        SkillCatalog, SkillInfoWire, Snapshot, TaskAccepted, TaskNoticePush, TaskParams,
-        TaskSummaryWire, WireEvent, WorkspaceCatalog, WorkspaceSummaryWire,
+        BackgroundTasksPush, CompactParams, CompactResult, DeleteSessionParams, EventParams,
+        FileCatalog, ForkAccepted, ForkSessionParams, KillTaskParams, ListFilesParams,
+        ListSkillsParams, ModelSelection, OpenSessionParams, PendingApprovalWire,
+        PermissionModeSelection, ProviderCatalog, ProviderInfoWire, RenameSessionParams,
+        ResumeParams, RewindAccepted, RewindParams, SessionName, SessionRef, SessionStatusWire,
+        SessionSummaryWire, SetModelParams, SetPermissionModeParams, SkillCatalog, SkillInfoWire,
+        Snapshot, TaskAccepted, TaskNoticePush, TaskParams, TaskSummaryWire, WireEvent,
+        WorkspaceCatalog, WorkspaceSummaryWire,
     },
 };
 use coda_tools::{BuildContext, ToolSpec};
@@ -68,6 +69,10 @@ use tokio::time::timeout;
 use tokio_stream::{StreamExt as _, StreamMap};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+#[cfg(all(test, feature = "pg-tests"))]
+#[path = "server_tests/read_only.rs"]
+mod read_only_tests;
 
 /// Coda server
 #[derive(Parser)]
@@ -370,6 +375,63 @@ impl AppOpener {
 }
 
 impl SessionOpener for AppOpener {
+    fn resolve_session_model<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        initial: Option<&'a ModelSelection>,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelResolution, OpenError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| OpenError::Storage("unknown workspace".into()))?;
+            let binding = if let Some(initial) = initial {
+                let provider = self
+                    .providers
+                    .get(&initial.provider_id)
+                    .expect("initial selection is validated");
+                workspace
+                    .storage
+                    .initialize_session(
+                        &key.1,
+                        SessionModelBinding {
+                            provider_id: provider.provider_id.clone(),
+                            model_id: provider.model_id.clone(),
+                            reasoning_effort: initial.reasoning_effort.clone(),
+                        },
+                    )
+                    .await
+            } else {
+                workspace.storage.load_model_binding(&key.1).await
+            }
+            .map_err(|error| OpenError::Storage(error.to_string()))?;
+            let efforts = self
+                .providers
+                .get(&binding.selection_key())
+                .map(|p| p.reasoning_efforts.as_slice());
+            Ok(SessionModelResolution::resolve(binding, efforts))
+        })
+    }
+
+    fn load_read_only_history<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<ReadOnlyHistory, OpenError>> + Send + 'a>> {
+        Box::pin(async move {
+            let workspace = self
+                .workspaces
+                .get(&key.0)
+                .ok_or_else(|| OpenError::Storage("unknown workspace".into()))?;
+            let storage = workspace.storage.session(&key.1);
+            ReadOnlyHistory::load(&storage, &key.1).await
+        })
+    }
+
+    fn archived_tasks(&self, key: &SessionKey) -> Result<Option<ArchivedTasks>, String> {
+        let dir = background_dir(&self.background_root, &key.0, &key.1)?;
+        ArchivedTasks::open_existing(&dir).map_err(|error| error.to_string())
+    }
+
     fn persist_allow_patterns<'a>(
         &'a self,
         key: &'a SessionKey,
@@ -398,29 +460,6 @@ impl SessionOpener for AppOpener {
                 .workspaces
                 .get(&key.0)
                 .ok_or_else(|| OpenError::Storage(format!("unknown workspace '{}'", key.0)))?;
-            // Re-assert the session row, under the hub's entry lock this time.
-            // `open_session`'s handler creates it before it ever reaches the
-            // hub — it needs the durable model binding to pick a provider — so
-            // a delete holding the key can remove that row while the open is
-            // still waiting on the tombstone, leaving this runtime live with
-            // nothing to write to. The insert is idempotent, so the ordinary
-            // path pays one no-op statement.
-            let provider = self
-                .providers
-                .get(provider_id)
-                .expect("caller passes a validated provider id");
-            workspace
-                .storage
-                .initialize_session(
-                    &key.1,
-                    SessionModelBinding {
-                        provider_id: provider.provider_id.clone(),
-                        model_id: provider.model_id.clone(),
-                        reasoning_effort: reasoning_effort.clone(),
-                    },
-                )
-                .await
-                .map_err(|err| OpenError::Storage(err.to_string()))?;
             open_session(
                 &self.providers,
                 workspace,
@@ -815,7 +854,13 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
                     } else {
                         session.unseen_outcome
                     };
+                    let efforts = app
+                        .providers
+                        .get(&session.model_binding.selection_key())
+                        .map(|p| p.reasoning_efforts.as_slice());
                     SessionSummaryWire {
+                        access: SessionModelResolution::resolve(session.model_binding, efforts)
+                            .access(),
                         id: session.session_id,
                         name: session.name,
                         updated_at_ms: Some(session.updated_at_ms),
@@ -976,11 +1021,14 @@ async fn attach_core(
     streams: &mut StreamMap<SessionKey, BoxStream<'static, RelayEvent>>,
     selections: &mut HashMap<SessionKey, Selection>,
     key: SessionKey,
-    provider_id: String,
+    provider_id: Option<String>,
     reasoning_effort: Option<String>,
     permission_mode: PermissionMode,
     takeover: bool,
 ) -> Result<Snapshot, AttachError> {
+    // Reattach caches may name an unavailable durable model. Only the seed for
+    // a new session falls back; the hub always resolves an existing binding.
+    let (provider_id, reasoning_effort) = resolve_selection(app, provider_id, reasoning_effort);
     let AttachSession { snapshot, events } = app
         .relay
         .attach(
@@ -1011,7 +1059,10 @@ async fn attach_core(
 /// Address a hub snapshot to a session. Shared by the two ways one reaches a
 /// client: as the answer to `open_session`, and as a pushed `snapshot`.
 fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
+    let read_only = matches!(snapshot.access, SessionAccess::ReadOnly { .. });
     Snapshot {
+        access: snapshot.access,
+        background_tasks_error: snapshot.background_tasks_error,
         workspace_id: key.0.clone(),
         session_id: key.1.clone(),
         messages: snapshot.messages,
@@ -1029,7 +1080,17 @@ fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
             .background_tasks
             .iter()
             .cloned()
-            .map(TaskSummaryWire::from)
+            .map(|summary| {
+                let mut task = TaskSummaryWire::from(summary);
+                if read_only {
+                    if task.running {
+                        task.status = format!("Not restored (last status: {})", task.status);
+                    }
+                    task.running = false;
+                    task.subtree_active = false;
+                }
+                task
+            })
             .collect(),
     }
 }
@@ -1241,7 +1302,7 @@ async fn dispatch_request(
                 )
                     .into();
             }
-            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
+            if !app.workspaces.contains_key(&params.workspace_id) {
                 return (
                     id,
                     RpcError::with_detail(
@@ -1251,55 +1312,7 @@ async fn dispatch_request(
                     ),
                 )
                     .into();
-            };
-            // Resolve the client selection only for first creation. Existing
-            // sessions reopen with their durable binding, regardless of the
-            // browser's latest workspace preference.
-            let (requested_provider_id, requested_reasoning_effort) =
-                resolve_selection(app, params.provider_id, params.reasoning_effort);
-            let requested_provider = app
-                .providers
-                .get(&requested_provider_id)
-                .expect("resolved provider selection exists");
-            let binding = match workspace
-                .storage
-                .initialize_session(
-                    &params.session_id,
-                    SessionModelBinding {
-                        provider_id: requested_provider.provider_id.clone(),
-                        model_id: requested_provider.model_id.clone(),
-                        reasoning_effort: requested_reasoning_effort,
-                    },
-                )
-                .await
-            {
-                Ok(binding) => binding,
-                Err(err) => {
-                    return (
-                        id,
-                        RpcError::with_detail(
-                            rpc::OPEN_FAILED,
-                            "failed to initialize session",
-                            err.to_string(),
-                        ),
-                    )
-                        .into();
-                }
-            };
-            let provider_id = binding.selection_key();
-            let Some(reasoning_effort) =
-                normalize_provider_selection(app, &provider_id, binding.reasoning_effort)
-            else {
-                return (
-                    id,
-                    RpcError::with_detail(
-                        rpc::OPEN_FAILED,
-                        "session model binding is unavailable",
-                        provider_id,
-                    ),
-                )
-                    .into();
-            };
+            }
             let key = (params.workspace_id, params.session_id);
             match attach_core(
                 app,
@@ -1307,8 +1320,8 @@ async fn dispatch_request(
                 streams,
                 selections,
                 key,
-                provider_id,
-                reasoning_effort,
+                params.provider_id,
+                params.reasoning_effort,
                 params.permission_mode,
                 params.takeover,
             )
@@ -1338,6 +1351,24 @@ async fn dispatch_request(
                 Ok(params) => params,
                 Err(err) => return (id, err).into(),
             };
+            match app
+                .relay
+                .provider_of(
+                    (params.workspace_id.clone(), params.session_id.clone()),
+                    conn_id,
+                )
+                .await
+            {
+                Err(model) => return (id, read_only_error(model)).into(),
+                Ok(None) => {
+                    return (
+                        id,
+                        RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
+                    )
+                        .into();
+                }
+                Ok(Some(_)) => {}
+            }
             // Invalid selections are caught here, before the hub — `OpenError`
             // has no "bad model" variant (Decision 8).
             let Some(reasoning_effort) =
@@ -1368,6 +1399,7 @@ async fn dispatch_request(
                 )
                 .await
             {
+                CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
                 CommandOutcome::ModelChanged {
                     provider_id,
                     reasoning_effort,
@@ -1471,6 +1503,7 @@ async fn dispatch_request(
                 )
                 .await
             {
+                CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
                 CommandOutcome::Ok => {
                     // Mirror the change into the re-attach cache: a session the
                     // hub closes underneath us must come back with the posture
@@ -1485,35 +1518,6 @@ async fn dispatch_request(
                 _ => (
                     id,
                     RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
-                )
-                    .into(),
-            }
-        }
-        "add_allow_pattern" => {
-            let params: AddAllowPatternParams = match parse_params(params) {
-                Ok(params) => params,
-                Err(err) => return (id, err).into(),
-            };
-            let Some(workspace) = app.workspaces.get(&params.workspace_id) else {
-                return (
-                    id,
-                    RpcError::with_detail(
-                        rpc::UNKNOWN_WORKSPACE,
-                        "unknown workspace",
-                        params.workspace_id,
-                    ),
-                )
-                    .into();
-            };
-            match add_allow_pattern(workspace.approval_config.clone(), params.pattern).await {
-                Ok(()) => (id, &serde_json::json!({})).into(),
-                Err(message) => (
-                    id,
-                    RpcError::with_detail(
-                        rpc::ALLOW_PATTERN_FAILED,
-                        "failed to add allow pattern",
-                        message,
-                    ),
                 )
                     .into(),
             }
@@ -1615,6 +1619,7 @@ async fn dispatch_request(
             }
             let key = (params.workspace_id, params.session_id);
             match app.relay.fork(key, params.cut_message_id).await {
+                ForkOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
                 ForkOutcome::Forked(forked) => (
                     id,
                     &ForkAccepted {
@@ -1659,6 +1664,7 @@ async fn dispatch_request(
                 )
                 .await;
             match result {
+                CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
                 CommandOutcome::Ok | CommandOutcome::StillPending(_) => {
                     (id, &serde_json::json!({"accepted":true})).into()
                 }
@@ -1839,6 +1845,18 @@ async fn dispatch_notification<T: Transport>(
     }
 }
 
+fn read_only_error(model: UnavailableModel) -> RpcError {
+    RpcError {
+        code: rpc::SESSION_READ_ONLY,
+        message: "session is read-only because its model configuration is unavailable".into(),
+        data: Some(serde_json::json!({
+            "reason": model.reason,
+            "provider_id": model.binding.selection_key(),
+            "reasoning_effort": model.binding.reasoning_effort,
+        })),
+    }
+}
+
 /// Start a new turn, answering with the id minted for its user message.
 ///
 /// This is the trust boundary for message identity: the id is always minted
@@ -1855,15 +1873,17 @@ async fn handle_task(
     params: TaskParams,
 ) -> RpcOutgoing {
     let key = (params.workspace_id, params.session_id);
-    let (task, images) = match accept_turn_input(app, &key, params.task, params.images).await {
-        Ok(accepted) => accepted,
-        Err(err) => return (id, err).into(),
-    };
+    let (task, images) =
+        match accept_turn_input(app, &key, conn_id, params.task, params.images).await {
+            Ok(accepted) => accepted,
+            Err(err) => return (id, err).into(),
+        };
     match app
         .relay
         .command(key, conn_id, SessionCommand::Task { task, images })
         .await
     {
+        CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
         CommandOutcome::TaskAccepted { message_id } => (id, &TaskAccepted { message_id }).into(),
         CommandOutcome::NotIdle => (
             id,
@@ -1891,16 +1911,18 @@ async fn handle_task(
 async fn accept_turn_input(
     app: &Arc<AppState>,
     key: &SessionKey,
+    conn_id: ConnId,
     task: String,
     images: Vec<String>,
 ) -> Result<(String, Vec<String>), RpcError> {
-    let accepts_images = match app.relay.provider_of(key.clone()).await {
-        Some(provider_id) => app
+    let accepts_images = match app.relay.provider_of(key.clone(), conn_id).await {
+        Err(model) => return Err(read_only_error(model)),
+        Ok(Some(provider_id)) => app
             .providers
             .get(&provider_id)
             .is_some_and(|handle| handle.input_modalities.contains(&Modality::Image)),
         // No live or pending session for this key.
-        None => return Err(RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live")),
+        Ok(None) => return Err(RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live")),
     };
     if !accepts_images && !images.is_empty() {
         return Err(RpcError::new(
@@ -1954,6 +1976,7 @@ async fn handle_compact(
         )
         .await
     {
+        CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
         CommandOutcome::Compacted { applied: true } => (id, &CompactResult::Applied).into(),
         CommandOutcome::Compacted { applied: false } => (id, &CompactResult::Recorded).into(),
         CommandOutcome::CompactionAbandoned { stale, reason } => {
@@ -1993,10 +2016,11 @@ async fn handle_rewind(
     params: RewindParams,
 ) -> RpcOutgoing {
     let key = (params.workspace_id, params.session_id);
-    let (task, images) = match accept_turn_input(app, &key, params.task, params.images).await {
-        Ok(accepted) => accepted,
-        Err(err) => return (id, err).into(),
-    };
+    let (task, images) =
+        match accept_turn_input(app, &key, conn_id, params.task, params.images).await {
+            Ok(accepted) => accepted,
+            Err(err) => return (id, err).into(),
+        };
     match app
         .relay
         .command(
@@ -2010,6 +2034,7 @@ async fn handle_rewind(
         )
         .await
     {
+        CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
         CommandOutcome::Rewound {
             message_id,
             messages,
@@ -2190,7 +2215,7 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                                 &mut streams,
                                 &mut selections,
                                 key.clone(),
-                                provider_id,
+                                Some(provider_id),
                                 reasoning_effort,
                                 permission_mode,
                                 false,

@@ -115,10 +115,10 @@ jobs:
 
       # No `DATABASE_URL` makes this fail rather than skip: a suite that skips
       # itself would leave persistence untested while the job still went green.
-      - name: Storage tests
+      - name: Storage and RPC tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/coda_test
-        run: cargo test -p coda_server --features pg-tests --test storage_pg
+        run: cargo test -p coda_server --features pg-tests
 
   web:
     if: ${{ !github.event.pull_request.draft }}

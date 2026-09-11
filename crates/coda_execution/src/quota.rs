@@ -357,7 +357,7 @@ fn classify_valid(
     }
 }
 
-fn summary_of(id: &TaskId, manifest: &TaskOutputManifest) -> TaskSummary {
+pub(crate) fn summary_of(id: &TaskId, manifest: &TaskOutputManifest) -> TaskSummary {
     TaskSummary {
         kind: manifest.meta.kind.clone(),
         parent_task_id: manifest.meta.parent_task_id.clone(),
@@ -383,7 +383,7 @@ fn note_recent_terminal(inv: &mut ArchiveInventory, summary: TaskSummary) {
     }
 }
 
-fn compact_recent(v: &mut Vec<TaskSummary>) {
+pub(crate) fn compact_recent(v: &mut Vec<TaskSummary>) {
     v.sort_by(|a, b| {
         let at = |s: &TaskSummary| s.status.terminal_at().unwrap_or(s.started_at);
         at(b).cmp(&at(a))

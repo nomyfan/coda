@@ -60,8 +60,16 @@ export function ModelSelector({
   const selected = providers.find((info) => info.id === providerId);
   const efforts = selected?.reasoning_efforts ?? [];
 
-  if (providers.length === 0 || !providerId) {
-    return null;
+  if (!providerId) return null;
+  if (!selected) {
+    return (
+      <span
+        className="max-w-64 truncate px-2 font-mono text-xs text-muted-foreground"
+        title={providerId}
+      >
+        {providerId}
+      </span>
+    );
   }
 
   const catalog = { url: serverUrl, providers };
@@ -107,7 +115,14 @@ export function ModelSelector({
           {dropdownItems}
         </SelectContent>
       </Select>
-      {efforts.length > 0 ? (
+      {reasoningEffort && !efforts.includes(reasoningEffort) ? (
+        <span
+          className="px-2 font-mono text-xs text-muted-foreground"
+          title="Saved reasoning effort"
+        >
+          {reasoningEffort}
+        </span>
+      ) : efforts.length > 0 ? (
         <Select
           value={reasoningEffort ?? efforts[0]}
           onValueChange={(value) => onSetModel(providerId, value as ReasoningEffort)}

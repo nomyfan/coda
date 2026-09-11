@@ -7,6 +7,7 @@ mod delete;
 mod event_log;
 mod forking;
 mod permission_mode;
+mod read_only;
 mod replay;
 mod rewind;
 mod set_model;

@@ -68,6 +68,49 @@ pub struct PendingApproval {
     pub suspended_at: jiff::Timestamp,
 }
 
+impl TryFrom<crate::StoredCheckpoint> for PendingApproval {
+    type Error = String;
+
+    fn try_from(stored: crate::StoredCheckpoint) -> Result<Self, Self::Error> {
+        let crate::persist::StoredResumePoint::PendingApproval {
+            parent_message_id,
+            pending_approval_calls,
+            ..
+        } = stored.resume_point
+        else {
+            return Err(format!(
+                "storage returned non-pending checkpoint {} as awaiting approval",
+                stored.pid
+            ));
+        };
+        if pending_approval_calls.is_empty() {
+            return Err(format!(
+                "storage returned empty approval checkpoint {} as awaiting approval",
+                stored.pid
+            ));
+        }
+        Ok(Self {
+            task_id: stored
+                .active_execution
+                .as_ref()
+                .and_then(|e| e.background_task().cloned()),
+            agent_path: stored
+                .active_execution
+                .as_ref()
+                .map(|e| e.agent_path.clone())
+                .unwrap_or_else(|| vec![stored.agent_name.clone()]),
+            pid: stored.pid,
+            agent_name: stored.agent_name,
+            parent_message_id,
+            calls: pending_approval_calls
+                .into_iter()
+                .map(|prepared| prepared.tool_call)
+                .collect(),
+            suspended_at: stored.suspended_at,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyTarget {
     pub envelope_id: String,

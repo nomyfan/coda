@@ -19,6 +19,7 @@ import type {
   ReasoningEffort,
   UsageRecord,
 } from "@/store/session";
+import type { SessionAccess } from "@/lib/protocol";
 import { ModelSelector } from "@/components/model-selector";
 import { PermissionSelector } from "@/components/permission-selector";
 import { ContextUsage } from "@/components/context-usage";
@@ -44,6 +45,10 @@ function toDataUri(file: File): Promise<string> {
 
 export const Composer = memo(function Composer({
   status,
+  writable,
+  access,
+  backgroundTasksError,
+  unsentDraft,
   running,
   compacting,
   approvalPending,
@@ -69,6 +74,10 @@ export const Composer = memo(function Composer({
   onCancelEdit,
 }: {
   status: ConnectionStatus;
+  writable: boolean;
+  access: SessionAccess | null;
+  backgroundTasksError?: string | null;
+  unsentDraft?: { text: string; images: string[] };
   running: boolean;
   /** A summary request owns the session but has no abort path. */
   compacting: boolean;
@@ -113,8 +122,17 @@ export const Composer = memo(function Composer({
   onAbort: () => void;
   onCancelEdit: () => void;
 }) {
-  const [task, setTask] = useState(editing?.text ?? forkDraft?.text ?? "");
-  const [images, setImages] = useState<string[]>(editing?.images ?? forkDraft?.images ?? []);
+  const [task, setTask] = useState(editing?.text ?? unsentDraft?.text ?? forkDraft?.text ?? "");
+  const [images, setImages] = useState<string[]>(
+    editing?.images ?? unsentDraft?.images ?? forkDraft?.images ?? [],
+  );
+  useEffect(() => {
+    if (unsentDraft) {
+      setTask(unsentDraft.text);
+      setImages(unsentDraft.images);
+    }
+  }, [unsentDraft]);
+  const readOnly = access?.type === "read_only";
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const layoutGroupId = useId();
   const getImageLayoutId = useCallback(
@@ -164,7 +182,7 @@ export const Composer = memo(function Composer({
   // draft goes read-only until the request settles. A compaction owns the whole
   // session the same way — nothing can be sent while it runs, so the composer
   // is fully disabled instead of merely holding the send button.
-  const frozen = evicted || editing?.submitting === true || compacting;
+  const frozen = !writable || evicted || editing?.submitting === true || compacting;
   // Reading a file is asynchronous, so a paste or drop begun a moment before
   // the submit finishes after it — with `frozen` captured as it was at the
   // start. The guards below open the door; this is what checks it is still open
@@ -184,6 +202,7 @@ export const Composer = memo(function Composer({
   const requireImageModel = images.length > 0 || sessionHasImages;
   const rewriting = editing?.target != null;
   const canSend =
+    writable &&
     connected &&
     Boolean(workspace) &&
     !busy &&
@@ -351,6 +370,19 @@ export const Composer = memo(function Composer({
         submit();
       }}
     >
+      {readOnly && (
+        <p role="status" className="mx-auto mb-2 max-w-4xl text-sm text-muted-foreground">
+          {access.reason === "model_not_configured"
+            ? "This model is no longer configured. This conversation is read-only."
+            : "The saved reasoning effort is no longer supported. This conversation is read-only."}{" "}
+          <span className="font-mono break-all">{providerId}</span>
+        </p>
+      )}
+      {backgroundTasksError && (
+        <p role="status" className="mx-auto mb-2 max-w-4xl text-sm text-destructive">
+          Background task results could not be loaded: {backgroundTasksError}
+        </p>
+      )}
       <LayoutGroup id={layoutGroupId}>
         <div
           className="relative mx-auto max-w-4xl"
@@ -486,7 +518,8 @@ export const Composer = memo(function Composer({
               noteSelection(event.currentTarget);
               handlePaste(event);
             }}
-            disabled={frozen}
+            readOnly={!writable}
+            disabled={writable && frozen}
             // The ARIA 1.2 combobox pattern: `textbox` (a textarea's implicit
             // role) carries no `aria-expanded`, so without this the popup below
             // is never announced as attached to the field.
@@ -498,9 +531,11 @@ export const Composer = memo(function Composer({
               mentionOpen && highlightedIndex >= 0 ? mentionOptionId(highlightedIndex) : undefined
             }
             placeholder={
-              evicted
-                ? "Session opened in another window — take over to continue"
-                : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
+              readOnly
+                ? "This conversation is read-only"
+                : evicted
+                  ? "Session opened in another window — take over to continue"
+                  : "Enter to send, Shift+Enter for newline, @ for files, / for commands and skills"
             }
             className={[
               "min-h-[104px] pb-10 pr-3 sm:min-h-[80px]",
@@ -530,7 +565,7 @@ export const Composer = memo(function Composer({
                   // Switchable whenever the session can hear it: the server
                   // rebuilds nothing, so mid-turn and awaiting-approval are
                   // both fine — and are exactly when the user wants it.
-                  disabled={!connected || evicted}
+                  disabled={!writable || !connected || evicted}
                   onSetMode={onSetPermissionMode}
                 />
               ) : null}
@@ -544,7 +579,7 @@ export const Composer = memo(function Composer({
                   providers={providers}
                   providerId={providerId}
                   reasoningEffort={reasoningEffort}
-                  disabled={!connected || busy}
+                  disabled={!writable || !connected || busy}
                   modelLocked={!selectingTarget}
                   requireImageModel={requireImageModel}
                   serverUrl={serverUrl}
@@ -574,7 +609,7 @@ export const Composer = memo(function Composer({
                   className="size-8 rounded-md"
                   type="button"
                   onClick={onAbort}
-                  disabled={!connected}
+                  disabled={!writable || !connected}
                   title="Abort"
                 >
                   <CircleStop />
@@ -593,7 +628,7 @@ export const Composer = memo(function Composer({
             </div>
           </div>
         </div>
-        {imagesBlockSend && (
+        {writable && imagesBlockSend && (
           <p className="mx-auto mt-1 max-w-4xl text-xs text-destructive">
             The selected model does not support images. Switch to a vision-capable model or remove
             the attached images.

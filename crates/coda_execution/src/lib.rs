@@ -26,6 +26,7 @@
 //! output cap in RAM and unread output survives a hub entry release.
 
 mod archive_dir;
+mod archived_tasks;
 mod disk_tail;
 mod manifest;
 pub mod process;
@@ -34,6 +35,7 @@ mod registry;
 mod task_archive;
 
 pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, BackgroundRootLock};
+pub use archived_tasks::ArchivedTasks;
 pub use coda_core::task::{InvalidTaskId, TaskId};
 pub use disk_tail::{DiskTail, OutputChunk};
 pub use manifest::{ExpireReason, OutputDisposition, StreamManifest, TaskOutputManifest};

@@ -10,6 +10,7 @@ import type { WorkspaceSummary } from "../src/lib/protocol.ts";
 
 function openedSession(overrides: Partial<OpenedSession> = {}): OpenedSession {
   return {
+    access: { type: "read_write" },
     key: "ws/s1",
     workspaceId: "ws",
     sessionId: "s1",
