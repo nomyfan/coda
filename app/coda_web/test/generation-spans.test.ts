@@ -179,3 +179,36 @@ test("a rewind drops spans for the calls it discarded", () => {
   expect(after.generationSpans.call_gone).toBeUndefined();
   expect(after.generationSpans.call_kept).toEqual({ startedAt: at(0), endedAt: at(2) });
 });
+
+test("historical and live assistant entries keep their recorded model independently of session selection", () => {
+  const metadata = {
+    provider_id: "removed-provider",
+    model_id: "removed-preview",
+    reasoning_effort: "high",
+  };
+  const oldReply = { ...toolCallOnly("old", "unused", 0, 1), content: "old reply", tool_calls: [] };
+  const reply = {
+    ...oldReply,
+    message_id: "recorded",
+    content: "recorded reply",
+    generation: metadata,
+    reasoning_content: "recorded reasoning",
+  };
+  const applied = applySnapshotToSession(session(), {
+    ...snapshot([{ Assistant: oldReply }, { Assistant: reply }]),
+    providerId: "new:released",
+  });
+  expect(applied.entries.find((e) => e.messageId === "old")?.model).toBeUndefined();
+  expect(applied.entries.filter((e) => e.id.endsWith(":recorded")).map((e) => e.model)).toEqual([
+    metadata,
+    metadata,
+  ]);
+  const updated = reduceEvent(applied, {
+    type: "llm_end",
+    agent_name: "worker",
+    pid: "child",
+    message: { ...reply, message_id: "child-reply" },
+  });
+  expect(updated.entries.find((e) => e.messageId === "child-reply")?.model).toEqual(metadata);
+  expect(updated.providerId).toBe("new:released");
+});

@@ -26,6 +26,7 @@ fn assistant_in(turn: TurnId, call_id: &str, prompt_tokens: Option<u32>) -> Hist
     entry_in(
         turn,
         Message::Assistant(AssistantMessage {
+            generation: None,
             message_id: MessageId::new(),
             content: String::new(),
             tool_calls: vec![ToolCall {
@@ -89,6 +90,7 @@ fn the_transcript_carries_calls_and_their_results() {
                 "read the config",
             ))),
             entry(Message::Assistant(AssistantMessage {
+                generation: None,
                 message_id: MessageId::new(),
                 content: "Looking.".into(),
                 tool_calls: vec![ToolCall {

@@ -102,6 +102,7 @@ async fn parallel_invocations(background_enabled: bool) {
             HashMap::new(),
             RunConfig {
                 default_model: ModelProfile {
+                    provider_id: "test".into(),
                     provider: ParallelProvider(Arc::new(Barrier::new(2)), background_enabled),
                     model: "fake".into(),
                     label: "fake".into(),

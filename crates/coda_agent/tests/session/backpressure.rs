@@ -77,6 +77,7 @@ async fn replies_exceeding_inbox_capacity_do_not_block_dispatch_or_shutdown() {
         .storage(MemoryStorage::default())
         .run_config(RunConfig {
             default_model: ModelProfile {
+                provider_id: "test".into(),
                 provider: provider.clone(),
                 model: "fake".into(),
                 label: "fake".into(),

@@ -65,7 +65,7 @@ async fn settling_unattended_marks_completed_and_releases() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -102,7 +102,7 @@ async fn settling_while_attached_does_not_mark() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -139,7 +139,7 @@ async fn suspending_while_unattended_does_not_mark() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -178,7 +178,7 @@ async fn attach_cannot_land_between_the_unattended_check_and_the_write() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -209,7 +209,7 @@ async fn attach_cannot_land_between_the_unattended_check_and_the_write() {
             hub.attach(
                 key(),
                 2,
-                "prov".into(),
+                "prov:fake".into(),
                 None,
                 PermissionMode::default(),
                 true,
@@ -252,7 +252,7 @@ async fn running_sessions_reports_only_running_sessions_in_the_given_workspace()
         .attach(
             running.clone(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -274,7 +274,7 @@ async fn running_sessions_reports_only_running_sessions_in_the_given_workspace()
     hub.attach(
         idle.clone(),
         2,
-        "prov".into(),
+        "prov:fake".into(),
         None,
         PermissionMode::default(),
         false,

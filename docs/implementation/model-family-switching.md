@@ -112,7 +112,7 @@ generation: Option<GenerationMetadata>
 
 目标模型可有不同的 effort 列表；保留当前 effort（若支持），否则 UI 选择目标默认值并显示后提交。显式传入不支持的值由服务端拒绝，省略则使用目标 `default_reasoning_effort`，再回退首项，无控制项则 None。
 
-不要求同 family 的所有配置字段相等。切换预检检查所有将继承新默认模型的已保存 process 的有效模型上下文；存在图片而目标仅支持文本时拒绝，显式指定其他模型的 process 不参与此检查。服务端给出具体不兼容原因，前端不得仅检查根 thread 的图片。
+不要求同 family 的所有配置字段相等。切换预检检查所有将继承新默认模型的已保存 process 的有效模型上下文；存在图片而目标仅支持文本时拒绝，显式指定其他模型的 process 不参与此检查。历史兼容性以服务端候选结果为准，前端只对未提交的草稿图片增加限制；已被压缩覆盖、但仍显示在历史中的图片不能再次禁用合法候选。
 
 上下文容量、输出上限和压缩阈值采用目标配置。既有 usage 是旧请求的统计，不能精确证明新模型的请求会适配；本次不新增 tokenizer 或自动跨模型历史转换，也不因切换直接压缩/删除历史。较小上下文的目标可能连压缩请求都无法接收，不能把自动压缩当作兼容保证；此限制在错误处理和验证中明确保留。
 
@@ -126,7 +126,7 @@ generation: Option<GenerationMetadata>
 4. 目标打开成功进入 Live；遇到 `PendingApprovalsRequired` 进入 Pending；其他打开错误进入新的 `ReopenRequired` 状态，保留新绑定、历史、审批和后台 registry，等待显式重试。
 5. 返回新的完整 snapshot，统一更新模型、family、access、审批与后台状态。只有 Live/Pending 恢复成功才提示切换完成；打开失败明确提示“模型选择已保存，会话恢复失败”，可重试当前目标或改选兼容目标。
 
-`ReopenRequired` 无可执行 runtime，对执行命令只读，允许重新 set_model、查看历史/任务结果及既有管理操作。Snapshot 增加 `runtime_open_failed` 只读原因和可展示的打开错误；已附着会话的目录 access 优先使用 hub 状态。新 attach 遇到该状态仍展示错误，不因网络重连不断自动重试；服务重启后按数据库绑定走正常打开流程。
+`ReopenRequired` 无可执行 runtime，对执行命令只读，允许重新 set_model、查看历史/任务结果及既有管理操作。Snapshot 增加 `runtime_open_failed` 只读原因和可展示的打开错误；已附着会话的目录 access 优先使用 hub 状态。`runtime_open_failed` 和 `binding_unconfirmed` 的 entry 即使没有后台任务或通知，也跨断线保留；新 attach 继续展示原错误，等待显式重试，不因网络重连自动恢复。普通只读会话仍可在无人连接且无后台工作时释放；删除和服务关闭继续清理 entry，服务重启后按数据库绑定走正常打开流程。
 
 重建由 hub 持有并完成，不因原请求连接断开而取消。切换窗口不接纳任务，不投递自动通知；请求的最终 snapshot 必须先于新 runtime 事件交付，避免客户端用旧快照覆盖新消息。复用现有 attach 的订阅与事件排序规则。
 
@@ -135,6 +135,8 @@ generation: Option<GenerationMetadata>
 确认使用同一数据库主库上的新连接和短 Read Committed 事务，按稳定的 `(workspace_id, session_id)` 主键执行 `SELECT model_binding ... FOR UPDATE`，不把旧绑定值放进 WHERE。只有取得与原写事务冲突的行锁、等待其提交或回滚后，才使用锁定读取返回的最终绑定判断：等于 expected 表示此次切换未提交，等于 next 表示已经提交并继续恢复。不能用之前的普通读取结果代替这个结果。[PostgreSQL 行锁文档](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)
 
 这一确认依赖写入路径先取得同一行锁，再发送 UPDATE，并一直持锁到事务结束，具体顺序见存储接口约束。锁等待超时、连接再次中断、行消失或读到 expected/next 之外的绑定，都不能解禁执行或自动重写旧绑定。此时继续保留结果未确认的状态，只允许后续重新确认；确认事务正常结束后才按结果推进。确认期间会话锁/操作门禁禁止其他会话绑定变更，因此不会将后续切换的结果误认为本次结果。
+
+显式重试完成确认后，先按当前配置重新判定最终绑定的可用性。若确认回滚到已经下架的 Preview，清除待确认状态及恢复错误，返回普通只读 snapshot，让用户重新选择同 family 的可用模型；不能继续要求该 Preview 通过模型校验。绑定可用时继续恢复；若后续历史校验或打开失败，保留明确的恢复失败状态，不能退回 `binding_unconfirmed`。
 
 进程崩溃后的第一次 attach 在启用 runtime 前也通过这一行锁等待关系读取绑定，不能假定旧数据库连接已随应用进程立即退出。确认后以数据库中保存的绑定为准；若无法确认则保持禁止执行。
 
@@ -221,24 +223,42 @@ ProviderInfoWire 增加 family，供新会话选择和展示使用。已有会�
 
 ## Implementation Roadmap
 
-- [ ] [状态验证] 用 hub fake opener 验证提交前失败、提交后打开失败、Pending 恢复、同目标重试及断线完成；补充旧 runtime 不接收工作、后台 shell registry 不被关闭的断言。
+- [x] [状态验证] 用 hub fake opener 验证提交前失败、提交后打开失败、Pending 恢复、同目标重试及断线完成；补充旧 runtime 不接收工作、后台 shell registry 不被关闭的断言。
   目的：先验证提交点与 ReopenRequired 状态是否覆盖真实失败路径。
   验证：数据库绑定、内存选择、snapshot、审批及通知顺序一致；OutcomeUnknown 期间保持禁止执行，只有锁定确认旧值后才恢复旧 runtime，确认新值则恢复新模型；失败后没有隐式旧模型调用。
-- [ ] [配置与存储] 增加 family，集中资格判断，改完整 binding 条件更新与 attach 补录。
+- [x] [配置与存储] 增加 family，集中资格判断，改完整 binding 条件更新与 attach 补录。
   目的：建立持久化兼容归属，原模型移除后仍可解析候选。
   验证：配置空值/错误类型、跨 provider、空值补录、非空不覆盖、配置 family 漂移、并发条件更新、fork/rewind；JSON 缺字段历史可读。固定 F 后把原模型配置改为 G/None，分别验证同模型 effort 修改、只读恢复、失败重试和相同选择请求均被拒绝；保留未建立归属时原模型 effort 可调整的对照用例。
-- [ ] [数据库时序] 在 throwaway PostgreSQL 用独立连接和同步屏障验证未知提交结果，不能仅用 fake storage 模拟锁语义。
+- [x] [数据库时序] 在 throwaway PostgreSQL 用独立连接和同步屏障验证未知提交结果，不能仅用 fake storage 模拟锁语义。
   目的：证明确认读取等待原事务结束，关闭“先读到旧绑定，原事务随后提交”的窗口。
   验证：事务 A 锁行、更新后保持未提交；连接 B 普通读取仍为旧值；确认连接 C 的 FOR UPDATE 必须阻塞。A 提交后 C 返回新值，hub 在此之前不得启用旧 runtime；A 回滚时 C 才返回旧值。另覆盖锁超时/连接错误继续禁止执行、首次 attach 等待残留写事务，以及加锁未确认前不会发送 UPDATE。使用明确的同步信号/数据库锁状态观察保证时序，不靠 sleep 猜测。
-- [ ] [消息来源] 增加 GenerationMetadata 与 profile provider_id，覆盖完成/取消消息及 provider 请求转换。
+- [x] [消息来源] 增加 GenerationMetadata 与 profile provider_id，覆盖完成/取消消息及 provider 请求转换。
   目的：每条历史回复能独立说明当时的模型来源。
   验证：根/继承/override 子 agent、无 usage、取消、旧消息、存储往返、fork、rewind；发往 provider 的请求不含 generation 元数据。
-- [ ] [服务端整合] 打通 live 切换、只读恢复、状态快照、目标模态校验和 effort 选择，保留 cold-open 清理及审批。
+- [x] [服务端整合] 打通 live 切换、只读恢复、状态快照、目标模态校验和 effort 选择，保留 cold-open 清理及审批。
   目的：把配置分组变成可恢复且状态一致的用户操作。
   验证：真实 throwaway PostgreSQL 的 RPC 测试覆盖 Preview 配置删除并重启、待审批恢复、当前 effort 下架、scope 清理失败、打开失败重试与断线重连；不访问真实 LLM。
-- [ ] [Web 与说明] 替换 modelLocked 判定，接收完整 snapshot，增加恢复错误/重试和消息来源展示，更新配置示例与项目说明。
+- [x] [Web 与说明] 替换 modelLocked 判定，接收完整 snapshot，增加恢复错误/重试和消息来源展示，更新配置示例与项目说明。
   目的：旧模型缺失时仍可操作，界面不误报恢复成功，不反推历史来源。
   验证：正常切换、只读恢复、目标默认 effort、无候选、旧消息、子 agent 来源、旧响应/新事件顺序；配置目录删除后 ID 仍可显示。
-- [ ] [最终检查] Rust 执行 `cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`；在 throwaway 数据库执行 pg-tests。Web 执行 `pnpm --filter coda-web lint` 与 `pnpm --filter coda-web test`。
+- [x] [最终检查] Rust 执行 `cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`；在 throwaway 数据库执行 pg-tests。Web 执行 `pnpm --filter coda-web lint` 与 `pnpm --filter coda-web test`。
   目的：覆盖默认构建未编译的存储测试，以及协议两端。
   验证：全部通过；检查默认系统提示与 templates，仅在模型/审批恢复行为影响 agent 决策时补充简短规则，不向 prompt 复制配置或存储实现。
+
+## Deviations from Design
+
+- `ReopenRequired` 复用 `ReadOnlyState` 表示，以 `runtime_open_failed` / `binding_unconfirmed` 区分打开失败与绑定待确认，避免复制只读历史、任务结果及管理操作的处理。断线释放时单独保留这两种状态，不能把它们当作普通只读 entry 释放。
+- attach 补录 family 时，也会持久化原绑定缺少的默认 effort；不能只修改内存中的 effort，否则后续完整绑定条件更新会与数据库不匹配。
+
+## Implementation Verification
+
+- hub 测试覆盖提交前失败、提交结果未知、确认提交/回滚、确认失败保持只读、打开失败后同目标重试、请求取消，以及后台 shell registry 和 permission mode 保留。
+- 本次 review 的回归测试先复现、后验证修复：确认回滚到已下架 Preview 后返回普通只读 snapshot，并可手动改选兼容模型；两种恢复错误在无后台工作时跨断线保留，重连不调用 opener 或重新确认，显式重试才恢复。另有对照测试验证普通只读会话仍在断线后释放。
+- 独立 PostgreSQL 测试库验证真实行锁等待、普通读取旧值后原事务提交/回滚、确认锁超时、首次 attach 等待残留事务、绑定条件更新，以及消息来源随 fork/rewind 保留。
+- 数据库 RPC 测试覆盖 Preview 删除并重启、跨 provider 手动恢复、待审批保留、family 漂移拒绝 effort/no-op/重试、空归属补录、子 agent 图片及显式 override、冷恢复 scope 清理失败后重试。
+- 生成来源测试覆盖根 agent、继承模型及显式 override 的子 agent、无 usage 的正常回复、取消后的部分回复、旧消息反序列化，以及 provider 请求不携带历史来源字段。
+- Web 测试覆盖完整 snapshot 恢复、已提交但未能打开时保持只读、同目标重试、已删除模型的选择器展示、目标默认 effort 和历史/子 agent 消息来源。
+- Web 回归测试通过实际 App → Composer → ModelSelector 的数据传递，验证压缩后的历史图片不禁用服务端允许的文本候选、未提交的草稿图片仍要求图片能力，以及服务端排除的候选不会被前端启用。
+- 已检查默认系统提示与 templates。本次模型配置和 UI 恢复未新增 agent 需要遵守的执行规则，因此无需修改 prompt。
+
+最终检查：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets` 均通过；完整 `cargo test --features pg-tests` 使用本次新建的临时测试库通过，其中 hub 所在的服务端库测试 278 项、数据库存储测试 54 项、数据库 RPC 测试 7 项。Web 的 lint、typecheck 和 167 项测试全部通过。`git diff --check` 无错误。临时测试库已删除，未调用真实 LLM。

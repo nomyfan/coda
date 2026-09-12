@@ -125,6 +125,7 @@ path = "/tmp/scratch"
             base_url: "https://api.deepseek.com/v1".to_string(),
             include_usage: true,
             models: vec![ModelConfig {
+                family: None,
                 id: "deepseek-reasoner".to_string(),
                 name: "DeepSeek R1".to_string(),
                 context_window: 128_000,
@@ -1220,5 +1221,37 @@ fn tool_call(name: &str) -> ToolCall {
         id: "test".into(),
         name: name.into(),
         arguments: None,
+    }
+}
+
+#[test]
+fn model_family_is_optional_and_requires_a_nonempty_exact_string() {
+    for (field, expected) in [
+        ("", None),
+        (", family = \"M1\"", Some("M1")),
+        (", family = \"m1\"", Some("m1")),
+    ] {
+        let config = PROVIDERS.replace(
+            "context_window = 128000",
+            &format!("context_window = 128000{field}"),
+        );
+        let parsed = parse_server_config(
+            &format!("{config}{DATABASE}\n[[workspaces]]\nid = \"test\"\npath = \".\"\n"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(parsed.providers[0].models[0].family.as_deref(), expected);
+    }
+    for value in ["\"\"", "\" \"", "\" f\"", "\"f \"", "42", "true", "[]"] {
+        let config = PROVIDERS.replace(
+            "context_window = 128000",
+            &format!("context_window = 128000, family = {value}"),
+        );
+        let error = parse_server_config(
+            &format!("{config}{DATABASE}\n[[workspaces]]\nid = \"test\"\npath = \".\"\n"),
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("family"), "{value}: {error}");
     }
 }

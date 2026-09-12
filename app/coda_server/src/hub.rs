@@ -30,8 +30,13 @@ use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tracing::{error, info, warn};
 
 use crate::config::{PermissionMode, PermissionModeCell, RelayConfig};
-use crate::session_access::{SessionAccess, SessionModelResolution, UnavailableModel};
-use crate::storage::{ForkCut, ForkError, ForkSource, ForkedSession, RewindError, UnseenOutcome};
+use crate::session_access::{
+    ReadOnlyReason, SessionAccess, SessionModelResolution, UnavailableModel,
+};
+use crate::storage::{
+    ForkCut, ForkError, ForkSource, ForkedSession, RewindError, SessionMetadataError,
+    SessionModelBinding, UnseenOutcome,
+};
 use crate::wire::{ModelSelection, WireEvent};
 
 /// Buffer size per lagging status-broadcast subscriber. A dropped event only
@@ -128,6 +133,8 @@ pub enum RelayEvent {
 #[derive(Debug, Clone)]
 pub struct SnapshotPayload {
     pub access: SessionAccess,
+    pub model_family: Option<String>,
+    pub runtime_open_error: Option<String>,
     pub background_tasks_error: Option<String>,
     pub messages: Vec<Message>,
     pub pending_approvals: Vec<PendingApproval>,
@@ -205,16 +212,12 @@ pub enum CommandOutcome {
     /// which is what puts it back in step with the truncated history.
     RewindNotStarted,
     /// A `SetModel` was applied.
-    ModelChanged {
-        provider_id: String,
-        reasoning_effort: Option<String>,
-    },
+    ModelChanged(Box<SnapshotPayload>),
     /// A `SetModel` selecting the model already in effect: a benign no-op the
     /// request dispatcher reports as idempotent success (echoing the selection).
-    Unchanged,
-    /// Provider/model is immutable after the session is opened. Only the
-    /// reasoning effort of that exact model can be changed.
-    ModelLocked,
+    Unchanged(Box<SnapshotPayload>),
+    /// The requested model, effort, family, or input capabilities are incompatible.
+    InvalidModel(String),
     /// A `SetModel` rejected because a turn is in flight (the session can only be
     /// rebuilt while idle). Reported as `MODEL_SWITCH_WHILE_RUNNING`.
     TurnRunning,
@@ -341,6 +344,9 @@ pub trait SessionOpener: Send + Sync + 'static {
         initial: Option<&'a ModelSelection>,
     ) -> Pin<Box<dyn Future<Output = Result<SessionModelResolution, OpenError>> + Send + 'a>>;
 
+    /// Classify an already confirmed binding against the current catalog, without I/O or mutation.
+    fn classify_model_binding(&self, binding: SessionModelBinding) -> SessionModelResolution;
+
     /// Read persisted history and approvals without restoring or changing execution.
     fn load_read_only_history<'a>(
         &'a self,
@@ -441,14 +447,25 @@ pub trait SessionOpener: Send + Sync + 'static {
         instructions: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Compacted, CompactError>> + Send + 'a>>;
 
-    /// Persist an effort update after a replacement runtime has been built but
-    /// before it becomes live.
-    fn update_reasoning_effort<'a>(
+    /// Validate a target against the fixed family and inherited model history.
+    fn validate_model_change<'a>(
         &'a self,
         key: &'a SessionKey,
-        provider_id: &'a str,
-        reasoning_effort: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+        current: &'a SessionModelBinding,
+        requested: &'a ModelSelection,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, String>> + Send + 'a>>;
+
+    fn update_model_binding<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        expected: &'a SessionModelBinding,
+        next: &'a SessionModelBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>;
+
+    fn confirm_model_binding<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>;
 
     /// Record that `key`'s turn just settled with nobody attached. Best-effort.
     fn mark_unseen_outcome<'a>(
@@ -563,8 +580,13 @@ pub trait SessionRelay: Send + Sync {
     /// but the catalog stays correct regardless.
     fn subscribe_status(&self) -> BoxStream<'static, SessionStatusEvent>;
 
-    /// Session ids in `workspace_id` with a turn currently in flight,
-    /// regardless of attachment. A point-in-time read, not a subscription.
+    /// Access of initialized entries, including model recovery failures.
+    fn session_accesses<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HashMap<String, SessionAccess>> + Send + 'a>>;
+
+    /// Session ids with a turn currently in flight, regardless of attachment.
     fn running_sessions<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -747,8 +769,7 @@ struct Attachment {
 
 struct LiveState {
     session: Session,
-    provider_id: String,
-    reasoning_effort: Option<String>,
+    binding: SessionModelBinding,
     /// Bumped when `SetModel` swaps the underlying session so the previous
     /// forwarder retires itself.
     generation: u64,
@@ -771,6 +792,9 @@ struct LiveState {
 
 struct ReadOnlyState {
     model: UnavailableModel,
+    runtime_open_error: Option<String>,
+    pending_binding: Option<(SessionModelBinding, SessionModelBinding)>,
+    generation: u64,
     history: ReadOnlyHistory,
     archive: Option<Arc<ArchivedTasks>>,
     tasks: Arc<[TaskSummary]>,
@@ -778,8 +802,8 @@ struct ReadOnlyState {
 }
 
 struct PendingState {
-    provider_id: String,
-    reasoning_effort: Option<String>,
+    binding: SessionModelBinding,
+    generation: u64,
     /// Thread ids still awaiting a resume decision.
     needed: HashSet<String>,
     decisions: HashMap<String, ResumeDecision>,
@@ -892,6 +916,7 @@ type EntryGuard = OwnedMutexGuard<EntryState>;
 type Entries = Arc<std::sync::Mutex<HashMap<SessionKey, Arc<SessionEntry>>>>;
 
 /// In-process [`SessionRelay`] implementation.
+#[derive(Clone)]
 pub struct SessionHub {
     opener: Arc<dyn SessionOpener>,
     entries: Entries,
@@ -1202,7 +1227,12 @@ impl SessionHub {
         }
         let idle = match &state.phase {
             EntryPhase::Live(live) => !live.turn_running,
-            EntryPhase::Pending(_) | EntryPhase::ReadOnly(_) => true,
+            EntryPhase::Pending(_) => true,
+            // Reconnecting must preserve a failed recovery until an explicit retry.
+            EntryPhase::ReadOnly(read_only) => !matches!(
+                read_only.model.reason,
+                ReadOnlyReason::RuntimeOpenFailed | ReadOnlyReason::BindingUnconfirmed
+            ),
             _ => false,
         };
         if !idle {
@@ -1440,8 +1470,7 @@ impl SessionHub {
         &self,
         entry: &Arc<SessionEntry>,
         session: Session,
-        provider_id: String,
-        reasoning_effort: Option<String>,
+        binding: SessionModelBinding,
         generation: u64,
     ) -> Box<LiveState> {
         let root_name = session.root_name().to_string();
@@ -1461,8 +1490,7 @@ impl SessionHub {
         );
         Box::new(LiveState {
             session,
-            provider_id,
-            reasoning_effort,
+            binding,
             generation,
             turn_running,
             snapshot,
@@ -1554,8 +1582,8 @@ impl SessionHub {
             }
             state.compacting = true;
             (
-                live.provider_id.clone(),
-                live.reasoning_effort.clone(),
+                live.binding.selection_key(),
+                live.binding.reasoning_effort.clone(),
                 live.generation,
             )
         };
@@ -1650,7 +1678,7 @@ impl SessionHub {
         let permission_mode = state.permission_mode.clone();
         let background = self.ensure_background(entry, state).await;
         let compacting = state.compacting;
-        let (provider_id, reasoning_effort, generation, previous_snapshot) = {
+        let (binding, generation, previous_snapshot) = {
             let EntryPhase::Live(live) = &mut state.phase else {
                 return CommandOutcome::Ignored;
             };
@@ -1674,8 +1702,7 @@ impl SessionHub {
             // shutdown is here for the rebuild alone.
             live.session.shutdown(Shutdown::graceful_unbounded()).await;
             (
-                live.provider_id.clone(),
-                live.reasoning_effort.clone(),
+                live.binding.clone(),
                 live.generation + 1,
                 std::mem::take(&mut live.snapshot),
             )
@@ -1690,8 +1717,8 @@ impl SessionHub {
             .opener
             .open(
                 key,
-                &provider_id,
-                reasoning_effort.clone(),
+                &binding.selection_key(),
+                binding.reasoning_effort.clone(),
                 permission_mode,
                 HashMap::new(),
                 background,
@@ -1704,8 +1731,7 @@ impl SessionHub {
                 return CommandOutcome::OpenFailed(err);
             }
         };
-        let mut replacement =
-            self.make_live(entry, session, provider_id, reasoning_effort, generation);
+        let mut replacement = self.make_live(entry, session, binding, generation);
 
         let messages = match truncated {
             Ok(messages) => {
@@ -1835,8 +1861,8 @@ impl SessionHub {
                 if !pending.needed.is_empty() {
                     return CommandOutcome::Ok;
                 }
-                let provider_id = pending.provider_id.clone();
-                let reasoning_effort = pending.reasoning_effort.clone();
+                let provider_id = pending.binding.selection_key();
+                let reasoning_effort = pending.binding.reasoning_effort.clone();
                 let decisions = std::mem::take(&mut pending.decisions);
                 match self
                     .opener
@@ -1854,9 +1880,8 @@ impl SessionHub {
                         state.phase = EntryPhase::Live(self.make_live(
                             entry,
                             session,
-                            provider_id,
-                            reasoning_effort,
-                            0,
+                            pending.binding.clone(),
+                            pending.generation,
                         ));
                         CommandOutcome::Ok
                     }
@@ -1885,88 +1910,255 @@ impl SessionHub {
         provider_id: String,
         reasoning_effort: Option<String>,
     ) -> CommandOutcome {
-        // The registry is the entry's, not the runtime's: the replacement
-        // session adopts the very tasks the outgoing one started.
-        let background = self.ensure_background(entry, state).await;
-        // Not `Live` (stale/not-attached is caught earlier by `command`'s guard;
-        // this is the non-`Live` phase): the dispatcher reads `Ignored` on the
-        // `set_model` path as `SESSION_NOT_LIVE` (Decision 8).
-        let permission_mode = state.permission_mode.clone();
-        // The rebuild below replaces the whole `LiveState`, which a running
-        // compaction is about to write its result into.
         if state.compacting {
             return CommandOutcome::NotIdle;
         }
-        let EntryPhase::Live(live) = &mut state.phase else {
-            return CommandOutcome::Ignored;
+        let (mut current, generation) = match &state.phase {
+            EntryPhase::Live(live) => {
+                if live.turn_running
+                    || live.session.has_background_work()
+                    || !live.session.pending_approvals().is_empty()
+                {
+                    return CommandOutcome::TurnRunning;
+                }
+                (live.binding.clone(), live.generation + 1)
+            }
+            EntryPhase::ReadOnly(read_only) => {
+                (read_only.model.binding.clone(), read_only.generation)
+            }
+            EntryPhase::Pending(_) => return CommandOutcome::NotIdle,
+            _ => return CommandOutcome::Ignored,
         };
-        // Selecting the current model is a benign no-op: idempotent success.
-        if live.provider_id == provider_id && live.reasoning_effort == reasoning_effort {
-            return CommandOutcome::Unchanged;
+        let mut confirming = false;
+        if let EntryPhase::ReadOnly(read_only) = &mut state.phase
+            && let Some((expected, next)) = &read_only.pending_binding
+        {
+            match self.opener.confirm_model_binding(key).await {
+                Ok(binding) if binding == *expected || binding == *next => {
+                    read_only.pending_binding = None;
+                    match self.opener.classify_model_binding(binding) {
+                        SessionModelResolution::Available(binding) => {
+                            confirming = true;
+                            current = binding;
+                            read_only.model.binding = current.clone();
+                        }
+                        SessionModelResolution::Unavailable(model) => {
+                            // Confirmation can establish rollback to an unavailable Preview.
+                            // The transaction is resolved; restore normal model selection.
+                            read_only.model = model;
+                            read_only.runtime_open_error = None;
+                            return CommandOutcome::ModelChanged(Box::new(
+                                compose_snapshot(
+                                    &state.phase,
+                                    state.permission_mode.get(),
+                                    false,
+                                    current_tasks(state),
+                                )
+                                .expect("initialized"),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return CommandOutcome::PersistenceFailed(
+                        "model binding is still unconfirmed; execution remains disabled".into(),
+                    );
+                }
+            }
         }
-        // The session is rebuilt with a new RunConfig; only safe while idle.
-        if live.session.has_background_work() || live.turn_running {
-            warn!(workspace_id = %key.0, session_id = %key.1, "ignoring set_model while a turn is running");
-            return CommandOutcome::TurnRunning;
+        let requested = if confirming {
+            ModelSelection {
+                provider_id: current.selection_key(),
+                reasoning_effort: current.reasoning_effort.clone(),
+            }
+        } else {
+            ModelSelection {
+                provider_id,
+                reasoning_effort,
+            }
+        };
+        let next = match self
+            .opener
+            .validate_model_change(key, &current, &requested)
+            .await
+        {
+            Ok(next) => next,
+            Err(error) if confirming => {
+                self.park_model_recovery(
+                    entry,
+                    state,
+                    current,
+                    ReadOnlyReason::RuntimeOpenFailed,
+                    error,
+                    None,
+                )
+                .await;
+                return CommandOutcome::ModelChanged(Box::new(
+                    compose_snapshot(
+                        &state.phase,
+                        state.permission_mode.get(),
+                        false,
+                        current_tasks(state),
+                    )
+                    .expect("initialized"),
+                ));
+            }
+            Err(error) => return CommandOutcome::InvalidModel(error),
+        };
+        if next == current && matches!(state.phase, EntryPhase::Live(_)) {
+            return CommandOutcome::Unchanged(Box::new(
+                compose_snapshot(
+                    &state.phase,
+                    state.permission_mode.get(),
+                    false,
+                    current_tasks(state),
+                )
+                .expect("initialized"),
+            ));
         }
-        if live.provider_id != provider_id {
-            return CommandOutcome::ModelLocked;
+        if next != current {
+            match self.opener.update_model_binding(key, &current, &next).await {
+                Ok(_) => {}
+                Err(SessionMetadataError::OutcomeUnknown(error)) => {
+                    match self.opener.confirm_model_binding(key).await {
+                        Ok(binding) if binding == next => {}
+                        Ok(binding) if binding == current => {
+                            return CommandOutcome::PersistenceFailed(error);
+                        }
+                        _ => {
+                            if let EntryPhase::Live(live) = &state.phase {
+                                live.session.shutdown(Shutdown::abort()).await;
+                            }
+                            self.park_model_recovery(
+                                entry,
+                                state,
+                                current.clone(),
+                                ReadOnlyReason::BindingUnconfirmed,
+                                error,
+                                Some((current, next)),
+                            )
+                            .await;
+                            return CommandOutcome::ModelChanged(Box::new(
+                                compose_snapshot(
+                                    &state.phase,
+                                    state.permission_mode.get(),
+                                    false,
+                                    current_tasks(state),
+                                )
+                                .expect("initialized"),
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return CommandOutcome::PersistenceFailed(error.to_string()),
+            }
         }
-        // Open the replacement before tearing down the current session, so a
-        // failed open leaves the existing one intact. The old session is idle,
-        // so its checkpoint is durable and the new open reads current state.
+        // The binding has committed. Retire the old runtime before opening the
+        // replacement; its shutdown must not close the entry-owned registry.
+        if let EntryPhase::Live(live) = &state.phase {
+            live.session.shutdown(Shutdown::abort()).await;
+        }
+        let background = self.ensure_background(entry, state).await;
         match self
             .opener
             .open(
                 key,
-                &provider_id,
-                reasoning_effort.clone(),
-                // The same cell, so the rebuilt runtime keeps reading the
-                // posture the session already had.
-                permission_mode,
+                &next.selection_key(),
+                next.reasoning_effort.clone(),
+                state.permission_mode.clone(),
                 HashMap::new(),
                 background,
             )
             .await
         {
             Ok(session) => {
-                if let Err(error) = self
-                    .opener
-                    .update_reasoning_effort(key, &provider_id, reasoning_effort.as_deref())
-                    .await
-                {
-                    session.shutdown(Shutdown::abort()).await;
-                    return CommandOutcome::PersistenceFailed(error);
-                }
-                let generation = live.generation + 1;
-                let mut replacement = self.make_live(
-                    entry,
-                    session,
-                    provider_id.clone(),
-                    reasoning_effort.clone(),
+                state.phase = EntryPhase::Live(self.make_live(entry, session, next, generation))
+            }
+            Err(OpenError::PendingApprovalsRequired(approvals)) => {
+                state.phase = EntryPhase::Pending(PendingState {
+                    binding: next,
                     generation,
-                );
-                // History is unchanged by a model swap; keep the in-memory
-                // snapshot rather than trusting a re-read (both match here,
-                // but staying on one source keeps the invariant simple).
-                replacement.snapshot = std::mem::take(&mut live.snapshot);
-                let old = std::mem::replace(live, replacement);
-                // The old runtime is idle; abort it outside the state mutation
-                // path. Its forwarder retires on the generation bump.
-                tokio::spawn(async move {
-                    old.session.shutdown(Shutdown::abort()).await;
+                    needed: approvals
+                        .iter()
+                        .map(|approval| approval.pid.clone())
+                        .collect(),
+                    decisions: HashMap::new(),
+                    approvals,
+                    snapshot: self.opener.load_messages(key).await,
                 });
-                CommandOutcome::ModelChanged {
-                    provider_id,
-                    reasoning_effort,
-                }
             }
-            Err(err @ OpenError::PendingApprovalsRequired(_)) => {
-                warn!(workspace_id = %key.0, session_id = %key.1, "cannot switch model while approvals are pending");
-                CommandOutcome::OpenFailed(err)
+            Err(error) => {
+                self.park_model_recovery(
+                    entry,
+                    state,
+                    next,
+                    ReadOnlyReason::RuntimeOpenFailed,
+                    error.to_string(),
+                    None,
+                )
+                .await;
             }
-            Err(err) => CommandOutcome::OpenFailed(err),
         }
+        CommandOutcome::ModelChanged(Box::new(
+            compose_snapshot(
+                &state.phase,
+                state.permission_mode.get(),
+                false,
+                current_tasks(state),
+            )
+            .expect("initialized"),
+        ))
+    }
+
+    async fn park_model_recovery(
+        &self,
+        entry: &Arc<SessionEntry>,
+        state: &mut EntryState,
+        binding: SessionModelBinding,
+        reason: ReadOnlyReason,
+        error: String,
+        pending_binding: Option<(SessionModelBinding, SessionModelBinding)>,
+    ) {
+        let generation = match &state.phase {
+            EntryPhase::Live(live) => live.generation + 1,
+            EntryPhase::ReadOnly(read_only) => read_only.generation,
+            _ => 0,
+        };
+        let history = match &state.phase {
+            EntryPhase::Live(live) => ReadOnlyHistory {
+                messages: live.snapshot.clone(),
+                approvals: live.session.pending_approvals(),
+            },
+            EntryPhase::ReadOnly(read_only) => ReadOnlyHistory {
+                messages: read_only.history.messages.clone(),
+                approvals: read_only.history.approvals.clone(),
+            },
+            _ => unreachable!("model recovery starts from live or read-only history"),
+        };
+        let history = self
+            .opener
+            .load_read_only_history(&entry.key)
+            .await
+            .unwrap_or(history);
+        let tasks = current_tasks(state);
+        let (archive, archive_error) = match &state.phase {
+            EntryPhase::ReadOnly(read_only)
+                if state.background.as_ref().is_none_or(Option::is_none) =>
+            {
+                (read_only.archive.clone(), read_only.archive_error.clone())
+            }
+            _ => (None, None),
+        };
+        state.phase = EntryPhase::ReadOnly(ReadOnlyState {
+            model: UnavailableModel { binding, reason },
+            history,
+            runtime_open_error: Some(error),
+            pending_binding,
+            generation,
+            archive,
+            tasks,
+            archive_error,
+        });
     }
 }
 
@@ -2047,16 +2239,18 @@ impl SessionRelay for SessionHub {
                         };
                         state.phase = EntryPhase::ReadOnly(ReadOnlyState {
                             model,
+                            runtime_open_error: None,
+                            pending_binding: None,
+                            generation: 0,
                             history,
                             archive,
                             tasks: tasks.into(),
                             archive_error,
                         });
                     }
-                    SessionModelResolution::Available {
-                        provider_id,
-                        reasoning_effort,
-                    } => {
+                    SessionModelResolution::Available(binding) => {
+                        let provider_id = binding.selection_key();
+                        let reasoning_effort = binding.reasoning_effort.clone();
                         let background = self.ensure_background(&entry, state).await;
                         match self
                             .opener
@@ -2071,20 +2265,15 @@ impl SessionRelay for SessionHub {
                             .await
                         {
                             Ok(session) => {
-                                state.phase = EntryPhase::Live(self.make_live(
-                                    &entry,
-                                    session,
-                                    provider_id,
-                                    reasoning_effort.clone(),
-                                    0,
-                                ));
+                                state.phase =
+                                    EntryPhase::Live(self.make_live(&entry, session, binding, 0));
                                 info!(workspace_id = %key.0, session_id = %key.1, "session opened");
                             }
                             Err(OpenError::PendingApprovalsRequired(approvals)) => {
                                 let snapshot = self.opener.load_messages(&key).await;
                                 state.phase = EntryPhase::Pending(PendingState {
-                                    provider_id,
-                                    reasoning_effort,
+                                    binding,
+                                    generation: 0,
                                     needed: approvals
                                         .iter()
                                         .map(|approval| approval.pid.clone())
@@ -2143,7 +2332,10 @@ impl SessionRelay for SessionHub {
                 return CommandOutcome::Ignored;
             };
             if let EntryPhase::ReadOnly(read_only) = &guard.phase
-                && !matches!(command, SessionCommand::GetTaskResult { .. })
+                && !matches!(
+                    command,
+                    SessionCommand::GetTaskResult { .. } | SessionCommand::SetModel { .. }
+                )
             {
                 warn!(workspace_id = %key.0, session_id = %key.1, "rejecting command on read-only session");
                 return CommandOutcome::ReadOnly(read_only.model.clone());
@@ -2151,6 +2343,24 @@ impl SessionRelay for SessionHub {
             // Taken by value rather than through `state` below: it is the one
             // command that has to drop the guard partway through.
             let command = match command {
+                SessionCommand::SetModel {
+                    provider_id,
+                    reasoning_effort,
+                } => {
+                    let hub = self.clone();
+                    return tokio::spawn(async move {
+                        hub.handle_set_model(
+                            &entry,
+                            &mut guard,
+                            &key,
+                            provider_id,
+                            reasoning_effort,
+                        )
+                        .await
+                    })
+                    .await
+                    .expect("model switch task panicked");
+                }
                 SessionCommand::GetTaskResult { task_id } => {
                     use crate::wire::TaskResultWire as ResultWire;
                     let (archive, archive_error) = match &guard.phase {
@@ -2388,7 +2598,7 @@ impl SessionRelay for SessionHub {
             }
             if borrowed {
                 match self.opener.resolve_session_model(&source, None).await {
-                    Ok(SessionModelResolution::Available { .. }) => {}
+                    Ok(SessionModelResolution::Available(_)) => {}
                     result => {
                         Self::leave_entry_gate(&self.entries, &entry, &mut guard, borrowed);
                         return match result {
@@ -2464,8 +2674,8 @@ impl SessionRelay for SessionHub {
                 return Ok(None);
             };
             match &guard.phase {
-                EntryPhase::Live(live) => Ok(Some(live.provider_id.clone())),
-                EntryPhase::Pending(pending) => Ok(Some(pending.provider_id.clone())),
+                EntryPhase::Live(live) => Ok(Some(live.binding.selection_key())),
+                EntryPhase::Pending(pending) => Ok(Some(pending.binding.selection_key())),
                 EntryPhase::ReadOnly(read_only) => Err(read_only.model.clone()),
                 _ => Ok(None),
             }
@@ -2527,6 +2737,35 @@ impl SessionRelay for SessionHub {
         BroadcastStream::new(self.status_tx.subscribe())
             .filter_map(|event| async move { event.ok() })
             .boxed()
+    }
+
+    fn session_accesses<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HashMap<String, SessionAccess>> + Send + 'a>> {
+        Box::pin(async move {
+            let entries: Vec<_> = self
+                .entries
+                .lock()
+                .expect("entries")
+                .iter()
+                .filter(|(key, _)| key.0 == workspace_id)
+                .map(|(_, entry)| entry.clone())
+                .collect();
+            let mut accesses = HashMap::new();
+            for entry in entries {
+                let state = entry.inner.lock().await;
+                let access = match &state.phase {
+                    EntryPhase::Live(_) | EntryPhase::Pending(_) => SessionAccess::ReadWrite,
+                    EntryPhase::ReadOnly(read_only) => SessionAccess::ReadOnly {
+                        reason: read_only.model.reason,
+                    },
+                    _ => continue,
+                };
+                accesses.insert(entry.key.1.clone(), access);
+            }
+            accesses
+        })
     }
 
     fn running_sessions<'a>(
@@ -2612,11 +2851,13 @@ fn compose_snapshot(
             );
             Some(SnapshotPayload {
                 access: SessionAccess::ReadWrite,
+                model_family: live.binding.family.clone(),
+                runtime_open_error: None,
                 background_tasks_error: None,
                 messages,
                 pending_approvals: live.session.pending_approvals(),
-                provider_id: live.provider_id.clone(),
-                reasoning_effort: live.reasoning_effort.clone(),
+                provider_id: live.binding.selection_key(),
+                reasoning_effort: live.binding.reasoning_effort.clone(),
                 permission_mode,
                 turn_running: live.turn_running,
                 compacting,
@@ -2627,6 +2868,8 @@ fn compose_snapshot(
             access: SessionAccess::ReadOnly {
                 reason: read_only.model.reason,
             },
+            model_family: read_only.model.binding.family.clone(),
+            runtime_open_error: read_only.runtime_open_error.clone(),
             background_tasks_error: read_only.archive_error.clone(),
             messages: read_only.history.messages.clone(),
             pending_approvals: read_only.history.approvals.clone(),
@@ -2635,10 +2878,16 @@ fn compose_snapshot(
             permission_mode,
             turn_running: false,
             compacting: false,
-            background_tasks: read_only.tasks.clone(),
+            background_tasks: if read_only.runtime_open_error.is_some() {
+                background_tasks
+            } else {
+                read_only.tasks.clone()
+            },
         }),
         EntryPhase::Pending(pending) => Some(SnapshotPayload {
             access: SessionAccess::ReadWrite,
+            model_family: pending.binding.family.clone(),
+            runtime_open_error: None,
             background_tasks_error: None,
             messages: pending.snapshot.clone(),
             pending_approvals: pending
@@ -2647,8 +2896,8 @@ fn compose_snapshot(
                 .filter(|approval| pending.needed.contains(&approval.pid))
                 .cloned()
                 .collect(),
-            provider_id: pending.provider_id.clone(),
-            reasoning_effort: pending.reasoning_effort.clone(),
+            provider_id: pending.binding.selection_key(),
+            reasoning_effort: pending.binding.reasoning_effort.clone(),
             permission_mode,
             turn_running: false,
             compacting,

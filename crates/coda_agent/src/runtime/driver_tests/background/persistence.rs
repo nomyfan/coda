@@ -188,6 +188,7 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .background(None)
         .run_config(RunConfig {
             default_model: ModelProfile {
+                provider_id: "test".into(),
                 provider: BackgroundProvider::default(),
                 model: "fake".into(),
                 label: "fake".into(),

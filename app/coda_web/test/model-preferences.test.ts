@@ -2,6 +2,7 @@ import { beforeEach, expect, test } from "vitest";
 
 import {
   initialModelSelection,
+  compatibleEffort,
   rememberModelSelection,
   resolveEffortForModel,
 } from "../src/store/model-preferences.ts";
@@ -194,4 +195,12 @@ test("resolveEffortForModel falls back to configured default then first", () => 
 
   const effortA = resolveEffortForModel(catalog("ws://one"), "alpha", modelA, "xhigh");
   expect(effortA).toBe("low");
+});
+
+test("existing conversations retain compatible effort and otherwise select the target default", () => {
+  rememberModelSelection("ws://one", "alpha", modelC.id, "low");
+  expect(compatibleEffort(modelC, "high")).toBe("high");
+  expect(compatibleEffort(modelC, "unavailable")).toBe("medium");
+  expect(compatibleEffort(modelA, "unavailable")).toBe("low");
+  expect(compatibleEffort(modelB, "high")).toBeNull();
 });

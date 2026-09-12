@@ -13,7 +13,6 @@ import {
   selectActiveCompacting,
   selectActiveEvicted,
   selectActivePersistError,
-  selectActiveHasImages,
   selectActiveProviderId,
   selectActiveProviders,
   selectActivePermissionMode,
@@ -22,6 +21,8 @@ import {
   selectActiveForkDraft,
   selectActiveCanWrite,
   selectActiveAccess,
+  selectActiveModelCandidates,
+  selectActiveRuntimeOpenError,
   selectActiveBackgroundTasksError,
   selectActiveUnsentDraft,
   selectActiveKey,
@@ -268,6 +269,8 @@ export default function App() {
   const activeForkDraft = useCodaStore(selectActiveForkDraft);
   const activeCanWrite = useCodaStore(selectActiveCanWrite);
   const activeAccess = useCodaStore(selectActiveAccess);
+  const activeModelCandidates = useCodaStore(selectActiveModelCandidates);
+  const activeRuntimeOpenError = useCodaStore(selectActiveRuntimeOpenError);
   const backgroundTasksError = useCodaStore(selectActiveBackgroundTasksError);
   const unsentDraft = useCodaStore(selectActiveUnsentDraft);
   const activeKey = useCodaStore(selectActiveKey);
@@ -280,7 +283,6 @@ export default function App() {
   const activePermissionMode = useCodaStore(selectActivePermissionMode);
   const activeSessionTitle = useCodaStore(selectActiveSessionTitle);
   const activeUsage = useCodaStore(selectActiveUsage);
-  const activeHasImages = useCodaStore(selectActiveHasImages);
 
   const handleForkDraftChange = useCallback(
     (text: string, images: string[]) => {
@@ -552,6 +554,8 @@ export default function App() {
                     }
                     writable={showingNewSession || activeCanWrite}
                     access={showingNewSession ? null : activeAccess}
+                    modelCandidates={showingNewSession ? undefined : (activeModelCandidates ?? [])}
+                    runtimeOpenError={showingNewSession ? undefined : activeRuntimeOpenError}
                     backgroundTasksError={showingNewSession ? undefined : backgroundTasksError}
                     unsentDraft={showingNewSession ? undefined : unsentDraft}
                     status={
@@ -577,7 +581,6 @@ export default function App() {
                         : activeReasoningEffort
                     }
                     usage={showingNewSession ? NO_USAGE : activeUsage}
-                    sessionHasImages={showingNewSession ? false : activeHasImages}
                     serverUrl={selectedServerUrl}
                     workspaceId={selectedWorkspace ?? ""}
                     editing={showingNewSession ? undefined : activeEditing}

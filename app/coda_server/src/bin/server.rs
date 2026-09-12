@@ -13,9 +13,11 @@ use coda_agent::{
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
 use coda_execution::{ArchiveDir, ArchivedTasks, BackgroundRootLock, BackgroundTasks};
 use coda_openai::OpenAICompatible;
-use coda_server::session_access::{SessionAccess, SessionModelResolution, UnavailableModel};
+use coda_server::session_access::{
+    SessionAccess, SessionModelResolution, UnavailableModel, can_select_model,
+};
 use coda_server::storage::{
-    CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession,
+    CompactionError, DbPool, ForkCut, ForkError, ForkSource, ForkedSession, SessionMetadataError,
 };
 use coda_server::{
     WorkspaceKnowledge,
@@ -119,6 +121,7 @@ struct AppState {
 /// multiple models under one provider. `reasoning_efforts` is the list the UI
 /// offers; empty means the model has no reasoning controls.
 struct ProviderHandle {
+    family: Option<String>,
     provider: Arc<OpenAICompatible>,
     model_id: String,
     model_name: String,
@@ -385,7 +388,7 @@ impl SessionOpener for AppOpener {
                 .workspaces
                 .get(&key.0)
                 .ok_or_else(|| OpenError::Storage("unknown workspace".into()))?;
-            let binding = if let Some(initial) = initial {
+            let mut binding = if let Some(initial) = initial {
                 let provider = self
                     .providers
                     .get(&initial.provider_id)
@@ -395,6 +398,7 @@ impl SessionOpener for AppOpener {
                     .initialize_session(
                         &key.1,
                         SessionModelBinding {
+                            family: provider.family.clone(),
                             provider_id: provider.provider_id.clone(),
                             model_id: provider.model_id.clone(),
                             reasoning_effort: initial.reasoning_effort.clone(),
@@ -402,15 +406,50 @@ impl SessionOpener for AppOpener {
                     )
                     .await
             } else {
-                workspace.storage.load_model_binding(&key.1).await
+                workspace.storage.confirm_model_binding(&key.1).await
             }
             .map_err(|error| OpenError::Storage(error.to_string()))?;
-            let efforts = self
-                .providers
-                .get(&binding.selection_key())
-                .map(|p| p.reasoning_efforts.as_slice());
-            Ok(SessionModelResolution::resolve(binding, efforts))
+            let mut next = binding.clone();
+            if let Some(configured) = self.providers.get(&binding.selection_key()) {
+                next.family = next.family.or_else(|| configured.family.clone());
+                if next.family == configured.family && next.reasoning_effort.is_none() {
+                    next.reasoning_effort = initial_reasoning_effort(configured);
+                }
+            }
+            if next != binding {
+                binding = match workspace
+                    .storage
+                    .compare_exchange_model_binding(&key.1, &binding, &next)
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(SessionMetadataError::OutcomeUnknown(_)) => {
+                        let saved = workspace
+                            .storage
+                            .confirm_model_binding(&key.1)
+                            .await
+                            .map_err(|error| OpenError::Storage(error.to_string()))?;
+                        if saved != next {
+                            return Err(OpenError::Storage(
+                                "model binding initialization was not committed".into(),
+                            ));
+                        }
+                        saved
+                    }
+                    Err(error) => return Err(OpenError::Storage(error.to_string())),
+                };
+            }
+            Ok(self.classify_model_binding(binding))
         })
+    }
+
+    fn classify_model_binding(&self, binding: SessionModelBinding) -> SessionModelResolution {
+        let configured = self.providers.get(&binding.selection_key());
+        SessionModelResolution::resolve(
+            binding,
+            configured.map(|p| p.reasoning_efforts.as_slice()),
+            configured.and_then(|p| p.family.as_deref()),
+        )
     }
 
     fn load_read_only_history<'a>(
@@ -631,32 +670,74 @@ impl SessionOpener for AppOpener {
         })
     }
 
-    fn update_reasoning_effort<'a>(
+    fn validate_model_change<'a>(
         &'a self,
         key: &'a SessionKey,
-        provider_id: &'a str,
-        reasoning_effort: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        current: &'a SessionModelBinding,
+        requested: &'a ModelSelection,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, String>> + Send + 'a>> {
         Box::pin(async move {
-            let workspace = self
-                .workspaces
-                .get(&key.0)
-                .ok_or_else(|| format!("unknown workspace '{}'", key.0))?;
-            let provider = self
+            let target = self
                 .providers
-                .get(provider_id)
-                .ok_or_else(|| format!("unknown provider/model '{provider_id}'"))?;
-            workspace
+                .get(&requested.provider_id)
+                .ok_or("unknown provider/model")?;
+            let binding = SessionModelBinding {
+                provider_id: target.provider_id.clone(),
+                model_id: target.model_id.clone(),
+                family: target.family.clone(),
+                reasoning_effort: requested
+                    .reasoning_effort
+                    .clone()
+                    .or_else(|| initial_reasoning_effort(target)),
+            };
+            if !can_select_model(current, &binding) {
+                return Err("target model does not match this conversation's fixed family".into());
+            }
+            if requested
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(|effort| !target.reasoning_efforts.contains(effort))
+            {
+                return Err("target model does not support the selected reasoning effort".into());
+            }
+            let workspace = self.workspaces.get(&key.0).ok_or("unknown workspace")?;
+            if !target.input_modalities.contains(&Modality::Image)
+                && inherited_history_has_images(workspace, &key.1).await?
+            {
+                return Err("this conversation has image input in an inherited process; select an image-capable model".into());
+            }
+            Ok(SessionModelBinding {
+                family: current.family.clone(),
+                ..binding
+            })
+        })
+    }
+
+    fn update_model_binding<'a>(
+        &'a self,
+        key: &'a SessionKey,
+        expected: &'a SessionModelBinding,
+        next: &'a SessionModelBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.workspaces[&key.0]
                 .storage
-                .update_reasoning_effort(
-                    &key.1,
-                    &provider.provider_id,
-                    &provider.model_id,
-                    reasoning_effort,
-                )
+                .compare_exchange_model_binding(&key.1, expected, next)
                 .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn confirm_model_binding<'a>(
+        &'a self,
+        key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.workspaces[&key.0]
+                .storage
+                .confirm_model_binding(&key.1)
+                .await
         })
     }
 
@@ -690,6 +771,23 @@ impl SessionOpener for AppOpener {
     }
 }
 
+async fn inherited_history_has_images(
+    workspace: &WorkspaceState,
+    session_id: &str,
+) -> Result<bool, String> {
+    for (name, history) in workspace.storage.model_histories(session_id).await? {
+        if workspace.agent_models.contains_key(&name) {
+            continue;
+        }
+        if coda_agent::message_view::model_view(&history)
+            .any(|entry| matches!(&entry.message, Message::User(message) if message.has_image()))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Open (or resume) the session for `session_id`, seeding it with the built-in
 /// tools, MCP tools, and approval policy. `decisions` covers any pending
 /// approvals carried over from a prior suspension.
@@ -710,6 +808,7 @@ async fn open_session(
     // The root agent (and any agent without an override) runs on the session's
     // selected model.
     let default_model = ModelProfile {
+        provider_id: provider.provider_id.clone(),
         provider: provider.provider.clone(),
         model: provider.model_id.clone(),
         label: provider_id.to_string(),
@@ -729,6 +828,7 @@ async fn open_session(
                 .get(&selection.provider_id)
                 .expect("agent model selections are validated at startup");
             let profile = ModelProfile {
+                provider_id: handle.provider_id.clone(),
                 provider: handle.provider.clone(),
                 model: handle.model_id.clone(),
                 label: selection.provider_id.clone(),
@@ -841,8 +941,9 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
         // Independent reads, run concurrently; not transactional, so a turn
         // settling in the gap can make one response stale, self-healing on
         // the next fetch or `session_status` push.
-        let (running, sessions_result) = tokio::join!(
+        let (running, accesses, sessions_result) = tokio::join!(
             app.relay.running_sessions(&workspace.id),
+            app.relay.session_accesses(&workspace.id),
             workspace.storage.list_sessions(),
         );
         let sessions = match sessions_result {
@@ -859,8 +960,19 @@ async fn workspace_catalog(app: &AppState) -> Vec<WorkspaceSummaryWire> {
                         .get(&session.model_binding.selection_key())
                         .map(|p| p.reasoning_efforts.as_slice());
                     SessionSummaryWire {
-                        access: SessionModelResolution::resolve(session.model_binding, efforts)
-                            .access(),
+                        access: accesses
+                            .get(&session.session_id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                SessionModelResolution::resolve(
+                                    session.model_binding.clone(),
+                                    efforts,
+                                    app.providers
+                                        .get(&session.model_binding.selection_key())
+                                        .and_then(|p| p.family.as_deref()),
+                                )
+                                .access()
+                            }),
                         id: session.session_id,
                         name: session.name,
                         updated_at_ms: Some(session.updated_at_ms),
@@ -917,8 +1029,10 @@ fn resolve_selection(
 ) -> (String, Option<String>) {
     if let Some(id) = provider_id
         && let Some(provider) = app.providers.get(&id)
-        && let Some(reasoning_effort) =
-            normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
+        && let Some(reasoning_effort) = normalize_reasoning_effort(
+            &provider.reasoning_efforts,
+            reasoning_effort.or_else(|| initial_reasoning_effort(provider)),
+        )
     {
         return (id, reasoning_effort);
     }
@@ -929,15 +1043,6 @@ fn resolve_selection(
             .expect("default provider always present"),
     );
     (id, effort)
-}
-
-fn normalize_provider_selection(
-    app: &AppState,
-    provider_id: &str,
-    reasoning_effort: Option<String>,
-) -> Option<Option<String>> {
-    let provider = app.providers.get(provider_id)?;
-    normalize_reasoning_effort(&provider.reasoning_efforts, reasoning_effort)
 }
 
 fn build_providers(
@@ -968,6 +1073,7 @@ fn build_providers(
         for model in models {
             let id = format!("{}:{}", provider_id, model.id);
             let handle = Arc::new(ProviderHandle {
+                family: model.family,
                 provider: shared_provider.clone(),
                 model_id: model.id,
                 model_name: model.name,
@@ -984,6 +1090,7 @@ fn build_providers(
                 input_modalities: model.input_modalities,
             });
             catalog.push(ProviderInfoWire {
+                family: handle.family.clone(),
                 id: id.clone(),
                 provider: handle.provider_id.clone(),
                 model: handle.model_name.clone(),
@@ -1048,7 +1155,7 @@ async fn attach_core(
             permission_mode: snapshot.permission_mode,
         },
     );
-    let wire_snapshot = wire_snapshot(&key, snapshot);
+    let wire_snapshot = wire_snapshot(app, &key, snapshot).await;
     // Register the stream *before* returning; the caller sends the snapshot
     // (result or notification) before the connection loop next polls the stream,
     // so the snapshot always precedes the replayed events.
@@ -1058,9 +1165,34 @@ async fn attach_core(
 
 /// Address a hub snapshot to a session. Shared by the two ways one reaches a
 /// client: as the answer to `open_session`, and as a pushed `snapshot`.
-fn wire_snapshot(key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
-    let read_only = matches!(snapshot.access, SessionAccess::ReadOnly { .. });
+async fn wire_snapshot(app: &AppState, key: &SessionKey, snapshot: SnapshotPayload) -> Snapshot {
+    let images = match app.workspaces.get(&key.0) {
+        Some(workspace) => inherited_history_has_images(workspace, &key.1).await,
+        None => Err("unknown workspace".into()),
+    };
+    let model_candidates = app
+        .provider_catalog
+        .iter()
+        .filter(|info| {
+            let compatible = match snapshot.model_family.as_deref() {
+                Some(family) => info.family.as_deref() == Some(family),
+                None => info.id == snapshot.provider_id,
+            };
+            compatible
+                && match &images {
+                    Ok(true) => info.input_modalities.contains(&Modality::Image),
+                    Ok(false) => true,
+                    Err(_) => false,
+                }
+        })
+        .map(|info| info.id.clone())
+        .collect();
+    let read_only = matches!(snapshot.access, SessionAccess::ReadOnly { .. })
+        && snapshot.runtime_open_error.is_none();
     Snapshot {
+        model_family: snapshot.model_family,
+        model_candidates,
+        runtime_open_error: snapshot.runtime_open_error,
         access: snapshot.access,
         background_tasks_error: snapshot.background_tasks_error,
         workspace_id: key.0.clone(),
@@ -1351,42 +1483,7 @@ async fn dispatch_request(
                 Ok(params) => params,
                 Err(err) => return (id, err).into(),
             };
-            match app
-                .relay
-                .provider_of(
-                    (params.workspace_id.clone(), params.session_id.clone()),
-                    conn_id,
-                )
-                .await
-            {
-                Err(model) => return (id, read_only_error(model)).into(),
-                Ok(None) => {
-                    return (
-                        id,
-                        RpcError::new(rpc::SESSION_NOT_LIVE, "session is not live"),
-                    )
-                        .into();
-                }
-                Ok(Some(_)) => {}
-            }
-            // Invalid selections are caught here, before the hub — `OpenError`
-            // has no "bad model" variant (Decision 8).
-            let Some(reasoning_effort) =
-                normalize_provider_selection(app, &params.provider_id, params.reasoning_effort)
-            else {
-                return (
-                    id,
-                    RpcError::with_detail(
-                        rpc::INVALID_MODEL_SELECTION,
-                        "invalid model selection",
-                        params.provider_id,
-                    ),
-                )
-                    .into();
-            };
             let key = (params.workspace_id, params.session_id);
-            let requested_provider = params.provider_id.clone();
-            let requested_effort = reasoning_effort.clone();
             match app
                 .relay
                 .command(
@@ -1394,46 +1491,53 @@ async fn dispatch_request(
                     conn_id,
                     SessionCommand::SetModel {
                         provider_id: params.provider_id,
-                        reasoning_effort,
+                        reasoning_effort: params.reasoning_effort,
                     },
                 )
                 .await
             {
                 CommandOutcome::ReadOnly(model) => (id, read_only_error(model)).into(),
-                CommandOutcome::ModelChanged {
-                    provider_id,
-                    reasoning_effort,
-                } => {
-                    // Keep the re-attach cache on the new selection so a
-                    // hub-initiated close doesn't reopen on the old model.
-                    let permission_mode = selections
-                        .get(&key)
-                        .map(|selection| selection.permission_mode)
-                        .unwrap_or_default();
-                    selections.insert(
+                CommandOutcome::ModelChanged(snapshot) | CommandOutcome::Unchanged(snapshot) => {
+                    // A new subscription discards queued events already represented
+                    // by the snapshot and replays only the current runtime's live log.
+                    match attach_core(
+                        app,
+                        conn_id,
+                        streams,
+                        selections,
                         key,
-                        Selection {
-                            provider_id: provider_id.clone(),
-                            reasoning_effort: reasoning_effort.clone(),
-                            permission_mode,
-                        },
-                    );
-                    (
-                        id,
-                        &ModelSelection {
-                            provider_id,
-                            reasoning_effort,
-                        },
+                        Some(snapshot.provider_id),
+                        snapshot.reasoning_effort,
+                        snapshot.permission_mode,
+                        false,
                     )
-                        .into()
+                    .await
+                    {
+                        Ok(snapshot) => (id, &snapshot).into(),
+                        Err(AttachError::Busy) => (
+                            id,
+                            RpcError::new(rpc::SESSION_BUSY, "session is held by another client"),
+                        )
+                            .into(),
+                        Err(AttachError::Open(error)) => (
+                            id,
+                            RpcError::with_detail(
+                                rpc::OPEN_FAILED,
+                                "failed to refresh model selection",
+                                error.to_string(),
+                            ),
+                        )
+                            .into(),
+                    }
                 }
-                // Already the selected model: idempotent success echoing it back.
-                CommandOutcome::Unchanged => (
+
+                CommandOutcome::InvalidModel(detail) => (
                     id,
-                    &ModelSelection {
-                        provider_id: requested_provider,
-                        reasoning_effort: requested_effort,
-                    },
+                    RpcError::with_detail(
+                        rpc::INVALID_MODEL_SELECTION,
+                        "invalid model selection",
+                        detail,
+                    ),
                 )
                     .into(),
                 CommandOutcome::TurnRunning => (
@@ -1448,15 +1552,7 @@ async fn dispatch_request(
                     id,
                     RpcError::new(
                         rpc::SESSION_NOT_IDLE,
-                        "cannot switch model while the session is compacting",
-                    ),
-                )
-                    .into(),
-                CommandOutcome::ModelLocked => (
-                    id,
-                    RpcError::new(
-                        rpc::MODEL_LOCKED,
-                        "provider/model is locked for this session",
+                        "cannot switch model while the session is compacting or awaiting approval",
                     ),
                 )
                     .into(),
@@ -1464,7 +1560,7 @@ async fn dispatch_request(
                     id,
                     RpcError::with_detail(
                         rpc::OPEN_FAILED,
-                        "failed to persist reasoning effort",
+                        "failed to persist model selection",
                         detail,
                     ),
                 )
@@ -2175,7 +2271,7 @@ async fn run_connection<T: Transport + Send + Sync + 'static>(transport: T, app:
                         .await
                     }
                     RelayEvent::Snapshot(snapshot) => {
-                        send_notify(&transport, "snapshot", &wire_snapshot(&key, *snapshot)).await
+                        send_notify(&transport, "snapshot", &wire_snapshot(&app, &key, *snapshot).await).await
                     }
                     RelayEvent::Evicted => {
                         streams.remove(&key);
@@ -2716,6 +2812,7 @@ mod selection_tests {
 
     fn model_config(id: &str) -> coda_server::config::ModelConfig {
         coda_server::config::ModelConfig {
+            family: None,
             id: id.into(),
             name: id.into(),
             context_window: 100_000,
