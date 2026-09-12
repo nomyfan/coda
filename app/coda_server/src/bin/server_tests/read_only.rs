@@ -30,17 +30,14 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        let url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must name a throwaway database");
-        let pool = coda_server::storage::connect(&url).await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let (providers, provider_catalog) = build_providers(vec![ProviderConfig {
+        Self::with_providers(vec![ProviderConfig {
             id: "test".into(),
             kind: coda_openai::ProviderKind::Generic,
             api_key: "unused".into(),
             base_url: "http://127.0.0.1:1".into(),
             include_usage: true,
             models: vec![ModelConfig {
+                family: None,
                 id: "available".into(),
                 name: "Available".into(),
                 context_window: 100_000,
@@ -50,7 +47,16 @@ impl Harness {
                 input_modalities: vec![Modality::Text],
                 auto_compact_threshold: None,
             }],
-        }]);
+        }])
+        .await
+    }
+
+    async fn with_providers(configs: Vec<ProviderConfig>) -> Self {
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must name a throwaway database");
+        let pool = coda_server::storage::connect(&url).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (providers, provider_catalog) = build_providers(configs);
         let shutdown = CancellationToken::new();
         let workspace = Arc::new(
             build_workspace(
@@ -76,8 +82,8 @@ impl Harness {
         ));
         let app = Arc::new(AppState {
             providers,
+            default_provider: provider_catalog[0].id.clone(),
             provider_catalog,
-            default_provider: "test:available".into(),
             shutdown,
             workspaces,
             relay,
@@ -162,6 +168,7 @@ fn suspended(pid: &str) -> StoredCheckpoint {
         arguments: Some(r#"{"command":"echo saved"}"#.into()),
     };
     let assistant = AssistantMessage {
+        generation: None,
         message_id,
         content: "saved reply".into(),
         tool_calls: vec![call.clone()],
@@ -204,6 +211,7 @@ fn suspended(pid: &str) -> StoredCheckpoint {
 async fn read_only_rpc_preserves_removed_agent_approvals_and_all_execution_rows() {
     let mut h = Harness::new().await;
     let binding = SessionModelBinding {
+        family: None,
         provider_id: "removed".into(),
         model_id: "model".into(),
         reasoning_effort: Some("old-effort".into()),
@@ -276,10 +284,6 @@ async fn read_only_rpc_preserves_removed_agent_approvals_and_all_execution_rows(
             json!({"agent_name": "coda", "pid": "chat", "decision": {"parent_message_id": parent_message_id, "resolutions": [["call-chat", "Execute"]]}, "allow_patterns": [["call-chat", "echo *"]]}),
         ),
         ("compact", json!({"instructions": "summary"})),
-        (
-            "set_model",
-            json!({"provider_id": "test:available", "reasoning_effort": "low"}),
-        ),
         ("set_permission_mode", json!({"mode": "yolo"})),
         ("fork_session", json!({})),
     ] {
@@ -291,6 +295,14 @@ async fn read_only_rpc_preserves_removed_agent_approvals_and_all_execution_rows(
         );
         assert_eq!(reply["error"]["data"]["reason"], "model_not_configured");
     }
+    assert_eq!(
+        h.request(
+            "set_model",
+            json!({"provider_id": "test:available", "reasoning_effort": "low"})
+        )
+        .await["error"]["code"],
+        rpc::INVALID_MODEL_SELECTION
+    );
     assert_eq!(
         h.request("add_allow_pattern", json!({"pattern": "echo *"}))
             .await["error"]["code"],
@@ -366,6 +378,7 @@ async fn unsupported_effort_allows_archived_results_and_reports_archive_errors()
         .initialize_session(
             "chat",
             SessionModelBinding {
+                family: None,
                 provider_id: "test".into(),
                 model_id: "available".into(),
                 reasoning_effort: Some("removed-effort".into()),
@@ -412,3 +425,6 @@ async fn unsupported_effort_allows_archived_results_and_reports_archive_errors()
     );
     h.finish().await;
 }
+
+#[path = "model_family.rs"]
+mod model_family;

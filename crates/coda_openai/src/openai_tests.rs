@@ -9,6 +9,7 @@ const GLM_FIXTURE: &str = include_str!("../tests/fixtures/openrouter-glm-5.2.jso
 fn assistant() -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![],
@@ -659,4 +660,33 @@ fn accumulator_rejects_empty_stream() {
         error,
         "stream completed without content, reasoning, or tool calls"
     );
+}
+
+#[test]
+fn generation_metadata_roundtrips_in_history_but_never_enters_provider_messages() {
+    let mut message = assistant();
+    let old = serde_json::to_value(&message).unwrap();
+    assert!(old.get("generation").is_none());
+    assert!(
+        serde_json::from_value::<AssistantMessage>(old)
+            .unwrap()
+            .generation
+            .is_none()
+    );
+    message.content = "a historical answer".into();
+    message.generation = Some(coda_core::llm::GenerationMetadata {
+        provider_id: "historical-provider".into(),
+        model_id: "historical-preview".into(),
+        reasoning_effort: Some("high".into()),
+    });
+    let saved = serde_json::to_value(&message).unwrap();
+    let restored: AssistantMessage = serde_json::from_value(saved).unwrap();
+    assert_eq!(restored.generation, message.generation);
+    let request: ChatCompletionRequestMessage =
+        RequestMessage::Assistant(restored).into_openai_type();
+    let outgoing = serde_json::to_value(request).unwrap();
+    assert!(outgoing.get("generation").is_none());
+    assert!(!outgoing.to_string().contains("historical-provider"));
+    assert!(!outgoing.to_string().contains("historical-preview"));
+    assert_eq!(outgoing["content"], "a historical answer");
 }

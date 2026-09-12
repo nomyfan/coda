@@ -12,7 +12,7 @@ use coda_agent::runtime::SessionStorage;
 use coda_core::llm::{Message, MessageId, TurnId};
 use diesel::expression::IntoSql;
 use diesel::prelude::*;
-use diesel::sql_types::{Array, Jsonb, Text};
+use diesel::sql_types::Text;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::{Object, Pool};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -21,14 +21,6 @@ use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-
-// `jsonb_set(target, path, new_value)`. Declaring it here is what keeps
-// `WorkspaceStorage::update_reasoning_effort` a single compare-and-set statement
-// instead of a read-modify-write: the call is type-checked like any built-in, so
-// the argument order and types cannot drift.
-diesel::define_sql_function! {
-    fn jsonb_set(target: Jsonb, path: Array<Text>, new_value: Jsonb) -> Jsonb;
-}
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -122,6 +114,8 @@ impl std::fmt::Debug for WorkspaceStorage {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionModelBinding {
+    #[serde(default)]
+    pub family: Option<String>,
     pub provider_id: String,
     pub model_id: String,
     pub reasoning_effort: Option<String>,
@@ -138,6 +132,7 @@ pub enum SessionMetadataError {
     InvalidSessionId(String),
     SessionNotFound,
     BindingMismatch,
+    OutcomeUnknown(String),
     Persistence(String),
 }
 
@@ -147,12 +142,18 @@ impl std::fmt::Display for SessionMetadataError {
             Self::InvalidSessionId(message) => write!(f, "{message}"),
             Self::SessionNotFound => write!(f, "session not found"),
             Self::BindingMismatch => write!(f, "session model binding does not match"),
-            Self::Persistence(message) => write!(f, "{message}"),
+            Self::Persistence(message) | Self::OutcomeUnknown(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for SessionMetadataError {}
+
+impl From<diesel::result::Error> for SessionMetadataError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Persistence(error.to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenameSessionError {
@@ -281,17 +282,8 @@ impl WorkspaceStorage {
                 ))
             })?;
 
-        sessions::table
-            .find((&self.workspace_id, session_id))
-            .select(sessions::model_binding)
-            .first::<Json<SessionModelBinding>>(&mut conn)
-            .await
-            .map(Json::into_inner)
-            .map_err(|err| {
-                SessionMetadataError::Persistence(format!(
-                    "failed to read the binding of session {session_id}: {err}"
-                ))
-            })
+        drop(conn);
+        self.confirm_model_binding(session_id).await
     }
 
     pub async fn load_model_binding(
@@ -372,78 +364,106 @@ impl WorkspaceStorage {
         Ok(())
     }
 
-    /// Change a session's reasoning effort, but only while it is still on the
-    /// model the caller thinks it is. The `filter` is the compare-and-set: no row
-    /// updated means either the session is gone or its binding moved on.
-    pub async fn update_reasoning_effort(
+    /// Update the entire binding under its row lock. An uncertain write must be
+    /// reconciled with `confirm_model_binding` before admitting more work.
+    pub async fn compare_exchange_model_binding(
         &self,
         session_id: &str,
-        expected_provider_id: &str,
-        expected_model_id: &str,
-        reasoning_effort: Option<&str>,
+        expected: &SessionModelBinding,
+        next: &SessionModelBinding,
     ) -> Result<SessionModelBinding, SessionMetadataError> {
-        validate_session_id(session_id).map_err(SessionMetadataError::InvalidSessionId)?;
-        let effort = reasoning_effort
-            .map(|effort| serde_json::Value::String(effort.to_string()))
-            .unwrap_or(serde_json::Value::Null);
         let mut conn = self
             .conn()
             .await
             .map_err(SessionMetadataError::Persistence)?;
-
-        let updated = diesel::update(
-            sessions::table
-                .find((&self.workspace_id, session_id))
-                .filter(
-                    sessions::model_binding
-                        .retrieve_as_text("provider_id")
-                        .eq(expected_provider_id)
-                        .and(
-                            sessions::model_binding
-                                .retrieve_as_text("model_id")
-                                .eq(expected_model_id),
-                        ),
-                ),
-        )
-        .set(sessions::model_binding.eq(jsonb_set(
-            sessions::model_binding,
-            vec!["reasoning_effort"],
-            Json(effort),
-        )))
-        .returning(sessions::model_binding)
-        .get_result::<Json<SessionModelBinding>>(&mut conn)
-        .await
-        .optional()
-        .map_err(|err| {
-            SessionMetadataError::Persistence(format!(
-                "failed to update the reasoning effort of session {session_id}: {err}"
-            ))
-        })?;
-
-        match updated {
-            Some(binding) => Ok(binding.into_inner()),
-            None if self.session_exists(session_id).await? => {
-                Err(SessionMetadataError::BindingMismatch)
+        let mut wrote = false;
+        let result = conn
+            .build_transaction()
+            .read_committed()
+            .run::<_, SessionMetadataError, _>(async |conn| {
+                let saved = sessions::table
+                    .find((&self.workspace_id, session_id))
+                    .select(sessions::model_binding)
+                    .for_update()
+                    .first::<Json<SessionModelBinding>>(&mut *conn)
+                    .await
+                    .optional()?
+                    .ok_or(SessionMetadataError::SessionNotFound)?
+                    .into_inner();
+                if saved != *expected {
+                    return Err(SessionMetadataError::BindingMismatch);
+                }
+                // Do not send UPDATE until the lock has been acknowledged.
+                wrote = true;
+                diesel::update(sessions::table.find((&self.workspace_id, session_id)))
+                    .set(sessions::model_binding.eq(Json(next)))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(next.clone())
+            })
+            .await;
+        match result {
+            Err(SessionMetadataError::Persistence(error)) if wrote => {
+                // Never lend the uncertain writer to a confirmation read.
+                drop(Object::take(conn));
+                Err(SessionMetadataError::OutcomeUnknown(error))
             }
-            None => Err(SessionMetadataError::SessionNotFound),
+            other => other,
         }
     }
 
-    async fn session_exists(&self, session_id: &str) -> Result<bool, SessionMetadataError> {
+    /// A locking read waits for any preceding binding writer to commit or roll
+    /// back. Ordinary MVCC reads cannot establish that execution barrier.
+    pub async fn confirm_model_binding(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionModelBinding, SessionMetadataError> {
         let mut conn = self
             .conn()
             .await
             .map_err(SessionMetadataError::Persistence)?;
-        diesel::select(diesel::dsl::exists(
-            sessions::table.find((&self.workspace_id, session_id)),
-        ))
-        .get_result(&mut conn)
-        .await
-        .map_err(|err| {
-            SessionMetadataError::Persistence(format!(
-                "failed to look up session {session_id}: {err}"
-            ))
-        })
+        conn.build_transaction()
+            .read_committed()
+            .run::<_, SessionMetadataError, _>(async |conn| {
+                // Bound a dead connection's lock wait; failure never proves rollback.
+                diesel::sql_query("SET LOCAL lock_timeout = '5s'")
+                    .execute(&mut *conn)
+                    .await?;
+                sessions::table
+                    .find((&self.workspace_id, session_id))
+                    .select(sessions::model_binding)
+                    .for_update()
+                    .first::<Json<SessionModelBinding>>(&mut *conn)
+                    .await
+                    .optional()?
+                    .map(Json::into_inner)
+                    .ok_or(SessionMetadataError::SessionNotFound)
+            })
+            .await
+    }
+
+    /// Persisted histories for input-compatibility checks across inherited processes.
+    pub async fn model_histories(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, Vec<HistoryEntry>)>, String> {
+        let mut conn = self.conn().await?;
+        let processes = process_checkpoints::table
+            .filter(process_checkpoints::workspace_id.eq(&self.workspace_id))
+            .filter(process_checkpoints::session_id.eq(session_id))
+            .select((process_checkpoints::pid, process_checkpoints::agent_name))
+            .load::<(String, String)>(&mut conn)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(conn);
+        let storage = self.session(session_id);
+        let mut histories = Vec::new();
+        for (pid, name) in processes {
+            if let Some(checkpoint) = storage.read_checkpoint(&pid).await? {
+                histories.push((name, checkpoint.messages));
+            }
+        }
+        Ok(histories)
     }
 
     /// Storage scoped to one session.

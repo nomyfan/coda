@@ -236,6 +236,9 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
                 }
                 ("coda", AgentEvent::LLMEnd(msg)) if msg.aborted => {
                     assert!(msg.content.contains("partial"));
+                    assert_eq!(msg.generation.as_ref().unwrap().provider_id, "test");
+                    assert_eq!(msg.generation.as_ref().unwrap().model_id, "fake");
+                    assert!(msg.usage.is_none());
                     saw_aborted_llm_end = true;
                 }
                 ("coda", AgentEvent::Aborted(AbortedTarget::Generation)) => {
@@ -291,6 +294,7 @@ async fn abort_during_generation_emits_aborted_and_persists_partial_message() {
         checkpoint.messages.last().map(|entry| &entry.message),
         Some(Message::Assistant(message))
             if message.aborted
+                && message.generation.as_ref().is_some_and(|g| g.provider_id == "test" && g.model_id == "fake")
                 && message.content.contains("partial")
                 && message.content.contains("interrupted by the user")
                 && message.reasoning_content.as_deref() == Some("partial reasoning")

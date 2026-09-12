@@ -146,6 +146,15 @@ export function resolveEffortForModel(
   if (memorized && provider.reasoning_efforts.includes(memorized)) {
     return memorized;
   }
+  return compatibleEffort(provider, currentEffort);
+}
+
+/** Existing conversations keep their effort when supported, otherwise use the target default. */
+export function compatibleEffort(
+  provider: ProviderInfo,
+  currentEffort: ReasoningEffort | null,
+): ReasoningEffort | null {
+  if (provider.reasoning_efforts.length === 0) return null;
   if (currentEffort && provider.reasoning_efforts.includes(currentEffort)) {
     return currentEffort;
   }

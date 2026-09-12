@@ -114,7 +114,6 @@ test("read-only actions cannot send RPCs, change settings, or apply approvals", 
     await compactActiveSession("summary");
     beginEdit("user");
     await rewindTurn("rewrite");
-    setModel("new:model", null);
     setPermissionMode("yolo");
     draftCall(approval, approval.calls[0], "Execute");
     setAllowDraft(approval, approval.calls[0], "echo *");
@@ -228,7 +227,6 @@ test("composer and approval panel keep readable content while disabling mutation
       providerId: "removed:model",
       reasoningEffort: "old-effort",
       usage: [],
-      sessionHasImages: true,
       serverUrl: server,
       workspaceId: "ws",
       unsentDraft: { text: "keep this draft", images: [] },
@@ -266,12 +264,123 @@ test("unsupported saved reasoning effort stays visible", () => {
       providerId: "p:m",
       reasoningEffort: "removed-effort",
       disabled: true,
-      modelLocked: true,
-      requireImageModel: false,
+      allowedModelIds: ["p:m"],
+      draftHasImages: false,
       serverUrl: server,
       workspaceId: "ws",
       onSetModel: vi.fn(),
     }),
   );
   expect(html).toContain("removed-effort");
+});
+
+test("manual model recovery applies the complete snapshot and retains pending approvals", async () => {
+  const { request } = mount({ ...session(), modelFamily: "f", modelCandidates: ["p2:released"] });
+  const snapshot = {
+    workspace_id: "ws",
+    session_id: "s1",
+    provider_id: "p2:released",
+    reasoning_effort: "high",
+    model_family: "f",
+    model_candidates: ["p2:released"],
+    runtime_open_error: null,
+    access: { type: "read_write" },
+    permission_mode: "accept_edits",
+    messages: [],
+    pending_approvals: [approval],
+    turn_running: false,
+    compacting: false,
+    background_tasks: [],
+  };
+  request.mockResolvedValueOnce(snapshot as never);
+  setModel("p2:released", "high");
+  await vi.waitFor(() =>
+    expect(codaStore.getState().servers[server].sessions["ws/s1"]).toMatchObject({
+      providerId: "p2:released",
+      reasoningEffort: "high",
+      access: { type: "read_write" },
+      modelFamily: "f",
+      modelCandidates: ["p2:released"],
+      runtimeOpenError: null,
+      approvals: [approval],
+    }),
+  );
+  expect(request).toHaveBeenCalledWith("set_model", {
+    workspace_id: "ws",
+    session_id: "s1",
+    provider_id: "p2:released",
+    reasoning_effort: "high",
+  });
+  expect(codaStore.getState().servers[server].catalog[0].sessions[0].access).toEqual({
+    type: "read_write",
+  });
+});
+
+test("a committed selection with a failed runtime stays read-only and retry applies the new snapshot", async () => {
+  const { request } = mount();
+  const snapshot = {
+    workspace_id: "ws",
+    session_id: "s1",
+    provider_id: "p2:released",
+    reasoning_effort: "high",
+    model_family: "f",
+    model_candidates: ["p2:released"],
+    runtime_open_error: "storage unavailable",
+    access: { type: "read_only", reason: "runtime_open_failed" },
+    permission_mode: "accept_edits",
+    messages: [],
+    pending_approvals: [],
+    turn_running: false,
+    compacting: false,
+    background_tasks: [],
+  };
+  request.mockResolvedValueOnce(snapshot as never);
+  setModel("p2:released", "high");
+  await vi.waitFor(() =>
+    expect(codaStore.getState().servers[server].sessions["ws/s1"].runtimeOpenError).toBe(
+      "storage unavailable",
+    ),
+  );
+  await sendTask("must remain blocked");
+  expect(request).toHaveBeenCalledTimes(1);
+  request.mockResolvedValueOnce({
+    ...snapshot,
+    runtime_open_error: null,
+    access: { type: "read_write" },
+  } as never);
+  setModel("p2:released", "high");
+  await vi.waitFor(() =>
+    expect(codaStore.getState().servers[server].sessions["ws/s1"].access).toEqual({
+      type: "read_write",
+    }),
+  );
+  expect(request).toHaveBeenCalledTimes(2);
+});
+
+test("a removed model remains visible while same-family recovery controls are enabled", () => {
+  const html = renderToStaticMarkup(
+    createElement(ModelSelector, {
+      providers: [
+        {
+          id: "p2:released",
+          provider: "p2",
+          model: "Released",
+          family: "f",
+          context_window: 1000,
+          reasoning_efforts: [],
+          input_modalities: ["text"],
+        },
+      ],
+      providerId: "p1:removed-preview",
+      reasoningEffort: null,
+      disabled: false,
+      allowedModelIds: ["p2:released"],
+      draftHasImages: false,
+      serverUrl: server,
+      workspaceId: "ws",
+      onSetModel: vi.fn(),
+    }),
+  );
+  expect(html).toContain("p1:removed-preview");
+  expect(html).not.toMatch(/<button[^>]* disabled=""/);
 });

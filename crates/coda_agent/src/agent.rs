@@ -481,6 +481,7 @@ impl SharedSystemPrompt {
 /// per turn; a session can map different agents to different profiles through
 /// [`RunConfig::agent_models`].
 pub struct ModelProfile<P> {
+    pub provider_id: String,
     pub provider: P,
     pub model: String,
     /// Human-readable identifier for logging (the `provider_id:model_id`
@@ -499,6 +500,7 @@ pub struct ModelProfile<P> {
 impl<P: Clone> Clone for ModelProfile<P> {
     fn clone(&self) -> Self {
         ModelProfile {
+            provider_id: self.provider_id.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
             label: self.label.clone(),

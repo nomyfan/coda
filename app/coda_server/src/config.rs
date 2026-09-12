@@ -43,6 +43,7 @@ impl From<std::io::Error> for ConfigError {
 /// caller defaults to 80% of `context_window`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
+    pub family: Option<String>,
     pub id: String,
     pub name: String,
     pub context_window: u32,
@@ -344,6 +345,12 @@ fn parse_models(
                 "provider '{provider_id}' has duplicate model id '{id}'"
             )));
         }
+        let family = table.get("family").map(|value| {
+            value.as_str().filter(|value| !value.is_empty() && value.trim() == *value)
+                .map(str::to_owned).ok_or_else(|| ConfigError::Parse(format!(
+                    "provider '{provider_id}' model '{id}' family must be a nonempty string without surrounding whitespace"
+                )))
+        }).transpose()?;
         // `name` is optional: when absent, the dashboard shows `id`.
         let name = table
             .get("name")
@@ -369,6 +376,7 @@ fn parse_models(
         let auto_compact_threshold =
             parse_auto_compact_threshold(table, provider_id, &id, context_window)?;
         models.push(ModelConfig {
+            family,
             id,
             name,
             context_window,

@@ -10,6 +10,7 @@ fn user() -> HistoryEntry {
 
 fn assistant(calls: &[&str]) -> HistoryEntry {
     entry(Message::Assistant(AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: calls
