@@ -11,7 +11,7 @@ use coda_agent::{
     compaction, runtime::SessionStorage,
 };
 use coda_core::llm::{LLMProvider, LLMProviderConfig, LLMStreamEvent, Message, Modality, TurnId};
-use coda_execution::{ArchiveDir, ArchivedTasks, BackgroundRootLock, BackgroundTasks};
+use coda_execution::{ArchiveDir, ArchiveRootLock, ArchivedTasks, BackgroundTasks};
 use coda_openai::OpenAICompatible;
 use coda_server::session_access::{
     SessionAccess, SessionModelResolution, UnavailableModel, can_select_model,
@@ -2625,7 +2625,7 @@ async fn main() {
     });
 
     let background_root = server_config.background.root.clone();
-    let _background_root_lock = BackgroundRootLock::acquire(&background_root).unwrap_or_else(|e| {
+    let _background_root_lock = ArchiveRootLock::acquire(&background_root).unwrap_or_else(|e| {
         eprintln!(
             "error locking background spool root {}: {e}",
             background_root.display()
@@ -2822,6 +2822,7 @@ mod selection_tests {
 
     fn model_config(id: &str) -> coda_server::config::ModelConfig {
         coda_server::config::ModelConfig {
+            output_limits: Default::default(),
             family: None,
             id: id.into(),
             name: id.into(),

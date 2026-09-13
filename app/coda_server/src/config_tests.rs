@@ -125,6 +125,7 @@ path = "/tmp/scratch"
             base_url: "https://api.deepseek.com/v1".to_string(),
             include_usage: true,
             models: vec![ModelConfig {
+                output_limits: Default::default(),
                 family: None,
                 id: "deepseek-reasoner".to_string(),
                 name: "DeepSeek R1".to_string(),

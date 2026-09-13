@@ -25,7 +25,7 @@
 //! ring files under a session archive, so a long-running task does not hold its
 //! output cap in RAM and unread output survives a hub entry release.
 
-mod archive_dir;
+use coda_output::archive_dir;
 mod archived_tasks;
 mod disk_tail;
 mod manifest;
@@ -34,7 +34,7 @@ mod quota;
 mod registry;
 mod task_archive;
 
-pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, BackgroundRootLock};
+pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, ArchiveRootLock};
 pub use archived_tasks::ArchivedTasks;
 pub use coda_core::task::{InvalidTaskId, TaskId};
 pub use disk_tail::{DiskTail, OutputChunk};

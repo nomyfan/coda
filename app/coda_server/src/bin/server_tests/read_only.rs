@@ -37,6 +37,7 @@ impl Harness {
             base_url: "http://127.0.0.1:1".into(),
             include_usage: true,
             models: vec![ModelConfig {
+                output_limits: Default::default(),
                 family: None,
                 id: "available".into(),
                 name: "Available".into(),

@@ -65,6 +65,12 @@ impl Default for TaskId {
     }
 }
 
+impl AsRef<str> for TaskId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

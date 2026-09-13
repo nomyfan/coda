@@ -5,8 +5,13 @@ use std::time::Duration;
 
 use coda_agent::{SUBAGENT_TOOL_PREFIX, ToolApprovalMode};
 use coda_core::llm::{Modality, ToolCall};
+use coda_core::output::{ModelOutputLimits, OutputLimits, ResourceLimits};
 use coda_openai::ProviderKind;
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+#[path = "config_resource_tests.rs"]
+mod resource_tests;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -43,6 +48,7 @@ impl From<std::io::Error> for ConfigError {
 /// caller defaults to 80% of `context_window`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
+    pub output_limits: ModelOutputLimits,
     pub family: Option<String>,
     pub id: String,
     pub name: String,
@@ -138,6 +144,7 @@ impl Default for BackgroundConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    pub resources: ResourceLimits,
     pub providers: Vec<ProviderConfig>,
     pub workspaces: Vec<WorkspaceConfig>,
     pub database: DatabaseConfig,
@@ -156,7 +163,8 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-    let providers = parse_providers(&doc)?;
+    let resources = parse_resources(content, base_dir)?;
+    let providers = parse_providers(&doc, &resources.output)?;
     let workspaces = parse_workspaces(&doc, base_dir)?;
     let database = parse_database(&doc)?;
     let background = parse_background(&doc, base_dir)?;
@@ -164,6 +172,7 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
     let keepalive = parse_keepalive(&doc)?;
 
     Ok(ServerConfig {
+        resources,
         providers,
         workspaces,
         database,
@@ -171,6 +180,28 @@ fn parse_server_config(content: &str, base_dir: &Path) -> Result<ServerConfig, C
         relay,
         keepalive,
     })
+}
+
+fn parse_resources(content: &str, base_dir: &Path) -> Result<ResourceLimits, ConfigError> {
+    #[derive(Deserialize)]
+    struct ResourceSection {
+        #[serde(default)]
+        resources: ResourceLimits,
+    }
+    let mut resources = toml_edit::de::from_str::<ResourceSection>(content)
+        .map_err(|error| ConfigError::Parse(format!("resources: {error}")))?
+        .resources;
+    let root = resources
+        .output
+        .root
+        .to_str()
+        .ok_or_else(|| ConfigError::Parse("resources.output.root must be UTF-8".into()))?;
+    resources.output.root = resolve_workspace_path(base_dir, &expand_env(root)?);
+    if !resources.output.root.is_absolute() {
+        resources.output.root = std::env::current_dir()?.join(&resources.output.root);
+    }
+    resources.validate().map_err(ConfigError::Parse)?;
+    Ok(resources)
 }
 
 /// Parse optional durable background output storage. Relative overrides use
@@ -249,7 +280,10 @@ fn positive_usize(value: &toml_edit::Item, field: &str) -> Result<usize, ConfigE
         .ok_or_else(|| ConfigError::Parse(format!("{field} must be a positive integer")))
 }
 
-fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, ConfigError> {
+fn parse_providers(
+    doc: &toml_edit::DocumentMut,
+    output_limits: &OutputLimits,
+) -> Result<Vec<ProviderConfig>, ConfigError> {
     let providers = doc
         .get("providers")
         .and_then(|item| item.as_array_of_tables())
@@ -278,7 +312,7 @@ fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, 
             .get("include_usage")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let models = parse_models(provider, &id)?;
+        let models = parse_models(provider, &id, output_limits)?;
 
         parsed.push(ProviderConfig {
             id,
@@ -305,6 +339,7 @@ fn parse_providers(doc: &toml_edit::DocumentMut) -> Result<Vec<ProviderConfig>, 
 fn parse_models(
     provider: &toml_edit::Table,
     provider_id: &str,
+    output_limits: &OutputLimits,
 ) -> Result<Vec<ModelConfig>, ConfigError> {
     let Some(array) = provider.get("models") else {
         return Err(ConfigError::Parse(format!(
@@ -376,6 +411,11 @@ fn parse_models(
         let auto_compact_threshold =
             parse_auto_compact_threshold(table, provider_id, &id, context_window)?;
         models.push(ModelConfig {
+            output_limits: parse_model_output_limits(table, output_limits).map_err(|error| {
+                ConfigError::Parse(format!(
+                    "provider '{provider_id}' model '{id}' output_limits.{error}"
+                ))
+            })?,
             family,
             id,
             name,
@@ -389,6 +429,29 @@ fn parse_models(
     }
 
     Ok(models)
+}
+
+fn parse_model_output_limits(
+    model: &toml_edit::InlineTable,
+    output: &OutputLimits,
+) -> Result<ModelOutputLimits, String> {
+    let mut limits = output.model;
+    if let Some(value) = model.get("output_limits") {
+        let table = value.as_inline_table().ok_or("must be an inline table")?;
+        for (name, value) in table {
+            let field = match name {
+                "single_bytes" => &mut limits.single_bytes,
+                "batch_bytes" => &mut limits.batch_bytes,
+                _ => return Err(format!("{name} is not a supported field")),
+            };
+            *field = value
+                .as_integer()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| format!("{name} must be a positive integer"))?;
+        }
+    }
+    limits.validate(&output.root)?;
+    Ok(limits)
 }
 
 fn parse_max_completion_tokens(

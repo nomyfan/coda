@@ -543,6 +543,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -554,6 +555,7 @@ name = "coda_execution"
 version = "0.1.0"
 dependencies = [
  "coda_core",
+ "coda_output",
  "jiff",
  "libc",
  "rustix",
@@ -590,6 +592,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "coda_output"
+version = "0.1.0"
+dependencies = [
+ "coda_core",
+ "jiff",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3223,6 +3239,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2153edc6955a6c354fad8f5efd38b6a8769bdccf9fe50f8e1329f81b0baa5d7"
 dependencies = [
  "indexmap",
+ "serde_core",
+ "serde_spanned",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "toml_writer",

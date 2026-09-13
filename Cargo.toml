@@ -7,6 +7,7 @@ members = [
   "crates/coda_mcp",
   "crates/coda_tools",
   "crates/coda_execution",
+  "crates/coda_output",
   "crates/coda_ptc",
   "app/coda_server",
 ]
@@ -18,6 +19,7 @@ coda_core = { path = "crates/coda_core" }
 coda_mcp = { path = "crates/coda_mcp" }
 coda_openai = { path = "crates/coda_openai" }
 coda_execution = { path = "crates/coda_execution" }
+coda_output = { path = "crates/coda_output" }
 coda_skills = { path = "crates/coda_skills" }
 coda_tools = { path = "crates/coda_tools" }
 coda_ptc = { path = "crates/coda_ptc" }
