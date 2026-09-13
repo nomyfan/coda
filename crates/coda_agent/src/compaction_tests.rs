@@ -30,6 +30,7 @@ fn assistant_in(turn: TurnId, call_id: &str, prompt_tokens: Option<u32>) -> Hist
             message_id: MessageId::new(),
             content: String::new(),
             tool_calls: vec![ToolCall {
+                output_bytes: None,
                 id: call_id.to_string(),
                 name: "tool".to_string(),
                 arguments: Some("{}".to_string()),
@@ -94,6 +95,7 @@ fn the_transcript_carries_calls_and_their_results() {
                 message_id: MessageId::new(),
                 content: "Looking.".into(),
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_read".into(),
                     name: "read_file".into(),
                     arguments: Some(r#"{"file_path":"coda-server.toml"}"#.into()),
@@ -532,6 +534,7 @@ fn malformed_history_is_an_error_instead_of_no_new_content() {
         unreachable!()
     };
     message.tool_calls.push(ToolCall {
+        output_bytes: None,
         id: "second".to_string(),
         name: "tool".to_string(),
         arguments: Some("{}".to_string()),

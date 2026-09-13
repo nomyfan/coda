@@ -99,6 +99,15 @@ struct Cli {
     listen_addr: String,
 }
 
+#[derive(serde::Deserialize)]
+struct GetTaskResultParams {
+    workspace_id: String,
+    session_id: String,
+    task_id: String,
+    #[serde(default)]
+    cursor: coda_execution::TaskResultCursor,
+}
+
 struct AppState {
     /// All configured providers, keyed by id. The dashboard chooses which one a
     /// session uses; `default_provider` is the fallback until it selects.
@@ -121,6 +130,7 @@ struct AppState {
 /// multiple models under one provider. `reasoning_efforts` is the list the UI
 /// offers; empty means the model has no reasoning controls.
 struct ProviderHandle {
+    output_limits: coda_core::output::ModelOutputLimits,
     family: Option<String>,
     provider: Arc<OpenAICompatible>,
     model_id: String,
@@ -143,6 +153,8 @@ struct ProviderHandle {
 }
 
 struct WorkspaceState {
+    output_store: Arc<coda_output::Store>,
+    ptc_limits: coda_core::output::PtcResourceLimits,
     id: String,
     storage: WorkspaceStorage,
     workspace_str: String,
@@ -339,6 +351,7 @@ impl AppOpener {
     /// so it has to read as an explanation to the user, not a stack trace.
     async fn summarize(
         &self,
+        key: &SessionKey,
         provider_id: &str,
         reasoning_effort: Option<&str>,
         history: &[HistoryEntry],
@@ -349,11 +362,26 @@ impl AppOpener {
             .providers
             .get(provider_id)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
+        let store = &self
+            .workspaces
+            .get(&key.0)
+            .ok_or("unknown workspace")?
+            .output_store;
+        let history = compaction::bounded_history(
+            history,
+            store.as_ref(),
+            coda_core::output::OutputOwner {
+                workspace_id: key.0.clone(),
+                session_id: key.1.clone(),
+            },
+            handle.output_limits,
+        )
+        .await?;
         let request = compaction::summary_request(
             handle.model_id.clone(),
             handle.max_completion_tokens,
             reasoning_effort.map(str::to_string),
-            coda_agent::message_view::model_view(history).take(cutoff.model_view_len),
+            coda_agent::message_view::model_view(&history).take(cutoff.model_view_len),
             instructions,
         );
 
@@ -380,6 +408,9 @@ impl AppOpener {
 }
 
 impl SessionOpener for AppOpener {
+    fn output_store(&self, key: &SessionKey) -> Arc<coda_output::Store> {
+        self.workspaces[&key.0].output_store.clone()
+    }
     fn resolve_session_model<'a>(
         &'a self,
         key: &'a SessionKey,
@@ -470,7 +501,8 @@ impl SessionOpener for AppOpener {
 
     fn archived_tasks(&self, key: &SessionKey) -> Result<Option<ArchivedTasks>, String> {
         let dir = background_dir(&self.background_root, &key.0, &key.1)?;
-        ArchivedTasks::open_existing(&dir).map_err(|error| error.to_string())
+        ArchivedTasks::open_with_store(&dir, self.workspaces[&key.0].output_store.clone())
+            .map_err(|error| error.to_string())
     }
 
     fn persist_allow_patterns<'a>(
@@ -602,6 +634,7 @@ impl SessionOpener for AppOpener {
             let baseline = checkpoint.messages.len();
             let summary = self
                 .summarize(
+                    key,
                     provider_id,
                     reasoning_effort,
                     &checkpoint.messages,
@@ -813,6 +846,7 @@ async fn open_session(
     // The root agent (and any agent without an override) runs on the session's
     // selected model.
     let default_model = ModelProfile {
+        output_limits: provider.output_limits,
         provider_id: provider.provider_id.clone(),
         provider: provider.provider.clone(),
         model: provider.model_id.clone(),
@@ -833,6 +867,7 @@ async fn open_session(
                 .get(&selection.provider_id)
                 .expect("agent model selections are validated at startup");
             let profile = ModelProfile {
+                output_limits: handle.output_limits,
                 provider_id: handle.provider_id.clone(),
                 provider: handle.provider.clone(),
                 model: handle.model_id.clone(),
@@ -846,6 +881,14 @@ async fn open_session(
         })
         .collect();
     let config = RunConfig {
+        outputs: Some(coda_core::output::OutputRuntime {
+            store: workspace.output_store.clone(),
+            owner: coda_core::output::OutputOwner {
+                workspace_id: workspace.id.clone(),
+                session_id: session_id.into(),
+            },
+            ptc: workspace.ptc_limits.clone(),
+        }),
         default_model,
         agent_models,
         tool_approval: workspace
@@ -1078,6 +1121,7 @@ fn build_providers(
         for model in models {
             let id = format!("{}:{}", provider_id, model.id);
             let handle = Arc::new(ProviderHandle {
+                output_limits: model.output_limits,
                 family: model.family,
                 provider: shared_provider.clone(),
                 model_id: model.id,
@@ -1783,7 +1827,7 @@ async fn dispatch_request(
             }
         }
         "get_task_result" => {
-            let params: KillTaskParams = match parse_params(params) {
+            let params: GetTaskResultParams = match parse_params(params) {
                 Ok(params) => params,
                 Err(error) => return (id, error).into(),
             };
@@ -1794,6 +1838,7 @@ async fn dispatch_request(
                     conn_id,
                     SessionCommand::GetTaskResult {
                         task_id: params.task_id,
+                        cursor: params.cursor,
                     },
                 )
                 .await
@@ -2451,6 +2496,8 @@ fn resolve_agent_model_selections(
 }
 
 async fn build_workspace(
+    output_store: Arc<coda_output::Store>,
+    ptc_limits: coda_core::output::PtcResourceLimits,
     workspace: WorkspaceConfig,
     providers: &HashMap<String, Arc<ProviderHandle>>,
     pool: &DbPool,
@@ -2556,6 +2603,8 @@ async fn build_workspace(
         .unwrap_or_else(WorkspaceKnowledge::empty);
 
     Ok(WorkspaceState {
+        output_store,
+        ptc_limits,
         id: workspace.id,
         files: FileIndex::new(workspace_str.clone()),
         knowledge: session_knowledge,
@@ -2624,6 +2673,11 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let output_store = Arc::new(
+        coda_output::Store::open(server_config.resources.output.clone())
+            .unwrap_or_else(|error| panic!("failed to open output storage: {error}")),
+    );
+    output_store.start_cleanup();
     let background_root = server_config.background.root.clone();
     let _background_root_lock = ArchiveRootLock::acquire(&background_root).unwrap_or_else(|e| {
         eprintln!(
@@ -2653,12 +2707,19 @@ async fn main() {
     let mut workspaces = HashMap::new();
     for workspace in server_config.workspaces {
         let id = workspace.id.clone();
-        let state = build_workspace(workspace, &providers, &pool, &shutdown)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("error loading workspace '{id}': {e}");
-                std::process::exit(1);
-            });
+        let state = build_workspace(
+            output_store.clone(),
+            server_config.resources.ptc.clone(),
+            workspace,
+            &providers,
+            &pool,
+            &shutdown,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("error loading workspace '{id}': {e}");
+            std::process::exit(1);
+        });
         workspaces.insert(id, Arc::new(state));
     }
 

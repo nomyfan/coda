@@ -521,6 +521,8 @@ version = "0.1.0"
 dependencies = [
  "coda_core",
  "coda_execution",
+ "coda_output",
+ "coda_ptc",
  "coda_tools",
  "futures",
  "jiff",
@@ -613,6 +615,7 @@ name = "coda_ptc"
 version = "0.1.0"
 dependencies = [
  "coda_core",
+ "coda_output",
  "rquickjs",
  "serde",
  "serde_json",
@@ -633,6 +636,7 @@ dependencies = [
  "coda_execution",
  "coda_mcp",
  "coda_openai",
+ "coda_output",
  "coda_skills",
  "coda_tools",
  "diesel",
@@ -672,12 +676,14 @@ version = "0.1.0"
 dependencies = [
  "coda_core",
  "coda_execution",
+ "coda_output",
  "coda_ptc",
  "diffy",
  "libc",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

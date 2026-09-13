@@ -138,7 +138,7 @@ async fn materialize(&self, output: &OutputData, memory: &BufferBudget)
 
 - `OutputData`：`Inline(text)`、`Buffered(BufferedOutput)`、`Captured(CapturedOutput)`、`Page(page)`。Buffered 是供程序消费的临时内存/文件句柄，带完整性及资源预留，不是历史引用；Captured 带有界预览、采集计数和 `storage = Retained(OutputRef) | Unavailable(StorageFailure)`，允许没有文件引用的正常返回；小结果完整内联时用 Inline。正文可能包含 stdout/stderr 或 PTC value/log，原始工具字符串语义不变。
 - `OutputRef`：随机 OutputId、各通道稳定绝对路径、采集字节数、保存字节数、`complete`、丢失原因和封存/到期时间。ID 不编码用户路径、工作区或会话；manifest 记录创建它的工作区和会话，供配额计费。它是文件引用，不是访问控制凭证。
-- `ToolMessage.output` 保存最终有界展示字符串；新增 `output_refs`、`storage_issues` 及 `read_receipts`。output_refs 只含该对外结果通过封存屏障的引用；storage_issues 记录有界的失败类别及计数，不以残留文件名充当成功引用。引用不混入 FileDiff artifact 或成功工具状态，可随失败/取消结果保存；不得以工具失败为理由丢弃已保留输出。读取凭证列表支持一个 PTC 脚本完成多次读取，但不携带其原始内容。
+- `ToolMessage.output` 保存最终有界展示字符串；新增 `output_refs` 及 `read_receipts`。output_refs 只含该对外结果通过封存屏障的引用；存储失败类别编码在有界响应的 `storage_failure` 及引用的 `failure` 中，不以残留文件名充当成功引用。引用不混入 FileDiff artifact 或成功工具状态，可随失败/取消结果保存；不得以工具失败为理由丢弃已保留输出。读取凭证列表支持一个 PTC 脚本完成多次读取，但不携带其原始内容。
 - 新增 `task_output_progress` 表，以 `(workspace_id, session_id, consumer_pid, task_id, channel)` 为键，保存连续已交付位置；只外键关联 session，避免 rewind 删除消息/进程时撤销交付事实。与消息及现有 `task_notice_receipts` 同事务更新；fork 不复制此表，会话删除级联删除。输出正文及输出对象元数据仍不建数据库表。
 - `<output-root>/objects/<output-id>/` 存小型 manifest 及普通通道文件（如 `stdout.txt`、`stderr.txt`、`result.json`），不使用 ring 布局或要求专用解码。待保留结果运行中为 `Writing`，完成封存后为 `Sealed`，失效为 `Expired`；manifest 标记的 Programmatic 临时对象不进入可靠封存状态，使用结束或重启恢复时清理，同样占用字节及对象数量配额。`complete` 与执行状态正交。无缺失的取消结果表示“采集到取消为止完整”，不表示命令执行完成。文件仅创建/追加，由服务封存后不再修改；本机同用户下的 shell 修改文件不属于存储的隔离保证。
 - 面向模型的小输出在内存内联；需要缩成预览时，在预览发布前尝试保存被省略的全文，成功才发布文件引用，失败则按 storage=Unavailable 提交预览。大输出超过采集缓存阈值时提前落盘；因此内存阈值与展示阈值不同也不会漏存。Programmatic 临时缓冲不因超过模型展示阈值而转为保留结果。
@@ -224,32 +224,49 @@ async fn materialize(&self, output: &OutputData, memory: &BufferBudget)
 
 ## Implementation Roadmap
 
-当前进度（2026-09-13）：已提交需求及设计，首批实现完成配置解析/校验和模型字段覆盖、core 输出元数据及可释放的内存额度、同批预算分配，以及 coda_output 目录安全代码迁移和首尾预览。后台归档已复用迁移后的目录实现；新增资源配置尚未接入工具执行，下面的完整里程碑仍保持未完成。下一步完成采集/封存及配额，并验证真实 PTC 日志交付和 checkpoint 链路。
+当前进度（2026-09-13）：全部实现已接入。统一采集/封存/配额、前台和文件工具、PTC 原始交付及独立日志队列、模型批预算、后台分页及 checkpoint 读取凭证、历史请求及压缩视图、服务配置和网页回查提示均已完成，以下里程碑已通过对应验证。
 
-- [ ] [交付验证] 用最小存储、后台 task_output、PTC 和真实 checkpoint 接口验证有界页面、读取凭证及封存失败降级。
+- [x] [交付验证] 用最小存储、后台 task_output、PTC 和真实 checkpoint 接口验证有界页面、读取凭证及封存失败降级。
   Purpose：先证明只交付预览不会误确认全文，输出存储失败仍可提交原执行结果，成功交付后崩溃也不会跳过数据。
   Verification：在真实 JS worker/host bridge 上用同步屏障让待交付结果占满非日志可分配额度，脚本随后同步 console.log 输出多块日志，长度同时超过采集缓存及日志队列容量，再 await 结果。磁盘正常、配额充足时断言日志完整保存、调用及结果交付成功，不靠超时释放，也不借用日志预留或突破总内存预算；覆盖单条长日志和多次日志调用。另注入 IO 超时/配额失败及取消，验证等待被及时唤醒、不完整标记、有界收尾及在途资源持续计费。
   Verification：小于一页预算、并发读、PTC 资源不足导致交付失败；逐点注入文件 fsync/manifest rename/目录 fsync 失败及超时迟到成功，断言 1 秒整理期限、原执行状态及 effects、无不可靠路径、在途计费；另测 checkpoint 失败/提交响应丢失和恢复，检查游标与通知一致。
   Verification：正常磁盘、配额充足且封存在期限内时，取消已产生超过内存/预览上限日志的命令，通过结果路径读到取消前位于中间的标记；覆盖取消发生在排队写入/封存期间、PTC 已显式输出大量日志及重复取消。断言终止先于封存完成，结果保持 Aborted、已保留日志引用进入 checkpoint、未提交取消调用的 effects；对照真实磁盘故障/整理超时才降级。
-- [ ] [配置与 core] 加入已验证的配置类型、OutputData/ToolFailure、引用及预算；让已有小结果工具可独立编译。
+- [x] [配置与 core] 加入已验证的配置类型、OutputData/ToolFailure、引用及预算；让已有小结果工具可独立编译。
   Purpose：确立跨 crate 契约，区分原始结果与模型展示。
   Verification：默认/覆盖/边界/非法组合测试，子 agent 模型覆盖与 SetModel；PTC 描述反映实际值。
-- [ ] [存储] 建立 coda_output，迁移目录安全基础，完成有界采集、顺序文件、配额及清理。
+- [x] [存储] 建立 coda_output，迁移目录安全基础，完成有界采集、顺序文件、配额及清理。
   Purpose：让大结果在内存和磁盘约束内可回查，不靠执行器各自实现。
   Verification：多通道及多会话并发写入、quota/ENOSPC/删除失败、取消在途 IO、超长单行/UTF-8、恢复扫描与 symlink；峰值缓存随输入总量不增长，产物可由普通 read_file/rg 直接读取。
-- [ ] [前台与文件工具] 接入 shell/grep/glob/ls；read_file 改按需读取并支持字节续读。
+- [x] [前台与文件工具] 接入 shell/grep/glob/ls；read_file 改按需读取并支持字节续读。
   Purpose：消除前台无界 Vec 和大文件整读，正常/失败/超时均保留诊断。
   Verification：超配额命令仍能退出、无管道阻塞；读取超过 10 MiB 文件及跨单行分页；取消和文件变化提示。
-- [ ] [统一消息及 PTC] 执行前分配批预算、完成前归档预览、请求视图兜底；PTC 接入实际内存预留、临时采集、日志及合法最终报告。
+- [x] [统一消息及 PTC] 执行前分配批预算、完成前归档预览、请求视图兜底；PTC 接入实际内存预留、临时采集、日志及合法最终报告。
   Purpose：普通/MCP/子 agent/PTC 共享模型输出边界，避免漏掉错误与取消路径。
   Verification：乱序完成及审批恢复预算稳定；批次过大不启动副作用；最终 JSON 超出展示额度后可回查原文且 envelope 合法，日志洪水、OUTPUT_LIMIT 与 effects 行为正确；最长合法路径在最小批次槽位下仍完整展示。
   Verification：顺序处理并释放 100 份 1 MiB 数据，累计超过原 16 MiB 限额仍成功；单份超过原 4 MiB、实际资源允许时原样交付；并发结果背压且原生内存峰值有界，无部分物化死锁。覆盖真实内存不足、采集不完整、JS 转换失败，断言执行状态与交付状态分开、外部副作用只发生一次、失败交付不推进读取凭证；PTC 内部 read_file/task_output 页面不套用模型额度。脚本抛错/取消后仅保留对外日志及错误，中间临时文件清理且在途 IO 继续计费，无自动诊断索引。
-- [ ] [后台与持久化] 以 OutputId 替换 ring/result 文件，落地交付凭证恢复、fork/rewind/delete 和旧格式退场。
+- [x] [后台与持久化] 以 OutputId 替换 ring/result 文件，落地交付凭证恢复、fork/rewind/delete 和旧格式退场。
   Purpose：所有输出共用配额，并在会话生命周期内保持可解释的回查行为。
   Verification：带数据库的 fork 保留路径/删除源会话后仍可读/配额及期限清理后文件缺失/重启/提交未知状态测试；确认 fork 不重复计费、删会话不漏算残留文件，后台通知既有回归测试；新增进度表走 migration 并生成 schema.rs，不手改。
-- [ ] [回查提示与 UI] 在预览展示绝对路径、完整性及期限；已有 get_task_result 接入有界分页，更新工具描述、system-prompt、templates、配置示例和 AGENTS.md。
+- [x] [回查提示与 UI] 在预览展示绝对路径、完整性及期限；已有 get_task_result 接入有界分页，更新工具描述、system-prompt、templates、配置示例和 AGENTS.md。
   Purpose：让 agent 通过现有文件工具取得省略内容，不额外实现结果搜索。
   Verification：read_file/grep/shell 可查询落盘内容且结果仍限额，现有审批继续生效；路径不被预览截断，过期后普通文件缺失；直接文件读取和面板读取均不确认任务通知，UI 不自动加载全部分页。
-- [ ] [最终验证] 运行项目规定检查及输出场景集。
+- [x] [最终验证] 运行项目规定检查及输出场景集。
   Purpose：确认跨 crate、存储和网页改动完整接入。
   Verification：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`；在一次性数据库上执行 `cargo test --features pg-tests`；`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`，并完成有界采集/磁盘配额的压力验证。
+
+
+## Verification Results
+
+- `cargo clippy --all-targets` 无警告，`cargo test --workspace` 通过，`cargo check -p coda_server --features pg-tests --all-targets` 通过。
+- 在独立的一次性 PostgreSQL 数据库上运行 `cargo test --workspace --features pg-tests --no-fail-fast`，全部启用的测试通过；已有 OpenRouter 付费实网测试保持忽略，没有使用真实服务进行额外付费请求。
+- 网页 `pnpm --filter coda-web lint`、`pnpm --filter coda-web test`（176 个测试）和 `pnpm --filter coda-web typecheck` 通过。
+- 输出场景覆盖：32 MiB 持续命令输出及配额耗尽后正常退出、大输出取消后中间日志回查、大文件/UTF-8 续读、封存各屏障失败及超时后的在途计费、淘汰/删除失败/重启扫描、稳定历史引用、批预算拒绝及 effects 交付、数据库 checkpoint 回滚/fork/rewind/delete、后台多消费者分页及旧格式退场。
+- PTC 场景覆盖：100 份 1 MiB 顺序处理、单份超过 4 MiB 原文交付、真实 JS worker 在结果占满非日志额度时排空单条长日志及多次日志、取消后保留显式日志、JS 转换失败不提交 state/读取凭证；最终回复继续进入统一展示预算。
+
+
+## Deviations from Design
+
+- 接口草图中的内部范围读取实现为 `OutputReader` + `OutputSnapshot`，后台采集增加 `CapturePurpose::Background` 来保证小结果也可重复读取；模型页面直接携带已封存引用，避免再次归档来源文件。
+- 存储失败写入有界响应的 `storage_failure` 和 `OutputRef.failure`，不另增重复的 `ToolMessage.storage_issues` 字段；执行状态仍由原工具结果保留。
+- 采集器提前 spill，为原始分块、首尾预览及 UTF-8 渲染副本留出空间；PTC 全文物化按原始字节及通道开销的 12 倍预留，最终 JSON 按编码大小的 32 倍加固定报告空间预留，以覆盖解码、String 容量增长和 JSON 树。它们是实际驻留资源的保守预留，不是累计流量限制，也不改变模型展示预算。
+- 历史大消息的请求视图使用由会话和消息 ID 派生的稳定对象 ID，保留期间重复生成请求/摘要不会重复归档或续期；正文及其历史 checkpoint 不被改写。

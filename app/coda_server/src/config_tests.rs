@@ -827,6 +827,7 @@ fn config_deny_overrides_allow() {
 fn config_non_shell_tools_skip() {
     let config = ToolApprovalConfig::load(Path::new("/nonexistent")).unwrap();
     let call = ToolCall {
+        output_bytes: None,
         id: "1".into(),
         name: "read_file".into(),
         arguments: None,
@@ -1211,6 +1212,7 @@ fn wildcard_whitespace_matches_any_whitespace() {
 fn shell_call(command: &str) -> ToolCall {
     let args = serde_json::json!({"command": command}).to_string();
     ToolCall {
+        output_bytes: None,
         id: "test".into(),
         name: "shell".into(),
         arguments: Some(args),
@@ -1219,6 +1221,7 @@ fn shell_call(command: &str) -> ToolCall {
 
 fn tool_call(name: &str) -> ToolCall {
     ToolCall {
+        output_bytes: None,
         id: "test".into(),
         name: name.into(),
         arguments: None,

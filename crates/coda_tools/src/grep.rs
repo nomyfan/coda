@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info};
 
-use crate::process::{CommandOutcome, run_command};
+use crate::process::{preserve_error, run_command};
+use coda_core::output::OutputData;
 
 pub struct GrepTool {
     /// Absolute path to the directory where the grep command should be executed.
@@ -34,7 +35,7 @@ impl GrepTool {
 impl Tool for GrepTool {
     type Parameters = GrepToolParams;
 
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "grep"
@@ -57,7 +58,6 @@ impl Tool for GrepTool {
         let cwd = self.cwd.clone();
 
         async move {
-            // TODO: optimize the case where result is too large
             let mut cmd = Command::new("rg");
             cmd.arg("--color=never")
                 .arg("--line-number")
@@ -75,29 +75,23 @@ impl Tool for GrepTool {
 
             info!("Executing rg: {:?}", cmd);
 
-            let output = match run_command(cmd, ctx.cancel)
+            let output = run_command(cmd, ctx.clone())
                 .await
-                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute rg: {}", e)))?
-            {
-                CommandOutcome::Completed(output) => output,
-                CommandOutcome::Cancelled { .. } => {
-                    return Err(ToolError::Aborted(
-                        "Interrupted by the user before completion.".to_string(),
-                    ));
+                .map_err(|e| ToolError::ExecutionError(format!("Failed to execute rg: {e}")))?;
+            match output.status.and_then(|status| status.code()) {
+                Some(0) => Ok(output.output),
+                Some(1) => Ok("No matches found.".into()),
+                _ => {
+                    let error = if output.status.is_none() {
+                        ToolError::Aborted("Interrupted by the user before completion.".into())
+                    } else {
+                        ToolError::ExecutionError(format!(
+                            "rg failed (exit code {})",
+                            output.status.and_then(|s| s.code()).unwrap_or(-1)
+                        ))
+                    };
+                    Err(preserve_error(&ctx, error, output.output))
                 }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            match output.status.code() {
-                Some(0) => Ok(stdout.into_owned()),
-                Some(1) => Ok("No matches found.".to_string()),
-                _ => Err(ToolError::ExecutionError(format!(
-                    "rg failed (exit code {}): {}",
-                    output.status.code().unwrap_or(-1),
-                    stderr
-                ))),
             }
         }
     }

@@ -134,11 +134,13 @@ fn malformed_history(usage: Option<CompletionUsage>) -> Vec<HistoryEntry> {
     let assistant = Message::Assistant(coda_core::llm::AssistantMessage {
         tool_calls: vec![
             ToolCall {
+                output_bytes: None,
                 id: "finished".to_string(),
                 name: "read_todos".to_string(),
                 arguments: Some("{}".to_string()),
             },
             ToolCall {
+                output_bytes: None,
                 id: "missing".to_string(),
                 name: "read_todos".to_string(),
                 arguments: Some("{}".to_string()),

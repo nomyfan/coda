@@ -1,8 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use coda_core::tool::ToolResult;
-
 use super::*;
 
 /// A bare prebuilt tool with a fixed name, standing in for an MCP tool.
@@ -34,8 +32,13 @@ impl ToolObject for FakeTool {
         self: Arc<Self>,
         _params: String,
         _ctx: coda_core::tool::ToolCallContext,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
-        Box::pin(async { Ok(String::new()) })
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<coda_core::output::OutputData, coda_core::tool::ToolFailure>>
+                + Send,
+        >,
+    > {
+        Box::pin(async { Ok(String::new().into()) })
     }
 }
 

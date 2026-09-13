@@ -93,6 +93,25 @@ fn trim_incomplete_end(bytes: &[u8]) -> &[u8] {
     }
 }
 
+/// Keep a trailing partial scalar for the next raw-byte page, even after invalid bytes.
+pub fn page_boundary(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                offset += error.valid_up_to();
+                if let Some(invalid) = error.error_len() {
+                    offset += invalid;
+                } else {
+                    return offset;
+                }
+            }
+        }
+    }
+    offset
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

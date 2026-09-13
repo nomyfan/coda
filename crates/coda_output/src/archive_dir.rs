@@ -61,6 +61,7 @@ impl ArchiveError {
 /// enum means create/rename/unlink never take an arbitrary caller string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFileName {
+    OutputOwner,
     Stdout,
     Stderr,
     Log,
@@ -76,6 +77,7 @@ pub enum ArchiveFileName {
 impl ArchiveFileName {
     pub fn as_str(self) -> &'static str {
         match self {
+            ArchiveFileName::OutputOwner => "owner.json",
             ArchiveFileName::Stdout => "stdout.txt",
             ArchiveFileName::Stderr => "stderr.txt",
             ArchiveFileName::Log => "log.txt",

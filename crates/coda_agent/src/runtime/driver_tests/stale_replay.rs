@@ -59,6 +59,7 @@ fn dispatched(parent_message_id: MessageId) -> (TurnId, Vec<HistoryEntry>) {
                 generation: None,
                 message_id: parent_message_id,
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_explore".into(),
                     name: "explore".into(),
                     arguments: Some(r#"{"task":"inspect the crate"}"#.into()),
@@ -351,6 +352,7 @@ async fn replayed_resumes_must_match_the_current_approval_batch() {
                 parent_message_id,
                 pending_approval_calls: vec![crate::persist::StoredPreparedToolCall {
                     tool_call: ToolCall {
+                        output_bytes: None,
                         id: "call_explore".into(),
                         name: "agent__explore".into(),
                         arguments: Some(r#"{"task":"inspect"}"#.into()),

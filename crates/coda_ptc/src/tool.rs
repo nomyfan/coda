@@ -1,4 +1,5 @@
 use coda_core::llm::ToolDefinition;
+use coda_core::output::{CapturePurpose, Channel, OutputData, OutputStore};
 use coda_core::tool::{HostEffectLimits, Tool, ToolCallContext, ToolError, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -19,6 +20,10 @@ pub const PROGRAMMATIC_TOOL_NAMES: &[&str] = &[
     "ls",
     "read_todos",
     "write_todos",
+    "shell",
+    "grep",
+    "glob",
+    "task_output",
 ];
 
 pub struct RunJavaScriptTool {
@@ -58,7 +63,7 @@ pub struct RunJavaScriptParams {
 
 impl Tool for RunJavaScriptTool {
     type Parameters = RunJavaScriptParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         RUN_JAVASCRIPT_TOOL_NAME
@@ -77,8 +82,17 @@ impl Tool for RunJavaScriptTool {
         params: Self::Parameters,
         ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        let limits = self.limits;
+        let mut limits = self.limits;
         async move {
+            let store: std::sync::Arc<dyn OutputStore> = ctx
+                .output_store
+                .clone()
+                .unwrap_or_else(|| coda_output::Store::standalone());
+            limits.capture_memory_bytes = store.limits().capture_memory_bytes;
+            if let Some(resources) = &ctx.ptc_limits {
+                limits = PtcLimits::configured(resources, limits.capture_memory_bytes);
+            }
+
             if params.code.len() > limits.source_bytes {
                 return Err(ToolError::ResourceLimit(format!(
                     "JavaScript source exceeds {} bytes",
@@ -105,19 +119,60 @@ impl Tool for RunJavaScriptTool {
                     artifact_bytes: limits.artifact_bytes,
                 },
             );
-            let report = JsExecutor::new(limits)
+            let capture = store
+                .begin(
+                    ctx.output_owner.clone(),
+                    vec![Channel::Result, Channel::Log],
+                    CapturePurpose::ModelResult,
+                )
+                .await
+                .map_err(ToolError::ResourceLimit)?;
+            let logs = coda_output::log::LogCollector::start(
+                capture,
+                limits.capture_memory_bytes / 8,
+                ctx.cancel.clone(),
+                std::time::Instant::now() + limits.wall_time,
+            )
+            .map_err(|error| {
+                ToolError::ResourceLimit(format!("PTC log worker unavailable: {error}"))
+            })?;
+            let result = JsExecutor::new(limits)
                 .run(
                     params.code,
                     exposed_tools,
                     invoker,
                     scope.clone(),
                     ctx.cancel.clone(),
+                    Some(logs.writer()),
                 )
-                .await
-                .map_err(map_engine_error)?;
+                .await;
+            let (stdout, stdout_truncated) = logs.snapshot();
+            let mut report = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    let body = serde_json::json!({"ok": false, "error": {"code": if matches!(error, crate::engine::JsEngineError::Aborted(_)) { "ABORTED" } else { "EXECUTION_ERROR" }, "message": error.to_string()}, "stdout": stdout, "stdout_truncated": stdout_truncated}).to_string();
+                    let output = logs.finish(&body).await;
+                    ctx.preserve_output(match output {
+                        OutputData::Inline(_) => OutputData::Inline(body),
+                        output => output,
+                    });
+                    return Err(map_engine_error(error));
+                }
+            };
+            report.stdout = stdout;
+            report.stdout_truncated = stdout_truncated;
             scope.commit_into_outer()?;
-            serde_json::to_string(&report).map_err(|error| {
+            let body = serde_json::to_string(&report).map_err(|error| {
                 ToolError::ExecutionError(format!("failed to serialize JavaScript report: {error}"))
+            })?;
+            let output = logs.finish(&body).await;
+            Ok(match output {
+                OutputData::Inline(_) => OutputData::Inline(body),
+                OutputData::Captured(mut output) => {
+                    output.report_ok = Some(report.ok);
+                    OutputData::Captured(output)
+                }
+                output => output,
             })
         }
     }
@@ -132,11 +187,14 @@ fn map_engine_error(error: crate::engine::JsEngineError) -> ToolError {
 
 /// Build the stable provider-facing JavaScript runner descriptor.
 pub fn run_javascript_definition() -> ToolDefinition {
-    let limits = PtcLimits::default();
+    run_javascript_definition_with_limits(PtcLimits::default())
+}
+
+pub fn run_javascript_definition_with_limits(limits: PtcLimits) -> ToolDefinition {
     ToolDefinition {
         name: RUN_JAVASCRIPT_TOOL_NAME.to_string(),
         description: format!(
-            "Run one bounded ES2020 JavaScript program to coordinate several tool calls without returning intermediate results to the model. Call list_javascript_tools before writing the script to discover the currently available tool names; the matching direct tool descriptors in this request contain their parameter schemas. Inside JavaScript, call tools.<name>(input) with exactly one object. Each call returns a Promise<string> containing the tool's raw result; call JSON.parse only when that result is JSON, and never eval tool output. Top-level await and return are supported. Await every tool Promise before returning. Use Promise.all for independent calls expected to succeed, or Promise.allSettled when one call may fail, so no call remains unfinished. A failed tool Promise rejects with a serializable Error whose name, code, and message fields describe the failure; catch it or inspect Promise.allSettled results when failure is expected. TOOL_UNAVAILABLE errors include the tool names still available to this script so it can be adjusted without another discovery call. console.log(...) is the only console method and retains the newest diagnostic output when its limit is exceeded. Return the final compact JSON-serializable value. There are no ambient filesystem, network, process, timer, module, or require APIs; external effects are available only through the discovered tools. Returning with an unfinished tool call produces UNAWAITED_TOOL_CALLS and cancels that call.\n\nRuntime limits:\n{}",
+            "Run one bounded ES2020 JavaScript program to coordinate several tool calls without returning intermediate results to the model. Call list_javascript_tools before writing the script to discover the currently available tool names; the matching direct tool descriptors in this request contain their parameter schemas. Inside JavaScript, call tools.<name>(input) with exactly one object. Each call returns a Promise<string> containing the tool's raw result; call JSON.parse only when that result is JSON, and never eval tool output. Top-level await and return are supported. Await every tool Promise before returning. Use Promise.all for independent calls expected to succeed, or Promise.allSettled when one call may fail, so no call remains unfinished. A failed tool Promise rejects with a serializable Error whose name, code, and message fields describe the failure; catch it or inspect Promise.allSettled results when failure is expected. TOOL_UNAVAILABLE errors include the tool names still available to this script so it can be adjusted without another discovery call. console.log(...) is the only console method. Large explicit logs are retained as files within storage quotas and retention; the model receives a bounded preview and paths. Intermediate tool results remain raw and are not archived for history. Return the final compact JSON-serializable value. There are no ambient filesystem, network, process, timer, module, or require APIs; external effects are available only through the discovered tools. Returning with an unfinished tool call produces UNAWAITED_TOOL_CALLS and cancels that call.\n\nRuntime limits:\n{}",
             runtime_limits_description(limits)
         ),
         parameter_schema: json!({
@@ -229,24 +287,18 @@ fn ensure_message_limit(
 
 fn runtime_limits_description(limits: PtcLimits) -> String {
     format!(
-        "- Submitted source: at most {} of UTF-8 code. QuickJS memory: {}. QuickJS stack: {}.\n\
-- Wall-clock deadline: {} seconds, including time waiting for worker capacity, queued calls, and host tool execution; expiry produces DEADLINE_EXCEEDED.\n\
-- Tool calls: the first {} calls are admitted; later attempts reject with CALL_LIMIT. At most {} admitted calls execute concurrently; additional calls wait for capacity and still count toward the call total and wall-clock deadline.\n\
-- Successful tool results returned to JavaScript: {} of UTF-8 data per call and {} cumulative; excess rejects the affected Promise with RESULT_LIMIT.\n\
-- Staged tool effects: {} of thread state and {} of artifacts; excess rejects the affected Promise with RESOURCE_LIMIT.\n\
-- console.log: keeps the newest {} of combined output and reports truncation. Final serialized result report: {}, including its JSON envelope but excluding console output; excess produces OUTPUT_LIMIT.",
+        "source {}; heap {}; stack {}; timeout {} seconds; calls {}; concurrent calls {}; host buffers {} (includes {} for logs); state {}; artifacts {}; final JSON {}. Host buffers are released after delivery; there is no cumulative result-byte limit.",
         format_bytes(limits.source_bytes),
         format_bytes(limits.heap_bytes),
         format_bytes(limits.stack_bytes),
         limits.wall_time.as_secs(),
         limits.max_calls,
         limits.max_concurrent_calls,
-        format_bytes(limits.result_bytes),
-        format_bytes(limits.total_result_bytes),
+        format_bytes(limits.host_buffer_bytes),
+        format_bytes(limits.capture_memory_bytes + 64 * 1024),
         format_bytes(limits.state_bytes),
         format_bytes(limits.artifact_bytes),
-        format_bytes(limits.stdout_bytes),
-        format_bytes(limits.final_bytes),
+        format_bytes(limits.final_bytes)
     )
 }
 
@@ -300,48 +352,11 @@ mod tests {
         let description = run_javascript_definition().description;
 
         for expected in [
-            format!(
-                "Submitted source: at most {} of UTF-8 code",
-                format_bytes(limits.source_bytes)
-            ),
-            format!("QuickJS memory: {}", format_bytes(limits.heap_bytes)),
-            format!("QuickJS stack: {}", format_bytes(limits.stack_bytes)),
-            format!(
-                "Wall-clock deadline: {} seconds",
-                limits.wall_time.as_secs()
-            ),
-            "queued calls, and host tool execution".to_string(),
-            "expiry produces DEADLINE_EXCEEDED".to_string(),
-            format!("the first {} calls are admitted", limits.max_calls),
-            "later attempts reject with CALL_LIMIT".to_string(),
-            format!(
-                "At most {} admitted calls execute concurrently",
-                limits.max_concurrent_calls
-            ),
-            "additional calls wait for capacity and still count toward the call total and wall-clock deadline"
-                .to_string(),
-            format!(
-                "Successful tool results returned to JavaScript: {} of UTF-8 data per call and {} cumulative",
-                format_bytes(limits.result_bytes),
-                format_bytes(limits.total_result_bytes)
-            ),
-            "excess rejects the affected Promise with RESULT_LIMIT".to_string(),
-            format!(
-                "Staged tool effects: {} of thread state and {} of artifacts",
-                format_bytes(limits.state_bytes),
-                format_bytes(limits.artifact_bytes)
-            ),
-            "excess rejects the affected Promise with RESOURCE_LIMIT".to_string(),
-            format!(
-                "console.log: keeps the newest {} of combined output",
-                format_bytes(limits.stdout_bytes)
-            ),
-            format!(
-                "Final serialized result report: {}",
-                format_bytes(limits.final_bytes)
-            ),
-            "including its JSON envelope but excluding console output".to_string(),
-            "excess produces OUTPUT_LIMIT".to_string(),
+            format_bytes(limits.host_buffer_bytes),
+            format_bytes(limits.heap_bytes),
+            format_bytes(limits.final_bytes),
+            "no cumulative result-byte limit".into(),
+            "Intermediate tool results remain raw".into(),
         ] {
             assert!(
                 description.contains(&expected),

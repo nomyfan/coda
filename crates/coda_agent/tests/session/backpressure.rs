@@ -24,6 +24,7 @@ impl coda_core::llm::LLMProvider for BurstProvider {
                 AssistantMessage {
                     tool_calls: (0..CHILDREN)
                         .map(|id| ToolCall {
+                            output_bytes: None,
                             id: format!("child-{id}"),
                             name: "agent__worker".into(),
                             arguments: Some(json!({"task": "work"}).to_string()),
@@ -76,7 +77,9 @@ async fn replies_exceeding_inbox_capacity_do_not_block_dispatch_or_shutdown() {
         .background(None)
         .storage(MemoryStorage::default())
         .run_config(RunConfig {
+            outputs: None,
             default_model: ModelProfile {
+                output_limits: coda_core::output::ModelOutputLimits::default(),
                 provider_id: "test".into(),
                 provider: provider.clone(),
                 model: "fake".into(),

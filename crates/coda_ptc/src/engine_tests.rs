@@ -41,6 +41,7 @@ impl HostToolInvoker for FakeInvoker {
         Box::pin(async move {
             tokio::time::sleep(delay).await;
             Ok(HostToolCallResult {
+                buffer_lease: None,
                 output: format!("{name}:{arguments}"),
             })
         })
@@ -130,6 +131,7 @@ impl HostToolInvoker for EffectInvoker {
                 })
                 .unwrap();
             Ok(HostToolCallResult {
+                buffer_lease: None,
                 output: "oversized".to_string(),
             })
         })
@@ -147,17 +149,38 @@ fn scope() -> HostCallScope {
 }
 
 async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
+    use coda_core::output::{CapturePurpose, Channel, OutputStore};
     let invoker = Arc::new(FakeInvoker::new(names));
-    JsExecutor::new(limits)
+    let store = coda_output::Store::standalone();
+    let capture = store
+        .begin(
+            coda_core::tool::ToolCallContext::default().output_owner,
+            vec![Channel::Result, Channel::Log],
+            CapturePurpose::ModelResult,
+        )
+        .await
+        .unwrap();
+    let logs = coda_output::log::LogCollector::start(
+        capture,
+        limits.capture_memory_bytes / 8,
+        CancellationToken::new(),
+        std::time::Instant::now() + limits.wall_time,
+    )
+    .unwrap();
+    let mut report = JsExecutor::new(limits)
         .run(
             code.to_string(),
             invoker.exposed_tools(),
             invoker,
             scope(),
             CancellationToken::new(),
+            Some(logs.writer()),
         )
         .await
-        .unwrap()
+        .unwrap();
+    (report.stdout, report.stdout_truncated) = logs.snapshot();
+    let _ = logs.finish("").await;
+    report
 }
 
 async fn run_with_tool_error(code: &str) -> JsRunReport {
@@ -169,6 +192,7 @@ async fn run_with_tool_error(code: &str) -> JsRunReport {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()
@@ -183,6 +207,7 @@ async fn run_with_unavailable_tool(code: &str) -> JsRunReport {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()
@@ -202,7 +227,7 @@ return { answer: 42 };
 
     assert!(report.ok);
     assert_eq!(report.value, Some(serde_json::json!({ "answer": 42 })));
-    assert_eq!(report.stdout, "hello {\"answer\":42}");
+    assert_eq!(report.stdout, "hello {\"answer\":42}\n");
     assert!(!report.stdout_truncated);
 }
 
@@ -405,7 +430,7 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
     assert_eq!(call_report.error.unwrap().code, "CALL_LIMIT");
 
     let result_limits = PtcLimits {
-        result_bytes: 4,
+        host_buffer_bytes: 256 * KIB + 64 * KIB + 8,
         ..PtcLimits::default()
     };
     let result_report = run(
@@ -414,7 +439,7 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
         result_limits,
     )
     .await;
-    assert_eq!(result_report.error.unwrap().code, "RESULT_LIMIT");
+    assert_eq!(result_report.error.unwrap().code, "OUTPUT_LIMIT");
 }
 
 #[tokio::test]
@@ -435,6 +460,7 @@ async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -447,7 +473,7 @@ async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
 #[tokio::test]
 async fn result_limit_discards_the_childs_staged_effects() {
     let limits = PtcLimits {
-        result_bytes: 4,
+        host_buffer_bytes: 256 * KIB + 64 * KIB + 8,
         ..PtcLimits::default()
     };
     let state = Arc::new(RecordingState::default());
@@ -469,11 +495,12 @@ async fn result_limit_discards_the_childs_staged_effects() {
             invoker,
             scope,
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
 
-    assert_eq!(report.error.unwrap().code, "RESULT_LIMIT");
+    assert_eq!(report.error.unwrap().code, "OUTPUT_LIMIT");
     commit.commit_into_outer().unwrap();
     assert_eq!(state.get("effect"), None);
     assert!(inspect_artifacts.take_artifacts().is_empty());
@@ -492,6 +519,7 @@ async fn unfinished_fire_and_forget_call_is_reported_and_cancelled() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -516,6 +544,7 @@ async fn worker_queue_wait_observes_the_wall_clock_deadline() {
             Arc::new(FakeInvoker::new(&["read_file"])),
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -540,6 +569,7 @@ async fn worker_queue_wait_observes_cancellation() {
             Arc::new(FakeInvoker::new(&["read_file"])),
             scope(),
             cancel,
+            None,
         )
         .await;
 
@@ -587,6 +617,7 @@ async fn deadline_cancels_a_pending_host_call() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -607,6 +638,7 @@ async fn cancellation_wakes_a_permanently_pending_promise() {
                 invoker,
                 scope(),
                 cancel,
+                None,
             )
             .await
     });
@@ -620,19 +652,20 @@ async fn cancellation_wakes_a_permanently_pending_promise() {
 }
 
 #[tokio::test]
-async fn console_overflow_keeps_the_tail() {
+async fn console_overflow_keeps_head_and_tail() {
     let limits = PtcLimits {
-        stdout_bytes: 8,
+        capture_memory_bytes: 64 * KIB,
         ..PtcLimits::default()
     };
     let report = run(
-        "console.log('first'); console.log('second'); return null;",
+        "console.log('first'); console.log('x'.repeat(70000)); console.log('second'); return null;",
         &["read_file"],
         limits,
     )
     .await;
 
-    assert_eq!(report.stdout, "second");
+    assert!(report.stdout.starts_with("first\n"));
+    assert!(report.stdout.ends_with("second\n"));
     assert!(report.stdout_truncated);
 }
 
@@ -646,3 +679,33 @@ async fn oversized_final_value_becomes_a_reported_error() {
 
     assert_eq!(report.error.unwrap().code, "OUTPUT_LIMIT");
 }
+
+struct RawInvoker {
+    bytes: usize,
+}
+impl HostToolInvoker for RawInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".into()])
+    }
+    fn call(
+        &self,
+        _: String,
+        _: String,
+        ctx: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        let bytes = self.bytes;
+        Box::pin(async move {
+            let CapturePurpose::Programmatic(budget) = ctx.output_purpose else {
+                panic!()
+            };
+            let lease = budget.reserve(bytes * 2, &ctx.cancel).await.unwrap();
+            Ok(HostToolCallResult {
+                output: "x".repeat(bytes),
+                buffer_lease: Some(lease),
+            })
+        })
+    }
+}
+
+#[path = "engine_tests/output.rs"]
+mod output;

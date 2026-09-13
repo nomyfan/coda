@@ -1,5 +1,4 @@
 use super::*;
-use crate::DEFAULT_STREAM_CAPACITY;
 use tokio::sync::Notify;
 
 fn meta() -> TaskMeta {
@@ -43,6 +42,7 @@ async fn panel_reads_preserve_model_cursors_and_completion_notice() {
                     stdout_overwritten,
                     stderr_overwritten,
                 },
+            ..
         }) = reg.read_result(&id).await.unwrap()
         else {
             panic!("expected shell result")
@@ -64,87 +64,6 @@ async fn panel_reads_preserve_model_cursors_and_completion_notice() {
         notice, TaskNotice::Task { id: notice_id, .. } if notice_id == &id
     )));
     reg.shutdown().await;
-}
-
-#[tokio::test]
-async fn shell_panel_snapshot_survives_reopen_and_reports_overwrite() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let reg = BackgroundTasks::session_backed(root.clone()).await.unwrap();
-    let id = reg
-        .spawn_with(meta(), |ctx| async move {
-            ctx.append_stdout(&vec![b'x'; DEFAULT_STREAM_CAPACITY as usize + 7])
-                .await
-                .unwrap();
-            ctx.append_stderr(&[0xff]).await.unwrap();
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-    reg.wait_terminal(&id).await;
-    reg.shutdown().await;
-    drop(reg);
-    let reg = BackgroundTasks::session_backed(root).await.unwrap();
-    let Some(TaskResult::Available {
-        output:
-            TaskResultOutput::Shell {
-                stdout,
-                stderr,
-                stdout_overwritten,
-                stderr_overwritten,
-            },
-        ..
-    }) = reg.read_result(&id).await.unwrap()
-    else {
-        panic!("expected shell result")
-    };
-    assert_eq!(stdout, "x".repeat(DEFAULT_STREAM_CAPACITY as usize));
-    assert_eq!(stdout_overwritten, 7);
-    assert_eq!(stderr, "\u{fffd}");
-    assert_eq!(stderr_overwritten, 0);
-    // UI reads must not absorb the loss that the model still needs to see.
-    assert_eq!(reg.read(&id).await.unwrap().unwrap().stdout_lost, 7);
-    reg.shutdown().await;
-}
-
-#[tokio::test]
-async fn quota_evicted_panel_results_are_expired_even_if_model_consumed_them() {
-    for consumed in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-        let archive = Arc::new(TaskArchive::new(root));
-        let quota = SessionQuota::from_inventory(
-            &ArchiveInventory::default(),
-            2 * DEFAULT_STREAM_CAPACITY,
-            archive.clone(),
-        );
-        let reg = BackgroundTasks::new(Arc::new(Backend {
-            archive,
-            quota,
-            temp: None,
-        }));
-        let id = reg
-            .spawn_with(meta(), |ctx| async move {
-                ctx.append_stdout(b"output").await.unwrap();
-                TaskExit::Exited { code: Some(0) }
-            })
-            .await
-            .unwrap();
-        reg.wait_terminal(&id).await;
-        if consumed {
-            reg.read(&id).await.unwrap();
-        }
-        let next = reg
-            .spawn_with(meta(), |_| async { TaskExit::Exited { code: Some(0) } })
-            .await
-            .unwrap();
-        reg.wait_terminal(&next).await;
-        assert!(matches!(
-            reg.read_result(&id).await.unwrap(),
-            Some(TaskResult::Expired { .. })
-        ));
-        reg.shutdown().await;
-    }
 }
 
 #[tokio::test]
@@ -192,10 +111,70 @@ async fn missing_retained_bytes_are_a_read_error_not_empty_output() {
     reg.wait_terminal(&id).await;
     std::fs::OpenOptions::new()
         .write(true)
-        .open(tmp.path().join(id.as_str()).join("stdout.ring"))
+        .open(
+            reg.backend
+                .archive
+                .open(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .files()
+                .snapshot()
+                .reference
+                .unwrap()
+                .channels
+                .iter()
+                .find(|c| c.channel == coda_core::output::Channel::Stdout)
+                .unwrap()
+                .path
+                .clone(),
+        )
         .unwrap()
         .set_len(0)
         .unwrap();
     assert!(reg.read_result(&id).await.is_err());
+    reg.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_pages_repeat_until_commit_and_consumers_progress_independently() {
+    use coda_core::output::Channel;
+    let reg = BackgroundTasks::temporary().unwrap();
+    let id = reg
+        .spawn_with(meta(), |ctx| async move {
+            ctx.append_stdout("页内容🙂".repeat(6000).as_bytes())
+                .await
+                .unwrap();
+            TaskExit::Exited { code: Some(0) }
+        })
+        .await
+        .unwrap();
+    reg.wait_terminal(&id).await;
+    let (first, concurrent) = tokio::join!(
+        reg.read_page(&id, "root", [0; 3], None, 8192),
+        reg.read_page(&id, "root", [0; 3], None, 8192),
+    );
+    let first = first.unwrap().unwrap();
+    assert_eq!(first.body, concurrent.unwrap().unwrap().body);
+    assert!(first.body.len() <= 8192);
+    assert!(!first.body.contains('�'));
+    assert!(!first.complete);
+    assert_eq!(first.references.len(), 1);
+    assert_eq!(reg.output_progress("root", &id, Channel::Stdout).await, 0);
+    reg.commit_reads(&first.receipts).await;
+    let next = first.receipts[0].end;
+    assert!(next > 0);
+    assert_eq!(
+        reg.output_progress("root", &id, Channel::Stdout).await,
+        next
+    );
+    assert_eq!(reg.output_progress("child", &id, Channel::Stdout).await, 0);
+    let child = reg
+        .read_page(&id, "child", [0; 3], None, 8192)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.body, first.body);
+    assert!(!reg.take_notices().await.is_empty());
     reg.shutdown().await;
 }

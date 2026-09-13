@@ -85,6 +85,14 @@ impl ProcessHandle {
 }
 
 pub trait SessionStorage: Send + Sync {
+    fn load_output_progress(
+        &self,
+        _pid: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<coda_core::output::ReadProgress>, String>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     fn has_notice_receipt(
         &self,
         _task_id: coda_core::task::TaskId,
@@ -150,6 +158,14 @@ pub trait SessionStorage: Send + Sync {
 }
 
 impl SessionStorage for Arc<dyn SessionStorage> {
+    fn load_output_progress(
+        &self,
+        pid: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<coda_core::output::ReadProgress>, String>> + Send + '_>,
+    > {
+        (**self).load_output_progress(pid)
+    }
     fn has_notice_receipt(
         &self,
         task_id: coda_core::task::TaskId,
@@ -227,6 +243,7 @@ impl SessionStorage for Arc<dyn SessionStorage> {
 
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
+    output_progress: Arc<Mutex<Vec<coda_core::output::ReadProgress>>>,
     checkpoints: Arc<Mutex<HashMap<String, StoredCheckpoint>>>,
     snapshots: Arc<Mutex<HashMap<String, StoredRuntimeSnapshot>>>,
     aborted: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
@@ -236,11 +253,30 @@ pub struct MemoryStorage {
 impl MemoryStorage {
     async fn record_task_reads(&self, checkpoint: &StoredCheckpoint, stored_count: usize) {
         let mut receipts = self.notice_receipts.lock().await;
+        let mut progress = self.output_progress.lock().await;
         for entry in checkpoint.messages.iter().skip(stored_count) {
-            if let coda_core::llm::Message::Tool(tool) = &entry.message
-                && let Some(task) = &tool.observed_task
-            {
-                receipts.insert(task.clone());
+            if let coda_core::llm::Message::Tool(tool) = &entry.message {
+                for task in tool.observed_task.iter().chain(tool.observed_tasks.iter()) {
+                    receipts.insert(task.clone());
+                }
+                for receipt in &tool.read_receipts {
+                    if let Some(current) = progress.iter_mut().find(|p| {
+                        p.consumer == receipt.consumer
+                            && p.task == receipt.task
+                            && p.channel == receipt.channel
+                    }) {
+                        if receipt.start <= current.offset {
+                            current.offset = current.offset.max(receipt.end);
+                        }
+                    } else if receipt.start == 0 {
+                        progress.push(coda_core::output::ReadProgress {
+                            consumer: receipt.consumer.clone(),
+                            task: receipt.task.clone(),
+                            channel: receipt.channel,
+                            offset: receipt.end,
+                        });
+                    }
+                }
             }
         }
     }
@@ -283,6 +319,25 @@ impl MemoryStorage {
 }
 
 impl SessionStorage for MemoryStorage {
+    fn load_output_progress(
+        &self,
+        pid: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<coda_core::output::ReadProgress>, String>> + Send + '_>,
+    > {
+        let pid = pid.to_owned();
+        Box::pin(async move {
+            Ok(self
+                .output_progress
+                .lock()
+                .await
+                .iter()
+                .filter(|p| p.consumer == pid)
+                .cloned()
+                .collect())
+        })
+    }
+
     fn has_notice_receipt(
         &self,
         task_id: coda_core::task::TaskId,

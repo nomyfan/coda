@@ -9,6 +9,7 @@ pub use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info, info_span};
 
 use super::llm::{ToolArtifact, ToolDefinition};
+use crate::output::{CapturePurpose, OutputData, OutputOwner, OutputStore};
 
 /// A tool's durable state on the calling thread, keyed by an opaque `kind`.
 ///
@@ -65,8 +66,9 @@ impl Display for HostEffectError {
 impl std::error::Error for HostEffectError {}
 
 /// Result returned by a tool invoked through a programmatic host bridge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct HostToolCallResult {
+    pub buffer_lease: Option<crate::output::BufferLease>,
     /// Raw tool output returned to the programmatic caller.
     pub output: String,
 }
@@ -145,6 +147,14 @@ pub struct ToolCallContext {
     observed_task: Arc<std::sync::Mutex<Option<crate::task::TaskId>>>,
     /// Optional capability installed only for a programmatic runner call.
     invoker: Option<Arc<dyn HostToolInvoker>>,
+    pub output_store: Option<Arc<dyn OutputStore>>,
+    pub output_owner: OutputOwner,
+    pub output_purpose: CapturePurpose,
+    pub output_bytes: usize,
+    pub ptc_limits: Option<crate::output::PtcResourceLimits>,
+    failure_output: Arc<std::sync::Mutex<Option<OutputData>>>,
+    read_receipts: Arc<std::sync::Mutex<Vec<crate::output::ReadReceipt>>>,
+    prior_reads: Arc<[crate::output::ReadReceipt]>,
 }
 
 impl ToolCallContext {
@@ -157,7 +167,50 @@ impl ToolCallContext {
             artifacts: Arc::new(UnboundedArtifactSink::default()),
             observed_task: Arc::default(),
             invoker: None,
+            output_store: None,
+            output_owner: OutputOwner {
+                workspace_id: String::new(),
+                session_id: String::new(),
+            },
+            output_purpose: CapturePurpose::ModelResult,
+            output_bytes: crate::output::ModelOutputLimits::default().single_bytes,
+            ptc_limits: None,
+            failure_output: Arc::default(),
+            read_receipts: Arc::default(),
+            prior_reads: Arc::from([]),
         }
+    }
+
+    pub fn record_reads(&self, receipts: Vec<crate::output::ReadReceipt>) {
+        self.read_receipts.lock().unwrap().extend(receipts);
+    }
+    pub fn take_reads(&self) -> Vec<crate::output::ReadReceipt> {
+        std::mem::take(&mut *self.read_receipts.lock().unwrap())
+    }
+    pub fn read_offset(
+        &self,
+        task: &crate::task::TaskId,
+        channel: crate::output::Channel,
+        mut offset: u64,
+    ) -> u64 {
+        for read in self
+            .prior_reads
+            .iter()
+            .chain(self.read_receipts.lock().unwrap().iter())
+        {
+            if &read.task == task && read.channel == channel && read.start <= offset {
+                offset = offset.max(read.end);
+            }
+        }
+        offset
+    }
+
+    pub fn preserve_output(&self, output: OutputData) {
+        *self.failure_output.lock().unwrap() = Some(output);
+    }
+
+    pub fn take_failure_output(&self) -> Option<OutputData> {
+        self.failure_output.lock().unwrap().take()
     }
 
     /// Record the complete terminal result returned by this task_output call.
@@ -242,6 +295,7 @@ pub struct HostEffectLimits {
 }
 
 struct ScopedEffects {
+    reads: Vec<crate::output::ReadReceipt>,
     /// Final value and retained size for each state key committed by child calls.
     state: BTreeMap<String, (serde_json::Value, usize)>,
     /// Artifacts committed by completed child calls in completion order.
@@ -276,6 +330,7 @@ impl HostCallScope {
             outer,
             limits,
             effects: std::sync::Mutex::new(ScopedEffects {
+                reads: Vec::new(),
                 state: BTreeMap::new(),
                 artifacts: Vec::new(),
                 reserved_state_bytes: 0,
@@ -303,6 +358,22 @@ impl HostCallScope {
             artifacts: artifacts.clone(),
             observed_task: Arc::default(),
             invoker: None,
+            output_store: self.0.outer.output_store.clone(),
+            output_owner: self.0.outer.output_owner.clone(),
+            output_purpose: self.0.outer.output_purpose.clone(),
+            output_bytes: self.0.outer.output_bytes,
+            ptc_limits: self.0.outer.ptc_limits.clone(),
+            failure_output: Arc::default(),
+            read_receipts: Arc::default(),
+            prior_reads: self
+                .0
+                .outer
+                .prior_reads
+                .iter()
+                .cloned()
+                .chain(self.0.effects.lock().unwrap().reads.iter().cloned())
+                .collect::<Vec<_>>()
+                .into(),
         };
         StagedToolCall {
             scope: self.clone(),
@@ -315,6 +386,9 @@ impl HostCallScope {
 
     /// Consume the scope and write each final state key once to the outer call.
     pub fn commit_into_outer(self) -> Result<(), HostEffectError> {
+        self.0
+            .outer
+            .record_reads(std::mem::take(&mut self.0.effects.lock().unwrap().reads));
         let (state, artifacts) = {
             let mut effects = self.0.effects.lock().unwrap();
             if effects.finalized {
@@ -495,6 +569,7 @@ impl StagedToolCall {
                     effects.reserved_state_bytes.saturating_sub(old_bytes);
             }
         }
+        effects.reads.extend(self.context.take_reads());
         effects
             .artifacts
             .extend(artifacts.into_iter().map(|(artifact, _)| artifact));
@@ -511,6 +586,27 @@ impl Drop for StagedToolCall {
     }
 }
 
+#[derive(Debug)]
+pub struct ToolFailure {
+    pub error: ToolError,
+    pub output: Option<OutputData>,
+}
+
+impl From<ToolError> for ToolFailure {
+    fn from(error: ToolError) -> Self {
+        Self {
+            error,
+            output: None,
+        }
+    }
+}
+
+impl Display for ToolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.error, f)
+    }
+}
+
 pub type ToolResult<T> = Result<T, ToolError>;
 
 impl<T> From<ToolError> for ToolResult<T> {
@@ -521,7 +617,7 @@ impl<T> From<ToolError> for ToolResult<T> {
 
 pub trait Tool: Send + Sync + 'static {
     type Parameters: DeserializeOwned + Send;
-    type Output: Display + Send;
+    type Output: Into<OutputData> + Send;
 
     fn name(&self) -> &str;
     fn description(&self) -> &str;
@@ -541,7 +637,7 @@ pub trait ToolObject: Send + Sync {
         self: Arc<Self>,
         params: String,
         ctx: ToolCallContext,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<OutputData, ToolFailure>> + Send>>;
 }
 
 pub struct ToolWrapper<T: Tool>(T);
@@ -566,7 +662,7 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
         self: Arc<Self>,
         input: String,
         ctx: ToolCallContext,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<OutputData, ToolFailure>> + Send>> {
         let started = std::time::Instant::now();
         let span = info_span!(
             "execute_tool",
@@ -585,7 +681,8 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
                 span.record("error_category", "invalid_parameters");
                 span.record("duration_ms", started.elapsed().as_millis() as u64);
                 return Box::pin(
-                    async move { ToolError::InvalidParameters(reason).into() }.instrument(span),
+                    async move { Err(ToolError::InvalidParameters(reason).into()) }
+                        .instrument(span),
                 );
             }
         };
@@ -593,16 +690,16 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
         Box::pin(
             async move {
                 info!("executing tool");
-                let result = self
-                    .0
-                    .execute(params, ctx)
-                    .await
-                    .map(|output| output.to_string());
+                let result = self.0.execute(params, ctx.clone()).await.map(Into::into);
                 let span = Span::current();
                 match &result {
                     Ok(output) => {
                         span.record("status", "ok");
-                        span.record("output_bytes", output.len());
+                        if let OutputData::Inline(text) | OutputData::Page { body: text, .. } =
+                            output
+                        {
+                            span.record("output_bytes", text.len());
+                        }
                     }
                     Err(ToolError::InvalidParameters(_)) => {
                         span.record("status", "error");
@@ -622,7 +719,10 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
                     }
                 };
                 span.record("duration_ms", started.elapsed().as_millis() as u64);
-                result
+                result.map_err(|error| ToolFailure {
+                    error,
+                    output: ctx.take_failure_output(),
+                })
             }
             .instrument(span),
         )

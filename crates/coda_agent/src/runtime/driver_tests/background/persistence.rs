@@ -19,10 +19,10 @@ async fn child_checkpoint_failure_finishes_scope_but_quarantines_until_abort_is_
         let independent = background.spawn_with(coda_execution::TaskMeta::shell("unrelated".into(), "unrelated".into(), "coda".into()), |ctx| async move { ctx.cancelled().cancelled().await; coda_execution::TaskExit::Killed }).await.unwrap();
         provider.child_release.notify_one();
         background.wait_terminal(&id).await;
-        assert!(matches!(background.read(&id).await.unwrap().unwrap().status, TaskStatus::Failed { message, .. } if message.contains("injected child")));
+        assert!(matches!(read_background(&background, &id).await.status, TaskStatus::Failed { message, .. } if message.contains("injected child")));
         assert!(runtime.pending_approvals().is_empty());
         assert!(runtime.has_background_work(), "cleanup outage keeps members quarantined");
-        assert!(background.read(&independent).await.unwrap().unwrap().status.is_running());
+        assert!(read_background(&background, &independent).await.status.is_running());
         let old_child = storage.inner.all_checkpoints().await.into_iter().find(|c| c.agent_name == "child").unwrap();
         let execution = old_child.active_execution.clone().unwrap();
         storage.block_cleanup.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -118,6 +118,7 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
     let task = coda_core::task::TaskId::new();
     let mut answer = assistant();
     answer.tool_calls.push(ToolCall {
+        output_bytes: None,
         id: "old-call".into(),
         name: "read_todos".into(),
         arguments: Some("{}".into()),
@@ -187,7 +188,9 @@ async fn cold_open_cleans_background_approvals_before_bootstrap() {
         .session_id(root)
         .background(None)
         .run_config(RunConfig {
+            outputs: None,
             default_model: ModelProfile {
+                output_limits: coda_core::output::ModelOutputLimits::default(),
                 provider_id: "test".into(),
                 provider: BackgroundProvider::default(),
                 model: "fake".into(),

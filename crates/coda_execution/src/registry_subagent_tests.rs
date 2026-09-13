@@ -28,16 +28,15 @@ async fn durable_pending_results_survive_reopen_and_are_read_repeatedly() {
         .unwrap();
     registry.wait_terminal(&id).await;
     assert_eq!(registry.take_notices().await.len(), 1);
-    assert_eq!(registry.read(&id).await.unwrap().unwrap().stdout, expected);
+    assert_eq!(full_answer(&registry, &id).await, expected);
     registry.shutdown().await;
     drop(registry);
     let registry = BackgroundTasks::session_backed(root).await.unwrap();
     assert_eq!(registry.take_notices().await.len(), 1);
-    assert_eq!(registry.read(&id).await.unwrap().unwrap().stdout, expected);
-    assert_eq!(registry.read(&id).await.unwrap().unwrap().stdout, expected);
+    assert_eq!(full_answer(&registry, &id).await, expected);
+    assert_eq!(full_answer(&registry, &id).await, expected);
     registry.acknowledge_notice(&id).await.unwrap();
     assert!(registry.take_notices().await.is_empty());
-    assert!(registry.backend.quota.retained_contains(&id));
 }
 
 #[tokio::test]
@@ -57,10 +56,7 @@ async fn restart_interrupts_an_uncommitted_result_and_preserves_cleanup_members(
         candidate.scope_members = vec![member.clone()];
         guard.commit(candidate).await.unwrap();
     }
-    record
-        .write_result("not yet committed".into())
-        .await
-        .unwrap();
+    record.write_result("not yet committed").await.unwrap();
     drop(record);
     drop(archive);
     let registry = BackgroundTasks::session_backed(root).await.unwrap();
@@ -159,4 +155,26 @@ async fn pending_notice_capacity_rejects_new_subagents_without_dropping_results(
             .is_err()
     );
     assert_eq!(registry.take_notices().await.len(), 64);
+}
+
+async fn full_answer(registry: &BackgroundTasks, id: &TaskId) -> String {
+    let mut cursor = crate::TaskResultCursor::default();
+    let mut answer = String::new();
+    loop {
+        let Some(TaskResult::Available {
+            output: TaskResultOutput::Subagent { answer: chunk },
+            page,
+            ..
+        }) = registry.read_result_page(id, cursor).await.unwrap()
+        else {
+            panic!()
+        };
+        assert!(chunk.len() <= 4096);
+        answer.push_str(&chunk);
+        if let Some(next) = page.next {
+            cursor = next
+        } else {
+            return answer;
+        }
+    }
 }

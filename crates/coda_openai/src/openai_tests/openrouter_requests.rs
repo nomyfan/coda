@@ -15,6 +15,7 @@ fn openrouter_replays_details_and_maps_off_effort_to_none() {
         model: "x-ai/grok-4.5".into(),
         messages: vec![RequestMessage::Assistant(AssistantMessage {
             tool_calls: vec![ToolCall {
+                output_bytes: None,
                 id: "call-1".into(),
                 name: "lookup_weather".into(),
                 arguments: Some("{}".into()),
@@ -58,6 +59,7 @@ fn openrouter_classifies_malformed_continuation_as_invalid_request() {
         model: "x-ai/grok-4.5".into(),
         messages: vec![RequestMessage::Assistant(AssistantMessage {
             tool_calls: vec![ToolCall {
+                output_bytes: None,
                 id: "call-1".into(),
                 name: "lookup_weather".into(),
                 arguments: Some("{}".into()),
@@ -86,6 +88,7 @@ fn openrouter_replays_plain_reasoning_only_for_tool_turns() {
         messages: vec![
             RequestMessage::Assistant(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call-1".into(),
                     name: "lookup_weather".into(),
                     arguments: Some("{}".into()),
@@ -136,6 +139,7 @@ fn openrouter_keeps_image_input_and_tool_continuation_in_one_request() {
             )),
             RequestMessage::Assistant(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call-1".into(),
                     name: "lookup_weather".into(),
                     arguments: Some("{}".into()),

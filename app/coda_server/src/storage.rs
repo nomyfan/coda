@@ -1250,20 +1250,73 @@ impl PgSessionStorage {
                 ))
                 .execute(conn)
                 .await?;
-            if let Message::Tool(tool) = &entry.message
-                && let Some(task_id) = &tool.observed_task
-            {
-                // The result and its delivery receipt commit or roll back together.
-                diesel::insert_into(task_notice_receipts::table)
-                    .values((
-                        task_notice_receipts::workspace_id.eq(&self.workspace_id),
-                        task_notice_receipts::session_id.eq(&self.session_id),
-                        task_notice_receipts::task_id.eq(task_id.as_str()),
-                        task_notice_receipts::message_id.eq(tool.message_id.as_uuid()),
-                    ))
-                    .on_conflict_do_nothing()
-                    .execute(conn)
-                    .await?;
+            if let Message::Tool(tool) = &entry.message {
+                use crate::schema::task_output_progress as progress;
+                for receipt in &tool.read_receipts {
+                    if receipt.consumer != pid
+                        || receipt.end < receipt.start
+                        || receipt.end > i64::MAX as u64
+                    {
+                        return Err(SaveError::Rejected(
+                            "invalid task output read receipt".into(),
+                        ));
+                    }
+                    let channel = serde_json::to_value(receipt.channel)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let key = (
+                        &self.workspace_id,
+                        &self.session_id,
+                        receipt.consumer.as_str(),
+                        receipt.task.as_str(),
+                        channel.as_str(),
+                    );
+                    let current = progress::table
+                        .find(key)
+                        .select(progress::next_offset)
+                        .for_update()
+                        .first::<i64>(conn)
+                        .await
+                        .optional()?;
+                    match current {
+                        Some(current) if receipt.start <= current as u64 => {
+                            diesel::update(progress::table.find(key))
+                                .set(progress::next_offset.eq(current.max(receipt.end as i64)))
+                                .execute(conn)
+                                .await?;
+                        }
+                        None if receipt.start == 0 => {
+                            diesel::insert_into(progress::table)
+                                .values((
+                                    progress::workspace_id.eq(&self.workspace_id),
+                                    progress::session_id.eq(&self.session_id),
+                                    progress::consumer.eq(&receipt.consumer),
+                                    progress::task_id.eq(receipt.task.as_str()),
+                                    progress::channel.eq(&channel),
+                                    progress::next_offset.eq(receipt.end as i64),
+                                ))
+                                .execute(conn)
+                                .await?;
+                        }
+                        _ => {}
+                    }
+                }
+                for task_id in tool.observed_task.iter().chain(tool.observed_tasks.iter()) {
+                    // Both the displayed result and the progress/notice receipts
+                    // belong to this same checkpoint transaction.
+                    diesel::insert_into(task_notice_receipts::table)
+                        .values((
+                            task_notice_receipts::workspace_id.eq(&self.workspace_id),
+                            task_notice_receipts::session_id.eq(&self.session_id),
+                            task_notice_receipts::task_id.eq(task_id.as_str()),
+                            task_notice_receipts::message_id.eq(tool.message_id.as_uuid()),
+                        ))
+                        .on_conflict_do_nothing()
+                        .execute(conn)
+                        .await?;
+                }
             }
         }
 
@@ -1661,6 +1714,40 @@ async fn touch(
 }
 
 impl SessionStorage for PgSessionStorage {
+    fn load_output_progress(
+        &self,
+        pid: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<coda_core::output::ReadProgress>, String>> + Send + '_>,
+    > {
+        let pid = pid.to_owned();
+        Box::pin(async move {
+            use crate::schema::task_output_progress as progress;
+            let mut conn = self.conn().await?;
+            let rows: Vec<(String, String, i64)> = progress::table
+                .filter(progress::workspace_id.eq(&self.workspace_id))
+                .filter(progress::session_id.eq(&self.session_id))
+                .filter(progress::consumer.eq(&pid))
+                .select((progress::task_id, progress::channel, progress::next_offset))
+                .load(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            rows.into_iter()
+                .map(|(task, channel, offset)| {
+                    Ok(coda_core::output::ReadProgress {
+                        consumer: pid.clone(),
+                        task: task
+                            .parse()
+                            .map_err(|e| format!("invalid stored task id: {e}"))?,
+                        channel: serde_json::from_value(serde_json::Value::String(channel))
+                            .map_err(|e| e.to_string())?,
+                        offset: offset as u64,
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn has_notice_receipt(
         &self,
         task_id: coda_core::task::TaskId,

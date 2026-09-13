@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::debug;
 
-use crate::process::{CommandOutcome, run_command};
+use crate::process::{preserve_error, run_command};
+use coda_core::output::OutputData;
 
 const SHELL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
@@ -75,7 +76,7 @@ impl ShellTool {
 
 impl Tool for ShellTool {
     type Parameters = ShellToolParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "shell"
@@ -138,52 +139,46 @@ impl Tool for ShellTool {
                     "Started background task {id}. Use task_output to read its \
                      output and task_kill to terminate it. You will be notified \
                      when it finishes."
-                ));
+                )
+                .into());
             }
 
-            let execution_cancel = ctx.cancel.child_token();
-            let mut command = Box::pin(run_command(cmd, execution_cancel.clone()));
-            let run = match tokio::time::timeout(timeout, &mut command).await {
-                Ok(run) => run,
+            let mut execution_ctx = ctx.clone();
+            execution_ctx.cancel = ctx.cancel.child_token();
+            let execution_cancel = execution_ctx.cancel.clone();
+            let mut command = Box::pin(run_command(cmd, execution_ctx));
+            let (run, timed_out) = match tokio::time::timeout(timeout, &mut command).await {
+                Ok(run) => (run, false),
                 Err(_) => {
                     execution_cancel.cancel();
-                    let _ = command.await;
-                    return Err(ToolError::ExecutionError(String::from(
-                        "Command timed out after the 2-minute execution limit.",
-                    )));
+                    (command.await, true)
                 }
-            }
-            .map_err(|e| ToolError::ExecutionError(format!("Failed to execute command: {}", e)))?;
-
-            let output = match run {
-                CommandOutcome::Cancelled { stdout, stderr } => {
-                    let stdout = String::from_utf8_lossy(&stdout);
-                    let stderr = String::from_utf8_lossy(&stderr);
-                    let mut reason =
-                        String::from("Command was aborted by the user before completion.");
-                    if !stdout.is_empty() {
-                        reason.push_str(&format!("\nstdout (partial): {}", stdout));
-                    }
-                    if !stderr.is_empty() {
-                        reason.push_str(&format!("\nstderr (partial): {}", stderr));
-                    }
-                    return Err(ToolError::Aborted(reason));
-                }
-                CommandOutcome::Completed(output) => output,
             };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if output.status.success() {
-                Ok(format!("{}", stdout))
+            let run = run.map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to execute command: {e}"))
+            })?;
+            if timed_out {
+                return Err(preserve_error(
+                    &ctx,
+                    ToolError::ExecutionError(
+                        "Command timed out after the 2-minute execution limit.".into(),
+                    ),
+                    run.output,
+                ));
+            }
+            let Some(status) = run.status else {
+                return Err(preserve_error(
+                    &ctx,
+                    ToolError::Aborted("Command was aborted by the user before completion.".into()),
+                    run.output,
+                ));
+            };
+            if status.success() {
+                Ok(run.output)
             } else {
-                Ok(format!(
-                    "exit code: {}\nstdout: {}\nstderr: {}",
-                    output.status.code().unwrap_or(-1),
-                    stdout,
-                    stderr
-                ))
+                Ok(run
+                    .output
+                    .with_prefix(format!("exit code: {}\n", status.code().unwrap_or(-1))))
             }
         }
     }

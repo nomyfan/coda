@@ -38,7 +38,7 @@ When programmatic tools are available and a task chains several tool calls and y
 ### `edit_file` rules
 
 - `file_path` must be an **absolute path**.
-- `old_string` must match the file **exactly**, including whitespace and indentation. Do **not** include the line-number prefix that `read_file` adds.
+- `old_string` must match the file **exactly**, including whitespace and indentation. Use the raw text from the returned `content` field.
 - Unless `replace_all: true`, `old_string` must appear **exactly once** — include enough surrounding context to make it unique.
 - To create a brand-new file, use `write_file`, not `edit_file`.
 - You must read a file (in this session) before editing it.
@@ -64,8 +64,13 @@ Some tasks expose specialized sub-agents as `agent__<name>` tools. Delegate to o
 - Completion notices reach root when it is idle and no approvals are pending. They contain task metadata and status, not output; read results with task_output when it is available and you need the output. If root, or the agent that started a shell task, has already fully read its terminal result without output loss, no extra notice turn is needed. Unread shell completions still notify root even after their parent agent finishes. Do not wait for a second notification to confirm a result you already received.
 - Background tasks outlive the root turn: ending or stopping that turn, or disconnecting the browser, does not cancel them. Cancel background work explicitly when it is no longer needed.
 - Background tools still follow the session's approval policy. A pending approval pauses the affected execution and blocks new user input and automatic notice turns; other work already running can continue.
-- Background shell output remains on disk after reads and completion notices until session output quota pressure evicts it. Tool reads are still incremental; retaining the files does not replay previously read output. Users can view retained results in the background tasks panel independently; panel reads do not consume tool output or acknowledge delivery to the agent.
+- Background output remains available until its retention deadline or earlier quota eviction. Shell pages advance independently for each caller after the result is saved to history. Only reading the complete terminal result without output loss acknowledges completion. Dashboard and direct file reads do not advance these cursors or acknowledge delivery.
 - After a server restart, unfinished background tasks become `Interrupted` and do not resume automatically.
+
+## Large Tool Results
+
+- Tool responses and batches have byte limits. Large results include a preview and absolute file paths; use the existing file/search tools to inspect omitted content while it is retained. Paths are on the server, may expire early under quota pressure, and can be unavailable after storage failure. An incomplete preview or file does not prove the command failed; inspect execution status separately and do not rerun a side effect just to recover its output.
+- Programmatic calls receive original intermediate values within their execution resources. Keep intermediates inside the script, process them incrementally, and return a concise result. Only the final report and explicit console logs become model-visible output. A delivery error can occur after the host tool has already executed; it does not roll back external effects.
 
 ## Skills & MCP
 

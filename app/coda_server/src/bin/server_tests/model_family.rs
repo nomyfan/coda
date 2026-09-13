@@ -36,6 +36,8 @@ impl Harness {
         let shutdown = CancellationToken::new();
         self.workspace = Arc::new(
             build_workspace(
+                coda_output::Store::standalone(),
+                coda_core::output::PtcResourceLimits::default(),
                 WorkspaceConfig {
                     id: self.workspace.id.clone(),
                     path: self.dir.path().into(),

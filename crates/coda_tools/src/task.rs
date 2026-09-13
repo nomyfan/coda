@@ -32,6 +32,8 @@ pub struct TaskOutputToolParams {
     /// The background task id, as returned when the task was started
     /// (e.g. "bg_1234...").
     id: String,
+    /// Continue a subagent answer from this byte offset. Shell output is incremental per caller.
+    byte_offset: Option<u64>,
 }
 
 pub struct TaskOutputTool {
@@ -50,15 +52,14 @@ impl TaskOutputTool {
 
 impl Tool for TaskOutputTool {
     type Parameters = TaskOutputToolParams;
-    type Output = String;
+    type Output = coda_core::output::OutputData;
 
     fn name(&self) -> &str {
         "task_output"
     }
 
     fn description(&self) -> &str {
-        "Read a background task. Shell output is incremental; subagent results \
-         include the complete final answer and can be read repeatedly."
+        "Read a bounded page from a background task. Shell reads advance per caller after successful delivery. Subagent answers start at byte zero unless byte_offset is supplied; use next_byte_offset to continue. Direct file and dashboard reads do not acknowledge task completion."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -75,47 +76,61 @@ impl Tool for TaskOutputTool {
         async move {
             let id = match parse_id(&params.id) {
                 Ok(id) => id,
-                Err(msg) => return Ok(msg),
+                Err(msg) => return Ok(msg.into()),
             };
-            let read = match background.read(&id).await {
-                Ok(Some(read)) => read,
-                Ok(None) => return Ok(unknown_task(&params.id)),
-                Err(e) => return Err(coda_core::tool::ToolError::ExecutionError(e.to_string())),
+            use coda_core::output::{CapturePurpose, Channel, HostResultBuffer, OutputData};
+            let bytes = match &ctx.output_purpose {
+                CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
+                _ => ctx.output_bytes,
             };
-            if read.complete {
+            let lease = match &ctx.output_purpose {
+                CapturePurpose::Programmatic(budget) => {
+                    Some(budget.reserve(bytes * 2, &ctx.cancel).await.map_err(|e| {
+                        coda_core::tool::ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}"))
+                    })?)
+                }
+                _ => None,
+            };
+            let mut positions = [0; 3];
+            for (index, channel) in [Channel::Stdout, Channel::Stderr, Channel::Result]
+                .into_iter()
+                .enumerate()
+            {
+                positions[index] = ctx.read_offset(
+                    &id,
+                    channel,
+                    background
+                        .output_progress(&ctx.origin.pid, &id, channel)
+                        .await,
+                );
+            }
+            let page = match background
+                .read_page(&id, &ctx.origin.pid, positions, params.byte_offset, bytes)
+                .await
+            {
+                Ok(Some(page)) => page,
+                Ok(None) => return Ok(unknown_task(&params.id).into()),
+                Err(error) => {
+                    return Err(coda_core::tool::ToolError::ExecutionError(
+                        error.to_string(),
+                    ));
+                }
+            };
+            if page.complete {
                 ctx.record_task_result(id);
             }
-            let mut out = format!("status: {}", read.status.describe());
-            if let Some(note) = &read.note {
-                out.push_str(&format!("\n({note})"));
-                return Ok(out);
+            ctx.record_reads(page.receipts);
+            if lease.is_some() {
+                Ok(OutputData::Buffered(HostResultBuffer {
+                    text: page.body,
+                    lease,
+                }))
+            } else {
+                Ok(OutputData::Page {
+                    body: page.body,
+                    references: page.references,
+                })
             }
-            if read.stdout_lost > 0 {
-                out.push_str(&format!(
-                    "\n({} bytes of stdout were overwritten before they could be read)",
-                    read.stdout_lost
-                ));
-            }
-            if !read.stdout.is_empty() {
-                out.push_str(&format!("\nstdout (new):\n{}", read.stdout));
-            }
-            if read.stderr_lost > 0 {
-                out.push_str(&format!(
-                    "\n({} bytes of stderr were overwritten before they could be read)",
-                    read.stderr_lost
-                ));
-            }
-            if !read.stderr.is_empty() {
-                out.push_str(&format!("\nstderr (new):\n{}", read.stderr));
-            }
-            if read.stdout.is_empty()
-                && read.stderr.is_empty()
-                && read.stdout_lost == 0
-                && read.stderr_lost == 0
-            {
-                out.push_str("\n(no new output)");
-            }
-            Ok(out)
         }
     }
 }

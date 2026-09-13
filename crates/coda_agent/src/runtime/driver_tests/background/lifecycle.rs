@@ -31,12 +31,12 @@ async fn background_tree_outlives_root_turn_and_delivers_complete_result_once() 
         let id = summary.id.parse().unwrap();
         background.wait_terminal(&id).await;
         assert!(matches!(
-            background.read(&id).await.unwrap().unwrap().status,
+            read_background(&background, &id).await.status,
             TaskStatus::Completed { .. }
         ));
-        let answer = background.read(&id).await.unwrap().unwrap().stdout;
+        let answer = read_background(&background, &id).await.stdout;
         assert_eq!(answer, "complete final answer".repeat(2000));
-        assert_eq!(background.read(&id).await.unwrap().unwrap().stdout, answer);
+        assert_eq!(read_background(&background, &id).await.stdout, answer);
         let notices = background.take_notices().await;
         assert_eq!(notices.len(), 1);
         assert!(

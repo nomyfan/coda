@@ -6,7 +6,8 @@ use coda_core::llm::{FileChangeOperation, ToolArtifact};
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 
 use crate::locks::KeyedLock;
-use crate::process::{CommandOutcome, run_command};
+use crate::process::{preserve_error, run_command};
+use coda_core::output::OutputData;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -123,8 +124,12 @@ pub struct ReadFileToolParams {
     file_path: String,
     /// The line number to start reading from (1-based). If not specified, reads from the beginning.
     offset: Option<usize>,
-    /// The number of lines to read. If not specified, reads to the end of the file.
+    /// Maximum lines to read (default 200); large lines may require byte continuation.
     limit: Option<usize>,
+    /// Continue from this byte position instead of a line offset.
+    byte_offset: Option<u64>,
+    /// Version from the previous page; a changed file returns FILE_CHANGED.
+    expected_version: Option<String>,
 }
 
 impl ReadFileTool {
@@ -138,14 +143,14 @@ impl ReadFileTool {
 
 impl Tool for ReadFileTool {
     type Parameters = ReadFileToolParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "read_file"
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. The file_path must be an absolute path. You can optionally specify offset (1-based line number) and limit to read a specific range of lines. Content is decoded as UTF-8."
+        "Read a bounded page from an absolute regular-file path. Defaults to at most 200 lines. Returns JSON with content, version and next_byte_offset; continue with byte_offset and expected_version. Line offset and byte_offset are mutually exclusive. The original file is mutable; FILE_CHANGED requires starting a new read. UTF-8 content is decoded lossily."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -156,51 +161,169 @@ impl Tool for ReadFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        async move {
-            let path = Path::new(&params.file_path);
-            if !path.is_absolute() {
-                return Err(ToolError::InvalidParameters(
-                    "file_path must be an absolute path".to_string(),
-                ));
-            }
+        async move { read_page(params, ctx).await }
+    }
+}
 
-            let mut file = open_regular_file(path, false).await?;
-            let buf = read_capped(&mut file).await?;
-            let content = String::from_utf8_lossy(&buf);
-
-            let lines: Vec<&str> = content.lines().collect();
-            let total = lines.len();
-
-            let start = match params.offset {
-                Some(offset) if offset >= 1 => offset - 1,
-                Some(_) => {
-                    return Err(ToolError::InvalidParameters(
-                        "offset must be >= 1".to_string(),
-                    ));
-                }
-                None => 0,
-            };
-
-            let end = match params.limit {
-                Some(limit) => (start + limit).min(total),
-                None => total,
-            };
-
-            if start >= total {
-                return Ok(String::new());
-            }
-
-            let result: String = lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            Ok(result)
+async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
+    use coda_core::output::{CapturePurpose, HostResultBuffer, IO_BLOCK_BYTES};
+    use std::os::unix::fs::MetadataExt;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let path = Path::new(&params.file_path);
+    if !path.is_absolute() {
+        return Err(ToolError::InvalidParameters(
+            "file_path must be an absolute path".into(),
+        ));
+    }
+    if params.byte_offset.is_some() && params.offset.is_some() {
+        return Err(ToolError::InvalidParameters(
+            "byte_offset and offset are mutually exclusive".into(),
+        ));
+    }
+    if params.offset == Some(0) || params.limit == Some(0) {
+        return Err(ToolError::InvalidParameters(
+            "offset and limit must be positive".into(),
+        ));
+    }
+    let bytes = match &ctx.output_purpose {
+        CapturePurpose::ModelResult | CapturePurpose::Background => ctx.output_bytes,
+        CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
+    };
+    let lease = match &ctx.output_purpose {
+        CapturePurpose::ModelResult | CapturePurpose::Background => None,
+        CapturePurpose::Programmatic(budget) => Some(
+            budget
+                .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)
+                .await
+                .map_err(|e| ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}")))?,
+        ),
+    };
+    let mut file = open_regular_file(path, false).await?;
+    let version_of = |meta: &std::fs::Metadata| {
+        format!(
+            "{}:{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        )
+    };
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+    let version = version_of(&metadata);
+    if params
+        .expected_version
+        .as_ref()
+        .is_some_and(|expected| expected != &version)
+    {
+        return Err(ToolError::ExecutionError(
+            "FILE_CHANGED: reopen the file without expected_version to start a new read".into(),
+        ));
+    }
+    let mut position = params.byte_offset.unwrap_or(0);
+    if position > metadata.len() {
+        return Err(ToolError::InvalidParameters(
+            "byte_offset is past the end of the file".into(),
+        ));
+    }
+    file.seek(std::io::SeekFrom::Start(position))
+        .await
+        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+    let mut reader = BufReader::with_capacity(IO_BLOCK_BYTES, file);
+    let mut line = 1usize;
+    let target_line = params.offset.unwrap_or(1);
+    while line < target_line {
+        let buf = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
+            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
+        };
+        if buf.is_empty() {
+            break;
         }
+        let count = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buf.len(), |index| {
+                line += 1;
+                index + 1
+            });
+        reader.consume(count);
+        position += count as u64;
+    }
+    let start = position;
+    let capacity = bytes.saturating_sub(512) / 6;
+    if capacity < 4 {
+        return Err(ToolError::ResourceLimit(
+            "OUTPUT_PAGE_LIMIT: no space for file content".into(),
+        ));
+    }
+    let mut raw = Vec::with_capacity(capacity);
+    let mut lines = 0;
+    let max_lines = params.limit.unwrap_or(200);
+    while raw.len() < capacity && lines < max_lines {
+        let buf = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
+            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let mut count = 0;
+        for byte in buf.iter().take(capacity - raw.len()) {
+            count += 1;
+            if *byte == b'\n' {
+                lines += 1;
+                if lines == max_lines {
+                    break;
+                }
+            }
+        }
+        raw.extend_from_slice(&buf[..count]);
+        reader.consume(count);
+    }
+    if start + (raw.len() as u64) < metadata.len() {
+        // Only an incomplete UTF-8 suffix is deferred. Genuine invalid bytes
+        // inside the selected range remain visible through lossy decoding.
+        raw.truncate(coda_output::preview::page_boundary(&raw));
+    }
+    position = start + raw.len() as u64;
+    let after = reader
+        .get_ref()
+        .metadata()
+        .await
+        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+    if version_of(&after) != version {
+        return Err(ToolError::ExecutionError(
+            "FILE_CHANGED: file changed while reading this page".into(),
+        ));
+    }
+    let body = serde_json::json!({
+        "content": String::from_utf8_lossy(&raw),
+        "byte_offset": start,
+        "next_byte_offset": (position < metadata.len()).then_some(position),
+        "start_line": params.byte_offset.is_none().then_some(line),
+        "version": version,
+        "complete": position == metadata.len(),
+        "source": "mutable_file"
+    })
+    .to_string();
+    if body.len() > bytes {
+        return Err(ToolError::ResourceLimit(
+            "OUTPUT_PAGE_LIMIT: file page metadata exceeds the delivery budget".into(),
+        ));
+    }
+    if lease.is_some() {
+        Ok(OutputData::Buffered(HostResultBuffer { text: body, lease }))
+    } else {
+        Ok(OutputData::Page {
+            body,
+            references: vec![],
+        })
     }
 }
 
@@ -334,9 +457,8 @@ pub struct EditFileToolParams {
     /// The absolute path to the file to edit.
     file_path: String,
     /// The exact text to replace. Must match the file content exactly, including
-    /// indentation and whitespace. Do NOT include the line-number prefix produced
-    /// by `read_file`. Unless `replace_all` is true, this text must be unique in
-    /// the file.
+    /// indentation and whitespace. Use raw `content` from `read_file`. Unless
+    /// `replace_all` is true, this text must be unique in the file.
     old_string: String,
     /// The text to replace `old_string` with.
     new_string: String,
@@ -362,7 +484,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit an existing file by replacing an exact string. The file_path must be an absolute path and the file must be UTF-8 text. `old_string` must match the file content exactly (including whitespace and indentation) and must NOT include the line-number prefix from read_file. Unless `replace_all` is true, `old_string` must appear exactly once. To create a new file use write_file instead."
+        "Edit an existing file by replacing an exact string. The file_path must be an absolute path and the file must be UTF-8 text. `old_string` must match the file content exactly (including whitespace and indentation); use the raw content returned by read_file. Unless `replace_all` is true, `old_string` must appear exactly once. To create a new file use write_file instead."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -564,7 +686,7 @@ impl ListDirectoryTool {
 
 impl Tool for ListDirectoryTool {
     type Parameters = ListDirectoryToolParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "ls"
@@ -599,27 +721,21 @@ impl Tool for ListDirectoryTool {
                 .arg("--exact-depth")
                 .arg("1")
                 .arg(&params.path);
-            let output = match run_command(cmd, ctx.cancel)
+            let output = run_command(cmd, ctx.clone())
                 .await
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-            {
-                CommandOutcome::Completed(output) => output,
-                CommandOutcome::Cancelled { .. } => {
-                    return Err(ToolError::Aborted(
-                        "Interrupted by the user before completion.".to_string(),
-                    ));
-                }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            match output.status.code() {
-                Some(0) if stdout.is_empty() => {
-                    Ok("Directory is empty or all entries are ignored.".to_string())
-                }
-                Some(0) => Ok(stdout.into_owned()),
-                _ => Err(ToolError::ExecutionError(stderr.into_owned())),
+                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+            match output.status {
+                Some(status) if status.success() => Ok(output.output),
+                Some(_) => Err(preserve_error(
+                    &ctx,
+                    ToolError::ExecutionError("fd failed".into()),
+                    output.output,
+                )),
+                None => Err(preserve_error(
+                    &ctx,
+                    ToolError::Aborted("Interrupted by the user before completion.".into()),
+                    output.output,
+                )),
             }
         }
     }

@@ -1,11 +1,7 @@
 use super::*;
-use crate::DEFAULT_STREAM_CAPACITY;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
-
-/// The ring capacity a fresh stream is created with — the retained window.
-const TAIL_BUF_CAP: usize = DEFAULT_STREAM_CAPACITY as usize;
 
 fn meta(command: &str) -> TaskMeta {
     TaskMeta::shell(command.into(), "test task".into(), "coda".into())
@@ -183,22 +179,15 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     let archive = Arc::new(TaskArchive::new(root));
-    let (acknowledged, release) = archive.pause_after_next_create_ack();
-    let quota = SessionQuota::from_inventory(
-        &ArchiveInventory::default(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
     let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
-        quota,
+        blocked: std::sync::atomic::AtomicBool::new(false),
         temp: None,
     })));
 
     let cmd = Command::new("/definitely/not/a/real/executable");
     let spawn_reg = reg.clone();
     let spawn = tokio::spawn(async move { spawn_reg.spawn(cmd, meta("bad executable")).await });
-    acknowledged.notified().await;
     let error = tokio::time::timeout(Duration::from_secs(2), spawn)
         .await
         .expect("process-start failure waited for the acknowledged create transaction")
@@ -206,8 +195,6 @@ async fn process_start_failure_rolls_back_archive_and_quota() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert_eq!(archive.root().entries().unwrap().count(), 0);
-    assert_eq!(reg.backend.quota.reserved(), 0);
-    release.notify_one();
     archive.settle().await;
 }
 
@@ -238,14 +225,9 @@ async fn shutdown_waits_for_detached_create_transaction() {
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     let archive = Arc::new(TaskArchive::new(root));
-    let quota = SessionQuota::from_inventory(
-        &ArchiveInventory::default(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
     let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
-        quota,
+        blocked: std::sync::atomic::AtomicBool::new(false),
         temp: None,
     })));
     let (entered, release) = archive.pause_next_create();
@@ -275,68 +257,6 @@ async fn shutdown_waits_for_detached_create_transaction() {
         .expect("shutdown did not resume after create settled")
         .unwrap();
     assert_eq!(archive.root().entries().unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn quiescent_drain_waits_for_detached_quota_expiration() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let archive = Arc::new(TaskArchive::new(root));
-    let quota = SessionQuota::from_inventory(
-        &ArchiveInventory::default(),
-        2 * DEFAULT_STREAM_CAPACITY,
-        archive.clone(),
-    );
-    let reg = Arc::new(BackgroundTasks::new(Arc::new(Backend {
-        archive,
-        quota: quota.clone(),
-        temp: None,
-    })));
-
-    let old = reg
-        .spawn_with(meta("old"), |ctx| async move {
-            ctx.append_stdout(b"unread").await.unwrap();
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-    let mut summaries = reg.summaries();
-    while running_count(&summaries) != 0 {
-        summaries.changed().await.unwrap();
-    }
-    reg.take_notices().await;
-
-    let (delete_entered, release_delete) = quota.pause_next_delete();
-    let spawn_reg = reg.clone();
-    let spawn = tokio::spawn(async move {
-        spawn_reg
-            .spawn_with(meta("cancelled replacement"), |_ctx| async {
-                TaskExit::Exited { code: Some(0) }
-            })
-            .await
-    });
-    delete_entered.notified().await;
-    spawn.abort();
-    assert!(matches!(spawn.await, Err(error) if error.is_cancelled()));
-
-    let drain_reg = reg.clone();
-    let mut drain = tokio::spawn(async move { drain_reg.take_notices_if_quiescent().await });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut drain)
-            .await
-            .is_err(),
-        "quiescent drain returned before detached quota work settled"
-    );
-    release_delete.notify_one();
-    let notices = tokio::time::timeout(Duration::from_secs(2), drain)
-        .await
-        .expect("quiescent drain did not resume")
-        .unwrap()
-        .expect("no task is running");
-    assert!(notices.iter().any(|notice| matches!(
-        notice,
-        TaskNotice::OutputExpired { id, .. } if id == &old
-    )));
 }
 
 #[tokio::test]
@@ -373,199 +293,15 @@ async fn normal_shutdown_preserves_killed_output_without_replaying_notice() {
 }
 
 #[tokio::test]
-async fn create_failure_does_not_lose_prior_expiration_fact() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let archive = Arc::new(TaskArchive::new(root));
-    let quota = SessionQuota::from_inventory(
-        &ArchiveInventory::default(),
-        2 * DEFAULT_STREAM_CAPACITY,
-        archive.clone(),
-    );
-    let reg = BackgroundTasks::new(Arc::new(Backend {
-        archive: archive.clone(),
-        quota,
-        temp: None,
-    }));
-    let old = reg
-        .spawn_with(meta("old"), |ctx| async move {
-            ctx.append_stdout(b"unread").await.unwrap();
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-    let mut rx = reg.summaries();
-    while running_count(&rx) > 0 {
-        rx.changed().await.unwrap();
-    }
-
-    archive.fail_next_initial_manifest();
-    assert!(
-        reg.spawn_with(meta("create fails"), |_ctx| async {
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .is_err()
-    );
-    let notices = reg.take_notices().await;
-    assert!(notices.iter().any(|notice| matches!(
-        notice,
-        TaskNotice::OutputExpired { id, .. } if id == &old
-    )));
-    archive.settle().await;
-    assert_eq!(reg.backend.quota.reserved(), 0);
-}
-
-#[tokio::test]
-async fn shell_output_survives_reads_and_completion_notices() {
-    for read_while_running in [true, false] {
-        let reg = BackgroundTasks::temporary().unwrap();
-        let ready = Arc::new(Notify::new());
-        let finish = Arc::new(Notify::new());
-        let task_ready = ready.clone();
-        let task_finish = finish.clone();
-        let id = reg
-            .spawn_with(meta("retained output"), move |ctx| async move {
-                ctx.append_stdout(b"hello").await.unwrap();
-                ctx.append_stderr(b"warning").await.unwrap();
-                task_ready.notify_one();
-                task_finish.notified().await;
-                TaskExit::Exited { code: Some(0) }
-            })
-            .await
-            .unwrap();
-        ready.notified().await;
-        if read_while_running {
-            let read = reg.read(&id).await.unwrap().unwrap();
-            assert_eq!(read.stdout, "hello");
-            assert_eq!(read.stderr, "warning");
-            assert!(!read.complete);
-        }
-        finish.notify_one();
-        reg.wait_terminal(&id).await;
-        let notices = reg.take_notices().await;
-        assert!(notices.iter().any(|notice| matches!(
-            notice,
-            TaskNotice::Task { id: notice_id, .. }
-                if notice_id == &id
-        )));
-        let read = reg.read(&id).await.unwrap().unwrap();
-        assert!(read.complete);
-        assert_eq!(read.stdout, if read_while_running { "" } else { "hello" });
-        assert_eq!(read.stderr, if read_while_running { "" } else { "warning" });
-        let again = reg.read(&id).await.unwrap().unwrap();
-        assert!(again.complete);
-        assert!(again.stdout.is_empty() && again.stderr.is_empty());
-
-        let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
-        assert_eq!(
-            record.lock_commit().await.current().disposition,
-            OutputDisposition::Retained
-        );
-        assert_eq!(record.files().stdout.tail(10).await.unwrap(), b"hello");
-        assert_eq!(record.files().stderr.tail(10).await.unwrap(), b"warning");
-        assert!(reg.backend.quota.retained_contains(&id));
-        assert_eq!(reg.backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
-        reg.shutdown().await;
-    }
-}
-
-#[tokio::test]
-async fn terminal_read_flushes_incomplete_utf8_and_retains_output() {
-    let reg = BackgroundTasks::temporary().unwrap();
-    let ready = Arc::new(Notify::new());
-    let finish = Arc::new(Notify::new());
-    let task_ready = ready.clone();
-    let task_finish = finish.clone();
-    let id = reg
-        .spawn_with(meta("partial utf8"), move |ctx| async move {
-            ctx.append_stdout(&[0xE2]).await.unwrap();
-            task_ready.notify_one();
-            task_finish.notified().await;
-            TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-
-    ready.notified().await;
-    let running = reg.read(&id).await.unwrap().unwrap();
-    assert!(running.stdout.is_empty(), "incomplete prefix is carried");
-    finish.notify_one();
-    let mut rx = reg.summaries();
-    while running_count(&rx) > 0 {
-        rx.changed().await.unwrap();
-    }
-
-    let terminal = reg.read(&id).await.unwrap().unwrap();
-    assert_eq!(terminal.stdout, "\u{FFFD}");
-    assert!(terminal.note.is_none());
-    let consumed = reg.read(&id).await.unwrap().unwrap();
-    assert!(consumed.stdout.is_empty());
-    assert!(consumed.complete);
-    assert!(consumed.note.is_none());
-    let record = reg.backend.archive.open(&id).await.unwrap().unwrap();
-    assert_eq!(record.files().stdout.tail(10).await.unwrap(), [0xE2]);
-    assert!(reg.backend.quota.retained_contains(&id));
-}
-
-#[tokio::test]
-async fn reopen_finalizes_interrupted_task_into_quota_index() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-    let archive = TaskArchive::new(root.clone());
-    let id = TaskId::new();
-    let record = archive
-        .create_unreserved(&id, &meta("crashed"))
-        .await
-        .unwrap();
-    record.files().stdout.append(b"saved").await.unwrap();
-    record.files().flush().await.unwrap();
-    {
-        let mut guard = record.lock_commit().await;
-        let candidate = guard.current().clone();
-        guard.commit(candidate).await.unwrap();
-    }
-    drop(record);
-    drop(archive);
-
-    let reg = BackgroundTasks::session_backed(root).await.unwrap();
-    let backend = &reg.backend;
-    assert!(backend.quota.retained_contains(&id));
-    assert_eq!(backend.quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
-    let read = reg.read(&id).await.unwrap().unwrap();
-    assert!(matches!(read.status, TaskStatus::Interrupted { .. }));
-    assert_eq!(read.stdout, "saved");
-
-    // Dying with the server is still a way for a task to end, so it owes the
-    // model a notice — the same one a normal completion would produce.
-    let notices = reg.take_notices().await;
-    let TaskNotice::Task {
-        id: noticed,
-        status,
-        ..
-    } = notices.first().expect("an interrupted task notifies")
-    else {
-        panic!("unexpected notice: {:?}", notices[0]);
-    };
-    assert_eq!(noticed, &id);
-    assert!(matches!(status, TaskStatus::Interrupted { .. }));
-}
-
-#[tokio::test]
 async fn shutdown_retries_dirty_in_memory_failed_manifest() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
     let archive = Arc::new(TaskArchive::new(root.clone()));
-    let quota = SessionQuota::from_inventory(
-        &ArchiveInventory::default(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
     let reg = BackgroundTasks::new(Arc::new(Backend {
         archive: archive.clone(),
-        quota,
+        blocked: std::sync::atomic::AtomicBool::new(false),
         temp: None,
     }));
     let finish = Arc::new(Notify::new());
@@ -611,116 +347,6 @@ async fn shutdown_retries_dirty_in_memory_failed_manifest() {
         reopened.lock_commit().await.current().status,
         TaskStatus::Failed { .. }
     ));
-}
-
-/// Incremental reads move an absolute cursor; a truncated head is
-/// reported as lost bytes, never re-read or skipped.
-#[tokio::test]
-async fn read_reports_lost_bytes_after_truncation() {
-    let reg = BackgroundTasks::temporary().unwrap();
-    let gate = Arc::new(Notify::new());
-    let g = gate.clone();
-    let id = reg
-        .spawn_with(meta("chatty"), move |ctx| async move {
-            ctx.append_stdout(b"first").await.unwrap();
-            g.notified().await;
-            // Blow past the buffer cap so the head (including anything
-            // unread) is dropped.
-            let big = vec![b'x'; TAIL_BUF_CAP + 7];
-            ctx.append_stdout(&big).await.unwrap();
-            ctx.cancelled().cancelled().await;
-            TaskExit::Killed
-        })
-        .await
-        .unwrap();
-
-    // First read consumes "first" (5 bytes, cursor -> 5).
-    let mut seen = String::new();
-    while seen.len() < 5 {
-        let read = reg.read(&id).await.unwrap().unwrap();
-        seen.push_str(&read.stdout);
-        assert_eq!(read.stdout_lost, 0);
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(seen, "first");
-    gate.notify_one();
-
-    // Wait until the big write landed, then drain: reads are chunked, so
-    // the retained window (cap bytes) comes back across several calls. Loss
-    // is reported exactly once, on the first read after the truncation.
-    let mut lost_total = 0u64;
-    let mut drained = 0usize;
-    loop {
-        let read = reg.read(&id).await.unwrap().unwrap();
-        lost_total += read.stdout_lost;
-        drained += read.stdout.len();
-        if drained >= TAIL_BUF_CAP {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        lost_total, 7,
-        "bytes dropped before the read are reported once"
-    );
-    assert_eq!(
-        drained, TAIL_BUF_CAP,
-        "the whole retained window is drained"
-    );
-    // Cursor is at total_written now: nothing further, nothing repeated.
-    reg.kill(&id).await.unwrap();
-    let read = reg.read(&id).await.unwrap().unwrap();
-    assert_eq!(read.stdout.len(), 0);
-    assert_eq!(read.stdout_lost, 0);
-    assert!(!read.complete, "loss while running still counts after exit");
-    reg.shutdown().await;
-}
-
-#[tokio::test]
-async fn paginated_loss_prevents_complete_reads_even_after_reopen() {
-    for stderr in [false, true] {
-        for reopen in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = ArchiveDir::open_or_create_root(tmp.path()).unwrap();
-            let mut reg = BackgroundTasks::session_backed(root.clone()).await.unwrap();
-            let id = reg
-                .spawn_with(meta("paginated loss"), move |ctx| async move {
-                    let bytes = vec![b'x'; TAIL_BUF_CAP + 7];
-                    if stderr {
-                        ctx.append_stderr(&bytes).await.unwrap();
-                    } else {
-                        ctx.append_stdout(&bytes).await.unwrap();
-                    }
-                    TaskExit::Exited { code: Some(0) }
-                })
-                .await
-                .unwrap();
-            reg.wait_terminal(&id).await;
-
-            let first = reg.read(&id).await.unwrap().unwrap();
-            assert_eq!(first.stdout_lost + first.stderr_lost, 7);
-            assert!(!first.complete);
-            let mut drained = first.stdout.len() + first.stderr.len();
-            if reopen {
-                reg.shutdown().await;
-                drop(reg);
-                reg = BackgroundTasks::session_backed(root).await.unwrap();
-            }
-            while drained < TAIL_BUF_CAP {
-                let page = reg.read(&id).await.unwrap().unwrap();
-                assert_eq!(page.stdout_lost + page.stderr_lost, 0);
-                let bytes = page.stdout.len() + page.stderr.len();
-                assert!(bytes > 0);
-                drained += bytes;
-                assert!(
-                    !page.complete,
-                    "earlier loss must survive pagination: stderr={stderr}, reopen={reopen}, drained={drained}"
-                );
-            }
-            assert_eq!(drained, TAIL_BUF_CAP);
-            reg.shutdown().await;
-        }
-    }
 }
 
 /// Reopened summaries and newly interrupted crash leftovers occupy the same
@@ -983,61 +609,6 @@ async fn assert_pids_die(pids: &[i32]) {
     });
 }
 
-/// A chatty real process producing far more than one ring's worth of output
-/// streams end-to-end without stalling: incremental reads drain a bounded
-/// window, and the completion notice reports the storage-level overwrite.
-#[tokio::test]
-async fn chatty_process_overflows_ring_and_reports_overwrite() {
-    let reg = BackgroundTasks::temporary().unwrap();
-    // ~10 bytes/line × 200_000 ≈ 2 MiB, well past the 512 KiB ring.
-    let id = reg
-        .spawn(
-            bash("for i in $(seq 1 200000); do echo \"ln $i\"; done"),
-            meta("chatty"),
-        )
-        .await
-        .unwrap();
-
-    // Drain incrementally until the process settles; reads must not block.
-    let mut seen = 0usize;
-    let status = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let read = reg.read(&id).await.unwrap().expect("task known");
-            seen += read.stdout.len();
-            if !read.status.is_running() && read.stdout.is_empty() {
-                // Archive reads can see terminal status before the monitor enqueues
-                // the notice. The summaries watch is the completion barrier.
-                reg.wait_terminal(&id).await;
-                break read.status;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("chatty process never settled");
-    assert!(matches!(status, TaskStatus::Exited { code: Some(0), .. }));
-    assert!(seen > 0, "streamed some output");
-
-    let notices = reg.take_notices().await;
-    assert!(notices.iter().any(|notice| matches!(
-        notice, TaskNotice::Task { id: notice_id, .. } if notice_id == &id
-    )));
-    let Some(TaskResult::Available {
-        output: TaskResultOutput::Shell {
-            stdout_overwritten, ..
-        },
-        ..
-    }) = reg.read_result(&id).await.unwrap()
-    else {
-        panic!("expected shell output")
-    };
-    assert!(
-        stdout_overwritten > 0,
-        "producing >1 ring of output overwrote earlier bytes"
-    );
-    reg.shutdown().await;
-}
-
 /// spawn → incremental reads observe streamed output → natural exit
 /// commits the code and produces a completion notice.
 #[tokio::test]
@@ -1192,6 +763,14 @@ async fn kill_settles_promptly_when_a_descendant_escapes_the_group() {
         .unwrap()
         .expect("task known");
     assert!(matches!(status, TaskStatus::Killed { .. }));
+
+    let page = reg
+        .read_page(&id, "root", [0; 3], None, 8192)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!page.complete);
+    assert!(page.body.contains("incomplete"));
 
     let _ = std::fs::remove_file(&ready);
     reg.shutdown().await;

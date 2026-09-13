@@ -380,6 +380,8 @@ pub struct AssistantMessage {
 /// A message representing a tool call from the AI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<usize>,
     pub id: String,
     pub name: String,
     pub arguments: Option<String>,
@@ -499,12 +501,18 @@ pub struct ToolMessage {
     pub id: String,
     pub name: String,
     pub output: ToolOutput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_refs: Vec<crate::output::OutputRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_receipts: Vec<crate::output::ReadReceipt>,
     pub outcome: ToolCallOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ToolArtifact>,
     /// Complete terminal result acknowledged by root or by the shell’s owning process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_task: Option<crate::task::TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_tasks: Vec<crate::task::TaskId>,
     /// When the tool call began executing, when known. Calls that resolve
     /// instantly (rejections, dispatch errors) leave this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -530,9 +538,12 @@ impl ToolMessage {
             id: id.into(),
             name: name.into(),
             output,
+            output_refs: Vec::new(),
+            read_receipts: Vec::new(),
             outcome,
             artifacts: Vec::new(),
             observed_task: None,
+            observed_tasks: Vec::new(),
             started_at,
             ended_at: jiff::Timestamp::now(),
         }

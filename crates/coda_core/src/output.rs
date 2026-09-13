@@ -1,6 +1,7 @@
 //! Resource limits and metadata shared by output producers and consumers.
 
 use std::path::PathBuf;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,11 +14,238 @@ pub use config::{ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLim
 pub const IO_BLOCK_BYTES: usize = 16 * 1024;
 pub const FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+pub type OutputFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone, Debug)]
+pub enum CapturePurpose {
+    ModelResult,
+    Background,
+    Programmatic(BufferBudget),
+}
+
+/// The lease stays alive through native-to-JS conversion, not just Promise enqueue.
+#[derive(Debug)]
+pub struct HostResultBuffer {
+    pub text: String,
+    pub lease: Option<BufferLease>,
+}
+
+pub trait OutputBuffer: Send + Sync + std::fmt::Debug {
+    fn materialize<'a>(
+        &'a self,
+        budget: &'a BufferBudget,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> OutputFuture<'a, Result<HostResultBuffer, String>>;
+}
+
+/// Captured bytes are never implicitly formatted or copied back into memory.
+#[derive(Debug)]
+pub enum OutputData {
+    Inline(String),
+    Captured(CapturedOutput),
+    Page {
+        body: String,
+        references: Vec<OutputRef>,
+    },
+    Buffered(HostResultBuffer),
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturedOutput {
+    pub report_ok: Option<bool>,
+    pub preview: String,
+    pub reference: Option<OutputRef>,
+    pub failure: Option<StorageFailure>,
+    pub buffer: Arc<dyn OutputBuffer>,
+}
+
+impl From<String> for OutputData {
+    fn from(value: String) -> Self {
+        Self::Inline(value)
+    }
+}
+
+impl From<&str> for OutputData {
+    fn from(value: &str) -> Self {
+        Self::Inline(value.into())
+    }
+}
+
+impl OutputData {
+    pub fn unavailable(preview: String, failure: StorageFailure) -> Self {
+        Self::Captured(CapturedOutput {
+            report_ok: None,
+            preview,
+            reference: None,
+            failure: Some(failure),
+            buffer: Arc::new(UnavailableBuffer),
+        })
+    }
+
+    pub fn with_prefix(self, prefix: String) -> Self {
+        match self {
+            Self::Buffered(mut buffer) => {
+                buffer.text.insert_str(0, &prefix);
+                Self::Buffered(buffer)
+            }
+            Self::Inline(text) => Self::Inline(format!("{prefix}{text}")),
+            Self::Page { body, references } => Self::Page {
+                body: format!("{prefix}{body}"),
+                references,
+            },
+            Self::Captured(mut output) => {
+                output.preview.insert_str(0, &prefix);
+                output.buffer = Arc::new(PrefixedBuffer {
+                    prefix,
+                    inner: output.buffer,
+                });
+                Self::Captured(output)
+            }
+        }
+    }
+
+    pub async fn materialize(
+        self,
+        budget: &BufferBudget,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<HostResultBuffer, String> {
+        match self {
+            Self::Buffered(buffer) => Ok(buffer),
+            Self::Inline(text) | Self::Page { body: text, .. } => {
+                let bytes = text
+                    .len()
+                    .checked_mul(2)
+                    .ok_or("OUTPUT_LIMIT: conversion size overflow")?;
+                let lease = budget
+                    .reserve(bytes, cancel)
+                    .await
+                    .map_err(|error| format!("OUTPUT_LIMIT: {error:?}"))?;
+                Ok(HostResultBuffer {
+                    text,
+                    lease: Some(lease),
+                })
+            }
+            Self::Captured(output) => output.buffer.materialize(budget, cancel).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrefixedBuffer {
+    prefix: String,
+    inner: Arc<dyn OutputBuffer>,
+}
+
+impl OutputBuffer for PrefixedBuffer {
+    fn materialize<'a>(
+        &'a self,
+        budget: &'a BufferBudget,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> OutputFuture<'a, Result<HostResultBuffer, String>> {
+        Box::pin(async move {
+            let mut result = self.inner.materialize(budget, cancel).await?;
+            result.text.insert_str(0, &self.prefix);
+            Ok(result)
+        })
+    }
+}
+
+pub trait OutputCapture: Send {
+    fn require_file(&mut self);
+    fn set_deadline(&mut self, deadline: tokio::time::Instant);
+    fn reader(&self) -> Arc<dyn OutputReader>;
+    fn fail(&mut self, failure: StorageFailure);
+    /// The caller supplies at most IO_BLOCK_BYTES per append.
+    fn append(&mut self, channel: Channel, bytes: Vec<u8>) -> OutputFuture<'_, ()>;
+    fn finish(self: Box<Self>, deadline: tokio::time::Instant)
+    -> OutputFuture<'static, OutputData>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputSnapshot {
+    #[serde(default)]
+    pub preview: String,
+    #[serde(default)]
+    pub sealed: bool,
+    pub id: OutputId,
+    pub channels: Vec<ChannelBytes>,
+    pub reference: Option<OutputRef>,
+    pub failure: Option<StorageFailure>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelBytes {
+    pub channel: Channel,
+    pub captured: u64,
+    pub saved: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReceipt {
+    pub consumer: String,
+    pub task: crate::task::TaskId,
+    pub channel: Channel,
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+    pub terminal: bool,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadProgress {
+    pub consumer: String,
+    pub task: crate::task::TaskId,
+    pub channel: Channel,
+    pub offset: u64,
+}
+
+pub trait OutputReader: Send + Sync {
+    fn snapshot(&self) -> OutputSnapshot;
+    fn read(
+        &self,
+        channel: Channel,
+        offset: u64,
+        bytes: usize,
+    ) -> OutputFuture<'_, Result<Vec<u8>, String>>;
+}
+
+pub trait OutputStore: Send + Sync {
+    fn retain_source(
+        &self,
+        owner: OutputOwner,
+        source: crate::llm::MessageId,
+        text: String,
+        deadline: tokio::time::Instant,
+    ) -> OutputFuture<'_, OutputData>;
+    fn limits(&self) -> &OutputLimits;
+    fn begin(
+        &self,
+        owner: OutputOwner,
+        channels: Vec<Channel>,
+        purpose: CapturePurpose,
+    ) -> OutputFuture<'_, Result<Box<dyn OutputCapture>, String>>;
+    fn retain(
+        &self,
+        owner: OutputOwner,
+        text: String,
+        deadline: tokio::time::Instant,
+    ) -> OutputFuture<'_, OutputData>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OutputId(uuid::Uuid);
 
 impl OutputId {
+    pub fn for_source(owner: &OutputOwner, source: crate::llm::MessageId) -> Self {
+        let name = format!("{}\0{}\0{}", owner.workspace_id, owner.session_id, source);
+        Self(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            name.as_bytes(),
+        ))
+    }
+
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
@@ -92,4 +320,23 @@ pub struct OutputRef {
     pub failure: Option<StorageFailure>,
     pub sealed_at: jiff::Timestamp,
     pub expires_at: jiff::Timestamp,
+}
+
+#[derive(Clone)]
+pub struct OutputRuntime {
+    pub store: Arc<dyn OutputStore>,
+    pub owner: OutputOwner,
+    pub ptc: PtcResourceLimits,
+}
+
+#[derive(Debug)]
+struct UnavailableBuffer;
+impl OutputBuffer for UnavailableBuffer {
+    fn materialize<'a>(
+        &'a self,
+        _: &'a BufferBudget,
+        _: &'a tokio_util::sync::CancellationToken,
+    ) -> OutputFuture<'a, Result<HostResultBuffer, String>> {
+        Box::pin(async { Err("OUTPUT_INCOMPLETE: complete output was not retained".into()) })
+    }
 }

@@ -21,31 +21,30 @@
 //! drive fake tasks through it, and it is the seam a non-process backend
 //! plugs into.
 //!
-//! Output lives on disk rather than in memory: each task owns a pair of bounded
-//! ring files under a session archive, so a long-running task does not hold its
-//! output cap in RAM and unread output survives a hub entry release.
+//! Payload collection and retention belong to `coda_output`. This crate saves
+//! task lifecycle metadata and reads bounded pages without consuming them until
+//! their delivery receipts have committed.
 
 use coda_output::archive_dir;
 mod archived_tasks;
-mod disk_tail;
+mod inventory;
 mod manifest;
 pub mod process;
-mod quota;
 mod registry;
 mod task_archive;
 
 pub use archive_dir::{ArchiveDir, ArchiveError, ArchiveFileName, ArchiveRootLock};
 pub use archived_tasks::ArchivedTasks;
 pub use coda_core::task::{InvalidTaskId, TaskId};
-pub use disk_tail::{DiskTail, OutputChunk};
-pub use manifest::{ExpireReason, OutputDisposition, StreamManifest, TaskOutputManifest};
+pub use inventory::{ArchiveInventory, scan_inventory};
+pub use manifest::{ExpireReason, TaskOutputManifest};
 pub use process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
-pub use quota::{
-    ArchiveInventory, ExpirationFact, InventoryIssue, QuotaError, QuotaReservation, ReserveOutcome,
-    RetainedIndexEntry, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory,
-};
 pub use registry::*;
 pub use task_archive::{
-    DEFAULT_STREAM_CAPACITY, TaskArchive, TaskCommitGuard, TaskOutputFiles, TaskPersistentState,
-    TaskRecord,
+    TaskArchive, TaskCommitGuard, TaskOutputFiles, TaskPersistentState, TaskRecord,
 };
+
+mod output;
+
+mod read_page;
+pub use read_page::{TaskPage, TaskResultCursor, TaskResultPage};
