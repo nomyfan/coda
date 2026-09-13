@@ -335,10 +335,8 @@ pub struct ListSkillsParams {
     pub workspace_id: String,
 }
 
-/// `set_model` params. An opened session rejects a different provider/model;
-/// the same model may update its reasoning setting while idle, applied from the
-/// next turn by reopening the runtime. `null` selects the first configured
-/// effort, `off` turns thinking off, and models without controls keep `null`.
+/// Select a compatible model while idle, or recover an unavailable session.
+/// Null effort selects the target default; the result is a full Snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetModelParams {
     pub workspace_id: String,
@@ -391,8 +389,7 @@ pub struct SkillInfoWire {
     pub description: String,
 }
 
-/// Result of `set_model`: the selection now in effect (echoed on a real switch
-/// and on an idempotent no-op).
+/// A requested or resolved model selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSelection {
     pub provider_id: String,
@@ -466,6 +463,9 @@ pub struct RewindAccepted {
 /// is really executing under rather than the one this browser remembered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub model_family: Option<String>,
+    pub model_candidates: Vec<String>,
+    pub runtime_open_error: Option<String>,
     pub access: SessionAccess,
     pub background_tasks_error: Option<String>,
     pub workspace_id: String,
@@ -594,6 +594,7 @@ pub struct EventParams {
 /// includes `text`; `image` enables image attachments).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfoWire {
+    pub family: Option<String>,
     pub id: String,
     /// The id of the provider this model belongs to (e.g. "deepseek").
     pub provider: String,

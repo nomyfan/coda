@@ -14,7 +14,7 @@ async fn a_second_task_is_rejected_while_the_first_keeps_fork_busy() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -91,7 +91,7 @@ async fn forking_a_live_session_reports_it_as_live() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -152,7 +152,7 @@ async fn an_attach_racing_the_gates_cleanup_gets_a_fresh_entry() {
             hub.attach(
                 key(),
                 1,
-                "prov".into(),
+                "prov:fake".into(),
                 None,
                 PermissionMode::default(),
                 false,
@@ -217,7 +217,7 @@ async fn a_busy_thread_refuses_the_same_way_live_or_cold() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -267,7 +267,7 @@ async fn slow_sub_agent_session() -> (SessionHub, BoxStream<'static, RelayEvent>
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,

@@ -5,6 +5,8 @@ import {
   approvalKey,
   type CompletionUsage,
   type SessionAccess,
+  type Snapshot,
+  type GenerationMetadata,
   type HistoryMessage,
   type PendingApproval,
   type PermissionMode,
@@ -60,6 +62,7 @@ export type {
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | "error";
 
 export type TranscriptEntry = {
+  model?: GenerationMetadata;
   id: string;
   kind:
     | "user"
@@ -131,6 +134,9 @@ type UnconfirmedInput = {
 };
 
 export type OpenedSession = {
+  modelFamily?: string | null;
+  modelCandidates?: string[];
+  runtimeOpenError?: string | null;
   access: SessionAccess | null;
   backgroundTasksError?: string | null;
   unsentDraft?: { text: string; images: string[] };
@@ -469,6 +475,7 @@ function historyToEntries(
         agentName: rootName,
         title: "Thinking",
         content: assistant.reasoning_content,
+        model: assistant.generation ?? undefined,
         startedAt: assistant.started_at,
         endedAt: assistant.reasoning_ended_at,
       });
@@ -482,6 +489,7 @@ function historyToEntries(
         content: assistant.content,
         status: assistant.aborted ? "aborted" : undefined,
         isFinalResponse: assistant.tool_calls.length === 0,
+        model: assistant.generation ?? undefined,
         startedAt: assistant.started_at,
         endedAt: assistant.ended_at,
       });
@@ -881,6 +889,7 @@ function finishAssistant(
   const isFinalResponse = event.agent_name === rootName && event.message.tool_calls.length === 0;
   if (session.entries.some((entry) => entry.liveKey === key)) {
     return finishLiveEntry(session, event.agent_name, event.pid, {
+      model: event.message.generation ?? undefined,
       messageId: event.message.message_id,
       status: event.message.aborted ? "aborted" : undefined,
       isFinalResponse,
@@ -896,6 +905,7 @@ function finishAssistant(
         {
           id: newId("assistant"),
           kind: "assistant",
+          model: event.message.generation ?? undefined,
           messageId: event.message.message_id,
           agentName: event.agent_name,
           pid: event.pid,
@@ -973,6 +983,7 @@ export function reduceEvent(session: OpenedSession, event: WireEvent): OpenedSes
         ...addActivity(
           finishAssistant(
             finishReasoning(session, event.agent_name, event.pid, {
+              model: event.message.generation ?? undefined,
               startedAt: event.message.started_at,
               endedAt: event.message.reasoning_ended_at,
             }),
@@ -1708,6 +1719,9 @@ export function applySnapshotToSession(
   session: OpenedSession,
   snapshot: {
     access: SessionAccess;
+    modelFamily?: string | null;
+    modelCandidates?: string[];
+    runtimeOpenError?: string | null;
     backgroundTasksError?: string | null;
     messages: HistoryMessage[];
     approvals: PendingApproval[];
@@ -1768,6 +1782,9 @@ export function applySnapshotToSession(
   return {
     ...session,
     access: snapshot.access,
+    modelFamily: snapshot.modelFamily ?? null,
+    modelCandidates: snapshot.modelCandidates ?? [],
+    runtimeOpenError: snapshot.runtimeOpenError ?? null,
     backgroundTasksError: snapshot.backgroundTasksError,
     // Compaction persists its input when it finishes, so an in-progress
     // snapshot cannot yet establish whether that command needs recovery.
@@ -1879,22 +1896,21 @@ if (typeof document !== "undefined") {
   });
 }
 
-function applySnapshot(
-  store: CodaStore,
-  server: string,
-  workspaceId: string,
-  sessionId: string,
-  messages: HistoryMessage[],
-  approvals: PendingApproval[],
-  providerId: string,
-  reasoningEffort: ReasoningEffort | null,
-  permissionMode: PermissionMode,
-  turnRunning: boolean,
-  compacting: boolean,
-  backgroundTasks: TaskSummary[],
-  access: SessionAccess,
-  backgroundTasksError: string | null,
-) {
+function applySnapshot(store: CodaStore, server: string, snapshot: Snapshot) {
+  const {
+    workspace_id: workspaceId,
+    session_id: sessionId,
+    messages,
+    pending_approvals: approvals = [],
+    provider_id: providerId,
+    reasoning_effort: reasoningEffort = null,
+    permission_mode: permissionMode = DEFAULT_PERMISSION_MODE,
+    turn_running: turnRunning = false,
+    compacting = false,
+    background_tasks: backgroundTasks = [],
+    access,
+    background_tasks_error: backgroundTasksError,
+  } = snapshot;
   flushPendingEvents();
   const key = sessionKey(workspaceId, sessionId);
   updateState(store, (state) => {
@@ -1922,6 +1938,9 @@ function applySnapshot(
     current.catalog = patchCatalogSession(current.catalog, workspaceId, sessionId, { access });
     current.sessions[key] = applySnapshotToSession(session, {
       access,
+      modelFamily: snapshot.model_family,
+      modelCandidates: snapshot.model_candidates,
+      runtimeOpenError: snapshot.runtime_open_error,
       backgroundTasksError,
       messages,
       approvals,
@@ -2618,22 +2637,7 @@ async function requestOpenAndApply(
   });
   try {
     const snap = await rpc.request("open_session", openParams(session, options.takeover));
-    applySnapshot(
-      codaStore,
-      server,
-      snap.workspace_id,
-      snap.session_id,
-      snap.messages,
-      snap.pending_approvals ?? [],
-      snap.provider_id,
-      snap.reasoning_effort ?? null,
-      snap.permission_mode ?? DEFAULT_PERMISSION_MODE,
-      snap.turn_running ?? false,
-      snap.compacting ?? false,
-      snap.background_tasks ?? [],
-      snap.access,
-      snap.background_tasks_error,
-    );
+    applySnapshot(codaStore, server, snap);
     return snap.access;
   } catch (err) {
     handleOpenError(server, session.workspaceId, session.sessionId, err);
@@ -2755,22 +2759,7 @@ export function connectServer(rawUrl: string) {
     applyEvent(server, params.workspace_id, params.session_id, params.event);
   });
   rpc.addMethod("snapshot", (params) => {
-    applySnapshot(
-      codaStore,
-      server,
-      params.workspace_id,
-      params.session_id,
-      params.messages,
-      params.pending_approvals ?? [],
-      params.provider_id,
-      params.reasoning_effort ?? null,
-      params.permission_mode ?? DEFAULT_PERMISSION_MODE,
-      params.turn_running ?? false,
-      params.compacting ?? false,
-      params.background_tasks ?? [],
-      params.access,
-      params.background_tasks_error,
-    );
+    applySnapshot(codaStore, server, params);
   });
   rpc.addMethod("background_tasks", (params) => {
     applyBackgroundTasks(codaStore, server, params.workspace_id, params.session_id, params.tasks);
@@ -3623,7 +3612,7 @@ export function dismissPersistError() {
 
 export function setModel(providerId: string, reasoningEffort: ReasoningEffort | null) {
   const active = currentActive();
-  if (!active || !sessionIsWritable(active.session)) {
+  if (!active || active.session.evicted) {
     return;
   }
   if (active.session.draft) {
@@ -3651,13 +3640,7 @@ export function setModel(providerId: string, reasoningEffort: ReasoningEffort | 
       reasoning_effort: reasoningEffort,
     })
     .then((result) => {
-      setSessionModel(
-        codaStore,
-        server,
-        session.key,
-        result.provider_id,
-        result.reasoning_effort ?? null,
-      );
+      applySnapshot(codaStore, server, result);
       rememberModelSelection(
         server,
         session.workspaceId,
@@ -4027,17 +4010,16 @@ export const selectActiveServer = (state: CodaStoreState) => state.activeServer;
 export const selectActiveKey = (state: CodaStoreState) => state.activeKey;
 export const selectActiveEntries = (state: CodaStoreState) =>
   activeSessionOf(state)?.entries ?? EMPTY_ENTRIES;
-/** Whether the active session's history carries any image attachment, so the
- * model selection must stay on a vision-capable model. */
-export const selectActiveHasImages = (state: CodaStoreState): boolean =>
-  (activeSessionOf(state)?.entries ?? EMPTY_ENTRIES).some(
-    (entry) => (entry.images?.length ?? 0) > 0,
-  );
 export const selectActiveCanWrite = (state: CodaStoreState): boolean => {
   const session = activeSessionOf(state);
   return !session || sessionIsWritable(session);
 };
 export const selectActiveAccess = (state: CodaStoreState) => activeSessionOf(state)?.access ?? null;
+export const selectActiveModelCandidates = (state: CodaStoreState) =>
+  activeSessionOf(state)?.modelCandidates;
+export const selectActiveRuntimeOpenError = (state: CodaStoreState) =>
+  activeSessionOf(state)?.runtimeOpenError;
+
 export const selectActiveBackgroundTasksError = (state: CodaStoreState) =>
   activeSessionOf(state)?.backgroundTasksError;
 export const selectActiveUnsentDraft = (state: CodaStoreState) =>

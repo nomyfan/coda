@@ -130,6 +130,7 @@ pub(super) async fn start_storage<
             HashMap::new(),
             RunConfig {
                 default_model: ModelProfile {
+                    provider_id: "test".into(),
                     provider,
                     model: "fake".into(),
                     label: "fake".into(),

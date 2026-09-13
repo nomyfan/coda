@@ -773,6 +773,7 @@ impl TryFrom<CompletionAccumulator> for AssistantMessage {
             return Err("stream completed without content, reasoning, or tool calls".to_string());
         }
         Ok(AssistantMessage {
+            generation: None,
             // This is the message's only construction point, so minting here
             // means one object with one id all the way to storage. The runtime
             // overwrites the timing below but leaves the id alone.

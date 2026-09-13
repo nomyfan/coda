@@ -41,6 +41,7 @@ pub(super) fn test_registry() -> Option<std::sync::Arc<coda_execution::Backgroun
 pub(super) fn assistant() -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![],
@@ -1208,6 +1209,7 @@ pub(super) fn test_config(
 ) -> RunConfig<TestProvider> {
     RunConfig {
         default_model: ModelProfile {
+            provider_id: "test".into(),
             provider,
             model: "fake".into(),
             label: "fake".into(),

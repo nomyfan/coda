@@ -442,6 +442,19 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
   return <span className="truncate font-mono text-xs text-muted-foreground">{entry.detail}</span>;
 }
 
+function EntryModel({ entry }: { entry: TranscriptEntry }) {
+  if (!entry.model) return null;
+  const { provider_id, model_id, reasoning_effort } = entry.model;
+  return (
+    <span
+      className="text-xs text-muted-foreground"
+      title={`${provider_id}:${model_id}${reasoning_effort ? ` · ${reasoning_effort}` : ""}`}
+    >
+      {model_id}
+    </span>
+  );
+}
+
 type EntryTimingMode = "start-and-duration" | "duration" | "end";
 
 /** Wall-clock time and/or elapsed duration for a message, e.g. `14:03 · 3.2s`. */
@@ -764,7 +777,12 @@ export function groupProcessItems(entries: TranscriptEntry[]): ProcessItem[] {
 /** One step inside a process disclosure (assistant prose inline, rest collapsed). */
 function ProcessEntry({ entry }: { entry: TranscriptEntry }) {
   if (entry.kind === "assistant") {
-    return <Markdown>{entry.content}</Markdown>;
+    return (
+      <>
+        <EntryModel entry={entry} />
+        <Markdown>{entry.content}</Markdown>
+      </>
+    );
   }
   return <TranscriptDisclosure entry={entry} />;
 }
@@ -1056,6 +1074,7 @@ const AssistantTurnBubble = memo(
         {finalAssistant ? (
           <div className="flex items-center gap-1">
             <MessageActions content={finalAssistant.content} label="response" align="start" />
+            <EntryModel entry={finalAssistant} />
             <EntryTiming entry={finalAssistant} mode="end" className={cn("px-1", HOVER_REVEAL)} />
           </div>
         ) : null}
@@ -1407,6 +1426,7 @@ const TranscriptItem = memo(function TranscriptItem({
         </article>
         <div className="flex items-center gap-1">
           <MessageActions content={entry.content} label="response" align="start" />
+          <EntryModel entry={entry} />
           <EntryTiming entry={entry} mode="end" className={cn("px-1", HOVER_REVEAL)} />
         </div>
       </div>

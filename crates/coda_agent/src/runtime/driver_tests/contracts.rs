@@ -151,6 +151,7 @@ async fn duplicate_stateful_calls_are_all_rejected_before_any_spawn() {
             HashMap::new(),
             RunConfig {
                 default_model: ModelProfile {
+                    provider_id: "test".into(),
                     provider: provider.clone(),
                     model: "fake".into(),
                     label: "fake".into(),

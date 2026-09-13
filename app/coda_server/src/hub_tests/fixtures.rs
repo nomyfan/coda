@@ -370,7 +370,20 @@ impl SessionStorage for SlowStorage {
 /// recorded, in order: `Some(outcome)` for a mark, `None` for a clear.
 pub(super) type UnseenOutcomeCalls = Vec<(SessionKey, Option<UnseenOutcome>)>;
 
+/// Failure controls for the durable model-switch boundary.
+#[derive(Default)]
+pub(super) struct ModelSwitchControl {
+    pub(super) saved: std::sync::Mutex<Option<SessionModelBinding>>,
+    pub(super) fail_open: std::sync::atomic::AtomicBool,
+    pub(super) uncertain: std::sync::atomic::AtomicBool,
+    pub(super) rollback: std::sync::atomic::AtomicBool,
+    pub(super) fail_confirmation: std::sync::atomic::AtomicBool,
+    pub(super) write_entered: Notify,
+    pub(super) write_gate: Option<Arc<Notify>>,
+}
+
 pub(super) struct TestOpener {
+    pub(super) model_switch: Option<Arc<ModelSwitchControl>>,
     pub(super) unavailable_model: Option<UnavailableModel>,
     pub(super) fail_read_only_load: bool,
     pub(super) storage: SlowStorage,
@@ -499,6 +512,7 @@ impl TestOpener {
         storage: SlowStorage,
     ) -> Self {
         Self {
+            model_switch: None,
             storage,
             background_root: tempfile::tempdir().expect("temp spool root"),
             provider: TestProvider {
@@ -536,6 +550,18 @@ pub(super) fn explore_thread() -> ProcessId {
     ProcessId::from_uuid5(&ProcessId::from(key().1), "explore")
 }
 
+fn test_binding(selection: &str, effort: Option<String>) -> crate::storage::SessionModelBinding {
+    let (provider_id, model_id) = selection
+        .split_once(':')
+        .expect("test model selection is composite");
+    crate::storage::SessionModelBinding {
+        provider_id: provider_id.into(),
+        model_id: model_id.into(),
+        family: None,
+        reasoning_effort: effort,
+    }
+}
+
 impl SessionOpener for TestOpener {
     fn resolve_session_model<'a>(
         &'a self,
@@ -543,17 +569,42 @@ impl SessionOpener for TestOpener {
         initial: Option<&'a ModelSelection>,
     ) -> Pin<Box<dyn Future<Output = Result<SessionModelResolution, OpenError>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(control) = &self.model_switch {
+                let mut saved = control.saved.lock().unwrap();
+                let binding = saved
+                    .get_or_insert_with(|| {
+                        let mut binding = test_binding(
+                            &initial.unwrap().provider_id,
+                            initial.unwrap().reasoning_effort.clone(),
+                        );
+                        binding.family = Some("f".into());
+                        binding
+                    })
+                    .clone();
+                return Ok(self.classify_model_binding(binding));
+            }
             Ok(match &self.unavailable_model {
                 Some(model) => SessionModelResolution::Unavailable(model.clone()),
-                None => SessionModelResolution::Available {
-                    provider_id: initial
-                        .map(|selection| selection.provider_id.clone())
-                        .unwrap_or_else(|| "p".into()),
-                    reasoning_effort: initial
-                        .and_then(|selection| selection.reasoning_effort.clone()),
-                },
+                None => SessionModelResolution::Available(test_binding(
+                    initial
+                        .map(|selection| selection.provider_id.as_str())
+                        .unwrap_or("p:fake"),
+                    initial.and_then(|selection| selection.reasoning_effort.clone()),
+                )),
             })
         })
+    }
+
+    fn classify_model_binding(&self, binding: SessionModelBinding) -> SessionModelResolution {
+        match &self.unavailable_model {
+            Some(model) if model.binding.selection_key() == binding.selection_key() => {
+                SessionModelResolution::Unavailable(UnavailableModel {
+                    binding,
+                    reason: model.reason,
+                })
+            }
+            _ => SessionModelResolution::Available(binding),
+        }
     }
 
     fn load_read_only_history<'a>(
@@ -581,8 +632,8 @@ impl SessionOpener for TestOpener {
     fn open<'a>(
         &'a self,
         key: &'a SessionKey,
-        _provider_id: &'a str,
-        _reasoning_effort: Option<String>,
+        provider_id: &'a str,
+        reasoning_effort: Option<String>,
         permission_mode: PermissionModeCell,
         decisions: HashMap<String, ResumeDecision>,
         background: Option<Arc<coda_execution::BackgroundTasks>>,
@@ -600,17 +651,26 @@ impl SessionOpener for TestOpener {
             if after_rewind && self.fail_open_after_rewind {
                 return Err(OpenError::Storage("injected rebuild failure".into()));
             }
+            if self
+                .model_switch
+                .as_ref()
+                .is_some_and(|control| control.fail_open.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(OpenError::Storage("injected model open failure".into()));
+            }
+            let (provider_name, model_name) = provider_id.split_once(':').unwrap();
             let session = Session::builder()
                 .storage(self.storage.clone())
                 .team(&self.team, ".")
                 .run_config(RunConfig {
                     default_model: ModelProfile {
+                        provider_id: provider_name.into(),
                         provider: self.provider.clone(),
-                        model: "fake".into(),
+                        model: model_name.into(),
                         label: "fake".into(),
                         temperature: None,
                         max_completion_tokens: None,
-                        reasoning_effort: None,
+                        reasoning_effort,
                         auto_compact_threshold_tokens: self.auto_compact_threshold_tokens,
                     },
                     agent_models: HashMap::new(),
@@ -808,19 +868,83 @@ impl SessionOpener for TestOpener {
         })
     }
 
-    fn update_reasoning_effort<'a>(
+    fn validate_model_change<'a>(
         &'a self,
         _key: &'a SessionKey,
-        _provider_id: &'a str,
-        _reasoning_effort: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        let fail = self.fail_effort_update;
+        current: &'a SessionModelBinding,
+        requested: &'a ModelSelection,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, String>> + Send + 'a>> {
         Box::pin(async move {
-            if fail {
-                Err("injected metadata write failure".to_string())
-            } else {
-                Ok(())
+            if self
+                .unavailable_model
+                .as_ref()
+                .is_some_and(|model| model.binding.selection_key() == requested.provider_id)
+            {
+                return Err("injected unavailable model".into());
             }
+            let mut binding =
+                test_binding(&requested.provider_id, requested.reasoning_effort.clone());
+            if self.model_switch.is_some() {
+                binding.family = Some("f".into());
+            }
+            if !crate::session_access::can_select_model(current, &binding) {
+                return Err("model does not match fixed family".into());
+            }
+            Ok(binding)
+        })
+    }
+
+    fn update_model_binding<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+        expected: &'a SessionModelBinding,
+        next: &'a SessionModelBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self.fail_effort_update {
+                return Err(SessionMetadataError::Persistence(
+                    "injected metadata write failure".into(),
+                ));
+            }
+            if let Some(control) = &self.model_switch {
+                control.write_entered.notify_one();
+                if let Some(gate) = &control.write_gate {
+                    gate.notified().await;
+                }
+                let mut saved = control.saved.lock().unwrap();
+                assert_eq!(saved.as_ref(), Some(expected));
+                if !control.rollback.load(std::sync::atomic::Ordering::SeqCst) {
+                    *saved = Some(next.clone());
+                }
+                self.calls.lock().unwrap().push("write_binding");
+                if control.uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(SessionMetadataError::OutcomeUnknown(
+                        "injected lost commit response".into(),
+                    ));
+                }
+            }
+            Ok(next.clone())
+        })
+    }
+
+    fn confirm_model_binding<'a>(
+        &'a self,
+        _key: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionModelBinding, SessionMetadataError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if let Some(control) = &self.model_switch
+                && !control
+                    .fail_confirmation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.calls.lock().unwrap().push("confirm_binding");
+                return Ok(control.saved.lock().unwrap().clone().unwrap());
+            }
+            Err(SessionMetadataError::Persistence(
+                "unavailable confirmation".into(),
+            ))
         })
     }
 
@@ -996,6 +1120,7 @@ pub(super) async fn wait_released(hub: &SessionHub) {
 pub(super) fn assistant(content: &str) -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: content.into(),
         tool_calls: vec![],

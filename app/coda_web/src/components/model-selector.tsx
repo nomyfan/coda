@@ -10,7 +10,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ProviderInfo, ReasoningEffort } from "@/lib/protocol";
-import { resolveEffortForModel } from "@/store/model-preferences";
+import { compatibleEffort, resolveEffortForModel } from "@/store/model-preferences";
 
 function effortLabel(effort: ReasoningEffort) {
   if (effort === "off") return "Off";
@@ -36,8 +36,8 @@ export function ModelSelector({
   providerId,
   reasoningEffort,
   disabled,
-  modelLocked,
-  requireImageModel,
+  allowedModelIds,
+  draftHasImages,
   serverUrl,
   workspaceId,
   onSetModel,
@@ -46,12 +46,10 @@ export function ModelSelector({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   disabled: boolean;
-  /** Once a session is opened its provider/model is durable; only reasoning
-   * effort remains adjustable while idle. */
-  modelLocked: boolean;
-  /** Restrict selectable models to vision-capable ones (the conversation
-   * already involves images). */
-  requireImageModel: boolean;
+  /** Undefined for a new session; otherwise supplied by the server. */
+  allowedModelIds?: string[];
+  /** History compatibility comes from allowedModelIds; only unsent images add a local constraint. */
+  draftHasImages: boolean;
   serverUrl: string;
   workspaceId: string;
   onSetModel: (providerId: string, reasoningEffort: ReasoningEffort | null) => void;
@@ -61,16 +59,6 @@ export function ModelSelector({
   const efforts = selected?.reasoning_efforts ?? [];
 
   if (!providerId) return null;
-  if (!selected) {
-    return (
-      <span
-        className="max-w-64 truncate px-2 font-mono text-xs text-muted-foreground"
-        title={providerId}
-      >
-        {providerId}
-      </span>
-    );
-  }
 
   const catalog = { url: serverUrl, providers };
 
@@ -84,7 +72,10 @@ export function ModelSelector({
           <SelectItem
             key={info.id}
             value={info.id}
-            disabled={requireImageModel && !info.input_modalities.includes("image")}
+            disabled={
+              (allowedModelIds !== undefined && !allowedModelIds.includes(info.id)) ||
+              (draftHasImages && !info.input_modalities.includes("image"))
+            }
           >
             {info.model}
           </SelectItem>
@@ -100,39 +91,41 @@ export function ModelSelector({
         onValueChange={(id) => {
           const next = providers.find((info) => info.id === id);
           if (!next) return;
-          const effort = resolveEffortForModel(catalog, workspaceId, next, reasoningEffort);
+          const effort =
+            allowedModelIds === undefined
+              ? resolveEffortForModel(catalog, workspaceId, next, reasoningEffort)
+              : compatibleEffort(next, reasoningEffort);
           onSetModel(id, effort);
         }}
-        disabled={disabled || modelLocked}
+        disabled={disabled || (allowedModelIds !== undefined && allowedModelIds.length === 0)}
       >
         <SelectTrigger
           size="sm"
           className="h-7 max-w-36 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-44 dark:bg-transparent dark:hover:bg-muted/70"
         >
-          <SelectValue placeholder="Model" />
+          <SelectValue placeholder="Model">{selected?.model ?? providerId}</SelectValue>
         </SelectTrigger>
         <SelectContent position="popper" side="top">
           {dropdownItems}
         </SelectContent>
       </Select>
-      {reasoningEffort && !efforts.includes(reasoningEffort) ? (
-        <span
-          className="px-2 font-mono text-xs text-muted-foreground"
-          title="Saved reasoning effort"
-        >
-          {reasoningEffort}
-        </span>
-      ) : efforts.length > 0 ? (
+      {efforts.length > 0 ? (
         <Select
           value={reasoningEffort ?? efforts[0]}
           onValueChange={(value) => onSetModel(providerId, value as ReasoningEffort)}
-          disabled={disabled}
+          disabled={
+            disabled || (allowedModelIds !== undefined && !allowedModelIds.includes(providerId))
+          }
         >
           <SelectTrigger
             size="sm"
             className="h-7 max-w-28 gap-1 rounded-md border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted/70 sm:max-w-32 dark:bg-transparent dark:hover:bg-muted/70"
           >
-            <SelectValue placeholder="Reasoning" />
+            <SelectValue placeholder="Reasoning">
+              {reasoningEffort && !efforts.includes(reasoningEffort)
+                ? reasoningEffort
+                : effortLabel(reasoningEffort ?? efforts[0])}
+            </SelectValue>
           </SelectTrigger>
           <SelectContent position="popper" side="top">
             {efforts.map((effort) => (
@@ -142,6 +135,13 @@ export function ModelSelector({
             ))}
           </SelectContent>
         </Select>
+      ) : reasoningEffort ? (
+        <span
+          className="px-2 font-mono text-xs text-muted-foreground"
+          title="Saved reasoning effort"
+        >
+          {reasoningEffort}
+        </span>
       ) : null}
     </>
   );

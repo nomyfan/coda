@@ -140,6 +140,9 @@ fn set_model_params_defaults_effort_to_none() {
 #[test]
 fn snapshot_serializes_without_type_tag() {
     let msg = Snapshot {
+        model_family: None,
+        model_candidates: Vec::new(),
+        runtime_open_error: None,
         access: crate::session_access::SessionAccess::ReadWrite,
         background_tasks_error: None,
         workspace_id: "coda".into(),
@@ -156,13 +159,13 @@ fn snapshot_serializes_without_type_tag() {
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
-        r#"{"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true,"compacting":false,"background_tasks":[]}"#
+        r#"{"model_family":null,"model_candidates":[],"runtime_open_error":null,"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":"high","permission_mode":"yolo","turn_running":true,"compacting":false,"background_tasks":[]}"#
     );
 }
 
 #[test]
 fn snapshot_without_turn_running_defaults_to_false() {
-    let json = r#"{"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
+    let json = r#"{"model_family":null,"model_candidates":[],"runtime_open_error":null,"access":{"type":"read_write"},"background_tasks_error":null,"workspace_id":"coda","session_id":"s1","messages":[],"pending_approvals":[],"provider_id":"deepseek","reasoning_effort":null}"#;
     let snapshot: Snapshot = serde_json::from_str(json).unwrap();
     assert!(!snapshot.turn_running);
     assert_eq!(snapshot.permission_mode, PermissionMode::AcceptEdits);
@@ -357,6 +360,7 @@ fn a_session_summary_can_carry_a_live_running_status() {
 fn provider_catalog_roundtrips() {
     let msg = ProviderCatalog {
         providers: vec![ProviderInfoWire {
+            family: None,
             id: "deepseek:deepseek-reasoner".into(),
             provider: "deepseek".into(),
             model: "deepseek-reasoner".into(),

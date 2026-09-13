@@ -56,6 +56,7 @@ fn dispatched(parent_message_id: MessageId) -> (TurnId, Vec<HistoryEntry>) {
         HistoryEntry::new(
             turn,
             Message::Assistant(AssistantMessage {
+                generation: None,
                 message_id: parent_message_id,
                 tool_calls: vec![ToolCall {
                     id: "call_explore".into(),

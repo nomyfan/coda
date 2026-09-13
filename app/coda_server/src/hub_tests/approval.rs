@@ -12,7 +12,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -50,7 +50,7 @@ async fn suspended_approval_survives_release_and_promotes_on_resume() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -102,7 +102,7 @@ async fn aborting_a_suspended_turn_clears_its_pending_approval() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -157,7 +157,7 @@ async fn new_task_is_rejected_while_an_approval_remains_pending() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -196,7 +196,7 @@ async fn new_task_is_rejected_while_an_approval_remains_pending() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,

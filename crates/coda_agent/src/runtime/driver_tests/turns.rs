@@ -492,6 +492,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
                     HistoryEntry::new(
                         current_turn,
                         Message::Assistant(AssistantMessage {
+                            generation: None,
                             message_id: parent_message_id,
                             tool_calls: vec![call.clone()],
                             ..assistant()

@@ -7,6 +7,7 @@ use coda_agent::{ToolApprovalMode, ToolCallResolution, runtime::SessionStorage};
 fn unavailable() -> UnavailableModel {
     UnavailableModel {
         binding: SessionModelBinding {
+            family: None,
             provider_id: "removed".into(),
             model_id: "model".into(),
             reasoning_effort: Some("old-effort".into()),
@@ -23,7 +24,7 @@ async fn attach(
     hub.attach(
         key(),
         conn,
-        "valid-default".into(),
+        "valid:default".into(),
         None,
         PermissionMode::Yolo,
         takeover,
@@ -87,10 +88,6 @@ async fn read_only_opens_preserve_history_and_approvals_and_reject_every_mutatio
         },
         SessionCommand::Compact {
             instructions: "summarize".into(),
-        },
-        SessionCommand::SetModel {
-            provider_id: "valid-default".into(),
-            reasoning_effort: None,
         },
         SessionCommand::SetPermissionMode {
             mode: PermissionMode::Explore,
@@ -180,4 +177,18 @@ async fn a_storage_failure_is_not_an_empty_read_only_conversation() {
     ));
     wait_released(&hub).await;
     assert!(opener.opened_modes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_read_only_sessions_still_release_on_disconnect() {
+    let mut opener = TestOpener::new("reply", ToolApprovalMode::Auto);
+    opener.unavailable_model = Some(unavailable());
+    let (hub, opener) = hub_and_opener(opener);
+    let attached = attach(&hub, 1, false).await.unwrap();
+    assert_eq!(attached.snapshot.runtime_open_error, None);
+    drop(attached);
+    hub.detach(key(), 1).await;
+    wait_released(&hub).await;
+    assert!(opener.calls.lock().unwrap().is_empty());
+    hub.shutdown_all().await;
 }

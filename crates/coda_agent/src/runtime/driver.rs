@@ -1745,6 +1745,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             messages,
             tools: request_tools,
         };
+        let generation = coda_core::llm::GenerationMetadata {
+            provider_id: self.config.profile.provider_id.clone(),
+            model_id: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+        };
         let started_at = jiff::Timestamp::now();
         self.runtime
             .emit_event(
@@ -1776,6 +1781,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                             partial_content + "\n[Generation was interrupted by the user]"
                         };
                         let message = coda_core::llm::AssistantMessage {
+                            generation: Some(generation.clone()),
                             message_id: MessageId::new(),
                             content,
                             tool_calls: Vec::new(),
@@ -1836,6 +1842,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         if assistant_message.reasoning_content.is_some() {
             assistant_message.reasoning_ended_at = Some(reasoning_ended_at.unwrap_or(ended_at));
         }
+        assistant_message.generation = Some(generation);
         assistant_message.started_at = started_at;
         assistant_message.ended_at = ended_at;
         self.process

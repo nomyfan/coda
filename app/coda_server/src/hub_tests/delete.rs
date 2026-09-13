@@ -13,7 +13,7 @@ async fn attach(hub: &SessionHub, conn: ConnId) -> Result<AttachSession, AttachE
     hub.attach(
         key(),
         conn,
-        "prov".into(),
+        "prov:fake".into(),
         None,
         PermissionMode::default(),
         false,
@@ -43,7 +43,7 @@ async fn delete_from_stale_connection_is_rejected() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,

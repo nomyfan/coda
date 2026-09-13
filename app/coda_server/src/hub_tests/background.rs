@@ -44,7 +44,7 @@ async fn a_running_task_keeps_an_unattached_entry_alive() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -100,7 +100,7 @@ async fn release_check_cannot_overtake_a_published_completion_notice() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -154,7 +154,7 @@ async fn shutdown_all_keeps_the_entry_until_registry_shutdown_finishes() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -215,7 +215,7 @@ async fn shutdown_all_waits_for_an_in_flight_delete() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -277,7 +277,7 @@ async fn stream_ended_release_closes_the_external_registry_before_map_removal() 
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -341,7 +341,7 @@ async fn a_finished_task_opens_a_turn_of_its_own() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -384,7 +384,7 @@ async fn a_notice_arriving_mid_turn_waits_for_the_turn_to_end() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -450,7 +450,7 @@ async fn a_model_switch_keeps_the_running_tasks() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -474,12 +474,12 @@ async fn a_model_switch_keeps_the_running_tasks() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: Some("high".into()),
             },
         )
         .await,
-        CommandOutcome::ModelChanged { .. }
+        CommandOutcome::ModelChanged(_)
     ));
 
     let after = background_of(&hub).await;
@@ -510,7 +510,7 @@ async fn killing_a_task_from_the_client_settles_it() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -584,7 +584,7 @@ async fn notices_that_pile_up_during_a_turn_arrive_as_one() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -667,7 +667,7 @@ async fn root_reads_terminal_results(include_unread: bool, subagents: bool) {
             .attach(
                 key(),
                 1,
-                "prov".into(),
+                "prov:fake".into(),
                 None,
                 PermissionMode::default(),
                 false,
@@ -775,7 +775,7 @@ async fn reading_terminal_status_after_draining_running_output_suppresses_notice
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,

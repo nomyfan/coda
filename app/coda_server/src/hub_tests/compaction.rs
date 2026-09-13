@@ -26,7 +26,7 @@ async fn attached_compaction(
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -65,7 +65,7 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -125,7 +125,7 @@ async fn compaction_stays_attachable_but_gates_every_history_mutation() {
             key(),
             2,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: None,
             },
         )
@@ -206,7 +206,7 @@ async fn detach_during_compaction_releases_only_after_it_finishes() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -318,7 +318,7 @@ async fn a_turn_in_flight_refuses_compaction_without_writing_a_marker() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -357,7 +357,7 @@ async fn a_turn_in_flight_refuses_compaction_without_writing_a_marker() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,

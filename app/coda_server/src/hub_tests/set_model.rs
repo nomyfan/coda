@@ -35,7 +35,14 @@ async fn set_model_preserves_capability_tools_in_the_rebuilt_session() {
             SlowStorage::default(),
         ));
         let mut attach = hub
-            .attach(key(), 1, "prov".into(), None, PermissionMode::Yolo, false)
+            .attach(
+                key(),
+                1,
+                "prov:fake".into(),
+                None,
+                PermissionMode::Yolo,
+                false,
+            )
             .await
             .unwrap();
 
@@ -46,12 +53,12 @@ async fn set_model_preserves_capability_tools_in_the_rebuilt_session() {
                         key(),
                         1,
                         SessionCommand::SetModel {
-                            provider_id: "prov".into(),
+                            provider_id: "prov:fake".into(),
                             reasoning_effort: Some("high".into()),
                         }
                     )
                     .await,
-                    CommandOutcome::ModelChanged { .. }
+                    CommandOutcome::ModelChanged(_)
                 ));
             }
             assert!(matches!(
@@ -102,7 +109,7 @@ async fn set_model_to_current_selection_is_unchanged() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -115,12 +122,12 @@ async fn set_model_to_current_selection_is_unchanged() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: None,
             },
         )
         .await,
-        CommandOutcome::Unchanged
+        CommandOutcome::Unchanged(_)
     ));
 
     hub.shutdown_all().await;
@@ -133,7 +140,7 @@ async fn set_model_effort_switch_returns_model_changed() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -146,13 +153,13 @@ async fn set_model_effort_switch_returns_model_changed() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: Some("high".into()),
             },
         )
         .await,
-        CommandOutcome::ModelChanged { provider_id, reasoning_effort }
-            if provider_id == "prov" && reasoning_effort.as_deref() == Some("high")
+        CommandOutcome::ModelChanged(snapshot)
+            if snapshot.provider_id == "prov:fake" && snapshot.reasoning_effort.as_deref() == Some("high")
     ));
 
     hub.shutdown_all().await;
@@ -183,7 +190,7 @@ async fn set_model_rejects_a_different_provider_or_model() {
             },
         )
         .await,
-        CommandOutcome::ModelLocked
+        CommandOutcome::InvalidModel(_)
     ));
 
     hub.shutdown_all().await;
@@ -196,7 +203,7 @@ async fn failed_effort_persistence_keeps_live_selection() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -209,7 +216,7 @@ async fn failed_effort_persistence_keeps_live_selection() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: Some("high".into()),
             },
         )
@@ -221,14 +228,14 @@ async fn failed_effort_persistence_keeps_live_selection() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             Some("high".into()),
             PermissionMode::default(),
             false,
         )
         .await
         .expect("refresh attach");
-    assert_eq!(refreshed.snapshot.provider_id, "prov");
+    assert_eq!(refreshed.snapshot.provider_id, "prov:fake");
     assert_eq!(refreshed.snapshot.reasoning_effort, None);
 
     hub.shutdown_all().await;
@@ -244,7 +251,7 @@ async fn set_model_while_turn_running_is_rejected() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -294,7 +301,7 @@ async fn set_model_on_unattached_connection_is_ignored() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,

@@ -47,6 +47,8 @@ export const Composer = memo(function Composer({
   status,
   writable,
   access,
+  modelCandidates,
+  runtimeOpenError,
   backgroundTasksError,
   unsentDraft,
   running,
@@ -61,7 +63,6 @@ export const Composer = memo(function Composer({
   providerId,
   reasoningEffort,
   usage,
-  sessionHasImages,
   serverUrl,
   workspaceId,
   editing,
@@ -76,6 +77,8 @@ export const Composer = memo(function Composer({
   status: ConnectionStatus;
   writable: boolean;
   access: SessionAccess | null;
+  modelCandidates?: string[];
+  runtimeOpenError?: string | null;
   backgroundTasksError?: string | null;
   unsentDraft?: { text: string; images: string[] };
   running: boolean;
@@ -100,9 +103,6 @@ export const Composer = memo(function Composer({
   providerId?: string;
   reasoningEffort: ReasoningEffort | null;
   usage: UsageRecord[];
-  /** The active session's history already carries image attachments, so a
-   * text-only model can no longer serve this conversation. */
-  sessionHasImages: boolean;
   serverUrl: string;
   workspaceId: string;
   /** A historical message pulled back in to be rewritten. The parent remounts
@@ -176,6 +176,7 @@ export const Composer = memo(function Composer({
 
   const connected = status === "connected";
   const busy = running || approvalPending || compacting;
+  const modelBusy = running || compacting || (!readOnly && approvalPending);
   // A submit in flight owns the draft: `editing.text`/`images` were frozen when
   // the request went out, and a reconnect can remount us from them at any
   // moment. Anything typed past that point would vanish without trace, so the
@@ -197,9 +198,6 @@ export const Composer = memo(function Composer({
   const compactCommand = parseCompactCommand(task.trim());
   const compactCommandHasImages = images.length > 0 && compactCommand !== null;
   const compactOnNewSession = selectingTarget && compactCommand !== null;
-  // Once images are in play — staged in the draft or already in history — only a
-  // vision-capable model can serve the turn, so text-only models are locked out.
-  const requireImageModel = images.length > 0 || sessionHasImages;
   const rewriting = editing?.target != null;
   const canSend =
     writable &&
@@ -372,10 +370,42 @@ export const Composer = memo(function Composer({
     >
       {readOnly && (
         <p role="status" className="mx-auto mb-2 max-w-4xl text-sm text-muted-foreground">
-          {access.reason === "model_not_configured"
-            ? "This model is no longer configured. This conversation is read-only."
-            : "The saved reasoning effort is no longer supported. This conversation is read-only."}{" "}
+          {
+            {
+              model_not_configured:
+                modelCandidates?.length === 0
+                  ? "This model is no longer configured and has no compatible replacement. Restore its configuration and restart the server."
+                  : "This model is no longer configured. Select a compatible model to continue.",
+              reasoning_effort_not_supported:
+                "The saved reasoning effort is no longer supported. Choose a supported setting to continue.",
+              model_family_changed:
+                "This model no longer belongs to this conversation’s family. Select a compatible model to continue.",
+              runtime_open_failed:
+                "Model selection saved, but the conversation could not be restored.",
+              binding_unconfirmed:
+                "The saved model selection could not be confirmed. Execution is paused.",
+            }[access.reason]
+          }{" "}
           <span className="font-mono break-all">{providerId}</span>
+          {runtimeOpenError && <span className="block">{runtimeOpenError}</span>}
+          {(access.reason === "runtime_open_failed" ||
+            access.reason === "binding_unconfirmed" ||
+            access.reason === "reasoning_effort_not_supported") && (
+            <button
+              type="button"
+              className="ml-2 underline"
+              disabled={!connected || modelBusy || evicted}
+              onClick={() =>
+                providerId &&
+                onSetModel(
+                  providerId,
+                  access.reason === "reasoning_effort_not_supported" ? null : reasoningEffort,
+                )
+              }
+            >
+              {access.reason === "reasoning_effort_not_supported" ? "Use default effort" : "Retry"}
+            </button>
+          )}
         </p>
       )}
       {backgroundTasksError && (
@@ -579,9 +609,14 @@ export const Composer = memo(function Composer({
                   providers={providers}
                   providerId={providerId}
                   reasoningEffort={reasoningEffort}
-                  disabled={!writable || !connected || busy}
-                  modelLocked={!selectingTarget}
-                  requireImageModel={requireImageModel}
+                  disabled={
+                    !connected ||
+                    modelBusy ||
+                    evicted ||
+                    (access?.type === "read_only" && access.reason === "binding_unconfirmed")
+                  }
+                  allowedModelIds={modelCandidates}
+                  draftHasImages={images.length > 0}
                   serverUrl={serverUrl}
                   workspaceId={workspaceId}
                   onSetModel={onSetModel}

@@ -32,6 +32,9 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Object;
 
+#[path = "storage_pg/model_family.rs"]
+mod model_family;
+
 /// A fresh pool per test. A pool is tied to the runtime that created it and
 /// `#[tokio::test]` gives every test its own, so a pool shared through a static
 /// starts timing out the moment the first test's runtime shuts down. Connections
@@ -118,6 +121,7 @@ fn workspace_id(test: &str) -> String {
 
 fn test_binding() -> SessionModelBinding {
     SessionModelBinding {
+        family: None,
         provider_id: "openrouter".to_string(),
         model_id: "x-ai/grok-4.5".to_string(),
         reasoning_effort: Some("high".to_string()),
@@ -155,6 +159,7 @@ fn entry(turn_id: TurnId, message: Message) -> HistoryEntry {
 /// don't spell out ten fields of timing and reasoning state.
 fn assistant(content: &str) -> Message {
     Message::Assistant(AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: content.to_string(),
         tool_calls: vec![],
@@ -556,6 +561,7 @@ async fn an_assistant_message_keeps_its_reasoning_continuation() {
                 vec![entry(
                     turn,
                     Message::Assistant(AssistantMessage {
+                        generation: None,
                         message_id: MessageId::new(),
                         content: String::new(),
                         tool_calls: vec![ToolCall {
@@ -1247,6 +1253,7 @@ async fn reopening_a_session_keeps_the_binding_it_was_created_with() {
         .initialize_session(
             "session-1",
             SessionModelBinding {
+                family: None,
                 provider_id: "other".to_string(),
                 model_id: "different".to_string(),
                 reasoning_effort: None,
@@ -1280,7 +1287,14 @@ async fn a_session_name_can_be_set_and_cleared_without_touching_its_binding() {
     );
 
     let binding = storage
-        .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", Some("low"))
+        .compare_exchange_model_binding(
+            "session-1",
+            &test_binding(),
+            &SessionModelBinding {
+                reasoning_effort: Some("low".into()),
+                ..test_binding()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(binding.reasoning_effort.as_deref(), Some("low"));
@@ -1321,7 +1335,14 @@ async fn clearing_the_reasoning_effort_stores_a_json_null() {
         .unwrap();
 
     let binding = storage
-        .update_reasoning_effort("session-1", "openrouter", "x-ai/grok-4.5", None)
+        .compare_exchange_model_binding(
+            "session-1",
+            &test_binding(),
+            &SessionModelBinding {
+                reasoning_effort: None,
+                ..test_binding()
+            },
+        )
         .await
         .unwrap();
 
@@ -1353,13 +1374,20 @@ async fn an_effort_update_for_a_different_model_is_rejected() {
 
     assert_eq!(
         storage
-            .update_reasoning_effort("session-1", "openrouter", "moonshotai/kimi-k3", Some("low"))
+            .compare_exchange_model_binding(
+                "session-1",
+                &SessionModelBinding {
+                    model_id: "moonshotai/kimi-k3".into(),
+                    ..test_binding()
+                },
+                &test_binding()
+            )
             .await,
         Err(SessionMetadataError::BindingMismatch)
     );
     assert_eq!(
         storage
-            .update_reasoning_effort("missing", "openrouter", "x-ai/grok-4.5", Some("low"))
+            .compare_exchange_model_binding("missing", &test_binding(), &test_binding())
             .await,
         Err(SessionMetadataError::SessionNotFound),
         "a mismatch and a missing session are different answers"
@@ -2468,6 +2496,7 @@ fn recorded(
         None,
     );
     let call = Message::Assistant(AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![ToolCall {

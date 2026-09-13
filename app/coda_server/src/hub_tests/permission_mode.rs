@@ -26,7 +26,7 @@ async fn opening_attach_seeds_the_mode() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::Explore,
             false,
@@ -48,12 +48,26 @@ async fn a_live_session_keeps_its_own_mode_across_a_takeover() {
     // could silently loosen — or tighten — a session mid-flight.
     let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
     let _first = hub
-        .attach(key(), 1, "prov".into(), None, PermissionMode::Yolo, false)
+        .attach(
+            key(),
+            1,
+            "prov:fake".into(),
+            None,
+            PermissionMode::Yolo,
+            false,
+        )
         .await
         .expect("attach");
 
     let second = hub
-        .attach(key(), 2, "prov".into(), None, PermissionMode::Explore, true)
+        .attach(
+            key(),
+            2,
+            "prov:fake".into(),
+            None,
+            PermissionMode::Explore,
+            true,
+        )
         .await
         .expect("takeover");
 
@@ -70,7 +84,7 @@ async fn set_permission_mode_reaches_the_running_runtime() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::Explore,
             false,
@@ -105,7 +119,14 @@ async fn the_mode_survives_a_model_rebuild() {
     // permissions.
     let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, PermissionMode::Yolo, false)
+        .attach(
+            key(),
+            1,
+            "prov:fake".into(),
+            None,
+            PermissionMode::Yolo,
+            false,
+        )
         .await
         .expect("attach");
 
@@ -114,12 +135,12 @@ async fn the_mode_survives_a_model_rebuild() {
             key(),
             1,
             SessionCommand::SetModel {
-                provider_id: "prov".into(),
+                provider_id: "prov:fake".into(),
                 reasoning_effort: Some("high".into()),
             },
         )
         .await,
-        CommandOutcome::ModelChanged { .. }
+        CommandOutcome::ModelChanged(_)
     ));
 
     assert_eq!(opener.opened_modes.lock().unwrap().len(), 2);
@@ -134,7 +155,14 @@ async fn a_released_session_takes_the_next_clients_mode() {
     // the only record of its posture, and reopening restores from it.
     let (hub, opener) = hub_and_opener(TestOpener::new("reply", ToolApprovalMode::Auto));
     let _attach = hub
-        .attach(key(), 1, "prov".into(), None, PermissionMode::Yolo, false)
+        .attach(
+            key(),
+            1,
+            "prov:fake".into(),
+            None,
+            PermissionMode::Yolo,
+            false,
+        )
         .await
         .expect("attach");
     hub.detach(key(), 1).await;
@@ -144,7 +172,7 @@ async fn a_released_session_takes_the_next_clients_mode() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::Explore,
             false,
@@ -165,7 +193,7 @@ async fn set_permission_mode_from_a_stale_connection_is_ignored() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::Explore,
             false,

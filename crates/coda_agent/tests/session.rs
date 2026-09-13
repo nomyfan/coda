@@ -86,6 +86,7 @@ fn never_completed()
 fn assistant() -> AssistantMessage {
     let now = jiff::Timestamp::now();
     AssistantMessage {
+        generation: None,
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![],
@@ -451,6 +452,7 @@ fn solo_team(spec: AgentSpec) -> AgentTeam {
 
 fn fake_profile() -> ModelProfile<FakeProvider> {
     ModelProfile {
+        provider_id: "test".into(),
         provider: FakeProvider,
         model: "fake".into(),
         label: "fake".into(),

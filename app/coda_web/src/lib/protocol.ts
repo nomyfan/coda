@@ -22,7 +22,14 @@ export type CompletionUsage = {
   } | null;
 };
 
+export type GenerationMetadata = {
+  provider_id: string;
+  model_id: string;
+  reasoning_effort: ReasoningEffort | null;
+};
+
 export type AssistantMessage = {
+  generation?: GenerationMetadata | null;
   /** Server-minted identity, stable across reconnects. */
   message_id: string;
   content: string;
@@ -147,7 +154,15 @@ export type ResumeDecision = {
 
 export type SessionAccess =
   | { type: "read_write" }
-  | { type: "read_only"; reason: "model_not_configured" | "reasoning_effort_not_supported" };
+  | {
+      type: "read_only";
+      reason:
+        | "model_not_configured"
+        | "reasoning_effort_not_supported"
+        | "model_family_changed"
+        | "runtime_open_failed"
+        | "binding_unconfirmed";
+    };
 
 export type WorkspaceSession = {
   access: SessionAccess | null;
@@ -211,6 +226,7 @@ export type Modality = "text" | "image";
  * Empty `reasoning_efforts` means the model has no reasoning controls.
  */
 export type ProviderInfo = {
+  family?: string | null;
   id: string;
   provider: string;
   model: string;
@@ -240,7 +256,6 @@ export const RpcCode = {
   /** `set_model`: a turn is in flight. */
   MODEL_SWITCH_WHILE_RUNNING: -32004,
   /** `set_model`: an opened session cannot change provider/model. */
-  MODEL_LOCKED: -32005,
   /** A command requiring an idle session found a turn in flight or awaiting approval. */
   SESSION_NOT_IDLE: -32006,
   SESSION_READ_ONLY: -32007,
@@ -269,7 +284,10 @@ export const RpcCode = {
 // `open_session` result and the unsolicited `snapshot` push; the catalogs back
 // both a request result and (historically) a push.
 
-type Snapshot = {
+export type Snapshot = {
+  model_family: string | null;
+  model_candidates: string[];
+  runtime_open_error: string | null;
   access: SessionAccess;
   background_tasks_error: string | null;
   workspace_id: string;
@@ -364,11 +382,6 @@ type SkillCatalog = { skills: SkillInfo[] };
 
 type ProviderCatalog = { providers: ProviderInfo[]; default_provider: string };
 
-type ModelSelectionResult = {
-  provider_id: string;
-  reasoning_effort?: ReasoningEffort | null;
-};
-
 export type CompactResult =
   | { outcome: "applied" }
   | { outcome: "recorded" }
@@ -440,7 +453,7 @@ export type RpcRequests = {
       provider_id: string;
       reasoning_effort: ReasoningEffort | null;
     },
-    ModelSelectionResult
+    Snapshot
   >;
 
   delete_session: RpcRequest<SessionRef, WorkspaceCatalog>;

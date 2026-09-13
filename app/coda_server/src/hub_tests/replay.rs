@@ -15,7 +15,7 @@ async fn task_settles_then_reattach_shows_folded_history() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -46,7 +46,7 @@ async fn task_settles_then_reattach_shows_folded_history() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -88,7 +88,7 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -116,7 +116,7 @@ async fn snapshot_and_checkpoint_agree_on_every_message_id() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -185,7 +185,7 @@ async fn auto_compaction_reaches_the_live_snapshot_without_a_reattach() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -255,7 +255,7 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -283,7 +283,7 @@ async fn midturn_attach_replays_chunks_and_evicts_previous() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -328,7 +328,7 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -355,7 +355,7 @@ async fn detach_idle_releases_and_reattach_reopens_from_persisted_state() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -375,7 +375,7 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -410,7 +410,7 @@ async fn disconnect_during_turn_keeps_session_until_settle() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -430,7 +430,7 @@ async fn burst_of_chunks_survives_replay_and_fold() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -456,7 +456,7 @@ async fn burst_of_chunks_survives_replay_and_fold() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             true,
@@ -479,7 +479,7 @@ async fn overflowing_tool_calls_refresh_snapshot_without_stopping_background_wor
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -537,7 +537,7 @@ async fn attach_without_takeover_is_refused_while_held() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -550,7 +550,7 @@ async fn attach_without_takeover_is_refused_while_held() {
         hub.attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false
@@ -568,7 +568,7 @@ async fn attach_without_takeover_is_refused_while_held() {
     hub.attach(
         key(),
         2,
-        "prov".into(),
+        "prov:fake".into(),
         None,
         PermissionMode::default(),
         true,
@@ -590,7 +590,7 @@ async fn failed_resume_does_not_stick_turn_running() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -637,7 +637,7 @@ async fn lagged_stream_refreshes_snapshot_and_keeps_runtime_attached() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -693,7 +693,7 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
         .attach(
             key(),
             1,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,
@@ -726,7 +726,7 @@ async fn a_refused_checkpoint_reports_the_failure_then_resyncs() {
         .attach(
             key(),
             2,
-            "prov".into(),
+            "prov:fake".into(),
             None,
             PermissionMode::default(),
             false,

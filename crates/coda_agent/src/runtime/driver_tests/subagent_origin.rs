@@ -659,3 +659,49 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
         .expect("explore checkpointed once it answered");
     assert_eq!(derived.as_ref(), child.pid);
 }
+
+#[tokio::test]
+async fn generation_metadata_records_root_inheritance_and_explicit_agent_overrides_without_usage() {
+    for override_child in [false, true] {
+        let (root, children) = explore_specs("main-system", SubAgentMode::Stateful);
+        let agents = AgentTeam::new(root, children).unwrap().build(
+            ".",
+            coda_tools::shared_file_locks(),
+            test_registry(),
+        );
+        let mut config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
+        config.default_model.provider_id = "p1".into();
+        config.default_model.model = "m1-preview".into();
+        config.default_model.reasoning_effort = Some("high".into());
+        if override_child {
+            let mut child = config.default_model.clone();
+            child.provider_id = "p2".into();
+            child.model = "explicit-child".into();
+            child.reasoning_effort = Some("low".into());
+            config.agent_models.insert("explore".into(), child);
+        }
+        let mut harness =
+            Harness::start_with_config(MemoryStorage::default(), agents, config, "inspect").await;
+        let mut saw_child = false;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let (name, pid, event) = harness.next_event().await;
+                if let AgentEvent::LLMEnd(message) = event {
+                    let generation = message.generation.as_ref().expect("runtime supplies provenance");
+                    let is_override = name == "explore" && override_child;
+                    assert_eq!(generation.provider_id, if is_override { "p2" } else { "p1" });
+                    assert_eq!(generation.model_id, if is_override { "explicit-child" } else { "m1-preview" });
+                    assert_eq!(generation.reasoning_effort.as_deref(), Some(if is_override { "low" } else { "high" }));
+                    assert!(message.usage.is_none());
+                    let stored = harness.storage.load_checkpoint(pid.as_ref()).await.unwrap().unwrap();
+                    assert!(stored.messages.iter().any(|entry| matches!(&entry.message, Message::Assistant(saved)
+                        if saved.message_id == message.message_id && saved.generation == message.generation)));
+                    saw_child |= name == "explore";
+                    if name == "coda" && message.tool_calls.is_empty() { break; }
+                }
+            }
+        }).await.unwrap();
+        assert!(saw_child);
+        harness.shutdown().await;
+    }
+}

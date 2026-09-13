@@ -323,9 +323,20 @@ impl UserMessage {
     }
 }
 
+/// The configured model and parameters used for one generation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationMetadata {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+}
+
 /// A message representing a response from the AI, which may include tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    /// Captured by the runtime, never inferred from the current session binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationMetadata>,
     /// Minted where the message is constructed — the provider adapter for a
     /// normal completion, the runtime for an aborted one. Each object is built
     /// exactly once and then flows through the event pipeline unchanged, so the
@@ -763,6 +774,7 @@ mod tests {
     fn assistant_reasoning_roundtrips_and_defaults_when_absent() {
         let now = jiff::Timestamp::now();
         let message = AssistantMessage {
+            generation: None,
             message_id: MessageId::new(),
             content: String::new(),
             tool_calls: vec![],

@@ -15,6 +15,18 @@
 # `max_completion_tokens` (positive and no larger than `context_window`).
 # The dashboard picks which model a session uses; the first listed is the default.
 
+# Optional model `family` declares that models can continue each other's history,
+# including tool calls and reasoning continuation. Codes are case-sensitive,
+# nonempty, have no surrounding whitespace, and are shared across providers.
+# Example for compatible endpoints or a Preview replacement:
+#   { id = "m1-preview", family = "m1", context_window = 128000 }
+#   { id = "m1",         family = "m1", context_window = 128000 }
+# Sessions save this family and allow manual switching within it while idle.
+# A session without a family can enroll when its original configured model gains
+# one. Once enrolled, changing/removing the model's family makes it read-only;
+# choose another model with the saved family or restore the configuration.
+# Removing a Preview model does not pick a replacement automatically.
+
 [[providers]]
 id = "deepseek"
 kind = "deepseek"

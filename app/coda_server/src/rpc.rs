@@ -61,7 +61,7 @@ pub const SESSION_BUSY: i32 = -32001;
 pub const NOT_OWNER: i32 = -32002;
 pub const SESSION_NOT_LIVE: i32 = -32003;
 pub const MODEL_SWITCH_WHILE_RUNNING: i32 = -32004;
-pub const MODEL_LOCKED: i32 = -32005;
+// -32005 was MODEL_LOCKED; family/effort/input violations use INVALID_MODEL_SELECTION.
 /// A command requiring an idle session found work in flight or parked.
 pub const SESSION_NOT_IDLE: i32 = -32006;
 pub const SESSION_READ_ONLY: i32 = -32007;
