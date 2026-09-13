@@ -1203,10 +1203,7 @@ pub(super) fn user_task(pid: &ProcessId, task: &str) -> Envelope {
 }
 
 /// A `RunConfig` where every agent runs on the fake test model.
-pub(super) fn test_config(
-    provider: TestProvider,
-    approval: ToolApprovalMode,
-) -> RunConfig<TestProvider> {
+pub(super) fn test_config<P>(provider: P, approval: ToolApprovalMode) -> RunConfig<P> {
     RunConfig {
         default_model: ModelProfile {
             provider_id: "test".into(),
@@ -1283,7 +1280,7 @@ where
     pub(super) async fn start_with_config(
         storage: S,
         agents: HashMap<String, Arc<Program>>,
-        config: RunConfig<TestProvider>,
+        config: RunConfig<impl LLMProvider + Clone>,
         initial_task: &str,
     ) -> Self {
         Self::start_with_config_at(storage, agents, config, ProcessId::new(), initial_task).await
@@ -1292,7 +1289,7 @@ where
     pub(super) async fn start_with_config_at(
         storage: S,
         agents: HashMap<String, Arc<Program>>,
-        config: RunConfig<TestProvider>,
+        config: RunConfig<impl LLMProvider + Clone>,
         pid: ProcessId,
         initial_task: &str,
     ) -> Self {

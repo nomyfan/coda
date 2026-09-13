@@ -27,7 +27,9 @@ async fn completion(
     while let Some(event) = stream.next().await {
         match event? {
             LLMStreamEvent::Completed(message) => return Ok(*message),
-            LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+            LLMStreamEvent::ModelReported(_)
+            | LLMStreamEvent::ContentChunk(_)
+            | LLMStreamEvent::ReasoningChunk(_) => {}
         }
     }
     Err(StreamError::InvalidResponse(

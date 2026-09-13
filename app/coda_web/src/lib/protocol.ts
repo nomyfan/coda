@@ -24,8 +24,11 @@ export type CompletionUsage = {
 
 export type GenerationMetadata = {
   provider_id: string;
+  /** The model identifier sent in the request. */
   model_id: string;
   reasoning_effort: ReasoningEffort | null;
+  /** Last upstream-reported model; absent when none was recorded. */
+  reported_model_id?: string | null;
 };
 
 export type AssistantMessage = {

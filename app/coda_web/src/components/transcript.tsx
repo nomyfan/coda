@@ -444,13 +444,16 @@ function EntryDetail({ entry }: { entry: TranscriptEntry }) {
 
 function EntryModel({ entry }: { entry: TranscriptEntry }) {
   if (!entry.model) return null;
-  const { provider_id, model_id, reasoning_effort } = entry.model;
+  const { provider_id, model_id, reasoning_effort, reported_model_id } = entry.model;
+  const details = [
+    `Reported model: ${reported_model_id ?? "not recorded"}`,
+    `Requested model: ${model_id}`,
+    `Configured provider: ${provider_id}`,
+    `Requested reasoning effort: ${reasoning_effort ?? "not specified"}`,
+  ];
   return (
-    <span
-      className="text-xs text-muted-foreground"
-      title={`${provider_id}:${model_id}${reasoning_effort ? ` · ${reasoning_effort}` : ""}`}
-    >
-      {model_id}
+    <span className="text-xs text-muted-foreground" title={details.join("\n")}>
+      {reported_model_id ?? `${model_id} (requested)`}
     </span>
   );
 }

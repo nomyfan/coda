@@ -1641,7 +1641,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         Ok(message.content.clone())
                     };
                 }
-                LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+                LLMStreamEvent::ModelReported(_)
+                | LLMStreamEvent::ContentChunk(_)
+                | LLMStreamEvent::ReasoningChunk(_) => {}
             }
         }
         Err("the provider closed the stream without a summary".to_string())
@@ -1745,10 +1747,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             messages,
             tools: request_tools,
         };
-        let generation = coda_core::llm::GenerationMetadata {
+        let mut generation = coda_core::llm::GenerationMetadata {
             provider_id: self.config.profile.provider_id.clone(),
             model_id: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
+            reported_model_id: None,
         };
         let started_at = jiff::Timestamp::now();
         self.runtime
@@ -1800,6 +1803,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 }
                 event = llm_stream.next() => {
                     match event {
+                        Some(Ok(LLMStreamEvent::ModelReported(model))) => {
+                            generation.reported_model_id = Some(model.into_boxed_str());
+                        }
                         Some(Ok(LLMStreamEvent::ContentChunk(chunk))) => {
                             if !partial_reasoning.is_empty() && reasoning_ended_at.is_none() {
                                 reasoning_ended_at = Some(jiff::Timestamp::now());

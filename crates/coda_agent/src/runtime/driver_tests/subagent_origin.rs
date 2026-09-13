@@ -10,6 +10,7 @@ use crate::{
     runtime::{MemoryStorage, SessionStorage},
 };
 use coda_core::llm::{Message, MessageId, MessageOrigin, ToolOutput, TurnId};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
@@ -660,6 +661,19 @@ async fn a_parked_thread_can_name_the_child_it_waits_on() {
     assert_eq!(derived.as_ref(), child.pid);
 }
 
+#[derive(Clone)]
+struct ModelReportingProvider(TestProvider);
+
+impl LLMProvider for ModelReportingProvider {
+    fn stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> impl futures::Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
+        let report = LLMStreamEvent::ModelReported(format!("reported-{}", request.model));
+        futures::stream::iter([Ok(report)]).chain(self.0.stream(request))
+    }
+}
+
 #[tokio::test]
 async fn generation_metadata_records_root_inheritance_and_explicit_agent_overrides_without_usage() {
     for override_child in [false, true] {
@@ -669,7 +683,10 @@ async fn generation_metadata_records_root_inheritance_and_explicit_agent_overrid
             coda_tools::shared_file_locks(),
             test_registry(),
         );
-        let mut config = test_config(TestProvider::default(), ToolApprovalMode::Auto);
+        let mut config = test_config(
+            ModelReportingProvider(TestProvider::default()),
+            ToolApprovalMode::Auto,
+        );
         config.default_model.provider_id = "p1".into();
         config.default_model.model = "m1-preview".into();
         config.default_model.reasoning_effort = Some("high".into());
@@ -691,6 +708,7 @@ async fn generation_metadata_records_root_inheritance_and_explicit_agent_overrid
                     let is_override = name == "explore" && override_child;
                     assert_eq!(generation.provider_id, if is_override { "p2" } else { "p1" });
                     assert_eq!(generation.model_id, if is_override { "explicit-child" } else { "m1-preview" });
+                    assert_eq!(generation.reported_model_id.as_deref(), Some(if is_override { "reported-explicit-child" } else { "reported-m1-preview" }));
                     assert_eq!(generation.reasoning_effort.as_deref(), Some(if is_override { "low" } else { "high" }));
                     assert!(message.usage.is_none());
                     let stored = harness.storage.load_checkpoint(pid.as_ref()).await.unwrap().unwrap();

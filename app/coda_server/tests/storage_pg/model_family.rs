@@ -316,6 +316,7 @@ async fn fork_and_rewind_preserve_historical_generation_and_the_current_family_b
         provider_id: "removed".into(),
         model_id: "preview".into(),
         reasoning_effort: Some("high".into()),
+        reported_model_id: Some("upstream-version".into()),
     };
     let Message::Assistant(mut recorded) = assistant("from the preview model") else {
         unreachable!()
@@ -338,6 +339,17 @@ async fn fork_and_rewind_preserve_historical_generation_and_the_current_family_b
         .save_checkpoint("s".into(), checkpoint("s", messages))
         .await
         .unwrap();
+    let storage = WorkspaceStorage::new(pool, &workspace);
+    let reopened = storage
+        .session("s")
+        .load_checkpoint("s")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&reopened.messages[1].message, Message::Assistant(a)
+        if a.generation.as_ref() == Some(&generation))
+    );
     let fork = storage
         .fork_session("s", ForkCut::All, ForkSource::Cold)
         .await

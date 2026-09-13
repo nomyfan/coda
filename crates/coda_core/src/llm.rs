@@ -323,12 +323,19 @@ impl UserMessage {
     }
 }
 
-/// The configured model and parameters used for one generation request.
+/// The request profile and upstream-reported model for one generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMetadata {
+    /// Coda's configured provider, not a gateway's underlying serving provider.
     pub provider_id: String,
+    /// The model identifier sent in the request.
     pub model_id: String,
+    /// The requested effort, not an upstream-confirmed execution parameter.
     pub reasoning_effort: Option<String>,
+    /// Last valid model reported by the upstream; absent when none was recorded.
+    /// This does not independently verify an underlying model version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model_id: Option<Box<str>>,
 }
 
 /// A message representing a response from the AI, which may include tool calls.
@@ -743,6 +750,10 @@ impl std::error::Error for StreamError {}
 
 /// Events produced by `LLMProvider::stream`.
 pub enum LLMStreamEvent {
+    /// The upstream's latest model identifier, replacing any prior report.
+    /// Providers emit a nonblank string before the same response's text events
+    /// and before Completed. Generation metadata is assembled by the runtime.
+    ModelReported(String),
     ContentChunk(String),
     /// A chunk of the model's reasoning / chain-of-thought text, from providers
     /// that expose a separate reasoning stream (e.g. DeepSeek).
