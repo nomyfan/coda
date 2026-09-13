@@ -1,5 +1,129 @@
 use super::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn model_histories_batch_processes_and_exclude_overrides_before_reading_payloads() {
+    use diesel::connection::InstrumentationEvent;
+    use diesel_async::AsyncConnection;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let pool = pool().await;
+    pool.resize(1);
+    let workspace = workspace_id("model-histories");
+    let storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    storage
+        .initialize_session("s", test_binding())
+        .await
+        .unwrap();
+    let mut expected = std::collections::HashMap::new();
+    for index in 0..12 {
+        let pid = format!("worker-{index}");
+        let turn = TurnId::from(MessageId::new());
+        let mut image = UserMessage::text(MessageId::new(), "old image");
+        image.parts.push(coda_core::llm::ContentPart::Image {
+            url: "data:image/png;base64,eA==".into(),
+        });
+        let reply = assistant("image description");
+        let cutoff = reply.message_id();
+        let history = vec![
+            entry(turn, Message::User(image)),
+            entry(turn, reply),
+            entry(turn, summary_message(cutoff, "compacted image")),
+            entry(
+                TurnId::from(MessageId::new()),
+                Message::User(UserMessage::text(MessageId::new(), format!("tail-{index}"))),
+            ),
+        ];
+        storage
+            .session("s")
+            .save_checkpoint(pid.clone(), checkpoint(&pid, history.clone()))
+            .await
+            .unwrap();
+        expected.insert(pid, history);
+    }
+    storage
+        .session("s")
+        .save_checkpoint("empty".into(), checkpoint("empty", vec![]))
+        .await
+        .unwrap();
+    let mut overridden = checkpoint(
+        "override",
+        vec![entry(TurnId::from(MessageId::new()), assistant("unused"))],
+    );
+    overridden.agent_name = "own-model".into();
+    storage
+        .session("s")
+        .save_checkpoint("override".into(), overridden)
+        .await
+        .unwrap();
+    // Same PID in another session and workspace must never join into this history.
+    for (scope, session) in [
+        (storage.clone(), "other"),
+        (
+            WorkspaceStorage::new(pool.clone(), workspace_id("other-model-histories")),
+            "s",
+        ),
+    ] {
+        scope
+            .initialize_session(session, test_binding())
+            .await
+            .unwrap();
+        scope
+            .session(session)
+            .save_checkpoint(
+                "worker-0".into(),
+                checkpoint(
+                    "worker-0",
+                    vec![entry(
+                        TurnId::from(MessageId::new()),
+                        assistant("unrelated"),
+                    )],
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let mut connection = conn(&pool).await;
+    diesel::sql_query("UPDATE messages SET payload = '{}'::jsonb WHERE workspace_id = $1 AND session_id = 's' AND pid = 'override'")
+        .bind::<Text, _>(&workspace).execute(&mut connection).await.unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let observed = queries.clone();
+    connection.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            // Exclude pool health checks; count actual checkpoint/history reads.
+            let sql = query.to_string();
+            if sql.contains("\"messages\"") || sql.contains("\"process_checkpoints\"") {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    drop(connection);
+
+    let histories = storage.model_histories("s", &["own-model"]).await.unwrap();
+    assert_eq!(
+        queries.as_ref().load(Ordering::SeqCst),
+        1,
+        "history reads must not grow with the process count"
+    );
+    assert_eq!(
+        serde_json::to_value(&histories).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    for history in histories.values() {
+        let visible: Vec<_> = coda_agent::message_view::model_view(history).collect();
+        assert_eq!(visible.len(), 2);
+        assert!(
+            !visible
+                .iter()
+                .any(|entry| matches!(&entry.message, Message::User(user) if user.has_image()))
+        );
+    }
+    // The malformed payload must still fail if its agent inherits the session model.
+    assert!(storage.model_histories("s", &[]).await.is_err());
+}
+
 #[derive(QueryableByName)]
 struct BackendPid {
     #[diesel(sql_type = Integer)]

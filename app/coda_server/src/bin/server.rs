@@ -775,10 +775,13 @@ async fn inherited_history_has_images(
     workspace: &WorkspaceState,
     session_id: &str,
 ) -> Result<bool, String> {
-    for (name, history) in workspace.storage.model_histories(session_id).await? {
-        if workspace.agent_models.contains_key(&name) {
-            continue;
-        }
+    let excluded_agents: Vec<_> = workspace.agent_models.keys().map(String::as_str).collect();
+    for history in workspace
+        .storage
+        .model_histories(session_id, &excluded_agents)
+        .await?
+        .into_values()
+    {
         if coda_agent::message_view::model_view(&history)
             .any(|entry| matches!(&entry.message, Message::User(message) if message.has_image()))
         {
@@ -1170,6 +1173,10 @@ async fn wire_snapshot(app: &AppState, key: &SessionKey, snapshot: SnapshotPaylo
         Some(workspace) => inherited_history_has_images(workspace, &key.1).await,
         None => Err("unknown workspace".into()),
     };
+    if let Err(error) = &images {
+        warn!(workspace_id = %key.0, session_id = %key.1, %error,
+            "could not prefilter model candidates; set_model will validate the selection");
+    }
     let model_candidates = app
         .provider_catalog
         .iter()
@@ -1181,8 +1188,9 @@ async fn wire_snapshot(app: &AppState, key: &SessionKey, snapshot: SnapshotPaylo
             compatible
                 && match &images {
                     Ok(true) => info.input_modalities.contains(&Modality::Image),
-                    Ok(false) => true,
-                    Err(_) => false,
+                    // A failed prefilter is not evidence of incompatibility.
+                    // set_model still validates history before changing the binding.
+                    Ok(false) | Err(_) => true,
                 }
         })
         .map(|info| info.id.clone())

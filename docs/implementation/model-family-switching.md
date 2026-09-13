@@ -196,7 +196,9 @@ async fn confirm_model_binding(
 
 RPC `set_model` 请求保留现有 provider_id selection key 与 reasoning_effort；客户端不上传 family。结果改为完整 Snapshot；提交前失败返回既有/扩充的选择错误，提交后恢复失败返回带错误状态的新 snapshot，不把两者混为“选择未改变”。未附着或旧连接仍拒绝。
 
-Snapshot 增加 `model_family`、兼容候选 selection key 列表，以及可选的 runtime 打开错误。候选由服务端生成并排除已知输入不兼容的目标；RPC 执行时仍在会话锁内验证。候选与“当前是否空闲”分开表达，运行中可以展示列表但不能提交。
+Snapshot 增加 `model_family`、兼容候选 selection key 列表，以及可选的 runtime 打开错误。候选由服务端生成并排除已知输入不兼容的目标；RPC 执行时仍在会话锁内验证。预筛选读取历史失败时记录错误日志，保留符合 family 规则的候选，不能把读取失败表示成“没有兼容模型”；实际 `set_model` 仍会读取并校验目标所需的历史，校验失败不更新绑定。候选与“当前是否空闲”分开表达，运行中可以展示列表但不能提交。
+
+输入兼容性检查用一次批量查询读取会话各 process 的历史，在 SQL 中排除显式覆盖模型的 agent。连接条件包含 workspace、session 和 pid，消息按各 process 的 seq 排序，继续复用有效上下文的压缩边界规则；不逐个加载完整 checkpoint，也不增加缓存及失效机制。
 
 ProviderInfoWire 增加 family，供新会话选择和展示使用。已有会话以服务端给出的候选为准，尤其原 selection key 已从目录消失时仍显示可操作选择器。只读禁用发送与执行，不笼统禁用模型恢复入口。
 
@@ -259,6 +261,7 @@ ProviderInfoWire 增加 family，供新会话选择和展示使用。已有会�
 - 生成来源测试覆盖根 agent、继承模型及显式 override 的子 agent、无 usage 的正常回复、取消后的部分回复、旧消息反序列化，以及 provider 请求不携带历史来源字段。
 - Web 测试覆盖完整 snapshot 恢复、已提交但未能打开时保持只读、同目标重试、已删除模型的选择器展示、目标默认 effort 和历史/子 agent 消息来源。
 - Web 回归测试通过实际 App → Composer → ModelSelector 的数据传递，验证压缩后的历史图片不禁用服务端允许的文本候选、未提交的草稿图片仍要求图片能力，以及服务端排除的候选不会被前端启用。
+- PR 评论回归测试验证历史预筛选失败时仍返回同 family 候选，实际切换继续拒绝无法校验或包含图片的文本目标，存储恢复后可手动切换到图片模型并保留审批。存储测试对 12 个 process 计数，确认只执行一次历史数据查询，并覆盖 session/workspace 隔离、消息排序、压缩边界，以及显式模型 override 的历史在反序列化前即被排除。
 - 已检查默认系统提示与 templates。本次模型配置和 UI 恢复未新增 agent 需要遵守的执行规则，因此无需修改 prompt。
 
-最终检查：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets` 均通过；完整 `cargo test --features pg-tests` 使用本次新建的临时测试库通过，其中 hub 所在的服务端库测试 278 项、数据库存储测试 54 项、数据库 RPC 测试 7 项。Web 的 lint、typecheck 和 167 项测试全部通过。`git diff --check` 无错误。临时测试库已删除，未调用真实 LLM。
+最终检查：`cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets` 均通过；完整 `cargo test --features pg-tests` 使用本次新建的临时测试库通过，其中 hub 所在的服务端库测试 278 项、数据库存储测试 55 项、数据库 RPC 测试 8 项。Web 的 lint、typecheck 和 167 项测试此前已通过，本轮未修改 Web 代码。`git diff --check` 无错误。临时测试库已删除，未调用真实 LLM。

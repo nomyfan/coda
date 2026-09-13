@@ -326,6 +326,102 @@ async fn inherited_child_images_restrict_candidates_but_an_explicit_model_overri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn history_read_failure_keeps_recovery_candidates_without_bypassing_validation() {
+    let mut h = Harness::with_providers(vec![
+        provider("p", "text", Some("f"), false),
+        provider("vision", "vision", Some("f"), true),
+        provider("other", "unrelated", Some("g"), true),
+    ])
+    .await;
+    let binding = SessionModelBinding {
+        provider_id: "removed".into(),
+        model_id: "preview".into(),
+        family: Some("f".into()),
+        reasoning_effort: Some("low".into()),
+    };
+    h.workspace
+        .storage
+        .initialize_session("chat", binding.clone())
+        .await
+        .unwrap();
+    let mut root = suspended("chat");
+    let Message::User(user) = &mut root.messages[0].message else {
+        unreachable!()
+    };
+    user.parts.push(coda_core::llm::ContentPart::Image {
+        url: "data:image/png;base64,eA==".into(),
+    });
+    let original = serde_json::to_string(&root.messages[0].message).unwrap();
+    h.workspace
+        .storage
+        .session("chat")
+        .save_checkpoint("chat".into(), root)
+        .await
+        .unwrap();
+    let opened = h.request("open_session", json!({})).await;
+    assert_eq!(
+        opened["result"]["model_candidates"],
+        json!(["vision:vision"])
+    );
+
+    // The hub has a readable snapshot. Fail only the subsequent history read,
+    // then restore the row to model recovery from a temporary storage error.
+    let mut conn = h.pool.get().await.unwrap();
+    diesel::sql_query("UPDATE messages SET payload = '{}'::jsonb WHERE workspace_id = $1 AND session_id = 'chat' AND pid = 'chat' AND seq = 0")
+        .bind::<Text, _>(&h.workspace.id)
+        .execute(&mut conn).await.unwrap();
+    let refreshed = h.request("open_session", json!({})).await;
+    assert_eq!(
+        refreshed["result"]["access"]["reason"],
+        "model_not_configured"
+    );
+    assert_eq!(
+        refreshed["result"]["messages"],
+        opened["result"]["messages"]
+    );
+    assert_eq!(
+        refreshed["result"]["model_candidates"],
+        json!(["p:text", "vision:vision"]),
+        "a failed prefilter must not mean no compatible replacements: {refreshed}"
+    );
+    let rejected = h
+        .request("set_model", json!({"provider_id": "p:text"}))
+        .await;
+    assert_eq!(rejected["error"]["code"], rpc::INVALID_MODEL_SELECTION);
+    assert_eq!(
+        h.workspace
+            .storage
+            .load_model_binding("chat")
+            .await
+            .unwrap(),
+        binding
+    );
+
+    diesel::sql_query("UPDATE messages SET payload = $1::jsonb WHERE workspace_id = $2 AND session_id = 'chat' AND pid = 'chat' AND seq = 0")
+        .bind::<Text, _>(original).bind::<Text, _>(&h.workspace.id)
+        .execute(&mut conn).await.unwrap();
+    drop(conn);
+    let rejected = h
+        .request("set_model", json!({"provider_id": "p:text"}))
+        .await;
+    assert_eq!(rejected["error"]["code"], rpc::INVALID_MODEL_SELECTION);
+    assert!(rejected["error"]["data"].to_string().contains("image"));
+    let recovered = h
+        .request("set_model", json!({"provider_id": "vision:vision"}))
+        .await;
+    assert_eq!(
+        recovered["result"]["access"]["type"], "read_write",
+        "{recovered}"
+    );
+    assert_eq!(recovered["result"]["provider_id"], "vision:vision");
+    assert_eq!(
+        recovered["result"]["pending_approvals"],
+        opened["result"]["pending_approvals"]
+    );
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_cold_scope_cleanup_keeps_the_committed_model_and_can_retry() {
     let mut h = Harness::with_providers(vec![provider("p", "released", Some("f"), false)]).await;
     h.workspace

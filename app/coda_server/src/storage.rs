@@ -442,26 +442,41 @@ impl WorkspaceStorage {
             .await
     }
 
-    /// Persisted histories for input-compatibility checks across inherited processes.
+    /// Histories keyed by process ID, excluding agents with their own model.
+    /// Empty processes are omitted; messages retain their per-process order.
     pub async fn model_histories(
         &self,
         session_id: &str,
-    ) -> Result<Vec<(String, Vec<HistoryEntry>)>, String> {
+        excluded_agents: &[&str],
+    ) -> Result<HashMap<String, Vec<HistoryEntry>>, String> {
         let mut conn = self.conn().await?;
-        let processes = process_checkpoints::table
-            .filter(process_checkpoints::workspace_id.eq(&self.workspace_id))
-            .filter(process_checkpoints::session_id.eq(session_id))
-            .select((process_checkpoints::pid, process_checkpoints::agent_name))
-            .load::<(String, String)>(&mut conn)
+        let rows = messages::table
+            .inner_join(
+                process_checkpoints::table.on(process_checkpoints::workspace_id
+                    .eq(messages::workspace_id)
+                    .and(process_checkpoints::session_id.eq(messages::session_id))
+                    .and(process_checkpoints::pid.eq(messages::pid))),
+            )
+            .filter(messages::workspace_id.eq(&self.workspace_id))
+            .filter(messages::session_id.eq(session_id))
+            .filter(process_checkpoints::agent_name.ne_all(excluded_agents))
+            .order((messages::pid, messages::seq))
+            .select((
+                messages::pid,
+                messages::turn_id,
+                messages::payload,
+                messages::state,
+            ))
+            .load::<(String, uuid::Uuid, Json<Message>, Json<ThreadStateMap>)>(&mut conn)
             .await
             .map_err(|error| error.to_string())?;
-        drop(conn);
-        let storage = self.session(session_id);
-        let mut histories = Vec::new();
-        for (pid, name) in processes {
-            if let Some(checkpoint) = storage.read_checkpoint(&pid).await? {
-                histories.push((name, checkpoint.messages));
-            }
+        let mut histories: HashMap<String, Vec<HistoryEntry>> = HashMap::new();
+        for (pid, turn_id, payload, state) in rows {
+            histories.entry(pid).or_default().push(HistoryEntry {
+                turn_id: TurnId::from(MessageId::from(turn_id)),
+                message: payload.into_inner(),
+                state: state.into_inner(),
+            });
         }
         Ok(histories)
     }
