@@ -173,10 +173,24 @@ impl IntoOpenAIType<ChatCompletionTools> for ToolDefinition {
 /// Streaming response superset accepted from supported OpenAI-compatible APIs.
 #[derive(Debug, serde::Deserialize)]
 struct CompatibleStreamResponse {
+    #[serde(default, deserialize_with = "deserialize_reported_model")]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<CompatibleStreamChoice>,
     usage: Option<ProviderCompletionUsage>,
     error: Option<CompatibleProviderError>,
+}
+
+fn deserialize_reported_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Optional metadata must not prevent an otherwise valid chunk from decoding.
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(model) if !model.trim().is_empty() => Some(model),
+        _ => None,
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -531,11 +545,18 @@ impl ProviderKind {
                 error.into_provider_error(provider_id),
             ));
         }
+        let mut events = Vec::new();
+        if let Some(model) = response.model
+            && completion.reported_model_id.as_ref() != Some(&model)
+        {
+            completion.reported_model_id = Some(model.clone());
+            events.push(LLMStreamEvent::ModelReported(model));
+        }
         if let Some(usage) = response.usage {
             completion.usage = Some(usage.into_completion_usage(self));
         }
         let Some(choice) = response.choices.into_iter().next() else {
-            return Ok(Vec::new());
+            return Ok(events);
         };
         let delta = choice.delta;
         let details = delta.reasoning_details.unwrap_or_default();
@@ -555,7 +576,6 @@ impl ProviderKind {
                 .or_else(|| visible_reasoning_from_details(&details)),
             Self::Generic | Self::Deepseek => delta.reasoning_content,
         };
-        let mut events = Vec::new();
         if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
             completion.reduce_reasoning(&reasoning);
             events.push(LLMStreamEvent::ReasoningChunk(reasoning));
@@ -674,6 +694,7 @@ impl OpenAICompatible {
 
 #[derive(Debug)]
 struct CompletionAccumulator {
+    reported_model_id: Option<String>,
     content: String,
     reasoning_content: String,
     reasoning_details: Vec<serde_json::Value>,
@@ -688,6 +709,7 @@ struct CompletionAccumulator {
 impl CompletionAccumulator {
     fn new() -> Self {
         CompletionAccumulator {
+            reported_model_id: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_details: Vec::new(),
@@ -794,5 +816,5 @@ impl TryFrom<CompletionAccumulator> for AssistantMessage {
 }
 
 #[cfg(test)]
-#[path = "openai_tests.rs"]
+#[path = "openai_tests/mod.rs"]
 mod tests;

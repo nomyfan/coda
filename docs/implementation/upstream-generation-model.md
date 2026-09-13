@@ -46,7 +46,7 @@ pub struct GenerationMetadata {
     pub model_id: String,
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reported_model_id: Option<String>,
+    pub reported_model_id: Option<Box<str>>,
 }
 ```
 
@@ -184,24 +184,43 @@ Web 的 `GenerationMetadata` 类型增加 `reported_model_id?: string | null`。
 
 ## Implementation Roadmap
 
-- [ ] **[核心接口与适配器] 增加可选持久化字段、模型事件和响应字段解析。**
+- [x] **[核心接口与适配器] 增加可选持久化字段、模型事件和响应字段解析。**
    目的：先验证最容易遗漏的实际流路径；在同一步更新所有穷尽 match，使工作区可编译。
    验证：本地 SSE stub 通过真实 `OpenAICompatible::stream` 发送“请求 A、首帧 B、正文、空 choices 尾帧 C、DONE”，确认 B/C 模型事件按序送达且消息内容正常。另测字段类型异常不会丢弃同帧正文。
 
-- [ ] **[运行时] 生成循环消费新事件，完成与用户中断共用 generation。**
+- [x] **[运行时] 生成循环消费新事件，完成与用户中断共用 generation。**
    目的：把报告绑定到产生消息的具体进程和具体生成。
    验证：正常结束、无 usage、仅工具调用、正文/仅 reasoning 后取消、收到 metadata 前取消，以及相邻生成报告隔离；root、继承和显式覆盖模型的子代理，并覆盖并行进程。
 
-- [ ] **[消息存储与传输] 验证新增字段贯穿 checkpoint、历史和结束事件。**
+- [x] **[消息存储与传输] 验证新增字段贯穿 checkpoint、历史和结束事件。**
    目的：历史显示有稳定的数据来源。
    验证：序列化往返、已有三字段 generation 和无 generation；PostgreSQL 保存/冷打开/fork/rewind；`llm_end` 与持久化消息一致。扩展既有 provider 消息编码回归，确认三种 kind 均不把任何 generation 字段送回上游。
 
-- [ ] **[Web] 更新协议类型及现有模型标签。**
+- [x] **[Web] 更新协议类型及现有模型标签。**
    目的：用户可辨认上游报告和请求来源。
    验证：响应 B 优先于请求 A；同名、未知、无 generation 的显示；历史重建与 live `llm_end` 一致；切换当前模型不改写旧标签。组件断言应检查实际文本和详情，不能只测试字段复制。
 
-- [ ] **[说明与最终检查] 更新 `GenerationMetadata` 注释和项目 AGENTS.md 中 generation 的说明。**
+- [x] **[说明与最终检查] 更新 `GenerationMetadata` 注释和项目 AGENTS.md 中 generation 的说明。**
    目的：明确请求字段、报告字段和未知值语义；本次信息不进入模型上下文，也不影响 agent 决策，默认 system prompt 与 templates 无需改动。
    验证：运行 `cargo clippy`、`cargo test`、`cargo check -p coda_server --features pg-tests --all-targets`、`pnpm --filter coda-web lint`、`pnpm --filter coda-web test`；存储集成验证使用项目指定的一次性测试库运行 `pg-tests`，不能以仅编译通过替代数据库行为验证。
 
 适配器补充用例需覆盖：三种 kind；字段只出现于首帧/尾帧/空 choices 帧；重复报告去重；不同值取最后；缺失、null、空白和非字符串不清除已有报告；有模型但没有正文/reasoning/工具结果仍按现有规则判为空响应。测试按项目规则组织，已有大型 `openai_tests.rs` 如需扩展应拆到测试目录，而不是继续堆入同一文件。
+
+## Deviations from Design
+
+- 持久化字段使用 `Option<Box<str>>` 代替原定的 `Option<String>`，减少每条消息内字符串容量字段的开销，避免 `Message` / `RequestMessage` 触发 Clippy 的枚举体积检查；JSON 仍是可选字符串，流事件仍使用 `String`，字段语义和所有权不变。
+
+## Validation Results
+
+2026-09-13 完成实现并验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo clippy -- -D warnings` | 通过 |
+| `cargo test --quiet` | 全工作区通过；包含真实 SDK 对本地 SSE 的测试，现有付费 OpenRouter smoke test 保持 ignored |
+| `cargo check -p coda_server --features pg-tests --all-targets` | 通过 |
+| PostgreSQL `storage_pg::model_family` 中的 generation 保存、冷打开、fork、rewind 用例 | 使用 `localhost:35432/coda_test` 执行通过 |
+| `pnpm --filter coda-web lint` / `test` / `typecheck` | 通过；21 个测试文件、174 个测试 |
+| `cargo fmt --all --check` / 修改过的 Web 文件 `oxfmt --check` | 通过 |
+
+新增覆盖包括：三个 provider kind 的模型字段解析；首帧/尾帧/空 choices；异常 metadata 不损坏正文；重复报告和最后有效值；请求信息与报告值的序列化及上游请求隔离；正常生成、相邻请求隔离、正文或仅 reasoning 后取消、仅 metadata 后取消；root/子代理 profile 和并行报告隔离；历史及 live 消息的实际标签和详情。

@@ -362,7 +362,9 @@ impl AppOpener {
             while let Some(event) = stream.next().await {
                 match event.map_err(|err| err.to_string())? {
                     LLMStreamEvent::Completed(message) => return Ok(message.content.clone()),
-                    LLMStreamEvent::ContentChunk(_) | LLMStreamEvent::ReasoningChunk(_) => {}
+                    LLMStreamEvent::ModelReported(_)
+                    | LLMStreamEvent::ContentChunk(_)
+                    | LLMStreamEvent::ReasoningChunk(_) => {}
                 }
             }
             Err("the provider closed the stream without a summary".to_string())

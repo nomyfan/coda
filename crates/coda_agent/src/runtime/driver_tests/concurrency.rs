@@ -2,6 +2,7 @@ use super::super::*;
 use super::fixtures::{assistant, user_task};
 use crate::{AgentSpec, AgentTeam, ModelProfile, RunConfig, runtime::MemoryStorage};
 use coda_core::llm::RequestMessage;
+use futures::StreamExt;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, timeout};
 
@@ -13,55 +14,65 @@ impl LLMProvider for ParallelProvider {
         &self,
         request: ChatCompletionRequest,
     ) -> impl futures::Stream<Item = Result<LLMStreamEvent, StreamError>> + Send + '_ {
-        futures::stream::once(async move {
-            let worker = matches!(&request.messages[0], RequestMessage::System(prompt) if prompt.0 == "worker");
-            let reply = if worker {
-                // Neither invocation can finish before the other has started.
-                self.0.wait().await;
-                let task = request
-                    .messages
-                    .iter()
-                    .find_map(|message| match message {
-                        RequestMessage::User(user) => Some(user.parts.clone()),
-                        _ => None,
-                    })
-                    .unwrap();
-                AssistantMessage {
-                    content: format!("finished {task:?}"),
-                    ..assistant()
-                }
-            } else if matches!(request.messages.last(), Some(RequestMessage::User(_))) {
-                AssistantMessage {
-                    tool_calls: ["first", "second"]
-                        .into_iter()
-                        .map(|task| ToolCall {
-                            id: task.into(),
-                            name: "agent__worker".into(),
-                            arguments: Some(
-                                serde_json::json!({"task":task, "run_in_background":self.1})
-                                    .to_string(),
-                            ),
-                        })
-                        .collect(),
-                    ..assistant()
-                }
-            } else {
-                assert_eq!(
-                    request
-                        .messages
-                        .iter()
-                        .filter(|m| matches!(m, RequestMessage::Tool(_)))
-                        .count()
-                        % 2,
-                    0
-                );
-                AssistantMessage {
-                    content: "both finished".into(),
-                    ..assistant()
-                }
-            };
-            Ok(LLMStreamEvent::Completed(Box::new(reply)))
-        })
+        let worker =
+            matches!(&request.messages[0], RequestMessage::System(prompt) if prompt.0 == "worker");
+        let task = worker.then(|| {
+            request
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    RequestMessage::User(user) => Some(user.parts.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        let reported_model = task
+            .as_ref()
+            .map(|task| format!("reported: {task:?}"))
+            .unwrap_or_else(|| "root-reported".into());
+        futures::stream::iter([Ok(LLMStreamEvent::ModelReported(reported_model))]).chain(
+            futures::stream::once(async move {
+                let reply = if worker {
+                    // Both reports reach their drivers before either invocation finishes.
+                    self.0.wait().await;
+                    let task = task.unwrap();
+                    AssistantMessage {
+                        content: format!("finished {task:?}"),
+                        ..assistant()
+                    }
+                } else if matches!(request.messages.last(), Some(RequestMessage::User(_))) {
+                    AssistantMessage {
+                        tool_calls: ["first", "second"]
+                            .into_iter()
+                            .map(|task| ToolCall {
+                                id: task.into(),
+                                name: "agent__worker".into(),
+                                arguments: Some(
+                                    serde_json::json!({"task":task, "run_in_background":self.1})
+                                        .to_string(),
+                                ),
+                            })
+                            .collect(),
+                        ..assistant()
+                    }
+                } else {
+                    assert_eq!(
+                        request
+                            .messages
+                            .iter()
+                            .filter(|m| matches!(m, RequestMessage::Tool(_)))
+                            .count()
+                            % 2,
+                        0
+                    );
+                    AssistantMessage {
+                        content: "both finished".into(),
+                        ..assistant()
+                    }
+                };
+                Ok(LLMStreamEvent::Completed(Box::new(reply)))
+            }),
+        )
     }
 }
 
@@ -125,13 +136,31 @@ async fn parallel_invocations(background_enabled: bool) {
             .await
             .unwrap();
         timeout(Duration::from_secs(2), async {
-        loop {
-            let (_, thread, _, event) = events.recv().await.unwrap();
-            if thread == root && matches!(event, AgentEvent::LLMEnd(ref answer) if answer.content == "both finished") {
-                break;
+            loop {
+                let (_, thread, _, event) = events.recv().await.unwrap();
+                if let AgentEvent::LLMEnd(answer) = event {
+                    let expected = if thread == root {
+                        "root-reported".to_string()
+                    } else {
+                        format!(
+                            "reported: {}",
+                            answer.content.strip_prefix("finished ").unwrap()
+                        )
+                    };
+                    let metadata = answer.generation.as_ref().unwrap();
+                    assert_eq!(metadata.model_id, "fake");
+                    assert_eq!(
+                        metadata.reported_model_id.as_deref(),
+                        Some(expected.as_str())
+                    );
+                    if thread == root && answer.content == "both finished" {
+                        break;
+                    }
+                }
             }
-        }
-    }).await.expect("both calls must run before either answers");
+        })
+        .await
+        .expect("both calls must run before either answers");
     }
     if let Some(background) = &background {
         let ids: Vec<coda_core::task::TaskId> = background

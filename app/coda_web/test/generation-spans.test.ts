@@ -185,6 +185,7 @@ test("historical and live assistant entries keep their recorded model independen
     provider_id: "removed-provider",
     model_id: "removed-preview",
     reasoning_effort: "high",
+    reported_model_id: "upstream-version",
   };
   const oldReply = { ...toolCallOnly("old", "unused", 0, 1), content: "old reply", tool_calls: [] };
   const reply = {

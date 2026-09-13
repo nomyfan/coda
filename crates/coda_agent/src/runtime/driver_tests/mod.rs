@@ -7,6 +7,7 @@ mod capabilities;
 mod checkpoint;
 mod concurrency;
 mod contracts;
+mod generation;
 mod orphaned_reply;
 mod ptc;
 mod stale_replay;
