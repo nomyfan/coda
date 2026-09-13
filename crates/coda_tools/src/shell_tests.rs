@@ -61,7 +61,29 @@ async fn completes_normally() {
         .execute(params("echo hello"), ToolCallContext::default())
         .await
         .unwrap();
+    let OutputData::Inline(out) = out else {
+        panic!("expected inline output")
+    };
     assert_eq!(out, "hello\n");
+}
+
+#[tokio::test]
+async fn normal_leader_exit_keeps_draining_its_child_output() {
+    let output = tool()
+        .execute(
+            params("(sleep 0.7; printf child-output) & exit 0"),
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+    let output = output
+        .materialize(
+            &coda_core::output::BufferBudget::new(1024 * 1024),
+            &coda_core::tool::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.text, "child-output");
 }
 
 #[tokio::test]
@@ -70,6 +92,9 @@ async fn reports_nonzero_exit() {
         .execute(params("echo oops >&2; exit 3"), ToolCallContext::default())
         .await
         .unwrap();
+    let OutputData::Inline(out) = out else {
+        panic!("expected inline output")
+    };
     assert!(out.starts_with("exit code: 3"), "unexpected output: {out}");
     assert!(out.contains("oops"), "unexpected output: {out}");
 }
@@ -414,6 +439,9 @@ async fn a_background_task_settles_at_once_and_outlives_the_timeout() {
     .expect("background call did not settle promptly")
     .expect("background call failed");
 
+    let OutputData::Inline(out) = out else {
+        panic!("expected inline output")
+    };
     let id = out
         .split_whitespace()
         .find(|word| word.starts_with("bg_"))
@@ -423,15 +451,109 @@ async fn a_background_task_settles_at_once_and_outlives_the_timeout() {
 
     tokio::time::sleep(Duration::from_millis(600)).await;
     let read = background
-        .read(&id)
+        .read_result(&id)
         .await
         .expect("registry readable")
         .expect("task still known");
-    assert_eq!(
-        read.status.describe(),
-        "running",
+    assert!(
+        matches!(read, coda_execution::TaskResult::Pending { .. }),
         "the foreground timeout reached a background task"
     );
 
     background.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_large_command_keeps_its_middle_log_readable() {
+    use coda_core::output::{Channel, OutputData, OutputLimits, OutputStore};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        coda_output::Store::open(OutputLimits {
+            root: root.path().join("output"),
+            capture_memory_bytes: 65536,
+            ..OutputLimits::default()
+        })
+        .unwrap(),
+    );
+    let ready = root.path().join("ready");
+    let script = format!(
+        "head -c 131072 /dev/zero | tr '\\0' A; printf 'MIDDLE-BEFORE-CANCEL'; head -c 131072 /dev/zero | tr '\\0' Z; touch '{}'; sleep 30",
+        ready.display()
+    );
+    let mut context = ToolCallContext::default();
+    context.output_store = Some(store.clone());
+    let saved = context.clone();
+    let task = tokio::spawn(tool().execute(params(&script), context));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let start = tokio::time::Instant::now();
+    saved.cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Aborted(_)));
+    assert!(start.elapsed() < Duration::from_secs(3));
+    let OutputData::Captured(output) = saved.take_failure_output().unwrap() else {
+        panic!("lost captured output")
+    };
+    let reference = output.reference.unwrap();
+    let file = reference
+        .channels
+        .iter()
+        .find(|c| c.channel == Channel::Stdout)
+        .unwrap();
+    assert!(
+        std::fs::read_to_string(&file.path)
+            .unwrap()
+            .contains("MIDDLE-BEFORE-CANCEL")
+    );
+    assert!(!output.preview.contains("MIDDLE-BEFORE-CANCEL"));
+    assert!(store.charged_bytes() <= store.limits().total_disk_bytes);
+}
+
+#[tokio::test]
+async fn exceeding_disk_quota_does_not_stop_the_command_or_lose_its_exit_status() {
+    use coda_core::output::{OutputData, OutputLimits, StorageFailure};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        coda_output::Store::open(OutputLimits {
+            root: root.path().join("output"),
+            capture_memory_bytes: 65536,
+            result_max_bytes: 1024 * 1024,
+            ..OutputLimits::default()
+        })
+        .unwrap(),
+    );
+    let mut context = ToolCallContext::default();
+    context.output_store = Some(store.clone());
+    let output = tool()
+        .execute(
+            params("head -c 33554432 /dev/zero; printf 'EXIT-MARKER'"),
+            context,
+        )
+        .await
+        .unwrap();
+    let OutputData::Captured(output) = output else {
+        panic!()
+    };
+    assert_eq!(output.failure, Some(StorageFailure::ResultLimit));
+    assert!(output.preview.contains("EXIT-MARKER"));
+    let reference = output.reference.unwrap();
+    assert!(!reference.complete);
+    assert_eq!(
+        reference
+            .channels
+            .iter()
+            .map(|c| c.saved_bytes)
+            .sum::<u64>(),
+        1024 * 1024
+    );
+    assert!(store.charged_bytes() < 2 * 1024 * 1024);
 }

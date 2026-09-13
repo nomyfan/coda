@@ -331,6 +331,7 @@ async fn a_saved_thread_comes_back_whole() {
             parent_message_id: MessageId::new(),
             pending_approval_calls: vec![StoredPreparedToolCall {
                 tool_call: ToolCall {
+                    output_bytes: None,
                     id: "call_shell".to_string(),
                     name: "shell".to_string(),
                     arguments: Some(r#"{"command":"ls"}"#.to_string()),
@@ -565,6 +566,7 @@ async fn an_assistant_message_keeps_its_reasoning_continuation() {
                         message_id: MessageId::new(),
                         content: String::new(),
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_weather".to_string(),
                             name: "lookup_weather".to_string(),
                             arguments: Some(r#"{"city":"Singapore"}"#.to_string()),
@@ -1167,6 +1169,7 @@ async fn the_session_list_flags_a_session_waiting_on_a_human() {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![StoredPreparedToolCall {
                         tool_call: ToolCall {
+                            output_bytes: None,
                             id: "call_shell".to_string(),
                             name: "shell".to_string(),
                             arguments: Some(r#"{"command":"cargo test"}"#.to_string()),
@@ -1774,6 +1777,7 @@ async fn a_rewind_is_refused_while_any_thread_is_mid_turn() {
                 parent_message_id: MessageId::new(),
                 pending_approval_calls: vec![StoredPreparedToolCall {
                     tool_call: ToolCall {
+                        output_bytes: None,
                         id: "call_shell".to_string(),
                         name: "shell".to_string(),
                         arguments: None,
@@ -2241,6 +2245,7 @@ async fn forking_a_session_with_work_in_flight_changes_nothing() {
                     parent_message_id: MessageId::new(),
                     pending_approval_calls: vec![StoredPreparedToolCall {
                         tool_call: ToolCall {
+                            output_bytes: None,
                             id: "call_shell".to_string(),
                             name: "shell".to_string(),
                             arguments: Some(r#"{"command":"rm -rf /"}"#.to_string()),
@@ -2500,6 +2505,7 @@ fn recorded(
         message_id: MessageId::new(),
         content: String::new(),
         tool_calls: vec![ToolCall {
+            output_bytes: None,
             id: call_id.to_string(),
             name: "a_tool".to_string(),
             arguments: None,

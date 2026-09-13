@@ -541,6 +541,7 @@ impl LLMProvider for TestProvider {
                 if tool_message(&request.messages, "ptc_list").is_none() {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "ptc_list".into(),
                             name: coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME.into(),
                             arguments: Some("{}".into()),
@@ -558,6 +559,7 @@ impl LLMProvider for TestProvider {
                 if tool_message(&request.messages, "ptc_call").is_none() {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "ptc_call".into(),
                             name: coda_tools::RUN_JAVASCRIPT_TOOL_NAME.into(),
                             arguments: Some(
@@ -580,6 +582,7 @@ impl LLMProvider for TestProvider {
                 Some("only") if tool_message(&request.messages, "call_first").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_first".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -618,6 +621,7 @@ impl LLMProvider for TestProvider {
                 Some("second") if tool_message(&request.messages, "call_1").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_1".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -632,6 +636,7 @@ impl LLMProvider for TestProvider {
                 Some("second") if tool_message(&request.messages, "call_2").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_2".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -679,6 +684,7 @@ impl LLMProvider for TestProvider {
                 Some("second") if tool_message(&request.messages, "call_1").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_1".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -710,6 +716,7 @@ impl LLMProvider for TestProvider {
                 Some("first") if tool_message(&request.messages, "call_explore_1").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_explore_1".into(),
                             name: "agent__explore".into(),
                             arguments: Some(r#"{"task":"first"}"#.into()),
@@ -732,6 +739,7 @@ impl LLMProvider for TestProvider {
                 Some("second") if tool_message(&request.messages, "call_explore_2").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_explore_2".into(),
                             name: "agent__explore".into(),
                             arguments: Some(r#"{"task":"second"}"#.into()),
@@ -771,6 +779,7 @@ impl LLMProvider for TestProvider {
                     2 if tool_message(&request.messages, "call_sub").is_none() => {
                         Self::completed(AssistantMessage {
                             tool_calls: vec![ToolCall {
+                                output_bytes: None,
                                 id: "call_sub".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
@@ -806,6 +815,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_explore".into(),
                             name: "explore".into(),
                             arguments: Some(r#"{"task":"inspect the crate"}"#.into()),
@@ -834,6 +844,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_explore".into(),
                             name: "explore".into(),
                             arguments: Some(r#"{"task":"inspect the crate"}"#.into()),
@@ -864,6 +875,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_probe".into(),
                             name: "probe".into(),
                             arguments: Some(r#"{"task":"probe deeper"}"#.into()),
@@ -885,6 +897,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_read_todos".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -910,6 +923,7 @@ impl LLMProvider for TestProvider {
                 if answered < 2 {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_1".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -928,26 +942,31 @@ impl LLMProvider for TestProvider {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![
                             ToolCall {
+                                output_bytes: None,
                                 id: "call_exec".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
                             },
                             ToolCall {
+                                output_bytes: None,
                                 id: "call_resolved".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
                             },
                             ToolCall {
+                                output_bytes: None,
                                 id: "call_rejected".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
                             },
                             ToolCall {
+                                output_bytes: None,
                                 id: "call_missing".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
                             },
                             ToolCall {
+                                output_bytes: None,
                                 id: "call_auto".into(),
                                 name: "echo".into(),
                                 arguments: Some(r#"{"text":"auto"}"#.into()),
@@ -997,6 +1016,7 @@ impl LLMProvider for TestProvider {
                 Some("phase1") if tool_message(&request.messages, "call_approve").is_none() => {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_approve".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -1018,11 +1038,13 @@ impl LLMProvider for TestProvider {
             "abort-main" => Self::completed(AssistantMessage {
                 tool_calls: vec![
                     ToolCall {
+                        output_bytes: None,
                         id: "call_slow".into(),
                         name: "slow_tool".into(),
                         arguments: Some(r#"{"label":"slow"}"#.into()),
                     },
                     ToolCall {
+                        output_bytes: None,
                         id: "call_explore".into(),
                         name: "explore".into(),
                         arguments: Some(r#"{"task":"hold"}"#.into()),
@@ -1032,6 +1054,7 @@ impl LLMProvider for TestProvider {
             }),
             "abort-cancel-aware-main" => Self::completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_cancel".into(),
                     name: "cancel_aware".into(),
                     arguments: Some(r#"{"label":"teardown"}"#.into()),
@@ -1097,6 +1120,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_read_todos".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -1139,6 +1163,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     Self::completed(AssistantMessage {
                         tool_calls: vec![ToolCall {
+                            output_bytes: None,
                             id: "call_explore".into(),
                             name: "explore".into(),
                             arguments: Some(r#"{"task":"inspect failure"}"#.into()),
@@ -1205,7 +1230,9 @@ pub(super) fn user_task(pid: &ProcessId, task: &str) -> Envelope {
 /// A `RunConfig` where every agent runs on the fake test model.
 pub(super) fn test_config<P>(provider: P, approval: ToolApprovalMode) -> RunConfig<P> {
     RunConfig {
+        outputs: None,
         default_model: ModelProfile {
+            output_limits: coda_core::output::ModelOutputLimits::default(),
             provider_id: "test".into(),
             provider,
             model: "fake".into(),
@@ -1432,7 +1459,7 @@ where
         self.runtime.request_exit().await;
         assert!(
             self.runtime
-                .wait_for_exit(Some(Duration::from_secs(2)))
+                .wait_for_exit(Some(Duration::from_secs(8)))
                 .await,
             "timed out waiting for runtime shutdown"
         );

@@ -45,6 +45,7 @@ impl LLMProvider for ParallelProvider {
                         tool_calls: ["first", "second"]
                             .into_iter()
                             .map(|task| ToolCall {
+                                output_bytes: None,
                                 id: task.into(),
                                 name: "agent__worker".into(),
                                 arguments: Some(
@@ -112,7 +113,9 @@ async fn parallel_invocations(background_enabled: bool) {
             None,
             HashMap::new(),
             RunConfig {
+                outputs: None,
                 default_model: ModelProfile {
+                    output_limits: coda_core::output::ModelOutputLimits::default(),
                     provider_id: "test".into(),
                     provider: ParallelProvider(Arc::new(Barrier::new(2)), background_enabled),
                     model: "fake".into(),

@@ -710,6 +710,7 @@ pub enum TaskResultWire {
     Available {
         status: coda_execution::TaskStatus,
         output: coda_execution::TaskResultOutput,
+        page: coda_execution::TaskResultPage,
     },
     Expired {
         status: coda_execution::TaskStatus,

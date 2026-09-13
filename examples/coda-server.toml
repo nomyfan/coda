@@ -79,3 +79,32 @@ path = "workspace"
 
 # [keepalive]
 # interval_secs = 30
+
+
+# --- Output and programmatic execution limits ---------------------------------
+# Optional; values below show the defaults except for the deployment root.
+# Sizes are UTF-8 bytes, not model tokens. Restart after changing these settings.
+# Keep a stable absolute root on persistent local storage. Its lock permits one
+# service process. Quotas cover all workspaces, including detached/deleted sessions.
+# See docs/tool-output-storage.md for retention, recovery and upgrade behavior.
+# [resources.output]
+# root = "/var/lib/coda/output" # Default: OS temporary directory / coda-output
+# capture_memory_bytes = 262144
+# result_max_bytes = 67108864
+# session_disk_bytes = 536870912
+# total_disk_bytes = 4294967296
+# retention_secs = 86400
+#
+# [resources.output.model]
+# single_bytes = 16384
+# batch_bytes = 65536
+# Model-specific overrides are independent; put them inside the model entry:
+# { id = "example", context_window = 128000, output_limits = { single_bytes = 8192 } }
+#
+# [resources.ptc]
+# timeout_secs = 120
+# heap_bytes = 67108864
+# host_buffer_bytes = 67108864
+# max_calls = 128
+# max_concurrent_calls = 16
+# final_bytes = 1048576

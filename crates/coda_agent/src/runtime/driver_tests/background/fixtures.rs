@@ -30,6 +30,7 @@ impl LLMProvider for BackgroundProvider {
             let mut answer = assistant();
             match (name, answered) {
                 ("root", false) => answer.tool_calls.push(ToolCall {
+                    output_bytes: None,
                     id: "background".into(),
                     name: "agent__worker".into(),
                     arguments: Some(
@@ -38,6 +39,7 @@ impl LLMProvider for BackgroundProvider {
                 }),
                 ("root", true) => answer.content = "root is free".into(),
                 ("worker", false) => answer.tool_calls.push(ToolCall {
+                    output_bytes: None,
                     id: "child".into(),
                     name: "agent__child".into(),
                     arguments: Some(serde_json::json!({"task":"child work", "run_in_background":self.nested_background}).to_string()),
@@ -48,6 +50,7 @@ impl LLMProvider for BackgroundProvider {
                     self.child_release.notified().await;
                     if self.approval && !answered {
                         answer.tool_calls.push(ToolCall {
+                            output_bytes: None,
                             id: "approval".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -129,7 +132,9 @@ pub(super) async fn start_storage<
             None,
             HashMap::new(),
             RunConfig {
+                outputs: None,
                 default_model: ModelProfile {
+                    output_limits: coda_core::output::ModelOutputLimits::default(),
                     provider_id: "test".into(),
                     provider,
                     model: "fake".into(),
@@ -273,5 +278,49 @@ impl SessionStorage for FaultStorage {
         Box<dyn Future<Output = Result<Option<crate::StoredRuntimeSnapshot>, String>> + Send + '_>,
     > {
         self.inner.load_session_snapshot(session)
+    }
+}
+
+pub(super) struct BackgroundRead {
+    pub status: coda_execution::TaskStatus,
+    pub stdout: String,
+}
+pub(super) async fn read_background(
+    background: &coda_execution::BackgroundTasks,
+    id: &coda_execution::TaskId,
+) -> BackgroundRead {
+    let mut cursor = coda_execution::TaskResultCursor::default();
+    let mut stdout = String::new();
+    loop {
+        match background
+            .read_result_page(id, cursor)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            coda_execution::TaskResult::Pending { status }
+            | coda_execution::TaskResult::Expired { status } => {
+                return BackgroundRead { status, stdout };
+            }
+            coda_execution::TaskResult::Available {
+                status,
+                output,
+                page,
+            } => {
+                match output {
+                    coda_execution::TaskResultOutput::Subagent { answer } => {
+                        stdout.push_str(&answer)
+                    }
+                    coda_execution::TaskResultOutput::Shell { stdout: chunk, .. } => {
+                        stdout.push_str(&chunk)
+                    }
+                }
+                if let Some(next) = page.next {
+                    cursor = next;
+                } else {
+                    return BackgroundRead { status, stdout };
+                }
+            }
+        }
     }
 }

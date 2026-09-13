@@ -9,6 +9,7 @@ mod concurrency;
 mod contracts;
 mod generation;
 mod orphaned_reply;
+mod output_limits;
 mod ptc;
 mod stale_replay;
 mod subagent_origin;

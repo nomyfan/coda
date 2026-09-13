@@ -25,7 +25,12 @@ impl ToolObject for CountedTodos {
         self: Arc<Self>,
         _: String,
         _: ToolCallContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<coda_core::output::OutputData, coda_core::tool::ToolFailure>>
+                + Send,
+        >,
+    > {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok("No todos.".into()) })
     }
@@ -104,7 +109,7 @@ async fn restoring_an_approved_ptc_snapshot_cannot_reenable_a_disabled_capabilit
             panic!("expected an approval checkpoint");
         };
         assert!(matches!(&pending_approval_calls[0].metadata,
-            Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools }) if exposed_tools == &["read_todos"]));
+            Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools }) if exposed_tools == &["read_todos", "task_output"]));
         harness.shutdown().await;
 
         let programs = AgentTeam::new(spec(prompt, Capabilities::none(), calls.clone()), vec![])

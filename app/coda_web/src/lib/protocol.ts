@@ -63,6 +63,27 @@ export type ToolCallOutcome =
   | "Aborted"
   | { Rejected: { reason?: string | null } };
 
+export type OutputRef = {
+  id: string;
+  channels: {
+    channel: "stdout" | "stderr" | "result" | "log";
+    path: string;
+    captured_bytes: number;
+    saved_bytes: number;
+  }[];
+  complete: boolean;
+  failure: string | null;
+  sealed_at: string;
+  expires_at: string;
+};
+export type TaskResultCursor = { stdout: number; stderr: number; result: number };
+export type TaskResultPage = {
+  next: TaskResultCursor | null;
+  output_refs: OutputRef[];
+  complete: boolean;
+  storage_failure: string | null;
+};
+
 export type ToolMessage = {
   /** Server-minted identity of this message. Distinct from `id`, which is the
    * id of the tool call it answers. */
@@ -72,6 +93,7 @@ export type ToolMessage = {
   output: ToolOutput;
   outcome: ToolCallOutcome;
   artifacts?: ToolArtifact[];
+  output_refs?: OutputRef[];
   /** RFC 3339 timestamps; the gap between them is the execution duration.
    * `started_at` is absent for instantly-resolved calls (rejections, dispatch errors). */
   started_at?: string | null;
@@ -331,6 +353,7 @@ export type TaskResult =
   | {
       state: "available";
       status: TaskStatus;
+      page?: TaskResultPage;
       output:
         | { kind: "subagent"; answer: string }
         | {
@@ -484,7 +507,10 @@ export type RpcRequests = {
     },
     { accepted: boolean }
   >;
-  get_task_result: RpcRequest<SessionRef & { task_id: string }, TaskResult>;
+  get_task_result: RpcRequest<
+    SessionRef & { task_id: string; cursor?: TaskResultCursor },
+    TaskResult
+  >;
   task: RpcRequest<
     {
       workspace_id: string;

@@ -6,5 +6,5 @@ pub use tool::{
     CapabilityMessageLimitError, DISCOVERY_MESSAGE_BYTES, LIST_JAVASCRIPT_TOOLS_TOOL_NAME,
     PROGRAMMATIC_TOOL_NAMES, RUN_JAVASCRIPT_TOOL_NAME, RunJavaScriptTool,
     TOOL_UNAVAILABLE_MESSAGE_BYTES, available_tools_message, list_javascript_tools_definition,
-    run_javascript_definition, tool_unavailable_message,
+    run_javascript_definition, run_javascript_definition_with_limits, tool_unavailable_message,
 };

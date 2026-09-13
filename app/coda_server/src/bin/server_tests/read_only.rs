@@ -37,6 +37,7 @@ impl Harness {
             base_url: "http://127.0.0.1:1".into(),
             include_usage: true,
             models: vec![ModelConfig {
+                output_limits: Default::default(),
                 family: None,
                 id: "available".into(),
                 name: "Available".into(),
@@ -60,6 +61,8 @@ impl Harness {
         let shutdown = CancellationToken::new();
         let workspace = Arc::new(
             build_workspace(
+                coda_output::Store::standalone(),
+                coda_core::output::PtcResourceLimits::default(),
                 WorkspaceConfig {
                     id: format!("readonly-{}", uuid::Uuid::new_v4()),
                     path: dir.path().into(),
@@ -163,6 +166,7 @@ impl Harness {
 fn suspended(pid: &str) -> StoredCheckpoint {
     let message_id = MessageId::new();
     let call = ToolCall {
+        output_bytes: None,
         id: format!("call-{pid}"),
         name: "shell".into(),
         arguments: Some(r#"{"command":"echo saved"}"#.into()),

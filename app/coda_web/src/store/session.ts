@@ -25,6 +25,8 @@ import {
   type ToolCallResolution,
   type ToolArtifact,
   type ToolMessage,
+  type OutputRef,
+  type TaskResultCursor,
   type WireEvent,
   type WorkspaceFile,
   type WorkspaceSession,
@@ -109,6 +111,7 @@ export type TranscriptEntry = {
   generation?: GenerationSpan;
   /** Immutable presentation data persisted with a completed tool call. */
   artifacts?: ToolArtifact[];
+  outputRefs?: OutputRef[];
 };
 
 export type GenerationSpan = { startedAt: string; endedAt: string };
@@ -638,6 +641,7 @@ function toolMessageToEntry(
     endedAt: message.ended_at,
     generation,
     artifacts: message.artifacts,
+    outputRefs: message.output_refs,
   };
 }
 
@@ -3557,7 +3561,7 @@ export function abort() {
 /** Stop one of the active session's background tasks. Optimistically nothing:
  * the server pushes the updated list, and killing something that has already
  * settled is a no-op there. */
-export async function getBackgroundTaskResult(taskId: string) {
+export async function getBackgroundTaskResult(taskId: string, cursor?: TaskResultCursor) {
   const active = currentActive();
   if (!active) {
     throw new Error("No active session");
@@ -3570,6 +3574,7 @@ export async function getBackgroundTaskResult(taskId: string) {
     workspace_id: active.session.workspaceId,
     session_id: active.session.sessionId,
     task_id: taskId,
+    cursor,
   });
 }
 

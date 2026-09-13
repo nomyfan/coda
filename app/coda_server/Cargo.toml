@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 coda_core = { workspace = true }
+coda_output = { workspace = true }
 coda_mcp = { workspace = true }
 coda_openai = { workspace = true }
 coda_agent = { workspace = true }
@@ -23,7 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = "0.0.12"
 schemars = { workspace = true }
-toml_edit = "0.25"
+toml_edit = { version = "0.25", features = ["serde"] }
 axum = { version = "0.8", features = ["ws"] }
 brush-parser = "0.4.0"
 clap = { version = "4", features = ["derive", "env"] }

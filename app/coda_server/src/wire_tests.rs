@@ -205,11 +205,13 @@ fn pending_approval_wire_suggests_shell_allow_patterns() {
         parent_message_id: MessageId::new(),
         calls: vec![
             ToolCall {
+                output_bytes: None,
                 id: "call_shell".into(),
                 name: "shell".into(),
                 arguments: Some(r##"{"command":"# Run tests\ncargo test"}"##.into()),
             },
             ToolCall {
+                output_bytes: None,
                 id: "call_read".into(),
                 name: "read_file".into(),
                 arguments: Some(r#"{"path":"README.md"}"#.into()),
@@ -240,6 +242,7 @@ fn pending_approval_wire_skips_compound_shell_calls() {
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
+            output_bytes: None,
             id: "call_shell".into(),
             name: "shell".into(),
             arguments: Some(r##"{"command":"# Navigate\ncd /work/coda && cargo test"}"##.into()),
@@ -261,6 +264,7 @@ fn pending_approval_wire_skips_shell_calls_with_only_comments() {
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
+            output_bytes: None,
             id: "call_shell".into(),
             name: "shell".into(),
             arguments: Some(r##"{"command":"# just a comment"}"##.into()),
@@ -282,6 +286,7 @@ fn pending_approval_wire_skips_unresolvable_shell_calls() {
         agent_name: "coda".into(),
         parent_message_id: MessageId::new(),
         calls: vec![ToolCall {
+            output_bytes: None,
             id: "call_shell".into(),
             name: "shell".into(),
             arguments: Some(r##"{"command":"git status > /tmp/out"}"##.into()),

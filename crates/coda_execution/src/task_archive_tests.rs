@@ -1,5 +1,39 @@
 use super::*;
-use crate::quota::{QuotaError, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory};
+
+#[tokio::test]
+async fn legacy_logs_retire_after_interrupted_scope_cleanup() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let root = ArchiveDir::open_or_create_root(temp.path()).unwrap();
+    let archive = TaskArchive::new(root.clone());
+    let id = TaskId::new();
+    let mut meta = TaskMeta::shell("old".into(), "old task".into(), "root".into());
+    meta.kind = crate::TaskKind::Subagent {
+        agent_name: "worker".into(),
+    };
+    let record = archive.create_unreserved(&id, &meta).await.unwrap();
+    drop(record);
+    let (dir, mut manifest) = load_task_dir(&root, &id).unwrap().unwrap();
+    manifest.manifest_version = 3;
+    manifest.payload = None;
+    manifest.cleanup_pending = true;
+    save_manifest(&dir, &manifest).unwrap();
+    dir.create_file(ArchiveFileName::StdoutRing)
+        .unwrap()
+        .write_all(b"old log")
+        .unwrap();
+    let registry = crate::BackgroundTasks::session_backed(root).await.unwrap();
+    assert!(dir.open_file(ArchiveFileName::StdoutRing, false).is_ok());
+    assert_eq!(registry.recovered_scopes().await.len(), 1);
+    registry.record_scope(&id, vec![], false).await.unwrap();
+    registry.retire_legacy_output().await.unwrap();
+    assert!(dir.open_file(ArchiveFileName::StdoutRing, false).is_err());
+    assert!(!registry.take_notices().await.is_empty());
+    assert!(
+        matches!(registry.read_result(&id).await.unwrap(), Some(crate::TaskResult::Available { page, .. }) if !page.complete && page.output_refs.is_empty())
+    );
+    registry.shutdown().await;
+}
 
 impl TaskRecord {
     fn pause_next_commit(
@@ -35,30 +69,12 @@ impl TaskArchive {
         (entered, release)
     }
 
-    pub(crate) fn pause_after_next_create_ack(
-        &self,
-    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_hooks.acknowledged_create_pause.lock().unwrap() = Some(CreatePause {
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-        (entered, release)
-    }
-
-    pub(crate) fn fail_next_discard(&self) {
-        self.test_hooks
-            .fail_next_discard
-            .store(true, Ordering::SeqCst);
-    }
-
     pub(crate) async fn create_unreserved(
         &self,
         id: &TaskId,
         meta: &TaskMeta,
     ) -> Result<Arc<TaskRecord>, ArchiveError> {
-        self.create_transaction(id, meta, None).await
+        self.create_transaction(id, meta).await
     }
 }
 
@@ -82,8 +98,7 @@ async fn create_persists_running_manifest_and_reopens() {
     // Commit the advanced range (Running cursor update).
     {
         let mut g = record.lock_commit().await;
-        let mut cand = g.current().clone();
-        cand.stdout_cursor = 5;
+        let cand = g.current().clone();
         g.commit(cand).await.unwrap();
     }
     drop(record);
@@ -91,7 +106,6 @@ async fn create_persists_running_manifest_and_reopens() {
     // Reopen from disk: same id, Running, cursor preserved, output readable.
     let reopened = archive.open(&id).await.unwrap().expect("task present");
     let g = reopened.lock_commit().await;
-    assert_eq!(g.current().stdout_cursor, 5);
     assert!(matches!(g.current().status, TaskStatus::Running));
     let chunk = reopened.files().stdout.read_from(0, 64).await.unwrap();
     assert_eq!(chunk.bytes, b"hello");
@@ -192,95 +206,6 @@ async fn cancelled_create_transaction_cleans_delivered_record() {
 }
 
 #[tokio::test]
-async fn acknowledged_create_finishes_handoff_before_it_can_be_cancelled() {
-    let (_tmp, archive) = root();
-    let archive = Arc::new(archive);
-    let quota = SessionQuota::from_inventory(
-        &scan_inventory(archive.root()).unwrap(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
-    let reservation = quota.reserve_for_create().await.reservation.unwrap();
-    let (acknowledged, release) = archive.pause_after_next_create_ack();
-    let create_archive = archive.clone();
-    let id = TaskId::new();
-    let create_id = id.clone();
-    let create = tokio::spawn(async move {
-        create_archive
-            .create(&create_id, &meta(), reservation)
-            .await
-    });
-
-    acknowledged.notified().await;
-    create.abort();
-    let (record, reservation) = create
-        .await
-        .expect("acknowledged create still had a cancellation point")
-        .unwrap();
-    archive.discard_created(&record).await.unwrap();
-    drop(reservation);
-    assert_eq!(archive.root().entries().unwrap().count(), 0);
-    assert_eq!(quota.reserved(), 0);
-
-    release.notify_one();
-    archive.settle().await;
-}
-
-#[tokio::test]
-async fn cancelled_create_cleanup_failure_keeps_charge_and_blocks_spawns() {
-    let (_tmp, archive) = root();
-    let archive = Arc::new(archive);
-    let quota = SessionQuota::from_inventory(
-        &scan_inventory(archive.root()).unwrap(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
-    let reservation = quota.reserve_for_create().await.reservation.unwrap();
-    let (entered, release) = archive.pause_next_create();
-    archive.fail_next_discard();
-    let create_archive = archive.clone();
-    let id = TaskId::new();
-    let create_id = id.clone();
-    let create = tokio::spawn(async move {
-        create_archive
-            .create(&create_id, &meta(), reservation)
-            .await
-    });
-    entered.notified().await;
-    create.abort();
-    release.notify_one();
-    assert!(matches!(create.await, Err(error) if error.is_cancelled()));
-    archive.settle().await;
-
-    assert_eq!(quota.reserved(), 2 * DEFAULT_STREAM_CAPACITY);
-    assert!(archive.root().open_dir(&id).is_ok());
-    assert!(matches!(
-        quota.reserve_for_create().await.reservation,
-        Err(QuotaError::Blocked)
-    ));
-}
-
-#[tokio::test]
-async fn create_rejects_reservation_for_wrong_layout() {
-    let (_tmp, archive) = root();
-    let archive = Arc::new(archive);
-    let quota = SessionQuota::from_inventory(
-        &scan_inventory(archive.root()).unwrap(),
-        SESSION_QUOTA_BYTES,
-        archive.clone(),
-    );
-    let reservation = quota.reserve_for_test(1).await.reservation.unwrap();
-    let id = TaskId::new();
-    let error = match archive.create(&id, &meta(), reservation).await {
-        Ok(_) => panic!("undersized reservation unexpectedly created a task"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("requires 1048576"));
-    assert!(archive.root().open_dir(&id).is_err());
-    assert_eq!(quota.reserved(), 0);
-}
-
-#[tokio::test]
 async fn open_unknown_is_none() {
     let (_tmp, archive) = root();
     let missing = TaskId::new();
@@ -317,60 +242,4 @@ async fn terminal_status_is_immutable() {
         at: jiff::Timestamp::now(),
     };
     assert!(g.commit(cand).await.is_err());
-}
-
-#[tokio::test]
-async fn cursor_cannot_regress() {
-    let (_tmp, archive) = root();
-    let id = TaskId::new();
-    let record = archive.create_unreserved(&id, &meta()).await.unwrap();
-    record.files().stdout.append(b"0123456789").await.unwrap();
-    {
-        let mut g = record.lock_commit().await;
-        let mut cand = g.current().clone();
-        cand.stdout_cursor = 5;
-        g.commit(cand).await.unwrap();
-    }
-    let mut g = record.lock_commit().await;
-    let mut cand = g.current().clone();
-    cand.stdout_cursor = 3;
-    assert!(g.commit(cand).await.is_err());
-}
-
-#[tokio::test]
-async fn consumed_transition_deletes_rings_and_reopens_without_them() {
-    let (_tmp, archive) = root();
-    let id = TaskId::new();
-    let record = archive.create_unreserved(&id, &meta()).await.unwrap();
-    record.files().stdout.append(b"abc").await.unwrap();
-    record.files().stderr.append(b"de").await.unwrap();
-    record.files().flush().await.unwrap();
-    // Terminal, fully consumed.
-    {
-        let mut g = record.lock_commit().await;
-        let mut cand = g.current().clone();
-        cand.status = TaskStatus::Exited {
-            code: Some(0),
-            at: jiff::Timestamp::now(),
-        };
-        cand.stdout_cursor = 3;
-        cand.stderr_cursor = 2;
-        g.commit(cand).await.unwrap();
-        // Now mark Consumed then delete rings (manifest-first).
-        let mut cand = g.current().clone();
-        cand.disposition = OutputDisposition::Consumed {
-            at: jiff::Timestamp::now(),
-        };
-        g.commit(cand).await.unwrap();
-        g.delete_rings().await.unwrap();
-    }
-    drop(record);
-
-    let reopened = archive.open(&id).await.unwrap().expect("still queryable");
-    let g = reopened.lock_commit().await;
-    assert!(matches!(
-        g.current().disposition,
-        OutputDisposition::Consumed { .. }
-    ));
-    assert!(matches!(g.current().status, TaskStatus::Exited { .. }));
 }

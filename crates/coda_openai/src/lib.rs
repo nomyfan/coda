@@ -776,6 +776,7 @@ impl TryFrom<CompletionAccumulator> for AssistantMessage {
                 .ok_or_else(|| "Missing function call name".to_string())?;
             let arguments = function.arguments;
             tool_calls.push(ToolCall {
+                output_bytes: None,
                 id,
                 name,
                 arguments,

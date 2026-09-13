@@ -1,10 +1,11 @@
+import { OutputReferences } from "./output-references";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { ChevronRight, ListChecks, RefreshCw, Square, X } from "lucide-react";
 
 import { Markdown } from "@/components/markdown";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import type { TaskSummary, TaskResult, TaskStatus } from "@/lib/protocol";
+import type { TaskSummary, TaskResult, TaskStatus, TaskResultCursor } from "@/lib/protocol";
 import { cn, formatClockTime } from "@/lib/utils";
 import {
   getBackgroundTaskResult,
@@ -152,6 +153,12 @@ export function TaskResultContent({ result }: { result: TaskResult }) {
   return (
     <div className="space-y-3">
       <p className="whitespace-pre-wrap text-muted-foreground">{taskStatusLabel(result.status)}</p>
+      <OutputReferences references={result.page?.output_refs} />
+      {result.page?.storage_failure ? (
+        <p className="text-muted-foreground">
+          Output storage: {result.page.storage_failure}. The retained output may be incomplete.
+        </p>
+      ) : null}
       {result.output.kind === "subagent" ? (
         <Markdown className="text-xs">{result.output.answer}</Markdown>
       ) : (
@@ -186,7 +193,7 @@ function ShellOutput({
       <h3 className="mb-1 font-mono font-medium">{label}</h3>
       {overwritten > 0 ? (
         <p className="mb-1 text-muted-foreground">
-          {overwritten.toLocaleString()} bytes of earlier output were overwritten.
+          {overwritten.toLocaleString()} bytes of output were not retained.
         </p>
       ) : null}
       <pre className="whitespace-pre-wrap break-words rounded bg-muted/40 p-2 font-mono text-xs">
@@ -200,37 +207,51 @@ function TaskResultDetails({ taskId, request }: { taskId: string; request?: Task
   const [result, setResult] = useState<TaskResult | null>(null);
   const [loading, setLoading] = useState(false);
   const requestVersion = useRef(0);
-  const loadResult = useCallback(async () => {
-    const version = ++requestVersion.current;
-    setLoading(true);
-    try {
-      const next = await getBackgroundTaskResult(taskId);
-      if (version === requestVersion.current) setResult(next);
-    } catch (error) {
-      if (version === requestVersion.current)
-        setResult({
-          state: "error",
-          message: error instanceof Error ? error.message : "Could not load result",
-        });
-    } finally {
-      if (version === requestVersion.current) setLoading(false);
-    }
-  }, [taskId]);
+  const loadResult = useCallback(
+    async (cursor?: TaskResultCursor) => {
+      const version = ++requestVersion.current;
+      setLoading(true);
+      try {
+        const next = await getBackgroundTaskResult(taskId, cursor);
+        if (version === requestVersion.current) setResult(next);
+      } catch (error) {
+        if (version === requestVersion.current)
+          setResult({
+            state: "error",
+            message: error instanceof Error ? error.message : "Could not load result",
+          });
+      } finally {
+        if (version === requestVersion.current) setLoading(false);
+      }
+    },
+    [taskId],
+  );
   useEffect(() => {
     void loadResult();
     return () => {
       requestVersion.current += 1;
     };
   }, [loadResult, request]);
+  const nextPage = result?.state === "available" ? result.page?.next : undefined;
   return (
     <>
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {nextPage ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={loading}
+            onClick={() => void loadResult(nextPage)}
+          >
+            Next page
+          </Button>
+        ) : null}
         <Button
           variant="ghost"
           size="icon"
           className="size-6 text-muted-foreground"
           disabled={loading}
-          onClick={loadResult}
+          onClick={() => void loadResult()}
           title={loading ? "Loading result…" : "Refresh result"}
           aria-label={loading ? "Loading result" : "Refresh result"}
         >

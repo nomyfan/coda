@@ -86,6 +86,7 @@ impl LLMProvider for DuplicateProvider {
                 ]
                 .into_iter()
                 .map(|(id, target, background)| ToolCall {
+                    output_bytes: None,
                     id: id.into(),
                     name: format!("agent__{target}"),
                     arguments: Some(
@@ -150,7 +151,9 @@ async fn duplicate_stateful_calls_are_all_rejected_before_any_spawn() {
             None,
             HashMap::new(),
             RunConfig {
+                outputs: None,
                 default_model: ModelProfile {
+                    output_limits: coda_core::output::ModelOutputLimits::default(),
                     provider_id: "test".into(),
                     provider: provider.clone(),
                     model: "fake".into(),

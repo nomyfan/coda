@@ -93,6 +93,7 @@ impl LLMProvider for TestProvider {
                             .into_iter()
                             .enumerate()
                             .map(|(i, id)| ToolCall {
+                                output_bytes: None,
                                 id: format!("read_{read_count}_{i}"),
                                 name: "task_output".into(),
                                 arguments: Some(serde_json::json!({"id":id}).to_string()),
@@ -137,8 +138,9 @@ impl LLMProvider for TestProvider {
                     Self::completed(assistant("completed after live resync"))
                 } else {
                     let mut msg = assistant("");
-                    msg.tool_calls = (0..(RelayConfig::default().max_message_tier_events + 10))
+                    msg.tool_calls = (0..8)
                         .map(|i| ToolCall {
+                            output_bytes: None,
                             id: format!("call_{i}"),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -165,6 +167,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     let mut msg = assistant("");
                     msg.tool_calls = vec![ToolCall {
+                        output_bytes: None,
                         id: "call_explore".into(),
                         name: "explore".into(),
                         arguments: Some(r#"{"task":"look"}"#.into()),
@@ -182,6 +185,7 @@ impl LLMProvider for TestProvider {
                 } else {
                     let mut msg = assistant("");
                     msg.tool_calls = vec![ToolCall {
+                        output_bytes: None,
                         id: "call_todos".into(),
                         name: "read_todos".into(),
                         arguments: Some("{}".into()),
@@ -212,6 +216,7 @@ impl LLMProvider for TestProvider {
                     (2, false) => {
                         let mut msg = assistant("");
                         msg.tool_calls = vec![ToolCall {
+                            output_bytes: None,
                             id: "call_1".into(),
                             name: "read_todos".into(),
                             arguments: Some("{}".into()),
@@ -244,6 +249,7 @@ impl LLMProvider for TestProvider {
                             gate.notified().await;
                             let mut msg = assistant("");
                             msg.tool_calls = vec![ToolCall {
+                                output_bytes: None,
                                 id: "call_todos".into(),
                                 name: "read_todos".into(),
                                 arguments: Some("{}".into()),
@@ -663,7 +669,9 @@ impl SessionOpener for TestOpener {
                 .storage(self.storage.clone())
                 .team(&self.team, ".")
                 .run_config(RunConfig {
+                    outputs: None,
                     default_model: ModelProfile {
+                        output_limits: coda_core::output::ModelOutputLimits::default(),
                         provider_id: provider_name.into(),
                         provider: self.provider.clone(),
                         model: model_name.into(),
@@ -984,7 +992,20 @@ pub(super) fn hub_with(
 ) -> (SessionHub, Arc<Notify>) {
     let opener = Arc::new(TestOpener::new(system_prompt, approval));
     let gate = opener.provider.gate.clone();
-    (SessionHub::new(opener, RelayConfig::default()), gate)
+    (
+        SessionHub::new(
+            opener,
+            if system_prompt == "runaway" {
+                RelayConfig {
+                    max_message_tier_events: 4,
+                    ..RelayConfig::default()
+                }
+            } else {
+                RelayConfig::default()
+            },
+        ),
+        gate,
+    )
 }
 
 pub(super) fn hub_with_failing_metadata(system_prompt: &str) -> SessionHub {
@@ -1131,5 +1152,19 @@ pub(super) fn assistant(content: &str) -> AssistantMessage {
         aborted: false,
         started_at: now,
         ended_at: now,
+    }
+}
+
+pub(super) struct BackgroundRead {
+    pub status: coda_execution::TaskStatus,
+}
+pub(super) async fn read_background(
+    background: &coda_execution::BackgroundTasks,
+    id: &coda_execution::TaskId,
+) -> BackgroundRead {
+    match background.read_result(id).await.unwrap().unwrap() {
+        coda_execution::TaskResult::Pending { status }
+        | coda_execution::TaskResult::Expired { status }
+        | coda_execution::TaskResult::Available { status, .. } => BackgroundRead { status },
     }
 }

@@ -1,10 +1,12 @@
-use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use coda_core::tool::{HostCallScope, HostToolCallError, HostToolInvoker};
+use coda_core::output::{BufferBudget, CapturePurpose};
+use coda_core::tool::{
+    HostCallScope, HostToolCallError, HostToolCallResult, HostToolInvoker, StagedToolCall,
+};
 use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Function, context::EvalOptions,
     convert::List, function::Async,
@@ -27,11 +29,10 @@ pub struct PtcLimits {
     pub join_grace: Duration,
     pub max_calls: usize,
     pub max_concurrent_calls: usize,
-    pub result_bytes: usize,
-    pub total_result_bytes: usize,
+    pub host_buffer_bytes: usize,
+    pub capture_memory_bytes: usize,
     pub state_bytes: usize,
     pub artifact_bytes: usize,
-    pub stdout_bytes: usize,
     pub final_bytes: usize,
 }
 
@@ -45,18 +46,37 @@ impl Default for PtcLimits {
             join_grace: Duration::from_secs(1),
             max_calls: 128,
             max_concurrent_calls: 16,
-            result_bytes: 4 * MIB,
-            total_result_bytes: 16 * MIB,
+            host_buffer_bytes: 64 * MIB,
+            capture_memory_bytes: 256 * KIB,
             state_bytes: 4 * MIB,
             artifact_bytes: 32 * MIB,
-            stdout_bytes: MIB,
             final_bytes: MIB,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+impl PtcLimits {
+    pub fn configured(
+        resources: &coda_core::output::PtcResourceLimits,
+        capture_memory_bytes: usize,
+    ) -> Self {
+        Self {
+            heap_bytes: resources.heap_bytes,
+            wall_time: Duration::from_secs(resources.timeout_secs),
+            max_calls: resources.max_calls,
+            max_concurrent_calls: resources.max_concurrent_calls,
+            host_buffer_bytes: resources.host_buffer_bytes,
+            capture_memory_bytes,
+            final_bytes: resources.final_bytes,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsRunReport {
+    #[serde(skip)]
+    pub(crate) buffer_lease: Option<coda_core::output::BufferLease>,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
@@ -103,7 +123,7 @@ impl std::error::Error for JsEngineError {}
 struct BridgeRequest {
     name: String,
     arguments: String,
-    reply: oneshot::Sender<Result<String, BridgeCallError>>,
+    reply: oneshot::Sender<Result<Delivery, BridgeCallError>>,
 }
 
 struct BridgeCallError {
@@ -121,10 +141,11 @@ impl BridgeCallError {
 }
 
 struct WorkerInput {
+    result_budget: BufferBudget,
     code: String,
     exposed_tools: Arc<[String]>,
     bridge_tx: mpsc::Sender<BridgeRequest>,
-    stdout: Arc<Mutex<BoundedLog>>,
+    stdout: Option<coda_output::log::LogWriter>,
     interrupt: Arc<AtomicBool>,
     cancel: CancellationToken,
     outstanding_calls: Arc<AtomicUsize>,
@@ -146,57 +167,23 @@ impl Drop for OutstandingCall {
     }
 }
 
-struct BoundedLog {
-    entries: VecDeque<String>,
-    bytes: usize,
-    limit: usize,
-    truncated: bool,
+struct Delivery {
+    result: HostToolCallResult,
+    staged: StagedToolCall,
 }
 
-impl BoundedLog {
-    fn new(limit: usize) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            bytes: 0,
-            limit,
-            truncated: false,
-        }
-    }
-
-    fn push(&mut self, mut entry: String) {
-        if entry.len() > self.limit {
-            let mut start = entry.len() - self.limit;
-            while !entry.is_char_boundary(start) {
-                start += 1;
+struct BridgeResponse(Result<Delivery, BridgeCallError>);
+impl<'js> rquickjs::IntoJs<'js> for BridgeResponse {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        match self.0 {
+            Ok(delivery) => {
+                let _lease = delivery.result.buffer_lease;
+                let value = List((true, delivery.result.output, String::new())).into_js(ctx)?;
+                delivery.staged.commit();
+                Ok(value)
             }
-            entry = entry[start..].to_string();
-            self.entries.clear();
-            self.bytes = 0;
-            self.truncated = true;
+            Err(error) => List((false, error.code.to_string(), error.message)).into_js(ctx),
         }
-        let extra = entry.len() + usize::from(!self.entries.is_empty());
-        while self.bytes.saturating_add(extra) > self.limit {
-            let Some(front) = self.entries.pop_front() else {
-                break;
-            };
-            self.bytes = self.bytes.saturating_sub(front.len());
-            if !self.entries.is_empty() {
-                self.bytes = self.bytes.saturating_sub(1);
-            }
-            self.truncated = true;
-        }
-        if !self.entries.is_empty() {
-            self.bytes += 1;
-        }
-        self.bytes += entry.len();
-        self.entries.push_back(entry);
-    }
-
-    fn snapshot(&self) -> (String, bool) {
-        (
-            self.entries.iter().cloned().collect::<Vec<_>>().join("\n"),
-            self.truncated,
-        )
     }
 }
 
@@ -223,6 +210,7 @@ impl JsExecutor {
         invoker: Arc<dyn HostToolInvoker>,
         scope: HostCallScope,
         cancel: CancellationToken,
+        log: Option<coda_output::log::LogWriter>,
     ) -> Result<JsRunReport, JsEngineError> {
         let deadline_at = tokio::time::Instant::now() + self.limits.wall_time;
         let permit = tokio::select! {
@@ -245,7 +233,7 @@ impl JsExecutor {
         let interrupt = Arc::new(AtomicBool::new(false));
         let outstanding_calls = Arc::new(AtomicUsize::new(0));
         let script_cancel = cancel.child_token();
-        let stdout = Arc::new(Mutex::new(BoundedLog::new(self.limits.stdout_bytes)));
+        let stdout = log;
         let (bridge_tx, mut bridge_rx) = mpsc::channel(self.limits.max_concurrent_calls);
         let (worker_tx, mut worker_rx) = oneshot::channel();
         let limits = self.limits;
@@ -253,11 +241,16 @@ impl JsExecutor {
         let worker_cancel = script_cancel.clone();
         let worker_stdout = stdout.clone();
         let worker_outstanding_calls = outstanding_calls.clone();
+        let result_budget = BufferBudget::new(
+            (limits.host_buffer_bytes - limits.capture_memory_bytes - 64 * KIB) as u32,
+        );
+        let worker_budget = result_budget.clone();
         std::thread::Builder::new()
             .name("coda-ptc".to_string())
             .spawn(move || {
                 let _permit = permit;
                 let result = run_worker(WorkerInput {
+                    result_budget: worker_budget,
                     code,
                     exposed_tools,
                     bridge_tx,
@@ -275,7 +268,6 @@ impl JsExecutor {
         let mut host_calls = tokio::task::JoinSet::new();
         let mut started_calls = 0usize;
         let completed_calls = Arc::new(AtomicUsize::new(0));
-        let total_result_bytes = Arc::new(Mutex::new(0usize));
         let deadline = tokio::time::sleep_until(deadline_at);
         tokio::pin!(deadline);
 
@@ -314,7 +306,7 @@ impl JsExecutor {
                     let invoker = invoker.clone();
                     let scope = scope.clone();
                     let host_limit = host_limit.clone();
-                    let total_result_bytes = total_result_bytes.clone();
+                    let result_budget = result_budget.clone();
                     let completed_calls = completed_calls.clone();
                     let call_cancel = script_cancel.child_token();
                     host_calls.spawn(async move {
@@ -325,36 +317,20 @@ impl JsExecutor {
                             )));
                             return;
                         };
-                        let staged_call = scope.begin_tool_call(call_cancel);
+                        let staged_call = scope.begin_tool_call(call_cancel.clone());
+                        let mut context = staged_call.context();
+                        context.output_purpose = CapturePurpose::Programmatic(result_budget.clone());
                         let result = invoker
-                            .call(request.name, request.arguments, staged_call.context())
+                            .call(request.name, request.arguments, context)
                             .await;
                         let response = match result {
-                            Ok(result) if result.output.len() > limits.result_bytes => {
-                                Err(BridgeCallError::new(
-                                    "RESULT_LIMIT",
-                                    format!(
-                                        "tool result exceeds {} bytes",
-                                        limits.result_bytes
-                                    ),
-                                ))
-                            }
-                            Ok(result) => {
-                                let mut total = total_result_bytes.lock().unwrap();
-                                let next = total.saturating_add(result.output.len());
-                                if next > limits.total_result_bytes {
-                                    Err(BridgeCallError::new(
-                                        "RESULT_LIMIT",
-                                        format!(
-                                            "cumulative tool results exceed {} bytes",
-                                            limits.total_result_bytes
-                                        ),
-                                    ))
-                                } else {
-                                    *total = next;
-                                    staged_call.commit();
-                                    Ok(result.output)
-                                }
+                            Ok(mut result) => {
+                                if result.buffer_lease.is_none() {
+                                    match result_budget.reserve(result.output.len().saturating_mul(2), &call_cancel).await {
+                                        Ok(lease) => { result.buffer_lease = Some(lease); Ok(Delivery { result, staged: staged_call }) }
+                                        Err(error) => Err(BridgeCallError::new("OUTPUT_LIMIT", format!("tool executed; result delivery failed: {error:?}"))),
+                                    }
+                                } else { Ok(Delivery { result, staged: staged_call }) }
                             }
                             Err(error) => Err(bridge_call_error(error)),
                         };
@@ -370,8 +346,14 @@ impl JsExecutor {
 
         bridge_rx.close();
         script_cancel.cancel();
-        host_calls.abort_all();
-        while host_calls.join_next().await.is_some() {}
+        let cleanup = async { while host_calls.join_next().await.is_some() {} };
+        if tokio::time::timeout(Duration::from_secs(3), cleanup)
+            .await
+            .is_err()
+        {
+            host_calls.abort_all();
+            while host_calls.join_next().await.is_some() {}
+        }
 
         if let Some(reason) = stop_reason {
             match tokio::time::timeout(limits.join_grace, &mut worker_rx).await {
@@ -401,9 +383,6 @@ impl JsExecutor {
             worker_result = Some(Ok(deadline_report()));
         }
         let mut report = worker_result.expect("worker result or stop reason must be present")?;
-        let (captured, truncated) = stdout.lock().unwrap().snapshot();
-        report.stdout = captured;
-        report.stdout_truncated = truncated;
         report.completed_calls = completed_calls.load(Ordering::Acquire);
         Ok(report)
     }
@@ -425,15 +404,23 @@ fn bridge_call_error(error: HostToolCallError) -> BridgeCallError {
             BridgeCallError::new("INVALID_PARAMETERS", message)
         }
         HostToolCallError::Execution(message) => BridgeCallError::new("TOOL_ERROR", message),
-        HostToolCallError::ResourceLimit(message) => {
-            BridgeCallError::new("RESOURCE_LIMIT", message)
-        }
+        HostToolCallError::ResourceLimit(message) => BridgeCallError::new(
+            if message.starts_with("OUTPUT_INCOMPLETE") {
+                "OUTPUT_INCOMPLETE"
+            } else if message.starts_with("OUTPUT_LIMIT") {
+                "OUTPUT_LIMIT"
+            } else {
+                "RESOURCE_LIMIT"
+            },
+            message,
+        ),
         HostToolCallError::Aborted(message) => BridgeCallError::new("ABORTED", message),
     }
 }
 
 fn deadline_report() -> JsRunReport {
     JsRunReport {
+        buffer_lease: None,
         ok: false,
         value: None,
         error: Some(JsErrorReport {
@@ -449,6 +436,7 @@ fn deadline_report() -> JsRunReport {
 
 fn unawaited_calls_report(count: usize) -> JsRunReport {
     JsRunReport {
+        buffer_lease: None,
         ok: false,
         value: None,
         error: Some(JsErrorReport {
@@ -466,6 +454,7 @@ fn unawaited_calls_report(count: usize) -> JsRunReport {
 
 fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
     let WorkerInput {
+        result_budget,
         code,
         exposed_tools,
         bridge_tx,
@@ -507,23 +496,14 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                                 .await
                                 .is_err()
                             {
-                                return List((
-                                    false,
-                                    "ABORTED".to_string(),
-                                    "host bridge closed".to_string(),
-                                ));
+                                return BridgeResponse(Err(BridgeCallError::new(
+                                    "ABORTED",
+                                    "host bridge closed",
+                                )));
                             }
-                            match response.await {
-                                Ok(Ok(output)) => List((true, output, String::new())),
-                                Ok(Err(error)) => {
-                                    List((false, error.code.to_string(), error.message))
-                                }
-                                Err(_) => List((
-                                    false,
-                                    "ABORTED".to_string(),
-                                    "host response dropped".to_string(),
-                                )),
-                            }
+                            BridgeResponse(response.await.unwrap_or_else(|_| {
+                                Err(BridgeCallError::new("ABORTED", "host response dropped"))
+                            }))
                         }
                     }),
                 )
@@ -532,7 +512,9 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                     .set("__coda_call_tool", call)
                     .map_err(js_init)?;
                 let log = Function::new(ctx.clone(), move |line: String| {
-                    stdout.lock().unwrap().push(line);
+                    if let Some(stdout) = &stdout {
+                        stdout.append(line);
+                    }
                 })
                 .map_err(js_init)?;
                 ctx.globals().set("__coda_log", log).map_err(js_init)?;
@@ -569,9 +551,29 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                     }
                 };
                 tokio::select! {
-                    result = promise.into_future::<String>() => {
+                    result = promise.into_future::<rquickjs::String>() => {
                         let report = match result {
-                            Ok(encoded) => decode_report(encoded, limits.final_bytes),
+                            Ok(encoded) => {
+                                // Count UTF-8 bytes while the value is still in the JS heap.
+                                let byte_length: Function = ctx.eval("s => { let n=0; for (const ch of s) { const c=ch.codePointAt(0); n += c<=127?1:c<=2047?2:c<=65535?3:4; } return n; }").map_err(js_init)?;
+                                let bytes: usize = byte_length.call((encoded.clone(),)).map_err(js_init)?;
+                                if bytes > limits.final_bytes { Ok(exception_report("OUTPUT_LIMIT", format!("final value exceeds {} bytes", limits.final_bytes))) }
+                                else if outstanding_calls.load(Ordering::Acquire) != 0 { Ok(unawaited_calls_report(outstanding_calls.load(Ordering::Acquire))) }
+                                else {
+                                    // Reserve parsing, JSON tree nodes and final report encoding together.
+                                    // The lease survives the worker and is released after output sealing.
+                                    let needed = bytes.saturating_mul(32).saturating_add(limits.capture_memory_bytes * 8).saturating_add(4096);
+                                    match result_budget.reserve(needed, &cancel).await {
+                                        Ok(lease) => {
+                                            let encoded = encoded.to_cstring().map_err(js_init)?;
+                                            let mut report = decode_report(encoded.as_str(), limits.final_bytes)?;
+                                            report.buffer_lease = Some(lease);
+                                            Ok(report)
+                                        }
+                                        Err(_) => Ok(exception_report("OUTPUT_LIMIT", "final report cannot fit the native memory budget".into())),
+                                    }
+                                }
+                            },
                             Err(error) => Ok(exception_report("JS_EXCEPTION", error.to_string())),
                         };
                         let unfinished = outstanding_calls.load(Ordering::Acquire);
@@ -632,7 +634,7 @@ fn adjust_syntax_stack(mut stack: String) -> String {
     stack
 }
 
-fn decode_report(encoded: String, limit: usize) -> Result<JsRunReport, JsEngineError> {
+fn decode_report(encoded: &str, limit: usize) -> Result<JsRunReport, JsEngineError> {
     if encoded.len() > limit {
         return Ok(exception_report(
             "OUTPUT_LIMIT",
@@ -645,10 +647,11 @@ fn decode_report(encoded: String, limit: usize) -> Result<JsRunReport, JsEngineE
         value: Option<serde_json::Value>,
         error: Option<JsErrorReport>,
     }
-    let wire: WireReport = serde_json::from_str(&encoded).map_err(|error| {
+    let wire: WireReport = serde_json::from_str(encoded).map_err(|error| {
         JsEngineError::Initialization(format!("invalid worker report: {error}"))
     })?;
     Ok(JsRunReport {
+        buffer_lease: None,
         ok: wire.ok,
         value: wire.value,
         error: wire.error,
@@ -664,6 +667,7 @@ fn exception_report(code: &str, message: String) -> JsRunReport {
 
 fn exception_report_with_stack(code: &str, message: String, stack: Option<String>) -> JsRunReport {
     JsRunReport {
+        buffer_lease: None,
         ok: false,
         value: None,
         error: Some(JsErrorReport {

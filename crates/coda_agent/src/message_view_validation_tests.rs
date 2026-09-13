@@ -16,6 +16,7 @@ fn assistant(calls: &[&str]) -> HistoryEntry {
         tool_calls: calls
             .iter()
             .map(|id| ToolCall {
+                output_bytes: None,
                 id: (*id).to_string(),
                 name: "tool".to_string(),
                 arguments: Some("{}".to_string()),

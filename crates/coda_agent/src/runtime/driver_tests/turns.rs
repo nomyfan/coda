@@ -451,6 +451,7 @@ async fn a_resume_target_replaces_snapshot_work_for_its_thread() {
     let current_turn = TurnId::from(current_prompt);
     let parent_message_id = MessageId::new();
     let call = ToolCall {
+        output_bytes: None,
         id: "call_read_todos".into(),
         name: "read_todos".into(),
         arguments: Some("{}".into()),

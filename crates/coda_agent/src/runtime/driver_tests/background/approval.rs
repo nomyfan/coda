@@ -34,7 +34,7 @@ async fn background_approval_blocks_new_input_and_cancellation_revokes_only_its_
         assert_eq!(approval.agent_path, vec!["coda", "worker", "child"]);
         let id = approval.task_id.clone().unwrap();
         assert!(matches!(
-            background.read(&id).await.unwrap().unwrap().status,
+            read_background(&background, &id).await.status,
             TaskStatus::WaitingApproval
         ));
         assert!(!runtime.root_turn_active());

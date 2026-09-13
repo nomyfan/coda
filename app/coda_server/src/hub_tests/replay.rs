@@ -509,15 +509,7 @@ async fn overflowing_tool_calls_refresh_snapshot_without_stopping_background_wor
     })
     .await;
     next_matching(&mut events, is_settling_llm_end).await;
-    assert!(
-        background
-            .read(&id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status
-            .is_running()
-    );
+    assert!(read_background(&background, &id).await.status.is_running());
     let entry = hub.get_entry(&key()).unwrap();
     let guard = entry.inner.lock().await;
     let EntryPhase::Live(live) = &guard.phase else {

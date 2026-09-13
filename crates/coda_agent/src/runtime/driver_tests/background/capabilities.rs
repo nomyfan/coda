@@ -1,5 +1,6 @@
 use super::super::super::*;
 use super::super::fixtures::{assistant, user_task};
+use super::fixtures::read_background;
 use crate::runtime::MemoryStorage;
 use crate::{AgentSpec, AgentTeam, Capabilities, ModelProfile, RunConfig};
 use coda_core::llm::RequestMessage;
@@ -30,6 +31,7 @@ impl LLMProvider for Provider {
             answer.content = format!("{} done", prompt.0);
         } else if prompt.0 == "root" {
             answer.tool_calls.push(ToolCall {
+                output_bytes: None,
                 id: "delegate".into(),
                 name: "agent__worker".into(),
                 arguments: Some(
@@ -44,6 +46,7 @@ impl LLMProvider for Provider {
             answer.content = "worker done".into();
         } else {
             answer.tool_calls.push(ToolCall {
+                output_bytes: None,
                 id: "shell".into(),
                 name: "shell".into(),
                 arguments: Some(
@@ -102,7 +105,9 @@ async fn start(
             None,
             HashMap::new(),
             RunConfig {
+                outputs: None,
                 default_model: ModelProfile {
+                    output_limits: coda_core::output::ModelOutputLimits::default(),
                     provider_id: "test".into(),
                     provider,
                     model: "fake".into(),
@@ -214,7 +219,7 @@ async fn background_delegation_does_not_require_the_targets_background_capabilit
         }
         let task = background.summaries().borrow()[0].id.parse().unwrap();
         background.wait_terminal(&task).await;
-        let result = background.read(&task).await.unwrap().unwrap();
+        let result = read_background(&background, &task).await;
         assert!(matches!(result.status, TaskStatus::Completed { .. }));
         assert_eq!(result.stdout, "worker done");
         {
@@ -298,10 +303,7 @@ async fn child_shell_completion_still_notifies_a_root_without_background_capabil
                 break;
             }
         }
-        assert_eq!(
-            background.read(&task).await.unwrap().unwrap().stdout,
-            "complete"
-        );
+        assert_eq!(read_background(&background, &task).await.stdout, "complete");
         assert!(
             requests
                 .lock()

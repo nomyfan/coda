@@ -317,12 +317,14 @@ async fn write_refuses_huge_file() {
 }
 
 #[tokio::test]
-async fn read_refuses_huge_file() {
+async fn read_pages_huge_file() {
     let path = tmp_huge_file("huge_read");
     let tool = ReadFileTool::new();
-    let err = tool
+    let page = tool
         .execute(
             ReadFileToolParams {
+                byte_offset: None,
+                expected_version: None,
                 file_path: path.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -330,8 +332,13 @@ async fn read_refuses_huge_file() {
             ToolCallContext::default(),
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err, ToolError::InvalidParameters(_)));
+        .unwrap();
+    let OutputData::Page { body, .. } = page else {
+        panic!("expected page")
+    };
+    assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_bytes);
+    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(page["next_byte_offset"].as_u64().is_some());
     std::fs::remove_file(&path).ok();
 }
 
@@ -363,6 +370,8 @@ async fn read_decodes_invalid_utf8_lossily() {
     let result = tool
         .execute(
             ReadFileToolParams {
+                byte_offset: None,
+                expected_version: None,
                 file_path: path.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -371,6 +380,9 @@ async fn read_decodes_invalid_utf8_lossily() {
         )
         .await
         .unwrap();
+    let OutputData::Page { body: result, .. } = result else {
+        panic!("expected file page")
+    };
     assert!(result.contains("before \u{FFFD}\u{FFFD} after"));
     std::fs::remove_file(&path).ok();
 }
@@ -600,6 +612,8 @@ async fn read_refuses_symlink() {
     let err = tool
         .execute(
             ReadFileToolParams {
+                byte_offset: None,
+                expected_version: None,
                 file_path: link.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -619,6 +633,8 @@ async fn read_refuses_directory() {
     let err = tool
         .execute(
             ReadFileToolParams {
+                byte_offset: None,
+                expected_version: None,
                 file_path: std::env::temp_dir().to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -674,4 +690,61 @@ async fn edit_errors_on_empty_old_string() {
     assert!(matches!(err, ToolError::InvalidParameters(_)));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn giant_unicode_line_pages_without_skips_and_detects_file_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("giant.txt");
+    let original = "你🙂界".repeat(10000);
+    std::fs::write(&file, &original).unwrap();
+    let mut offset = 0;
+    let mut version = None;
+    let mut content = String::new();
+    loop {
+        let mut context = ToolCallContext::default();
+        context.output_bytes = 1024;
+        let OutputData::Page { body, .. } = ReadFileTool::new()
+            .execute(
+                ReadFileToolParams {
+                    file_path: file.to_str().unwrap().into(),
+                    offset: None,
+                    limit: None,
+                    byte_offset: Some(offset),
+                    expected_version: version.clone(),
+                },
+                context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(body.len() <= 1024);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        version = Some(page["version"].as_str().unwrap().to_owned());
+        content.push_str(page["content"].as_str().unwrap());
+        if let Some(next) = page["next_byte_offset"].as_u64() {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(content, original);
+    std::fs::write(&file, "changed").unwrap();
+    let error = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: file.to_str().unwrap().into(),
+                offset: None,
+                limit: None,
+                byte_offset: None,
+                expected_version: version,
+            },
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("FILE_CHANGED"));
 }
