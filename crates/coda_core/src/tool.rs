@@ -87,6 +87,8 @@ pub enum HostToolCallError {
     ResourceLimit(String),
     Aborted(String),
     Output(OutputError),
+    /// The tool ran, but its result could not be handed to the script.
+    Undelivered(OutputError),
 }
 
 /// The only capability that lets a tool call another registered tool.
@@ -307,12 +309,6 @@ impl From<ToolError> for HostToolCallError {
             ToolError::Aborted(message) => Self::Aborted(message),
             ToolError::Output(error) => Self::Output(error),
         }
-    }
-}
-
-impl From<OutputError> for HostToolCallError {
-    fn from(error: OutputError) -> Self {
-        ToolError::from(error).into()
     }
 }
 

@@ -449,6 +449,62 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
     assert_eq!(result_report.error.unwrap().code, "OUTPUT_LIMIT");
 }
 
+struct LargeResultInvoker(usize);
+
+impl HostToolInvoker for LargeResultInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".to_string()])
+    }
+
+    fn call(
+        &self,
+        _name: String,
+        _arguments: String,
+        _context: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        let bytes = self.0;
+        Box::pin(async move {
+            Ok(HostToolCallResult {
+                buffer_lease: None,
+                output: "x".repeat(bytes),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn undeliverable_host_result_says_the_tool_ran() {
+    // Room for the final report, but not for twice the 2 MiB result.
+    let limits = PtcLimits {
+        host_buffer_bytes: PtcLimits::default().log_buffer_bytes() + 3 * MIB,
+        ..PtcLimits::default()
+    };
+    let invoker = Arc::new(LargeResultInvoker(2 * MIB));
+    let report = JsExecutor::new(limits)
+        .run(
+            "try { await tools.read_file({}); } catch (error) { return [error.code, error.message]; }"
+                .to_string(),
+            invoker.exposed_tools(),
+            invoker,
+            scope(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(report.ok, "{report:?}");
+    let value = report.value.unwrap();
+    assert_eq!(value[0], "OUTPUT_LIMIT");
+    assert!(
+        value[1]
+            .as_str()
+            .unwrap()
+            .starts_with("tool executed; result delivery failed: OUTPUT_LIMIT: "),
+        "{value}"
+    );
+}
+
 #[tokio::test]
 async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
     let limits = PtcLimits {

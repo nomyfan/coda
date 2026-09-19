@@ -441,7 +441,10 @@ impl HostToolInvoker for AgentToolInvoker {
                 .execute(arguments, context)
                 .await
                 .map_err(|failure| HostToolCallError::from(failure.error))?;
-            let buffer = output.materialize(&budget, &cancel).await?;
+            let buffer = output
+                .materialize(&budget, &cancel)
+                .await
+                .map_err(HostToolCallError::Undelivered)?;
             Ok(HostToolCallResult {
                 output: buffer.text,
                 buffer_lease: buffer.lease,

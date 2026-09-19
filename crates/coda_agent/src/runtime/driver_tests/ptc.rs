@@ -87,6 +87,37 @@ fn malformed_snapshot_is_deduplicated_and_restored_in_fixed_order() {
 }
 
 #[tokio::test]
+async fn delivery_failure_after_execution_is_reported_as_undelivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = coda_tools::BuildContext::new(dir.path().to_string_lossy());
+    let mut tools = Tools::default();
+    tools.register(coda_tools::WriteFileToolSpec.build(&build));
+    let invoker = AgentToolInvoker::new(tools, ToolApprovalMode::Auto, vec!["write_file".into()]);
+    let path = dir.path().join("written.txt");
+    let mut context = coda_core::tool::ToolCallContext::default();
+    // Too small for even the short confirmation write_file returns.
+    context.result_budget =
+        coda_core::output::ResultBudget::Script(coda_core::output::BufferBudget::new(8));
+    let arguments = serde_json::json!({ "file_path": path, "content": "hello" }).to_string();
+
+    let error = invoker
+        .call("write_file".into(), arguments, context)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            coda_core::tool::HostToolCallError::Undelivered(coda_core::output::OutputError::Limit(
+                _
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+}
+
+#[tokio::test]
 async fn stable_descriptors_are_injected_without_encoding_the_eligible_subset() {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let provider = TestProvider::with_recorded_requests(recorded.clone());

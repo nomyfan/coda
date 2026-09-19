@@ -1049,7 +1049,7 @@ impl OutputBuffer for Buffer {
         Box::pin(async move {
             if self.failure.is_some() {
                 return Err(OutputError::Incomplete(
-                    "tool executed but its complete output is unavailable".into(),
+                    "complete output is unavailable".into(),
                 ));
             }
             let length = {
@@ -1100,7 +1100,7 @@ impl OutputBuffer for Buffer {
                 })
             });
             tokio::select! {
-                _ = cancel.cancelled() => Err(OutputError::Aborted("result delivery cancelled after tool execution".into())),
+                _ = cancel.cancelled() => Err(OutputError::Aborted("delivery was cancelled".into())),
                 result = read => result.map_err(|e| OutputError::Incomplete(e.to_string()))?,
             }
         })

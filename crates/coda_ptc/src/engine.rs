@@ -332,7 +332,7 @@ impl JsExecutor {
                                 if result.buffer_lease.is_none() {
                                     match result_budget.reserve(result.output.len().saturating_mul(2), &call_cancel).await {
                                         Ok(lease) => { result.buffer_lease = Some(lease); Ok(Delivery { result, staged: staged_call }) }
-                                        Err(error) => Err(bridge_call_error(OutputError::from(error).into())),
+                                        Err(error) => Err(bridge_call_error(HostToolCallError::Undelivered(error.into()))),
                                     }
                                 } else { Ok(Delivery { result, staged: staged_call }) }
                             }
@@ -413,6 +413,10 @@ fn bridge_call_error(error: HostToolCallError) -> BridgeCallError {
         }
         HostToolCallError::Aborted(message) => BridgeCallError::new("ABORTED", message),
         HostToolCallError::Output(error) => BridgeCallError::new(error.code(), error.to_string()),
+        HostToolCallError::Undelivered(error) => BridgeCallError::new(
+            error.code(),
+            format!("tool executed; result delivery failed: {error}"),
+        ),
     }
 }
 
