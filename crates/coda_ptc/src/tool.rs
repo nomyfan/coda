@@ -1,5 +1,5 @@
 use coda_core::llm::ToolDefinition;
-use coda_core::output::{CapturePurpose, Channel, OutputData, OutputStore};
+use coda_core::output::{CapturePurpose, Channel, OutputData};
 use coda_core::tool::{HostEffectLimits, Tool, ToolCallContext, ToolError, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -84,13 +84,10 @@ impl Tool for RunJavaScriptTool {
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
         let mut limits = self.limits;
         async move {
-            let store: std::sync::Arc<dyn OutputStore> = ctx
-                .output_store
-                .clone()
-                .unwrap_or_else(|| coda_output::Store::standalone());
+            let (store, owner) = coda_output::Store::session_or_standalone(ctx.outputs.as_ref());
             limits.capture_memory_bytes = store.limits().capture_memory_bytes;
-            if let Some(resources) = &ctx.ptc_limits {
-                limits = PtcLimits::configured(resources, limits.capture_memory_bytes);
+            if let Some(outputs) = &ctx.outputs {
+                limits = PtcLimits::configured(&outputs.ptc, limits.capture_memory_bytes);
             }
 
             if params.code.len() > limits.source_bytes {
@@ -121,7 +118,7 @@ impl Tool for RunJavaScriptTool {
             );
             let capture = store
                 .begin(
-                    ctx.output_owner.clone(),
+                    owner,
                     vec![Channel::ResultJson, Channel::Log],
                     CapturePurpose::Foreground,
                 )

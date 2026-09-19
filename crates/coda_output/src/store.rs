@@ -75,6 +75,17 @@ impl Store {
             .clone()
     }
 
+    /// The session's output store and the owner its output is charged to, or
+    /// the standalone store outside a session.
+    pub fn session_or_standalone(
+        outputs: Option<&OutputRuntime>,
+    ) -> (Arc<dyn OutputStore>, OutputOwner) {
+        match outputs {
+            Some(outputs) => (outputs.store.clone(), outputs.owner.clone()),
+            None => (Self::standalone(), OutputOwner::default()),
+        }
+    }
+
     /// Locks and scans the whole root before accepting any writes.
     pub fn open(limits: OutputLimits) -> Result<Self, String> {
         let lock = ArchiveRootLock::acquire(&limits.root).map_err(|e| e.to_string())?;

@@ -81,7 +81,7 @@ impl HostToolInvoker for LogPressureInvoker {
                     buffer_lease: None,
                 });
             }
-            let CapturePurpose::Programmatic(budget) = ctx.output_purpose else {
+            let ResultBudget::Script(budget) = ctx.result_budget else {
                 panic!()
             };
             let captured = || {
@@ -129,12 +129,12 @@ impl HostToolInvoker for LogPressureInvoker {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn synchronous_logs_drain_while_pending_delivery_holds_all_non_log_memory() {
-    use coda_core::output::{Channel, OutputData, OutputStore};
+    use coda_core::output::{CapturePurpose, Channel, OutputData, OutputOwner, OutputStore};
     for many in [false, true] {
         let store = coda_output::Store::standalone();
         let capture = store
             .begin(
-                ToolCallContext::default().output_owner,
+                OutputOwner::default(),
                 vec![Channel::ResultJson, Channel::Log],
                 CapturePurpose::Foreground,
             )
@@ -188,11 +188,11 @@ async fn synchronous_logs_drain_while_pending_delivery_holds_all_non_log_memory(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() {
-    use coda_core::output::{Channel, OutputData, OutputStore};
+    use coda_core::output::{CapturePurpose, Channel, OutputData, OutputOwner, OutputStore};
     let store = coda_output::Store::standalone();
     let capture = store
         .begin(
-            ToolCallContext::default().output_owner,
+            OutputOwner::default(),
             vec![Channel::ResultJson, Channel::Log],
             CapturePurpose::Foreground,
         )
@@ -257,7 +257,7 @@ async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() 
 /// the log is never folded into the report JSON.
 #[tokio::test]
 async fn small_report_and_log_render_as_report_then_log() {
-    use coda_core::output::{Channel, OutputData, OutputStore};
+    use coda_core::output::{CapturePurpose, Channel, OutputData, OutputOwner, OutputStore};
     for (logged, expected) in [
         (true, "{\"ok\":true,\"value\":1}\nlog:\nhello\n"),
         (false, "{\"ok\":true,\"value\":1}"),
@@ -265,7 +265,7 @@ async fn small_report_and_log_render_as_report_then_log() {
         let store = coda_output::Store::standalone();
         let capture = store
             .begin(
-                ToolCallContext::default().output_owner,
+                OutputOwner::default(),
                 vec![Channel::ResultJson, Channel::Log],
                 CapturePurpose::Foreground,
             )

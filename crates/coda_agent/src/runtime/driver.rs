@@ -1,4 +1,4 @@
-use coda_core::output::{OutputBuffer, OutputData};
+use coda_core::output::{OutputBuffer, OutputData, ResultBudget};
 use coda_core::tool::ToolFailure;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -430,9 +430,11 @@ impl HostToolInvoker for AgentToolInvoker {
                     "host tool call was cancelled".to_string(),
                 ));
             }
-            let budget = match &context.output_purpose {
-                coda_core::output::CapturePurpose::Programmatic(budget) => budget.clone(),
-                _ => coda_core::output::BufferBudget::new(64 * 1024 * 1024),
+            let budget = match &context.result_budget {
+                ResultBudget::Script(budget) => budget.clone(),
+                ResultBudget::Model { .. } => {
+                    coda_core::output::BufferBudget::new(64 * 1024 * 1024)
+                }
             };
             let cancel = context.cancel.clone();
             let result = tool.execute(arguments, context).await;
@@ -1346,15 +1348,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         data: OutputData,
         bytes: usize,
     ) -> coda_output::render::RenderedOutput {
-        let context = ToolCallContext::default();
-        let fallback;
-        let (store, owner) = if let Some(outputs) = &self.config.outputs {
-            (outputs.store.as_ref(), outputs.owner.clone())
-        } else {
-            fallback = coda_tools::standalone_output_store(&context);
-            (fallback.as_ref(), context.output_owner)
-        };
-        let rendered = coda_output::render::render(store, owner, data, bytes)
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let rendered = coda_output::render::render(store.as_ref(), owner, data, bytes)
             .await
             .unwrap_or_else(|error| coda_output::render::RenderedOutput {
                 delivery_error: true,
@@ -1735,18 +1731,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 AgentEvent::CompactionStart,
             )
             .await;
-        let fallback = ToolCallContext::default();
-        let (store, owner) = self
-            .config
-            .outputs
-            .as_ref()
-            .map(|o| (o.store.clone(), o.owner.clone()))
-            .unwrap_or_else(|| {
-                (
-                    coda_tools::standalone_output_store(&fallback),
-                    fallback.output_owner,
-                )
-            });
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
         let summary = async {
             let history = compaction::bounded_history(
                 &history,
@@ -1923,16 +1909,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             Ok(messages) => messages,
             Err(error) => return self.generation_failed(error.to_string()),
         };
-        let fallback;
-        let (store, owner) = if let Some(outputs) = &self.config.outputs {
-            (outputs.store.clone(), outputs.owner.clone())
-        } else {
-            fallback = ToolCallContext::default();
-            (
-                coda_tools::standalone_output_store(&fallback),
-                fallback.output_owner,
-            )
-        };
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
         let minimum = match coda_core::output::ModelOutputLimits::minimum_response_bytes(
             &store.limits().root,
         ) {
@@ -2368,15 +2346,13 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 // without touching its siblings.
                 let call_state = Arc::new(CallState::new(committed.clone()));
                 let mut ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
-                ctx.output_bytes = tc
-                    .tool_call
-                    .output_bytes
-                    .unwrap_or(self.config.profile.output_limits.single_bytes);
-                if let Some(outputs) = &self.config.outputs {
-                    ctx.output_store = Some(outputs.store.clone());
-                    ctx.output_owner = outputs.owner.clone();
-                    ctx.ptc_limits = Some(outputs.ptc.clone());
-                }
+                ctx.result_budget = ResultBudget::Model {
+                    page_bytes: tc
+                        .tool_call
+                        .output_bytes
+                        .unwrap_or(self.config.profile.output_limits.single_bytes),
+                };
+                ctx.outputs = self.config.outputs.clone();
                 ctx.background_task = self
                     .process
                     .execution

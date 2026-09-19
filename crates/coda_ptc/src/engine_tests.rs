@@ -154,12 +154,12 @@ async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
 
 /// Also returns the console log preview and whether it was cut short.
 async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunReport, String, bool) {
-    use coda_core::output::{CapturePurpose, Channel, OutputStore};
+    use coda_core::output::{CapturePurpose, Channel, OutputOwner, OutputStore};
     let invoker = Arc::new(FakeInvoker::new(names));
     let store = coda_output::Store::standalone();
     let capture = store
         .begin(
-            coda_core::tool::ToolCallContext::default().output_owner,
+            OutputOwner::default(),
             vec![Channel::ResultJson, Channel::Log],
             CapturePurpose::Foreground,
         )
@@ -702,7 +702,7 @@ impl HostToolInvoker for RawInvoker {
     ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
         let bytes = self.bytes;
         Box::pin(async move {
-            let CapturePurpose::Programmatic(budget) = ctx.output_purpose else {
+            let ResultBudget::Script(budget) = ctx.result_budget else {
                 panic!()
             };
             let lease = budget.reserve(bytes * 2, &ctx.cancel).await.unwrap();

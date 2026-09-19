@@ -35,9 +35,3 @@ pub const SYNTHETIC_RESERVED_TOOL_NAMES: &[&str] = &[
     "task_output",
     "task_kill",
 ];
-
-pub fn standalone_output_store(
-    ctx: &coda_core::tool::ToolCallContext,
-) -> std::sync::Arc<dyn coda_core::output::OutputStore> {
-    process::output_store(ctx)
-}

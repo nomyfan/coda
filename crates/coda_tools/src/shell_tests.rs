@@ -463,6 +463,16 @@ async fn a_background_task_settles_at_once_and_outlives_the_timeout() {
     background.shutdown().await;
 }
 
+fn context_with_store(store: Arc<coda_output::Store>) -> ToolCallContext {
+    let mut context = ToolCallContext::default();
+    context.outputs = Some(coda_core::output::OutputRuntime {
+        store,
+        owner: Default::default(),
+        ptc: Default::default(),
+    });
+    context
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_large_command_keeps_its_middle_log_readable() {
     use coda_core::output::{Channel, OutputData, OutputLimits, OutputStore};
@@ -480,8 +490,7 @@ async fn cancelled_large_command_keeps_its_middle_log_readable() {
         "head -c 131072 /dev/zero | tr '\\0' A; printf 'MIDDLE-BEFORE-CANCEL'; head -c 131072 /dev/zero | tr '\\0' Z; touch '{}'; sleep 30",
         ready.display()
     );
-    let mut context = ToolCallContext::default();
-    context.output_store = Some(store.clone());
+    let context = context_with_store(store.clone());
     let saved = context.clone();
     let task = tokio::spawn(tool().execute(params(&script), context));
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -531,8 +540,7 @@ async fn exceeding_disk_quota_does_not_stop_the_command_or_lose_its_exit_status(
         })
         .unwrap(),
     );
-    let mut context = ToolCallContext::default();
-    context.output_store = Some(store.clone());
+    let context = context_with_store(store.clone());
     let output = tool()
         .execute(
             params("head -c 33554432 /dev/zero; printf 'EXIT-MARKER'"),

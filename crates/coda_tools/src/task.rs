@@ -78,19 +78,15 @@ impl Tool for TaskOutputTool {
                 Ok(id) => id,
                 Err(msg) => return Ok(msg.into()),
             };
-            use coda_core::output::{CapturePurpose, Channel, HostResultBuffer, OutputData};
-            let bytes = match &ctx.output_purpose {
-                CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
-                _ => ctx.output_bytes,
-            };
-            let lease = match &ctx.output_purpose {
-                CapturePurpose::Programmatic(budget) => {
-                    Some(budget.reserve(bytes * 2, &ctx.cancel).await.map_err(|e| {
-                        coda_core::tool::ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}"))
-                    })?)
-                }
-                _ => None,
-            };
+            use coda_core::output::{Channel, HostResultBuffer, OutputData};
+            let bytes = ctx.result_budget.page_bytes();
+            let lease = ctx
+                .result_budget
+                .reserve(bytes * 2, &ctx.cancel)
+                .await
+                .map_err(|e| {
+                    coda_core::tool::ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}"))
+                })?;
             let mut positions = [0; 3];
             for (index, channel) in [Channel::Stdout, Channel::Stderr, Channel::Result]
                 .into_iter()

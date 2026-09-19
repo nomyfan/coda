@@ -1,7 +1,5 @@
 //! Cancellation-aware process execution with bounded stdout/stderr capture.
-use std::sync::Arc;
-
-use coda_core::output::{Channel, FINALIZE_TIMEOUT, IO_BLOCK_BYTES, OutputData, OutputStore};
+use coda_core::output::{Channel, FINALIZE_TIMEOUT, IO_BLOCK_BYTES, OutputData};
 use coda_core::tool::{CancellationToken, ToolCallContext, ToolError};
 use coda_execution::{GroupedChild, PIPE_DRAIN_TIMEOUT};
 use tokio::io::AsyncReadExt;
@@ -10,13 +8,6 @@ use tokio::process::Command;
 pub(crate) struct CommandOutcome {
     pub status: Option<std::process::ExitStatus>,
     pub output: OutputData,
-}
-
-pub(crate) fn output_store(ctx: &ToolCallContext) -> Arc<dyn OutputStore> {
-    if let Some(store) = &ctx.output_store {
-        return store.clone();
-    }
-    coda_output::Store::standalone()
 }
 
 pub(crate) fn preserve_error(
@@ -49,10 +40,10 @@ pub(crate) async fn run_command(
             output: OutputData::Inline(String::new()),
         });
     }
-    let store = output_store(&ctx);
+    let (store, owner) = coda_output::Store::session_or_standalone(ctx.outputs.as_ref());
     let mut capture = tokio::select! {
         _ = ctx.cancel.cancelled() => return Ok(CommandOutcome { status: None, output: OutputData::Inline(String::new()) }),
-        capture = store.begin(ctx.output_owner.clone(), vec![Channel::Stdout, Channel::Stderr], ctx.output_purpose.clone()) => capture.map_err(std::io::Error::other)?,
+        capture = store.begin(owner, vec![Channel::Stdout, Channel::Stderr], ctx.result_budget.capture_purpose()) => capture.map_err(std::io::Error::other)?,
     };
     if ctx.cancel.is_cancelled() {
         return Ok(CommandOutcome {

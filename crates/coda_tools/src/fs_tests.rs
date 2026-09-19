@@ -820,7 +820,7 @@ async fn invalid_bytes_cannot_push_a_first_line_past_the_budget() {
 
 async fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, bytes: usize) -> String {
     let mut context = ToolCallContext::default();
-    context.output_bytes = bytes;
+    context.result_budget = coda_core::output::ResultBudget::Model { page_bytes: bytes };
     let result = ReadFileTool::new()
         .execute(
             ReadFileToolParams {

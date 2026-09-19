@@ -133,7 +133,7 @@ async fn task_pages_advance_only_when_the_checkpoint_commits() {
         else {
             panic!("expected page")
         };
-        assert!(body.len() <= ctx.output_bytes);
+        assert!(body.len() <= ctx.result_budget.page_bytes());
         let OutputData::Page { body: repeated, .. } = tool
             .execute(
                 TaskOutputToolParams {

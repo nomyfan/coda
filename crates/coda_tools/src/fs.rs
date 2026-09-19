@@ -174,7 +174,7 @@ const LINE_OVERHEAD_BYTES: usize = 128;
 /// however large the file is, and stops at whichever comes first: `limit`
 /// lines or the output budget.
 async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
-    use coda_core::output::{CapturePurpose, HostResultBuffer, IO_BLOCK_BYTES};
+    use coda_core::output::{HostResultBuffer, IO_BLOCK_BYTES};
     use tokio::io::{AsyncBufReadExt, BufReader};
     let path = Path::new(&params.file_path);
     if !path.is_absolute() {
@@ -187,10 +187,7 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
             "offset and limit must be positive".into(),
         ));
     }
-    let bytes = match &ctx.output_purpose {
-        CapturePurpose::Foreground | CapturePurpose::Background => ctx.output_bytes,
-        CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
-    };
+    let bytes = ctx.result_budget.page_bytes();
     let budget = bytes.saturating_sub(FOOTER_BYTES);
     if budget <= LINE_OVERHEAD_BYTES {
         return Err(ToolError::ResourceLimit(
@@ -198,15 +195,11 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
         ));
     }
     let line_cap = MAX_LINE_BYTES.min(budget - LINE_OVERHEAD_BYTES);
-    let lease = match &ctx.output_purpose {
-        CapturePurpose::Foreground | CapturePurpose::Background => None,
-        CapturePurpose::Programmatic(budget) => Some(
-            budget
-                .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)
-                .await
-                .map_err(|e| ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}")))?,
-        ),
-    };
+    let lease = ctx
+        .result_budget
+        .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)
+        .await
+        .map_err(|e| ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}")))?;
     let file = open_regular_file(path, false).await?;
     let mut reader = BufReader::with_capacity(IO_BLOCK_BYTES, file);
     let first = params.offset.unwrap_or(1);

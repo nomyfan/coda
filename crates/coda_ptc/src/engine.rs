@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use coda_core::output::{BufferBudget, CapturePurpose};
+use coda_core::output::{BufferBudget, ResultBudget};
 use coda_core::tool::{
     HostCallScope, HostToolCallError, HostToolCallResult, HostToolInvoker, StagedToolCall,
 };
@@ -317,7 +317,7 @@ impl JsExecutor {
                         };
                         let staged_call = scope.begin_tool_call(call_cancel.clone());
                         let mut context = staged_call.context();
-                        context.output_purpose = CapturePurpose::Programmatic(result_budget.clone());
+                        context.result_budget = ResultBudget::Script(result_budget.clone());
                         let result = invoker
                             .call(request.name, request.arguments, context)
                             .await;

@@ -9,7 +9,7 @@ pub use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info, info_span};
 
 use super::llm::{ToolArtifact, ToolDefinition};
-use crate::output::{CapturePurpose, OutputData, OutputOwner, OutputStore};
+use crate::output::{OutputData, OutputRuntime, ReadReceipt, ResultBudget};
 
 /// A tool's durable state on the calling thread, keyed by an opaque `kind`.
 ///
@@ -144,17 +144,27 @@ pub struct ToolCallContext {
     pub state: Arc<dyn ThreadState>,
     /// Destination for presentation artifacts produced by this call.
     artifacts: Arc<dyn ArtifactSink>,
-    observed_task: Arc<std::sync::Mutex<Option<crate::task::TaskId>>>,
+    effects: Arc<std::sync::Mutex<CallEffects>>,
     /// Optional capability installed only for a programmatic runner call.
     invoker: Option<Arc<dyn HostToolInvoker>>,
-    pub output_store: Option<Arc<dyn OutputStore>>,
-    pub output_owner: OutputOwner,
-    pub output_purpose: CapturePurpose,
-    pub output_bytes: usize,
-    pub ptc_limits: Option<crate::output::PtcResourceLimits>,
-    failure_output: Arc<std::sync::Mutex<Option<OutputData>>>,
-    read_receipts: Arc<std::sync::Mutex<Vec<crate::output::ReadReceipt>>>,
-    prior_reads: Arc<[crate::output::ReadReceipt]>,
+    /// The session's output storage. `None` outside a session, where tools
+    /// fall back to a standalone store.
+    pub outputs: Option<OutputRuntime>,
+    pub result_budget: ResultBudget,
+    /// Task output read by earlier host calls in the same script and not yet
+    /// committed. Empty outside a script.
+    prior_reads: Arc<[ReadReceipt]>,
+}
+
+/// What a call records while it runs, drained by whoever settles it.
+#[derive(Default)]
+struct CallEffects {
+    /// Output kept for the failure report when the call errors.
+    failure_output: Option<OutputData>,
+    /// Task output this call read.
+    reads: Vec<ReadReceipt>,
+    /// Task whose complete terminal result this call returned.
+    observed_task: Option<crate::task::TaskId>,
 }
 
 impl ToolCallContext {
@@ -165,27 +175,21 @@ impl ToolCallContext {
             origin: crate::task::TaskOrigin::default(),
             state,
             artifacts: Arc::new(UnboundedArtifactSink::default()),
-            observed_task: Arc::default(),
+            effects: Arc::default(),
             invoker: None,
-            output_store: None,
-            output_owner: OutputOwner {
-                workspace_id: String::new(),
-                session_id: String::new(),
+            outputs: None,
+            result_budget: ResultBudget::Model {
+                page_bytes: crate::output::ModelOutputLimits::default().single_bytes,
             },
-            output_purpose: CapturePurpose::Foreground,
-            output_bytes: crate::output::ModelOutputLimits::default().single_bytes,
-            ptc_limits: None,
-            failure_output: Arc::default(),
-            read_receipts: Arc::default(),
             prior_reads: Arc::from([]),
         }
     }
 
-    pub fn record_reads(&self, receipts: Vec<crate::output::ReadReceipt>) {
-        self.read_receipts.lock().unwrap().extend(receipts);
+    pub fn record_reads(&self, receipts: Vec<ReadReceipt>) {
+        self.effects.lock().unwrap().reads.extend(receipts);
     }
-    pub fn take_reads(&self) -> Vec<crate::output::ReadReceipt> {
-        std::mem::take(&mut *self.read_receipts.lock().unwrap())
+    pub fn take_reads(&self) -> Vec<ReadReceipt> {
+        std::mem::take(&mut self.effects.lock().unwrap().reads)
     }
     pub fn read_offset(
         &self,
@@ -196,7 +200,7 @@ impl ToolCallContext {
         for read in self
             .prior_reads
             .iter()
-            .chain(self.read_receipts.lock().unwrap().iter())
+            .chain(self.effects.lock().unwrap().reads.iter())
         {
             if &read.task == task && read.channel == channel && read.start <= offset {
                 offset = offset.max(read.end);
@@ -206,21 +210,21 @@ impl ToolCallContext {
     }
 
     pub fn preserve_output(&self, output: OutputData) {
-        *self.failure_output.lock().unwrap() = Some(output);
+        self.effects.lock().unwrap().failure_output = Some(output);
     }
 
     pub fn take_failure_output(&self) -> Option<OutputData> {
-        self.failure_output.lock().unwrap().take()
+        self.effects.lock().unwrap().failure_output.take()
     }
 
     /// Record the complete terminal result returned by this task_output call.
     /// Delivery is acknowledged only when the runtime persists its tool result.
     pub fn record_task_result(&self, task_id: crate::task::TaskId) {
-        *self.observed_task.lock().expect("task result") = Some(task_id);
+        self.effects.lock().unwrap().observed_task = Some(task_id);
     }
 
     pub fn take_task_result(&self) -> Option<crate::task::TaskId> {
-        self.observed_task.lock().expect("task result").take()
+        self.effects.lock().unwrap().observed_task.take()
     }
 
     /// Install the narrowly scoped host-call capability for a runner tool.
@@ -356,15 +360,10 @@ impl HostCallScope {
             origin: self.0.outer.origin.clone(),
             state: state.clone(),
             artifacts: artifacts.clone(),
-            observed_task: Arc::default(),
+            effects: Arc::default(),
             invoker: None,
-            output_store: self.0.outer.output_store.clone(),
-            output_owner: self.0.outer.output_owner.clone(),
-            output_purpose: self.0.outer.output_purpose.clone(),
-            output_bytes: self.0.outer.output_bytes,
-            ptc_limits: self.0.outer.ptc_limits.clone(),
-            failure_output: Arc::default(),
-            read_receipts: Arc::default(),
+            outputs: self.0.outer.outputs.clone(),
+            result_budget: self.0.outer.result_budget.clone(),
             prior_reads: self
                 .0
                 .outer
