@@ -174,7 +174,7 @@ const LINE_OVERHEAD_BYTES: usize = 128;
 /// however large the file is, and stops at whichever comes first: `limit`
 /// lines or the output budget.
 async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
-    use coda_core::output::{HostResultBuffer, IO_BLOCK_BYTES};
+    use coda_core::output::{HostResultBuffer, IO_BLOCK_BYTES, OutputError};
     use tokio::io::{AsyncBufReadExt, BufReader};
     let path = Path::new(&params.file_path);
     if !path.is_absolute() {
@@ -190,16 +190,13 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
     let bytes = ctx.result_budget.page_bytes();
     let budget = bytes.saturating_sub(FOOTER_BYTES);
     if budget <= LINE_OVERHEAD_BYTES {
-        return Err(ToolError::ResourceLimit(
-            "OUTPUT_PAGE_LIMIT: no space for file content".into(),
-        ));
+        return Err(OutputError::PageLimit("no space for file content".into()).into());
     }
     let line_cap = MAX_LINE_BYTES.min(budget - LINE_OVERHEAD_BYTES);
     let lease = ctx
         .result_budget
         .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)
-        .await
-        .map_err(|e| ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}")))?;
+        .await?;
     let file = open_regular_file(path, false).await?;
     let mut reader = BufReader::with_capacity(IO_BLOCK_BYTES, file);
     let first = params.offset.unwrap_or(1);
@@ -275,9 +272,10 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
             // `line_cap` leaves room for the prefix and marker, so a first
             // line always fits; this only guards that arithmetic.
             if shown == 0 {
-                return Err(ToolError::ResourceLimit(
-                    "OUTPUT_PAGE_LIMIT: a single line does not fit the output budget".into(),
-                ));
+                return Err(OutputError::PageLimit(
+                    "a single line does not fit the output budget".into(),
+                )
+                .into());
             }
             break Some((line_no, format!("reached the {bytes}-byte output limit")));
         }

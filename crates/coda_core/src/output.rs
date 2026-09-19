@@ -76,10 +76,78 @@ impl ResultBudget {
         &self,
         bytes: usize,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Option<BufferLease>, BufferLimitError> {
+    ) -> Result<Option<BufferLease>, OutputError> {
         match self {
             Self::Model { .. } => Ok(None),
-            Self::Script(budget) => budget.reserve(bytes, cancel).await.map(Some),
+            Self::Script(budget) => Ok(Some(budget.reserve(bytes, cancel).await?)),
+        }
+    }
+}
+
+/// Why output could not be kept, read back or delivered. Scripts get
+/// [`code`](Self::code) as the error code; the `Display` text starts with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputError {
+    /// A buffer does not fit the memory budget it draws from.
+    Limit(String),
+    /// A page cannot fit its delivery budget.
+    PageLimit(String),
+    /// The response cannot fit the complete saved-file paths and metadata.
+    MetadataLimit,
+    /// The complete output was not kept, or reading it back failed.
+    Incomplete(String),
+    /// The saved files were removed after their retention period.
+    Expired,
+    /// Reading saved output did not finish in time.
+    ReadTimeout,
+    /// Delivery was cancelled after the tool had run.
+    Aborted(String),
+    /// A script's buffer reached the model: a runtime bug, not a tool failure.
+    Delivery,
+}
+
+impl OutputError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Limit(_) => "OUTPUT_LIMIT",
+            Self::PageLimit(_) => "OUTPUT_PAGE_LIMIT",
+            Self::MetadataLimit => "OUTPUT_METADATA_LIMIT",
+            Self::Incomplete(_) => "OUTPUT_INCOMPLETE",
+            Self::Expired => "OUTPUT_EXPIRED",
+            Self::ReadTimeout => "OUTPUT_READ_TIMEOUT",
+            Self::Aborted(_) => "OUTPUT_ABORTED",
+            Self::Delivery => "OUTPUT_DELIVERY",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = match self {
+            Self::Limit(detail)
+            | Self::PageLimit(detail)
+            | Self::Incomplete(detail)
+            | Self::Aborted(detail) => detail,
+            Self::MetadataLimit => "response cannot fit complete output paths",
+            Self::Expired => "retained file no longer exists",
+            Self::ReadTimeout => "reading saved output timed out",
+            Self::Delivery => "programmatic buffer reached the model boundary",
+        };
+        write!(f, "{}: {detail}", self.code())
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+impl From<BufferLimitError> for OutputError {
+    fn from(error: BufferLimitError) -> Self {
+        match error {
+            BufferLimitError::TooLarge => {
+                Self::Limit("the buffer does not fit the script's memory budget".into())
+            }
+            BufferLimitError::Cancelled => {
+                Self::Aborted("cancelled while waiting for buffer memory".into())
+            }
         }
     }
 }
@@ -102,7 +170,7 @@ pub trait OutputBuffer: Send + Sync + std::fmt::Debug {
         &'a self,
         budget: &'a BufferBudget,
         cancel: &'a tokio_util::sync::CancellationToken,
-    ) -> OutputFuture<'a, Result<HostResultBuffer, String>>;
+    ) -> OutputFuture<'a, Result<HostResultBuffer, OutputError>>;
 }
 
 /// A tool's result on its way out, before it is rendered for the model or
@@ -203,18 +271,12 @@ impl OutputData {
         self,
         budget: &BufferBudget,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<HostResultBuffer, String> {
+    ) -> Result<HostResultBuffer, OutputError> {
         match self {
             Self::Buffered(buffer) => Ok(buffer),
             Self::Inline(text) | Self::Page { body: text, .. } => {
-                let bytes = text
-                    .len()
-                    .checked_mul(2)
-                    .ok_or("OUTPUT_LIMIT: conversion size overflow")?;
-                let lease = budget
-                    .reserve(bytes, cancel)
-                    .await
-                    .map_err(|error| format!("OUTPUT_LIMIT: {error:?}"))?;
+                // A `String` is at most `isize::MAX` bytes, so doubling cannot overflow.
+                let lease = budget.reserve(text.len() * 2, cancel).await?;
                 Ok(HostResultBuffer {
                     text,
                     lease: Some(lease),
@@ -240,7 +302,7 @@ impl OutputBuffer for PrefixedBuffer {
         &'a self,
         budget: &'a BufferBudget,
         cancel: &'a tokio_util::sync::CancellationToken,
-    ) -> OutputFuture<'a, Result<HostResultBuffer, String>> {
+    ) -> OutputFuture<'a, Result<HostResultBuffer, OutputError>> {
         Box::pin(async move {
             let mut result = self.inner.materialize(budget, cancel).await?;
             result.text.insert_str(0, &self.prefix);
@@ -250,12 +312,12 @@ impl OutputBuffer for PrefixedBuffer {
 }
 
 pub trait OutputCapture: Send {
-    fn require_file(&mut self);
     fn set_deadline(&mut self, deadline: tokio::time::Instant);
     fn reader(&self) -> Arc<dyn OutputReader>;
     fn fail(&mut self, failure: StorageFailure);
-    /// The caller supplies at most IO_BLOCK_BYTES per append.
-    fn append(&mut self, channel: Channel, bytes: Vec<u8>) -> OutputFuture<'_, ()>;
+    /// Record `bytes` on `channel`. After storage fails or the deadline passes,
+    /// bytes are still counted and previewed but no longer saved.
+    fn append<'a>(&'a mut self, channel: Channel, bytes: &'a [u8]) -> OutputFuture<'a, ()>;
     fn finish(self: Box<Self>, deadline: tokio::time::Instant)
     -> OutputFuture<'static, OutputData>;
 }
@@ -336,7 +398,7 @@ pub trait OutputReader: Send + Sync {
         channel: Channel,
         offset: u64,
         bytes: usize,
-    ) -> OutputFuture<'_, Result<Vec<u8>, String>>;
+    ) -> OutputFuture<'_, Result<Vec<u8>, OutputError>>;
 }
 
 pub trait OutputStore: Send + Sync {
@@ -353,7 +415,7 @@ pub trait OutputStore: Send + Sync {
         owner: OutputOwner,
         channels: Vec<Channel>,
         purpose: CapturePurpose,
-    ) -> OutputFuture<'_, Result<Box<dyn OutputCapture>, String>>;
+    ) -> OutputFuture<'_, Result<Box<dyn OutputCapture>, OutputError>>;
     fn retain(
         &self,
         owner: OutputOwner,
@@ -598,7 +660,11 @@ impl OutputBuffer for UnavailableBuffer {
         &'a self,
         _: &'a BufferBudget,
         _: &'a tokio_util::sync::CancellationToken,
-    ) -> OutputFuture<'a, Result<HostResultBuffer, String>> {
-        Box::pin(async { Err("OUTPUT_INCOMPLETE: complete output was not retained".into()) })
+    ) -> OutputFuture<'a, Result<HostResultBuffer, OutputError>> {
+        Box::pin(async {
+            Err(OutputError::Incomplete(
+                "complete output was not retained".into(),
+            ))
+        })
     }
 }

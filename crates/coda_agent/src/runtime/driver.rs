@@ -437,35 +437,15 @@ impl HostToolInvoker for AgentToolInvoker {
                 }
             };
             let cancel = context.cancel.clone();
-            let result = tool.execute(arguments, context).await;
-            let result = match result {
-                Ok(output) => match output.materialize(&budget, &cancel).await {
-                    Ok(buffer) => {
-                        return Ok(HostToolCallResult {
-                            output: buffer.text,
-                            buffer_lease: buffer.lease,
-                        });
-                    }
-                    Err(error) => return Err(HostToolCallError::ResourceLimit(error)),
-                },
-                Err(error) => Err::<String, _>(error.error),
-            };
-            match result {
-                Ok(output) => Ok(HostToolCallResult {
-                    output,
-                    buffer_lease: None,
-                }),
-                Err(ToolError::InvalidParameters(message)) => {
-                    Err(HostToolCallError::InvalidParameters(message))
-                }
-                Err(ToolError::ExecutionError(message)) => {
-                    Err(HostToolCallError::Execution(message))
-                }
-                Err(ToolError::ResourceLimit(message)) => {
-                    Err(HostToolCallError::ResourceLimit(message))
-                }
-                Err(ToolError::Aborted(message)) => Err(HostToolCallError::Aborted(message)),
-            }
+            let output = tool
+                .execute(arguments, context)
+                .await
+                .map_err(|failure| HostToolCallError::from(failure.error))?;
+            let buffer = output.materialize(&budget, &cancel).await?;
+            Ok(HostToolCallResult {
+                output: buffer.text,
+                buffer_lease: buffer.lease,
+            })
         })
     }
 }
@@ -527,6 +507,10 @@ fn execute_javascript_tool_discovery(
                 Err(ToolError::Aborted(_)) => {
                     span.record("status", "error");
                     span.record("error_category", "aborted");
+                }
+                Err(ToolError::Output(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "output");
                 }
             }
             span.record("duration_ms", started.elapsed().as_millis() as u64);
@@ -1354,7 +1338,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             .await
             .unwrap_or_else(|error| coda_output::render::RenderedOutput {
                 delivery_error: true,
-                body: error,
+                body: error.to_string(),
                 references: vec![],
                 lease: None,
             });
@@ -1939,7 +1923,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         coda_output::render::bound_tool(store.as_ref(), owner.clone(), tool, bytes)
                             .await
                     {
-                        return self.generation_failed(error);
+                        return self.generation_failed(error.to_string());
                     }
                 }
                 _ => {}

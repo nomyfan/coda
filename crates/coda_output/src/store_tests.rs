@@ -31,18 +31,16 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
         .unwrap();
     for _ in 0..20 {
         capture
-            .append(Channel::Stdout, vec![b'a'; IO_BLOCK_BYTES])
+            .append(Channel::Stdout, &vec![b'a'; IO_BLOCK_BYTES])
             .await;
     }
-    capture
-        .append(Channel::Stdout, b"middle-marker".to_vec())
-        .await;
+    capture.append(Channel::Stdout, b"middle-marker").await;
     for _ in 0..20 {
         capture
-            .append(Channel::Stdout, vec![b'z'; IO_BLOCK_BYTES])
+            .append(Channel::Stdout, &vec![b'z'; IO_BLOCK_BYTES])
             .await;
     }
-    capture.append(Channel::Stderr, b"warning".to_vec()).await;
+    capture.append(Channel::Stderr, b"warning").await;
     let output = capture
         .finish(tokio::time::Instant::now() + FINALIZE_TIMEOUT)
         .await;
@@ -68,12 +66,10 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
         .unwrap();
     for _ in 0..128 {
         capture
-            .append(Channel::Stdout, vec![b'a'; IO_BLOCK_BYTES])
+            .append(Channel::Stdout, &vec![b'a'; IO_BLOCK_BYTES])
             .await;
     }
-    capture
-        .append(Channel::Stdout, b"tail-marker".to_vec())
-        .await;
+    capture.append(Channel::Stdout, b"tail-marker").await;
     let OutputData::Captured(output) = capture
         .finish(tokio::time::Instant::now() + FINALIZE_TIMEOUT)
         .await
@@ -90,7 +86,7 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
             .len(),
         1024 * 1024
     );
-    assert!(
+    assert!(matches!(
         output
             .buffer
             .materialize(
@@ -98,9 +94,9 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
                 &coda_core::tool::CancellationToken::new()
             )
             .await
-            .unwrap_err()
-            .contains("OUTPUT_INCOMPLETE")
-    );
+            .unwrap_err(),
+        OutputError::Incomplete(_)
+    ));
 }
 
 #[tokio::test]
@@ -113,7 +109,7 @@ async fn expired_finalization_does_not_publish_a_path() {
         .unwrap();
     for _ in 0..8 {
         capture
-            .append(Channel::Stdout, vec![b'x'; IO_BLOCK_BYTES])
+            .append(Channel::Stdout, &vec![b'x'; IO_BLOCK_BYTES])
             .await;
     }
     let OutputData::Captured(output) = capture
@@ -162,7 +158,7 @@ async fn programmatic_data_is_exact_and_has_no_history_reference() {
         .unwrap();
     for _ in 0..8 {
         capture
-            .append(Channel::Stdout, vec![b'x'; IO_BLOCK_BYTES])
+            .append(Channel::Stdout, &vec![b'x'; IO_BLOCK_BYTES])
             .await;
     }
     let output = capture
@@ -189,7 +185,7 @@ async fn every_seal_barrier_failure_returns_preview_without_a_reference() {
             .await
             .unwrap();
         capture
-            .append(Channel::Stdout, b"retained diagnostic".to_vec())
+            .append(Channel::Stdout, b"retained diagnostic")
             .await;
         *store.inner.hook.lock().unwrap() = Some((step, Box::new(|| Err(StorageFailure::Io))));
         let reader = capture.reader();
@@ -215,7 +211,7 @@ async fn timed_out_seal_keeps_inflight_bytes_charged_until_io_finishes() {
         .await
         .unwrap();
     capture
-        .append(Channel::Stdout, vec![b'x'; IO_BLOCK_BYTES])
+        .append(Channel::Stdout, &vec![b'x'; IO_BLOCK_BYTES])
         .await;
     let (entered, reached) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();

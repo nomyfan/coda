@@ -15,14 +15,16 @@ pub async fn render(
     owner: OutputOwner,
     output: OutputData,
     bytes: usize,
-) -> Result<RenderedOutput, String> {
+) -> Result<RenderedOutput, OutputError> {
     let output = match output {
         OutputData::Buffered(_) => {
-            return Err("OUTPUT_DELIVERY: programmatic buffer reached the model boundary".into());
+            return Err(OutputError::Delivery);
         }
         OutputData::Page { body, references } => {
             if body.len() > bytes {
-                return Err("OUTPUT_PAGE_LIMIT: page exceeds its assigned delivery budget".into());
+                return Err(OutputError::PageLimit(
+                    "page exceeds its assigned delivery budget".into(),
+                ));
             }
             return Ok(RenderedOutput {
                 delivery_error: false,
@@ -89,7 +91,7 @@ pub fn render_saved(
     failure: Option<StorageFailure>,
     report_ok: Option<bool>,
     bytes: usize,
-) -> Result<String, String> {
+) -> Result<String, OutputError> {
     let saved = describe_saved(references, failure.as_ref());
     let head = report_ok.map_or(String::new(), |ok| format!("ok: {ok}\n"));
     let captured: u64 = references
@@ -113,7 +115,7 @@ pub fn render_saved(
         text
     };
     if compose("", true).len() > bytes {
-        return Err("OUTPUT_METADATA_LIMIT: response cannot fit complete output paths".into());
+        return Err(OutputError::MetadataLimit);
     }
     let whole = compose(preview, false);
     if whole.len() <= bytes {
@@ -145,7 +147,7 @@ pub async fn bound_tool(
     owner: OutputOwner,
     tool: &mut coda_core::llm::ToolMessage,
     bytes: usize,
-) -> Result<(), String> {
+) -> Result<(), OutputError> {
     let body = match &mut tool.output {
         coda_core::llm::ToolOutput::Ok(body) | coda_core::llm::ToolOutput::Err(body) => body,
     };

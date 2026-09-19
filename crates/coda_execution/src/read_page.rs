@@ -1,5 +1,5 @@
 use crate::{BackgroundTasks, TaskAccessError, TaskId};
-use coda_core::output::{Channel, ReadProgress, ReadReceipt};
+use coda_core::output::{Channel, OutputError, ReadProgress, ReadReceipt};
 
 pub struct TaskPage {
     pub body: String,
@@ -82,9 +82,9 @@ impl BackgroundTasks {
         // Headings, one truncation line per channel and the saved-file lines.
         let metadata = body.len() + saved.len() + 512;
         if metadata + 24 > budget {
-            return Err(std::io::Error::other(
-                "OUTPUT_PAGE_LIMIT: budget cannot hold task metadata",
-            )
+            return Err(std::io::Error::other(OutputError::PageLimit(
+                "budget cannot hold task metadata".into(),
+            ))
             .into());
         }
         if snapshot.sealed && snapshot.reference.is_none() {
@@ -186,9 +186,9 @@ impl BackgroundTasks {
             body.push_str(&saved);
         }
         if body.len() > budget {
-            return Err(std::io::Error::other(
-                "OUTPUT_PAGE_LIMIT: task page exceeded the assigned budget",
-            )
+            return Err(std::io::Error::other(OutputError::PageLimit(
+                "task page exceeded the assigned budget".into(),
+            ))
             .into());
         }
         Ok(Some(TaskPage {

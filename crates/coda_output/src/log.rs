@@ -61,7 +61,7 @@ impl LogCollector {
                         chunk
                     };
                     let Some(chunk) = chunk else { break };
-                    runtime.block_on(capture.append(Channel::Log, chunk));
+                    runtime.block_on(capture.append(Channel::Log, &chunk));
                 }
                 let _ = complete.send(capture);
             })?;
@@ -90,12 +90,7 @@ impl LogCollector {
         match tokio::time::timeout_at(deadline, self.completion.take().unwrap()).await {
             Ok(Ok(mut capture)) => {
                 capture.set_deadline(deadline);
-                for chunk in report.as_bytes().chunks(IO_BLOCK_BYTES) {
-                    if tokio::time::Instant::now() >= deadline {
-                        capture.fail(coda_core::output::StorageFailure::FinalizeTimeout);
-                    }
-                    capture.append(Channel::ResultJson, chunk.to_vec()).await;
-                }
+                capture.append(Channel::ResultJson, report.as_bytes()).await;
                 capture.finish(deadline).await
             }
             _ => OutputData::unavailable(

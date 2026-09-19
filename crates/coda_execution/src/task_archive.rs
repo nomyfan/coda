@@ -364,7 +364,7 @@ impl TaskArchive {
             Ok(capture) => capture,
             Err(error) => {
                 return Err(CreateFailure::after_cleanup(
-                    ArchiveError::corrupt(error),
+                    ArchiveError::corrupt(error.to_string()),
                     rollback_created_task(self.root.clone(), id.clone(), task_dir).await,
                 ));
             }

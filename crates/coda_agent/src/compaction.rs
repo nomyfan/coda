@@ -323,7 +323,9 @@ pub async fn bounded_history(
             }
             Message::Tool(tool) => {
                 let bytes = slots.get(&tool.id).copied().unwrap_or(limits.single_bytes);
-                coda_output::render::bound_tool(store, owner.clone(), tool, bytes).await?;
+                coda_output::render::bound_tool(store, owner.clone(), tool, bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
             _ => {}
         }

@@ -125,8 +125,7 @@ impl Tool for RunJavaScriptTool {
                     vec![Channel::ResultJson, Channel::Log],
                     CapturePurpose::Foreground,
                 )
-                .await
-                .map_err(ToolError::ResourceLimit)?;
+                .await?;
             let logs = coda_output::log::LogCollector::start(
                 capture,
                 limits.capture_memory_bytes / 8,

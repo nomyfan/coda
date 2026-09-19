@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use coda_core::output::{
-    BufferBudget, OutputLimits, OutputRuntime, PtcResourceLimits, ResultBudget,
+    BufferBudget, OutputError, OutputLimits, OutputRuntime, PtcResourceLimits, ResultBudget,
     ptc_log_buffer_bytes,
 };
 use coda_core::tool::{
@@ -332,7 +332,7 @@ impl JsExecutor {
                                 if result.buffer_lease.is_none() {
                                     match result_budget.reserve(result.output.len().saturating_mul(2), &call_cancel).await {
                                         Ok(lease) => { result.buffer_lease = Some(lease); Ok(Delivery { result, staged: staged_call }) }
-                                        Err(error) => Err(BridgeCallError::new("OUTPUT_LIMIT", format!("tool executed; result delivery failed: {error:?}"))),
+                                        Err(error) => Err(bridge_call_error(OutputError::from(error).into())),
                                     }
                                 } else { Ok(Delivery { result, staged: staged_call }) }
                             }
@@ -408,17 +408,11 @@ fn bridge_call_error(error: HostToolCallError) -> BridgeCallError {
             BridgeCallError::new("INVALID_PARAMETERS", message)
         }
         HostToolCallError::Execution(message) => BridgeCallError::new("TOOL_ERROR", message),
-        HostToolCallError::ResourceLimit(message) => BridgeCallError::new(
-            if message.starts_with("OUTPUT_INCOMPLETE") {
-                "OUTPUT_INCOMPLETE"
-            } else if message.starts_with("OUTPUT_LIMIT") {
-                "OUTPUT_LIMIT"
-            } else {
-                "RESOURCE_LIMIT"
-            },
-            message,
-        ),
+        HostToolCallError::ResourceLimit(message) => {
+            BridgeCallError::new("RESOURCE_LIMIT", message)
+        }
         HostToolCallError::Aborted(message) => BridgeCallError::new("ABORTED", message),
+        HostToolCallError::Output(error) => BridgeCallError::new(error.code(), error.to_string()),
     }
 }
 
@@ -557,7 +551,7 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                                 // Count UTF-8 bytes while the value is still in the JS heap.
                                 let byte_length: Function = ctx.eval("s => { let n=0; for (const ch of s) { const c=ch.codePointAt(0); n += c<=127?1:c<=2047?2:c<=65535?3:4; } return n; }").map_err(js_init)?;
                                 let bytes: usize = byte_length.call((encoded.clone(),)).map_err(js_init)?;
-                                if bytes > limits.final_bytes { Ok(exception_report("OUTPUT_LIMIT", format!("final value exceeds {} bytes", limits.final_bytes))) }
+                                if bytes > limits.final_bytes { Ok(output_limit_report(format!("final value exceeds {} bytes", limits.final_bytes))) }
                                 else if outstanding_calls.load(Ordering::Acquire) != 0 { Ok(unawaited_calls_report(outstanding_calls.load(Ordering::Acquire))) }
                                 else {
                                     // Reserve parsing, JSON tree nodes and final report encoding together.
@@ -570,7 +564,7 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                                             report.buffer_lease = Some(lease);
                                             Ok(report)
                                         }
-                                        Err(_) => Ok(exception_report("OUTPUT_LIMIT", "final report cannot fit the native memory budget".into())),
+                                        Err(_) => Ok(output_limit_report("final report cannot fit the native memory budget".into())),
                                     }
                                 }
                             },
@@ -636,10 +630,9 @@ fn adjust_syntax_stack(mut stack: String) -> String {
 
 fn decode_report(encoded: &str, limit: usize) -> Result<JsRunReport, JsEngineError> {
     if encoded.len() > limit {
-        return Ok(exception_report(
-            "OUTPUT_LIMIT",
-            format!("final value exceeds {limit} bytes"),
-        ));
+        return Ok(output_limit_report(format!(
+            "final value exceeds {limit} bytes"
+        )));
     }
     #[derive(Deserialize)]
     struct WireReport {
@@ -661,6 +654,11 @@ fn decode_report(encoded: &str, limit: usize) -> Result<JsRunReport, JsEngineErr
 
 fn exception_report(code: &str, message: String) -> JsRunReport {
     exception_report_with_stack(code, message, None)
+}
+
+fn output_limit_report(detail: String) -> JsRunReport {
+    let error = OutputError::Limit(detail);
+    exception_report(error.code(), error.to_string())
 }
 
 fn exception_report_with_stack(code: &str, message: String, stack: Option<String>) -> JsRunReport {

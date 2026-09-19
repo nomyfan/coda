@@ -89,7 +89,7 @@ pub(crate) async fn run_command(
                     } else {
                         &err_block[..count]
                     };
-                    capture.append(channel, bytes.to_vec()).await;
+                    capture.append(channel, bytes).await;
                 }
             }
         }

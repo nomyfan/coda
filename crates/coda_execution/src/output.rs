@@ -1,7 +1,6 @@
 //! Task execution owns lifecycle; coda_output owns every payload byte.
 use coda_core::output::{
-    Channel, FINALIZE_TIMEOUT, IO_BLOCK_BYTES, OutputCapture, OutputData, OutputReader,
-    OutputSnapshot,
+    Channel, FINALIZE_TIMEOUT, OutputCapture, OutputData, OutputReader, OutputSnapshot,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -101,9 +100,7 @@ impl Stream {
             .writer
             .as_mut()
             .ok_or_else(|| std::io::Error::other("task output is sealed"))?;
-        for chunk in bytes.chunks(IO_BLOCK_BYTES) {
-            writer.append(self.channel, chunk.to_vec()).await;
-        }
+        writer.append(self.channel, bytes).await;
         // Storage exhaustion is recorded by the capture. It must not stop
         // draining the command's pipe or change its execution outcome.
         Ok(())

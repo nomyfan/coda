@@ -9,7 +9,7 @@ pub use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, info, info_span};
 
 use super::llm::{ToolArtifact, ToolDefinition};
-use crate::output::{OutputData, OutputRuntime, ReadReceipt, ResultBudget};
+use crate::output::{OutputData, OutputError, OutputRuntime, ReadReceipt, ResultBudget};
 
 /// A tool's durable state on the calling thread, keyed by an opaque `kind`.
 ///
@@ -86,6 +86,7 @@ pub enum HostToolCallError {
     Execution(String),
     ResourceLimit(String),
     Aborted(String),
+    Output(OutputError),
 }
 
 /// The only capability that lets a tool call another registered tool.
@@ -270,6 +271,8 @@ pub enum ToolError {
     /// The call observed cancellation and stopped early. The payload becomes
     /// the recorded tool result and may carry partial output.
     Aborted(String),
+    /// Output could not be kept, read back or delivered.
+    Output(OutputError),
 }
 
 impl Display for ToolError {
@@ -279,7 +282,37 @@ impl Display for ToolError {
             ToolError::ExecutionError(reason) => write!(f, "Execution error: {}", reason),
             ToolError::ResourceLimit(reason) => write!(f, "Resource limit: {}", reason),
             ToolError::Aborted(reason) => write!(f, "Aborted: {}", reason),
+            ToolError::Output(error) => write!(f, "{error}"),
         }
+    }
+}
+
+/// Cancellation surfaces as [`ToolError::Aborted`], so the call is recorded
+/// as aborted rather than failed.
+impl From<OutputError> for ToolError {
+    fn from(error: OutputError) -> Self {
+        match error {
+            OutputError::Aborted(_) => ToolError::Aborted(error.to_string()),
+            error => ToolError::Output(error),
+        }
+    }
+}
+
+impl From<ToolError> for HostToolCallError {
+    fn from(error: ToolError) -> Self {
+        match error {
+            ToolError::InvalidParameters(message) => Self::InvalidParameters(message),
+            ToolError::ExecutionError(message) => Self::Execution(message),
+            ToolError::ResourceLimit(message) => Self::ResourceLimit(message),
+            ToolError::Aborted(message) => Self::Aborted(message),
+            ToolError::Output(error) => Self::Output(error),
+        }
+    }
+}
+
+impl From<OutputError> for HostToolCallError {
+    fn from(error: OutputError) -> Self {
+        ToolError::from(error).into()
     }
 }
 
@@ -715,6 +748,10 @@ impl<T: Tool> ToolObject for ToolWrapper<T> {
                     Err(ToolError::Aborted(_)) => {
                         span.record("status", "error");
                         span.record("error_category", "aborted");
+                    }
+                    Err(ToolError::Output(_)) => {
+                        span.record("status", "error");
+                        span.record("error_category", "output");
                     }
                 };
                 span.record("duration_ms", started.elapsed().as_millis() as u64);

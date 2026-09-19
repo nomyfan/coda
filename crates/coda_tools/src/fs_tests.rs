@@ -362,6 +362,28 @@ async fn write_refuses_huge_file() {
 }
 
 #[tokio::test]
+async fn read_cancelled_while_waiting_for_script_memory_is_aborted() {
+    let path = tmp_file("read_cancelled", "hello\n");
+    let mut context = ToolCallContext::default();
+    context.result_budget =
+        coda_core::output::ResultBudget::Script(coda_core::output::BufferBudget::new(1 << 20));
+    context.cancel.cancel();
+    let error = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            },
+            context,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Aborted(_)), "{error:?}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
 async fn read_pages_huge_file() {
     let path = tmp_huge_file("huge_read");
     let tool = ReadFileTool::new();
