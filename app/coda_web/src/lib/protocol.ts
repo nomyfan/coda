@@ -66,7 +66,7 @@ export type ToolCallOutcome =
 export type OutputRef = {
   id: string;
   channels: {
-    channel: "stdout" | "stderr" | "result" | "log";
+    channel: "stdout" | "stderr" | "result" | "result_json" | "log";
     path: string;
     captured_bytes: number;
     saved_bytes: number;

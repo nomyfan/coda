@@ -269,23 +269,48 @@ pub struct OutputOwner {
     pub session_id: String,
 }
 
+/// One named stream of a saved output, stored as its own file.
+///
+/// Each producer uses a fixed set, so only these combinations occur:
+///
+/// - External commands (`shell`, and `grep`/`glob`/`ls`, which run `rg`/`fd`),
+///   foreground or background: `Stdout` + `Stderr`.
+/// - Any other tool result, and a background subagent's answer: `Result`.
+/// - `run_javascript`: `ResultJson` + `Log`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
+    /// A command's standard output.
     Stdout,
+    /// A command's standard error.
     Stderr,
+    /// A plain-text result: an oversized tool output or a subagent's answer.
     Result,
+    /// A `run_javascript` report (`ok`, `value` or `error`), as JSON.
+    ResultJson,
+    /// What a `run_javascript` script printed with `console.log`.
     Log,
 }
 
 impl Channel {
-    pub const ALL: [Self; 4] = [Self::Stdout, Self::Stderr, Self::Result, Self::Log];
+    /// Most channels the store accepts for one output. The producers listed
+    /// on [`Channel`] use at most two; this is the store's own bound.
+    pub const MAX_PER_OUTPUT: usize = 4;
+
+    pub const ALL: [Self; 5] = [
+        Self::Stdout,
+        Self::Stderr,
+        Self::Result,
+        Self::ResultJson,
+        Self::Log,
+    ];
 
     pub fn file_name(self) -> &'static str {
         match self {
             Self::Stdout => "stdout.txt",
             Self::Stderr => "stderr.txt",
-            Self::Result => "result.json",
+            Self::Result => "result.txt",
+            Self::ResultJson => "result.json",
             Self::Log => "log.txt",
         }
     }
@@ -294,7 +319,7 @@ impl Channel {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
-            Self::Result => "result",
+            Self::Result | Self::ResultJson => "result",
             Self::Log => "log",
         }
     }

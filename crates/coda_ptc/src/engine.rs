@@ -82,8 +82,6 @@ pub struct JsRunReport {
     pub value: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsErrorReport>,
-    pub stdout: String,
-    pub stdout_truncated: bool,
     pub completed_calls: usize,
 }
 
@@ -428,8 +426,6 @@ fn deadline_report() -> JsRunReport {
             message: "JavaScript execution exceeded its wall-clock deadline".to_string(),
             stack: None,
         }),
-        stdout: String::new(),
-        stdout_truncated: false,
         completed_calls: 0,
     }
 }
@@ -446,8 +442,6 @@ fn unawaited_calls_report(count: usize) -> JsRunReport {
             ),
             stack: None,
         }),
-        stdout: String::new(),
-        stdout_truncated: false,
         completed_calls: 0,
     }
 }
@@ -655,8 +649,6 @@ fn decode_report(encoded: &str, limit: usize) -> Result<JsRunReport, JsEngineErr
         ok: wire.ok,
         value: wire.value,
         error: wire.error,
-        stdout: String::new(),
-        stdout_truncated: false,
         completed_calls: 0,
     })
 }
@@ -675,8 +667,6 @@ fn exception_report_with_stack(code: &str, message: String, stack: Option<String
             message,
             stack,
         }),
-        stdout: String::new(),
-        stdout_truncated: false,
         completed_calls: 0,
     }
 }

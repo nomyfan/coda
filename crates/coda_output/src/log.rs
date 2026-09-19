@@ -94,12 +94,19 @@ impl LogCollector {
                     if tokio::time::Instant::now() >= deadline {
                         capture.fail(coda_core::output::StorageFailure::FinalizeTimeout);
                     }
-                    capture.append(Channel::Result, chunk.to_vec()).await;
+                    capture.append(Channel::ResultJson, chunk.to_vec()).await;
                 }
                 capture.finish(deadline).await
             }
             _ => OutputData::unavailable(
-                format!("{report}\n{}", self.snapshot().0),
+                {
+                    let (log, _) = self.snapshot();
+                    match (report.is_empty(), log.is_empty()) {
+                        (_, true) => report.to_owned(),
+                        (true, false) => format!("log:\n{log}"),
+                        (false, false) => format!("{report}\nlog:\n{log}"),
+                    }
+                },
                 coda_core::output::StorageFailure::FinalizeTimeout,
             ),
         }

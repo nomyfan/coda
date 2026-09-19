@@ -66,6 +66,7 @@ pub enum ArchiveFileName {
     Stderr,
     Log,
     OutputResult,
+    OutputResultJson,
     Meta,
     MetaTmp,
     StdoutRing,
@@ -81,7 +82,10 @@ impl ArchiveFileName {
             ArchiveFileName::Stdout => "stdout.txt",
             ArchiveFileName::Stderr => "stderr.txt",
             ArchiveFileName::Log => "log.txt",
-            ArchiveFileName::OutputResult => "result.json",
+            // Same name as the legacy `Result`, but that one only ever lives in
+            // a background task directory, never in an output object.
+            ArchiveFileName::OutputResult => "result.txt",
+            ArchiveFileName::OutputResultJson => "result.json",
             ArchiveFileName::Meta => "meta.json",
             ArchiveFileName::MetaTmp => "meta.json.tmp",
             ArchiveFileName::StdoutRing => "stdout.ring",

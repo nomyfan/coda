@@ -83,7 +83,8 @@ impl ModelOutputLimits {
     }
 
     /// Conservative body allowance shared by configuration checks and batch dispatch.
-    /// Includes one fully described four-channel reference plus 512 bytes for status,
+    /// Includes one fully described reference with the most channels an output
+    /// may hold (the longest-named ones) plus 512 bytes for status,
     /// continuation information and the response envelope; excludes preview text.
     pub fn minimum_response_bytes(output_root: &Path) -> Result<usize, String> {
         let id = OutputId(uuid::Uuid::nil());
@@ -92,11 +93,15 @@ impl ModelOutputLimits {
             .into_iter()
             .max_by_key(|value| value.to_string().len())
             .expect("timestamp bounds are nonempty");
+        // The worst case is the channels with the longest file names, as many
+        // as one output may hold.
+        let mut channels = Channel::ALL;
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.file_name().len()));
         let reference = OutputRef {
             id,
-            channels: Channel::ALL
-                .into_iter()
-                .map(|channel| OutputChannelRef {
+            channels: channels[..Channel::MAX_PER_OUTPUT]
+                .iter()
+                .map(|&channel| OutputChannelRef {
                     channel,
                     path: directory.join(channel.file_name()),
                     captured_bytes: u64::MAX,

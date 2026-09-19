@@ -149,13 +149,18 @@ fn scope() -> HostCallScope {
 }
 
 async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
+    run_logged(code, names, limits).await.0
+}
+
+/// Also returns the console log preview and whether it was cut short.
+async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunReport, String, bool) {
     use coda_core::output::{CapturePurpose, Channel, OutputStore};
     let invoker = Arc::new(FakeInvoker::new(names));
     let store = coda_output::Store::standalone();
     let capture = store
         .begin(
             coda_core::tool::ToolCallContext::default().output_owner,
-            vec![Channel::Result, Channel::Log],
+            vec![Channel::ResultJson, Channel::Log],
             CapturePurpose::ModelResult,
         )
         .await
@@ -167,7 +172,7 @@ async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
         std::time::Instant::now() + limits.wall_time,
     )
     .unwrap();
-    let mut report = JsExecutor::new(limits)
+    let report = JsExecutor::new(limits)
         .run(
             code.to_string(),
             invoker.exposed_tools(),
@@ -178,9 +183,9 @@ async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
         )
         .await
         .unwrap();
-    (report.stdout, report.stdout_truncated) = logs.snapshot();
+    let (log, truncated) = logs.snapshot();
     let _ = logs.finish("").await;
-    report
+    (report, log, truncated)
 }
 
 async fn run_with_tool_error(code: &str) -> JsRunReport {
@@ -215,7 +220,7 @@ async fn run_with_unavailable_tool(code: &str) -> JsRunReport {
 
 #[tokio::test]
 async fn returns_json_value_and_bounded_console_output() {
-    let report = run(
+    let (report, log, truncated) = run_logged(
         r#"
 console.log("hello", { answer: 42 });
 return { answer: 42 };
@@ -227,8 +232,10 @@ return { answer: 42 };
 
     assert!(report.ok);
     assert_eq!(report.value, Some(serde_json::json!({ "answer": 42 })));
-    assert_eq!(report.stdout, "hello {\"answer\":42}\n");
-    assert!(!report.stdout_truncated);
+    assert_eq!(log, "hello {\"answer\":42}\n");
+    assert!(!truncated);
+    // The log is kept apart from the report, not copied into it.
+    assert!(!serde_json::to_string(&report).unwrap().contains("hello"));
 }
 
 #[tokio::test]
@@ -657,16 +664,16 @@ async fn console_overflow_keeps_head_and_tail() {
         capture_memory_bytes: 64 * KIB,
         ..PtcLimits::default()
     };
-    let report = run(
+    let (_, log, truncated) = run_logged(
         "console.log('first'); console.log('x'.repeat(70000)); console.log('second'); return null;",
         &["read_file"],
         limits,
     )
     .await;
 
-    assert!(report.stdout.starts_with("first\n"));
-    assert!(report.stdout.ends_with("second\n"));
-    assert!(report.stdout_truncated);
+    assert!(log.starts_with("first\n"));
+    assert!(log.ends_with("second\n"));
+    assert!(truncated);
 }
 
 #[tokio::test]

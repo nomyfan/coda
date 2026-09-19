@@ -13,11 +13,12 @@ use crate::preview::Preview;
 const OBJECT_OVERHEAD: u64 = 32 * 1024;
 const MAX_MANIFEST: u64 = 8192;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
-const FILES: [FileName; 7] = [
+const FILES: [FileName; 8] = [
     FileName::OutputOwner,
     FileName::Stdout,
     FileName::Stderr,
     FileName::OutputResult,
+    FileName::OutputResultJson,
     FileName::Log,
     FileName::Meta,
     FileName::MetaTmp,
@@ -988,6 +989,7 @@ fn file_name(channel: Channel) -> FileName {
         Channel::Stdout => FileName::Stdout,
         Channel::Stderr => FileName::Stderr,
         Channel::Result => FileName::OutputResult,
+        Channel::ResultJson => FileName::OutputResultJson,
         Channel::Log => FileName::Log,
     }
 }
@@ -1078,7 +1080,7 @@ impl Store {
     ) -> OutputFuture<'_, Result<Box<dyn OutputCapture>, String>> {
         Box::pin(async move {
             if channels.is_empty()
-                || channels.len() > 4
+                || channels.len() > Channel::MAX_PER_OUTPUT
                 || channels
                     .iter()
                     .enumerate()

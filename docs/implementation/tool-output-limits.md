@@ -140,7 +140,7 @@ async fn materialize(&self, output: &OutputData, memory: &BufferBudget)
 - `OutputRef`：随机 OutputId、各通道稳定绝对路径、采集字节数、保存字节数、`complete`、丢失原因和封存/到期时间。ID 不编码用户路径、工作区或会话；manifest 记录创建它的工作区和会话，供配额计费。它是文件引用，不是访问控制凭证。
 - `ToolMessage.output` 保存最终有界展示字符串；新增 `output_refs` 及 `read_receipts`。output_refs 只含该对外结果通过封存屏障的引用；存储失败类别编码在有界响应的 `storage_failure` 及引用的 `failure` 中，不以残留文件名充当成功引用。引用不混入 FileDiff artifact 或成功工具状态，可随失败/取消结果保存；不得以工具失败为理由丢弃已保留输出。读取凭证列表支持一个 PTC 脚本完成多次读取，但不携带其原始内容。
 - 新增 `task_output_progress` 表，以 `(workspace_id, session_id, consumer_pid, task_id, channel)` 为键，保存连续已交付位置；只外键关联 session，避免 rewind 删除消息/进程时撤销交付事实。与消息及现有 `task_notice_receipts` 同事务更新；fork 不复制此表，会话删除级联删除。输出正文及输出对象元数据仍不建数据库表。
-- `<output-root>/objects/<output-id>/` 存小型 manifest 及普通通道文件（如 `stdout.txt`、`stderr.txt`、`result.json`），不使用 ring 布局或要求专用解码。待保留结果运行中为 `Writing`，完成封存后为 `Sealed`，失效为 `Expired`；manifest 标记的 Programmatic 临时对象不进入可靠封存状态，使用结束或重启恢复时清理，同样占用字节及对象数量配额。`complete` 与执行状态正交。无缺失的取消结果表示“采集到取消为止完整”，不表示命令执行完成。文件仅创建/追加，由服务封存后不再修改；本机同用户下的 shell 修改文件不属于存储的隔离保证。
+- `<output-root>/objects/<output-id>/` 存小型 manifest 及普通通道文件（如 `stdout.txt`、`stderr.txt`、`result.txt`（纯文本）、`result.json`（`run_javascript` 报告）），不使用 ring 布局或要求专用解码。待保留结果运行中为 `Writing`，完成封存后为 `Sealed`，失效为 `Expired`；manifest 标记的 Programmatic 临时对象不进入可靠封存状态，使用结束或重启恢复时清理，同样占用字节及对象数量配额。`complete` 与执行状态正交。无缺失的取消结果表示“采集到取消为止完整”，不表示命令执行完成。文件仅创建/追加，由服务封存后不再修改；本机同用户下的 shell 修改文件不属于存储的隔离保证。
 - 面向模型的小输出在内存内联；需要缩成预览时，在预览发布前尝试保存被省略的全文，成功才发布文件引用，失败则按 storage=Unavailable 提交预览。大输出超过采集缓存阈值时提前落盘；因此内存阈值与展示阈值不同也不会漏存。Programmatic 临时缓冲不因超过模型展示阈值而转为保留结果。
 - `OutputStore` 是进程级共享实例；统一配额锁管理正在写入的预留量、已保存量及清理量。每会话/每结果计数同一次预留更新，失败回滚；持有全局锁时不等待文件 IO，不同时持有多个结果锁。
 - 每会话配额按“由该会话生成的对象”计费，服务总配额按实际对象计费；fork 继承路径不产生额外字节，不重复收费。原会话删除后，残留对象继续计入其原始计费桶及服务总量，直到实际清理；配额索引不能随会话删除而归零。

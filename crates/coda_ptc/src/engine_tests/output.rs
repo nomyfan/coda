@@ -135,7 +135,7 @@ async fn synchronous_logs_drain_while_pending_delivery_holds_all_non_log_memory(
         let capture = store
             .begin(
                 ToolCallContext::default().output_owner,
-                vec![Channel::Result, Channel::Log],
+                vec![Channel::ResultJson, Channel::Log],
                 CapturePurpose::ModelResult,
             )
             .await
@@ -193,7 +193,7 @@ async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() 
     let capture = store
         .begin(
             ToolCallContext::default().output_owner,
-            vec![Channel::Result, Channel::Log],
+            vec![Channel::ResultJson, Channel::Log],
             CapturePurpose::ModelResult,
         )
         .await
@@ -251,4 +251,39 @@ async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() 
             .unwrap()
             .contains("middle-log")
     );
+}
+
+/// The model sees the report, then the script's log under its own heading;
+/// the log is never folded into the report JSON.
+#[tokio::test]
+async fn small_report_and_log_render_as_report_then_log() {
+    use coda_core::output::{Channel, OutputData, OutputStore};
+    for (logged, expected) in [
+        (true, "{\"ok\":true,\"value\":1}\nlog:\nhello\n"),
+        (false, "{\"ok\":true,\"value\":1}"),
+    ] {
+        let store = coda_output::Store::standalone();
+        let capture = store
+            .begin(
+                ToolCallContext::default().output_owner,
+                vec![Channel::ResultJson, Channel::Log],
+                CapturePurpose::ModelResult,
+            )
+            .await
+            .unwrap();
+        let logs = coda_output::log::LogCollector::start(
+            capture,
+            8192,
+            CancellationToken::new(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        if logged {
+            logs.writer().append("hello\n".into());
+        }
+        let OutputData::Inline(text) = logs.finish(r#"{"ok":true,"value":1}"#).await else {
+            panic!("expected inline output")
+        };
+        assert_eq!(text, expected);
+    }
 }

@@ -87,8 +87,10 @@ fn long_output_roots_require_room_for_all_channel_paths() {
 fn path_budget_counts_utf8_bytes_for_every_channel() {
     let short = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaa")).unwrap();
     let long = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaaa")).unwrap();
-    // Each extra path byte appears once in each of the four channel paths.
-    assert_eq!(long - short, 4 * 4);
+    // Each extra path byte appears once in each of the four channel paths an
+    // output may hold at most.
+    assert_eq!(long - short, 4 * Channel::MAX_PER_OUTPUT);
+    assert_eq!(Channel::MAX_PER_OUTPUT, 4);
     let unicode = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/中😀")).unwrap();
     let same_byte_length =
         ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaa")).unwrap();

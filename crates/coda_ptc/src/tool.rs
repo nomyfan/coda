@@ -122,7 +122,7 @@ impl Tool for RunJavaScriptTool {
             let capture = store
                 .begin(
                     ctx.output_owner.clone(),
-                    vec![Channel::Result, Channel::Log],
+                    vec![Channel::ResultJson, Channel::Log],
                     CapturePurpose::ModelResult,
                 )
                 .await
@@ -146,37 +146,25 @@ impl Tool for RunJavaScriptTool {
                     Some(logs.writer()),
                 )
                 .await;
-            let (stdout, stdout_truncated) = logs.snapshot();
-            let mut report = match result {
+            // The script's console output lives only in the log channel; the
+            // store renders it after the report under a `log:` heading.
+            let report = match result {
                 Ok(report) => report,
                 Err(error) => {
                     // The error message itself travels in the ToolError; only
-                    // the console output needs preserving next to it.
+                    // the log needs preserving next to it.
                     let output = logs.finish("").await;
-                    if !stdout.is_empty() {
-                        ctx.preserve_output(match output {
-                            OutputData::Inline(_) => {
-                                let mut body = format!("console output:\n{stdout}");
-                                if stdout_truncated {
-                                    body.push_str("\n[console output truncated: only the start and end were kept in memory]");
-                                }
-                                OutputData::Inline(body)
-                            }
-                            output => output,
-                        });
+                    if !matches!(&output, OutputData::Inline(text) if text.is_empty()) {
+                        ctx.preserve_output(output);
                     }
                     return Err(map_engine_error(error));
                 }
             };
-            report.stdout = stdout;
-            report.stdout_truncated = stdout_truncated;
             scope.commit_into_outer()?;
             let body = serde_json::to_string(&report).map_err(|error| {
                 ToolError::ExecutionError(format!("failed to serialize JavaScript report: {error}"))
             })?;
-            let output = logs.finish(&body).await;
-            Ok(match output {
-                OutputData::Inline(_) => OutputData::Inline(body),
+            Ok(match logs.finish(&body).await {
                 OutputData::Captured(mut output) => {
                     output.report_ok = Some(report.ok);
                     OutputData::Captured(output)
