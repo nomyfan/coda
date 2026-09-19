@@ -84,12 +84,11 @@ fn long_output_roots_require_room_for_all_channel_paths() {
 }
 
 #[test]
-fn path_budget_counts_utf8_bytes_and_json_escaping_for_every_channel() {
-    let plain = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaa")).unwrap();
-    let escaped = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/\"\\\n\t")).unwrap();
-    // Each of the four path characters acquires one extra JSON escape byte,
-    // in each of the four channel paths.
-    assert_eq!(escaped - plain, 4 * 4);
+fn path_budget_counts_utf8_bytes_for_every_channel() {
+    let short = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaa")).unwrap();
+    let long = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaaa")).unwrap();
+    // Each extra path byte appears once in each of the four channel paths.
+    assert_eq!(long - short, 4 * 4);
     let unicode = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/中😀")).unwrap();
     let same_byte_length =
         ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaa")).unwrap();

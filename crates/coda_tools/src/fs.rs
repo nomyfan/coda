@@ -124,12 +124,8 @@ pub struct ReadFileToolParams {
     file_path: String,
     /// The line number to start reading from (1-based). If not specified, reads from the beginning.
     offset: Option<usize>,
-    /// Maximum lines to read (default 200); large lines may require byte continuation.
+    /// Maximum lines to read (default 200). A page may stop earlier to fit the output budget.
     limit: Option<usize>,
-    /// Continue from this byte position instead of a line offset.
-    byte_offset: Option<u64>,
-    /// Version from the previous page; a changed file returns FILE_CHANGED.
-    expected_version: Option<String>,
 }
 
 impl ReadFileTool {
@@ -150,7 +146,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a bounded page from an absolute regular-file path. Defaults to at most 200 lines. Returns JSON with content, version and next_byte_offset; continue with byte_offset and expected_version. Line offset and byte_offset are mutually exclusive. The original file is mutable; FILE_CHANGED requires starting a new read. UTF-8 content is decoded lossily."
+        "Read lines from a file. The file_path must be an absolute path. Returns at most 200 lines by default, each prefixed with its 1-based line number and a tab; use offset (1-based line number) and limit to read other ranges. A page may stop earlier to fit the output budget, and ends with the offset to continue from. Lines longer than 2000 bytes are cut short; use grep or shell to see the rest. Content is decoded as UTF-8, with invalid bytes replaced."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -167,19 +163,23 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Longest line a page shows in full; grep or shell reach the rest of it.
+const MAX_LINE_BYTES: usize = 2000;
+/// Page budget held back for the continuation footer.
+const FOOTER_BYTES: usize = 128;
+/// Line budget held back for the line-number prefix and truncation marker.
+const LINE_OVERHEAD_BYTES: usize = 128;
+
+/// Streams the file instead of loading it, so a page costs its own size
+/// however large the file is, and stops at whichever comes first: `limit`
+/// lines or the output budget.
 async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
     use coda_core::output::{CapturePurpose, HostResultBuffer, IO_BLOCK_BYTES};
-    use std::os::unix::fs::MetadataExt;
     use tokio::io::{AsyncBufReadExt, BufReader};
     let path = Path::new(&params.file_path);
     if !path.is_absolute() {
         return Err(ToolError::InvalidParameters(
             "file_path must be an absolute path".into(),
-        ));
-    }
-    if params.byte_offset.is_some() && params.offset.is_some() {
-        return Err(ToolError::InvalidParameters(
-            "byte_offset and offset are mutually exclusive".into(),
         ));
     }
     if params.offset == Some(0) || params.limit == Some(0) {
@@ -191,6 +191,13 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
         CapturePurpose::ModelResult | CapturePurpose::Background => ctx.output_bytes,
         CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
     };
+    let budget = bytes.saturating_sub(FOOTER_BYTES);
+    if budget <= LINE_OVERHEAD_BYTES {
+        return Err(ToolError::ResourceLimit(
+            "OUTPUT_PAGE_LIMIT: no space for file content".into(),
+        ));
+    }
+    let line_cap = MAX_LINE_BYTES.min(budget - LINE_OVERHEAD_BYTES);
     let lease = match &ctx.output_purpose {
         CapturePurpose::ModelResult | CapturePurpose::Background => None,
         CapturePurpose::Programmatic(budget) => Some(
@@ -200,122 +207,99 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
                 .map_err(|e| ToolError::ResourceLimit(format!("OUTPUT_LIMIT: {e:?}")))?,
         ),
     };
-    let mut file = open_regular_file(path, false).await?;
-    let version_of = |meta: &std::fs::Metadata| {
-        format!(
-            "{}:{}:{}:{}:{}",
-            meta.dev(),
-            meta.ino(),
-            meta.len(),
-            meta.mtime(),
-            meta.mtime_nsec()
-        )
-    };
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-    let version = version_of(&metadata);
-    if params
-        .expected_version
-        .as_ref()
-        .is_some_and(|expected| expected != &version)
-    {
-        return Err(ToolError::ExecutionError(
-            "FILE_CHANGED: reopen the file without expected_version to start a new read".into(),
-        ));
-    }
-    let mut position = params.byte_offset.unwrap_or(0);
-    if position > metadata.len() {
-        return Err(ToolError::InvalidParameters(
-            "byte_offset is past the end of the file".into(),
-        ));
-    }
-    file.seek(std::io::SeekFrom::Start(position))
-        .await
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+    let file = open_regular_file(path, false).await?;
     let mut reader = BufReader::with_capacity(IO_BLOCK_BYTES, file);
-    let mut line = 1usize;
-    let target_line = params.offset.unwrap_or(1);
-    while line < target_line {
-        let buf = tokio::select! {
-            _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
-            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
-        };
-        if buf.is_empty() {
-            break;
-        }
-        let count = buf
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buf.len(), |index| {
-                line += 1;
-                index + 1
-            });
-        reader.consume(count);
-        position += count as u64;
-    }
-    let start = position;
-    let capacity = bytes.saturating_sub(512) / 6;
-    if capacity < 4 {
-        return Err(ToolError::ResourceLimit(
-            "OUTPUT_PAGE_LIMIT: no space for file content".into(),
-        ));
-    }
-    let mut raw = Vec::with_capacity(capacity);
-    let mut lines = 0;
+    let first = params.offset.unwrap_or(1);
     let max_lines = params.limit.unwrap_or(200);
-    while raw.len() < capacity && lines < max_lines {
-        let buf = tokio::select! {
+    let mut body = String::new();
+    let mut shown = 0;
+    let mut line_no = 1;
+    let mut raw = Vec::with_capacity(line_cap);
+    let next = loop {
+        let at_eof = tokio::select! {
             _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
-            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
+            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?.is_empty(),
         };
-        if buf.is_empty() {
-            break;
+        if at_eof {
+            break None;
         }
-        let mut count = 0;
-        for byte in buf.iter().take(capacity - raw.len()) {
-            count += 1;
-            if *byte == b'\n' {
-                lines += 1;
-                if lines == max_lines {
-                    break;
-                }
+        if shown == max_lines {
+            break Some((line_no, format!("reached the {max_lines}-line limit")));
+        }
+        // Read one line, keeping at most `line_cap` bytes of it; lines before
+        // the requested offset are only scanned.
+        raw.clear();
+        let mut dropped = 0;
+        loop {
+            let buf = tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
+                buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
+            };
+            if buf.is_empty() {
+                break;
+            }
+            let newline = buf.iter().position(|byte| *byte == b'\n');
+            let content = &buf[..newline.unwrap_or(buf.len())];
+            let keep = if line_no >= first {
+                (line_cap - raw.len()).min(content.len())
+            } else {
+                0
+            };
+            raw.extend_from_slice(&content[..keep]);
+            dropped += content.len() - keep;
+            let consumed = newline.map_or(buf.len(), |index| index + 1);
+            reader.consume(consumed);
+            if newline.is_some() {
+                break;
             }
         }
-        raw.extend_from_slice(&buf[..count]);
-        reader.consume(count);
-    }
-    if start + (raw.len() as u64) < metadata.len() {
-        // Only an incomplete UTF-8 suffix is deferred. Genuine invalid bytes
-        // inside the selected range remain visible through lossy decoding.
-        raw.truncate(coda_output::preview::page_boundary(&raw));
-    }
-    position = start + raw.len() as u64;
-    let after = reader
-        .get_ref()
-        .metadata()
-        .await
-        .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
-    if version_of(&after) != version {
-        return Err(ToolError::ExecutionError(
-            "FILE_CHANGED: file changed while reading this page".into(),
-        ));
-    }
-    let body = serde_json::json!({
-        "content": String::from_utf8_lossy(&raw),
-        "byte_offset": start,
-        "next_byte_offset": (position < metadata.len()).then_some(position),
-        "start_line": params.byte_offset.is_none().then_some(line),
-        "version": version,
-        "complete": position == metadata.len(),
-        "source": "mutable_file"
-    })
-    .to_string();
-    if body.len() > bytes {
-        return Err(ToolError::ResourceLimit(
-            "OUTPUT_PAGE_LIMIT: file page metadata exceeds the delivery budget".into(),
-        ));
+        if line_no < first {
+            line_no += 1;
+            continue;
+        }
+        if dropped == 0 && raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        if dropped > 0 {
+            // Cut at a character boundary rather than leave a split one.
+            let boundary = coda_output::preview::page_boundary(&raw);
+            dropped += raw.len() - boundary;
+            raw.truncate(boundary);
+        }
+        // Cap the decoded text, not the raw bytes: each invalid byte decodes to
+        // a three-byte replacement character.
+        let (text, used) = coda_output::preview::decode_within(&raw, line_cap);
+        dropped += raw.len() - used;
+        let mut entry = format!("{line_no:>6}\t{text}");
+        if dropped > 0 {
+            let _ = write!(
+                entry,
+                " [line truncated: longer than {line_cap} bytes, {dropped} more bytes omitted]"
+            );
+        }
+        let separator = usize::from(shown > 0);
+        if body.len() + separator + entry.len() > budget {
+            // `line_cap` leaves room for the prefix and marker, so a first
+            // line always fits; this only guards that arithmetic.
+            if shown == 0 {
+                return Err(ToolError::ResourceLimit(
+                    "OUTPUT_PAGE_LIMIT: a single line does not fit the output budget".into(),
+                ));
+            }
+            break Some((line_no, format!("reached the {bytes}-byte output limit")));
+        }
+        if separator == 1 {
+            body.push('\n');
+        }
+        body.push_str(&entry);
+        shown += 1;
+        line_no += 1;
+    };
+    if let Some((next, reason)) = next {
+        let _ = write!(
+            body,
+            "\n[page truncated: {reason}; continue with offset={next}]"
+        );
     }
     if lease.is_some() {
         Ok(OutputData::Buffered(HostResultBuffer { text: body, lease }))
@@ -457,8 +441,9 @@ pub struct EditFileToolParams {
     /// The absolute path to the file to edit.
     file_path: String,
     /// The exact text to replace. Must match the file content exactly, including
-    /// indentation and whitespace. Use raw `content` from `read_file`. Unless
-    /// `replace_all` is true, this text must be unique in the file.
+    /// indentation and whitespace. Do NOT include the line-number prefix produced
+    /// by `read_file`. Unless `replace_all` is true, this text must be unique in
+    /// the file.
     old_string: String,
     /// The text to replace `old_string` with.
     new_string: String,
@@ -484,7 +469,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit an existing file by replacing an exact string. The file_path must be an absolute path and the file must be UTF-8 text. `old_string` must match the file content exactly (including whitespace and indentation); use the raw content returned by read_file. Unless `replace_all` is true, `old_string` must appear exactly once. To create a new file use write_file instead."
+        "Edit an existing file by replacing an exact string. The file_path must be an absolute path and the file must be UTF-8 text. `old_string` must match the file content exactly (including whitespace and indentation) and must NOT include the line-number prefix from read_file. Unless `replace_all` is true, `old_string` must appear exactly once. To create a new file use write_file instead."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -725,7 +710,15 @@ impl Tool for ListDirectoryTool {
                 .await
                 .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
             match output.status {
-                Some(status) if status.success() => Ok(output.output),
+                Some(status) if status.success() => {
+                    if matches!(&output.output, OutputData::Inline(text) if text.is_empty()) {
+                        Ok("Directory is empty or all entries are ignored."
+                            .to_string()
+                            .into())
+                    } else {
+                        Ok(output.output)
+                    }
+                }
                 Some(_) => Err(preserve_error(
                     &ctx,
                     ToolError::ExecutionError("fd failed".into()),

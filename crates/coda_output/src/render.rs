@@ -66,12 +66,12 @@ pub async fn render(
         }
         OutputData::Inline(body) | OutputData::Page { body, .. } => {
             // Even a store initialization failure cannot bypass the model limit.
-            let mut preview = Preview::new(bytes.saturating_sub(128));
+            let mut preview = Preview::new(bytes.saturating_sub(192));
             preview.append(body.as_bytes());
             Ok(RenderedOutput {
                 delivery_error: false,
                 body: format!(
-                    "{}\n[Complete output was not retained: storage unavailable]",
+                    "{}\n[output truncated: longer than the {bytes}-byte output limit]\n[full output was not saved: storage is unavailable]",
                     preview.text()
                 ),
                 references: vec![],
@@ -81,6 +81,8 @@ pub async fn render(
     }
 }
 
+/// Fits a preview and the saved-file description into `bytes` as plain text.
+/// The file lines always remain whole; only the preview is shortened.
 pub fn render_saved(
     preview: &str,
     references: &[OutputRef],
@@ -88,33 +90,43 @@ pub fn render_saved(
     report_ok: Option<bool>,
     bytes: usize,
 ) -> Result<String, String> {
-    let mut envelope =
-        serde_json::json!({ "preview": "", "output_refs": references, "storage_failure": failure });
-    if let Some(ok) = report_ok {
-        envelope["ok"] = ok.into();
-        envelope.as_object_mut().unwrap().remove("preview");
-        envelope["value_preview"] = "".into();
-    }
-    let preview_key = if report_ok.is_some() {
-        "value_preview"
-    } else {
-        "preview"
+    let saved = describe_saved(references, failure.as_ref());
+    let head = report_ok.map_or(String::new(), |ok| format!("ok: {ok}\n"));
+    let captured: u64 = references
+        .iter()
+        .flat_map(|reference| &reference.channels)
+        .map(|channel| channel.captured_bytes)
+        .sum();
+    let compose = |shown: &str, cut: bool| {
+        let mut text = format!("{head}{shown}");
+        if cut {
+            text.push_str(&format!(
+                "\n[output truncated: longer than the {bytes}-byte output limit]"
+            ));
+        } else if captured > shown.len() as u64 {
+            text.push_str("\n[output truncated: only the start and end were kept in memory]");
+        }
+        if !saved.is_empty() {
+            text.push('\n');
+            text.push_str(&saved);
+        }
+        text
     };
-    let empty = serde_json::to_string(&envelope)
-        .map_err(|e| e.to_string())?
-        .len();
-    if empty > bytes {
+    if compose("", true).len() > bytes {
         return Err("OUTPUT_METADATA_LIMIT: response cannot fit complete output paths".into());
+    }
+    let whole = compose(preview, false);
+    if whole.len() <= bytes {
+        return Ok(whole);
     }
     let mut low = 0;
     let mut high = preview.len();
-    let mut best = serde_json::to_string(&envelope).unwrap();
+    let mut best = compose("", true);
     while low <= high {
         let capacity = low + (high - low) / 2;
         let mut bounded = Preview::new(capacity);
         bounded.append(preview.as_bytes());
-        envelope[preview_key] = bounded.text().into();
-        let candidate = serde_json::to_string(&envelope).unwrap();
+        let candidate = compose(&bounded.text(), true);
         if candidate.len() <= bytes {
             best = candidate;
             low = capacity + 1;
@@ -156,4 +168,72 @@ pub async fn bound_tool(
         render_saved(body, &tool.output_refs, None, None, bytes)?
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference(captured: u64, saved: u64, failure: Option<StorageFailure>) -> OutputRef {
+        OutputRef {
+            id: OutputId::default(),
+            channels: vec![OutputChannelRef {
+                channel: Channel::Stdout,
+                path: "/out/objects/x/stdout.txt".into(),
+                captured_bytes: captured,
+                saved_bytes: saved,
+            }],
+            complete: failure.is_none(),
+            failure,
+            sealed_at: jiff::Timestamp::UNIX_EPOCH,
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn oversized_output_is_plain_text_with_reason_and_paths() {
+        let preview = "a".repeat(2000);
+        let text = render_saved(&preview, &[reference(2000, 2000, None)], None, None, 600).unwrap();
+        assert!(text.len() <= 600);
+        assert!(text.starts_with("aaa"));
+        assert!(text.contains("bytes omitted"));
+        assert!(text.contains("\n[output truncated: longer than the 600-byte output limit]"));
+        assert!(text.contains("\n[stdout saved to /out/objects/x/stdout.txt (2000 bytes)]"));
+        assert!(text.ends_with("[saved output expires at 1970-01-01T00:00:00Z]"));
+    }
+
+    #[test]
+    fn empty_channels_are_not_listed() {
+        let mut saved = reference(2000, 2000, None);
+        saved.channels.push(OutputChannelRef {
+            channel: Channel::Stderr,
+            path: "/out/objects/x/stderr.txt".into(),
+            captured_bytes: 0,
+            saved_bytes: 0,
+        });
+        let text = render_saved("abc", &[saved], None, None, 4096).unwrap();
+        assert!(text.contains("stdout.txt"));
+        assert!(!text.contains("stderr"));
+    }
+
+    #[test]
+    fn partial_saves_and_missing_saves_say_why() {
+        let partial = render_saved(
+            "abc",
+            &[reference(9000, 100, Some(StorageFailure::SessionQuota))],
+            None,
+            None,
+            4096,
+        )
+        .unwrap();
+        assert!(partial.contains("(100 of 9000 bytes)"));
+        assert!(
+            partial.contains("[saved output is incomplete: the session disk quota was reached]")
+        );
+        let missing = render_saved("abc", &[], Some(StorageFailure::Io), Some(true), 4096).unwrap();
+        assert_eq!(
+            missing,
+            "ok: true\nabc\n[full output was not saved: writing to disk failed]"
+        );
+    }
 }

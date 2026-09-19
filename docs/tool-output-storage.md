@@ -8,7 +8,7 @@ Configure `[resources.output]`, `[resources.output.model]` and `[resources.ptc]`
 
 Set `resources.output.root` to a stable absolute path on persistent local storage. Relative paths resolve against the configuration file, and `${VAR}` expansion is supported. The default uses the OS temporary directory and is intended for local development. One service process holds the root lock; do not share the directory between independent server instances. Startup inventories all objects before admitting writes, including objects belonging to sessions that have not been opened.
 
-Saved results contain ordinary files under `objects/<id>/`. Tools and the dashboard show server-local absolute paths. Use `read_file` with its byte continuation and version, `grep`, or `shell` to inspect retained content. Existing filesystem permissions and tool approval rules still apply; the output root is not a new access-control boundary.
+Saved results contain ordinary files under `objects/<id>/`. Tools and the dashboard show server-local absolute paths. Use `read_file` with a line `offset`, `grep`, or `shell` to inspect retained content; `read_file` cuts lines longer than 2000 bytes, so use `grep` or `shell` for the rest of a very long line. Existing filesystem permissions and tool approval rules still apply; the output root is not a new access-control boundary.
 
 The default retention is 24 hours. Expired objects are cleaned every 60 seconds in bounded batches; quota pressure may evict unpinned objects sooner. Payload, metadata and in-flight reservations count against storage limits. Active writers and results awaiting checkpoint cannot be evicted. Deletion failures remain charged and are retried.
 
@@ -20,7 +20,7 @@ A command keeps running when saved output reaches a quota or a write fails. The 
 
 Cancellation terminates execution immediately, then allows bounded pipe draining and a shared one-second output finalization deadline. On healthy storage, already-captured intermediate log lines remain accessible through the retained path. Cancelled tool effects are not committed just because their logs were saved.
 
-PTC receives original intermediate tool values within its native-buffer and JS-heap limits, without a cumulative result-volume cap. Intermediate command spills are temporary and are removed after delivery or failure. Synchronous console output has its own reserved, independently drained queue. The final report and explicit logs use the same output boundary as other tools; oversized model responses remain valid JSON envelopes with paths. An output delivery failure does not undo a host tool's external effects or authorize an automatic retry.
+PTC receives original intermediate tool values within its native-buffer and JS-heap limits, without a cumulative result-volume cap. Intermediate command spills are temporary and are removed after delivery or failure. Synchronous console output has its own reserved, independently drained queue. The final report and explicit logs use the same output boundary as other tools; oversized model responses become a plain-text preview followed by one-line notes giving the truncation reason and the saved file paths. An output delivery failure does not undo a host tool's external effects or authorize an automatic retry.
 
 ## Background output and upgrades
 

@@ -59,7 +59,7 @@ impl Tool for TaskOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Read a bounded page from a background task. Shell reads advance per caller after successful delivery. Subagent answers start at byte zero unless byte_offset is supplied; use next_byte_offset to continue. Direct file and dashboard reads do not acknowledge task completion."
+        "Read a background task: its status, then new stdout/stderr for a shell task or the final answer for a subagent. Output longer than the page ends with a truncation note: call again for more shell output (reads advance per caller), or pass the byte_offset it names to continue a subagent answer, which otherwise starts from the beginning and can be read repeatedly. Reading saved files directly or through the dashboard does not mark the task as read."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {

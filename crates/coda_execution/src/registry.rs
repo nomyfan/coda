@@ -1584,12 +1584,27 @@ impl BackgroundTasks {
             .await?
             .unwrap();
         self.commit_reads(&page.receipts).await;
-        let value: serde_json::Value = serde_json::from_str(&page.body).unwrap();
         Ok(Some(TaskRead {
             status,
-            stdout: value["stdout"].as_str().unwrap_or_default().into(),
-            stderr: value["stderr"].as_str().unwrap_or_default().into(),
+            stdout: page_section(&page.body, "stdout (new):"),
+            stderr: page_section(&page.body, "stderr (new):"),
             complete: page.complete,
         }))
     }
+}
+
+/// The text under `heading` in a task page, up to the next heading or note.
+/// Test pages never contain those markers themselves.
+#[cfg(test)]
+pub(crate) fn page_section(body: &str, heading: &str) -> String {
+    let Some(start) = body.find(&format!("\n{heading}\n")) else {
+        return String::new();
+    };
+    let rest = &body[start + heading.len() + 2..];
+    let end = ["\nstderr (new):\n", "\n[", "\n(no new output)"]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].to_owned()
 }

@@ -134,7 +134,6 @@ async fn task_pages_advance_only_when_the_checkpoint_commits() {
             panic!("expected page")
         };
         assert!(body.len() <= ctx.output_bytes);
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         let OutputData::Page { body: repeated, .. } = tool
             .execute(
                 TaskOutputToolParams {
@@ -149,10 +148,17 @@ async fn task_pages_advance_only_when_the_checkpoint_commits() {
             panic!("expected page")
         };
         assert_eq!(body, repeated, "an uncommitted read must be retryable");
-        read.push_str(value["stdout"].as_str().unwrap());
         let receipts = ctx.take_reads();
-        done = value["complete"] == true;
-        assert_eq!(receipts.iter().all(|r| r.complete), done);
+        let stdout = receipts
+            .iter()
+            .find(|r| r.channel == Channel::Stdout)
+            .unwrap();
+        let heading = "\nstdout (new):\n";
+        if stdout.end > stdout.start {
+            let start = body.find(heading).unwrap() + heading.len();
+            read.push_str(&body[start..][..(stdout.end - stdout.start) as usize]);
+        }
+        done = receipts.iter().all(|r| r.complete);
         background.commit_reads(&receipts).await;
         if done {
             break;

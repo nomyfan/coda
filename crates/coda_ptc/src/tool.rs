@@ -150,12 +150,21 @@ impl Tool for RunJavaScriptTool {
             let mut report = match result {
                 Ok(report) => report,
                 Err(error) => {
-                    let body = serde_json::json!({"ok": false, "error": {"code": if matches!(error, crate::engine::JsEngineError::Aborted(_)) { "ABORTED" } else { "EXECUTION_ERROR" }, "message": error.to_string()}, "stdout": stdout, "stdout_truncated": stdout_truncated}).to_string();
-                    let output = logs.finish(&body).await;
-                    ctx.preserve_output(match output {
-                        OutputData::Inline(_) => OutputData::Inline(body),
-                        output => output,
-                    });
+                    // The error message itself travels in the ToolError; only
+                    // the console output needs preserving next to it.
+                    let output = logs.finish("").await;
+                    if !stdout.is_empty() {
+                        ctx.preserve_output(match output {
+                            OutputData::Inline(_) => {
+                                let mut body = format!("console output:\n{stdout}");
+                                if stdout_truncated {
+                                    body.push_str("\n[console output truncated: only the start and end were kept in memory]");
+                                }
+                                OutputData::Inline(body)
+                            }
+                            output => output,
+                        });
+                    }
                     return Err(map_engine_error(error));
                 }
             };

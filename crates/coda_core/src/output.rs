@@ -289,6 +289,15 @@ impl Channel {
             Self::Log => "log.txt",
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Result => "result",
+            Self::Log => "log",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +310,20 @@ pub enum StorageFailure {
     Io,
     FinalizeTimeout,
     Incomplete,
+}
+
+impl std::fmt::Display for StorageFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResultLimit => "the per-result size limit was reached",
+            Self::SessionQuota => "the session disk quota was reached",
+            Self::ServiceQuota => "the service disk quota was reached",
+            Self::ObjectLimit => "the saved output count limit was reached",
+            Self::Io => "writing to disk failed",
+            Self::FinalizeTimeout => "saving timed out",
+            Self::Incomplete => "the capture was incomplete",
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +343,48 @@ pub struct OutputRef {
     pub failure: Option<StorageFailure>,
     pub sealed_at: jiff::Timestamp,
     pub expires_at: jiff::Timestamp,
+}
+
+/// Plain-text lines telling the model where retained output lives, how much of
+/// it was saved and why any is missing. `failure` covers output that has no
+/// reference, or a failure its references do not already report.
+pub fn describe_saved(references: &[OutputRef], failure: Option<&StorageFailure>) -> String {
+    let mut lines = Vec::new();
+    for reference in references {
+        // An empty channel still has a file, but naming it tells the model nothing.
+        for channel in reference.channels.iter().filter(|c| c.captured_bytes > 0) {
+            let size = if channel.saved_bytes == channel.captured_bytes {
+                format!("{} bytes", channel.captured_bytes)
+            } else {
+                format!(
+                    "{} of {} bytes",
+                    channel.saved_bytes, channel.captured_bytes
+                )
+            };
+            lines.push(format!(
+                "[{} saved to {} ({size})]",
+                channel.channel.name(),
+                channel.path.display()
+            ));
+        }
+        if let Some(failure) = &reference.failure {
+            lines.push(format!("[saved output is incomplete: {failure}]"));
+        }
+        lines.push(format!(
+            "[saved output expires at {}]",
+            reference.expires_at
+        ));
+    }
+    if let Some(failure) = failure
+        && !references.iter().any(|r| r.failure.is_some())
+    {
+        lines.push(if references.is_empty() {
+            format!("[full output was not saved: {failure}]")
+        } else {
+            format!("[saved output is incomplete: {failure}]")
+        });
+    }
+    lines.join("\n")
 }
 
 #[derive(Clone)]

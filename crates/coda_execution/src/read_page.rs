@@ -77,11 +77,10 @@ impl BackgroundTasks {
             }
             status_text.truncate(end);
         }
-        while serde_json::to_string(&status_text).unwrap().len() > 128 {
-            status_text.pop();
-        }
-        let mut body = serde_json::json!({"task": id, "status": status_text, "stdout": "", "stderr": "", "next_byte_offset": null, "complete": false, "output_refs": reference, "storage_failure": snapshot.failure});
-        let metadata = body.to_string().len() + 128;
+        let mut body = format!("status: {status_text}");
+        let saved = coda_core::output::describe_saved(&reference, snapshot.failure.as_ref());
+        // Headings, one truncation line per channel and the saved-file lines.
+        let metadata = body.len() + saved.len() + 512;
         if metadata + 24 > budget {
             return Err(std::io::Error::other(
                 "OUTPUT_PAGE_LIMIT: budget cannot hold task metadata",
@@ -89,17 +88,18 @@ impl BackgroundTasks {
             .into());
         }
         if snapshot.sealed && snapshot.reference.is_none() {
-            body["storage_failure"] = serde_json::to_value(
-                snapshot
-                    .failure
-                    .unwrap_or(coda_core::output::StorageFailure::Incomplete),
-            )
-            .unwrap();
-            let mut preview = coda_output::preview::Preview::new((budget - metadata) / 6);
+            let failure = snapshot
+                .failure
+                .unwrap_or(coda_core::output::StorageFailure::Incomplete);
+            let mut preview = coda_output::preview::Preview::new(budget - metadata);
             preview.append(snapshot.preview.as_bytes());
-            body["stdout"] = preview.text().into();
+            body.push_str(&format!(
+                "\noutput preview:\n{}\n{}",
+                preview.text(),
+                coda_core::output::describe_saved(&[], Some(&failure))
+            ));
             return Ok(Some(TaskPage {
-                body: body.to_string(),
+                body,
                 references: reference,
                 receipts: vec![],
                 complete: false,
@@ -114,8 +114,10 @@ impl BackgroundTasks {
         } else {
             &[Channel::Stdout, Channel::Stderr]
         };
-        let raw_budget = (budget - metadata) / 6 / channels.len();
+        let share = (budget - metadata) / channels.len();
         let mut receipts = Vec::new();
+        let mut notes = Vec::new();
+        let mut shown_any = false;
         let mut complete = !status.is_running() && snapshot.failure.is_none();
         for (index, channel) in channels.iter().enumerate() {
             let position_index = if subagent { 2 } else { index };
@@ -129,21 +131,34 @@ impl BackgroundTasks {
                 Channel::Stderr => &record.files().stderr,
                 _ => &record.files().result,
             };
-            let page = stream.read_from(start, raw_budget).await?;
-            let end = start + page.bytes.len() as u64;
+            let page = stream.read_from(start, share).await?;
+            let (text, used) = coda_output::preview::decode_within(&page.bytes, share);
+            let end = start + used as u64;
             let total = snapshot
                 .channels
                 .iter()
                 .find(|c| c.channel == *channel)
                 .map_or(0, |c| c.captured);
             complete &= end >= total && start <= positions[position_index];
-            body[if *channel == Channel::Stderr {
-                "stderr"
-            } else {
-                "stdout"
-            }] = String::from_utf8_lossy(&page.bytes).into_owned().into();
-            if subagent && end < total {
-                body["next_byte_offset"] = end.into();
+            if !text.is_empty() {
+                shown_any = true;
+                let heading = match (channel, start) {
+                    (Channel::Result, 0) => "result:".to_owned(),
+                    (Channel::Result, _) => format!("result (from byte {start}):"),
+                    _ => format!("{} (new):", channel.name()),
+                };
+                body.push_str(&format!("\n{heading}\n{text}"));
+            }
+            if end < total {
+                let next = if subagent {
+                    format!("continue with byte_offset={end}")
+                } else {
+                    "call task_output again for the rest".to_owned()
+                };
+                notes.push(format!(
+                    "[{} truncated: longer than the {budget}-byte output limit; {next}]",
+                    channel.name()
+                ));
             }
             receipts.push(ReadReceipt {
                 consumer: consumer.into(),
@@ -159,8 +174,17 @@ impl BackgroundTasks {
         for receipt in &mut receipts {
             receipt.complete = complete;
         }
-        body["complete"] = complete.into();
-        let body = body.to_string();
+        if !shown_any {
+            body.push_str("\n(no new output)");
+        }
+        for note in notes {
+            body.push('\n');
+            body.push_str(&note);
+        }
+        if !saved.is_empty() {
+            body.push('\n');
+            body.push_str(&saved);
+        }
         if body.len() > budget {
             return Err(std::io::Error::other(
                 "OUTPUT_PAGE_LIMIT: task page exceeded the assigned budget",

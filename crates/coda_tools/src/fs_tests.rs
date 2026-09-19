@@ -162,6 +162,24 @@ async fn ls_pre_cancelled_context_aborts() {
 }
 
 #[tokio::test]
+async fn ls_reports_an_empty_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let result = ListDirectoryTool::new()
+        .execute(
+            ListDirectoryToolParams {
+                path: root.path().to_string_lossy().into_owned(),
+            },
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+    let OutputData::Inline(text) = result else {
+        panic!("expected inline output")
+    };
+    assert_eq!(text, "Directory is empty or all entries are ignored.");
+}
+
+#[tokio::test]
 async fn edit_replaces_unique_match() {
     let path = tmp_file("unique", "hello world\nfoo bar\n");
     let tool = EditFileTool::new(test_locks());
@@ -323,8 +341,6 @@ async fn read_pages_huge_file() {
     let page = tool
         .execute(
             ReadFileToolParams {
-                byte_offset: None,
-                expected_version: None,
                 file_path: path.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -337,8 +353,7 @@ async fn read_pages_huge_file() {
         panic!("expected page")
     };
     assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_bytes);
-    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(page["next_byte_offset"].as_u64().is_some());
+    assert!(body.ends_with(" more bytes omitted]"));
     std::fs::remove_file(&path).ok();
 }
 
@@ -370,8 +385,6 @@ async fn read_decodes_invalid_utf8_lossily() {
     let result = tool
         .execute(
             ReadFileToolParams {
-                byte_offset: None,
-                expected_version: None,
                 file_path: path.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -612,8 +625,6 @@ async fn read_refuses_symlink() {
     let err = tool
         .execute(
             ReadFileToolParams {
-                byte_offset: None,
-                expected_version: None,
                 file_path: link.to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -633,8 +644,6 @@ async fn read_refuses_directory() {
     let err = tool
         .execute(
             ReadFileToolParams {
-                byte_offset: None,
-                expected_version: None,
                 file_path: std::env::temp_dir().to_str().unwrap().to_string(),
                 offset: None,
                 limit: None,
@@ -693,58 +702,110 @@ async fn edit_errors_on_empty_old_string() {
 }
 
 #[tokio::test]
-async fn giant_unicode_line_pages_without_skips_and_detects_file_changes() {
+async fn read_numbers_lines_and_honours_offset_and_limit() {
     let root = tempfile::tempdir().unwrap();
-    let file = root.path().join("giant.txt");
-    let original = "你🙂界".repeat(10000);
-    std::fs::write(&file, &original).unwrap();
-    let mut offset = 0;
-    let mut version = None;
-    let mut content = String::new();
+    let file = root.path().join("lines.txt");
+    std::fs::write(&file, "one\r\ntwo\nthree\nfour").unwrap();
+    assert_eq!(
+        read(&file, None, None, 16 * 1024).await,
+        "     1\tone\n     2\ttwo\n     3\tthree\n     4\tfour"
+    );
+    assert_eq!(
+        read(&file, Some(2), Some(2), 16 * 1024).await,
+        "     2\ttwo\n     3\tthree\n[page truncated: reached the 2-line limit; continue with offset=4]"
+    );
+    assert_eq!(
+        read(&file, Some(4), Some(1), 16 * 1024).await,
+        "     4\tfour"
+    );
+    assert_eq!(read(&file, Some(9), None, 16 * 1024).await, "");
+}
+
+#[tokio::test]
+async fn read_pages_by_budget_without_skipping_lines() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("many.txt");
+    let lines: Vec<String> = (1..=150)
+        .map(|n| format!("line {n} {}", "x".repeat(40)))
+        .collect();
+    std::fs::write(&file, lines.join("\n")).unwrap();
+    let mut offset = 1;
+    let mut seen = Vec::new();
     loop {
-        let mut context = ToolCallContext::default();
-        context.output_bytes = 1024;
-        let OutputData::Page { body, .. } = ReadFileTool::new()
-            .execute(
-                ReadFileToolParams {
-                    file_path: file.to_str().unwrap().into(),
-                    offset: None,
-                    limit: None,
-                    byte_offset: Some(offset),
-                    expected_version: version.clone(),
-                },
-                context,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
+        let body = read(&file, Some(offset), None, 1024).await;
         assert!(body.len() <= 1024);
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        version = Some(page["version"].as_str().unwrap().to_owned());
-        content.push_str(page["content"].as_str().unwrap());
-        if let Some(next) = page["next_byte_offset"].as_u64() {
-            assert!(next > offset);
-            offset = next;
-        } else {
-            break;
+        let footer = "\n[page truncated: reached the 1024-byte output limit; continue with offset=";
+        let (page, next) = match body.split_once(footer) {
+            Some((page, next)) => (page, Some(next.trim_end_matches(']').parse().unwrap())),
+            None => (body.as_str(), None),
+        };
+        for entry in page.lines() {
+            let (number, text) = entry.split_once('\t').unwrap();
+            assert_eq!(number.trim().parse::<usize>().unwrap(), seen.len() + 1);
+            seen.push(text.to_owned());
+        }
+        match next {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
         }
     }
-    assert_eq!(content, original);
-    std::fs::write(&file, "changed").unwrap();
-    let error = ReadFileTool::new()
+    assert_eq!(seen, lines);
+}
+
+#[tokio::test]
+async fn read_cuts_long_lines_at_a_character_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("giant.txt");
+    let giant = "你🙂界".repeat(10000);
+    std::fs::write(&file, format!("{giant}\nnext\n")).unwrap();
+    let body = read(&file, None, None, 16 * 1024).await;
+    let (first, rest) = body.split_once('\n').unwrap();
+    let text = first.strip_prefix("     1\t").unwrap();
+    let (shown, marker) = text.split_once(" [line truncated: ").unwrap();
+    assert!(shown.len() <= MAX_LINE_BYTES && giant.starts_with(shown));
+    assert_eq!(
+        marker,
+        format!(
+            "longer than {MAX_LINE_BYTES} bytes, {} more bytes omitted]",
+            giant.len() - shown.len()
+        )
+    );
+    assert_eq!(rest, "     2\tnext");
+}
+
+#[tokio::test]
+async fn invalid_bytes_cannot_push_a_first_line_past_the_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("invalid.bin");
+    std::fs::write(&file, vec![0xFF; 5000]).unwrap();
+    // Small enough that the raw line cap is well under 2000 bytes.
+    let body = read(&file, None, None, 600).await;
+    assert!(body.len() <= 600, "{} bytes", body.len());
+    let text = body.strip_prefix("     1\t").unwrap();
+    let (shown, marker) = text.split_once(" [line truncated: ").unwrap();
+    assert!(shown.chars().all(|c| c == '\u{FFFD}'));
+    let omitted = 5000 - shown.chars().count();
+    assert!(marker.ends_with(&format!("{omitted} more bytes omitted]")));
+}
+
+async fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, bytes: usize) -> String {
+    let mut context = ToolCallContext::default();
+    context.output_bytes = bytes;
+    let result = ReadFileTool::new()
         .execute(
             ReadFileToolParams {
-                file_path: file.to_str().unwrap().into(),
-                offset: None,
-                limit: None,
-                byte_offset: None,
-                expected_version: version,
+                file_path: path.to_str().unwrap().into(),
+                offset,
+                limit,
             },
-            ToolCallContext::default(),
+            context,
         )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("FILE_CHANGED"));
+        .await;
+    let OutputData::Page { body, .. } = result.unwrap() else {
+        panic!("expected file page")
+    };
+    body
 }

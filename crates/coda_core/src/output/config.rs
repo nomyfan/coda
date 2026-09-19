@@ -83,7 +83,7 @@ impl ModelOutputLimits {
     }
 
     /// Conservative body allowance shared by configuration checks and batch dispatch.
-    /// Includes one fully encoded four-channel reference plus 512 bytes for status,
+    /// Includes one fully described four-channel reference plus 512 bytes for status,
     /// continuation information and the response envelope; excludes preview text.
     pub fn minimum_response_bytes(output_root: &Path) -> Result<usize, String> {
         let id = OutputId(uuid::Uuid::nil());
@@ -108,9 +108,7 @@ impl ModelOutputLimits {
             sealed_at: timestamp,
             expires_at: timestamp,
         };
-        let encoded = serde_json::to_vec(&reference)
-            .map_err(|error| format!("cannot encode output paths and metadata: {error}"))?;
-        encoded
+        super::describe_saved(&[reference], None)
             .len()
             .checked_add(512)
             .ok_or_else(|| "minimum output response size overflowed".into())

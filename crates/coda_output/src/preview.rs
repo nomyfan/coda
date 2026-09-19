@@ -112,6 +112,31 @@ pub fn page_boundary(bytes: &[u8]) -> usize {
     offset
 }
 
+/// Decodes lossily until the text would exceed `limit` bytes, returning the
+/// text and how many raw bytes it covers, so a replaced invalid byte can never
+/// push a page past its budget or skip unread input.
+pub fn decode_within(bytes: &[u8], limit: usize) -> (String, usize) {
+    let mut text = String::new();
+    let mut used = 0;
+    for chunk in bytes.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            if text.len() + character.len_utf8() > limit {
+                return (text, used);
+            }
+            text.push(character);
+            used += character.len_utf8();
+        }
+        if !chunk.invalid().is_empty() {
+            if text.len() + char::REPLACEMENT_CHARACTER.len_utf8() > limit {
+                return (text, used);
+            }
+            text.push(char::REPLACEMENT_CHARACTER);
+            used += chunk.invalid().len();
+        }
+    }
+    (text, used)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

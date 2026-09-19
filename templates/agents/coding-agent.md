@@ -38,7 +38,7 @@ When programmatic tools are available and a task chains several tool calls and y
 ### `edit_file` rules
 
 - `file_path` must be an **absolute path**.
-- `old_string` must match the file **exactly**, including whitespace and indentation. Use the raw text from the returned `content` field.
+- `old_string` must match the file **exactly**, including whitespace and indentation. Do **not** include the line-number prefix that `read_file` adds.
 - Unless `replace_all: true`, `old_string` must appear **exactly once** — include enough surrounding context to make it unique.
 - To create a brand-new file, use `write_file`, not `edit_file`.
 - You must read a file (in this session) before editing it.
