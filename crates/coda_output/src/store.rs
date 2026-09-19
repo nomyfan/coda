@@ -1094,10 +1094,7 @@ impl OutputBuffer for Buffer {
                         }
                     }
                 }
-                Ok(HostResultBuffer {
-                    text,
-                    lease: Some(lease),
-                })
+                Ok(HostResultBuffer { text, lease })
             });
             tokio::select! {
                 _ = cancel.cancelled() => Err(OutputError::Aborted("delivery was cancelled".into())),

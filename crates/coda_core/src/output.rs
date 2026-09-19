@@ -102,8 +102,6 @@ pub enum OutputError {
     ReadTimeout,
     /// Delivery was cancelled after the tool had run.
     Aborted(String),
-    /// A script's buffer reached the model: a runtime bug, not a tool failure.
-    Delivery,
 }
 
 impl OutputError {
@@ -116,7 +114,6 @@ impl OutputError {
             Self::Expired => "OUTPUT_EXPIRED",
             Self::ReadTimeout => "OUTPUT_READ_TIMEOUT",
             Self::Aborted(_) => "OUTPUT_ABORTED",
-            Self::Delivery => "OUTPUT_DELIVERY",
         }
     }
 }
@@ -131,7 +128,6 @@ impl std::fmt::Display for OutputError {
             Self::MetadataLimit => "response cannot fit complete output paths",
             Self::Expired => "retained file no longer exists",
             Self::ReadTimeout => "reading saved output timed out",
-            Self::Delivery => "programmatic buffer reached the model boundary",
         };
         write!(f, "{}: {detail}", self.code())
     }
@@ -160,9 +156,8 @@ impl From<BufferLimitError> for OutputError {
 pub struct HostResultBuffer {
     /// The complete result text.
     pub text: String,
-    /// Budget held for `text`; `None` leaves the caller to reserve it before
-    /// delivery.
-    pub lease: Option<BufferLease>,
+    /// Budget held for `text`.
+    pub lease: BufferLease,
 }
 
 pub trait OutputBuffer: Send + Sync + std::fmt::Debug {
@@ -196,11 +191,10 @@ pub enum OutputData {
         body: String,
         /// Saved files the page was read from, listed for the model.
         references: Vec<OutputRef>,
+        /// Script memory reserved before the page was read, so building it
+        /// never exceeds the script's budget. `None` when the model reads it.
+        lease: Option<BufferLease>,
     },
-    /// A result already materialized for a `run_javascript` script, its
-    /// memory held by a lease on the script's budget. It never reaches the
-    /// model.
-    Buffered(HostResultBuffer),
 }
 
 /// What a result carries for output kept outside memory: a preview for the
@@ -247,14 +241,15 @@ impl OutputData {
 
     pub fn with_prefix(self, prefix: String) -> Self {
         match self {
-            Self::Buffered(mut buffer) => {
-                buffer.text.insert_str(0, &prefix);
-                Self::Buffered(buffer)
-            }
             Self::Inline(text) => Self::Inline(format!("{prefix}{text}")),
-            Self::Page { body, references } => Self::Page {
+            Self::Page {
+                body,
+                references,
+                lease,
+            } => Self::Page {
                 body: format!("{prefix}{body}"),
                 references,
+                lease,
             },
             Self::Captured(mut output) => {
                 output.preview.insert_str(0, &prefix);
@@ -273,14 +268,15 @@ impl OutputData {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<HostResultBuffer, OutputError> {
         match self {
-            Self::Buffered(buffer) => Ok(buffer),
+            Self::Page {
+                body,
+                lease: Some(lease),
+                ..
+            } => Ok(HostResultBuffer { text: body, lease }),
             Self::Inline(text) | Self::Page { body: text, .. } => {
                 // A `String` is at most `isize::MAX` bytes, so doubling cannot overflow.
                 let lease = budget.reserve(text.len() * 2, cancel).await?;
-                Ok(HostResultBuffer {
-                    text,
-                    lease: Some(lease),
-                })
+                Ok(HostResultBuffer { text, lease })
             }
             Self::Captured(output) => output.buffer.materialize(budget, cancel).await,
         }

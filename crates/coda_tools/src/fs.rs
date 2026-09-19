@@ -174,7 +174,7 @@ const LINE_OVERHEAD_BYTES: usize = 128;
 /// however large the file is, and stops at whichever comes first: `limit`
 /// lines or the output budget.
 async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
-    use coda_core::output::{HostResultBuffer, IO_BLOCK_BYTES, OutputError};
+    use coda_core::output::{IO_BLOCK_BYTES, OutputError};
     use tokio::io::{AsyncBufReadExt, BufReader};
     let path = Path::new(&params.file_path);
     if !path.is_absolute() {
@@ -292,14 +292,11 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
             "\n[page truncated: {reason}; continue with offset={next}]"
         );
     }
-    if lease.is_some() {
-        Ok(OutputData::Buffered(HostResultBuffer { text: body, lease }))
-    } else {
-        Ok(OutputData::Page {
-            body,
-            references: vec![],
-        })
-    }
+    Ok(OutputData::Page {
+        body,
+        references: vec![],
+        lease,
+    })
 }
 
 // ---- WriteFile ----

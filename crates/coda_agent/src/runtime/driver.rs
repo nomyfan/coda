@@ -447,7 +447,7 @@ impl HostToolInvoker for AgentToolInvoker {
                 .map_err(HostToolCallError::Undelivered)?;
             Ok(HostToolCallResult {
                 output: buffer.text,
-                buffer_lease: buffer.lease,
+                buffer_lease: Some(buffer.lease),
             })
         })
     }

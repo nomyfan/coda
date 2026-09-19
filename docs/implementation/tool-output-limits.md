@@ -137,7 +137,7 @@ async fn materialize(&self, output: &OutputData, memory: &BufferBudget)
 
 ## Data Model
 
-- `OutputData`：`Inline(text)`、`Buffered(BufferedOutput)`、`Captured(CapturedOutput)`、`Page(page)`。Buffered 是供程序消费的临时内存/文件句柄，带完整性及资源预留，不是历史引用；Captured 带有界预览、采集计数和 `storage = Retained(OutputRef) | Unavailable(StorageFailure)`，允许没有文件引用的正常返回；小结果完整内联时用 Inline。正文可能包含 stdout/stderr 或 PTC value/log，原始工具字符串语义不变。
+- `OutputData`：`Inline(text)`、`Captured(CapturedOutput)`、`Page { body, references, lease }`。Page 是分页工具（`read_file`、`task_output`）按页预算读出的一页；脚本调用时带着读取前从脚本内存预算预留的 lease，模型调用时为 None；Captured 带有界预览、采集计数和 `storage = Retained(OutputRef) | Unavailable(StorageFailure)`，允许没有文件引用的正常返回；小结果完整内联时用 Inline。正文可能包含 stdout/stderr 或 PTC value/log，原始工具字符串语义不变。
 - `OutputRef`：随机 OutputId、各通道稳定绝对路径、采集字节数、保存字节数、`complete`、丢失原因和封存/到期时间。ID 不编码用户路径、工作区或会话；manifest 记录创建它的工作区和会话，供配额计费。它是文件引用，不是访问控制凭证。
 - `ToolMessage.output` 保存最终有界展示字符串；新增 `output_refs` 及 `read_receipts`。output_refs 只含该对外结果通过封存屏障的引用；存储失败类别编码在有界响应的 `storage_failure` 及引用的 `failure` 中，不以残留文件名充当成功引用。引用不混入 FileDiff artifact 或成功工具状态，可随失败/取消结果保存；不得以工具失败为理由丢弃已保留输出。读取凭证列表支持一个 PTC 脚本完成多次读取，但不携带其原始内容。
 - 新增 `task_output_progress` 表，以 `(workspace_id, session_id, consumer_pid, task_id, channel)` 为键，保存连续已交付位置；只外键关联 session，避免 rewind 删除消息/进程时撤销交付事实。与消息及现有 `task_notice_receipts` 同事务更新；fork 不复制此表，会话删除级联删除。输出正文及输出对象元数据仍不建数据库表。

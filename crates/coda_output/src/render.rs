@@ -17,10 +17,10 @@ pub async fn render(
     bytes: usize,
 ) -> Result<RenderedOutput, OutputError> {
     let output = match output {
-        OutputData::Buffered(_) => {
-            return Err(OutputError::Delivery);
-        }
-        OutputData::Page { body, references } => {
+        // A lease only exists for a script's call, which never renders.
+        OutputData::Page {
+            body, references, ..
+        } => {
             if body.len() > bytes {
                 return Err(OutputError::PageLimit(
                     "page exceeds its assigned delivery budget".into(),
@@ -49,7 +49,6 @@ pub async fn render(
         output => output,
     };
     match output {
-        OutputData::Buffered(_) => unreachable!(),
         OutputData::Captured(output) => {
             let references: Vec<_> = output.reference.into_iter().collect();
             let best = render_saved(

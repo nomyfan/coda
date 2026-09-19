@@ -76,6 +76,7 @@ impl Tool for EffectTool {
                 "invalid_page" => OutputData::Page {
                     body: "x".repeat(100_000),
                     references: vec![],
+                    lease: None,
                 },
                 _ => "中间日志".repeat(20_000).into(),
             })

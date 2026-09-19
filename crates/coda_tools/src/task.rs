@@ -78,7 +78,7 @@ impl Tool for TaskOutputTool {
                 Ok(id) => id,
                 Err(msg) => return Ok(msg.into()),
             };
-            use coda_core::output::{Channel, HostResultBuffer, OutputData};
+            use coda_core::output::{Channel, OutputData};
             let bytes = ctx.result_budget.page_bytes();
             let lease = ctx.result_budget.reserve(bytes * 2, &ctx.cancel).await?;
             let mut positions = [0; 3];
@@ -110,17 +110,11 @@ impl Tool for TaskOutputTool {
                 ctx.record_task_result(id);
             }
             ctx.record_reads(page.receipts);
-            if lease.is_some() {
-                Ok(OutputData::Buffered(HostResultBuffer {
-                    text: page.body,
-                    lease,
-                }))
-            } else {
-                Ok(OutputData::Page {
-                    body: page.body,
-                    references: page.references,
-                })
-            }
+            Ok(OutputData::Page {
+                body: page.body,
+                references: page.references,
+                lease,
+            })
         }
     }
 }

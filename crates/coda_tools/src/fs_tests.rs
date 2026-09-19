@@ -384,6 +384,35 @@ async fn read_cancelled_while_waiting_for_script_memory_is_aborted() {
 }
 
 #[tokio::test]
+async fn script_read_hands_over_the_memory_reserved_before_reading() {
+    let path = tmp_file("script_read", "hello\n");
+    let budget = coda_core::output::BufferBudget::new(1 << 20);
+    let mut context = ToolCallContext::default();
+    context.result_budget = coda_core::output::ResultBudget::Script(budget.clone());
+    let cancel = context.cancel.clone();
+    let page = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            },
+            context,
+        )
+        .await
+        .unwrap();
+    let reserved = budget.capacity() - budget.available();
+    assert!(reserved > 0, "the read reserves script memory up front");
+
+    let buffer = page.materialize(&budget, &cancel).await.unwrap();
+    assert!(buffer.text.contains("hello"));
+    assert_eq!(budget.capacity() - budget.available(), reserved);
+    drop(buffer);
+    assert_eq!(budget.available(), budget.capacity());
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
 async fn read_pages_huge_file() {
     let path = tmp_huge_file("huge_read");
     let tool = ReadFileTool::new();
