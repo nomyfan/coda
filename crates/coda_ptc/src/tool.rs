@@ -123,7 +123,7 @@ impl Tool for RunJavaScriptTool {
                 .begin(
                     ctx.output_owner.clone(),
                     vec![Channel::ResultJson, Channel::Log],
-                    CapturePurpose::ModelResult,
+                    CapturePurpose::Foreground,
                 )
                 .await
                 .map_err(ToolError::ResourceLimit)?;

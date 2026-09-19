@@ -25,7 +25,7 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
         .begin(
             owner(),
             vec![Channel::Stdout, Channel::Stderr],
-            CapturePurpose::ModelResult,
+            CapturePurpose::Foreground,
         )
         .await
         .unwrap();
@@ -63,7 +63,7 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
     let root = tempfile::tempdir().unwrap();
     let store = store(root.path());
     let mut capture = store
-        .begin(owner(), vec![Channel::Stdout], CapturePurpose::ModelResult)
+        .begin(owner(), vec![Channel::Stdout], CapturePurpose::Foreground)
         .await
         .unwrap();
     for _ in 0..128 {
@@ -108,7 +108,7 @@ async fn expired_finalization_does_not_publish_a_path() {
     let root = tempfile::tempdir().unwrap();
     let store = store(root.path());
     let mut capture = store
-        .begin(owner(), vec![Channel::Stdout], CapturePurpose::ModelResult)
+        .begin(owner(), vec![Channel::Stdout], CapturePurpose::Foreground)
         .await
         .unwrap();
     for _ in 0..8 {

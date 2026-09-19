@@ -161,7 +161,7 @@ async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunRepo
         .begin(
             coda_core::tool::ToolCallContext::default().output_owner,
             vec![Channel::ResultJson, Channel::Log],
-            CapturePurpose::ModelResult,
+            CapturePurpose::Foreground,
         )
         .await
         .unwrap();

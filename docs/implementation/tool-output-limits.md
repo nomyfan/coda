@@ -92,7 +92,8 @@
 
 ```rust
 enum CapturePurpose {
-    ModelResult,
+    Foreground,
+    Background,
     Programmatic(BufferBudget),
 }
 
@@ -105,7 +106,7 @@ fn begin(&self, owner: SessionKey, channels: &[Channel],
 // 执行取消时已有数据移交有界收尾；写入受 IO/整理截止时间约束，取消本身不是存储故障。
 async fn append(&mut self, channel: Channel, bytes: &[u8]) -> CaptureStatus;
 
-// ModelResult 在 deadline 前封存，返回可靠引用或预览及存储不可用状态。
+// Foreground 在 deadline 前封存，返回可靠引用或预览及存储不可用状态。
 // Programmatic 返回带完整性状态的临时缓冲，待交付/放弃后清理，不发布可靠引用。
 // 不继承已取消的执行 token；结果中不含工具执行成败，在途 IO 由存储层收尾。
 async fn finish(self, end: CaptureEnd, deadline: Instant) -> OutputData;

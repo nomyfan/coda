@@ -761,7 +761,7 @@ impl OutputStore for Store {
                 .begin_capture(
                     owner,
                     vec![Channel::Result],
-                    CapturePurpose::ModelResult,
+                    CapturePurpose::Foreground,
                     Some(id),
                 )
                 .await
@@ -789,7 +789,7 @@ impl OutputStore for Store {
     ) -> OutputFuture<'_, OutputData> {
         Box::pin(async move {
             let mut capture = match self
-                .begin(owner, vec![Channel::Result], CapturePurpose::ModelResult)
+                .begin(owner, vec![Channel::Result], CapturePurpose::Foreground)
                 .await
             {
                 Ok(capture) => capture,
@@ -1090,7 +1090,7 @@ impl Store {
             }
             let limit = self.inner.limits.capture_memory_bytes;
             let memory = match &purpose {
-                CapturePurpose::ModelResult | CapturePurpose::Background => None,
+                CapturePurpose::Foreground | CapturePurpose::Background => None,
                 CapturePurpose::Programmatic(budget) => Some(
                     budget
                         .reserve(limit, &coda_core::tool::CancellationToken::new())

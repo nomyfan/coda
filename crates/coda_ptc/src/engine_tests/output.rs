@@ -136,7 +136,7 @@ async fn synchronous_logs_drain_while_pending_delivery_holds_all_non_log_memory(
             .begin(
                 ToolCallContext::default().output_owner,
                 vec![Channel::ResultJson, Channel::Log],
-                CapturePurpose::ModelResult,
+                CapturePurpose::Foreground,
             )
             .await
             .unwrap();
@@ -194,7 +194,7 @@ async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() 
         .begin(
             ToolCallContext::default().output_owner,
             vec![Channel::ResultJson, Channel::Log],
-            CapturePurpose::ModelResult,
+            CapturePurpose::Foreground,
         )
         .await
         .unwrap();
@@ -267,7 +267,7 @@ async fn small_report_and_log_render_as_report_then_log() {
             .begin(
                 ToolCallContext::default().output_owner,
                 vec![Channel::ResultJson, Channel::Log],
-                CapturePurpose::ModelResult,
+                CapturePurpose::Foreground,
             )
             .await
             .unwrap();

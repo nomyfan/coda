@@ -16,10 +16,28 @@ pub const FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 pub type OutputFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Which execution path a capture serves. The store derives memory
+/// accounting, spilling and retention from it, and tools use it to size the
+/// pages they return.
 #[derive(Clone, Debug)]
 pub enum CapturePurpose {
-    ModelResult,
+    /// A tool call awaited within a turn, whose result goes back to the
+    /// calling agent's model — a background subagent's own calls included.
+    /// Output stays in memory while small and spills to files once it
+    /// outgrows that; spilled output is sealed with an [`OutputRef`] and kept
+    /// for the retention period. Tools size a page to
+    /// [`output_bytes`](crate::tool::ToolCallContext::output_bytes). The
+    /// default on a [`ToolCallContext`](crate::tool::ToolCallContext).
+    Foreground,
+    /// A background task's archive, read across turns by `task_output` and
+    /// the task panel. Every byte goes straight to files, sealed with an
+    /// [`OutputRef`]. The task archive passes it to the store directly; it is
+    /// never set on a `ToolCallContext`.
     Background,
+    /// A host tool call from a `run_javascript` script. Capture memory is
+    /// reserved from the script's budget, and the output always ends in a
+    /// temporary file with no [`OutputRef`], removed once its buffer is
+    /// dropped. Tools size a page to a quarter of the budget.
     Programmatic(BufferBudget),
 }
 

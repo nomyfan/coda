@@ -188,7 +188,7 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
         ));
     }
     let bytes = match &ctx.output_purpose {
-        CapturePurpose::ModelResult | CapturePurpose::Background => ctx.output_bytes,
+        CapturePurpose::Foreground | CapturePurpose::Background => ctx.output_bytes,
         CapturePurpose::Programmatic(budget) => budget.capacity() / 4,
     };
     let budget = bytes.saturating_sub(FOOTER_BYTES);
@@ -199,7 +199,7 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
     }
     let line_cap = MAX_LINE_BYTES.min(budget - LINE_OVERHEAD_BYTES);
     let lease = match &ctx.output_purpose {
-        CapturePurpose::ModelResult | CapturePurpose::Background => None,
+        CapturePurpose::Foreground | CapturePurpose::Background => None,
         CapturePurpose::Programmatic(budget) => Some(
             budget
                 .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)

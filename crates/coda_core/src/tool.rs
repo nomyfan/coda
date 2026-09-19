@@ -172,7 +172,7 @@ impl ToolCallContext {
                 workspace_id: String::new(),
                 session_id: String::new(),
             },
-            output_purpose: CapturePurpose::ModelResult,
+            output_purpose: CapturePurpose::Foreground,
             output_bytes: crate::output::ModelOutputLimits::default().single_bytes,
             ptc_limits: None,
             failure_output: Arc::default(),
