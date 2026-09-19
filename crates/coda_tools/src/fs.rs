@@ -678,7 +678,7 @@ impl Tool for ListDirectoryTool {
     }
 
     fn description(&self) -> &str {
-        "List the contents of a directory. The path must be an absolute path. Respects .gitignore rules."
+        "List the contents of a directory. The path must be an absolute path. Includes hidden entries except .git and anything ignored by .gitignore; a path inside .git is still listed."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -700,7 +700,12 @@ impl Tool for ListDirectoryTool {
             }
 
             let mut cmd = Command::new("fd");
+            // Dotfiles such as .github/ or .env.example matter to an agent, so
+            // only .gitignore rules hide entries; .git itself is never useful.
             cmd.arg("--color=never")
+                .arg("--hidden")
+                .arg("--exclude")
+                .arg(".git")
                 .arg("--glob")
                 .arg("*")
                 .arg("--exact-depth")

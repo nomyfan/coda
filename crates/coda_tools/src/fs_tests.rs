@@ -180,6 +180,33 @@ async fn ls_reports_an_empty_directory() {
 }
 
 #[tokio::test]
+async fn ls_lists_hidden_entries_but_not_git() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::create_dir(root.path().join(".github")).unwrap();
+    std::fs::write(root.path().join(".env.example"), "").unwrap();
+    std::fs::write(root.path().join("visible.txt"), "").unwrap();
+    let result = ListDirectoryTool::new()
+        .execute(
+            ListDirectoryToolParams {
+                path: root.path().to_string_lossy().into_owned(),
+            },
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+    let OutputData::Inline(text) = result else {
+        panic!("expected inline output")
+    };
+    let mut names: Vec<_> = text
+        .lines()
+        .map(|line| line.trim_end_matches('/').rsplit('/').next().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".env.example", ".github", "visible.txt"]);
+}
+
+#[tokio::test]
 async fn edit_replaces_unique_match() {
     let path = tmp_file("unique", "hello world\nfoo bar\n");
     let tool = EditFileTool::new(test_locks());
