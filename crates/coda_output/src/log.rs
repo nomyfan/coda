@@ -1,6 +1,7 @@
 //! A synchronous log producer with its own independently drained queue.
-use crate::preview::Preview;
-use coda_core::output::{Channel, FINALIZE_TIMEOUT, IO_BLOCK_BYTES, OutputCapture, OutputData};
+use coda_core::output::{
+    Channel, FINALIZE_TIMEOUT, IO_BLOCK_BYTES, OutputCapture, OutputData, OutputPreview, Preview,
+};
 use coda_core::tool::CancellationToken;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,6 +22,7 @@ pub struct LogWriter {
 
 pub struct LogCollector {
     writer: LogWriter,
+    preview_bytes: usize,
     completion: Option<tokio::sync::oneshot::Receiver<Box<dyn OutputCapture>>>,
 }
 
@@ -67,6 +69,7 @@ impl LogCollector {
             })?;
         Ok(Self {
             writer,
+            preview_bytes,
             completion: Some(completion),
         })
     }
@@ -77,7 +80,7 @@ impl LogCollector {
 
     pub fn snapshot(&self) -> (String, bool) {
         let queue = self.writer.queue.0.lock().unwrap();
-        (queue.preview.text(), !queue.preview.complete())
+        queue.preview.render(usize::MAX)
     }
 
     pub async fn finish(mut self, report: &str) -> OutputData {
@@ -94,13 +97,15 @@ impl LogCollector {
                 capture.finish(deadline).await
             }
             _ => OutputData::unavailable(
-                {
-                    let (log, _) = self.snapshot();
-                    match (report.is_empty(), log.is_empty()) {
-                        (_, true) => report.to_owned(),
-                        (true, false) => format!("log:\n{log}"),
-                        (false, false) => format!("{report}\nlog:\n{log}"),
-                    }
+                OutputPreview {
+                    prefix: String::new(),
+                    channels: vec![
+                        (Channel::ResultJson, Preview::of(report, self.preview_bytes)),
+                        (
+                            Channel::Log,
+                            self.writer.queue.0.lock().unwrap().preview.clone(),
+                        ),
+                    ],
                 },
                 coda_core::output::StorageFailure::FinalizeTimeout,
             ),

@@ -161,7 +161,9 @@ async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunRepo
         .begin(
             OutputOwner::default(),
             vec![Channel::ResultJson, Channel::Log],
-            CapturePurpose::Foreground,
+            CapturePurpose::Foreground {
+                page_bytes: 16 * 1024,
+            },
         )
         .await
         .unwrap();
@@ -728,7 +730,8 @@ async fn console_overflow_keeps_head_and_tail() {
     .await;
 
     assert!(log.starts_with("first\n"));
-    assert!(log.ends_with("second\n"));
+    assert!(log.contains(" [line 2 truncated: "), "{log}");
+    assert!(log.ends_with("\nsecond"));
     assert!(truncated);
 }
 

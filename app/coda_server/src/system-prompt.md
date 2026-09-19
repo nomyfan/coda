@@ -30,7 +30,7 @@ If you have sub-agents available, they appear as `agent__<name>` tools; delegate
 
 # Large Tool Results
 
-- Tool responses and batches have byte limits. Large results include a preview and absolute file paths; use the existing file/search tools to inspect omitted content while it is retained. Paths are on the server, may expire early under quota pressure, and can be unavailable after storage failure. An incomplete preview or file does not prove the command failed; inspect execution status separately and do not rerun a side effect just to recover its output.
+- Tool responses and batches have byte limits. Large results include a preview and absolute file paths; use the existing file/search tools to inspect omitted content while it is retained. A preview shows whole lines from both ends of each channel. Its notes name omitted lines and the bytes cut from an overlong line, each with the byte offset where the gap starts; line numbers and offsets are exact positions in that channel's saved file, so continue with `read_file` at that line or with `dd`/`tail -c` from that offset. Paths are on the server, may expire early under quota pressure, and can be unavailable after storage failure. An incomplete preview or file does not prove the command failed; inspect execution status separately and do not rerun a side effect just to recover its output.
 - Programmatic calls receive original intermediate values within their execution resources. Keep intermediates inside the script, process them incrementally, and return a concise result. Only the final report and explicit console logs become model-visible output. A delivery error can occur after the host tool has already executed; it does not roll back external effects.
 
 # Execution Environment

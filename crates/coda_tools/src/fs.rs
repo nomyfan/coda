@@ -8,6 +8,7 @@ use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 use crate::locks::KeyedLock;
 use crate::process::{preserve_error, run_command};
 use coda_core::output::OutputData;
+use coda_core::output::preview::MAX_LINE_BYTES;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -146,7 +147,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read lines from a file. The file_path must be an absolute path. Returns at most 200 lines by default, each prefixed with its 1-based line number and a tab; use offset (1-based line number) and limit to read other ranges. A page may stop earlier to fit the output budget, and ends with the offset to continue from. Lines longer than 2000 bytes are cut short; use grep or shell to see the rest. Content is decoded as UTF-8, with invalid bytes replaced."
+        "Read lines from a file. The file_path must be an absolute path. Returns at most 200 lines by default, each prefixed with its 1-based line number and a tab; use offset (1-based line number) and limit to read other ranges. A page may stop earlier to fit the output budget, and ends with the offset to continue from. Lines longer than 2000 bytes are cut short, with a note giving how many bytes are left out and the byte offset in the file where they start; read the rest with shell tools such as dd or tail -c. Content is decoded as UTF-8, with invalid bytes replaced."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -163,8 +164,6 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// Longest line a page shows in full; grep or shell reach the rest of it.
-const MAX_LINE_BYTES: usize = 2000;
 /// Page budget held back for the continuation footer.
 const FOOTER_BYTES: usize = 128;
 /// Line budget held back for the line-number prefix and truncation marker.
@@ -174,6 +173,7 @@ const LINE_OVERHEAD_BYTES: usize = 128;
 /// however large the file is, and stops at whichever comes first: `limit`
 /// lines or the output budget.
 async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
+    use coda_core::output::preview::{decode_within, page_boundary};
     use coda_core::output::{IO_BLOCK_BYTES, OutputError};
     use tokio::io::{AsyncBufReadExt, BufReader};
     let path = Path::new(&params.file_path);
@@ -204,6 +204,8 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
     let mut body = String::new();
     let mut shown = 0;
     let mut line_no = 1;
+    // Byte offset of the next unread byte, for naming where a cut line resumes.
+    let mut position = 0u64;
     let mut raw = Vec::with_capacity(line_cap);
     let next = loop {
         let at_eof = tokio::select! {
@@ -220,6 +222,7 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
         // the requested offset are only scanned.
         raw.clear();
         let mut dropped = 0;
+        let line_start = position;
         loop {
             let buf = tokio::select! {
                 _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
@@ -239,6 +242,7 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
             dropped += content.len() - keep;
             let consumed = newline.map_or(buf.len(), |index| index + 1);
             reader.consume(consumed);
+            position += consumed as u64;
             if newline.is_some() {
                 break;
             }
@@ -247,24 +251,27 @@ async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResu
             line_no += 1;
             continue;
         }
+        let length = raw.len() + dropped;
         if dropped == 0 && raw.last() == Some(&b'\r') {
             raw.pop();
         }
         if dropped > 0 {
             // Cut at a character boundary rather than leave a split one.
-            let boundary = coda_output::preview::page_boundary(&raw);
+            let boundary = page_boundary(&raw);
             dropped += raw.len() - boundary;
             raw.truncate(boundary);
         }
         // Cap the decoded text, not the raw bytes: each invalid byte decodes to
         // a three-byte replacement character.
-        let (text, used) = coda_output::preview::decode_within(&raw, line_cap);
+        let (text, used) = decode_within(&raw, line_cap);
         dropped += raw.len() - used;
         let mut entry = format!("{line_no:>6}\t{text}");
         if dropped > 0 {
             let _ = write!(
                 entry,
-                " [line truncated: longer than {line_cap} bytes, {dropped} more bytes omitted]"
+                " [line {line_no} truncated: {} more bytes at offset {}]",
+                length - used,
+                line_start + used as u64
             );
         }
         let separator = usize::from(shown > 0);

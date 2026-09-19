@@ -123,7 +123,9 @@ impl Tool for RunJavaScriptTool {
                 .begin(
                     owner,
                     vec![Channel::ResultJson, Channel::Log],
-                    CapturePurpose::Foreground,
+                    CapturePurpose::Foreground {
+                        page_bytes: ctx.result_budget.page_bytes(),
+                    },
                 )
                 .await?;
             let logs = coda_output::log::LogCollector::start(

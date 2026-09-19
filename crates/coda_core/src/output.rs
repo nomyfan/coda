@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod budget;
 pub mod config;
+pub mod preview;
 
 pub use budget::{BufferBudget, BufferLease, BufferLimitError};
 pub use config::{
     ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLimits, ptc_log_buffer_bytes,
 };
+pub use preview::{OutputPreview, Preview};
 
 pub const IO_BLOCK_BYTES: usize = 16 * 1024;
 pub const FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -27,7 +29,11 @@ pub enum CapturePurpose {
     /// Output stays in memory while small and spills to files once it
     /// outgrows that; spilled output is sealed with an [`OutputRef`] and kept
     /// for the retention period.
-    Foreground,
+    Foreground {
+        /// The call's share of the model's output budget; each channel's
+        /// preview retains this much.
+        page_bytes: usize,
+    },
     /// A background task's archive, read across turns by `task_output` and
     /// the task panel. Every byte goes straight to files, sealed with an
     /// [`OutputRef`]. Only the task archive captures this way.
@@ -57,7 +63,9 @@ impl ResultBudget {
     /// How output captured for this result is stored.
     pub fn capture_purpose(&self) -> CapturePurpose {
         match self {
-            Self::Model { .. } => CapturePurpose::Foreground,
+            Self::Model { page_bytes } => CapturePurpose::Foreground {
+                page_bytes: *page_bytes,
+            },
             Self::Script(budget) => CapturePurpose::Programmatic(budget.clone()),
         }
     }
@@ -205,8 +213,9 @@ pub struct CapturedOutput {
     /// A `run_javascript` report's `ok`, shown ahead of the preview; `None`
     /// for every other tool.
     pub report_ok: Option<bool>,
-    /// Head and tail of each channel; rendering may shorten it further.
-    pub preview: String,
+    /// Whole lines from both ends of each channel; rendering fits it to the
+    /// call's budget and names what it leaves out.
+    pub preview: OutputPreview,
     /// The saved files, once sealed. `None` for a script's temporary capture
     /// or when saving failed.
     pub reference: Option<OutputRef>,
@@ -229,7 +238,7 @@ impl From<&str> for OutputData {
 }
 
 impl OutputData {
-    pub fn unavailable(preview: String, failure: StorageFailure) -> Self {
+    pub fn unavailable(preview: OutputPreview, failure: StorageFailure) -> Self {
         Self::Captured(CapturedOutput {
             report_ok: None,
             preview,
@@ -252,7 +261,7 @@ impl OutputData {
                 lease,
             },
             Self::Captured(mut output) => {
-                output.preview.insert_str(0, &prefix);
+                output.preview.prefix.insert_str(0, &prefix);
                 output.buffer = Arc::new(PrefixedBuffer {
                     prefix,
                     inner: output.buffer,
@@ -398,11 +407,14 @@ pub trait OutputReader: Send + Sync {
 }
 
 pub trait OutputStore: Send + Sync {
+    /// Saves a history message's text once, however often it is re-bounded;
+    /// the preview retains `page_bytes` of it.
     fn retain_source(
         &self,
         owner: OutputOwner,
         source: crate::llm::MessageId,
         text: String,
+        page_bytes: usize,
         deadline: tokio::time::Instant,
     ) -> OutputFuture<'_, OutputData>;
     fn limits(&self) -> &OutputLimits;
@@ -412,10 +424,13 @@ pub trait OutputStore: Send + Sync {
         channels: Vec<Channel>,
         purpose: CapturePurpose,
     ) -> OutputFuture<'_, Result<Box<dyn OutputCapture>, OutputError>>;
+    /// Saves text too large for the model; the preview retains `page_bytes`
+    /// of it.
     fn retain(
         &self,
         owner: OutputOwner,
         text: String,
+        page_bytes: usize,
         deadline: tokio::time::Instant,
     ) -> OutputFuture<'_, OutputData>;
 }

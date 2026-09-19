@@ -1,5 +1,8 @@
 use super::*;
 
+/// The model page every test capture previews for.
+const PAGE: usize = 16 * 1024;
+
 fn owner() -> OutputOwner {
     OutputOwner {
         workspace_id: "workspace".into(),
@@ -25,7 +28,7 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
         .begin(
             owner(),
             vec![Channel::Stdout, Channel::Stderr],
-            CapturePurpose::Foreground,
+            CapturePurpose::Foreground { page_bytes: PAGE },
         )
         .await
         .unwrap();
@@ -47,8 +50,8 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
     let OutputData::Captured(output) = output else {
         panic!("expected spill")
     };
-    assert!(output.preview.len() < store.limits().capture_memory_bytes);
-    assert!(output.preview.contains("warning"));
+    let (preview, _) = output.preview.render(PAGE);
+    assert!(preview.contains("warning"), "{preview}");
     let reference = output.reference.as_ref().unwrap();
     assert!(reference.complete);
     let stdout = std::fs::read(&reference.channels[0].path).unwrap();
@@ -57,11 +60,45 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
 }
 
 #[tokio::test]
+async fn previews_share_a_quarter_of_the_capture_memory() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(OutputLimits {
+        root: root.path().join("output"),
+        capture_memory_bytes: 64 * 1024,
+        ..OutputLimits::default()
+    })
+    .unwrap();
+    let working = 64 * 1024 - 2 * IO_BLOCK_BYTES;
+    let capacities = |page_bytes| {
+        store
+            .start_capture(
+                owner(),
+                vec![Channel::Stdout, Channel::Stderr],
+                &CapturePurpose::Foreground { page_bytes },
+                None,
+                None,
+            )
+            .previews
+            .iter()
+            .map(|(_, preview)| preview.capacity())
+            .collect::<Vec<_>>()
+    };
+    // A page larger than the capture memory still gets only its share.
+    assert_eq!(capacities(256 * 1024), [working / 8, working / 8]);
+    // A small page needs no more than four pages each.
+    assert_eq!(capacities(1024), [4096, 4096]);
+}
+
+#[tokio::test]
 async fn result_limit_keeps_prefix_and_latest_preview() {
     let root = tempfile::tempdir().unwrap();
     let store = store(root.path());
     let mut capture = store
-        .begin(owner(), vec![Channel::Stdout], CapturePurpose::Foreground)
+        .begin(
+            owner(),
+            vec![Channel::Stdout],
+            CapturePurpose::Foreground { page_bytes: PAGE },
+        )
         .await
         .unwrap();
     for _ in 0..128 {
@@ -69,7 +106,7 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
             .append(Channel::Stdout, &vec![b'a'; IO_BLOCK_BYTES])
             .await;
     }
-    capture.append(Channel::Stdout, b"tail-marker").await;
+    capture.append(Channel::Stdout, b"\ntail-marker").await;
     let OutputData::Captured(output) = capture
         .finish(tokio::time::Instant::now() + FINALIZE_TIMEOUT)
         .await
@@ -77,7 +114,7 @@ async fn result_limit_keeps_prefix_and_latest_preview() {
         panic!()
     };
     assert_eq!(output.failure, Some(StorageFailure::ResultLimit));
-    assert!(output.preview.ends_with("tail-marker"));
+    assert!(output.preview.render(PAGE).0.ends_with("\ntail-marker"));
     let reference = output.reference.unwrap();
     assert!(!reference.complete);
     assert_eq!(
@@ -104,7 +141,11 @@ async fn expired_finalization_does_not_publish_a_path() {
     let root = tempfile::tempdir().unwrap();
     let store = store(root.path());
     let mut capture = store
-        .begin(owner(), vec![Channel::Stdout], CapturePurpose::Foreground)
+        .begin(
+            owner(),
+            vec![Channel::Stdout],
+            CapturePurpose::Foreground { page_bytes: PAGE },
+        )
         .await
         .unwrap();
     for _ in 0..8 {
@@ -120,7 +161,7 @@ async fn expired_finalization_does_not_publish_a_path() {
     };
     assert!(output.reference.is_none());
     assert_eq!(output.failure, Some(StorageFailure::FinalizeTimeout));
-    assert!(!output.preview.is_empty());
+    assert!(!output.preview.render(PAGE).0.is_empty());
 }
 
 #[tokio::test]
@@ -131,6 +172,7 @@ async fn explicit_retention_spills_values_smaller_than_the_capture_cache() {
         .retain(
             owner(),
             "hello".into(),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await
@@ -196,7 +238,13 @@ async fn every_seal_barrier_failure_returns_preview_without_a_reference() {
             panic!()
         };
         assert!(output.reference.is_none(), "{step}");
-        assert!(output.preview.contains("retained diagnostic"));
+        assert!(
+            output
+                .preview
+                .render(PAGE)
+                .0
+                .contains("retained diagnostic")
+        );
         assert_eq!(reader.snapshot().failure, Some(StorageFailure::Io));
         assert!(reader.read(Channel::Stdout, 0, 100).await.is_err());
     }
@@ -260,6 +308,7 @@ async fn shared_quota_evicts_unpinned_outputs_and_never_live_captures() {
         .retain(
             owner(),
             "x".repeat(600 * 1024),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await;
@@ -273,6 +322,7 @@ async fn shared_quota_evicts_unpinned_outputs_and_never_live_captures() {
         .retain(
             owner(),
             "y".repeat(600 * 1024),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await;
@@ -286,6 +336,7 @@ async fn shared_quota_evicts_unpinned_outputs_and_never_live_captures() {
         .retain(
             owner(),
             "z".repeat(600 * 1024),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await;
@@ -302,6 +353,7 @@ async fn failed_deletion_stays_charged_and_recovery_counts_orphan_ownership() {
         .retain(
             owner(),
             "persisted".into(),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await;
@@ -341,6 +393,7 @@ async fn history_source_is_archived_once_and_reopens_under_the_same_path() {
                 owner(),
                 source,
                 "history".repeat(4000),
+                PAGE,
                 tokio::time::Instant::now() + FINALIZE_TIMEOUT,
             )
             .await;
@@ -355,6 +408,7 @@ async fn history_source_is_archived_once_and_reopens_under_the_same_path() {
                 owner(),
                 source,
                 "history".repeat(4000),
+                PAGE,
                 tokio::time::Instant::now() + FINALIZE_TIMEOUT,
             )
             .await;
@@ -379,6 +433,7 @@ async fn history_source_is_archived_once_and_reopens_under_the_same_path() {
             owner(),
             source,
             "history".repeat(4000),
+            PAGE,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await;

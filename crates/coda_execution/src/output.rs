@@ -132,7 +132,7 @@ impl Stream {
             .await
             .map_err(std::io::Error::other)?;
         if offset + (bytes.len() as u64) < saved {
-            bytes.truncate(coda_output::preview::page_boundary(&bytes));
+            bytes.truncate(coda_core::output::preview::page_boundary(&bytes));
         }
         let next_cursor = offset + bytes.len() as u64;
         Ok(OutputChunk {

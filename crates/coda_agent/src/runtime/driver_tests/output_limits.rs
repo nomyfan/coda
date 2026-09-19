@@ -70,7 +70,11 @@ impl Tool for EffectTool {
             ctx.state.set("effect", serde_json::json!(true))?;
             Ok(match mode {
                 "unavailable" => OutputData::unavailable(
-                    "successful execution diagnostic".into(),
+                    coda_core::output::OutputPreview::of(
+                        coda_core::output::Channel::Result,
+                        "successful execution diagnostic",
+                        1024,
+                    ),
                     StorageFailure::Io,
                 ),
                 "invalid_page" => OutputData::Page {

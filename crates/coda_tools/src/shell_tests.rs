@@ -523,7 +523,13 @@ async fn cancelled_large_command_keeps_its_middle_log_readable() {
             .unwrap()
             .contains("MIDDLE-BEFORE-CANCEL")
     );
-    assert!(!output.preview.contains("MIDDLE-BEFORE-CANCEL"));
+    assert!(
+        !output
+            .preview
+            .render(16 * 1024)
+            .0
+            .contains("MIDDLE-BEFORE-CANCEL")
+    );
     assert!(store.charged_bytes() <= store.limits().total_disk_bytes);
 }
 
@@ -543,7 +549,7 @@ async fn exceeding_disk_quota_does_not_stop_the_command_or_lose_its_exit_status(
     let context = context_with_store(store.clone());
     let output = tool()
         .execute(
-            params("head -c 33554432 /dev/zero; printf 'EXIT-MARKER'"),
+            params("head -c 33554432 /dev/zero; printf '\\nEXIT-MARKER'"),
             context,
         )
         .await
@@ -552,7 +558,13 @@ async fn exceeding_disk_quota_does_not_stop_the_command_or_lose_its_exit_status(
         panic!()
     };
     assert_eq!(output.failure, Some(StorageFailure::ResultLimit));
-    assert!(output.preview.contains("EXIT-MARKER"));
+    assert!(
+        output
+            .preview
+            .render(16 * 1024)
+            .0
+            .ends_with("\nEXIT-MARKER")
+    );
     let reference = output.reference.unwrap();
     assert!(!reference.complete);
     assert_eq!(

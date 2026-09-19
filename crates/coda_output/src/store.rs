@@ -8,13 +8,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::archive_dir::{ArchiveDir, ArchiveFileName as FileName, ArchiveRootLock, EntryKind};
-use crate::preview::Preview;
+use coda_core::output::preview::append_channel_text;
 
 const OBJECT_OVERHEAD: u64 = 32 * 1024;
 const MAX_MANIFEST: u64 = 8192;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_OBJECTS: usize = 65536;
 const MAX_SESSION_OBJECTS: usize = 4096;
+/// The snapshot preview a background task's manifest persists, and all that
+/// output no model reads directly is previewed for.
+const SNAPSHOT_PREVIEW_BYTES: usize = 1024;
 /// Every file an output object may hold.
 fn object_files() -> impl Iterator<Item = FileName> {
     [FileName::OutputOwner, FileName::Meta, FileName::MetaTmp]
@@ -160,26 +163,26 @@ impl Store {
                     .any(|(i, c)| channels[..i].contains(c)),
             "invalid output channels: {channels:?}"
         );
-        let limit = self.inner.limits.capture_memory_bytes;
+        // The capture budget less the two IO blocks queued and in flight. An
+        // eighth buffers output inline, a quarter holds the channels'
+        // previews, and the rest covers decoding and rendering copies.
+        let working = self.inner.limits.capture_memory_bytes - 2 * IO_BLOCK_BYTES;
+        let inline_limit = working / 8;
         // Background output is read while it is still being written, so
         // every byte goes straight to disk and even an empty capture
         // leaves files to read. A script's capture holds budget only
         // until the writer finishes, so it also ends on disk, as a
         // temporary file nothing references.
-        let inline_limit = (limit - 2 * IO_BLOCK_BYTES) / 8;
-        let (inline_limit, force_disk, temporary) = match purpose {
-            CapturePurpose::Foreground => (inline_limit, false, false),
-            CapturePurpose::Background => (0, true, false),
-            CapturePurpose::Programmatic(_) => (inline_limit, true, true),
+        let (inline_limit, force_disk, temporary, page) = match purpose {
+            CapturePurpose::Foreground { page_bytes } => (inline_limit, false, false, *page_bytes),
+            CapturePurpose::Background => (0, true, false, SNAPSHOT_PREVIEW_BYTES),
+            CapturePurpose::Programmatic(_) => (inline_limit, true, true, SNAPSHOT_PREVIEW_BYTES),
         };
+        // Line records cost more than their text, so up to four pages.
+        let preview_bytes = page.saturating_mul(4).min(working / 4 / channels.len());
         let previews = channels
             .iter()
-            .map(|c| {
-                (
-                    *c,
-                    Preview::new((limit - 2 * IO_BLOCK_BYTES) / 32 / channels.len()),
-                )
-            })
+            .map(|c| (*c, Preview::new(preview_bytes)))
             .collect();
         let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sender, mut receiver) = mpsc::channel(1);
@@ -283,12 +286,13 @@ impl Store {
         owner: OutputOwner,
         id: Option<OutputId>,
         text: &str,
+        page_bytes: usize,
         deadline: tokio::time::Instant,
     ) -> OutputData {
         let mut capture = self.start_capture(
             owner,
             vec![Channel::Result],
-            &CapturePurpose::Foreground,
+            &CapturePurpose::Foreground { page_bytes },
             None,
             id,
         );
@@ -320,7 +324,7 @@ impl OutputStore for Store {
                         )
                         .await?,
                 ),
-                CapturePurpose::Foreground | CapturePurpose::Background => None,
+                CapturePurpose::Foreground { .. } | CapturePurpose::Background => None,
             };
             Ok(
                 Box::new(self.start_capture(owner, channels, &purpose, memory, None))
@@ -334,12 +338,14 @@ impl OutputStore for Store {
         owner: OutputOwner,
         source: coda_core::llm::MessageId,
         text: String,
+        page_bytes: usize,
         deadline: tokio::time::Instant,
     ) -> OutputFuture<'_, OutputData> {
         Box::pin(async move {
+            let preview = |text: &str| OutputPreview::of(Channel::Result, text, page_bytes);
             let Ok(_gate) = tokio::time::timeout_at(deadline, self.inner.history_gate.lock()).await
             else {
-                return OutputData::unavailable(text, StorageFailure::FinalizeTimeout);
+                return OutputData::unavailable(preview(&text), StorageFailure::FinalizeTimeout);
             };
             let id = OutputId::for_source(&owner, source);
             let retained = {
@@ -381,18 +387,19 @@ impl OutputStore for Store {
                 return match tokio::time::timeout_at(deadline, opened).await {
                     Ok(Ok(Ok(buffer))) => OutputData::Captured(CapturedOutput {
                         report_ok: None,
-                        preview: text,
+                        preview: preview(&text),
                         reference: Some(reference.clone()),
                         failure: reference.failure,
                         buffer,
                     }),
-                    _ => OutputData::unavailable(text, StorageFailure::Io),
+                    _ => OutputData::unavailable(preview(&text), StorageFailure::Io),
                 };
             }
             if self.inner.ledger.lock().unwrap().contains_key(&id) {
-                return OutputData::unavailable(text, StorageFailure::Io);
+                return OutputData::unavailable(preview(&text), StorageFailure::Io);
             }
-            self.save_result(owner, Some(id), &text, deadline).await
+            self.save_result(owner, Some(id), &text, page_bytes, deadline)
+                .await
         })
     }
 
@@ -400,9 +407,13 @@ impl OutputStore for Store {
         &self,
         owner: OutputOwner,
         text: String,
+        page_bytes: usize,
         deadline: tokio::time::Instant,
     ) -> OutputFuture<'_, OutputData> {
-        Box::pin(async move { self.save_result(owner, None, &text, deadline).await })
+        Box::pin(async move {
+            self.save_result(owner, None, &text, page_bytes, deadline)
+                .await
+        })
     }
 }
 
@@ -722,20 +733,16 @@ impl OutputCapture for Capture {
             let deadline = self
                 .deadline
                 .map_or(deadline, |current| current.min(deadline));
-            let mut preview = String::new();
             let captured = self
                 .previews
                 .iter()
                 .map(|(channel, p)| (*channel, p.captured_bytes()))
                 .collect();
-            for (channel, p) in &self.previews {
-                append_text(&mut preview, *channel, &p.text());
-            }
-            {
-                let mut bounded = Preview::new(1024);
-                bounded.append(preview.as_bytes());
-                self.reader.snapshot.lock().unwrap().preview = bounded.text();
-            }
+            let preview = OutputPreview {
+                prefix: String::new(),
+                channels: std::mem::take(&mut self.previews),
+            };
+            self.reader.snapshot.lock().unwrap().preview = preview.render(SNAPSHOT_PREVIEW_BYTES).0;
             let (reply, receive) = oneshot::channel();
             let operation = async {
                 self.sender
@@ -767,7 +774,11 @@ impl OutputCapture for Capture {
                     {
                         let mut text = String::new();
                         for (channel, bytes) in channels {
-                            append_text(&mut text, *channel, &String::from_utf8_lossy(bytes));
+                            append_channel_text(
+                                &mut text,
+                                *channel,
+                                &String::from_utf8_lossy(bytes),
+                            );
                         }
                         return OutputData::Inline(text);
                     }
@@ -1081,7 +1092,11 @@ impl OutputBuffer for Buffer {
                 match &mut *source {
                     Source::Memory(channels) => {
                         for (channel, bytes) in channels {
-                            append_text(&mut text, *channel, &String::from_utf8_lossy(bytes));
+                            append_channel_text(
+                                &mut text,
+                                *channel,
+                                &String::from_utf8_lossy(bytes),
+                            );
                         }
                     }
                     Source::Files(channels) => {
@@ -1090,7 +1105,11 @@ impl OutputBuffer for Buffer {
                             let mut bytes = vec![0; *length as usize];
                             file.read_exact_at(&mut bytes, 0)
                                 .map_err(|e| OutputError::Incomplete(e.to_string()))?;
-                            append_text(&mut text, *channel, &String::from_utf8_lossy(&bytes));
+                            append_channel_text(
+                                &mut text,
+                                *channel,
+                                &String::from_utf8_lossy(&bytes),
+                            );
                         }
                     }
                 }
@@ -1167,23 +1186,6 @@ impl OutputReader for Reader {
                 .map_err(|e| OutputError::Incomplete(e.to_string()))?
         })
     }
-}
-
-fn append_text(text: &mut String, channel: Channel, content: &str) {
-    if content.is_empty() {
-        return;
-    }
-    if matches!(channel, Channel::Stderr | Channel::Log) {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(if channel == Channel::Stderr {
-            "stderr:\n"
-        } else {
-            "log:\n"
-        });
-    }
-    text.push_str(content);
 }
 
 #[cfg(test)]

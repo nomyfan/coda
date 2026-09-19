@@ -136,7 +136,9 @@ async fn synchronous_logs_drain_while_pending_delivery_holds_all_non_log_memory(
             .begin(
                 OutputOwner::default(),
                 vec![Channel::ResultJson, Channel::Log],
-                CapturePurpose::Foreground,
+                CapturePurpose::Foreground {
+                    page_bytes: 16 * 1024,
+                },
             )
             .await
             .unwrap();
@@ -194,7 +196,9 @@ async fn cancellation_preserves_explicit_logs_without_archiving_intermediates() 
         .begin(
             OutputOwner::default(),
             vec![Channel::ResultJson, Channel::Log],
-            CapturePurpose::Foreground,
+            CapturePurpose::Foreground {
+                page_bytes: 16 * 1024,
+            },
         )
         .await
         .unwrap();
@@ -267,7 +271,9 @@ async fn small_report_and_log_render_as_report_then_log() {
             .begin(
                 OutputOwner::default(),
                 vec![Channel::ResultJson, Channel::Log],
-                CapturePurpose::Foreground,
+                CapturePurpose::Foreground {
+                    page_bytes: 16 * 1024,
+                },
             )
             .await
             .unwrap();

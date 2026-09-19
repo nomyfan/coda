@@ -506,6 +506,7 @@ async fn output_progress_and_paths_survive_rewind_while_forks_share_only_the_fil
                 session_id: "root".into(),
             },
             "shared middle log".repeat(2000),
+            16 * 1024,
             tokio::time::Instant::now() + FINALIZE_TIMEOUT,
         )
         .await

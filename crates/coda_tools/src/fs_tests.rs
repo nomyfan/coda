@@ -431,7 +431,7 @@ async fn read_pages_huge_file() {
         panic!("expected page")
     };
     assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_bytes);
-    assert!(body.ends_with(" more bytes omitted]"));
+    assert!(body.contains(" [line 1 truncated: "), "{body}");
     std::fs::remove_file(&path).ok();
 }
 
@@ -838,20 +838,22 @@ async fn read_cuts_long_lines_at_a_character_boundary() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("giant.txt");
     let giant = "你🙂界".repeat(10000);
-    std::fs::write(&file, format!("{giant}\nnext\n")).unwrap();
+    std::fs::write(&file, format!("head\n{giant}\nnext\n")).unwrap();
     let body = read(&file, None, None, 16 * 1024).await;
-    let (first, rest) = body.split_once('\n').unwrap();
-    let text = first.strip_prefix("     1\t").unwrap();
-    let (shown, marker) = text.split_once(" [line truncated: ").unwrap();
+    let lines: Vec<_> = body.lines().collect();
+    let text = lines[1].strip_prefix("     2\t").unwrap();
+    let (shown, marker) = text.split_once(" [line 2 truncated: ").unwrap();
     assert!(shown.len() <= MAX_LINE_BYTES && giant.starts_with(shown));
+    // The offset is into the file, so the rest can be read with `dd` or `tail -c`.
     assert_eq!(
         marker,
         format!(
-            "longer than {MAX_LINE_BYTES} bytes, {} more bytes omitted]",
-            giant.len() - shown.len()
+            "{} more bytes at offset {}]",
+            giant.len() - shown.len(),
+            "head\n".len() + shown.len()
         )
     );
-    assert_eq!(rest, "     2\tnext");
+    assert_eq!(lines[2], "     3\tnext");
 }
 
 #[tokio::test]
@@ -863,10 +865,14 @@ async fn invalid_bytes_cannot_push_a_first_line_past_the_budget() {
     let body = read(&file, None, None, 600).await;
     assert!(body.len() <= 600, "{} bytes", body.len());
     let text = body.strip_prefix("     1\t").unwrap();
-    let (shown, marker) = text.split_once(" [line truncated: ").unwrap();
+    let (shown, marker) = text.split_once(" [line 1 truncated: ").unwrap();
     assert!(shown.chars().all(|c| c == '\u{FFFD}'));
-    let omitted = 5000 - shown.chars().count();
-    assert!(marker.ends_with(&format!("{omitted} more bytes omitted]")));
+    // Each replacement character stands for one raw byte.
+    let used = shown.chars().count();
+    assert_eq!(
+        marker,
+        format!("{} more bytes at offset {used}]", 5000 - used)
+    );
 }
 
 async fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, bytes: usize) -> String {

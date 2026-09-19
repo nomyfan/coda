@@ -91,11 +91,15 @@ impl BackgroundTasks {
             let failure = snapshot
                 .failure
                 .unwrap_or(coda_core::output::StorageFailure::Incomplete);
-            let mut preview = coda_output::preview::Preview::new(budget - metadata);
-            preview.append(snapshot.preview.as_bytes());
+            let preview =
+                coda_core::output::preview::leading_lines(&snapshot.preview, budget - metadata);
+            let rest = if preview.len() < snapshot.preview.len() {
+                "\n[... rest of the preview omitted ...]"
+            } else {
+                ""
+            };
             body.push_str(&format!(
-                "\noutput preview:\n{}\n{}",
-                preview.text(),
+                "\noutput preview:\n{preview}{rest}\n{}",
                 coda_core::output::describe_saved(&[], Some(&failure))
             ));
             return Ok(Some(TaskPage {
@@ -132,7 +136,7 @@ impl BackgroundTasks {
                 _ => &record.files().result,
             };
             let page = stream.read_from(start, share).await?;
-            let (text, used) = coda_output::preview::decode_within(&page.bytes, share);
+            let (text, used) = coda_core::output::preview::decode_within(&page.bytes, share);
             let end = start + used as u64;
             let total = snapshot
                 .channels

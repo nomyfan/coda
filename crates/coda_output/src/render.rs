@@ -1,4 +1,4 @@
-use crate::preview::Preview;
+use coda_core::output::preview::leading_lines;
 use coda_core::output::*;
 use std::sync::Arc;
 
@@ -43,7 +43,12 @@ pub async fn render(
         }
         OutputData::Inline(body) => {
             store
-                .retain(owner, body, tokio::time::Instant::now() + FINALIZE_TIMEOUT)
+                .retain(
+                    owner,
+                    body,
+                    bytes,
+                    tokio::time::Instant::now() + FINALIZE_TIMEOUT,
+                )
                 .await
         }
         output => output,
@@ -67,13 +72,12 @@ pub async fn render(
         }
         OutputData::Inline(body) | OutputData::Page { body, .. } => {
             // Even a store initialization failure cannot bypass the model limit.
-            let mut preview = Preview::new(bytes.saturating_sub(192));
-            preview.append(body.as_bytes());
+            let (shown, _) =
+                OutputPreview::of(Channel::Result, &body, bytes).render(bytes.saturating_sub(192));
             Ok(RenderedOutput {
                 delivery_error: false,
                 body: format!(
-                    "{}\n[output truncated: longer than the {bytes}-byte output limit]\n[full output was not saved: storage is unavailable]",
-                    preview.text()
+                    "{shown}\n[output truncated: longer than the {bytes}-byte output limit]\n[full output was not saved: storage is unavailable]"
                 ),
                 references: vec![],
                 lease: None,
@@ -85,59 +89,25 @@ pub async fn render(
 /// Fits a preview and the saved-file description into `bytes` as plain text.
 /// The file lines always remain whole; only the preview is shortened.
 pub fn render_saved(
-    preview: &str,
+    preview: &OutputPreview,
     references: &[OutputRef],
     failure: Option<StorageFailure>,
     report_ok: Option<bool>,
     bytes: usize,
 ) -> Result<String, OutputError> {
-    let saved = describe_saved(references, failure.as_ref());
     let head = report_ok.map_or(String::new(), |ok| format!("ok: {ok}\n"));
-    let captured: u64 = references
-        .iter()
-        .flat_map(|reference| &reference.channels)
-        .map(|channel| channel.captured_bytes)
-        .sum();
-    let compose = |shown: &str, cut: bool| {
-        let mut text = format!("{head}{shown}");
-        if cut {
-            text.push_str(&format!(
-                "\n[output truncated: longer than the {bytes}-byte output limit]"
-            ));
-        } else if captured > shown.len() as u64 {
-            text.push_str("\n[output truncated: only the start and end were kept in memory]");
-        }
-        if !saved.is_empty() {
-            text.push('\n');
-            text.push_str(&saved);
-        }
-        text
-    };
-    if compose("", true).len() > bytes {
+    let truncated = format!("\n[output truncated: longer than the {bytes}-byte output limit]");
+    let mut saved = describe_saved(references, failure.as_ref());
+    if !saved.is_empty() {
+        saved.insert(0, '\n');
+    }
+    let fixed = head.len() + truncated.len() + saved.len();
+    if fixed > bytes {
         return Err(OutputError::MetadataLimit);
     }
-    let whole = compose(preview, false);
-    if whole.len() <= bytes {
-        return Ok(whole);
-    }
-    let mut low = 0;
-    let mut high = preview.len();
-    let mut best = compose("", true);
-    while low <= high {
-        let capacity = low + (high - low) / 2;
-        let mut bounded = Preview::new(capacity);
-        bounded.append(preview.as_bytes());
-        let candidate = compose(&bounded.text(), true);
-        if candidate.len() <= bytes {
-            best = candidate;
-            low = capacity + 1;
-        } else if capacity == 0 {
-            break;
-        } else {
-            high = capacity - 1;
-        }
-    }
-    Ok(best)
+    let (shown, cut) = preview.render(bytes - fixed);
+    let truncated = if cut { truncated.as_str() } else { "" };
+    Ok(format!("{head}{shown}{truncated}{saved}"))
 }
 
 /// Rebound an existing message without changing execution outcome or read receipts.
@@ -159,6 +129,7 @@ pub async fn bound_tool(
                 owner.clone(),
                 tool.message_id,
                 std::mem::take(body),
+                bytes,
                 tokio::time::Instant::now() + FINALIZE_TIMEOUT,
             )
             .await;
@@ -166,7 +137,25 @@ pub async fn bound_tool(
         tool.output_refs = rendered.references;
         rendered.body
     } else {
-        render_saved(body, &tool.output_refs, None, None, bytes)?
+        // The body is an earlier render of the saved files. Its own line
+        // markers stay accurate only while whole, so keep its leading lines.
+        const NOTE: &str =
+            "[... rest of this earlier preview omitted to fit a smaller output limit ...]";
+        let saved = describe_saved(&tool.output_refs, None);
+        let earlier = body
+            .strip_suffix(saved.as_str())
+            .unwrap_or(body)
+            .trim_end_matches('\n');
+        let fixed = NOTE.len() + 1 + saved.len() + 1;
+        if fixed > bytes {
+            return Err(OutputError::MetadataLimit);
+        }
+        let kept = leading_lines(earlier, bytes - fixed);
+        [kept, NOTE, &saved]
+            .into_iter()
+            .filter(|piece| !piece.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     Ok(())
 }
@@ -194,10 +183,17 @@ mod tests {
     #[test]
     fn oversized_output_is_plain_text_with_reason_and_paths() {
         let preview = "a".repeat(2000);
-        let text = render_saved(&preview, &[reference(2000, 2000, None)], None, None, 600).unwrap();
+        let text = render_saved(
+            &OutputPreview::of(Channel::Stdout, &preview, 4096),
+            &[reference(2000, 2000, None)],
+            None,
+            None,
+            600,
+        )
+        .unwrap();
         assert!(text.len() <= 600);
         assert!(text.starts_with("aaa"));
-        assert!(text.contains("bytes omitted"));
+        assert!(text.contains(" [line 1 truncated: "), "{text}");
         assert!(text.contains("\n[output truncated: longer than the 600-byte output limit]"));
         assert!(text.contains("\n[stdout saved to /out/objects/x/stdout.txt (2000 bytes)]"));
         assert!(text.ends_with("[saved output expires at 1970-01-01T00:00:00Z]"));
@@ -212,7 +208,14 @@ mod tests {
             captured_bytes: 0,
             saved_bytes: 0,
         });
-        let text = render_saved("abc", &[saved], None, None, 4096).unwrap();
+        let text = render_saved(
+            &OutputPreview::of(Channel::Stdout, "abc", 64),
+            &[saved],
+            None,
+            None,
+            4096,
+        )
+        .unwrap();
         assert!(text.contains("stdout.txt"));
         assert!(!text.contains("stderr"));
     }
@@ -220,7 +223,7 @@ mod tests {
     #[test]
     fn partial_saves_and_missing_saves_say_why() {
         let partial = render_saved(
-            "abc",
+            &OutputPreview::of(Channel::Stdout, "abc", 64),
             &[reference(9000, 100, Some(StorageFailure::SessionQuota))],
             None,
             None,
@@ -231,7 +234,14 @@ mod tests {
         assert!(
             partial.contains("[saved output is incomplete: the session disk quota was reached]")
         );
-        let missing = render_saved("abc", &[], Some(StorageFailure::Io), Some(true), 4096).unwrap();
+        let missing = render_saved(
+            &OutputPreview::of(Channel::Stdout, "abc", 64),
+            &[],
+            Some(StorageFailure::Io),
+            Some(true),
+            4096,
+        )
+        .unwrap();
         assert_eq!(
             missing,
             "ok: true\nabc\n[full output was not saved: writing to disk failed]"
