@@ -80,8 +80,6 @@ path = "workspace"
 # [keepalive]
 # interval_secs = 30
 
-
-# --- Output and programmatic execution limits ---------------------------------
 # Optional; values below show the defaults except for the deployment root.
 # Sizes are UTF-8 bytes, not model tokens. Restart after changing these settings.
 # Keep a stable absolute root on persistent local storage. Its lock permits one
