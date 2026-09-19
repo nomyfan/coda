@@ -4,10 +4,9 @@ use super::*;
 fn default_limits_leave_a_separate_log_reservation() {
     let limits = ResourceLimits::default();
     limits.validate().unwrap();
-    assert_eq!(limits.log_buffer_bytes(), 320 * KIB);
     assert_eq!(
-        limits.result_buffer_bytes() + limits.log_buffer_bytes(),
-        limits.ptc.host_buffer_bytes
+        ptc_log_buffer_bytes(limits.output.capture_memory_bytes),
+        320 * KIB
     );
 }
 

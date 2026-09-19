@@ -611,10 +611,6 @@ impl BackgroundTasks {
         owner: coda_core::output::OutputOwner,
     ) -> std::io::Result<Self> {
         let archive = Arc::new(TaskArchive::with_output(archive_dir, store, owner));
-        archive
-            .upgrade_legacy()
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let scan_root = archive.root().clone();
         let inventory = match tokio::task::spawn_blocking(move || scan_inventory(&scan_root)).await
         {
@@ -632,20 +628,7 @@ impl BackgroundTasks {
             temp: None,
         }));
         reg.seed_from_inventory(&archive, inventory).await;
-        archive
-            .upgrade_legacy()
-            .await
-            .map_err(std::io::Error::other)?;
         Ok(reg)
-    }
-
-    /// Retire old payloads after cold-open scope cleanup, before starting execution.
-    pub async fn retire_legacy_output(&self) -> Result<(), TaskAccessError> {
-        self.backend
-            .archive
-            .upgrade_legacy()
-            .await
-            .map_err(Into::into)
     }
 
     /// Seed the live overview from an inventory scan and convert recoverable

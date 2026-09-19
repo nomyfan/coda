@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use coda_core::output::{BufferBudget, ResultBudget};
+use coda_core::output::{
+    BufferBudget, OutputLimits, OutputRuntime, PtcResourceLimits, ResultBudget,
+    ptc_log_buffer_bytes,
+};
 use coda_core::tool::{
     HostCallScope, HostToolCallError, HostToolCallResult, HostToolInvoker, StagedToolCall,
 };
@@ -38,38 +41,43 @@ pub struct PtcLimits {
 
 impl Default for PtcLimits {
     fn default() -> Self {
-        Self {
-            source_bytes: 256 * KIB,
-            heap_bytes: 64 * MIB,
-            stack_bytes: 512 * KIB,
-            wall_time: Duration::from_mins(2),
-            join_grace: Duration::from_secs(1),
-            max_calls: 128,
-            max_concurrent_calls: 16,
-            host_buffer_bytes: 64 * MIB,
-            capture_memory_bytes: 256 * KIB,
-            state_bytes: 4 * MIB,
-            artifact_bytes: 32 * MIB,
-            final_bytes: MIB,
-        }
+        Self::new(
+            &PtcResourceLimits::default(),
+            OutputLimits::default().capture_memory_bytes,
+        )
     }
 }
 
 impl PtcLimits {
-    pub fn configured(
-        resources: &coda_core::output::PtcResourceLimits,
-        capture_memory_bytes: usize,
-    ) -> Self {
+    /// The limits a session's scripts run under.
+    pub fn for_session(outputs: &OutputRuntime) -> Self {
+        Self::new(&outputs.ptc, outputs.store.limits().capture_memory_bytes)
+    }
+
+    /// Configurable limits come from `resources`; the rest are fixed.
+    fn new(resources: &PtcResourceLimits, capture_memory_bytes: usize) -> Self {
         Self {
+            source_bytes: 256 * KIB,
             heap_bytes: resources.heap_bytes,
+            stack_bytes: 512 * KIB,
             wall_time: Duration::from_secs(resources.timeout_secs),
+            join_grace: Duration::from_secs(1),
             max_calls: resources.max_calls,
             max_concurrent_calls: resources.max_concurrent_calls,
             host_buffer_bytes: resources.host_buffer_bytes,
             capture_memory_bytes,
+            state_bytes: 4 * MIB,
+            artifact_bytes: 32 * MIB,
             final_bytes: resources.final_bytes,
-            ..Self::default()
         }
+    }
+
+    pub fn log_buffer_bytes(&self) -> usize {
+        ptc_log_buffer_bytes(self.capture_memory_bytes)
+    }
+
+    pub fn result_buffer_bytes(&self) -> usize {
+        self.host_buffer_bytes - self.log_buffer_bytes()
     }
 }
 
@@ -239,9 +247,7 @@ impl JsExecutor {
         let worker_cancel = script_cancel.clone();
         let worker_stdout = stdout.clone();
         let worker_outstanding_calls = outstanding_calls.clone();
-        let result_budget = BufferBudget::new(
-            (limits.host_buffer_bytes - limits.capture_memory_bytes - 64 * KIB) as u32,
-        );
+        let result_budget = BufferBudget::new(limits.result_buffer_bytes() as u32);
         let worker_budget = result_budget.clone();
         std::thread::Builder::new()
             .name("coda-ptc".to_string())

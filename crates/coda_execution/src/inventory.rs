@@ -64,10 +64,7 @@ pub(crate) fn summary_of(id: &TaskId, manifest: &TaskOutputManifest) -> TaskSumm
         parent_task_id: manifest.meta.parent_task_id.clone(),
         subtree_active: manifest.status.is_running(),
         result_available: manifest.meta.is_subagent()
-            && manifest
-                .payload
-                .as_ref()
-                .is_some_and(|p| p.reference.is_some())
+            && manifest.payload.reference.is_some()
             && matches!(manifest.status, TaskStatus::Completed { .. }),
         id: id.as_str().to_owned(),
         command: manifest.meta.command().to_owned(),

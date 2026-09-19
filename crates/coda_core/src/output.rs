@@ -9,7 +9,9 @@ pub mod budget;
 pub mod config;
 
 pub use budget::{BufferBudget, BufferLease, BufferLimitError};
-pub use config::{ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLimits};
+pub use config::{
+    ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLimits, ptc_log_buffer_bytes,
+};
 
 pub const IO_BLOCK_BYTES: usize = 16 * 1024;
 pub const FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -265,10 +267,8 @@ pub trait OutputCapture: Send {
 pub struct OutputSnapshot {
     /// A short preview across all channels, filled in when the capture
     /// finishes.
-    #[serde(default)]
     pub preview: String,
     /// The capture has finished; no more bytes will arrive.
-    #[serde(default)]
     pub sealed: bool,
     /// The output these counts belong to.
     pub id: OutputId,

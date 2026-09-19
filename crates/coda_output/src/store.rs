@@ -13,16 +13,12 @@ use crate::preview::Preview;
 const OBJECT_OVERHEAD: u64 = 32 * 1024;
 const MAX_MANIFEST: u64 = 8192;
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
-const FILES: [FileName; 8] = [
-    FileName::OutputOwner,
-    FileName::Stdout,
-    FileName::Stderr,
-    FileName::OutputResult,
-    FileName::OutputResultJson,
-    FileName::Log,
-    FileName::Meta,
-    FileName::MetaTmp,
-];
+/// Every file an output object may hold.
+fn object_files() -> impl Iterator<Item = FileName> {
+    [FileName::OutputOwner, FileName::Meta, FileName::MetaTmp]
+        .into_iter()
+        .chain(Channel::ALL.map(FileName::Channel))
+}
 
 pub struct Store {
     inner: Arc<StoreInner>,
@@ -151,13 +147,10 @@ impl StoreInner {
                 .open_dir(&entry.name)
                 .map_err(|e| e.to_string())?;
             let mut charged = OBJECT_OVERHEAD;
-            for name in FILES {
+            for name in object_files() {
                 match dir.open_file(name, false) {
                     Ok(file) => {
-                        if !matches!(
-                            name,
-                            FileName::Meta | FileName::MetaTmp | FileName::OutputOwner
-                        ) {
+                        if matches!(name, FileName::Channel(_)) {
                             charged = charged
                                 .checked_add(file.metadata().map_err(|e| e.to_string())?.len())
                                 .ok_or("output size overflow")?;
@@ -189,7 +182,7 @@ impl StoreInner {
                                 .join(channel.channel.file_name())
                             && channel.saved_bytes <= channel.captured_bytes
                             && dir
-                                .open_file(file_name(channel.channel), false)
+                                .open_file(FileName::Channel(channel.channel), false)
                                 .and_then(|f| Ok(f.metadata()?.len()))
                                 .is_ok_and(|len| len == channel.saved_bytes)
                     })
@@ -329,7 +322,7 @@ impl StoreInner {
                     }
                     Err(e) => return Err(e),
                 };
-                for name in FILES {
+                for name in object_files() {
                     dir.unlink(name)?;
                 }
                 self.objects.remove_dir(id.to_string())?;
@@ -537,7 +530,7 @@ impl Writer {
                 .directory
                 .as_ref()
                 .unwrap()
-                .create_file(file_name(channel))
+                .create_file(FileName::Channel(channel))
                 .map_err(|_| StorageFailure::Io)?;
             self.files.push((channel, file, 0));
             for chunk in bytes.chunks(IO_BLOCK_BYTES) {
@@ -742,7 +735,7 @@ impl OutputStore for Store {
                         .channels
                         .iter()
                         .map(|channel| {
-                            dir.open_file(file_name(channel.channel), false)
+                            dir.open_file(FileName::Channel(channel.channel), false)
                                 .map(|file| (channel.channel, file, channel.saved_bytes))
                                 .map_err(|e| e.to_string())
                         })
@@ -960,13 +953,7 @@ impl OutputCapture for Capture {
                     self.fail(failure.clone());
                     self.abandoned
                         .store(true, std::sync::atomic::Ordering::Release);
-                    OutputData::Captured(CapturedOutput {
-                        report_ok: None,
-                        preview,
-                        reference: None,
-                        failure: Some(failure),
-                        buffer: Arc::new(Unavailable),
-                    })
+                    OutputData::unavailable(preview, failure)
                 }
             }
         })
@@ -980,28 +967,6 @@ impl Drop for Capture {
             self.abandoned
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-    }
-}
-
-#[derive(Debug)]
-struct Unavailable;
-impl OutputBuffer for Unavailable {
-    fn materialize<'a>(
-        &'a self,
-        _: &'a BufferBudget,
-        _: &'a coda_core::tool::CancellationToken,
-    ) -> OutputFuture<'a, Result<HostResultBuffer, String>> {
-        Box::pin(async { Err("OUTPUT_INCOMPLETE: complete output was not retained".into()) })
-    }
-}
-
-fn file_name(channel: Channel) -> FileName {
-    match channel {
-        Channel::Stdout => FileName::Stdout,
-        Channel::Stderr => FileName::Stderr,
-        Channel::Result => FileName::OutputResult,
-        Channel::ResultJson => FileName::OutputResultJson,
-        Channel::Log => FileName::Log,
     }
 }
 
@@ -1065,7 +1030,7 @@ impl OutputReader for Reader {
                     .open_dir(snapshot.id.to_string())
                     .map_err(|e| e.to_string())?;
                 let file = dir
-                    .open_file(file_name(channel), false)
+                    .open_file(FileName::Channel(channel), false)
                     .map_err(|e| e.to_string())?;
                 let count = bytes.min(saved.saturating_sub(offset) as usize);
                 let mut result = vec![0; count];

@@ -336,13 +336,6 @@ impl<'a, P: LLMProvider + Clone + 'static> SessionBuilder<'a, P> {
             }
         }
 
-        if let Some(registry) = &background {
-            registry
-                .retire_legacy_output()
-                .await
-                .map_err(|error| OpenError::Storage(error.to_string()))?;
-        }
-
         // Load resumed state BEFORE bootstrap so we can (a) surface root history
         // via `resumed_messages` and (b) detect pending approvals on *any*
         // agent in the snapshot, not just the root.

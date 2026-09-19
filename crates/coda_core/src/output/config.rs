@@ -230,19 +230,18 @@ impl ResourceLimits {
             KIB as u64,
             output.result_max_bytes.min((16 * MIB) as u64),
         )?;
-        if ptc.host_buffer_bytes < output.capture_memory_bytes + 128 * KIB {
+        if ptc.host_buffer_bytes < ptc_log_buffer_bytes(output.capture_memory_bytes) + 64 * KIB {
             return Err("resources.ptc.host_buffer_bytes must leave at least 64 KiB after the log reservation (resources.output.capture_memory_bytes + 64 KiB)".into());
         }
         Ok(())
     }
+}
 
-    pub fn log_buffer_bytes(&self) -> usize {
-        self.output.capture_memory_bytes + 64 * KIB
-    }
-
-    pub fn result_buffer_bytes(&self) -> usize {
-        self.ptc.host_buffer_bytes - self.log_buffer_bytes()
-    }
+/// The part of a `run_javascript` call's host buffers kept for its console
+/// log: the log capture's memory plus a fixed 64 KiB margin. Tool results get
+/// the rest.
+pub fn ptc_log_buffer_bytes(capture_memory_bytes: usize) -> usize {
+    capture_memory_bytes + 64 * KIB
 }
 
 fn bounded(field: &str, value: u64, min: u64, max: u64) -> Result<(), String> {

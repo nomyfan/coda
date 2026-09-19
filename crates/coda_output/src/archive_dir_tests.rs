@@ -178,11 +178,11 @@ fn create_open_and_verify_perms() {
     let (_tmp, root) = temp_root();
     let id = TaskId::new();
     let task = root.create_dir(&id).unwrap();
-    let mut f = task.create_file(ArchiveFileName::StdoutRing).unwrap();
+    let mut f = task.create_file(ArchiveFileName::Meta).unwrap();
     f.write_all(b"hi").unwrap();
     drop(f);
 
-    let mut r = task.open_file(ArchiveFileName::StdoutRing, false).unwrap();
+    let mut r = task.open_file(ArchiveFileName::Meta, false).unwrap();
     let mut s = String::new();
     r.read_to_string(&mut s).unwrap();
     assert_eq!(s, "hi");

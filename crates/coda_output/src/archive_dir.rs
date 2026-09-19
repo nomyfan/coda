@@ -16,6 +16,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 
+use coda_core::output::Channel;
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RawMode, Stat};
 use rustix::io::Errno;
 use rustix::process::geteuid;
@@ -57,41 +58,25 @@ impl ArchiveError {
     }
 }
 
-/// The closed set of files that may live in a task directory. Keeping it an
-/// enum means create/rename/unlink never take an arbitrary caller string.
+/// The closed set of files that may live in a task directory or an output
+/// object. Keeping it an enum means create/rename/unlink never take an
+/// arbitrary caller string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFileName {
     OutputOwner,
-    Stdout,
-    Stderr,
-    Log,
-    OutputResult,
-    OutputResultJson,
+    /// One channel of an output object, named by [`Channel::file_name`].
+    Channel(Channel),
     Meta,
     MetaTmp,
-    StdoutRing,
-    StderrRing,
-    Result,
-    ResultTmp,
 }
 
 impl ArchiveFileName {
     pub fn as_str(self) -> &'static str {
         match self {
             ArchiveFileName::OutputOwner => "owner.json",
-            ArchiveFileName::Stdout => "stdout.txt",
-            ArchiveFileName::Stderr => "stderr.txt",
-            ArchiveFileName::Log => "log.txt",
-            // Same name as the legacy `Result`, but that one only ever lives in
-            // a background task directory, never in an output object.
-            ArchiveFileName::OutputResult => "result.txt",
-            ArchiveFileName::OutputResultJson => "result.json",
+            ArchiveFileName::Channel(channel) => channel.file_name(),
             ArchiveFileName::Meta => "meta.json",
             ArchiveFileName::MetaTmp => "meta.json.tmp",
-            ArchiveFileName::StdoutRing => "stdout.ring",
-            ArchiveFileName::StderrRing => "stderr.ring",
-            ArchiveFileName::Result => "result.txt",
-            ArchiveFileName::ResultTmp => "result.txt.tmp",
         }
     }
 }

@@ -82,13 +82,16 @@ impl Tool for RunJavaScriptTool {
         params: Self::Parameters,
         ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        let mut limits = self.limits;
+        let own_limits = self.limits;
         async move {
             let (store, owner) = coda_output::Store::session_or_standalone(ctx.outputs.as_ref());
-            limits.capture_memory_bytes = store.limits().capture_memory_bytes;
-            if let Some(outputs) = &ctx.outputs {
-                limits = PtcLimits::configured(&outputs.ptc, limits.capture_memory_bytes);
-            }
+            let limits = match &ctx.outputs {
+                Some(outputs) => PtcLimits::for_session(outputs),
+                None => PtcLimits {
+                    capture_memory_bytes: store.limits().capture_memory_bytes,
+                    ..own_limits
+                },
+            };
 
             if params.code.len() > limits.source_bytes {
                 return Err(ToolError::ResourceLimit(format!(
@@ -289,7 +292,7 @@ fn runtime_limits_description(limits: PtcLimits) -> String {
         limits.max_calls,
         limits.max_concurrent_calls,
         format_bytes(limits.host_buffer_bytes),
-        format_bytes(limits.capture_memory_bytes + 64 * 1024),
+        format_bytes(limits.log_buffer_bytes()),
         format_bytes(limits.state_bytes),
         format_bytes(limits.artifact_bytes),
         format_bytes(limits.final_bytes)

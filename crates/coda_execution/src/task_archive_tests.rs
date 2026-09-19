@@ -1,40 +1,5 @@
 use super::*;
 
-#[tokio::test]
-async fn legacy_logs_retire_after_interrupted_scope_cleanup() {
-    use std::io::Write;
-    let temp = tempfile::tempdir().unwrap();
-    let root = ArchiveDir::open_or_create_root(temp.path()).unwrap();
-    let archive = TaskArchive::new(root.clone());
-    let id = TaskId::new();
-    let mut meta = TaskMeta::shell("old".into(), "old task".into(), "root".into());
-    meta.kind = crate::TaskKind::Subagent {
-        agent_name: "worker".into(),
-    };
-    let record = archive.create_unreserved(&id, &meta).await.unwrap();
-    drop(record);
-    let (dir, mut manifest) = load_task_dir(&root, &id).unwrap().unwrap();
-    manifest.manifest_version = 3;
-    manifest.payload = None;
-    manifest.cleanup_pending = true;
-    save_manifest(&dir, &manifest).unwrap();
-    dir.create_file(ArchiveFileName::StdoutRing)
-        .unwrap()
-        .write_all(b"old log")
-        .unwrap();
-    let registry = crate::BackgroundTasks::session_backed(root).await.unwrap();
-    assert!(dir.open_file(ArchiveFileName::StdoutRing, false).is_ok());
-    assert_eq!(registry.recovered_scopes().await.len(), 1);
-    registry.record_scope(&id, vec![], false).await.unwrap();
-    registry.retire_legacy_output().await.unwrap();
-    assert!(dir.open_file(ArchiveFileName::StdoutRing, false).is_err());
-    assert!(!registry.take_notices().await.is_empty());
-    assert!(
-        matches!(registry.read_result(&id).await.unwrap(), Some(crate::TaskResult::Available { page, .. }) if !page.complete && page.output_refs.is_empty())
-    );
-    registry.shutdown().await;
-}
-
 impl TaskRecord {
     fn pause_next_commit(
         &self,

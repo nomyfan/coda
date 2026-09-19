@@ -164,8 +164,6 @@ async fn corrupt_expired_and_unknown_results_remain_distinct_without_cleanup() {
         serde_json::from_slice(&std::fs::read(&manifest_file).unwrap()).unwrap();
     let path = &manifest
         .payload
-        .as_ref()
-        .unwrap()
         .reference
         .as_ref()
         .unwrap()
@@ -178,7 +176,8 @@ async fn corrupt_expired_and_unknown_results_remain_distinct_without_cleanup() {
     let before = contents(tmp.path());
     assert!(archive.read_result(&id).await.is_err());
     assert_eq!(before, contents(tmp.path()));
-    manifest.payload = None;
+    manifest.payload.reference = None;
+    manifest.payload.failure = Some(coda_core::output::StorageFailure::Incomplete);
     std::fs::write(manifest_file, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let before = contents(tmp.path());
     assert!(matches!(

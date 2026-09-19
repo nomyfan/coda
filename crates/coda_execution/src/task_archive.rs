@@ -87,7 +87,7 @@ impl TaskRecord {
     /// Snapshot lifecycle and output state after any required finalization.
     async fn build_manifest(&self, state: &TaskPersistentState) -> TaskOutputManifest {
         TaskOutputManifest {
-            payload: Some(self.files.snapshot()),
+            payload: self.files.snapshot(),
             notice: state.notice.clone(),
             cleanup_pending: state.cleanup_pending,
             scope_members: state.scope_members.clone(),
@@ -423,41 +423,6 @@ impl TaskArchive {
         Ok(record)
     }
 
-    pub async fn upgrade_legacy(&self) -> Result<(), ArchiveError> {
-        let root = self.root.clone();
-        tokio::task::spawn_blocking(move || {
-            for entry in root.entries()? {
-                let entry = entry?;
-                let Ok(id) = entry.name.parse::<TaskId>() else {
-                    continue;
-                };
-                let Ok(Some((dir, mut manifest))) = load_task_dir(&root, &id) else {
-                    continue;
-                };
-                if manifest.status.is_running() || manifest.cleanup_pending {
-                    continue;
-                }
-                if manifest.manifest_version == 3 {
-                    manifest.manifest_version = MANIFEST_VERSION;
-                    manifest.payload = None;
-                    save_manifest(&dir, &manifest)?;
-                }
-                for name in [
-                    ArchiveFileName::StdoutRing,
-                    ArchiveFileName::StderrRing,
-                    ArchiveFileName::Result,
-                    ArchiveFileName::ResultTmp,
-                ] {
-                    dir.unlink(name)?;
-                }
-                dir.sync()?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(join_err)?
-    }
-
     pub async fn settle(&self) {
         ArchiveActivity::settle(&self.activity).await;
     }
@@ -520,19 +485,7 @@ impl TaskArchive {
         task_dir: ArchiveDir,
         manifest: TaskOutputManifest,
     ) -> Result<Arc<TaskRecord>, ArchiveError> {
-        let mut snapshot =
-            manifest
-                .payload
-                .clone()
-                .unwrap_or_else(|| coda_core::output::OutputSnapshot {
-                    preview: "Legacy output is unavailable after the storage format upgrade."
-                        .into(),
-                    sealed: true,
-                    id: coda_core::output::OutputId::new(),
-                    channels: vec![],
-                    reference: None,
-                    failure: Some(coda_core::output::StorageFailure::Incomplete),
-                });
+        let mut snapshot = manifest.payload.clone();
         if !snapshot.sealed {
             snapshot.sealed = true;
             snapshot.failure = Some(coda_core::output::StorageFailure::Incomplete);
@@ -603,14 +556,7 @@ fn rollback_created_task_blocking(
     task_dir: &ArchiveDir,
 ) -> Result<(), ArchiveError> {
     let mut first_error = None;
-    for name in [
-        ArchiveFileName::MetaTmp,
-        ArchiveFileName::Meta,
-        ArchiveFileName::StdoutRing,
-        ArchiveFileName::StderrRing,
-        ArchiveFileName::Result,
-        ArchiveFileName::ResultTmp,
-    ] {
+    for name in [ArchiveFileName::MetaTmp, ArchiveFileName::Meta] {
         if let Err(error) = task_dir.unlink(name)
             && first_error.is_none()
         {
@@ -666,7 +612,7 @@ pub(crate) fn validate_manifest(
     id: &TaskId,
     manifest: &TaskOutputManifest,
 ) -> Result<(), ArchiveError> {
-    if !matches!(manifest.manifest_version, 3 | MANIFEST_VERSION) {
+    if manifest.manifest_version != MANIFEST_VERSION {
         return Err(ArchiveError::corrupt(format!(
             "unsupported manifest_version {}",
             manifest.manifest_version

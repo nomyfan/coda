@@ -1880,12 +1880,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     request_tools.push(coda_tools::list_javascript_tools_definition());
                     let limits = self.config.outputs.as_ref().map_or_else(
                         coda_ptc::PtcLimits::default,
-                        |outputs| {
-                            coda_ptc::PtcLimits::configured(
-                                &outputs.ptc,
-                                outputs.store.limits().capture_memory_bytes,
-                            )
-                        },
+                        coda_ptc::PtcLimits::for_session,
                     );
                     request_tools.push(coda_ptc::run_javascript_definition_with_limits(limits));
                 }

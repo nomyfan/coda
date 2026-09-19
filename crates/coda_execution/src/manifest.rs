@@ -12,8 +12,7 @@ pub const MANIFEST_VERSION: u32 = 4;
 /// Full manifest persisted as `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOutputManifest {
-    #[serde(default)]
-    pub payload: Option<coda_core::output::OutputSnapshot>,
+    pub payload: coda_core::output::OutputSnapshot,
     pub notice: Option<NoticeDelivery>,
     pub cleanup_pending: bool,
     pub scope_members: Vec<coda_core::task::ScopeMember>,
