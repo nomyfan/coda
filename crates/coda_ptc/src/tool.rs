@@ -1,5 +1,5 @@
 use coda_core::llm::ToolDefinition;
-use coda_core::output::{CapturePurpose, Channel, OutputData};
+use coda_core::output::{CapturePurpose, Channel, OutputData, preview_bytes_for};
 use coda_core::tool::{HostEffectLimits, Tool, ToolCallContext, ToolError, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -85,12 +85,13 @@ impl Tool for RunJavaScriptTool {
         let own_limits = self.limits;
         async move {
             let (store, owner) = coda_output::Store::session_or_standalone(ctx.outputs.as_ref());
-            let limits = match &ctx.outputs {
-                Some(outputs) => PtcLimits::for_session(outputs),
-                None => PtcLimits {
-                    capture_memory_bytes: store.limits().capture_memory_bytes,
-                    ..own_limits
-                },
+            let page_bytes = ctx.result_budget.page_bytes();
+            let limits = PtcLimits {
+                page_bytes,
+                ..match &ctx.outputs {
+                    Some(outputs) => PtcLimits::for_session(outputs),
+                    None => own_limits,
+                }
             };
 
             if params.code.len() > limits.source_bytes {
@@ -123,14 +124,12 @@ impl Tool for RunJavaScriptTool {
                 .begin(
                     owner,
                     vec![Channel::ResultJson, Channel::Log],
-                    CapturePurpose::Foreground {
-                        page_bytes: ctx.result_budget.page_bytes(),
-                    },
+                    CapturePurpose::Foreground { page_bytes },
                 )
                 .await?;
             let logs = coda_output::log::LogCollector::start(
                 capture,
-                limits.capture_memory_bytes / 8,
+                preview_bytes_for(page_bytes),
                 ctx.cancel.clone(),
                 std::time::Instant::now() + limits.wall_time,
             )
@@ -285,7 +284,7 @@ fn ensure_message_limit(
 
 fn runtime_limits_description(limits: PtcLimits) -> String {
     format!(
-        "source {}; heap {}; stack {}; timeout {} seconds; calls {}; concurrent calls {}; host buffers {} (includes {} for logs); state {}; artifacts {}; final JSON {}. Host buffers are released after delivery; there is no cumulative result-byte limit.",
+        "source {}; heap {}; stack {}; timeout {} seconds; calls {}; concurrent calls {}; host buffers {} (includes {} for output capture); state {}; artifacts {}; final JSON {}. Host buffers are released after delivery; there is no cumulative result-byte limit.",
         format_bytes(limits.source_bytes),
         format_bytes(limits.heap_bytes),
         format_bytes(limits.stack_bytes),
@@ -293,10 +292,10 @@ fn runtime_limits_description(limits: PtcLimits) -> String {
         limits.max_calls,
         limits.max_concurrent_calls,
         format_bytes(limits.host_buffer_bytes),
-        format_bytes(limits.log_buffer_bytes()),
+        format_bytes(limits.capture_reserve_bytes()),
         format_bytes(limits.state_bytes),
         format_bytes(limits.artifact_bytes),
-        format_bytes(limits.final_bytes)
+        format_bytes(limits.final_report_bytes)
     )
 }
 
@@ -352,7 +351,7 @@ mod tests {
         for expected in [
             format_bytes(limits.host_buffer_bytes),
             format_bytes(limits.heap_bytes),
-            format_bytes(limits.final_bytes),
+            format_bytes(limits.final_report_bytes),
             "no cumulative result-byte limit".into(),
             "Intermediate tool results remain raw".into(),
         ] {
@@ -361,6 +360,18 @@ mod tests {
                 "description omitted {expected:?}: {description}"
             );
         }
+
+        // A deployment that raises the page must see its own figure.
+        let raised = PtcLimits {
+            page_bytes: 4 * limits.page_bytes,
+            ..limits
+        };
+        let raised_description = run_javascript_definition_with_limits(raised).description;
+        assert!(
+            raised_description.contains(&format_bytes(raised.capture_reserve_bytes())),
+            "description kept the default reservation: {raised_description}"
+        );
+        assert!(!raised_description.contains(&format_bytes(limits.capture_reserve_bytes())));
     }
 
     #[test]

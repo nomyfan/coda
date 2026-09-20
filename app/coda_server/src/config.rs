@@ -440,8 +440,8 @@ fn parse_model_output_limits(
         let table = value.as_inline_table().ok_or("must be an inline table")?;
         for (name, value) in table {
             let field = match name {
-                "single_bytes" => &mut limits.single_bytes,
-                "batch_bytes" => &mut limits.batch_bytes,
+                "single_call_bytes" => &mut limits.single_call_bytes,
+                "batch_call_bytes" => &mut limits.batch_call_bytes,
                 _ => return Err(format!("{name} is not a supported field")),
             };
             *field = value

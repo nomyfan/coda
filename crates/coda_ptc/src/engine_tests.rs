@@ -148,28 +148,43 @@ fn scope() -> HostCallScope {
     )
 }
 
+/// The model page a script's output is captured for.
+const PAGE: usize = 16 * KIB;
+
 async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
     run_logged(code, names, limits).await.0
 }
 
 /// Also returns the console log preview and whether it was cut short.
 async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunReport, String, bool) {
+    run_paged(code, names, limits, PAGE).await
+}
+
+async fn run_paged(
+    code: &str,
+    names: &[&str],
+    limits: PtcLimits,
+    page_bytes: usize,
+) -> (JsRunReport, String, bool) {
     use coda_core::output::{CapturePurpose, Channel, OutputOwner, OutputStore};
+    // Production sizes both from one page (`tool.rs`); so must the harness.
+    let limits = PtcLimits {
+        page_bytes,
+        ..limits
+    };
     let invoker = Arc::new(FakeInvoker::new(names));
     let store = coda_output::Store::standalone();
     let capture = store
         .begin(
             OutputOwner::default(),
             vec![Channel::ResultJson, Channel::Log],
-            CapturePurpose::Foreground {
-                page_bytes: 16 * 1024,
-            },
+            CapturePurpose::Foreground { page_bytes },
         )
         .await
         .unwrap();
     let logs = coda_output::log::LogCollector::start(
         capture,
-        limits.capture_memory_bytes / 8,
+        coda_core::output::preview_bytes_for(page_bytes),
         CancellationToken::new(),
         std::time::Instant::now() + limits.wall_time,
     )
@@ -438,8 +453,9 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
     .await;
     assert_eq!(call_report.error.unwrap().code, "CALL_LIMIT");
 
+    // Eight bytes for results, below the fixed cost of sealing any report.
     let result_limits = PtcLimits {
-        host_buffer_bytes: 256 * KIB + 64 * KIB + 8,
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 8,
         ..PtcLimits::default()
     };
     let result_report = run(
@@ -448,7 +464,11 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
         result_limits,
     )
     .await;
-    assert_eq!(result_report.error.unwrap().code, "OUTPUT_LIMIT");
+    // Sealing costs more than this invoker's result, so it is always what
+    // rejects; `undeliverable_host_result_says_the_tool_ran` covers the other.
+    let error = result_report.error.unwrap();
+    assert_eq!(error.code, "OUTPUT_LIMIT");
+    assert!(error.message.contains("final report"), "{}", error.message);
 }
 
 struct LargeResultInvoker(usize);
@@ -478,7 +498,7 @@ impl HostToolInvoker for LargeResultInvoker {
 async fn undeliverable_host_result_says_the_tool_ran() {
     // Room for the final report, but not for twice the 2 MiB result.
     let limits = PtcLimits {
-        host_buffer_bytes: PtcLimits::default().log_buffer_bytes() + 3 * MIB,
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 3 * MIB,
         ..PtcLimits::default()
     };
     let invoker = Arc::new(LargeResultInvoker(2 * MIB));
@@ -537,8 +557,9 @@ async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
 
 #[tokio::test]
 async fn result_limit_discards_the_childs_staged_effects() {
+    // Eight bytes for results once the capture reservation is taken out.
     let limits = PtcLimits {
-        host_buffer_bytes: 256 * KIB + 64 * KIB + 8,
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 8,
         ..PtcLimits::default()
     };
     let state = Arc::new(RecordingState::default());
@@ -718,14 +739,12 @@ async fn cancellation_wakes_a_permanently_pending_promise() {
 
 #[tokio::test]
 async fn console_overflow_keeps_head_and_tail() {
-    let limits = PtcLimits {
-        capture_memory_bytes: 64 * KIB,
-        ..PtcLimits::default()
-    };
-    let (_, log, truncated) = run_logged(
+    // An 8 KiB preview against a log an order of magnitude longer.
+    let (_, log, truncated) = run_paged(
         "console.log('first'); console.log('x'.repeat(70000)); console.log('second'); return null;",
         &["read_file"],
-        limits,
+        PtcLimits::default(),
+        2 * KIB,
     )
     .await;
 
@@ -738,7 +757,7 @@ async fn console_overflow_keeps_head_and_tail() {
 #[tokio::test]
 async fn oversized_final_value_becomes_a_reported_error() {
     let limits = PtcLimits {
-        final_bytes: 32,
+        final_report_bytes: 32,
         ..PtcLimits::default()
     };
     let report = run("return 'x'.repeat(100);", &["read_file"], limits).await;
@@ -775,3 +794,31 @@ impl HostToolInvoker for RawInvoker {
 
 #[path = "engine_tests/output.rs"]
 mod output;
+
+/// The reservation and the capture both scale with the page, so the smallest
+/// host buffer must still cover the largest page.
+#[test]
+fn the_smallest_host_buffer_covers_the_capture_at_the_largest_page() {
+    use coda_core::output::{ModelOutputLimits, PtcResourceLimits, capture_memory_for};
+
+    let limits = PtcLimits {
+        host_buffer_bytes: PtcResourceLimits::MIN_HOST_BUFFER_BYTES,
+        page_bytes: ModelOutputLimits::MAX_SINGLE_CALL_BYTES,
+        ..PtcLimits::default()
+    };
+    // The reservation covers what the capture actually holds.
+    assert!(
+        limits.capture_reserve_bytes()
+            >= capture_memory_for(limits.page_bytes, 2)
+                + coda_core::output::preview_bytes_for(limits.page_bytes)
+    );
+    // A merely positive budget seals no report at all.
+    assert!(
+        limits.result_buffer_bytes() > coda_core::output::PTC_REPORT_SEALING_BYTES + 1024 * KIB,
+        "result budget was {} bytes, below the fixed report sealing cost",
+        limits.result_buffer_bytes()
+    );
+    // A default page leaves nearly all of the default host buffer to results.
+    let default = PtcLimits::default();
+    assert!(default.result_buffer_bytes() > default.host_buffer_bytes * 9 / 10);
+}

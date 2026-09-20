@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use coda_core::output::{
-    BufferBudget, OutputError, OutputLimits, OutputRuntime, PtcResourceLimits, ResultBudget,
-    ptc_log_buffer_bytes,
+    BufferBudget, ModelOutputLimits, OutputError, OutputRuntime, PTC_REPORT_SEALING_BYTES,
+    PtcResourceLimits, ResultBudget, ptc_capture_reserve_bytes,
 };
 use coda_core::tool::{
     HostCallScope, HostToolCallError, HostToolCallResult, HostToolInvoker, StagedToolCall,
@@ -33,29 +33,28 @@ pub struct PtcLimits {
     pub max_calls: usize,
     pub max_concurrent_calls: usize,
     pub host_buffer_bytes: usize,
-    pub capture_memory_bytes: usize,
+    /// The call's share of the model output budget; the capture reservation
+    /// follows it.
+    pub page_bytes: usize,
     pub state_bytes: usize,
     pub artifact_bytes: usize,
-    pub final_bytes: usize,
+    pub final_report_bytes: usize,
 }
 
 impl Default for PtcLimits {
     fn default() -> Self {
-        Self::new(
-            &PtcResourceLimits::default(),
-            OutputLimits::default().capture_memory_bytes,
-        )
+        Self::new(&PtcResourceLimits::default())
     }
 }
 
 impl PtcLimits {
     /// The limits a session's scripts run under.
     pub fn for_session(outputs: &OutputRuntime) -> Self {
-        Self::new(&outputs.ptc, outputs.store.limits().capture_memory_bytes)
+        Self::new(&outputs.ptc)
     }
 
     /// Configurable limits come from `resources`; the rest are fixed.
-    fn new(resources: &PtcResourceLimits, capture_memory_bytes: usize) -> Self {
+    fn new(resources: &PtcResourceLimits) -> Self {
         Self {
             source_bytes: 256 * KIB,
             heap_bytes: resources.heap_bytes,
@@ -65,19 +64,23 @@ impl PtcLimits {
             max_calls: resources.max_calls,
             max_concurrent_calls: resources.max_concurrent_calls,
             host_buffer_bytes: resources.host_buffer_bytes,
-            capture_memory_bytes,
+            page_bytes: ModelOutputLimits::default().single_call_bytes,
             state_bytes: 4 * MIB,
             artifact_bytes: 32 * MIB,
-            final_bytes: resources.final_bytes,
+            final_report_bytes: resources.final_report_bytes,
         }
     }
 
-    pub fn log_buffer_bytes(&self) -> usize {
-        ptc_log_buffer_bytes(self.capture_memory_bytes)
+    /// Host buffers set aside for the capture that takes no lease of its own.
+    pub fn capture_reserve_bytes(&self) -> usize {
+        ptc_capture_reserve_bytes(self.page_bytes)
     }
 
+    /// What is left for host tool results and for sealing the report. The
+    /// `host_buffer_bytes` floor clears both at the largest page.
     pub fn result_buffer_bytes(&self) -> usize {
-        self.host_buffer_bytes - self.log_buffer_bytes()
+        self.host_buffer_bytes
+            .saturating_sub(self.capture_reserve_bytes())
     }
 }
 
@@ -555,16 +558,16 @@ fn run_worker(input: WorkerInput) -> Result<JsRunReport, JsEngineError> {
                                 // Count UTF-8 bytes while the value is still in the JS heap.
                                 let byte_length: Function = ctx.eval("s => { let n=0; for (const ch of s) { const c=ch.codePointAt(0); n += c<=127?1:c<=2047?2:c<=65535?3:4; } return n; }").map_err(js_init)?;
                                 let bytes: usize = byte_length.call((encoded.clone(),)).map_err(js_init)?;
-                                if bytes > limits.final_bytes { Ok(output_limit_report(format!("final value exceeds {} bytes", limits.final_bytes))) }
+                                if bytes > limits.final_report_bytes { Ok(output_limit_report(format!("final value exceeds {} bytes", limits.final_report_bytes))) }
                                 else if outstanding_calls.load(Ordering::Acquire) != 0 { Ok(unawaited_calls_report(outstanding_calls.load(Ordering::Acquire))) }
                                 else {
                                     // Reserve parsing, JSON tree nodes and final report encoding together.
                                     // The lease survives the worker and is released after output sealing.
-                                    let needed = bytes.saturating_mul(32).saturating_add(limits.capture_memory_bytes * 8).saturating_add(4096);
+                                    let needed = bytes.saturating_mul(32).saturating_add(PTC_REPORT_SEALING_BYTES).saturating_add(4096);
                                     match result_budget.reserve(needed, &cancel).await {
                                         Ok(lease) => {
                                             let encoded = encoded.to_cstring().map_err(js_init)?;
-                                            let mut report = decode_report(encoded.as_str(), limits.final_bytes)?;
+                                            let mut report = decode_report(encoded.as_str(), limits.final_report_bytes)?;
                                             report.buffer_lease = Some(lease);
                                             Ok(report)
                                         }

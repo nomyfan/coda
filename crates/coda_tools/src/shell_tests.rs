@@ -480,7 +480,6 @@ async fn cancelled_large_command_keeps_its_middle_log_readable() {
     let store = Arc::new(
         coda_output::Store::open(OutputLimits {
             root: root.path().join("output"),
-            capture_memory_bytes: 65536,
             ..OutputLimits::default()
         })
         .unwrap(),
@@ -540,8 +539,7 @@ async fn exceeding_disk_quota_does_not_stop_the_command_or_lose_its_exit_status(
     let store = Arc::new(
         coda_output::Store::open(OutputLimits {
             root: root.path().join("output"),
-            capture_memory_bytes: 65536,
-            result_max_bytes: 1024 * 1024,
+            result_disk_bytes: 1024 * 1024,
             ..OutputLimits::default()
         })
         .unwrap(),

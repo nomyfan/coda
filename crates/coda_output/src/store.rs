@@ -163,23 +163,21 @@ impl Store {
                     .any(|(i, c)| channels[..i].contains(c)),
             "invalid output channels: {channels:?}"
         );
-        // The capture budget less the two IO blocks queued and in flight. An
-        // eighth buffers output inline, a quarter holds the channels'
-        // previews, and the rest covers decoding and rendering copies.
-        let working = self.inner.limits.capture_memory_bytes - 2 * IO_BLOCK_BYTES;
-        let inline_limit = working / 8;
         // Background output is read while it is still being written, so
         // every byte goes straight to disk and even an empty capture
         // leaves files to read. A script's capture holds budget only
         // until the writer finishes, so it also ends on disk, as a
         // temporary file nothing references.
-        let (inline_limit, force_disk, temporary, page) = match purpose {
-            CapturePurpose::Foreground { page_bytes } => (inline_limit, false, false, *page_bytes),
-            CapturePurpose::Background => (0, true, false, SNAPSHOT_PREVIEW_BYTES),
-            CapturePurpose::Programmatic(_) => (inline_limit, true, true, SNAPSHOT_PREVIEW_BYTES),
+        let (force_disk, temporary, page) = match purpose {
+            CapturePurpose::Foreground { page_bytes } => (false, false, *page_bytes),
+            CapturePurpose::Background => (true, false, SNAPSHOT_PREVIEW_BYTES),
+            CapturePurpose::Programmatic(_) => (true, true, SNAPSHOT_PREVIEW_BYTES),
         };
-        // Line records cost more than their text, so up to four pages.
-        let preview_bytes = page.saturating_mul(4).min(working / 4 / channels.len());
+        let preview_bytes = preview_bytes_for(page);
+        let inline_limit = match purpose {
+            CapturePurpose::Background => 0,
+            _ => inline_bytes_for(page),
+        };
         let previews = channels
             .iter()
             .map(|c| (*c, Preview::new(preview_bytes)))
@@ -319,7 +317,7 @@ impl OutputStore for Store {
                 CapturePurpose::Programmatic(budget) => Some(
                     budget
                         .reserve(
-                            self.inner.limits.capture_memory_bytes,
+                            capture_memory_for(SNAPSHOT_PREVIEW_BYTES, channels.len()),
                             &coda_core::tool::CancellationToken::new(),
                         )
                         .await?,
@@ -875,7 +873,7 @@ impl Writer {
 
     fn write(&mut self, channel: Channel, bytes: &[u8]) -> Result<(), StorageFailure> {
         let total: u64 = self.files.iter().map(|(_, _, n)| *n).sum();
-        let allowed = (self.store.limits.result_max_bytes.saturating_sub(total))
+        let allowed = (self.store.limits.result_disk_bytes.saturating_sub(total))
             .min(bytes.len() as u64) as usize;
         if allowed > 0 {
             self.store

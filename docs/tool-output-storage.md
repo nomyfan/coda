@@ -1,8 +1,10 @@
 # Tool output storage
 
-Tool collection memory, retained files and model-visible responses have separate limits. Defaults are 256 KiB of capture memory per active output, 64 MiB of saved payload per result, 512 MiB per session and 4 GiB across the service. Model responses default to 16 KiB per tool and 64 KiB per batch, including the preview, paths and metadata. These sizes are UTF-8 bytes, not tokens.
+Retained files and model-visible responses have separate limits. Defaults are 64 MiB of saved payload per result, 512 MiB per session and 4 GiB across the service. Model responses default to 16 KiB per tool and 64 KiB per batch, including the preview, paths and metadata. These sizes are UTF-8 bytes, not tokens.
 
-Configure `[resources.output]`, `[resources.output.model]` and `[resources.ptc]` in the server TOML; the [example configuration](../examples/coda-server.toml) lists every setting. Provider model entries can override `output_limits.single_bytes` and `output_limits.batch_bytes` independently. Changes require a restart. Startup rejects incompatible limits and response budgets too small to include complete file paths. Capture may spill before exhausting its memory allowance to reserve space for preview rendering, UTF-8 decoding and queued IO.
+Capture memory is not configured; it follows from the response budget. Each channel keeps four pages of preview, since a saved output is rendered from its preview alone and a smaller one would show the model less than `single_call_bytes` promises. A capture buffers two pages before spilling to files, so a result the model can see whole leaves no file behind. Raising `single_call_bytes` therefore also raises the memory an active call may hold.
+
+Configure `[resources.output]`, `[resources.output.model]` and `[resources.ptc]` in the server TOML; the [example configuration](../examples/coda-server.toml) lists every setting. Provider model entries can override `output_limits.single_call_bytes` and `output_limits.batch_call_bytes` independently. Changes require a restart. Startup rejects incompatible limits and response budgets too small to include complete file paths.
 
 ## Deployment and retention
 

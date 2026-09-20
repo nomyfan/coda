@@ -430,7 +430,7 @@ async fn read_pages_huge_file() {
     let OutputData::Page { body, .. } = page else {
         panic!("expected page")
     };
-    assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_bytes);
+    assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_call_bytes);
     assert!(body.contains(" [line 1 truncated: "), "{body}");
     std::fs::remove_file(&path).ok();
 }

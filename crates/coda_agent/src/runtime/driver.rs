@@ -1241,7 +1241,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 data,
                 tc.tool_call
                     .output_bytes
-                    .unwrap_or(self.config.profile.output_limits.single_bytes),
+                    .unwrap_or(self.config.profile.output_limits.single_call_bytes),
             )
             .await;
         succeeded &= !rendered.delivery_error && !matches!(outcome, ToolCallOutcome::Aborted);
@@ -1324,10 +1324,10 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             {
                 return call
                     .output_bytes
-                    .unwrap_or(self.config.profile.output_limits.single_bytes);
+                    .unwrap_or(self.config.profile.output_limits.single_call_bytes);
             }
         }
-        self.config.profile.output_limits.single_bytes
+        self.config.profile.output_limits.single_call_bytes
     }
 
     async fn render_output(
@@ -1865,10 +1865,15 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             if descriptor.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME {
                 if snapshot.is_some() {
                     request_tools.push(coda_tools::list_javascript_tools_definition());
-                    let limits = self.config.outputs.as_ref().map_or_else(
-                        coda_ptc::PtcLimits::default,
-                        coda_ptc::PtcLimits::for_session,
-                    );
+                    // Quote what this model runs under: the reservation
+                    // scales with the page, which this profile may override.
+                    let limits = coda_ptc::PtcLimits {
+                        page_bytes: self.config.profile.output_limits.single_call_bytes,
+                        ..self.config.outputs.as_ref().map_or_else(
+                            coda_ptc::PtcLimits::default,
+                            coda_ptc::PtcLimits::for_session,
+                        )
+                    };
                     request_tools.push(coda_ptc::run_javascript_definition_with_limits(limits));
                 }
             } else {
@@ -1921,7 +1926,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     let bytes = slots
                         .get(&tool.id)
                         .copied()
-                        .unwrap_or(self.config.profile.output_limits.single_bytes);
+                        .unwrap_or(self.config.profile.output_limits.single_call_bytes);
                     if let Err(error) =
                         coda_output::render::bound_tool(store.as_ref(), owner.clone(), tool, bytes)
                             .await
@@ -2332,7 +2337,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     page_bytes: tc
                         .tool_call
                         .output_bytes
-                        .unwrap_or(self.config.profile.output_limits.single_bytes),
+                        .unwrap_or(self.config.profile.output_limits.single_call_bytes),
                 };
                 ctx.outputs = self.config.outputs.clone();
                 ctx.background_task = self

@@ -20,8 +20,7 @@ pub struct ResourceLimits {
 #[serde(default, deny_unknown_fields)]
 pub struct OutputLimits {
     pub root: PathBuf,
-    pub capture_memory_bytes: usize,
-    pub result_max_bytes: u64,
+    pub result_disk_bytes: u64,
     pub session_disk_bytes: u64,
     pub total_disk_bytes: u64,
     pub retention_secs: u64,
@@ -32,8 +31,7 @@ impl Default for OutputLimits {
     fn default() -> Self {
         Self {
             root: std::env::temp_dir().join("coda-output"),
-            capture_memory_bytes: 256 * KIB,
-            result_max_bytes: 64 * MIB as u64,
+            result_disk_bytes: 64 * MIB as u64,
             session_disk_bytes: 512 * MIB as u64,
             total_disk_bytes: 4 * GIB,
             retention_secs: 86400,
@@ -45,38 +43,42 @@ impl Default for OutputLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelOutputLimits {
-    pub single_bytes: usize,
-    pub batch_bytes: usize,
+    pub single_call_bytes: usize,
+    pub batch_call_bytes: usize,
 }
 
 impl Default for ModelOutputLimits {
     fn default() -> Self {
         Self {
-            single_bytes: 16 * KIB,
-            batch_bytes: 64 * KIB,
+            single_call_bytes: 16 * KIB,
+            batch_call_bytes: 64 * KIB,
         }
     }
 }
 
 impl ModelOutputLimits {
+    /// The largest page any model may be configured for; capture memory is
+    /// derived from it.
+    pub const MAX_SINGLE_CALL_BYTES: usize = 256 * KIB;
+
     pub fn validate(&self, output_root: &Path) -> Result<(), String> {
         bounded(
-            "single_bytes",
-            self.single_bytes as u64,
+            "single_call_bytes",
+            self.single_call_bytes as u64,
             KIB as u64,
-            (256 * KIB) as u64,
+            Self::MAX_SINGLE_CALL_BYTES as u64,
         )?;
         bounded(
-            "batch_bytes",
-            self.batch_bytes as u64,
-            self.single_bytes as u64,
+            "batch_call_bytes",
+            self.batch_call_bytes as u64,
+            self.single_call_bytes as u64,
             MIB as u64,
         )?;
         let minimum = Self::minimum_response_bytes(output_root)?;
-        if self.single_bytes < minimum {
+        if self.single_call_bytes < minimum {
             return Err(format!(
-                "single_bytes must be at least {minimum} to show complete output paths and metadata, got {}",
-                self.single_bytes
+                "single_call_bytes must be at least {minimum} to show complete output paths and metadata, got {}",
+                self.single_call_bytes
             ));
         }
         Ok(())
@@ -124,12 +126,12 @@ impl ModelOutputLimits {
         if calls == 0 {
             return Ok(Vec::new());
         }
-        let share = (self.batch_bytes / calls).min(self.single_bytes);
+        let share = (self.batch_call_bytes / calls).min(self.single_call_bytes);
         if share < minimum {
             return Err("tool batch cannot fit the minimum output metadata");
         }
-        let remainder = if share < self.single_bytes {
-            self.batch_bytes % calls
+        let remainder = if share < self.single_call_bytes {
+            self.batch_call_bytes % calls
         } else {
             0
         };
@@ -147,7 +149,7 @@ pub struct PtcResourceLimits {
     pub host_buffer_bytes: usize,
     pub max_calls: usize,
     pub max_concurrent_calls: usize,
-    pub final_bytes: usize,
+    pub final_report_bytes: usize,
 }
 
 impl Default for PtcResourceLimits {
@@ -158,10 +160,26 @@ impl Default for PtcResourceLimits {
             host_buffer_bytes: 64 * MIB,
             max_calls: 128,
             max_concurrent_calls: 16,
-            final_bytes: MIB,
+            final_report_bytes: MIB,
         }
     }
 }
+
+impl PtcResourceLimits {
+    /// The smallest configurable host-buffer budget: enough to clear the
+    /// capture reservation at [`ModelOutputLimits::MAX_SINGLE_CALL_BYTES`]
+    /// *and* [`super::PTC_REPORT_SEALING_BYTES`], which is what keeps this
+    /// table independent of the model's.
+    pub const MIN_HOST_BUFFER_BYTES: usize = 8 * MIB;
+}
+
+// No legal pair of settings may leave a script unable to seal a report.
+const _: () = assert!(
+    PtcResourceLimits::MIN_HOST_BUFFER_BYTES
+        >= super::ptc_capture_reserve_bytes(ModelOutputLimits::MAX_SINGLE_CALL_BYTES)
+            + super::PTC_REPORT_SEALING_BYTES
+            + MIB
+);
 
 impl ResourceLimits {
     pub fn validate(&self) -> Result<(), String> {
@@ -171,21 +189,15 @@ impl ResourceLimits {
             return Err("resources.output.root must resolve to an absolute path".into());
         }
         bounded(
-            "resources.output.capture_memory_bytes",
-            output.capture_memory_bytes as u64,
-            (64 * KIB) as u64,
-            (4 * MIB) as u64,
-        )?;
-        bounded(
-            "resources.output.result_max_bytes",
-            output.result_max_bytes,
+            "resources.output.result_disk_bytes",
+            output.result_disk_bytes,
             MIB as u64,
             GIB,
         )?;
         bounded(
             "resources.output.session_disk_bytes",
             output.session_disk_bytes,
-            output.result_max_bytes,
+            output.result_disk_bytes,
             TIB,
         )?;
         bounded(
@@ -214,7 +226,7 @@ impl ResourceLimits {
         bounded(
             "resources.ptc.host_buffer_bytes",
             ptc.host_buffer_bytes as u64,
-            (4 * MIB) as u64,
+            PtcResourceLimits::MIN_HOST_BUFFER_BYTES as u64,
             (512 * MIB) as u64,
         )?;
         bounded("resources.ptc.max_calls", ptc.max_calls as u64, 1, 1024)?;
@@ -225,23 +237,13 @@ impl ResourceLimits {
             ptc.max_calls.min(64) as u64,
         )?;
         bounded(
-            "resources.ptc.final_bytes",
-            ptc.final_bytes as u64,
+            "resources.ptc.final_report_bytes",
+            ptc.final_report_bytes as u64,
             KIB as u64,
-            output.result_max_bytes.min((16 * MIB) as u64),
+            output.result_disk_bytes.min((16 * MIB) as u64),
         )?;
-        if ptc.host_buffer_bytes < ptc_log_buffer_bytes(output.capture_memory_bytes) + 64 * KIB {
-            return Err("resources.ptc.host_buffer_bytes must leave at least 64 KiB after the log reservation (resources.output.capture_memory_bytes + 64 KiB)".into());
-        }
         Ok(())
     }
-}
-
-/// The part of a `run_javascript` call's host buffers kept for its console
-/// log: the log capture's memory plus a fixed 64 KiB margin. Tool results get
-/// the rest.
-pub fn ptc_log_buffer_bytes(capture_memory_bytes: usize) -> usize {
-    capture_memory_bytes + 64 * KIB
 }
 
 fn bounded(field: &str, value: u64, min: u64, max: u64) -> Result<(), String> {

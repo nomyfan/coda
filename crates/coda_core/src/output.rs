@@ -10,13 +10,47 @@ pub mod config;
 pub mod preview;
 
 pub use budget::{BufferBudget, BufferLease, BufferLimitError};
-pub use config::{
-    ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLimits, ptc_log_buffer_bytes,
-};
+pub use config::{ModelOutputLimits, OutputLimits, PtcResourceLimits, ResourceLimits};
 pub use preview::{OutputPreview, Preview};
 
 pub const IO_BLOCK_BYTES: usize = 16 * 1024;
 pub const FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Preview one channel keeps to render `page_bytes` for the model. A saved
+/// output renders from its preview alone, so a smaller one would silently
+/// show less than promised; line records cost extra, hence four pages.
+pub const fn preview_bytes_for(page_bytes: usize) -> usize {
+    page_bytes.saturating_mul(4)
+}
+
+/// What a capture buffers before spilling, so a result the model can see
+/// whole leaves no file behind.
+pub const fn inline_bytes_for(page_bytes: usize) -> usize {
+    page_bytes.saturating_mul(2)
+}
+
+/// What one capture may hold: its inline buffer, its channels' previews and
+/// the two IO blocks in flight. A script's capture reserves this.
+pub const fn capture_memory_for(page_bytes: usize, channels: usize) -> usize {
+    inline_bytes_for(page_bytes)
+        .saturating_add(preview_bytes_for(page_bytes).saturating_mul(channels))
+        .saturating_add(2 * IO_BLOCK_BYTES)
+}
+
+/// Native memory one `run_javascript` call holds outside its result budget:
+/// the capture that seals its report and log, plus the log collector's own
+/// preview and queue. That capture takes no lease, so `host_buffer_bytes`
+/// sets this aside — and both sides scale with the page.
+pub const fn ptc_capture_reserve_bytes(page_bytes: usize) -> usize {
+    capture_memory_for(page_bytes, 2)
+        .saturating_add(preview_bytes_for(page_bytes))
+        .saturating_add(2 * IO_BLOCK_BYTES)
+}
+
+/// Fixed cost of sealing a final report, whatever the report's own size. A
+/// result budget below this delivers no report at all, so this, not zero, is
+/// the floor a host buffer has to clear.
+pub const PTC_REPORT_SEALING_BYTES: usize = 2 * 1024 * 1024;
 
 pub type OutputFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

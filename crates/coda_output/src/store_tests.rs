@@ -13,8 +13,7 @@ fn owner() -> OutputOwner {
 fn store(root: &std::path::Path) -> Store {
     Store::open(OutputLimits {
         root: root.join("output"),
-        capture_memory_bytes: 65536,
-        result_max_bytes: 1024 * 1024,
+        result_disk_bytes: 1024 * 1024,
         ..OutputLimits::default()
     })
     .unwrap()
@@ -60,15 +59,13 @@ async fn large_output_has_readable_middle_and_bounded_preview() {
 }
 
 #[tokio::test]
-async fn previews_share_a_quarter_of_the_capture_memory() {
+async fn previews_cover_the_page_they_must_render() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(OutputLimits {
         root: root.path().join("output"),
-        capture_memory_bytes: 64 * 1024,
         ..OutputLimits::default()
     })
     .unwrap();
-    let working = 64 * 1024 - 2 * IO_BLOCK_BYTES;
     let capacities = |page_bytes| {
         store
             .start_capture(
@@ -83,8 +80,8 @@ async fn previews_share_a_quarter_of_the_capture_memory() {
             .map(|(_, preview)| preview.capacity())
             .collect::<Vec<_>>()
     };
-    // A page larger than the capture memory still gets only its share.
-    assert_eq!(capacities(256 * 1024), [working / 8, working / 8]);
+    // Four pages each, so a preview can always fill the call's budget.
+    assert_eq!(capacities(256 * 1024), [1024 * 1024, 1024 * 1024]);
     // A small page needs no more than four pages each.
     assert_eq!(capacities(1024), [4096, 4096]);
 }
@@ -298,7 +295,7 @@ async fn shared_quota_evicts_unpinned_outputs_and_never_live_captures() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(OutputLimits {
         root: root.path().join("output"),
-        result_max_bytes: 1024 * 1024,
+        result_disk_bytes: 1024 * 1024,
         session_disk_bytes: 1024 * 1024,
         total_disk_bytes: 1024 * 1024,
         ..OutputLimits::default()

@@ -182,7 +182,7 @@ impl ToolCallContext {
             invoker: None,
             outputs: None,
             result_budget: ResultBudget::Model {
-                page_bytes: crate::output::ModelOutputLimits::default().single_bytes,
+                page_bytes: crate::output::ModelOutputLimits::default().single_call_bytes,
             },
             prior_reads: Arc::from([]),
         }
