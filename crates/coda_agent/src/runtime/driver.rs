@@ -1315,8 +1315,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         aborted
     }
 
-    /// Append a tool message that recorded no state: a write-off, a rejection,
-    /// a missing tool, or a sub-agent's reply.
+    /// The output budget assigned to call `id` when its assistant message was
+    /// recorded, or the single-call default when the call is not in history.
     async fn call_output_budget(&self, id: &str) -> usize {
         for entry in self.process.history().await.iter().rev() {
             if let Message::Assistant(message) = &entry.message
@@ -1351,6 +1351,8 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         rendered
     }
 
+    /// Append a tool message that recorded no state: a write-off, a rejection,
+    /// a missing tool, or a sub-agent's reply.
     async fn add_tool_message(&mut self, message: ToolMessage) {
         self.add_message_with_state(message, Vec::new()).await
     }
@@ -2050,14 +2052,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         assistant_message.generation = Some(generation);
         assistant_message.started_at = started_at;
         assistant_message.ended_at = ended_at;
-        let minimum = coda_core::output::ModelOutputLimits::minimum_response_bytes(
-            self.config
-                .outputs
-                .as_ref()
-                .map_or(std::path::Path::new("/tmp/coda-output"), |runtime| {
-                    runtime.store.limits().root.as_path()
-                }),
-        );
+        let (store, _) = coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let minimum =
+            coda_core::output::ModelOutputLimits::minimum_response_bytes(&store.limits().root);
         let shares = minimum.and_then(|minimum| {
             self.config
                 .profile
