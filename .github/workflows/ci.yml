@@ -47,6 +47,19 @@ jobs:
         with:
           prefix-key: ${{ matrix.os }}-cargo
 
+      # The glob, grep and ls tools shell out to these, and their tests run them.
+      - name: Install fd and ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          # Debian ships fd as `fdfind`.
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install fd and ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fd ripgrep
+
       - name: Rustfmt
         run: cargo fmt --all --check
 
