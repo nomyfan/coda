@@ -41,6 +41,7 @@ impl HostToolInvoker for FakeInvoker {
         Box::pin(async move {
             tokio::time::sleep(delay).await;
             Ok(HostToolCallResult {
+                buffer_lease: None,
                 output: format!("{name}:{arguments}"),
             })
         })
@@ -130,6 +131,7 @@ impl HostToolInvoker for EffectInvoker {
                 })
                 .unwrap();
             Ok(HostToolCallResult {
+                buffer_lease: None,
                 output: "oversized".to_string(),
             })
         })
@@ -146,18 +148,61 @@ fn scope() -> HostCallScope {
     )
 }
 
+/// The model page a script's output is captured for.
+const PAGE: usize = 16 * KIB;
+
 async fn run(code: &str, names: &[&str], limits: PtcLimits) -> JsRunReport {
+    run_logged(code, names, limits).await.0
+}
+
+/// Also returns the console log preview and whether it was cut short.
+async fn run_logged(code: &str, names: &[&str], limits: PtcLimits) -> (JsRunReport, String, bool) {
+    run_paged(code, names, limits, PAGE).await
+}
+
+async fn run_paged(
+    code: &str,
+    names: &[&str],
+    limits: PtcLimits,
+    page_bytes: usize,
+) -> (JsRunReport, String, bool) {
+    use coda_core::output::{CapturePurpose, Channel, OutputOwner, OutputStore};
+    // Production sizes both from one page (`tool.rs`); so must the harness.
+    let limits = PtcLimits {
+        page_bytes,
+        ..limits
+    };
     let invoker = Arc::new(FakeInvoker::new(names));
-    JsExecutor::new(limits)
+    let store = coda_output::Store::standalone();
+    let capture = store
+        .begin(
+            OutputOwner::default(),
+            vec![Channel::ResultJson, Channel::Log],
+            CapturePurpose::Foreground { page_bytes },
+        )
+        .await
+        .unwrap();
+    let logs = coda_output::log::LogCollector::start(
+        capture,
+        coda_core::output::preview_bytes_for(page_bytes),
+        CancellationToken::new(),
+        std::time::Instant::now() + limits.wall_time,
+    )
+    .unwrap();
+    let report = JsExecutor::new(limits)
         .run(
             code.to_string(),
             invoker.exposed_tools(),
             invoker,
             scope(),
             CancellationToken::new(),
+            Some(logs.writer()),
         )
         .await
-        .unwrap()
+        .unwrap();
+    let (log, truncated) = logs.snapshot();
+    let _ = logs.finish("").await;
+    (report, log, truncated)
 }
 
 async fn run_with_tool_error(code: &str) -> JsRunReport {
@@ -169,6 +214,7 @@ async fn run_with_tool_error(code: &str) -> JsRunReport {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()
@@ -183,6 +229,7 @@ async fn run_with_unavailable_tool(code: &str) -> JsRunReport {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap()
@@ -190,7 +237,7 @@ async fn run_with_unavailable_tool(code: &str) -> JsRunReport {
 
 #[tokio::test]
 async fn returns_json_value_and_bounded_console_output() {
-    let report = run(
+    let (report, log, truncated) = run_logged(
         r#"
 console.log("hello", { answer: 42 });
 return { answer: 42 };
@@ -202,8 +249,10 @@ return { answer: 42 };
 
     assert!(report.ok);
     assert_eq!(report.value, Some(serde_json::json!({ "answer": 42 })));
-    assert_eq!(report.stdout, "hello {\"answer\":42}");
-    assert!(!report.stdout_truncated);
+    assert_eq!(log, "hello {\"answer\":42}\n");
+    assert!(!truncated);
+    // The log is kept apart from the report, not copied into it.
+    assert!(!serde_json::to_string(&report).unwrap().contains("hello"));
 }
 
 #[tokio::test]
@@ -404,8 +453,9 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
     .await;
     assert_eq!(call_report.error.unwrap().code, "CALL_LIMIT");
 
+    // Eight bytes for results, below the fixed cost of sealing any report.
     let result_limits = PtcLimits {
-        result_bytes: 4,
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 8,
         ..PtcLimits::default()
     };
     let result_report = run(
@@ -414,7 +464,67 @@ async fn host_call_and_result_limits_reject_inside_javascript() {
         result_limits,
     )
     .await;
-    assert_eq!(result_report.error.unwrap().code, "RESULT_LIMIT");
+    // Sealing costs more than this invoker's result, so it is always what
+    // rejects; `undeliverable_host_result_says_the_tool_ran` covers the other.
+    let error = result_report.error.unwrap();
+    assert_eq!(error.code, "OUTPUT_LIMIT");
+    assert!(error.message.contains("final report"), "{}", error.message);
+}
+
+struct LargeResultInvoker(usize);
+
+impl HostToolInvoker for LargeResultInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".to_string()])
+    }
+
+    fn call(
+        &self,
+        _name: String,
+        _arguments: String,
+        _context: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        let bytes = self.0;
+        Box::pin(async move {
+            Ok(HostToolCallResult {
+                buffer_lease: None,
+                output: "x".repeat(bytes),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn undeliverable_host_result_says_the_tool_ran() {
+    // Room for the final report, but not for twice the 2 MiB result.
+    let limits = PtcLimits {
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 3 * MIB,
+        ..PtcLimits::default()
+    };
+    let invoker = Arc::new(LargeResultInvoker(2 * MIB));
+    let report = JsExecutor::new(limits)
+        .run(
+            "try { await tools.read_file({}); } catch (error) { return [error.code, error.message]; }"
+                .to_string(),
+            invoker.exposed_tools(),
+            invoker,
+            scope(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(report.ok, "{report:?}");
+    let value = report.value.unwrap();
+    assert_eq!(value[0], "OUTPUT_LIMIT");
+    assert!(
+        value[1]
+            .as_str()
+            .unwrap()
+            .starts_with("tool executed; result delivery failed: OUTPUT_LIMIT: "),
+        "{value}"
+    );
 }
 
 #[tokio::test]
@@ -435,6 +545,7 @@ async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -446,8 +557,9 @@ async fn concurrency_cap_queues_excess_calls_instead_of_rejecting_them() {
 
 #[tokio::test]
 async fn result_limit_discards_the_childs_staged_effects() {
+    // Eight bytes for results once the capture reservation is taken out.
     let limits = PtcLimits {
-        result_bytes: 4,
+        host_buffer_bytes: PtcLimits::default().capture_reserve_bytes() + 8,
         ..PtcLimits::default()
     };
     let state = Arc::new(RecordingState::default());
@@ -469,11 +581,12 @@ async fn result_limit_discards_the_childs_staged_effects() {
             invoker,
             scope,
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
 
-    assert_eq!(report.error.unwrap().code, "RESULT_LIMIT");
+    assert_eq!(report.error.unwrap().code, "OUTPUT_LIMIT");
     commit.commit_into_outer().unwrap();
     assert_eq!(state.get("effect"), None);
     assert!(inspect_artifacts.take_artifacts().is_empty());
@@ -492,6 +605,7 @@ async fn unfinished_fire_and_forget_call_is_reported_and_cancelled() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -516,6 +630,7 @@ async fn worker_queue_wait_observes_the_wall_clock_deadline() {
             Arc::new(FakeInvoker::new(&["read_file"])),
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -540,6 +655,7 @@ async fn worker_queue_wait_observes_cancellation() {
             Arc::new(FakeInvoker::new(&["read_file"])),
             scope(),
             cancel,
+            None,
         )
         .await;
 
@@ -587,6 +703,7 @@ async fn deadline_cancels_a_pending_host_call() {
             invoker,
             scope(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -607,6 +724,7 @@ async fn cancellation_wakes_a_permanently_pending_promise() {
                 invoker,
                 scope(),
                 cancel,
+                None,
             )
             .await
     });
@@ -620,29 +738,87 @@ async fn cancellation_wakes_a_permanently_pending_promise() {
 }
 
 #[tokio::test]
-async fn console_overflow_keeps_the_tail() {
-    let limits = PtcLimits {
-        stdout_bytes: 8,
-        ..PtcLimits::default()
-    };
-    let report = run(
-        "console.log('first'); console.log('second'); return null;",
+async fn console_overflow_keeps_head_and_tail() {
+    // An 8 KiB preview against a log an order of magnitude longer.
+    let (_, log, truncated) = run_paged(
+        "console.log('first'); console.log('x'.repeat(70000)); console.log('second'); return null;",
         &["read_file"],
-        limits,
+        PtcLimits::default(),
+        2 * KIB,
     )
     .await;
 
-    assert_eq!(report.stdout, "second");
-    assert!(report.stdout_truncated);
+    assert!(log.starts_with("first\n"));
+    assert!(log.contains(" [line 2 truncated: "), "{log}");
+    assert!(log.ends_with("\nsecond"));
+    assert!(truncated);
 }
 
 #[tokio::test]
 async fn oversized_final_value_becomes_a_reported_error() {
     let limits = PtcLimits {
-        final_bytes: 32,
+        final_report_bytes: 32,
         ..PtcLimits::default()
     };
     let report = run("return 'x'.repeat(100);", &["read_file"], limits).await;
 
     assert_eq!(report.error.unwrap().code, "OUTPUT_LIMIT");
+}
+
+struct RawInvoker {
+    bytes: usize,
+}
+impl HostToolInvoker for RawInvoker {
+    fn exposed_tools(&self) -> Arc<[String]> {
+        Arc::from(vec!["read_file".into()])
+    }
+    fn call(
+        &self,
+        _: String,
+        _: String,
+        ctx: ToolCallContext,
+    ) -> Pin<Box<dyn Future<Output = Result<HostToolCallResult, HostToolCallError>> + Send>> {
+        let bytes = self.bytes;
+        Box::pin(async move {
+            let ResultBudget::Script(budget) = ctx.result_budget else {
+                panic!()
+            };
+            let lease = budget.reserve(bytes * 2, &ctx.cancel).await.unwrap();
+            Ok(HostToolCallResult {
+                output: "x".repeat(bytes),
+                buffer_lease: Some(lease),
+            })
+        })
+    }
+}
+
+#[path = "engine_tests/output.rs"]
+mod output;
+
+/// The reservation and the capture both scale with the page, so the smallest
+/// host buffer must still cover the largest page.
+#[test]
+fn the_smallest_host_buffer_covers_the_capture_at_the_largest_page() {
+    use coda_core::output::{ModelOutputLimits, PtcResourceLimits, capture_memory_for};
+
+    let limits = PtcLimits {
+        host_buffer_bytes: PtcResourceLimits::MIN_HOST_BUFFER_BYTES,
+        page_bytes: ModelOutputLimits::MAX_SINGLE_CALL_BYTES,
+        ..PtcLimits::default()
+    };
+    // The reservation covers what the capture actually holds.
+    assert!(
+        limits.capture_reserve_bytes()
+            >= capture_memory_for(limits.page_bytes, 2)
+                + coda_core::output::preview_bytes_for(limits.page_bytes)
+    );
+    // A merely positive budget seals no report at all.
+    assert!(
+        limits.result_buffer_bytes() > coda_core::output::PTC_REPORT_SEALING_BYTES + 1024 * KIB,
+        "result budget was {} bytes, below the fixed report sealing cost",
+        limits.result_buffer_bytes()
+    );
+    // A default page leaves nearly all of the default host buffer to results.
+    let default = PtcLimits::default();
+    assert!(default.result_buffer_bytes() > default.host_buffer_bytes * 9 / 10);
 }

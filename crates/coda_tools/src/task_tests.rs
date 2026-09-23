@@ -49,68 +49,12 @@ async fn a_subagent_can_request_its_own_stop_without_waiting_for_itself() {
     .await
     .expect("self stop must not wait on its own monitor");
     assert!(matches!(
-        background.read(&id).await.unwrap().unwrap().status,
-        coda_execution::TaskStatus::Killed { .. }
+        background.read_result(&id).await.unwrap(),
+        Some(coda_execution::TaskResult::Available {
+            status: coda_execution::TaskStatus::Killed { .. },
+            ..
+        })
     ));
-}
-
-#[tokio::test]
-async fn task_output_reads_incrementally_and_reports_expiry() {
-    let background = Arc::new(BackgroundTasks::temporary().unwrap());
-    let id = background
-        .spawn(bash("echo first; sleep 39.01"), meta("stream"))
-        .await
-        .unwrap();
-    let tool = TaskOutputTool::new(background.clone());
-
-    // First read eventually sees "first"; the next read must not repeat it.
-    let progress = ToolCallContext::default();
-    let out = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let out = tool
-                .execute(
-                    TaskOutputToolParams { id: id.to_string() },
-                    progress.clone(),
-                )
-                .await
-                .unwrap();
-            if out.contains("first") {
-                break out;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("output never arrived");
-    assert!(out.contains("status: running"), "unexpected: {out}");
-    assert!(progress.take_task_result().is_none());
-
-    let again = tool
-        .execute(
-            TaskOutputToolParams { id: id.to_string() },
-            ToolCallContext::default(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        again.contains("(no new output)"),
-        "second read repeated output: {again}"
-    );
-
-    let missing = tool
-        .execute(
-            TaskOutputToolParams {
-                id: "bg_00000000000000000000000000000000".into(),
-            },
-            ToolCallContext::default(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        missing.contains("Unknown or expired task id"),
-        "unexpected: {missing}"
-    );
-    background.shutdown().await;
 }
 
 #[tokio::test]
@@ -158,86 +102,73 @@ async fn task_kill_terminates_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn task_output_never_records_a_terminal_read_after_paginated_loss() {
+async fn task_pages_advance_only_when_the_checkpoint_commits() {
+    use coda_core::output::{Channel, OutputData};
     let background = Arc::new(BackgroundTasks::temporary().unwrap());
     let id = background
-        .spawn_with(meta("overwritten output"), |ctx| async move {
-            let bytes = vec![b'x'; coda_execution::DEFAULT_STREAM_CAPACITY as usize + 7];
-            ctx.append_stdout(&bytes).await.unwrap();
+        .spawn_with(meta("pages"), |ctx| async move {
+            ctx.append_stdout("中🙂".repeat(4000).as_bytes())
+                .await
+                .unwrap();
             coda_execution::TaskExit::Exited { code: Some(0) }
         })
         .await
         .unwrap();
     background.wait_terminal(&id).await;
     let tool = TaskOutputTool::new(background.clone());
-    loop {
+    let mut read = String::new();
+    let mut done = false;
+    for _ in 0..100 {
         let ctx = ToolCallContext::default();
-        let out = tool
-            .execute(TaskOutputToolParams { id: id.to_string() }, ctx.clone())
+        let OutputData::Page { body, .. } = tool
+            .execute(
+                TaskOutputToolParams {
+                    id: id.to_string(),
+                    byte_offset: None,
+                },
+                ctx.clone(),
+            )
             .await
+            .unwrap()
+        else {
+            panic!("expected page")
+        };
+        assert!(body.len() <= ctx.result_budget.page_bytes());
+        let OutputData::Page { body: repeated, .. } = tool
+            .execute(
+                TaskOutputToolParams {
+                    id: id.to_string(),
+                    byte_offset: None,
+                },
+                ToolCallContext::default(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected page")
+        };
+        assert_eq!(body, repeated, "an uncommitted read must be retryable");
+        let receipts = ctx.take_reads();
+        let stdout = receipts
+            .iter()
+            .find(|r| r.channel == Channel::Stdout)
             .unwrap();
-        assert!(
-            ctx.take_task_result().is_none(),
-            "no page may acknowledge a result with missing output"
-        );
-        if out.contains("(no new output)") {
+        let heading = "\nstdout (new):\n";
+        if stdout.end > stdout.start {
+            let start = body.find(heading).unwrap() + heading.len();
+            read.push_str(&body[start..][..(stdout.end - stdout.start) as usize]);
+        }
+        done = receipts.iter().all(|r| r.complete);
+        background.commit_reads(&receipts).await;
+        if done {
             break;
         }
     }
-    assert!(
-        background
-            .take_notices()
-            .await
-            .iter()
-            .any(|notice| matches!(
-                notice,
-                coda_execution::TaskNotice::Task { id: notice_id, .. } if notice_id == &id
-            ))
-    );
-    background.shutdown().await;
-}
-
-#[tokio::test]
-async fn task_output_only_records_a_complete_terminal_read() {
-    let background = Arc::new(BackgroundTasks::temporary().unwrap());
-    let id = background
-        .spawn_with(meta("large output"), |ctx| async move {
-            ctx.append_stdout(&vec![b'x'; 200 * 1024]).await.unwrap();
-            coda_execution::TaskExit::Exited { code: Some(0) }
-        })
-        .await
-        .unwrap();
-    background.wait_terminal(&id).await;
-    let tool = TaskOutputTool::new(background.clone());
-    let first = ToolCallContext::default();
-    tool.execute(TaskOutputToolParams { id: id.to_string() }, first.clone())
-        .await
-        .unwrap();
-    assert!(
-        first.take_task_result().is_none(),
-        "a partial page must not suppress the notice"
-    );
-    let last = ToolCallContext::default();
-    tool.execute(TaskOutputToolParams { id: id.to_string() }, last.clone())
-        .await
-        .unwrap();
-    assert_eq!(last.take_task_result(), Some(id.clone()));
-    let consumed = ToolCallContext::default();
-    tool.execute(
-        TaskOutputToolParams { id: id.to_string() },
-        consumed.clone(),
-    )
-    .await
-    .unwrap();
+    assert!(done);
+    assert_eq!(read, "中🙂".repeat(4000));
     assert_eq!(
-        consumed.take_task_result(),
-        Some(id.clone()),
-        "terminal status remains observable after lossless output reclamation"
-    );
-    assert_eq!(
-        background.take_notices().await.len(),
-        1,
-        "reading alone does not acknowledge delivery before checkpoint"
+        background.output_progress("", &id, Channel::Stdout).await,
+        read.len() as u64
     );
     background.shutdown().await;
 }

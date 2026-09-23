@@ -1,3 +1,5 @@
+use coda_core::output::{OutputBuffer, OutputData, ResultBudget};
+use coda_core::tool::ToolFailure;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -13,7 +15,7 @@ use coda_core::llm::{
 };
 use coda_core::tool::{
     HostToolCallError, HostToolCallResult, HostToolInvoker, ThreadState, ToolCallContext,
-    ToolError, ToolResult, Tools,
+    ToolError, Tools,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -39,11 +41,7 @@ use crate::{
 /// How long an aborted turn waits for in-flight tool calls to observe their
 /// cancellation token, tear down their work (e.g. kill child processes), and
 /// settle with partial output before their futures are dropped.
-/// Shortened under `cfg(test)` so tests exercising the timeout path stay fast.
-#[cfg(not(test))]
-const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(test)]
-const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+const TOOL_ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long an auto-compaction's summarization call waits on its provider —
 /// mirrors `SUMMARY_TIMEOUT` in the manual path. Unlike the main generation
@@ -207,6 +205,8 @@ pub(crate) async fn run_process(
             .unwrap_or_else(|| TurnId::from(MessageId::new()));
         process.execution = runtime.execution(&pid);
         let mut agent_loop = ProcessLoop {
+            output_leases: Vec::new(),
+            pending_reads: Vec::new(),
             runtime: runtime.clone(),
             process: &mut process,
             cancel: cancel.clone(),
@@ -385,6 +385,7 @@ impl AgentToolInvoker {
                     .map_or_else(|| "{}".to_string(), |(_, arguments)| arguments.to_string());
                 self.tools.get(name).is_some()
                     && self.currently_allowed(&ToolCall {
+                        output_bytes: None,
                         id: "ptc-capability-probe".to_string(),
                         name: (*name).clone(),
                         arguments: Some(arguments),
@@ -429,20 +430,25 @@ impl HostToolInvoker for AgentToolInvoker {
                     "host tool call was cancelled".to_string(),
                 ));
             }
-            let result = tool.execute(arguments, context).await;
-            match result {
-                Ok(output) => Ok(HostToolCallResult { output }),
-                Err(ToolError::InvalidParameters(message)) => {
-                    Err(HostToolCallError::InvalidParameters(message))
+            let budget = match &context.result_budget {
+                ResultBudget::Script(budget) => budget.clone(),
+                ResultBudget::Model { .. } => {
+                    coda_core::output::BufferBudget::new(64 * 1024 * 1024)
                 }
-                Err(ToolError::ExecutionError(message)) => {
-                    Err(HostToolCallError::Execution(message))
-                }
-                Err(ToolError::ResourceLimit(message)) => {
-                    Err(HostToolCallError::ResourceLimit(message))
-                }
-                Err(ToolError::Aborted(message)) => Err(HostToolCallError::Aborted(message)),
-            }
+            };
+            let cancel = context.cancel.clone();
+            let output = tool
+                .execute(arguments, context)
+                .await
+                .map_err(|failure| HostToolCallError::from(failure.error))?;
+            let buffer = output
+                .materialize(&budget, &cancel)
+                .await
+                .map_err(HostToolCallError::Undelivered)?;
+            Ok(HostToolCallResult {
+                output: buffer.text,
+                buffer_lease: Some(buffer.lease),
+            })
         })
     }
 }
@@ -450,7 +456,7 @@ impl HostToolInvoker for AgentToolInvoker {
 fn execute_javascript_tool_discovery(
     input: String,
     invoker: Option<AgentToolInvoker>,
-) -> std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+) -> std::pin::Pin<Box<dyn Future<Output = Result<OutputData, ToolFailure>> + Send>> {
     let started = std::time::Instant::now();
     let span = info_span!(
         "execute_tool",
@@ -505,9 +511,13 @@ fn execute_javascript_tool_discovery(
                     span.record("status", "error");
                     span.record("error_category", "aborted");
                 }
+                Err(ToolError::Output(_)) => {
+                    span.record("status", "error");
+                    span.record("error_category", "output");
+                }
             }
             span.record("duration_ms", started.elapsed().as_millis() as u64);
-            result
+            result.map(Into::into).map_err(Into::into)
         }
         .instrument(span),
     )
@@ -638,6 +648,8 @@ enum TurnOutcome {
 }
 
 struct ProcessLoop<'a, C: LLMProvider + Clone> {
+    output_leases: Vec<Arc<dyn OutputBuffer>>,
+    pending_reads: Vec<coda_core::output::ReadReceipt>,
     runtime: ProcessRuntime,
     process: &'a mut Process,
     cancel: CancellationToken,
@@ -658,6 +670,27 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     }
 
     async fn run(&mut self, envelope: Option<Envelope>) -> Result<TurnOutcome, String> {
+        if let Some(background) = &self.runtime.background {
+            match self
+                .runtime
+                .session_storage
+                .load_output_progress(self.process.pid.as_ref())
+                .await
+            {
+                Ok(progress) => background.restore_output_progress(progress).await,
+                Err(error) => {
+                    self.runtime
+                        .emit_event(
+                            self.process.program.name.clone(),
+                            self.process.pid.clone(),
+                            self.turn,
+                            AgentEvent::PersistFailed(error),
+                        )
+                        .await;
+                    return Ok(TurnOutcome::Completed);
+                }
+            }
+        }
         // Load stored checkpoint and scatter its fields into the appropriate
         // locations. After this block the stored type is gone — only the
         // `resume_point` local variable carries forward.
@@ -973,6 +1006,11 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 .await;
             return false;
         }
+        if let Some(background) = &self.runtime.background {
+            background.commit_reads(&self.pending_reads).await;
+        }
+        self.pending_reads.clear();
+        self.output_leases.clear();
         if finished && self.runtime.is_root_process(&self.process.pid) {
             self.runtime.turn_gate.close(self.turn);
         }
@@ -1168,25 +1206,52 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     /// keeps whatever partial output it salvaged and is marked `Aborted`;
     /// anything else keeps the outcome it started with. Returns whether the
     /// call was recorded as aborted.
+    #[allow(clippy::too_many_arguments)]
     async fn settle_local_tool(
         &mut self,
         tc: PendingToolCall,
         started_at: jiff::Timestamp,
-        result: ToolResult<String>,
+        result: Result<OutputData, ToolFailure>,
         call_state: &CallState,
         artifacts: Vec<coda_core::llm::ToolArtifact>,
         observed_task: Option<coda_core::task::TaskId>,
+        read_receipts: Vec<coda_core::output::ReadReceipt>,
     ) -> bool {
-        let (output, outcome) = match result {
-            Ok(output) => (ToolOutput::Ok(output), tc.outcome),
-            Err(ToolError::Aborted(reason)) => (ToolOutput::Err(reason), ToolCallOutcome::Aborted),
-            Err(err) => (
-                ToolOutput::Err(format!("Tool execution error: {}", err)),
-                tc.outcome,
-            ),
+        let (data, mut succeeded, outcome) = match result {
+            Ok(output) => (output, true, tc.outcome.clone()),
+            Err(failure) => {
+                let outcome = if matches!(&failure.error, ToolError::Aborted(_)) {
+                    ToolCallOutcome::Aborted
+                } else {
+                    tc.outcome.clone()
+                };
+                let reason = format!("Tool execution error: {}\n", failure.error);
+                (
+                    failure.output.map_or_else(
+                        || OutputData::Inline(reason.clone()),
+                        |output| output.with_prefix(reason.clone()),
+                    ),
+                    false,
+                    outcome,
+                )
+            }
+        };
+        let rendered = self
+            .render_output(
+                data,
+                tc.tool_call
+                    .output_bytes
+                    .unwrap_or(self.config.profile.output_limits.single_call_bytes),
+            )
+            .await;
+        succeeded &= !rendered.delivery_error && !matches!(outcome, ToolCallOutcome::Aborted);
+        let output = if succeeded {
+            ToolOutput::Ok(rendered.body)
+        } else {
+            ToolOutput::Err(rendered.body)
         };
         let aborted = matches!(outcome, ToolCallOutcome::Aborted);
-        let succeeded = matches!(output, ToolOutput::Ok(_));
+
         // A call that did not succeed establishes no new value, whatever it
         // recorded on the way: `set` says "this is what it is now", and a call
         // that failed or was cut short never got to mean that.
@@ -1203,6 +1268,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             Some(started_at),
         )
         .with_artifacts(if succeeded { artifacts } else { Vec::new() });
+        message.output_refs = rendered.references;
         if succeeded
             && !aborted
             && let Some(task) = observed_task
@@ -1224,8 +1290,65 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 message.observed_task = Some(task);
             }
         }
+        if succeeded && !aborted {
+            message.read_receipts = read_receipts;
+            for receipt in message
+                .read_receipts
+                .iter()
+                .filter(|receipt| receipt.complete)
+            {
+                let can_acknowledge = self.runtime.is_root_process(&self.process.pid)
+                    || if let Some(background) = &self.runtime.background {
+                        background
+                            .owns_shell(&receipt.task, &self.process.pid.0)
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                if can_acknowledge && !message.observed_tasks.contains(&receipt.task) {
+                    message.observed_tasks.push(receipt.task.clone());
+                }
+            }
+        }
         self.add_message_with_state(message, recorded).await;
         aborted
+    }
+
+    /// The output budget assigned to call `id` when its assistant message was
+    /// recorded, or the single-call default when the call is not in history.
+    async fn call_output_budget(&self, id: &str) -> usize {
+        for entry in self.process.history().await.iter().rev() {
+            if let Message::Assistant(message) = &entry.message
+                && let Some(call) = message.tool_calls.iter().find(|call| call.id == id)
+            {
+                return call
+                    .output_bytes
+                    .unwrap_or(self.config.profile.output_limits.single_call_bytes);
+            }
+        }
+        self.config.profile.output_limits.single_call_bytes
+    }
+
+    async fn render_output(
+        &mut self,
+        data: OutputData,
+        bytes: usize,
+    ) -> coda_output::render::RenderedOutput {
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let rendered = coda_output::render::render(store.as_ref(), owner, data, bytes)
+            .await
+            .unwrap_or_else(|error| coda_output::render::RenderedOutput {
+                delivery_error: true,
+                body: error.to_string(),
+                references: vec![],
+                lease: None,
+            });
+        if let Some(lease) = &rendered.lease {
+            self.output_leases.push(lease.clone());
+        }
+        rendered
     }
 
     /// Append a tool message that recorded no state: a write-off, a rejection,
@@ -1239,9 +1362,24 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
     /// message anchor, while the event keeps consumers in sync with history.
     async fn add_message_with_state(
         &mut self,
-        message: ToolMessage,
+        mut message: ToolMessage,
         recorded: Vec<(String, Value)>,
     ) {
+        if message.output_refs.is_empty() {
+            let budget = self.call_output_budget(&message.id).await;
+            let body = match &mut message.output {
+                ToolOutput::Ok(body) | ToolOutput::Err(body) => body,
+            };
+            if body.len() > budget {
+                let rendered = self
+                    .render_output(OutputData::Inline(std::mem::take(body)), budget)
+                    .await;
+                *body = rendered.body;
+                message.output_refs = rendered.references;
+            }
+        }
+        self.pending_reads
+            .extend(message.read_receipts.iter().cloned());
         self.process
             .add_message_with_state(Message::Tool(message.clone()), recorded)
             .await;
@@ -1582,18 +1720,30 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 AgentEvent::CompactionStart,
             )
             .await;
-        let request = compaction::summary_request(
-            self.config.profile.model.clone(),
-            self.config.profile.max_completion_tokens,
-            self.config.profile.reasoning_effort.clone(),
-            message_view::model_view(&history).take(cutoff.model_view_len),
-            "",
-        );
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let summary = async {
+            let history = compaction::bounded_history(
+                &history,
+                store.as_ref(),
+                owner,
+                self.config.profile.output_limits,
+            )
+            .await?;
+            let request = compaction::summary_request(
+                self.config.profile.model.clone(),
+                self.config.profile.max_completion_tokens,
+                self.config.profile.reasoning_effort.clone(),
+                message_view::model_view(&history).take(cutoff.model_view_len),
+                "",
+            );
+            self.summarize(request).await
+        };
 
         let outcome = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Ok(()),
-            outcome = tokio::time::timeout(AUTO_COMPACT_SUMMARY_TIMEOUT, self.summarize(request)) => {
+            outcome = tokio::time::timeout(AUTO_COMPACT_SUMMARY_TIMEOUT, summary) => {
                 outcome.unwrap_or_else(|_| {
                     Err(format!(
                         "the provider did not answer within {AUTO_COMPACT_SUMMARY_TIMEOUT:?}"
@@ -1677,6 +1827,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             .filter_map(|name| {
                 let descriptor = by_name.get(*name)?;
                 let probe = ToolCall {
+                    output_bytes: None,
                     id: "ptc-capability-probe".to_string(),
                     name: (*name).to_string(),
                     arguments: Some("{}".to_string()),
@@ -1716,7 +1867,16 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             if descriptor.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME {
                 if snapshot.is_some() {
                     request_tools.push(coda_tools::list_javascript_tools_definition());
-                    request_tools.push(coda_tools::run_javascript_definition());
+                    // Quote what this model runs under: the reservation
+                    // scales with the page, which this profile may override.
+                    let limits = coda_ptc::PtcLimits {
+                        page_bytes: self.config.profile.output_limits.single_call_bytes,
+                        ..self.config.outputs.as_ref().map_or_else(
+                            coda_ptc::PtcLimits::default,
+                            coda_ptc::PtcLimits::for_session,
+                        )
+                    };
+                    request_tools.push(coda_ptc::run_javascript_definition_with_limits(limits));
                 }
             } else {
                 request_tools.push(descriptor);
@@ -1734,10 +1894,51 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
 
     async fn handle_generation(&mut self) -> ProcessLoopState {
         let pid = self.process.pid.clone();
-        let messages = match self.process.messages().await {
+        let mut messages = match self.process.messages().await {
             Ok(messages) => messages,
             Err(error) => return self.generation_failed(error.to_string()),
         };
+        let (store, owner) =
+            coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let minimum = match coda_core::output::ModelOutputLimits::minimum_response_bytes(
+            &store.limits().root,
+        ) {
+            Ok(minimum) => minimum,
+            Err(error) => return self.generation_failed(error),
+        };
+        let mut slots = HashMap::new();
+        for message in &mut messages {
+            match message {
+                coda_core::llm::RequestMessage::Assistant(assistant) => {
+                    slots.clear();
+                    let shares = match self
+                        .config
+                        .profile
+                        .output_limits
+                        .allocate(assistant.tool_calls.len(), minimum)
+                    {
+                        Ok(shares) => shares,
+                        Err(error) => return self.generation_failed(error.into()),
+                    };
+                    for (call, bytes) in assistant.tool_calls.iter().zip(shares) {
+                        slots.insert(call.id.clone(), bytes);
+                    }
+                }
+                coda_core::llm::RequestMessage::Tool(tool) => {
+                    let bytes = slots
+                        .get(&tool.id)
+                        .copied()
+                        .unwrap_or(self.config.profile.output_limits.single_call_bytes);
+                    if let Err(error) =
+                        coda_output::render::bound_tool(store.as_ref(), owner.clone(), tool, bytes)
+                            .await
+                    {
+                        return self.generation_failed(error.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
         let (request_tools, ptc_snapshot) = self.generation_tools();
         let request = ChatCompletionRequest {
             model: self.config.profile.model.clone(),
@@ -1851,6 +2052,23 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
         assistant_message.generation = Some(generation);
         assistant_message.started_at = started_at;
         assistant_message.ended_at = ended_at;
+        let (store, _) = coda_output::Store::session_or_standalone(self.config.outputs.as_ref());
+        let minimum =
+            coda_core::output::ModelOutputLimits::minimum_response_bytes(&store.limits().root);
+        let shares = minimum.and_then(|minimum| {
+            self.config
+                .profile
+                .output_limits
+                .allocate(assistant_message.tool_calls.len(), minimum)
+                .map_err(str::to_owned)
+        });
+        let shares = match shares {
+            Ok(shares) => shares,
+            Err(error) => return self.generation_failed(error),
+        };
+        for (call, bytes) in assistant_message.tool_calls.iter_mut().zip(shares) {
+            call.output_bytes = Some(bytes);
+        }
         self.process
             .add_message(Message::Assistant(assistant_message.clone()))
             .await;
@@ -2112,6 +2330,13 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 // without touching its siblings.
                 let call_state = Arc::new(CallState::new(committed.clone()));
                 let mut ctx = ToolCallContext::new(self.cancel.child_token(), call_state.clone());
+                ctx.result_budget = ResultBudget::Model {
+                    page_bytes: tc
+                        .tool_call
+                        .output_bytes
+                        .unwrap_or(self.config.profile.output_limits.single_call_bytes),
+                };
+                ctx.outputs = self.config.outputs.clone();
                 ctx.background_task = self
                     .process
                     .execution
@@ -2140,40 +2365,42 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                     }
                     None => None,
                 };
-                let execution: std::pin::Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> =
-                    if is_programmatic
-                        && !self
-                            .process
-                            .program
-                            .capabilities
-                            .contains(crate::Capability::Ptc)
-                    {
-                        Box::pin(async {
-                            Err(ToolError::ExecutionError(
-                                "PTC_UNAVAILABLE: ptc capability is disabled for this agent".into(),
-                            ))
-                        })
-                    } else if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME {
-                        execute_javascript_tool_discovery(
-                            tc.tool_call.arguments.clone().unwrap_or_default(),
-                            invoker,
+                let execution: std::pin::Pin<
+                    Box<dyn Future<Output = Result<OutputData, ToolFailure>> + Send>,
+                > = if is_programmatic
+                    && !self
+                        .process
+                        .program
+                        .capabilities
+                        .contains(crate::Capability::Ptc)
+                {
+                    Box::pin(async {
+                        Err(ToolError::ExecutionError(
+                            "PTC_UNAVAILABLE: ptc capability is disabled for this agent".into(),
                         )
-                    } else {
-                        if tc.tool_call.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME
-                            && let Some(invoker) = invoker
-                        {
-                            ctx = ctx.with_invoker(Arc::new(invoker));
-                        }
-                        self.process
-                            .program
-                            .tools
-                            .get(&tc.tool_call.name)
-                            .expect("ordinary local tool was checked above")
-                            .execute(
-                                tc.tool_call.arguments.clone().unwrap_or_default(),
-                                ctx.clone(),
-                            )
-                    };
+                        .into())
+                    })
+                } else if tc.tool_call.name == coda_tools::LIST_JAVASCRIPT_TOOLS_TOOL_NAME {
+                    execute_javascript_tool_discovery(
+                        tc.tool_call.arguments.clone().unwrap_or_default(),
+                        invoker,
+                    )
+                } else {
+                    if tc.tool_call.name == coda_tools::RUN_JAVASCRIPT_TOOL_NAME
+                        && let Some(invoker) = invoker
+                    {
+                        ctx = ctx.with_invoker(Arc::new(invoker));
+                    }
+                    self.process
+                        .program
+                        .tools
+                        .get(&tc.tool_call.name)
+                        .expect("ordinary local tool was checked above")
+                        .execute(
+                            tc.tool_call.arguments.clone().unwrap_or_default(),
+                            ctx.clone(),
+                        )
+                };
                 let future = async move {
                     let output = execution.await;
                     (
@@ -2183,6 +2410,7 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                         call_state,
                         ctx.take_artifacts(),
                         ctx.take_task_result(),
+                        ctx.take_reads(),
                     )
                 };
                 futures.push(future);
@@ -2215,9 +2443,9 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => break true,
-                Some((tc, started_at, result, call_state, artifacts, observed_task)) = futures.next() => {
+                Some((tc, started_at, result, call_state, artifacts, observed_task, read_receipts)) = futures.next() => {
                     pending_local.remove(&tc.tool_call.id);
-                    self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task).await;
+                    self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task, read_receipts).await;
                 }
             }
         };
@@ -2239,10 +2467,10 @@ impl<'a, C: LLMProvider + Clone> ProcessLoop<'a, C> {
                 tokio::select! {
                     biased;
                     _ = &mut grace => break,
-                    Some((tc, started_at, result, call_state, artifacts, observed_task)) = futures.next() => {
+                    Some((tc, started_at, result, call_state, artifacts, observed_task, read_receipts)) = futures.next() => {
                         pending_local.remove(&tc.tool_call.id);
                         let id = tc.tool_call.id.clone();
-                        if self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task).await {
+                        if self.settle_local_tool(tc, started_at, result, &call_state, artifacts, observed_task, read_receipts).await {
                             aborted_ids.push(id);
                         }
                     }

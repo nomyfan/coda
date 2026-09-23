@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 coda_core = { workspace = true }
+coda_output = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 rustix = { workspace = true }

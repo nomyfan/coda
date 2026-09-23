@@ -52,6 +52,7 @@ fn injects_reasoning_only_for_assistant_tool_calls() {
         RequestMessage::Assistant(AssistantMessage {
             content: String::new(),
             tool_calls: vec![ToolCall {
+                output_bytes: None,
                 id: "call-1".into(),
                 name: "shell".into(),
                 arguments: Some("{}".into()),

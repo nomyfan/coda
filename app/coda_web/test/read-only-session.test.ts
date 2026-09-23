@@ -181,6 +181,19 @@ test("rename and archived result reads remain available", async () => {
   ]);
 });
 
+test("task result pagination sends only the requested page", async () => {
+  const { request } = mount();
+  const cursor = { stdout: 4096, stderr: 0, result: 0 };
+  await getBackgroundTaskResult("bg_1", cursor);
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(request).toHaveBeenCalledWith("get_task_result", {
+    workspace_id: "ws",
+    session_id: "s1",
+    task_id: "bg_1",
+    cursor,
+  });
+});
+
 test("reopening disables writes until a read-only snapshot arrives", async () => {
   const { request } = mount({ ...session(), access: { type: "read_write" }, approvals: [] });
   let resolve!: (value: unknown) => void;

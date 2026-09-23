@@ -162,6 +162,51 @@ async fn ls_pre_cancelled_context_aborts() {
 }
 
 #[tokio::test]
+async fn ls_reports_an_empty_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let result = ListDirectoryTool::new()
+        .execute(
+            ListDirectoryToolParams {
+                path: root.path().to_string_lossy().into_owned(),
+            },
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+    let OutputData::Inline(text) = result else {
+        panic!("expected inline output")
+    };
+    assert_eq!(text, "Directory is empty or all entries are ignored.");
+}
+
+#[tokio::test]
+async fn ls_lists_hidden_entries_but_not_git() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::create_dir(root.path().join(".github")).unwrap();
+    std::fs::write(root.path().join(".env.example"), "").unwrap();
+    std::fs::write(root.path().join("visible.txt"), "").unwrap();
+    let result = ListDirectoryTool::new()
+        .execute(
+            ListDirectoryToolParams {
+                path: root.path().to_string_lossy().into_owned(),
+            },
+            ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+    let OutputData::Inline(text) = result else {
+        panic!("expected inline output")
+    };
+    let mut names: Vec<_> = text
+        .lines()
+        .map(|line| line.trim_end_matches('/').rsplit('/').next().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".env.example", ".github", "visible.txt"]);
+}
+
+#[tokio::test]
 async fn edit_replaces_unique_match() {
     let path = tmp_file("unique", "hello world\nfoo bar\n");
     let tool = EditFileTool::new(test_locks());
@@ -317,10 +362,61 @@ async fn write_refuses_huge_file() {
 }
 
 #[tokio::test]
-async fn read_refuses_huge_file() {
+async fn read_cancelled_while_waiting_for_script_memory_is_aborted() {
+    let path = tmp_file("read_cancelled", "hello\n");
+    let mut context = ToolCallContext::default();
+    context.result_budget =
+        coda_core::output::ResultBudget::Script(coda_core::output::BufferBudget::new(1 << 20));
+    context.cancel.cancel();
+    let error = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            },
+            context,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Aborted(_)), "{error:?}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn script_read_hands_over_the_memory_reserved_before_reading() {
+    let path = tmp_file("script_read", "hello\n");
+    let budget = coda_core::output::BufferBudget::new(1 << 20);
+    let mut context = ToolCallContext::default();
+    context.result_budget = coda_core::output::ResultBudget::Script(budget.clone());
+    let cancel = context.cancel.clone();
+    let page = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: path.to_str().unwrap().to_string(),
+                offset: None,
+                limit: None,
+            },
+            context,
+        )
+        .await
+        .unwrap();
+    let reserved = budget.capacity() - budget.available();
+    assert!(reserved > 0, "the read reserves script memory up front");
+
+    let buffer = page.materialize(&budget, &cancel).await.unwrap();
+    assert!(buffer.text.contains("hello"));
+    assert_eq!(budget.capacity() - budget.available(), reserved);
+    drop(buffer);
+    assert_eq!(budget.available(), budget.capacity());
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn read_pages_huge_file() {
     let path = tmp_huge_file("huge_read");
     let tool = ReadFileTool::new();
-    let err = tool
+    let page = tool
         .execute(
             ReadFileToolParams {
                 file_path: path.to_str().unwrap().to_string(),
@@ -330,8 +426,12 @@ async fn read_refuses_huge_file() {
             ToolCallContext::default(),
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err, ToolError::InvalidParameters(_)));
+        .unwrap();
+    let OutputData::Page { body, .. } = page else {
+        panic!("expected page")
+    };
+    assert!(body.len() <= coda_core::output::ModelOutputLimits::default().single_call_bytes);
+    assert!(body.contains(" [line 1 truncated: "), "{body}");
     std::fs::remove_file(&path).ok();
 }
 
@@ -371,6 +471,9 @@ async fn read_decodes_invalid_utf8_lossily() {
         )
         .await
         .unwrap();
+    let OutputData::Page { body: result, .. } = result else {
+        panic!("expected file page")
+    };
     assert!(result.contains("before \u{FFFD}\u{FFFD} after"));
     std::fs::remove_file(&path).ok();
 }
@@ -674,4 +777,119 @@ async fn edit_errors_on_empty_old_string() {
     assert!(matches!(err, ToolError::InvalidParameters(_)));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn read_numbers_lines_and_honours_offset_and_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("lines.txt");
+    std::fs::write(&file, "one\r\ntwo\nthree\nfour").unwrap();
+    assert_eq!(
+        read(&file, None, None, 16 * 1024).await,
+        "     1\tone\n     2\ttwo\n     3\tthree\n     4\tfour"
+    );
+    assert_eq!(
+        read(&file, Some(2), Some(2), 16 * 1024).await,
+        "     2\ttwo\n     3\tthree\n[page truncated: reached the 2-line limit; continue with offset=4]"
+    );
+    assert_eq!(
+        read(&file, Some(4), Some(1), 16 * 1024).await,
+        "     4\tfour"
+    );
+    assert_eq!(read(&file, Some(9), None, 16 * 1024).await, "");
+}
+
+#[tokio::test]
+async fn read_pages_by_budget_without_skipping_lines() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("many.txt");
+    let lines: Vec<String> = (1..=150)
+        .map(|n| format!("line {n} {}", "x".repeat(40)))
+        .collect();
+    std::fs::write(&file, lines.join("\n")).unwrap();
+    let mut offset = 1;
+    let mut seen = Vec::new();
+    loop {
+        let body = read(&file, Some(offset), None, 1024).await;
+        assert!(body.len() <= 1024);
+        let footer = "\n[page truncated: reached the 1024-byte output limit; continue with offset=";
+        let (page, next) = match body.split_once(footer) {
+            Some((page, next)) => (page, Some(next.trim_end_matches(']').parse().unwrap())),
+            None => (body.as_str(), None),
+        };
+        for entry in page.lines() {
+            let (number, text) = entry.split_once('\t').unwrap();
+            assert_eq!(number.trim().parse::<usize>().unwrap(), seen.len() + 1);
+            seen.push(text.to_owned());
+        }
+        match next {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, lines);
+}
+
+#[tokio::test]
+async fn read_cuts_long_lines_at_a_character_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("giant.txt");
+    let giant = "你🙂界".repeat(10000);
+    std::fs::write(&file, format!("head\n{giant}\nnext\n")).unwrap();
+    let body = read(&file, None, None, 16 * 1024).await;
+    let lines: Vec<_> = body.lines().collect();
+    let text = lines[1].strip_prefix("     2\t").unwrap();
+    let (shown, marker) = text.split_once(" [line 2 truncated: ").unwrap();
+    assert!(shown.len() <= MAX_LINE_BYTES && giant.starts_with(shown));
+    // The offset is into the file, so the rest can be read with `dd` or `tail -c`.
+    assert_eq!(
+        marker,
+        format!(
+            "{} more bytes at offset {}]",
+            giant.len() - shown.len(),
+            "head\n".len() + shown.len()
+        )
+    );
+    assert_eq!(lines[2], "     3\tnext");
+}
+
+#[tokio::test]
+async fn invalid_bytes_cannot_push_a_first_line_past_the_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("invalid.bin");
+    std::fs::write(&file, vec![0xFF; 5000]).unwrap();
+    // Small enough that the raw line cap is well under 2000 bytes.
+    let body = read(&file, None, None, 600).await;
+    assert!(body.len() <= 600, "{} bytes", body.len());
+    let text = body.strip_prefix("     1\t").unwrap();
+    let (shown, marker) = text.split_once(" [line 1 truncated: ").unwrap();
+    assert!(shown.chars().all(|c| c == '\u{FFFD}'));
+    // Each replacement character stands for one raw byte.
+    let used = shown.chars().count();
+    assert_eq!(
+        marker,
+        format!("{} more bytes at offset {used}]", 5000 - used)
+    );
+}
+
+async fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, bytes: usize) -> String {
+    let mut context = ToolCallContext::default();
+    context.result_budget = coda_core::output::ResultBudget::Model { page_bytes: bytes };
+    let result = ReadFileTool::new()
+        .execute(
+            ReadFileToolParams {
+                file_path: path.to_str().unwrap().into(),
+                offset,
+                limit,
+            },
+            context,
+        )
+        .await;
+    let OutputData::Page { body, .. } = result.unwrap() else {
+        panic!("expected file page")
+    };
+    body
 }

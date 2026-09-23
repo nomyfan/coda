@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use coda_core::tool::{ToolCallContext, ToolObject, ToolResult, ToolWrapper};
+use coda_core::tool::{ToolCallContext, ToolObject, ToolWrapper};
 
 use coda_execution::BackgroundTasks;
 
@@ -242,7 +242,12 @@ impl ToolObject for SharedToolObject {
         self: Arc<Self>,
         params: String,
         ctx: ToolCallContext,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<coda_core::output::OutputData, coda_core::tool::ToolFailure>>
+                + Send,
+        >,
+    > {
         self.0.clone().execute(params, ctx)
     }
 }

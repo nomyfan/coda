@@ -98,6 +98,7 @@ pub enum SessionCommand {
     /// which is exactly when a user watching a runaway task wants it.
     GetTaskResult {
         task_id: String,
+        cursor: coda_execution::TaskResultCursor,
     },
     KillTask {
         task_id: String,
@@ -336,6 +337,9 @@ impl ReadOnlyHistory {
 /// Builds sessions for the relay. Injected at construction: configuration is
 /// available on every instance, so commands never need to carry build logic.
 pub trait SessionOpener: Send + Sync + 'static {
+    fn output_store(&self, _key: &SessionKey) -> Arc<coda_output::Store> {
+        coda_output::Store::standalone()
+    }
     /// Resolve the saved model; initial is used only when creating a session.
     /// None only reads an existing binding and must not create a session.
     fn resolve_session_model<'a>(
@@ -1286,9 +1290,16 @@ impl SessionHub {
             return background.clone();
         }
         let opened = match self.opener.background_archive(&entry.key) {
-            Ok(archive) => BackgroundTasks::session_backed(archive)
-                .await
-                .map_err(|e| e.to_string()),
+            Ok(archive) => BackgroundTasks::session_backed_with_output(
+                archive,
+                self.opener.output_store(&entry.key),
+                coda_core::output::OutputOwner {
+                    workspace_id: entry.key.0.clone(),
+                    session_id: entry.key.1.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string()),
             Err(error) => Err(error),
         };
         let background = match opened {
@@ -1396,25 +1407,11 @@ impl SessionHub {
             TaskNotice::Subagent { id, .. } => Some(id.clone()),
             _ => None,
         });
-        let mut text = notices
+        let text = notices
             .iter()
             .map(TaskNotice::render)
             .collect::<Vec<_>>()
             .join("\n\n");
-        if let Some(id) = &durable_id
-            && let Some(Some(background)) = &state.background
-        {
-            match background.read(id).await {
-                Ok(Some(result)) => {
-                    text.push_str("\n\n");
-                    text.push_str(&result.stdout);
-                }
-                _ => {
-                    state.pending_notices.extend(notices);
-                    return false;
-                }
-            }
-        }
         let outcomes: Vec<_> = notices.iter().map(TaskNotice::outcome).collect();
         let message_id = durable_id
             .as_ref()
@@ -2361,7 +2358,7 @@ impl SessionRelay for SessionHub {
                     .await
                     .expect("model switch task panicked");
                 }
-                SessionCommand::GetTaskResult { task_id } => {
+                SessionCommand::GetTaskResult { task_id, cursor } => {
                     use crate::wire::TaskResultWire as ResultWire;
                     let (archive, archive_error) = match &guard.phase {
                         EntryPhase::ReadOnly(read_only) => {
@@ -2382,11 +2379,14 @@ impl SessionRelay for SessionHub {
                     drop(guard);
                     let archived = archive.is_some();
                     let result = if let Some(archive) = archive {
-                        archive.read_result(&id).await.map_err(|e| e.to_string())
+                        archive
+                            .read_result_page(&id, cursor)
+                            .await
+                            .map_err(|e| e.to_string())
                     } else {
                         background
                             .expect("result source exists")
-                            .read_result(&id)
+                            .read_result_page(&id, cursor)
                             .await
                             .map_err(|e| e.to_string())
                     };
@@ -2406,9 +2406,15 @@ impl SessionRelay for SessionHub {
                                 ResultWire::Pending { status }
                             }
                         }
-                        Ok(Some(coda_execution::TaskResult::Available { status, output })) => {
-                            ResultWire::Available { status, output }
-                        }
+                        Ok(Some(coda_execution::TaskResult::Available {
+                            status,
+                            output,
+                            page,
+                        })) => ResultWire::Available {
+                            status,
+                            output,
+                            page,
+                        },
                         Err(message) => ResultWire::Error { message },
                     };
                     let Some((current, _guard)) = self.lock_entry_for_conn(&key, conn_id).await

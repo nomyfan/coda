@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 
 use coda_core::llm::{Message, MessageId, TurnId, UserMessage};
-use coda_core::tool::{ToolCallContext, ToolObject, ToolResult};
+use coda_core::tool::{ToolCallContext, ToolObject};
 
 use super::*;
 
@@ -63,8 +63,14 @@ impl ToolObject for RecordingTool {
         self: Arc<Self>,
         _params: String,
         _ctx: ToolCallContext,
-    ) -> Pin<Box<dyn std::future::Future<Output = ToolResult<String>> + Send>> {
-        Box::pin(async { Ok(String::new()) })
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<coda_core::output::OutputData, coda_core::tool::ToolFailure>,
+                > + Send,
+        >,
+    > {
+        Box::pin(async { Ok(String::new().into()) })
     }
 }
 

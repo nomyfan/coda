@@ -488,11 +488,7 @@ async fn a_model_switch_keeps_the_running_tasks() {
         "the model switch replaced the task registry"
     );
     assert!(
-        after
-            .read(&id)
-            .await
-            .expect("registry readable")
-            .is_some_and(|read| read.status.is_running()),
+        read_background(&after, &id).await.status.is_running(),
         "the task did not survive the model switch"
     );
 
@@ -539,11 +535,7 @@ async fn killing_a_task_from_the_client_settles_it() {
         CommandOutcome::Ok
     ));
 
-    let read = background
-        .read(&id)
-        .await
-        .expect("registry readable")
-        .expect("task still known");
+    let read = read_background(&background, &id).await;
     assert_eq!(read.status.describe(), "killed");
 
     // Killing something already gone is not an error — the list the user

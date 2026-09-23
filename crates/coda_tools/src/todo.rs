@@ -167,3 +167,9 @@ impl Tool for WriteTodosTool {
 #[cfg(test)]
 #[path = "todo_tests.rs"]
 mod tests;
+
+impl From<ReadTodosOutput> for coda_core::output::OutputData {
+    fn from(value: ReadTodosOutput) -> Self {
+        Self::Inline(value.to_string())
+    }
+}

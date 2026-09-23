@@ -19,7 +19,16 @@
           }
         })
         .join(" ");
-      appendLog(line);
+      const text = line + "\n";
+      // At most 4096 UTF-16 code units => at most 16384 UTF-8 bytes.
+      // Keep surrogate pairs together before crossing the native boundary.
+      for (let start = 0; start < text.length; ) {
+        let end = Math.min(start + 4096, text.length);
+        const last = text.charCodeAt(end - 1);
+        if (end < text.length && last >= 0xd800 && last <= 0xdbff) --end;
+        appendLog(text.slice(start, end));
+        start = end;
+      }
     },
   });
   Object.defineProperty(globalThis, "console", {

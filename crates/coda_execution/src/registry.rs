@@ -1,6 +1,6 @@
 //! The registry itself: task identity, the terminal-commit protocol, the
-//! notice queue and the summaries watch. Storage (the session archive, ring
-//! files and quota) lives in the sibling modules this one drives.
+//! notice queue and summaries watch. TaskArchive persists lifecycle metadata;
+//! coda_output owns payload storage and quotas.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -13,11 +13,9 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::archive_dir::{ArchiveDir, ArchiveError};
-use crate::manifest::{ExpireReason, NoticeDelivery, OutputDisposition};
+use crate::inventory::{ArchiveInventory, scan_inventory};
+use crate::manifest::{ExpireReason, NoticeDelivery};
 use crate::process::{GroupedChild, PIPE_DRAIN_TIMEOUT};
-use crate::quota::{
-    ArchiveInventory, ExpirationFact, SESSION_QUOTA_BYTES, SessionQuota, scan_inventory,
-};
 use crate::task_archive::{TaskArchive, TaskRecord};
 use coda_core::task::TaskId;
 
@@ -30,9 +28,6 @@ const MAX_TERMINAL: usize = 32;
 const MAX_FULL_NOTICES: usize = 64;
 /// (id, status) pairs the overflow aggregate holds; beyond this only a count.
 const MAX_OVERFLOW_ENTRIES: usize = 256;
-/// Bytes returned per stream by one `read` (128 KiB); the cursor advances only
-/// over what is actually returned, so a large backlog drains across calls.
-const READ_CHUNK_LIMIT: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -105,9 +100,8 @@ pub enum TaskStatus {
     Killed {
         at: jiff::Timestamp,
     },
-    /// The task's output spool failed irrecoverably (a ring append/read or a
-    /// terminal manifest save). The process outcome is subsumed by this state
-    /// so a spool failure is never misreported as a clean exit.
+    /// A pipe read or lifecycle persistence failed. Output storage degradation
+    /// is tracked separately and does not change the execution status.
     Failed {
         message: String,
         at: jiff::Timestamp,
@@ -313,23 +307,6 @@ impl TaskNotice {
     }
 }
 
-/// Result of an incremental read: output produced since the previous read.
-/// `*_lost` count bytes that were already dropped from the tail buffer before
-/// this read could observe them.
-#[derive(Debug)]
-pub struct TaskRead {
-    /// Drained a terminal task with no output lost in this or any prior read.
-    pub complete: bool,
-    pub status: TaskStatus,
-    pub stdout: String,
-    pub stderr: String,
-    pub stdout_lost: u64,
-    pub stderr_lost: u64,
-    /// A storage-level note (output consumed or quota-expired), separate from
-    /// the streams so it is never mistaken for task output.
-    pub note: Option<String>,
-}
-
 /// How the task's work future resolved. The process-backed runner reports
 /// `Killed` when it tore the process group down in response to cancellation.
 #[derive(Debug)]
@@ -349,7 +326,7 @@ pub enum TaskExit {
 }
 
 /// A live task entry: the archive-backed record plus its cancellation token.
-/// Output bytes live only in the record's ring files, never in memory here.
+/// Output bytes belong to the shared store, never the registry bookkeeping.
 struct TaskEntry {
     record: Arc<TaskRecord>,
     /// Independent of any turn token: only `kill`/`shutdown` cancel it.
@@ -378,9 +355,8 @@ impl TaskEntry {
     }
 }
 
-/// Handle a task's work future uses to stream output into its ring files.
-/// Appends take only the per-stream `DiskTail` lock — never the registry or
-/// commit lock — so a chatty task never contends with reads or bookkeeping.
+/// Handle a task uses to stream output into the shared output store.
+/// Appends do not take the registry or lifecycle commit lock.
 #[derive(Clone)]
 pub struct TaskCtx {
     record: Arc<TaskRecord>,
@@ -418,7 +394,7 @@ struct RegistryState {
     recovered_scopes: HashMap<TaskId, Vec<coda_core::task::ScopeMember>>,
     tasks: HashMap<TaskId, Arc<TaskEntry>>,
     /// Redundant indexes so everything below is answerable while holding this
-    /// lock alone — a task's ring/commit locks are never taken under it.
+    /// lock alone — a task's capture/commit locks are never taken under it.
     running_count: usize,
     summaries: HashMap<TaskId, TaskSummary>,
     terminal_order: VecDeque<TaskId>,
@@ -530,13 +506,12 @@ fn notice_into_fact(notice: TaskNotice) -> Option<TaskNoticeFact> {
     }
 }
 
-/// The disk-backed store behind a live registry: the session archive plus its
-/// quota. `temp` is `Some` only for a self-owned (temporary) registry, whose
-/// output directory is deleted when the registry drops.
-struct Backend {
-    archive: Arc<TaskArchive>,
-    quota: SessionQuota,
-    /// Held only for its `Drop`: deletes the temporary output directory when the
+/// The lifecycle archive behind a live registry. `temp` is `Some` only for a self-owned (temporary) registry, whose
+/// metadata directory is deleted when the registry drops.
+pub(crate) struct Backend {
+    pub(crate) archive: Arc<TaskArchive>,
+    blocked: std::sync::atomic::AtomicBool,
+    /// Held only for its `Drop`: deletes the temporary metadata directory when the
     /// registry drops. `None` for a session-backed registry (output persists).
     #[allow(dead_code)]
     temp: Option<tempfile::TempDir>,
@@ -546,13 +521,14 @@ struct Backend {
 /// `Session` itself when self-built) is responsible for calling
 /// [`shutdown`](Self::shutdown) per the ownership rules in the design doc.
 pub struct BackgroundTasks {
+    pub(crate) progress: Mutex<Vec<coda_core::output::ReadProgress>>,
     inner: Arc<Mutex<RegistryState>>,
     summaries_rx: watch::Receiver<Arc<[TaskSummary]>>,
     /// Serializes concurrent `shutdown` calls: the join-before-drain barrier
     /// must hold for every caller, not just the one that drains the monitor
     /// handles first.
     shutdown_gate: Mutex<()>,
-    backend: Arc<Backend>,
+    pub(crate) backend: Arc<Backend>,
 }
 
 impl BackgroundTasks {
@@ -575,6 +551,7 @@ impl BackgroundTasks {
     fn new(backend: Arc<Backend>) -> Self {
         let (summaries_tx, summaries_rx) = watch::channel(Arc::from(Vec::new().into_boxed_slice()));
         BackgroundTasks {
+            progress: Mutex::default(),
             inner: Arc::new(Mutex::new(RegistryState {
                 tasks: HashMap::new(),
                 subagent_slots: HashSet::new(),
@@ -604,25 +581,36 @@ impl BackgroundTasks {
         let root = ArchiveDir::open_or_create_root(temp.path())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let archive = Arc::new(TaskArchive::new(root));
-        let quota = SessionQuota::from_inventory(
-            &ArchiveInventory::default(),
-            SESSION_QUOTA_BYTES,
-            archive.clone(),
-        );
         Ok(Self::new(Arc::new(Backend {
             archive,
-            quota,
+            blocked: std::sync::atomic::AtomicBool::new(false),
             temp: Some(temp),
         })))
     }
 
     /// A hub-owned registry backed by a session archive directory. Runs the
-    /// session-local inventory to rebuild the quota and corruption blocker,
+    /// session-local inventory to rebuild lifecycle state and the corruption blocker,
     /// seeds the live overview from recent terminal summaries, and converts any
     /// crash-`Running` task that passes validation to `Interrupted`. Output is
     /// **not** deleted on shutdown.
     pub async fn session_backed(archive_dir: ArchiveDir) -> std::io::Result<Self> {
-        let archive = Arc::new(TaskArchive::new(archive_dir));
+        Self::session_backed_with_output(
+            archive_dir,
+            coda_output::Store::standalone(),
+            coda_core::output::OutputOwner {
+                workspace_id: String::new(),
+                session_id: String::new(),
+            },
+        )
+        .await
+    }
+
+    pub async fn session_backed_with_output(
+        archive_dir: ArchiveDir,
+        store: Arc<coda_output::Store>,
+        owner: coda_core::output::OutputOwner,
+    ) -> std::io::Result<Self> {
+        let archive = Arc::new(TaskArchive::with_output(archive_dir, store, owner));
         let scan_root = archive.root().clone();
         let inventory = match tokio::task::spawn_blocking(move || scan_inventory(&scan_root)).await
         {
@@ -634,10 +622,9 @@ impl BackgroundTasks {
                 )));
             }
         };
-        let quota = SessionQuota::from_inventory(&inventory, SESSION_QUOTA_BYTES, archive.clone());
         let reg = Self::new(Arc::new(Backend {
             archive: archive.clone(),
-            quota,
+            blocked: std::sync::atomic::AtomicBool::new(inventory.spawn_blocked),
             temp: None,
         }));
         reg.seed_from_inventory(&archive, inventory).await;
@@ -696,12 +683,16 @@ impl BackgroundTasks {
                         task = id.as_str(),
                         "recoverable task disappeared during reopen"
                     );
-                    self.backend.quota.block_spawns();
+                    self.backend
+                        .blocked
+                        .store(true, std::sync::atomic::Ordering::Release);
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(task = id.as_str(), error = %error, "recoverable task could not be reopened");
-                    self.backend.quota.block_spawns();
+                    self.backend
+                        .blocked
+                        .store(true, std::sync::atomic::Ordering::Release);
                     continue;
                 }
             };
@@ -717,14 +708,13 @@ impl BackgroundTasks {
             if let Err(error) = guard.commit(candidate).await {
                 tracing::warn!(task = id.as_str(), error = %error, "Running task could not be converted to Interrupted");
                 drop(guard);
-                self.backend.quota.block_spawns();
+                self.backend
+                    .blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
                 continue;
             }
             let status = guard.current().status.clone();
             drop(guard);
-            if let Err(error) = self.backend.quota.finalize_terminal(&record).await {
-                tracing::warn!(task = id.as_str(), error = %error, "Interrupted task output finalize failed");
-            }
             // A task the previous incarnation was running ended without
             // anyone being told — the process died with the server. That is a
             // terminal fact like any other, so it is queued as a notice and
@@ -774,7 +764,7 @@ impl BackgroundTasks {
     }
 
     /// Start `cmd` as a background process task in its own sentinel-pinned
-    /// process group. Rejection (closed / running limit / quota) has
+    /// process group. Rejection (closed / running limit / invalid archive) has
     /// no side effects; only `kill`/`shutdown` terminate a started task.
     pub async fn spawn(&self, mut cmd: Command, meta: TaskMeta) -> std::io::Result<TaskId> {
         self.register_task(TaskId::new(), meta, move |ctx| {
@@ -786,7 +776,7 @@ impl BackgroundTasks {
 
     /// Start `work` as a background task. The task is visible in the summaries
     /// (and thus to keepalive watchers) before the id is returned. Fails when
-    /// closed, at `MAX_RUNNING`, or the quota is blocked.
+    /// closed, at `MAX_RUNNING`, or the archive is invalid.
     pub async fn spawn_with<F, Fut>(&self, meta: TaskMeta, work: F) -> std::io::Result<TaskId>
     where
         F: FnOnce(TaskCtx) -> Fut,
@@ -809,11 +799,11 @@ impl BackgroundTasks {
         self.register_task(id, meta, move |ctx| Ok(work(ctx))).await
     }
 
-    /// Reserve quota, create the archive record, and register the task. The
+    /// Create the archive record and register the task. The
     /// registry lock is held across the whole sequence so the capacity check
     /// and the registration are atomic (a concurrent spawn cannot exceed the
     /// limit); this is deadlock-safe because no path holds a per-task commit or
-    /// quota lock while waiting for the registry lock. On any failure before
+    /// capture lock while waiting for the registry lock. On any failure before
     /// registration no task is published; a process-start failure rolls back
     /// the prepared archive before returning.
     async fn register_task<F, Fut>(
@@ -855,22 +845,14 @@ impl BackgroundTasks {
             }
         }
 
-        let outcome = backend.quota.reserve_for_create().await;
-        // These facts are already durable even if reservation or archive
-        // creation fails, so enqueue them before inspecting the result.
-        enqueue_expirations(&mut inner, outcome.expirations);
-        let reservation = outcome
-            .reservation
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let (record, reservation) = match backend.archive.create(&id, &meta, reservation).await {
-            Ok(record) => record,
-            Err(error) => {
-                // A create error can include a failed half-product cleanup.
-                // Stop further growth; the uncommitted reservation rolls back.
-                backend.quota.block_spawns();
-                return Err(std::io::Error::other(error.to_string()));
-            }
-        };
+        if backend.blocked.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other("task archive recovery is incomplete"));
+        }
+        let record = backend
+            .archive
+            .create(&id, &meta)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let cancel = CancellationToken::new();
         let entry = Arc::new(TaskEntry {
             record: record.clone(),
@@ -885,8 +867,9 @@ impl BackgroundTasks {
                 if let Err(cleanup_error) = backend.archive.discard_created(&record).await {
                     // Keep the reservation charged for files we could not
                     // prove were removed, and close the session to new growth.
-                    reservation.commit();
-                    backend.quota.block_spawns();
+                    backend
+                        .blocked
+                        .store(true, std::sync::atomic::Ordering::Release);
                     return Err(std::io::Error::other(format!(
                         "{error}; background archive rollback failed: {cleanup_error}"
                     )));
@@ -894,7 +877,6 @@ impl BackgroundTasks {
                 return Err(error);
             }
         };
-        reservation.commit();
         let monitor = tokio::spawn(monitor_task(
             self.inner.clone(),
             self.backend.clone(),
@@ -918,157 +900,19 @@ impl BackgroundTasks {
     /// notices. Running tasks return Pending; deleted output returns Expired.
     /// Returns None for an unknown id and an error for corrupt or unreadable output.
     pub async fn read_result(&self, id: &TaskId) -> Result<Option<TaskResult>, TaskAccessError> {
+        self.read_result_page(id, crate::TaskResultCursor::default())
+            .await
+    }
+
+    pub async fn read_result_page(
+        &self,
+        id: &TaskId,
+        cursor: crate::TaskResultCursor,
+    ) -> Result<Option<TaskResult>, TaskAccessError> {
         let Some(record) = self.backend.archive.open(id).await? else {
             return Ok(None);
         };
-        // Quota eviction takes the same lock through deletion.
-        let guard = record.lock_commit().await;
-        let state = guard.current();
-        let status = state.status.clone();
-        if status.is_running() {
-            return Ok(Some(TaskResult::Pending { status }));
-        }
-        if !state.disposition.rings_present() {
-            return Ok(Some(TaskResult::Expired { status }));
-        }
-        let output = if record.meta().is_subagent() {
-            let answer = if matches!(status, TaskStatus::Completed { .. }) {
-                record.read_result(state.result_bytes).await?
-            } else {
-                status.describe()
-            };
-            TaskResultOutput::Subagent { answer }
-        } else {
-            let (stdout_capacity, stderr_capacity) = record.capacities();
-            let stdout = record
-                .files()
-                .stdout
-                .read_from(0, stdout_capacity as usize)
-                .await?;
-            let stderr = record
-                .files()
-                .stderr
-                .read_from(0, stderr_capacity as usize)
-                .await?;
-            TaskResultOutput::Shell {
-                stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
-                stdout_overwritten: stdout.lost,
-                stderr_overwritten: stderr.lost,
-            }
-        };
-        Ok(Some(TaskResult::Available { status, output }))
-    }
-
-    /// Read shell output incrementally or the complete subagent result.
-    /// Shell cursors are persisted before returning bytes. Unknown ids return
-    /// None; corrupt archives, read failures and cursor save failures return errors.
-    pub async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
-        let backend = &self.backend;
-        let Some(record) = backend
-            .archive
-            .open(id)
-            .await
-            .map_err(TaskAccessError::from)?
-        else {
-            return Ok(None);
-        };
-
-        if record.meta().is_subagent() {
-            let guard = record.lock_commit().await;
-            let state = guard.current();
-            let expired = !state.disposition.rings_present();
-            let stdout = if expired || state.status.is_running() {
-                String::new()
-            } else if matches!(state.status, TaskStatus::Completed { .. }) {
-                record.read_result(state.result_bytes).await?
-            } else {
-                state.status.describe()
-            };
-            return Ok(Some(TaskRead {
-                complete: !state.status.is_running() && !expired,
-                status: state.status.clone(),
-                stdout,
-                stderr: String::new(),
-                stdout_lost: 0,
-                stderr_lost: 0,
-                note: expired.then(|| "subagent result expired".into()),
-            }));
-        }
-
-        let mut guard = record.lock_commit().await;
-        let state = guard.current().clone();
-        let status = state.status.clone();
-
-        // Cleaned-up output: no bytes, just the terminal status and a note.
-        if !state.disposition.rings_present() {
-            let note = match &state.disposition {
-                OutputDisposition::Expired { .. } => {
-                    "output expired: evicted to reclaim the session output quota".to_owned()
-                }
-                _ => "output fully consumed; nothing more to read".to_owned(),
-            };
-            return Ok(Some(TaskRead {
-                complete: matches!(state.disposition, OutputDisposition::Consumed { .. })
-                    && !state.output_lost,
-                status,
-                stdout: String::new(),
-                stderr: String::new(),
-                stdout_lost: 0,
-                stderr_lost: 0,
-                note: Some(note),
-            }));
-        }
-
-        let out = record
-            .files()
-            .stdout
-            .read_from(state.stdout_cursor, READ_CHUNK_LIMIT)
-            .await
-            .map_err(TaskAccessError::from)?;
-        let err = record
-            .files()
-            .stderr
-            .read_from(state.stderr_cursor, READ_CHUNK_LIMIT)
-            .await
-            .map_err(TaskAccessError::from)?;
-        let terminal = !status.is_running();
-        let (stdout, out_carry) = decode_with_carry(
-            &state.stdout_carry,
-            &out.bytes,
-            out.lost,
-            terminal && !out.has_more,
-        );
-        let (stderr, err_carry) = decode_with_carry(
-            &state.stderr_carry,
-            &err.bytes,
-            err.lost,
-            terminal && !err.has_more,
-        );
-
-        // Persist cursors, carry and cumulative loss before returning any bytes.
-        let mut candidate = state;
-        candidate.stdout_cursor = out.next_cursor;
-        candidate.stderr_cursor = err.next_cursor;
-        candidate.output_lost |= out.lost > 0 || err.lost > 0;
-        candidate.stdout_carry = out_carry;
-        candidate.stderr_carry = err_carry;
-        let complete = terminal && !out.has_more && !err.has_more && !candidate.output_lost;
-        guard
-            .commit(candidate)
-            .await
-            .map_err(TaskAccessError::from)?;
-        drop(guard);
-
-        Ok(Some(TaskRead {
-            complete,
-            status,
-            stdout,
-            stderr,
-            stdout_lost: out.lost,
-            stderr_lost: err.lost,
-            note: None,
-        }))
+        Ok(Some(crate::read_page::read_result(&record, cursor).await?))
     }
 
     /// Request termination and wait for the monitor's *full* commit — the
@@ -1241,7 +1085,6 @@ impl BackgroundTasks {
             inner.cleanup_pending.remove(id);
             inner.recovered_scopes.remove(id);
         }
-        self.backend.quota.finalize_terminal(&record).await?;
         Ok(())
     }
 
@@ -1262,19 +1105,16 @@ impl BackgroundTasks {
             inner.subagent_notices.remove(id);
             inner.subagent_slots.remove(id);
         }
-        self.backend.quota.finalize_terminal(&record).await?;
         Ok(())
     }
 
     /// Drain accumulated notices (the overflow aggregate last).
     pub async fn take_notices(&self) -> Vec<TaskNotice> {
-        let expirations = self.backend.quota.take_expirations();
         let mut inner = self.inner.lock().await;
-        enqueue_expirations(&mut inner, expirations);
         drain_notices(&mut inner)
     }
 
-    /// Wait for detached archive/quota work already in flight to settle, then
+    /// Wait for detached archive work already in flight to settle, then
     /// atomically check whether the registry has no running tasks and, if so,
     /// drain every pending notice. `None` means a task is still running.
     ///
@@ -1283,13 +1123,8 @@ impl BackgroundTasks {
     /// are task monitors and already-registered detached transactions, both of
     /// which are covered by the barriers and registry mutex below.
     pub async fn take_notices_if_quiescent(&self) -> Option<Vec<TaskNotice>> {
-        let expirations = {
-            self.backend.quota.settle().await;
-            self.backend.archive.settle().await;
-            self.backend.quota.take_expirations()
-        };
+        self.backend.archive.settle().await;
         let mut inner = self.inner.lock().await;
-        enqueue_expirations(&mut inner, expirations);
         if inner.running_count != 0 {
             return None;
         }
@@ -1320,7 +1155,7 @@ impl BackgroundTasks {
             entry.cancel.cancel();
         }
         // Join monitors *before* draining: every terminal state and notice is
-        // committed (rings flushed, manifests saved) by the time we collect them.
+        // committed (outputs sealed, manifests saved) by the time we collect them.
         for monitor in monitors {
             let _ = monitor.await;
         }
@@ -1337,10 +1172,8 @@ impl BackgroundTasks {
                 }
             }
         }
-        self.backend.quota.settle().await;
         self.backend.archive.settle().await;
         let mut inner = self.inner.lock().await;
-        enqueue_expirations(&mut inner, self.backend.quota.take_expirations());
         let notices = drain_notices(&mut inner);
         // Wake watchers even when nothing changed (e.g. zero tasks) so a
         // keepalive watcher parked on this registry re-checks its entry and
@@ -1350,20 +1183,6 @@ impl BackgroundTasks {
     }
 }
 
-fn enqueue_expirations(inner: &mut RegistryState, expirations: Vec<ExpirationFact>) {
-    for fact in expirations {
-        if let Some(summary) = inner.summaries.get_mut(&fact.id) {
-            summary.result_available = false;
-        }
-        inner.push_notice(TaskNotice::OutputExpired {
-            id: fact.id,
-            expired_at: fact.expired_at,
-            reason: fact.reason,
-        });
-    }
-}
-
-/// Drain the notices and the overflow aggregate (aggregate last).
 fn drain_notices(inner: &mut RegistryState) -> Vec<TaskNotice> {
     let mut notices = std::mem::take(&mut inner.notices);
     notices.extend(inner.subagent_notices.values().cloned());
@@ -1386,6 +1205,7 @@ pub enum TaskResult {
     Available {
         status: TaskStatus,
         output: TaskResultOutput,
+        page: crate::TaskResultPage,
     },
     Expired {
         status: TaskStatus,
@@ -1431,45 +1251,6 @@ impl From<std::io::Error> for TaskAccessError {
     }
 }
 
-/// Decode a chunk of raw output into a `String`, carrying a trailing incomplete
-/// UTF-8 sequence to the next read. The byte cursor never regresses: carried
-/// bytes are stored (not re-read), and a chunk boundary that split a scalar is
-/// stitched with `prev_carry`. When `flush` (terminal EOF with no more bytes),
-/// any trailing incomplete bytes are emitted as U+FFFD rather than carried. A
-/// consumer loss (`lost > 0`) discards a now-orphaned carry as one U+FFFD.
-fn decode_with_carry(prev_carry: &[u8], bytes: &[u8], lost: u64, flush: bool) -> (String, Vec<u8>) {
-    let mut out = String::new();
-    let mut work: Vec<u8> = Vec::with_capacity(prev_carry.len() + bytes.len());
-    if lost > 0 && !prev_carry.is_empty() {
-        // The carry's continuation was overwritten before we could read it.
-        out.push('\u{FFFD}');
-    } else {
-        work.extend_from_slice(prev_carry);
-    }
-    work.extend_from_slice(bytes);
-
-    match std::str::from_utf8(&work) {
-        Ok(s) => {
-            out.push_str(s);
-            (out, Vec::new())
-        }
-        Err(e) => {
-            let valid = e.valid_up_to();
-            // SAFETY-free: valid..end is guaranteed valid UTF-8.
-            out.push_str(std::str::from_utf8(&work[..valid]).unwrap());
-            let rest = &work[valid..];
-            match e.error_len() {
-                // Trailing incomplete sequence: carry it unless we must flush.
-                None if !flush && rest.len() <= 3 => (out, rest.to_vec()),
-                _ => {
-                    out.push_str(&String::from_utf8_lossy(rest));
-                    (out, Vec::new())
-                }
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum StreamName {
     Stdout,
@@ -1492,8 +1273,8 @@ enum PumpResult {
     Failed { message: String },
 }
 
-/// Drives one background process: pumps stdout/stderr into the ring files and
-/// resolves when the leader exits and the pipes drain. A pump read/spool
+/// Drives one background process: pumps stdout/stderr into the output store and
+/// resolves when the leader exits and the pipes drain. A pump pipe read
 /// failure is terminal — the group is killed and the task settles `Failed`,
 /// never a clean exit. Cancellation (kill/shutdown) SIGKILLs the group and is
 /// biased to win over a concurrent failure so a user kill stays `Killed`. Pipe
@@ -1515,16 +1296,26 @@ async fn run_process(mut group: GroupedChild, ctx: TaskCtx) -> TaskExit {
         // Cancellation wins over everything (biased below reinforces this).
         if cancel.is_cancelled() {
             group.kill_group();
-            drain_pump(&mut out_pump, &mut out_res).await;
-            drain_pump(&mut err_pump, &mut err_res).await;
+            let (out_complete, err_complete) = tokio::join!(
+                drain_pump(&mut out_pump, &mut out_res),
+                drain_pump(&mut err_pump, &mut err_res),
+            );
+            if !out_complete || !err_complete {
+                ctx.record.files().mark_incomplete().await;
+            }
             let _ = group.child.wait().await;
             return TaskExit::Killed;
         }
         // A spool/read failure is terminal even if the leader already exited.
         if let Some(message) = failure {
             group.kill_group();
-            drain_pump(&mut out_pump, &mut out_res).await;
-            drain_pump(&mut err_pump, &mut err_res).await;
+            let (out_complete, err_complete) = tokio::join!(
+                drain_pump(&mut out_pump, &mut out_res),
+                drain_pump(&mut err_pump, &mut err_res),
+            );
+            if !out_complete || !err_complete {
+                ctx.record.files().mark_incomplete().await;
+            }
             let _ = group.child.wait().await;
             return TaskExit::Failed { message };
         }
@@ -1568,7 +1359,7 @@ fn record_pump(
     *slot = Some(result);
 }
 
-/// One stream's pump loop: read the pipe, append to the ring. A read or append
+/// One stream's pump loop: read the pipe, append to the output store. A read or append
 /// error ends the pump with a structured failure rather than a silent EOF.
 async fn pump_stream<R>(mut reader: R, ctx: TaskCtx, stream: StreamName) -> PumpResult
 where
@@ -1600,16 +1391,22 @@ where
 }
 
 /// Bounded wait for a pipe pump after a group kill; on expiry it is aborted and
-/// its result treated as EOF, so an escaped descendant cannot stall teardown.
-async fn drain_pump(pump: &mut JoinHandle<PumpResult>, slot: &mut Option<PumpResult>) {
-    if slot.is_some() {
-        return;
+/// its capture marked incomplete, so an escaped descendant cannot stall teardown.
+async fn drain_pump(pump: &mut JoinHandle<PumpResult>, slot: &mut Option<PumpResult>) -> bool {
+    if let Some(result) = slot {
+        return matches!(result, PumpResult::Eof);
     }
     match tokio::time::timeout(PIPE_DRAIN_TIMEOUT, &mut *pump).await {
-        Ok(res) => *slot = Some(res.unwrap_or(PumpResult::Eof)),
+        Ok(res) => {
+            let complete = matches!(res, Ok(PumpResult::Eof));
+            *slot = Some(res.unwrap_or(PumpResult::Eof));
+            complete
+        }
         Err(_) => {
             pump.abort();
+            let _ = pump.await;
             *slot = Some(PumpResult::Eof);
+            false
         }
     }
 }
@@ -1621,8 +1418,7 @@ struct TerminalOutcome {
 }
 
 /// Awaits the task's work and commits the terminal state — the single writer of
-/// that transition. Order (load-bearing): terminal manifest commit first, then
-/// quota eviction registration, then (under the registry lock) notice enqueue,
+/// that transition. Order (load-bearing): terminal manifest commit first, then (under the registry lock) notice enqueue,
 /// bookkeeping, and the summaries publish *last*
 /// so a watcher seeing zero running already has the notice drainable.
 async fn monitor_task(
@@ -1633,15 +1429,12 @@ async fn monitor_task(
 ) {
     let exit = work.await;
     let record = &entry.record;
-    let outcome = commit_terminal(record, exit, &backend, &inner).await;
+    let outcome = commit_terminal(record, exit).await;
 
     if outcome.persistence_dirty {
-        backend.quota.block_spawns();
-    }
-
-    // Register for quota eviction before publishing completion.
-    if let Err(e) = backend.quota.finalize_terminal(record).await {
-        tracing::warn!(task = record.id().as_str(), error = %e, "task output finalize failed");
+        backend
+            .blocked
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     let id = record.id().clone();
@@ -1668,47 +1461,14 @@ async fn monitor_task(
     inner.publish();
 }
 
-/// Flush the rings and atomically
-/// commit the terminal manifest. A flush or save failure degrades the task to
-/// `Failed` rather than reporting a clean exit whose output was not persisted.
-async fn commit_terminal(
-    record: &Arc<TaskRecord>,
-    mut exit: TaskExit,
-    backend: &Backend,
-    inner: &Mutex<RegistryState>,
-) -> TerminalOutcome {
-    let mut result_bytes = 0;
-    if let TaskExit::Completed { answer } = &exit {
-        let bytes = answer.len() as u64;
-        let reserved = backend.quota.reserve_bytes(bytes).await;
-        {
-            let mut state = inner.lock().await;
-            enqueue_expirations(&mut state, reserved.expirations);
-            state.publish();
-        }
-        match reserved.reservation {
-            Ok(reservation) => match record.write_result(answer.clone()).await {
-                Ok(()) => {
-                    reservation.commit();
-                    result_bytes = bytes;
-                }
-                Err(error) => {
-                    // Preserve the charge until cleanup can prove that no partial file remains.
-                    if record.discard_uncommitted_result().await.is_err() {
-                        reservation.commit();
-                        backend.quota.block_spawns();
-                    }
-                    exit = TaskExit::Failed {
-                        message: format!("subagent result save failed: {error}"),
-                    };
-                }
-            },
-            Err(error) => {
-                exit = TaskExit::Failed {
-                    message: format!("subagent result quota: {error}"),
-                }
-            }
-        }
+/// Seal output without changing execution status, then commit task lifecycle.
+/// Only a lifecycle manifest failure degrades the task to `Failed`.
+async fn commit_terminal(record: &Arc<TaskRecord>, exit: TaskExit) -> TerminalOutcome {
+    record.files().begin_finalization().await;
+    if let TaskExit::Completed { answer } = &exit
+        && let Err(error) = record.write_result(answer).await
+    {
+        tracing::warn!(%error, "background result capture failed");
     }
     let at = jiff::Timestamp::now();
     let intended = match exit {
@@ -1730,7 +1490,6 @@ async fn commit_terminal(
     }
     let mut candidate = guard.current().clone();
     candidate.status = intended.clone();
-    candidate.result_bytes = result_bytes;
     if record.meta().is_subagent() {
         candidate.notice = Some(crate::manifest::NoticeDelivery::Pending);
     }
@@ -1738,7 +1497,7 @@ async fn commit_terminal(
         guard.commit(candidate).await.err()
     } else {
         Some(ArchiveError::Io(std::io::Error::other(
-            "background output ring flush failed",
+            "background output finalization failed",
         )))
     };
     let status = if let Some(error) = commit_error {
@@ -1749,7 +1508,7 @@ async fn commit_terminal(
         // Settle the runtime exactly once even when no manifest write works.
         // Then retry persisting that same in-memory Failed state best-effort.
         guard
-            .fail_in_memory(failed.clone(), result_bytes)
+            .fail_in_memory(failed.clone())
             .expect("Running can always degrade to Failed");
         let degraded = guard.current().clone();
         if let Err(retry_error) = guard.commit(degraded).await {
@@ -1764,6 +1523,7 @@ async fn commit_terminal(
     } else {
         intended
     };
+    record.files().checkpointed().await;
     TerminalOutcome {
         status,
         persistence_dirty: guard.current().persistence_dirty,
@@ -1781,3 +1541,53 @@ mod subagent_tests;
 #[cfg(test)]
 #[path = "registry_result_tests.rs"]
 mod result_tests;
+
+#[cfg(test)]
+struct TaskRead {
+    status: TaskStatus,
+    stdout: String,
+    stderr: String,
+    complete: bool,
+}
+#[cfg(test)]
+impl BackgroundTasks {
+    async fn read(&self, id: &TaskId) -> Result<Option<TaskRead>, TaskAccessError> {
+        use coda_core::output::Channel;
+        let Some(record) = self.backend.archive.open(id).await? else {
+            return Ok(None);
+        };
+        let status = record.lock_commit().await.current().status.clone();
+        let positions = [
+            self.output_progress("test", id, Channel::Stdout).await,
+            self.output_progress("test", id, Channel::Stderr).await,
+            self.output_progress("test", id, Channel::Result).await,
+        ];
+        let page = self
+            .read_page(id, "test", positions, None, 16 * 1024)
+            .await?
+            .unwrap();
+        self.commit_reads(&page.receipts).await;
+        Ok(Some(TaskRead {
+            status,
+            stdout: page_section(&page.body, "stdout (new):"),
+            stderr: page_section(&page.body, "stderr (new):"),
+            complete: page.complete,
+        }))
+    }
+}
+
+/// The text under `heading` in a task page, up to the next heading or note.
+/// Test pages never contain those markers themselves.
+#[cfg(test)]
+pub(crate) fn page_section(body: &str, heading: &str) -> String {
+    let Some(start) = body.find(&format!("\n{heading}\n")) else {
+        return String::new();
+    };
+    let rest = &body[start + heading.len() + 2..];
+    let end = ["\nstderr (new):\n", "\n[", "\n(no new output)"]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].to_owned()
+}

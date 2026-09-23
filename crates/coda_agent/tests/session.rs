@@ -143,6 +143,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_write_todos".into(),
                     name: "write_todos".into(),
                     arguments: Some(
@@ -167,6 +168,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_read_todos".into(),
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
@@ -201,6 +203,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_read".into(),
                     name: "read_file".into(),
                     arguments: Some(json!({"file_path": path}).to_string()),
@@ -245,6 +248,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             } else if has_write {
                 return completed(AssistantMessage {
                     tool_calls: vec![ToolCall {
+                        output_bytes: None,
                         id: "call_read".into(),
                         name: "read_file".into(),
                         arguments: Some(json!({"file_path": path}).to_string()),
@@ -254,6 +258,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             } else {
                 return completed(AssistantMessage {
                     tool_calls: vec![ToolCall {
+                        output_bytes: None,
                         id: "call_write".into(),
                         name: "write_file".into(),
                         arguments: Some(
@@ -290,6 +295,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_explore".into(),
                     name: "explore".into(),
                     arguments: Some(r#"{"task":"session probe"}"#.into()),
@@ -316,6 +322,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_explore_approval".into(),
                     name: "explore".into(),
                     arguments: Some(r#"{"task":"subagent approval probe"}"#.into()),
@@ -333,6 +340,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_subagent_todos".into(),
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
@@ -381,6 +389,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_todos".into(),
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
@@ -410,6 +419,7 @@ impl coda_core::llm::LLMProvider for FakeProvider {
             }
             return completed(AssistantMessage {
                 tool_calls: vec![ToolCall {
+                    output_bytes: None,
                     id: "call_timeout".into(),
                     name: "read_todos".into(),
                     arguments: Some("{}".into()),
@@ -452,6 +462,7 @@ fn solo_team(spec: AgentSpec) -> AgentTeam {
 
 fn fake_profile() -> ModelProfile<FakeProvider> {
     ModelProfile {
+        output_limits: coda_core::output::ModelOutputLimits::default(),
         provider_id: "test".into(),
         provider: FakeProvider,
         model: "fake".into(),
@@ -465,6 +476,7 @@ fn fake_profile() -> ModelProfile<FakeProvider> {
 
 fn run_config(approval: ToolApprovalMode) -> RunConfig<FakeProvider> {
     RunConfig {
+        outputs: None,
         default_model: fake_profile(),
         agent_models: HashMap::new(),
         tool_approval: approval,

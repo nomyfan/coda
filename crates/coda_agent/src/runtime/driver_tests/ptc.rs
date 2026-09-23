@@ -83,7 +83,38 @@ fn malformed_snapshot_is_deduplicated_and_restored_in_fixed_order() {
         ],
     );
 
-    assert_eq!(&*invoker.exposed_tools(), &["ls", "read_todos"]);
+    assert_eq!(&*invoker.exposed_tools(), &["ls", "read_todos", "shell"]);
+}
+
+#[tokio::test]
+async fn delivery_failure_after_execution_is_reported_as_undelivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = coda_tools::BuildContext::new(dir.path().to_string_lossy());
+    let mut tools = Tools::default();
+    tools.register(coda_tools::WriteFileToolSpec.build(&build));
+    let invoker = AgentToolInvoker::new(tools, ToolApprovalMode::Auto, vec!["write_file".into()]);
+    let path = dir.path().join("written.txt");
+    let mut context = coda_core::tool::ToolCallContext::default();
+    // Too small for even the short confirmation write_file returns.
+    context.result_budget =
+        coda_core::output::ResultBudget::Script(coda_core::output::BufferBudget::new(8));
+    let arguments = serde_json::json!({ "file_path": path, "content": "hello" }).to_string();
+
+    let error = invoker
+        .call("write_file".into(), arguments, context)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            coda_core::tool::HostToolCallError::Undelivered(coda_core::output::OutputError::Limit(
+                _
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
 }
 
 #[tokio::test]
@@ -192,7 +223,7 @@ async fn discovery_uses_the_snapshot_intersected_with_live_policy_and_normal_eve
     assert!(saw_start);
     assert!(matches!(
         result.output,
-        ToolOutput::Ok(output) if output == "[read_todos]"
+        ToolOutput::Ok(output) if output == "[read_todos, task_output]"
     ));
     assert!(matches!(
         result.outcome,
@@ -210,7 +241,7 @@ async fn discovery_requires_exactly_an_empty_object() {
             .await
             .expect_err(input);
         assert!(matches!(
-            error,
+            error.error,
             coda_core::tool::ToolError::InvalidParameters(_)
         ));
     }
@@ -219,18 +250,18 @@ async fn discovery_requires_exactly_an_empty_object() {
     let mut tools = Tools::default();
     tools.register(coda_tools::ReadTodosToolSpec.build(&build));
     let invoker = AgentToolInvoker::new(tools, ToolApprovalMode::Auto, vec!["read_todos".into()]);
-    assert_eq!(
+    assert!(matches!(
         execute_javascript_tool_discovery(" \n { } \t".to_string(), Some(invoker))
             .await
             .unwrap(),
-        "[read_todos]"
-    );
+        coda_core::output::OutputData::Inline(text) if text == "[read_todos]"
+    ));
 
     let error = execute_javascript_tool_discovery("{}".to_string(), None)
         .await
         .unwrap_err();
     assert!(matches!(
-        error,
+        error.error,
         coda_core::tool::ToolError::ExecutionError(message)
             if message.contains("PTC_UNAVAILABLE")
     ));
@@ -301,7 +332,7 @@ async fn outer_approval_preserves_the_generation_snapshot() {
     assert!(matches!(
         &pending_approval_calls[0].metadata,
         Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools })
-            if exposed_tools == &["read_todos"]
+            if exposed_tools == &["read_todos", "task_output"]
     ));
 
     harness
@@ -343,7 +374,7 @@ async fn discovery_approval_preserves_the_generation_snapshot() {
     assert!(matches!(
         &pending_approval_calls[0].metadata,
         Some(ToolExecutionMetadata::ProgrammaticToolCalling { exposed_tools })
-            if exposed_tools == &["read_todos"]
+            if exposed_tools == &["read_todos", "task_output"]
     ));
 
     harness
@@ -392,7 +423,7 @@ async fn live_policy_can_shrink_but_not_bypass_the_snapshot() {
         assert_eq!(report["error"]["code"], "TOOL_UNAVAILABLE");
         assert_eq!(
             report["error"]["message"],
-            "tool \"read_todos\" is unavailable; available tools: []"
+            "tool \"read_todos\" is unavailable; available tools: [task_output]"
         );
     }
     harness.shutdown().await;

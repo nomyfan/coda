@@ -71,6 +71,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    task_output_progress (workspace_id, session_id, consumer, task_id, channel) {
+        workspace_id -> Text,
+        session_id -> Text,
+        consumer -> Text,
+        task_id -> Text,
+        channel -> Text,
+        next_offset -> Int8,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     aborted_executions,
     messages,
@@ -78,4 +89,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     runtime_snapshots,
     sessions,
     task_notice_receipts,
+    task_output_progress,
 );

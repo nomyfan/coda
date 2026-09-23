@@ -58,7 +58,7 @@ async fn abort_during_mixed_tool_execution_aborts_local_and_subagent_calls() {
     )
     .await;
 
-    let result = timeout(Duration::from_secs(2), async {
+    let result = timeout(Duration::from_secs(8), async {
         let mut started = std::collections::HashSet::new();
         let mut ended = std::collections::HashSet::new();
 

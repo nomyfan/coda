@@ -481,6 +481,7 @@ impl SharedSystemPrompt {
 /// per turn; a session can map different agents to different profiles through
 /// [`RunConfig::agent_models`].
 pub struct ModelProfile<P> {
+    pub output_limits: coda_core::output::ModelOutputLimits,
     pub provider_id: String,
     pub provider: P,
     pub model: String,
@@ -500,6 +501,7 @@ pub struct ModelProfile<P> {
 impl<P: Clone> Clone for ModelProfile<P> {
     fn clone(&self) -> Self {
         ModelProfile {
+            output_limits: self.output_limits,
             provider_id: self.provider_id.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
@@ -517,6 +519,7 @@ impl<P: Clone> Clone for ModelProfile<P> {
 /// any agent without an entry in `agent_models` — uses `default_model`, while
 /// `agent_models` overrides specific agents by name.
 pub struct RunConfig<P> {
+    pub outputs: Option<coda_core::output::OutputRuntime>,
     pub default_model: ModelProfile<P>,
     /// Per-agent model overrides, keyed by agent name. Agents absent here fall
     /// back to `default_model`.
@@ -537,6 +540,7 @@ impl<P: Clone> RunConfig<P> {
             .cloned()
             .unwrap_or_else(|| self.default_model.clone());
         AgentRunConfig {
+            outputs: self.outputs.clone(),
             profile,
             tool_approval: self.tool_approval.clone(),
         }
@@ -546,6 +550,7 @@ impl<P: Clone> RunConfig<P> {
 impl<P: Clone> Clone for RunConfig<P> {
     fn clone(&self) -> Self {
         RunConfig {
+            outputs: self.outputs.clone(),
             default_model: self.default_model.clone(),
             agent_models: self.agent_models.clone(),
             tool_approval: self.tool_approval.clone(),
@@ -557,6 +562,7 @@ impl<P: Clone> Clone for RunConfig<P> {
 /// The resolved configuration handed to a single agent's run loop.
 #[derive(Clone)]
 pub(crate) struct AgentRunConfig<P> {
+    pub outputs: Option<coda_core::output::OutputRuntime>,
     pub profile: ModelProfile<P>,
     pub tool_approval: ToolApprovalMode,
 }

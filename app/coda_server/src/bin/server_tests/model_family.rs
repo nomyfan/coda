@@ -8,6 +8,7 @@ fn provider(id: &str, model: &str, family: Option<&str>, image: bool) -> Provide
         base_url: "http://127.0.0.1:1".into(),
         include_usage: true,
         models: vec![ModelConfig {
+            output_limits: Default::default(),
             id: model.into(),
             name: model.into(),
             family: family.map(str::to_owned),
@@ -35,6 +36,8 @@ impl Harness {
         let shutdown = CancellationToken::new();
         self.workspace = Arc::new(
             build_workspace(
+                coda_output::Store::standalone(),
+                coda_core::output::PtcResourceLimits::default(),
                 WorkspaceConfig {
                     id: self.workspace.id.clone(),
                     path: self.dir.path().into(),

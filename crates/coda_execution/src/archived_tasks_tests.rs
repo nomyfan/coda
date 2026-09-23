@@ -1,5 +1,6 @@
 use super::*;
 use crate::{BackgroundTasks, TaskArchive, TaskExit, TaskKind, TaskMeta, TaskOrigin};
+use crate::{TaskResultOutput, TaskStatus};
 
 fn contents(path: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     let mut files = std::collections::BTreeMap::new();
@@ -98,7 +99,7 @@ async fn unfinished_archive_is_neither_recovered_nor_cleaned() {
         )
         .await
         .unwrap();
-    record.write_result("not committed".into()).await.unwrap();
+    record.write_result("not committed").await.unwrap();
     drop(record);
     drop(archive);
     let before = contents(tmp.path());
@@ -127,7 +128,7 @@ fn missing_and_symlink_archives_are_not_created_or_followed() {
 
 #[tokio::test]
 async fn corrupt_expired_and_unknown_results_remain_distinct_without_cleanup() {
-    use crate::manifest::{ExpireReason, OutputDisposition, TaskOutputManifest};
+    use crate::manifest::TaskOutputManifest;
     let tmp = tempfile::tempdir().unwrap();
     let registry =
         BackgroundTasks::session_backed(ArchiveDir::open_or_create_root(tmp.path()).unwrap())
@@ -158,22 +159,36 @@ async fn corrupt_expired_and_unknown_results_remain_distinct_without_cleanup() {
     let archive = ArchivedTasks::open_existing(tmp.path()).unwrap().unwrap();
     assert!(archive.read_result(&TaskId::new()).await.unwrap().is_none());
     let task_dir = tmp.path().join(id.as_str());
-    std::fs::write(task_dir.join("result.txt"), b"bad length").unwrap();
-    let before = contents(tmp.path());
-    assert!(archive.read_result(&id).await.is_err());
-    assert_eq!(before, contents(tmp.path()));
     let manifest_file = task_dir.join("meta.json");
     let mut manifest: TaskOutputManifest =
         serde_json::from_slice(&std::fs::read(&manifest_file).unwrap()).unwrap();
-    manifest.output = OutputDisposition::Expired {
-        at: jiff::Timestamp::now(),
-        reason: ExpireReason::SessionQuota,
-    };
+    let path = &manifest
+        .payload
+        .reference
+        .as_ref()
+        .unwrap()
+        .channels
+        .iter()
+        .find(|c| c.channel == coda_core::output::Channel::Result)
+        .unwrap()
+        .path;
+    std::fs::write(path, b"x").unwrap();
+    let before = contents(tmp.path());
+    assert!(archive.read_result(&id).await.is_err());
+    assert_eq!(before, contents(tmp.path()));
+    manifest.payload.reference = None;
+    manifest.payload.failure = Some(coda_core::output::StorageFailure::Incomplete);
     std::fs::write(manifest_file, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let before = contents(tmp.path());
     assert!(matches!(
         archive.read_result(&id).await.unwrap(),
-        Some(TaskResult::Expired { .. })
+        Some(TaskResult::Available {
+            page: crate::TaskResultPage {
+                complete: false,
+                ..
+            },
+            ..
+        })
     ));
     assert!(!archive.overview().await.unwrap()[0].result_available);
     assert_eq!(before, contents(tmp.path()));

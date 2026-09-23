@@ -27,6 +27,7 @@ impl LLMProvider for TaskReader {
             let mut answer = assistant();
             match (prompt.0.as_str(), answered) {
                 ("root", false) => answer.tool_calls.push(ToolCall {
+                    output_bytes: None,
                     id: "background".into(),
                     name: "agent__worker".into(),
                     arguments: Some(
@@ -37,6 +38,7 @@ impl LLMProvider for TaskReader {
                 ("worker", false) => {
                     for (index, id) in self.tasks.lock().unwrap().iter().enumerate() {
                         answer.tool_calls.push(ToolCall {
+                            output_bytes: None,
                             id: format!("read-{index}"),
                             name: "task_output".into(),
                             arguments: Some(serde_json::json!({"id":id}).to_string()),

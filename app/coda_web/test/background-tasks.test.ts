@@ -10,6 +10,7 @@ import type {
 } from "../src/lib/protocol.ts";
 import { orderTasks, TaskResultContent } from "../src/components/background-tasks.tsx";
 import { transcriptRenderItems } from "../src/components/transcript.tsx";
+import { OutputReferences } from "../src/components/output-references.tsx";
 import {
   appendTaskNotice,
   applyEvent,
@@ -55,6 +56,36 @@ const finishedNotice: TaskNoticeMessage = {
 };
 
 const finished: HistoryMessage = { TaskNotice: finishedNotice };
+
+test("retained output paths are literal copyable server paths with retention details", () => {
+  const html = renderToStaticMarkup(
+    createElement(OutputReferences, {
+      references: [
+        {
+          id: "output-id",
+          complete: false,
+          failure: "result_limit",
+          sealed_at: "2026-09-13T00:00:00Z",
+          expires_at: "2026-09-14T00:00:00Z",
+          channels: [
+            {
+              channel: "stdout",
+              path: "/server/<logs>/stdout.txt",
+              captured_bytes: 20,
+              saved_bytes: 10,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  expect(html).toContain("Partial output");
+  expect(html).toContain("/server/&lt;logs&gt;/stdout.txt");
+  expect(html).toContain("Copy stdout file path");
+  expect(html).toContain("storage limits may remove it earlier");
+  expect(html).toContain("These files are on the server");
+  expect(html).not.toContain("href=");
+});
 
 test("a finished background task renders as a notice, not a user bubble", () => {
   const after = applySnapshotToSession(session(), {
@@ -289,7 +320,7 @@ test("shell results render each stream as literal text with overwrite counts", (
   expect(html).toContain("Exited with code 1");
   expect(html).toContain("stdout");
   expect(html).toContain("stderr");
-  expect(html).toContain("7 bytes of earlier output were overwritten.");
+  expect(html).toContain("7 bytes of output were not retained.");
   expect(html).toContain("**literal** &lt;script&gt;unsafe()&lt;/script&gt;");
   expect(html).not.toContain("<script>");
   expect(html).toContain("build failed");

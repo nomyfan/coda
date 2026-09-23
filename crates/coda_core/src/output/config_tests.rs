@@ -1,0 +1,99 @@
+use super::*;
+
+#[test]
+fn invalid_resource_relations_report_the_configuration_field() {
+    let mut limits = ResourceLimits::default();
+    limits.output.session_disk_bytes = limits.output.result_disk_bytes - 1;
+    assert!(
+        limits
+            .validate()
+            .unwrap_err()
+            .starts_with("resources.output.session_disk_bytes")
+    );
+    let mut limits = ResourceLimits::default();
+    limits.ptc.host_buffer_bytes = PtcResourceLimits::MIN_HOST_BUFFER_BYTES - 1;
+    assert!(
+        limits
+            .validate()
+            .unwrap_err()
+            .starts_with("resources.ptc.host_buffer_bytes")
+    );
+    let mut limits = ResourceLimits::default();
+    limits.ptc.max_concurrent_calls = limits.ptc.max_calls + 1;
+    assert!(
+        limits
+            .validate()
+            .unwrap_err()
+            .starts_with("resources.ptc.max_concurrent_calls")
+    );
+}
+
+#[test]
+fn dispatch_budget_is_bounded_and_rejects_unrepresentable_batches() {
+    let limits = ModelOutputLimits {
+        single_call_bytes: 1024,
+        batch_call_bytes: 4097,
+    };
+    assert_eq!(limits.allocate(1, 512).unwrap(), vec![1024]);
+    assert_eq!(
+        limits.allocate(5, 512).unwrap(),
+        vec![820, 820, 819, 819, 819]
+    );
+    assert!(limits.allocate(9, 512).is_err());
+    assert!(limits.allocate(usize::MAX, 512).is_err());
+    assert!(limits.allocate(0, 512).unwrap().is_empty());
+}
+
+#[test]
+fn removed_intermediate_limits_are_rejected() {
+    assert!(
+        serde_json::from_value::<ResourceLimits>(serde_json::json!({
+            "ptc": {"total_result_bytes": 16777216}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn long_output_roots_require_room_for_all_channel_paths() {
+    let mut limits = ResourceLimits::default();
+    limits.output.root = PathBuf::from(format!("/tmp/{}", "x".repeat(500)));
+    limits.output.model.single_call_bytes = 1024;
+    let error = limits.validate().unwrap_err();
+    assert!(error.starts_with("resources.output.model.single_call_bytes"));
+    assert!(error.contains("complete output paths and metadata"));
+
+    let minimum = ModelOutputLimits::minimum_response_bytes(&limits.output.root).unwrap();
+    assert!(minimum > 4 * 505);
+    limits.output.model.single_call_bytes = minimum;
+    limits.validate().unwrap();
+    limits.output.model.single_call_bytes -= 1;
+    assert!(limits.validate().is_err());
+}
+
+#[test]
+fn path_budget_counts_utf8_bytes_for_every_channel() {
+    let short = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaa")).unwrap();
+    let long = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaaa")).unwrap();
+    // Each extra path byte appears once in each of the four channel paths an
+    // output may hold at most.
+    assert_eq!(long - short, 4 * Channel::MAX_PER_OUTPUT);
+    assert_eq!(Channel::MAX_PER_OUTPUT, 4);
+    let unicode = ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/中😀")).unwrap();
+    let same_byte_length =
+        ModelOutputLimits::minimum_response_bytes(Path::new("/tmp/aaaaaaa")).unwrap();
+    assert_eq!(unicode, same_byte_length);
+}
+
+#[test]
+fn batch_dispatch_can_use_the_same_path_metadata_minimum() {
+    let root = Path::new("/tmp/output");
+    let minimum = ModelOutputLimits::minimum_response_bytes(root).unwrap();
+    let limits = ModelOutputLimits {
+        single_call_bytes: minimum,
+        batch_call_bytes: minimum * 2,
+    };
+    limits.validate(root).unwrap();
+    assert_eq!(limits.allocate(2, minimum).unwrap(), vec![minimum; 2]);
+    assert!(limits.allocate(3, minimum).is_err());
+}

@@ -6,7 +6,9 @@ use coda_core::llm::{FileChangeOperation, ToolArtifact};
 use coda_core::tool::{Tool, ToolCallContext, ToolError, ToolResult};
 
 use crate::locks::KeyedLock;
-use crate::process::{CommandOutcome, run_command};
+use crate::process::{preserve_error, run_command};
+use coda_core::output::OutputData;
+use coda_core::output::preview::MAX_LINE_BYTES;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -123,7 +125,7 @@ pub struct ReadFileToolParams {
     file_path: String,
     /// The line number to start reading from (1-based). If not specified, reads from the beginning.
     offset: Option<usize>,
-    /// The number of lines to read. If not specified, reads to the end of the file.
+    /// Maximum lines to read (default 200). A page may stop earlier to fit the output budget.
     limit: Option<usize>,
 }
 
@@ -138,14 +140,14 @@ impl ReadFileTool {
 
 impl Tool for ReadFileTool {
     type Parameters = ReadFileToolParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "read_file"
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. The file_path must be an absolute path. You can optionally specify offset (1-based line number) and limit to read a specific range of lines. Content is decoded as UTF-8."
+        "Read lines from a file. The file_path must be an absolute path. Returns at most 200 lines by default, each prefixed with its 1-based line number and a tab; use offset (1-based line number) and limit to read other ranges. A page may stop earlier to fit the output budget, and ends with the offset to continue from. Lines longer than 2000 bytes are cut short, with a note giving how many bytes are left out and the byte offset in the file where they start; read the rest with shell tools such as dd or tail -c. Content is decoded as UTF-8, with invalid bytes replaced."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -156,52 +158,152 @@ impl Tool for ReadFileTool {
     fn execute(
         &self,
         params: Self::Parameters,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> impl Future<Output = ToolResult<Self::Output>> + Send + 'static {
-        async move {
-            let path = Path::new(&params.file_path);
-            if !path.is_absolute() {
-                return Err(ToolError::InvalidParameters(
-                    "file_path must be an absolute path".to_string(),
-                ));
-            }
-
-            let mut file = open_regular_file(path, false).await?;
-            let buf = read_capped(&mut file).await?;
-            let content = String::from_utf8_lossy(&buf);
-
-            let lines: Vec<&str> = content.lines().collect();
-            let total = lines.len();
-
-            let start = match params.offset {
-                Some(offset) if offset >= 1 => offset - 1,
-                Some(_) => {
-                    return Err(ToolError::InvalidParameters(
-                        "offset must be >= 1".to_string(),
-                    ));
-                }
-                None => 0,
-            };
-
-            let end = match params.limit {
-                Some(limit) => (start + limit).min(total),
-                None => total,
-            };
-
-            if start >= total {
-                return Ok(String::new());
-            }
-
-            let result: String = lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            Ok(result)
-        }
+        async move { read_page(params, ctx).await }
     }
+}
+
+/// Page budget held back for the continuation footer.
+const FOOTER_BYTES: usize = 128;
+/// Line budget held back for the line-number prefix and truncation marker.
+const LINE_OVERHEAD_BYTES: usize = 128;
+
+/// Streams the file instead of loading it, so a page costs its own size
+/// however large the file is, and stops at whichever comes first: `limit`
+/// lines or the output budget.
+async fn read_page(params: ReadFileToolParams, ctx: ToolCallContext) -> ToolResult<OutputData> {
+    use coda_core::output::preview::{decode_within, page_boundary};
+    use coda_core::output::{IO_BLOCK_BYTES, OutputError};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let path = Path::new(&params.file_path);
+    if !path.is_absolute() {
+        return Err(ToolError::InvalidParameters(
+            "file_path must be an absolute path".into(),
+        ));
+    }
+    if params.offset == Some(0) || params.limit == Some(0) {
+        return Err(ToolError::InvalidParameters(
+            "offset and limit must be positive".into(),
+        ));
+    }
+    let bytes = ctx.result_budget.page_bytes();
+    let budget = bytes.saturating_sub(FOOTER_BYTES);
+    if budget <= LINE_OVERHEAD_BYTES {
+        return Err(OutputError::PageLimit("no space for file content".into()).into());
+    }
+    let line_cap = MAX_LINE_BYTES.min(budget - LINE_OVERHEAD_BYTES);
+    let lease = ctx
+        .result_budget
+        .reserve(bytes * 2 + IO_BLOCK_BYTES, &ctx.cancel)
+        .await?;
+    let file = open_regular_file(path, false).await?;
+    let mut reader = BufReader::with_capacity(IO_BLOCK_BYTES, file);
+    let first = params.offset.unwrap_or(1);
+    let max_lines = params.limit.unwrap_or(200);
+    let mut body = String::new();
+    let mut shown = 0;
+    let mut line_no = 1;
+    // Byte offset of the next unread byte, for naming where a cut line resumes.
+    let mut position = 0u64;
+    let mut raw = Vec::with_capacity(line_cap);
+    let next = loop {
+        let at_eof = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
+            buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?.is_empty(),
+        };
+        if at_eof {
+            break None;
+        }
+        if shown == max_lines {
+            break Some((line_no, format!("reached the {max_lines}-line limit")));
+        }
+        // Read one line, keeping at most `line_cap` bytes of it; lines before
+        // the requested offset are only scanned.
+        raw.clear();
+        let mut dropped = 0;
+        let line_start = position;
+        loop {
+            let buf = tokio::select! {
+                _ = ctx.cancel.cancelled() => return Err(ToolError::Aborted("File read cancelled".into())),
+                buf = reader.fill_buf() => buf.map_err(|e| ToolError::ExecutionError(e.to_string()))?,
+            };
+            if buf.is_empty() {
+                break;
+            }
+            let newline = buf.iter().position(|byte| *byte == b'\n');
+            let content = &buf[..newline.unwrap_or(buf.len())];
+            let keep = if line_no >= first {
+                (line_cap - raw.len()).min(content.len())
+            } else {
+                0
+            };
+            raw.extend_from_slice(&content[..keep]);
+            dropped += content.len() - keep;
+            let consumed = newline.map_or(buf.len(), |index| index + 1);
+            reader.consume(consumed);
+            position += consumed as u64;
+            if newline.is_some() {
+                break;
+            }
+        }
+        if line_no < first {
+            line_no += 1;
+            continue;
+        }
+        let length = raw.len() + dropped;
+        if dropped == 0 && raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        if dropped > 0 {
+            // Cut at a character boundary rather than leave a split one.
+            let boundary = page_boundary(&raw);
+            dropped += raw.len() - boundary;
+            raw.truncate(boundary);
+        }
+        // Cap the decoded text, not the raw bytes: each invalid byte decodes to
+        // a three-byte replacement character.
+        let (text, used) = decode_within(&raw, line_cap);
+        dropped += raw.len() - used;
+        let mut entry = format!("{line_no:>6}\t{text}");
+        if dropped > 0 {
+            let _ = write!(
+                entry,
+                " [line {line_no} truncated: {} more bytes at offset {}]",
+                length - used,
+                line_start + used as u64
+            );
+        }
+        let separator = usize::from(shown > 0);
+        if body.len() + separator + entry.len() > budget {
+            // `line_cap` leaves room for the prefix and marker, so a first
+            // line always fits; this only guards that arithmetic.
+            if shown == 0 {
+                return Err(OutputError::PageLimit(
+                    "a single line does not fit the output budget".into(),
+                )
+                .into());
+            }
+            break Some((line_no, format!("reached the {bytes}-byte output limit")));
+        }
+        if separator == 1 {
+            body.push('\n');
+        }
+        body.push_str(&entry);
+        shown += 1;
+        line_no += 1;
+    };
+    if let Some((next, reason)) = next {
+        let _ = write!(
+            body,
+            "\n[page truncated: {reason}; continue with offset={next}]"
+        );
+    }
+    Ok(OutputData::Page {
+        body,
+        references: vec![],
+        lease,
+    })
 }
 
 // ---- WriteFile ----
@@ -564,14 +666,14 @@ impl ListDirectoryTool {
 
 impl Tool for ListDirectoryTool {
     type Parameters = ListDirectoryToolParams;
-    type Output = String;
+    type Output = OutputData;
 
     fn name(&self) -> &str {
         "ls"
     }
 
     fn description(&self) -> &str {
-        "List the contents of a directory. The path must be an absolute path. Respects .gitignore rules."
+        "List the contents of a directory. The path must be an absolute path. Includes hidden entries except .git and anything ignored by .gitignore; a path inside .git is still listed."
     }
 
     fn parameter_schema(&self) -> &serde_json::Value {
@@ -593,33 +695,40 @@ impl Tool for ListDirectoryTool {
             }
 
             let mut cmd = Command::new("fd");
+            // Dotfiles such as .github/ or .env.example matter to an agent, so
+            // only .gitignore rules hide entries; .git itself is never useful.
             cmd.arg("--color=never")
+                .arg("--hidden")
+                .arg("--exclude")
+                .arg(".git")
                 .arg("--glob")
                 .arg("*")
                 .arg("--exact-depth")
                 .arg("1")
                 .arg(&params.path);
-            let output = match run_command(cmd, ctx.cancel)
+            let output = run_command(cmd, ctx.clone())
                 .await
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))?
-            {
-                CommandOutcome::Completed(output) => output,
-                CommandOutcome::Cancelled { .. } => {
-                    return Err(ToolError::Aborted(
-                        "Interrupted by the user before completion.".to_string(),
-                    ));
+                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+            match output.status {
+                Some(status) if status.success() => {
+                    if matches!(&output.output, OutputData::Inline(text) if text.is_empty()) {
+                        Ok("Directory is empty or all entries are ignored."
+                            .to_string()
+                            .into())
+                    } else {
+                        Ok(output.output)
+                    }
                 }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            match output.status.code() {
-                Some(0) if stdout.is_empty() => {
-                    Ok("Directory is empty or all entries are ignored.".to_string())
-                }
-                Some(0) => Ok(stdout.into_owned()),
-                _ => Err(ToolError::ExecutionError(stderr.into_owned())),
+                Some(_) => Err(preserve_error(
+                    &ctx,
+                    ToolError::ExecutionError("fd failed".into()),
+                    output.output,
+                )),
+                None => Err(preserve_error(
+                    &ctx,
+                    ToolError::Aborted("Interrupted by the user before completion.".into()),
+                    output.output,
+                )),
             }
         }
     }

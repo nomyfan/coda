@@ -102,6 +102,7 @@ async fn abort_transaction_cleans_calls_and_fences_late_checkpoints_and_snapshot
         unreachable!()
     };
     assistant.tool_calls.push(ToolCall {
+        output_bytes: None,
         id: "call".into(),
         name: "shell".into(),
         arguments: Some("{}".into()),
@@ -455,4 +456,172 @@ async fn owning_process_task_read_receipt_is_persisted() {
         .unwrap();
     let reopened = PgSessionStorage::new(pool, &workspace, "root");
     assert!(reopened.has_notice_receipt(task).await.unwrap());
+}
+
+fn page_read(task: &TaskId, consumer: &str, start: u64, end: u64, total: u64) -> ToolMessage {
+    use coda_core::output::{Channel, ReadReceipt};
+    let mut tool = ToolMessage::new(
+        "page",
+        "task_output",
+        ToolOutput::Ok("bounded page".into()),
+        ToolCallOutcome::Auto,
+        None,
+    );
+    tool.read_receipts.push(ReadReceipt {
+        consumer: consumer.into(),
+        task: task.clone(),
+        channel: Channel::Stdout,
+        start,
+        end,
+        total,
+        terminal: true,
+        complete: end == total,
+    });
+    if end == total {
+        tool.observed_tasks.push(task.clone());
+    }
+    tool
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_progress_and_paths_survive_rewind_while_forks_share_only_the_files() {
+    use coda_core::output::{FINALIZE_TIMEOUT, OutputData, OutputLimits, OutputOwner, OutputStore};
+    let pool = pool().await;
+    let workspace = workspace_id("output_progress_paths");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    let task = TaskId::new();
+    let user = MessageId::new();
+    let turn = TurnId::from(user);
+    let dir = tempfile::tempdir().unwrap();
+    let store = coda_output::Store::open(OutputLimits {
+        root: dir.path().join("output"),
+        ..OutputLimits::default()
+    })
+    .unwrap();
+    let OutputData::Captured(output) = store
+        .retain(
+            OutputOwner {
+                workspace_id: workspace.clone(),
+                session_id: "root".into(),
+            },
+            "shared middle log".repeat(2000),
+            16 * 1024,
+            tokio::time::Instant::now() + FINALIZE_TIMEOUT,
+        )
+        .await
+    else {
+        panic!()
+    };
+    let reference = output.reference.unwrap();
+    let mut tool = page_read(&task, "root", 0, 20, 20);
+    tool.output_refs.push(reference.clone());
+    storage
+        .save_checkpoint(
+            "root".into(),
+            checkpoint(
+                "root",
+                vec![
+                    entry(turn, Message::User(UserMessage::text(user, "read"))),
+                    entry(turn, Message::Tool(tool)),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    let reopened = PgSessionStorage::new(pool.clone(), &workspace, "root");
+    assert_eq!(
+        reopened.load_output_progress("root").await.unwrap()[0].offset,
+        20
+    );
+    assert!(reopened.has_notice_receipt(task.clone()).await.unwrap());
+    let workspace_storage = WorkspaceStorage::new(pool.clone(), &workspace);
+    let charged = store.charged_bytes();
+    let fork = workspace_storage
+        .fork_session("root", ForkCut::All, ForkSource::Live)
+        .await
+        .unwrap();
+    let fork_storage = PgSessionStorage::new(pool.clone(), &workspace, &fork.session_id);
+    assert!(
+        fork_storage
+            .load_output_progress(&fork.session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!fork_storage.has_notice_receipt(task).await.unwrap());
+    let saved = fork_storage
+        .load_checkpoint(&fork.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&saved.messages[1].message, Message::Tool(t) if t.output_refs == vec![reference.clone()])
+    );
+    reopened.rewind_to(user).await.unwrap();
+    assert_eq!(
+        reopened.load_output_progress("root").await.unwrap()[0].offset,
+        20
+    );
+    workspace_storage.delete_session("root").await.unwrap();
+    assert!(
+        reopened
+            .load_output_progress("root")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.charged_bytes(), charged);
+    assert_eq!(
+        std::fs::read_to_string(&reference.channels[0].path).unwrap(),
+        "shared middle log".repeat(2000)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_output_checkpoint_rolls_back_progress_and_notification_together() {
+    let pool = pool().await;
+    let workspace = workspace_id("output_progress_rollback");
+    seed_session(&pool, &workspace, "root").await;
+    let storage = PgSessionStorage::new(pool, &workspace, "root");
+    let task = TaskId::new();
+    let id = MessageId::new();
+    let turn = TurnId::from(id);
+    let first = entry(turn, Message::User(UserMessage::text(id, "read")));
+    storage
+        .save_checkpoint("root".into(), checkpoint("root", vec![first.clone()]))
+        .await
+        .unwrap();
+    let tool = entry(turn, Message::Tool(page_read(&task, "root", 0, 100, 100)));
+    assert!(
+        storage
+            .save_checkpoint(
+                "root".into(),
+                checkpoint("root", vec![first.clone(), tool.clone(), first.clone()])
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .load_output_progress("root")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!storage.has_notice_receipt(task.clone()).await.unwrap());
+    let final_checkpoint = checkpoint("root", vec![first, tool]);
+    storage
+        .save_checkpoint("root".into(), final_checkpoint.clone())
+        .await
+        .unwrap();
+    storage
+        .save_checkpoint("root".into(), final_checkpoint)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.load_output_progress("root").await.unwrap()[0].offset,
+        100
+    );
+    assert!(storage.has_notice_receipt(task).await.unwrap());
 }

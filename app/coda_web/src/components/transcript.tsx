@@ -1,3 +1,4 @@
+import { OutputReferences } from "./output-references";
 import {
   Bot,
   Brain,
@@ -581,6 +582,7 @@ function ToolEntryContent({ entry }: { entry: TranscriptEntry }) {
           )}
         </div>
       ) : null}
+      <OutputReferences references={entry.outputRefs} />
       {fileDiffs.map((artifact) => (
         <div
           key={`${artifact.operation}:${artifact.path}`}

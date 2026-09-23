@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rmcp::model::Tool;
 use tracing::warn;
 
-use coda_core::tool::{ToolCallContext, ToolError, ToolObject, ToolResult};
+use coda_core::tool::{ToolCallContext, ToolError, ToolObject};
 
 use crate::McpClient;
 
@@ -89,14 +89,19 @@ impl ToolObject for McpToolAdapter {
         self: Arc<Self>,
         params: String,
         ctx: ToolCallContext,
-    ) -> Pin<Box<dyn Future<Output = ToolResult<String>> + Send>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<coda_core::output::OutputData, coda_core::tool::ToolFailure>>
+                + Send,
+        >,
+    > {
         Box::pin(async move {
             let arguments: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&params).map_err(|e| {
                     ToolError::InvalidParameters(format!("invalid JSON arguments: {e}"))
                 })?;
 
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => Err(ToolError::Aborted(
                     "MCP tool call was interrupted by the user before completion.".to_string(),
@@ -104,7 +109,8 @@ impl ToolObject for McpToolAdapter {
                 ret = self.client.call_tool(&self.raw_name, arguments) => {
                     ret.map_err(|e| ToolError::ExecutionError(e.to_string()))
                 }
-            }
+            };
+            result.map(Into::into).map_err(Into::into)
         })
     }
 }

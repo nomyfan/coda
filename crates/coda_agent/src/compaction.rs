@@ -298,6 +298,44 @@ fn transcript<'a>(messages: impl IntoIterator<Item = &'a HistoryEntry>) -> Strin
     out
 }
 
+/// Apply current per-call and batch budgets before flattening tool history for a summary.
+pub async fn bounded_history(
+    history: &[HistoryEntry],
+    store: &dyn coda_core::output::OutputStore,
+    owner: coda_core::output::OutputOwner,
+    limits: coda_core::output::ModelOutputLimits,
+) -> Result<Vec<HistoryEntry>, String> {
+    let mut history = history.to_vec();
+    let minimum =
+        coda_core::output::ModelOutputLimits::minimum_response_bytes(&store.limits().root)?;
+    let mut slots = std::collections::HashMap::new();
+    for entry in &mut history {
+        match &mut entry.message {
+            Message::Assistant(message) => {
+                slots.clear();
+                for (call, bytes) in message
+                    .tool_calls
+                    .iter()
+                    .zip(limits.allocate(message.tool_calls.len(), minimum)?)
+                {
+                    slots.insert(call.id.clone(), bytes);
+                }
+            }
+            Message::Tool(tool) => {
+                let bytes = slots
+                    .get(&tool.id)
+                    .copied()
+                    .unwrap_or(limits.single_call_bytes);
+                coda_output::render::bound_tool(store, owner.clone(), tool, bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(history)
+}
+
 #[cfg(test)]
 #[path = "compaction_tests.rs"]
 mod tests;
